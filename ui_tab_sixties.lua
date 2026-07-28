@@ -50,20 +50,25 @@ local function makeCard(parent)
     card.acct = fstr(card, "small")
     card.acct:SetPoint("LEFT", card.name, "RIGHT", 6, 0)
 
+    -- PvP-flag crest sits INLINE on the name line (owner nit #2): name · #acct ·
+    -- crest. Small, vertically centered with the name text. The final left-anchor
+    -- (after #acct, or after the name when #acct is hidden) is chosen in Populate.
     card.crest = card:CreateTexture(nil, "ARTWORK")
-    card.crest:SetSize(18, 18)
-    card.crest:SetPoint("TOPRIGHT", card, "TOPRIGHT", -PADX, -8)
+    card.crest:SetSize(14, 14)
+    card.crest:SetPoint("LEFT", card.acct, "RIGHT", 6, 0)
     card.crest:SetTexCoord(0.02, 0.62, 0.03, 0.63)
     card.crest:Hide()
 
     -- Line 2: location.
     card.loc = fstr(card, "small")
     card.loc:SetPoint("TOPLEFT", card, "TOPLEFT", PADX, -30)
-    card.loc:SetPoint("RIGHT", card, "RIGHT", -PADX, 0)
+    -- RIGHT edge is bounded to the upper-right chrono/hearth stack (built below),
+    -- so a long location never slides under those icons (owner nit #3 reflow).
     card.loc:SetJustifyH("LEFT")
     card.loc:SetWordWrap(false)
 
-    -- Line 3: raid-lockout diamond pips (parity item 1) + freshness (right).
+    -- Line 3: raid-lockout diamond pips (parity item 1). The upper-right corner
+    -- of this band now holds the stacked chrono/hearth indicators (owner nit #3).
     -- Row of green/red diamonds (green = available, red = locked); a hover frame
     -- spanning the row shows a tooltip naming each raid + its reset time.
     card.raid = {}
@@ -101,11 +106,14 @@ local function makeCard(parent)
     end)
     card.raidHover:SetScript("OnLeave", function() GameTooltip:Hide() end)
 
+    -- "Updated Xd Yh ago" freshness sits in the card's BOTTOM-RIGHT corner
+    -- (owner nit #1): muted, small, right-aligned, baseline near the bottom edge.
     card.fresh = fstr(card, "small")
-    card.fresh:SetPoint("TOPRIGHT", card, "TOPRIGHT", -PADX, -46)
+    card.fresh:SetPoint("BOTTOMRIGHT", card, "BOTTOMRIGHT", -PADX, 8)
     card.fresh:SetJustifyH("RIGHT")
 
-    -- Line 4: collapsing buff-icon strip (left) + chrono/hearth (right).
+    -- Line 4 (bottom row): collapsing buff-icon strip (left) + "Updated" freshness
+    -- (bottom-right, built above). Chrono/hearth now live in the upper-right corner.
     card.buffSlots = {}
     for i = 1, 10 do
         local slot = CreateFrame("Frame", nil, card, "BackdropTemplate")
@@ -119,19 +127,14 @@ local function makeCard(parent)
         card.buffSlots[i] = slot
     end
 
-    -- Chrono + hearth at the right of line 4.
-    card.hearth = card:CreateTexture(nil, "ARTWORK")
-    card.hearth:SetSize(16, 16)
-    card.hearth:SetPoint("BOTTOMRIGHT", card, "BOTTOMRIGHT", -PADX, 8)
-    card.hearth:SetTexture(Dashboard.ItemIcon(HEARTHSTONE_ITEM))
-    card.hearth:SetTexCoord(0.08, 0.92, 0.08, 0.92)
-    card.hearthCD = fstr(card, "small")
-    card.hearthCD:SetPoint("BOTTOMRIGHT", card.hearth, "BOTTOMLEFT", -2, 2)
-    card.hearthCD:SetJustifyH("RIGHT")
-
+    -- Chronoboon + hearthstone stack in the card's UPPER-RIGHT corner (owner
+    -- nit #3): chronoboon on top, hearthstone directly below it. Small icons;
+    -- the hearthstone keeps its cooldown sub-label to its left and the chronoboon
+    -- keeps its border-colour status. The chronoboon holds a fixed slot whether
+    -- or not it is shown, so the hearthstone never shifts.
     card.chrono = CreateFrame("Frame", nil, card, "BackdropTemplate")
-    card.chrono:SetSize(18, 18)
-    card.chrono:SetPoint("RIGHT", card.hearthCD, "LEFT", -6, 0)
+    card.chrono:SetSize(16, 16)
+    card.chrono:SetPoint("TOPRIGHT", card, "TOPRIGHT", -PADX, -8)
     local chIc = card.chrono:CreateTexture(nil, "ARTWORK")
     chIc:SetPoint("TOPLEFT", card.chrono, "TOPLEFT", 1, -1)
     chIc:SetPoint("BOTTOMRIGHT", card.chrono, "BOTTOMRIGHT", -1, 1)
@@ -139,6 +142,21 @@ local function makeCard(parent)
     chIc:SetTexCoord(0.08, 0.92, 0.08, 0.92)
     card.chrono.icon = chIc
     card.chrono:Hide()
+
+    card.hearth = card:CreateTexture(nil, "ARTWORK")
+    card.hearth:SetSize(16, 16)
+    card.hearth:SetPoint("TOPRIGHT", card.chrono, "BOTTOMRIGHT", 0, -4)
+    card.hearth:SetTexture(Dashboard.ItemIcon(HEARTHSTONE_ITEM))
+    card.hearth:SetTexCoord(0.08, 0.92, 0.08, 0.92)
+    card.hearthCD = fstr(card, "small")
+    card.hearthCD:SetPoint("RIGHT", card.hearth, "LEFT", -3, 0)
+    card.hearthCD:SetJustifyH("RIGHT")
+
+    -- Now that the corner stack exists, bound the location line's right edge to
+    -- the hearthstone label so a long location can't slide under the icons. The
+    -- empty label collapses onto the hearth's left edge, so the clearance tracks
+    -- whatever the label currently shows.
+    card.loc:SetPoint("RIGHT", card.hearthCD, "LEFT", -6, 0)
 
     -- Raid-code row tooltip (explains the abbreviations).
     card:SetScript("OnEnter", function() end)  -- highlight handled by texture
@@ -158,6 +176,11 @@ local function makeCard(parent)
 
         if rec.pvpFlagged and rec.faction then
             self.crest:SetTexture(Dashboard.FactionCrest(rec.faction))
+            -- Sit the crest inline right after the account tag when it is shown,
+            -- else right after the name, so it always hugs the end of the line.
+            self.crest:ClearAllPoints()
+            local afterName = (entry.aid and entry.aid ~= "") and self.acct or self.name
+            self.crest:SetPoint("LEFT", afterName, "RIGHT", 6, 0)
             self.crest:Show()
         else
             self.crest:Hide()
@@ -220,8 +243,8 @@ local function makeCard(parent)
             end
         end
 
-        -- Chrono + hearth (real item icons; re-set each refresh so a late
-        -- item-cache resolve corrects a first-paint question mark).
+        -- Chrono + hearth in the upper-right stack (real item icons; re-set each
+        -- refresh so a late item-cache resolve corrects a first-paint question mark).
         self.hearth:SetTexture(Dashboard.ItemIcon(HEARTHSTONE_ITEM))
         self.chrono.icon:SetTexture(Dashboard.ItemIcon(CHRONOBOON_ITEM))
         if rec.chronoboonActive then
