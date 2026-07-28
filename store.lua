@@ -255,11 +255,13 @@ local function defaultTimerSettings()
             minimapFlowerSize = 12,
             minimapTuberSize  = 12,
             -- Songflower display durations (seconds) consumed by the timers-tab
-            -- UP?/minus state machine (timers.lua NodeState). Reference-aligned
-            -- defaults (item 27): UP? window 5s, minus-timer 120s — replacing the
-            -- prior 0="always" / 1500 sentinels.
-            flowerMinusDuration = 120,
-            flowerUpDuration    = 5,
+            -- UP?/minus state machine (timers.lua NodeState). Songflower respawn
+            -- is 25 minutes, so minus-timer = 1500s (matches Timers.NODE_RESPAWN)
+            -- and UP? window = 0 (indefinite, matching NodeState semantics). The
+            -- earlier 120/5 defaults decayed a live node to "No data" ~125s after
+            -- a pick; MigrateSongflowerDefaults rewrites any SV still holding them.
+            flowerMinusDuration = 1500,
+            flowerUpDuration    = 0,
         },
         pullBar = {
             width   = 220,
@@ -345,7 +347,9 @@ local function defaultData()
             localBoon  = {},    -- ["Name-Realm"] = encoded snapshot
             tooltipBoon = {},   -- ["Name-Realm"] = encoded snapshot
         },
-        manualLocations = {},   -- ["Name-Realm"] = "label"
+        manualLocations = {},   -- ["Name-Realm"] = "label" (legacy location override; retained, no longer edited via UI)
+        notes = {},             -- ["Name-Realm"] = "free-text note" (replaces the location-override concept)
+        notesMigrated = false,  -- one-time marker: legacy manualLocations copied into empty notes
         social = {
             guild   = {},       -- ["Name-Realm"] = true
             friends = {},       -- ["Name-Realm"] = true
@@ -427,6 +431,54 @@ function Store.MigrateSettings(db)
 end
 
 ----------------------------------------------------------------------
+-- Songflower display-duration default correction (owner-confirmed).
+--
+-- An earlier build shipped flowerMinusDuration=120 / flowerUpDuration=5, but
+-- songflower respawn is 25 minutes; those defaults decayed a live node to
+-- "No data" ~125s after a pick. The accurate values are 1500s (25m, matching
+-- Timers.NODE_RESPAWN) and 0 (indefinite UP? window, matching NodeState). Only
+-- values that STILL equal the old defaults are rewritten — a user-customized
+-- number is preserved. Idempotent by nature (1500 ~= 120, 0 ~= 5).
+----------------------------------------------------------------------
+
+function Store.MigrateSongflowerDefaults(db)
+    if type(db) ~= "table" then return end
+    local fw = db.timerSettings and db.timerSettings.felwood
+    if type(fw) ~= "table" then return end
+    if fw.flowerMinusDuration == 120 then fw.flowerMinusDuration = 1500 end
+    if fw.flowerUpDuration    == 5   then fw.flowerUpDuration    = 0    end
+end
+
+----------------------------------------------------------------------
+-- Notes migration (replaces the per-character location-override concept).
+--
+-- The manual-location override is retired in favour of a free-text note. This
+-- one-time, additive pass copies any legacy manualLocations value into the
+-- character's note WHEN that note is empty; it never deletes or modifies the
+-- stored manualLocations data (we do not destroy user data — the UI simply
+-- stops consuming it). Guarded by the `notesMigrated` marker so a later user
+-- edit (e.g. clearing a note) is never re-clobbered by the old location.
+----------------------------------------------------------------------
+
+function Store.MigrateNotes(data)
+    if type(data) ~= "table" then return end
+    if data.notesMigrated then return end
+    if type(data.notes) ~= "table" then data.notes = {} end
+    local locs = data.manualLocations
+    if type(locs) == "table" then
+        for nameRealm, label in pairs(locs) do
+            if type(label) == "string" and label ~= "" then
+                local existing = data.notes[nameRealm]
+                if existing == nil or existing == "" then
+                    data.notes[nameRealm] = label
+                end
+            end
+        end
+    end
+    data.notesMigrated = true
+end
+
+----------------------------------------------------------------------
 -- Account bucket shape
 ----------------------------------------------------------------------
 
@@ -454,6 +506,9 @@ function Store.Init()
     -- Settings migrations run BEFORE applyDefaults so a legacy shape is
     -- transformed first, then any still-missing keys are backfilled.
     Store.MigrateSettings(DaseekiNexusDB)
+    -- Rewrite any SV still holding the wrong songflower defaults (120/5 -> 1500/0)
+    -- before defaults backfill; user-customized values are left untouched.
+    Store.MigrateSongflowerDefaults(DaseekiNexusDB)
 
     applyDefaults(DaseekiNexusDB, defaultSettings())
     DaseekiNexusDB.settingsVersion = Store.SETTINGS_VERSION
@@ -470,6 +525,8 @@ function Store.Init()
         local preservedTimers  = DaseekiNexusData.timers
         local preservedSocial  = DaseekiNexusData.social
         local preservedManual  = DaseekiNexusData.manualLocations
+        local preservedNotes   = DaseekiNexusData.notes
+        local preservedNotesMig = DaseekiNexusData.notesMigrated
         local preservedDeleted = DaseekiNexusData.deletedAIDs
 
         DaseekiNexusData = defaultData()
@@ -477,11 +534,16 @@ function Store.Init()
         if preservedTimers  then DaseekiNexusData.timers = preservedTimers end
         if preservedSocial  then DaseekiNexusData.social = preservedSocial end
         if preservedManual  then DaseekiNexusData.manualLocations = preservedManual end
+        if preservedNotes   then DaseekiNexusData.notes = preservedNotes end
+        if preservedNotesMig ~= nil then DaseekiNexusData.notesMigrated = preservedNotesMig end
         if preservedDeleted then DaseekiNexusData.deletedAIDs = preservedDeleted end
     end
 
     -- Backfill any structure a partial/older DB is missing.
     applyDefaults(DaseekiNexusData, defaultData())
+
+    -- One-time additive copy of legacy location overrides into empty notes.
+    Store.MigrateNotes(DaseekiNexusData)
 
     Store.db   = DaseekiNexusDB
     Store.data = DaseekiNexusData
@@ -854,6 +916,22 @@ function Store.SetManualLocation(nameRealm, label)
     Store.data.manualLocations[nameRealm] = label
 end
 
+-- Per-character free-text note (replaces the location-override concept). Same
+-- persistence scope as manualLocations (lives in DaseekiNexusData, preserved
+-- across version wipes). Empty string normalizes to nil on write, and a stored
+-- "" reads back as nil.
+function Store.GetNote(nameRealm)
+    local notes = Store.data.notes
+    local n = notes and notes[nameRealm]
+    if n == "" then return nil end
+    return n
+end
+function Store.SetNote(nameRealm, text)
+    if type(Store.data.notes) ~= "table" then Store.data.notes = {} end
+    if text == "" then text = nil end
+    Store.data.notes[nameRealm] = text
+end
+
 -- Faction settings block for the given faction ("Alliance"/"Horde").
 function Store.GetFactionSettings(faction)
     local fs = Store.db.factionSettings
@@ -874,8 +952,8 @@ local function testDefaults(fails)
         and ag.sendToAnyone == false, "per-category send gates default off")
     ck(ag.whitelistEnabled == true, "whitelistEnabled default true")
     local fw = s.timerSettings.felwood
-    ck(fw.flowerUpDuration == 5, "songflower UP? default 5s")
-    ck(fw.flowerMinusDuration == 120, "songflower minus default 120s")
+    ck(fw.flowerUpDuration == 0, "songflower UP? default indefinite (0)")
+    ck(fw.flowerMinusDuration == 1500, "songflower minus default 1500s (25m)")
     ck(fw.worldFlowerSize == 14 and fw.worldTuberSize == 14
         and fw.worldTimerFont == 10 and fw.minimapFlowerSize == 12
         and fw.minimapTuberSize == 12, "5-field pin sizing present")
@@ -919,10 +997,63 @@ local function testAlertMigration(fails)
     ck(db.timerSettings.alerts.pullTimer.rend.chat == true, "migration idempotent")
 end
 
+local function testSongflowerMigration(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    -- Stored old defaults are rewritten to the accurate values.
+    local db = { timerSettings = { felwood = {
+        flowerMinusDuration = 120, flowerUpDuration = 5 } } }
+    Store.MigrateSongflowerDefaults(db)
+    ck(db.timerSettings.felwood.flowerMinusDuration == 1500, "120 minus -> 1500")
+    ck(db.timerSettings.felwood.flowerUpDuration == 0, "5 UP? -> 0")
+    -- Idempotent by nature: re-running leaves the corrected values alone.
+    Store.MigrateSongflowerDefaults(db)
+    ck(db.timerSettings.felwood.flowerMinusDuration == 1500, "songflower migration idempotent")
+    -- User-customized values are preserved.
+    local custom = { timerSettings = { felwood = {
+        flowerMinusDuration = 900, flowerUpDuration = 3 } } }
+    Store.MigrateSongflowerDefaults(custom)
+    ck(custom.timerSettings.felwood.flowerMinusDuration == 900, "custom minus 900 untouched")
+    ck(custom.timerSettings.felwood.flowerUpDuration == 3, "custom UP? 3 untouched")
+    -- Missing felwood block is a safe no-op.
+    Store.MigrateSongflowerDefaults({})
+    Store.MigrateSongflowerDefaults(nil)
+end
+
+local function testNotes(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local saved = Store.data
+    Store.data = { notes = {}, manualLocations = {} }
+    -- Round-trip.
+    Store.SetNote("A-Realm", "meet at inn")
+    ck(Store.GetNote("A-Realm") == "meet at inn", "note round-trip")
+    -- Empty string normalizes to nil.
+    Store.SetNote("A-Realm", "")
+    ck(Store.GetNote("A-Realm") == nil, "empty string -> nil on read")
+    ck(Store.data.notes["A-Realm"] == nil, "empty string stored as nil")
+    Store.data = saved
+    -- Migration: copies location into empty note, preserves existing note,
+    -- never destroys manualLocations.
+    local data = {
+        notes = { ["C-Realm"] = "kept" },
+        manualLocations = { ["B-Realm"] = "Stormwind", ["C-Realm"] = "Ironforge" },
+    }
+    Store.MigrateNotes(data)
+    ck(data.notes["B-Realm"] == "Stormwind", "location copied into empty note")
+    ck(data.notes["C-Realm"] == "kept", "existing note not overwritten")
+    ck(data.manualLocations["B-Realm"] == "Stormwind", "manualLocations not destroyed")
+    ck(data.notesMigrated == true, "notesMigrated marker set")
+    -- Idempotent via marker: clearing a note then re-running does not re-copy.
+    data.notes["B-Realm"] = nil
+    Store.MigrateNotes(data)
+    ck(data.notes["B-Realm"] == nil, "note migration idempotent via marker")
+end
+
 function Store.RunSelfTests(verbose)
     local suites = {
         { name = "defaults",        fn = testDefaults },
         { name = "alert migration", fn = testAlertMigration },
+        { name = "songflower migration", fn = testSongflowerMigration },
+        { name = "notes",           fn = testNotes },
     }
     local allPass = true
     for _, suite in ipairs(suites) do

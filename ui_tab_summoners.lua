@@ -1,7 +1,9 @@
 -- Daseeki Nexus — ui_tab_summoners.lua
--- The "Summoners" tab (spec §5): a single-panel, click-sortable 6-column table
--- of the faction's warlock summoners (shards >= 20), with alternating row
--- shading and a per-row location-override popup. Column headers are always
+-- The "Summoners" tab (spec §5): a single-panel, click-sortable table of the
+-- faction's warlock summoners (shards >= 20), with alternating row shading and
+-- a per-row free-text Note editor popup. The Location column shows the
+-- game-captured location only; a separate Notes column holds the user's note
+-- (the old location-override concept is retired). Column headers are always
 -- present (style guide: every column labeled); default sort is Shards ascending.
 
 local ADDON, ns = ...
@@ -21,18 +23,28 @@ local SOULSTONE_ICON = "Interface\\Icons\\Spell_Shadow_SoulGem"  -- soulstone av
 -- (marked `icon`): lit when a soulstone is available, greyed on CD/none/unknown.
 local COLS = {
     { key = "name",      label = "Name",      w = 158, just = "LEFT"  },
+    -- Level (secondary info): narrow 2-digit slot, centered to match the numeric
+    -- rhythm of Account/Shards; value rendered muted, em-dash when 0/unknown.
+    { key = "level",     label = "Lvl",       w = 40,  just = "CENTER"},
     { key = "account",   label = "Account",   w = 78,  just = "CENTER"},
     { key = "shards",    label = "Shards",    w = 84,  just = "CENTER"},
     { key = "class",     label = "Class",     w = 96,  just = "LEFT"  },
     { key = "location",  label = "Location",  w = 0,   just = "LEFT", flex = true },
+    -- Notes (secondary info): user free-text, muted; long notes truncate with a
+    -- trailing ellipsis (non-wrapping FontString) and show in full on hover.
+    { key = "notes",     label = "Notes",     w = 110, just = "LEFT"  },
     { key = "status",    label = "Status",    w = 78,  just = "CENTER"},
     { key = "soulstone", label = "Soulstone", w = 76,  just = "CENTER", icon = true },
     { key = "edit",      label = "",          w = 30,  just = "CENTER"},
 }
 
--- Index of the soulstone icon column (computed so row layout can place its icon).
-local SOUL_COL_INDEX
-for i, c in ipairs(COLS) do if c.key == "soulstone" then SOUL_COL_INDEX = i end end
+-- Indexes of columns whose cells are drawn/handled specially (computed so row
+-- layout can place the soulstone icon and the note hover region).
+local SOUL_COL_INDEX, NOTES_COL_INDEX
+for i, c in ipairs(COLS) do
+    if c.key == "soulstone" then SOUL_COL_INDEX = i end
+    if c.key == "notes"     then NOTES_COL_INDEX = i end
+end
 
 -- Soulstone availability for a record (parity item 6, engine half not yet landed).
 -- The tracker will write a warlock soulstone-ready flag into the character record;
@@ -53,14 +65,16 @@ local function fstr(parent, key)
 end
 
 ----------------------------------------------------------------------
--- Location-override popup (single shared instance, anchored per row).
+-- Per-row Note editor popup (single shared instance, anchored per row).
+-- Same popup mechanics as the retired location-override editor; writes the
+-- character's free-text note via Store.SetNote / prefills via Store.GetNote.
 ----------------------------------------------------------------------
 
-local function ensureLocPopup()
-    if Dashboard._summonLocPopup then return Dashboard._summonLocPopup end
+local function ensureNotePopup()
+    if Dashboard._summonNotePopup then return Dashboard._summonNotePopup end
     local p = CreateFrame("Frame", nil, UIParent, "BackdropTemplate")
     p:SetFrameStrata("DIALOG")
-    p:SetSize(240, 40)
+    p:SetSize(280, 40)
     p:Hide()
     UI.Skin(p, function(self)
         self:SetBackdrop(UI.FLAT_BACKDROP)
@@ -69,7 +83,7 @@ local function ensureLocPopup()
     end)
     local box = CreateFrame("EditBox", nil, p, "BackdropTemplate")
     box:SetPoint("LEFT", p, "LEFT", 8, 0)
-    box:SetSize(160, 22); box:SetAutoFocus(true)
+    box:SetSize(200, 22); box:SetAutoFocus(true)
     box:SetFontObject(UI.fonts.body); box:SetTextInsets(6, 6, 0, 0)
     UI.Skin(box, function(self)
         self:SetBackdrop(UI.FLAT_BACKDROP)
@@ -80,7 +94,7 @@ local function ensureLocPopup()
     local function commit()
         if p._nameRealm then
             local t = box:GetText()
-            ns.Store.SetManualLocation(p._nameRealm, (t ~= "" and t) or nil)
+            ns.Store.SetNote(p._nameRealm, (t ~= "" and t) or nil)
         end
         p:Hide()
         if p._onDone then p._onDone() end
@@ -100,15 +114,15 @@ local function ensureLocPopup()
     closer:SetScript("OnClick", function() p:Hide() end)
     p:SetScript("OnHide", function() closer:Hide() end)
     p._closer = closer
-    Dashboard._summonLocPopup = p
+    Dashboard._summonNotePopup = p
     return p
 end
 
-local function openLocPopup(anchor, nameRealm, onDone)
-    local p = ensureLocPopup()
+local function openNotePopup(anchor, nameRealm, onDone)
+    local p = ensureNotePopup()
     p._nameRealm = nameRealm
     p._onDone = onDone
-    p.box:SetText(ns.Store.GetManualLocation(nameRealm) or "")
+    p.box:SetText(ns.Store.GetNote(nameRealm) or "")
     p:ClearAllPoints()
     p:SetPoint("TOPRIGHT", anchor, "BOTTOMRIGHT", 0, -2)
     p._closer:Show()
@@ -220,6 +234,20 @@ Dashboard.RegisterTab("summoners", function(host)
                 GameTooltip:Show()
             end)
             r.soulHit:SetScript("OnLeave", function() GameTooltip:Hide() end)
+            -- Note hover region: reveals the full note (the cell truncates with an
+            -- ellipsis). Shown only when the row carries a note.
+            r.noteHit = CreateFrame("Frame", nil, r)
+            r.noteHit:EnableMouse(true)
+            r.noteHit:Hide()
+            r.noteHit:SetScript("OnEnter", function(self)
+                if not self._note then return end
+                GameTooltip:SetOwner(self, "ANCHOR_TOP")
+                GameTooltip:AddLine("Note", UI.Color("text"))
+                local cr, cg, cb = UI.Color("muted")
+                GameTooltip:AddLine(self._note, cr, cg, cb, true)   -- wrapText = true
+                GameTooltip:Show()
+            end)
+            r.noteHit:SetScript("OnLeave", function() GameTooltip:Hide() end)
             -- Edit button (last column).
             r.edit = UI.MakeButton(r, { text = "…", variant = "quiet", width = 22, height = 18 })
             obj._rows[i] = r
@@ -253,10 +281,12 @@ Dashboard.RegisterTab("summoners", function(host)
         local function keyval(e)
             local rec = e.rec
             if key == "name" then return (e.nameRealm or ""):lower()
+            elseif key == "level" then return rec.level or 0
             elseif key == "account" then return tonumber(e.aid) or 999
             elseif key == "shards" then return rec.shardCount or 0
             elseif key == "class" then return (rec.className or ""):lower()
             elseif key == "location" then return (rec.location or ""):lower()
+            elseif key == "notes" then return (ns.Store.GetNote(e.nameRealm) or ""):lower()
             elseif key == "status" then return e.online and 1 or 0 end
             return 0
         end
@@ -300,12 +330,24 @@ Dashboard.RegisterTab("summoners", function(host)
             else
                 shardCell = "-"
             end
+            -- Level cell: muted 2-digit number; em-dash (faint) when 0/nil so an
+            -- unknown level never reads as a real "0".
+            local lvl = rec.level
+            local levelCell = (lvl and lvl > 0)
+                and Dashboard.Colored(lvl, "muted")
+                or Dashboard.Colored("\226\128\148", "faint")
+            -- Note cell: muted free-text; the non-wrapping FontString truncates a
+            -- long note with a trailing ellipsis, full text on hover (noteHit).
+            local note = ns.Store.GetNote(e.nameRealm)
+            local noteCell = (note and note ~= "") and Dashboard.Colored(note, "muted") or ""
             local cells = {
                 Dashboard.ColoredName(e.nameRealm, rec.classTag),
+                levelCell,
                 (e.aid ~= "" and e.aid) or "-",
                 shardCell,
                 rec.className or "?",
                 rec.location or Dashboard.Colored("Missing","danger"),
+                noteCell,
                 e.online and Dashboard.Colored("Online","ok") or Dashboard.Colored("Offline","faint"),
             }
             for c = 1, #COLS - 1 do
@@ -342,12 +384,24 @@ Dashboard.RegisterTab("summoners", function(host)
                 r.soulIcon:Hide()
                 r.soulHit:Hide()
             end
-            -- Edit button.
+            -- Note hover region (full-text tooltip): only when a note exists.
+            if NOTES_COL_INDEX and note and note ~= "" then
+                local g = geom[NOTES_COL_INDEX]
+                r.noteHit:ClearAllPoints()
+                r.noteHit:SetPoint("LEFT", r, "LEFT", g.x, 0)
+                r.noteHit:SetSize(g.w, ROW_H)
+                r.noteHit._note = note
+                r.noteHit:Show()
+            else
+                r.noteHit._note = nil
+                r.noteHit:Hide()
+            end
+            -- Edit button (opens the per-row Note editor).
             r.edit:ClearAllPoints()
             r.edit:SetPoint("LEFT", r, "LEFT", geom[#COLS].x, 0)
             r.edit._nameRealm = e.nameRealm
             r.edit:SetScript("OnClick", function(self)
-                openLocPopup(self, self._nameRealm, obj.Refresh)
+                openNotePopup(self, self._nameRealm, obj.Refresh)
             end)
             r:Show()
         end
