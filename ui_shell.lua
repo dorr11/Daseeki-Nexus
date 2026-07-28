@@ -165,6 +165,28 @@ local DEFAULT_THRESHOLD = { normal = 20 * 60, minimum = 5 * 60 }
 
 Dashboard.RAID_DISPLAY = { "Naxx", "AQ40", "BWL", "MC", "ZG", "AQ20", "Ony" }
 
+-- Full raid names for diamond-pip tooltips (60s cards, parity item 1) and the
+-- detail Raids rows (parity item 2). Keys match Store.RAID_KEYS.
+Dashboard.RAID_FULLNAME = {
+    Naxx = "Naxxramas",
+    AQ40 = "Temple of Ahn'Qiraj",
+    BWL  = "Blackwing Lair",
+    MC   = "Molten Core",
+    ZG   = "Zul'Gurub",
+    AQ20 = "Ruins of Ahn'Qiraj",
+    Ony  = "Onyxia's Lair",
+}
+
+-- Reset-cadence groups (parity item 2): the detail Raids section renders these
+-- in order with a small vertical gap BETWEEN groups, mirroring the reference's
+-- weekly / 3-day / 5-day visual grouping. The flat RAID_DISPLAY order above is
+-- exactly the concatenation of these groups, so the card pip row is unaffected.
+Dashboard.RAID_GROUPS = {
+    { cadence = "Weekly", keys = { "Naxx", "AQ40", "BWL", "MC" } },
+    { cadence = "3-day",  keys = { "ZG", "AQ20" } },
+    { cadence = "5-day",  keys = { "Ony" } },
+}
+
 ----------------------------------------------------------------------
 -- Shared helpers
 ----------------------------------------------------------------------
@@ -182,6 +204,25 @@ function Dashboard.HexColor(token)
 end
 function Dashboard.Colored(text, token)
     return Dashboard.HexColor(token) .. tostring(text) .. "|r"
+end
+
+-- Token-drawn diamond pip (parity items 1 & 2 — raid-lockout pips as diamonds).
+-- A small solid WHITE8X8 square rotated 45° renders as a filled diamond, tinted
+-- from a theme token so the whole thing stays tokens-only (no custom .tga; the
+-- network design doc mandates token-drawn shapes for pips/arrows/stripes). Size
+-- is the square edge; the rotated diamond's bounding box is ~size*1.41, so give
+-- each pip ~size*1.6 of horizontal room. `layer` optional (default ARTWORK).
+function Dashboard.MakeDiamond(parent, size, layer)
+    size = size or 9
+    local d = parent:CreateTexture(nil, layer or "ARTWORK")
+    d:SetTexture("Interface\\Buttons\\WHITE8X8")
+    d:SetSize(size, size)
+    d:SetRotation(0.7853981633974483)   -- math.rad(45)
+    return d
+end
+function Dashboard.SetDiamondColor(tex, token, alpha)
+    local r, g, b = UI.Color(token)
+    tex:SetVertexColor(r, g, b, alpha or 1)
 end
 
 -- Class color (r,g,b) from the user override table, falling back to Blizzard's.
@@ -1301,9 +1342,10 @@ function Dashboard.BuildDetailPanel(parent)
         if not r then
             r = CreateFrame("Frame", nil, child)
             r:SetHeight(18)
-            r.dot = r:CreateTexture(nil, "ARTWORK")
-            r.dot:SetSize(8, 8); r.dot:SetPoint("LEFT", r, "LEFT", 2, 0)
-            r.name = fs(r, "body"); r.name:SetPoint("LEFT", r.dot, "RIGHT", 8, 0)
+            -- Diamond pip (parity item 2), tinted green/red per lockout state.
+            r.dot = Dashboard.MakeDiamond(r, 9)
+            r.dot:SetPoint("LEFT", r, "LEFT", 4, 0)
+            r.name = fs(r, "body"); r.name:SetPoint("LEFT", r.dot, "RIGHT", 10, 0)
             r.val = fs(r, "muted"); r.val:SetPoint("RIGHT", r, "RIGHT", 0, 0); r.val:SetJustifyH("RIGHT")
             D._raidRows[i] = r
         end
@@ -1395,7 +1437,14 @@ function Dashboard.BuildDetailPanel(parent)
         -- Meta.
         local acct = (entry.aid ~= "" and entry.aid) or "?"
         line(("Account %s  |  %s  |  %s"):format(acct, rec.className or "?", rec.faction or "?"), "muted")
-        if rec.pvpFlagged then line("PvP flagged", "danger") end
+        -- PvP-flagged warning (parity item 4): red "PVP Flagged" with the
+        -- character's faction crest inline (sub-rect of the PvP crest art).
+        if rec.pvpFlagged then
+            local crest = rec.faction
+                and ("|T%s:14:14:0:0:64:64:1:40:2:40|t "):format(Dashboard.FactionCrest(rec.faction))
+                or ""
+            line(crest .. "PVP Flagged", "body", "danger")
+        end
 
         -- Location + source + manual override.
         header("Location")
@@ -1431,20 +1480,32 @@ function Dashboard.BuildDetailPanel(parent)
                 r:ClearAllPoints()
                 r:SetPoint("TOPLEFT", child, "TOPLEFT", 0, -y)
                 r:SetWidth(W)
+                -- Row label is "ABBR - Full Name" (parity item 3), e.g.
+                -- "DMF - Sayge's Dark Fortune", "SF - Songflower Serenade".
+                local label = ("%s - %s"):format(meta.short, meta.name)
                 if present then
                     local th = Dashboard.GetThreshold(entry.faction or rec.faction, meta.thresholdKey)
                     local tok = Dashboard.AuraColorToken(st.duration, th)
+                    -- Booned contents (parity item 37): a slot whose source is
+                    -- "boon" is a chronoboon-stored buff — render it green with a
+                    -- green "(Boon)" suffix ("1h 59m (Boon)") per the reference,
+                    -- regardless of threshold. The engine (tracker tooltip parse)
+                    -- writes source="boon" + the parsed remaining into the slot.
+                    local booned = (st.source == "boon")
+                    if booned then tok = "ok" end
                     r.icon:SetDesaturated(false); r.icon:SetVertexColor(1, 1, 1); r.icon:SetAlpha(1)
-                    r.name:SetText(meta.name); r.name:SetTextColor(UI.Color(tok))
-                    local annot = rec.chronoboonActive and "  (Boon)" or ""
+                    r.name:SetText(label); r.name:SetTextColor(UI.Color(tok))
+                    local annot = booned and " (Boon)" or ""
                     r.val:SetText(Dashboard.FormatDuration(st.duration) .. annot)
                     r.val:SetTextColor(UI.Color(tok))
                 else
-                    -- Missing + applicable: greyed icon; name + "Missing" in
-                    -- danger (required) or warn/amber (optional).
+                    -- Missing + applicable: greyed icon; "ABBR - Full Name" +
+                    -- "Missing" in danger (required) or warn/amber (optional).
+                    -- When a chronoboon is active but this slot was not captured
+                    -- as boon contents, it reads "UNBOONED" (parity item 37).
                     local tok = (requirement == "optional") and warnToken() or "danger"
                     r.icon:SetDesaturated(true); r.icon:SetVertexColor(0.7, 0.7, 0.7); r.icon:SetAlpha(0.5)
-                    r.name:SetText(meta.name); r.name:SetTextColor(UI.Color(tok))
+                    r.name:SetText(label); r.name:SetTextColor(UI.Color(tok))
                     local missTxt = rec.chronoboonActive and "UNBOONED" or "Missing"
                     r.val:SetText(missTxt); r.val:SetTextColor(UI.Color(tok))
                 end
@@ -1453,42 +1514,57 @@ function Dashboard.BuildDetailPanel(parent)
             end
         end
 
-        -- Cooldowns.
+        -- Cooldowns (parity item 5): boon count + Chronoboon icon + Active/Ready;
+        -- DMF state (in Boon / DMFable / on cooldown) with freshness; Hearthstone
+        -- Ready/countdown; warlock soul shards.
         header("Cooldowns")
-        line(("Chronoboon: %s (%d in bags)"):format(
-            rec.chronoboonActive and "active" or "none", rec.boonCount or 0), "body")
-        local dmfTxt = rec.dmfInBoon and "in Boon" or (rec.dmfCooldownActive and "on cooldown" or "available")
-        line("Darkmoon fortune: " .. dmfTxt, "body")
+        local boonIcon = ("|T%s:14:14|t"):format(Dashboard.ItemIcon(184937))  -- Chronoboon Displacer
+        local boonState = rec.chronoboonActive and Dashboard.Colored("Active", "ok")
+            or (((rec.boonCount or 0) > 0) and Dashboard.Colored("Ready", "ok") or Dashboard.Colored("None", "faint"))
+        line(("Chronoboon: %s %d in bags · %s"):format(boonIcon, rec.boonCount or 0, boonState), "body")
+        local dmfState
+        if rec.dmfInBoon then dmfState = Dashboard.Colored("in Boon", "ok")
+        elseif rec.dmfCooldownActive then dmfState = Dashboard.Colored("on cooldown", "muted")
+        else dmfState = Dashboard.Colored("DMFable", "ok") end
+        line(("Darkmoon fortune: %s · %s"):format(dmfState, Dashboard.FreshnessText(rec.lastDataUpdate)), "body")
         if (rec.hearthstoneCD or 0) > 0 then
             line("Hearthstone: " .. Dashboard.FormatDuration(rec.hearthstoneCD), "body")
         else
-            line("Hearthstone: ready", "body")
+            line("Hearthstone: Ready", "body")
         end
         if rec.classTag == "WARLOCK" then
             line("Soul shards: " .. (rec.shardCount or 0), "body")
         end
 
-        -- Raids.
+        -- Raids (parity item 2): a diamond pip + FULL raid name per raid, grouped
+        -- with a small gap by reset cadence (weekly · 3-day · 5-day) like the
+        -- reference. Each row reads green "Available" / red "Locked · Xd" and the
+        -- name takes the state color too.
         header("Raids")
         local nowE = now()
-        for _, key in ipairs(Dashboard.RAID_DISPLAY) do
-            ri = ri + 1
-            local r = getRaidRow(ri)
-            r:ClearAllPoints()
-            r:SetPoint("TOPLEFT", child, "TOPLEFT", 0, -y)
-            r:SetWidth(W)
-            local expiry = rec.raidLockouts and rec.raidLockouts[key]
-            local locked = expiry and expiry > nowE
-            r.dot:SetColorTexture(UI.Color(locked and "danger" or "ok"))
-            r.name:SetText(key); r.name:SetTextColor(UI.Color("text"))
-            if locked then
-                r.val:SetText("Locked · " .. Dashboard.FormatDuration(expiry - nowE))
-                r.val:SetTextColor(UI.Color("danger"))
-            else
-                r.val:SetText("Available"); r.val:SetTextColor(UI.Color("ok"))
+        for gi, grp in ipairs(Dashboard.RAID_GROUPS) do
+            if gi > 1 then y = y + 6 end   -- spacing between cadence groups
+            for _, key in ipairs(grp.keys) do
+                ri = ri + 1
+                local r = getRaidRow(ri)
+                r:ClearAllPoints()
+                r:SetPoint("TOPLEFT", child, "TOPLEFT", 0, -y)
+                r:SetWidth(W)
+                local expiry = rec.raidLockouts and rec.raidLockouts[key]
+                local locked = expiry and expiry > nowE
+                local tok = locked and "danger" or "ok"
+                Dashboard.SetDiamondColor(r.dot, tok)
+                r.name:SetText(Dashboard.RAID_FULLNAME[key] or key)
+                r.name:SetTextColor(UI.Color(tok))
+                if locked then
+                    r.val:SetText("Locked · " .. Dashboard.FormatDuration(expiry - nowE))
+                else
+                    r.val:SetText("Available")
+                end
+                r.val:SetTextColor(UI.Color(tok))
+                r:Show()
+                y = y + 18
             end
-            r:Show()
-            y = y + 18
         end
 
         child:SetHeight(math.max(y + 8, 1))
@@ -1703,15 +1779,17 @@ Dashboard.RegisterTab("help", function(host)
 
     local s = flow:AddSection("Daseeki Nexus")
     s:Hint("Cross-account world-buff dashboard and timers for the Daseeki suite. "
-        .. "Every account that shares your mesh Token sees the same roster.")
+        .. "Every account that shares your mesh Channel and Token sees the same roster.")
 
     -- ── Setup Guide (numbered, like the reference's Quick Start) ──────────────
+    -- Mesh joins on a Channel + Token PAIR (both user-set, case sensitive, no
+    -- auto-derivation) — the pair is the mesh password.
     local g = flow:AddSection("Setup Guide")
     g:Hint("1.  Install Daseeki Nexus on every account you want connected.")
-    g:Hint("2.  On each account, open Settings \226\134\146 General and set a unique Account ID.")
-    g:Hint("3.  In Settings \226\134\146 Mesh & Accounts, set the SAME Token on every account, then enable the mesh.")
-    g:Hint("4.  Log out and back in once on each account \226\128\148 characters appear across your accounts within seconds.")
-    g:Hint("5.  Optional: coming from ShadowNetwork? Run /nexus import to carry over your settings, Token and data.")
+    g:Hint("2.  On each account, open Settings \226\134\146 General and set a unique Account ID (1\226\128\1512 digits, different on each account).")
+    g:Hint("3.  In Settings \226\134\146 Mesh & Accounts, set the SAME Channel name (16+ letters/numbers, case sensitive) AND the SAME Token (6 letters/numbers) on every account.")
+    g:Hint("4.  Enable the mesh, then log out and back in once on each account \226\128\148 characters appear across your accounts within seconds.")
+    g:Hint("5.  Migrating from another world-buff addon? Run /nexus import to carry over its settings, Channel, Token and data (see Troubleshooting).")
     g:Hint("Open Settings from the button at this window's top-right, or with /nexus settings.")
 
     -- ── Slash commands (one per line, every user-facing subcommand) ───────────
@@ -1725,6 +1803,43 @@ Dashboard.RegisterTab("help", function(host)
     c:Hint("/nexus settings \226\128\148 open the Daseeki hub to Nexus settings")
     c:Hint("/nexus import \226\128\148 import ShadowNetwork settings & data ('dry' to preview)")
     c:Hint("/nexus help \226\128\148 full command list in chat")
+
+    -- ── Minimap button (parity item 10): OUR real click matrix, one per line ──
+    -- (Documents what minimap.lua actually binds — Alt+Left /camp logout is
+    -- intentionally omitted this build for secure-frame safety, so it is not
+    -- listed; Shift+Left is not a separate action.)
+    local mm = flow:AddSection("Minimap button")
+    mm:Hint("Left-click \226\128\148 invite all online characters.")
+    mm:Hint("Right-click \226\128\148 open or close the dashboard.")
+    mm:Hint("Ctrl + Right-click \226\128\148 open the Cancel Buffs popup.")
+    mm:Hint("Shift + Right-click \226\128\148 open the dashboard on the Timers tab.")
+    mm:Hint("Alt + Right-click \226\128\148 open the world map at Felwood.")
+    mm:Hint("Hover \226\128\148 live Rend / Onyxia (A/H) cooldowns plus this click list.")
+    mm:Hint("Drag it around the minimap ring to reposition (unless locked in Settings \226\134\146 General).")
+
+    -- ── Troubleshooting (parity item 11): Q&A adapted to our token+channel flow
+    local tr = flow:AddSection("Troubleshooting")
+    tr:Hint("Other accounts not showing? The Channel AND Token must match byte-for-byte on every account \226\128\148 both are case sensitive and together act as your mesh password. Correct any mismatch in Settings \226\134\146 Mesh & Accounts, then /reload.")
+    tr:Hint("Characters under the wrong account? Two accounts are sharing an Account ID. Give each account its own unique ID in Settings \226\134\146 General.")
+    tr:Hint("Copying settings to a new account? Set it up with the same Channel + Token, then use Send Settings to Mesh (you confirm the target account IDs first).")
+    tr:Hint("Coming from ShadowNetwork? Run /nexus import \226\128\148 it carries over your settings, Channel, Token and stored data.")
+
+    -- ── Accounts & Tombstones (parity item 19) ────────────────────────────────
+    local ac = flow:AddSection("Accounts & Tombstones")
+    ac:Hint("Deleting an account is local only \226\128\148 it hides that account on THIS client and leaves a 14-day tombstone that blocks it from re-appearing.")
+    ac:Hint("Remove a tombstone early and the account re-adds itself on its next heartbeat (while it is still meshing).")
+    ac:Hint("Changing your Account ID migrates your data locally; other accounts keep showing your OLD ID until they delete it.")
+    ac:Hint("If two accounts use the same ID you'll see an \"Account ID conflict\" warning \226\128\148 change one of them to a unique ID.")
+    ac:Hint("You can't delete your OWN account \226\128\148 change your Account ID instead.")
+
+    -- ── First-time setup (detailed) — parity item 21, at the bottom ───────────
+    local ds = flow:AddSection("First-time setup (detailed)")
+    ds:Hint("1.  Account ID \226\128\148 In Settings \226\134\146 General, give this account a short unique ID (1\226\128\1512 digits). Every connected account needs a DIFFERENT ID; this is how the mesh tells your accounts apart.")
+    ds:Hint("2.  Channel \226\128\148 In Settings \226\134\146 Mesh & Accounts, set a Channel name of 16+ letters and numbers. It is case sensitive and must be identical on every account \226\128\148 think of it as the room your accounts meet in.")
+    ds:Hint("3.  Token \226\128\148 Set a 6-character Token (letters/numbers), also identical everywhere. The Channel + Token together are your mesh password; anyone with both can see your roster, so keep them private.")
+    ds:Hint("4.  Same faction \226\128\148 The mesh rides a hidden faction chat channel, so each account must log in a character on the SAME faction to connect. Cross-faction characters simply will not mesh.")
+    ds:Hint("5.  Enable + relog \226\128\148 Enable the mesh, then log out and back in once on each account. Your characters appear across accounts within seconds.")
+    ds:Hint("6.  Verify \226\128\148 Open the 60s or Online tab; you should see characters from your other accounts. If not, check Troubleshooting above.")
 
     pane:Layout()
     return { Refresh = function() pane:Layout() end }

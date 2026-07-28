@@ -21,11 +21,13 @@ local function anchorOf(state)
     return math.max(state.lastPop or 0, state.lastKilled or 0)
 end
 
--- World-buff rows: {logKey, icon slot, label}.
+-- World-buff rows. Onyxia rows carry a faction `crest` (parity item 8) shown as
+-- a PvP crest icon after the name instead of "— Horde"/"— Alliance" text; `title`
+-- disambiguates the (otherwise identical) Onyxia pop-log headers.
 local WB_ROWS = {
-    { key = "rend", logKey = "rend", slot = 2, label = "Rend (Warchief's)" },
-    { key = "onyH", logKey = "onyH", slot = 1, label = "Onyxia — Horde" },
-    { key = "onyA", logKey = "onyA", slot = 1, label = "Onyxia — Alliance" },
+    { key = "rend", logKey = "rend", slot = 2, label = "Rend (Warchief's)", title = "Rend" },
+    { key = "onyH", logKey = "onyH", slot = 1, label = "Onyxia", crest = "Horde",    title = "Onyxia (Horde)" },
+    { key = "onyA", logKey = "onyA", slot = 1, label = "Onyxia", crest = "Alliance", title = "Onyxia (Alliance)" },
 }
 
 ----------------------------------------------------------------------
@@ -142,9 +144,19 @@ Dashboard.RegisterTab("timers", function(host)
         r.icon:SetTexCoord(0.08, 0.92, 0.08, 0.92)
         r.icon:SetTexture(Dashboard.AuraIcon(def.slot))   -- real-spell icon (shared source)
         r.name = fstr(r, "body"); r.name:SetPoint("LEFT", r.icon, "RIGHT", 8, 0); r.name:SetText(def.label)
-        r.status = fstr(r, "body"); r.status:SetPoint("LEFT", r.name, "RIGHT", 12, 0)
+        -- Faction crest after the name for Onyxia rows (parity item 8), replacing
+        -- the "— Horde"/"— Alliance" text; status anchors after the crest.
+        local afterName = r.name
+        if def.crest then
+            r.crest = r:CreateTexture(nil, "ARTWORK")
+            r.crest:SetSize(16, 16); r.crest:SetPoint("LEFT", r.name, "RIGHT", 5, 0)
+            r.crest:SetTexture(Dashboard.FactionCrest(def.crest))
+            r.crest:SetTexCoord(0.02, 0.62, 0.03, 0.63)
+            afterName = r.crest
+        end
+        r.status = fstr(r, "body"); r.status:SetPoint("LEFT", afterName, "RIGHT", 12, 0)
         r.log = UI.MakeButton(r, { text = "Log", variant = "quiet", width = 44, height = 20,
-            onClick = function() showPopLog(def.logKey, def.label .. " — Pop Log") end })
+            onClick = function() showPopLog(def.logKey, (def.title or def.label) .. " — Pop Log") end })
         r.log:SetPoint("RIGHT", r, "RIGHT", 2, 0)
         r.stamp = fstr(r, "small"); r.stamp:SetPoint("RIGHT", r.log, "LEFT", -10, 0); r.stamp:SetJustifyH("RIGHT")
         wbRows[i] = r
@@ -188,9 +200,12 @@ Dashboard.RegisterTab("timers", function(host)
     sfChild:SetHeight(math.max(#nodes * 20, 1))
     sfScroll:SetScript("OnSizeChanged", function() sfChild:SetWidth(sfScroll:GetWidth()) end)
 
-    -- Broadcast Timers button (bottom).
+    -- Broadcast Timers button (bottom) — the tab's one primary action (parity
+    -- item 9). DaseekiUI's most prominent button style is variant "normal"
+    -- (control fill + accent border); there is no separate "primary" variant, so
+    -- "normal" IS primary here, paired with an inline muted note.
     local bcast = UI.MakeButton(box, {
-        text = "Broadcast Timers", width = 160, height = 24,
+        text = "Broadcast Timers", variant = "normal", width = 160, height = 24,
         onClick = function(self)
             local nowT = GetTime()
             if obj._lastBcast and (nowT - obj._lastBcast) < 60 then
@@ -210,7 +225,7 @@ Dashboard.RegisterTab("timers", function(host)
     local bcastHint = fstr(box, "small")
     bcastHint:SetPoint("LEFT", bcast, "RIGHT", 10, 0)
     bcastHint:SetText("Sends your timer data to the mesh (throttled 60s).")
-    bcastHint:SetTextColor(UI.Color("faint"))
+    bcastHint:SetTextColor(UI.Color("muted"))
 
     -- Refresh routine.
     function obj.Refresh()
@@ -235,11 +250,14 @@ Dashboard.RegisterTab("timers", function(host)
                     r.status:SetTextColor(UI.Color("danger"))
                     r.status._pulse = true
                 else
+                    -- Amber (warn) countdown for CD > 20min (parity item 8 /
+                    -- spec §3 "steady orange").
                     r.status:SetText(Dashboard.FormatDuration(rem))
-                    r.status:SetTextColor(UI.Color("accent"))
+                    r.status:SetTextColor(UI.Color("warn"))
                     r.status._pulse = false
                 end
-                r.stamp:SetText("off CD " .. date("%H:%M", info.nextAt))
+                -- Absolute off-CD stamp to the second, server time (parity item 8).
+                r.stamp:SetText("off CD " .. date("%H:%M:%S", info.nextAt))
                 r.stamp:SetTextColor(UI.Color("muted"))
             end
         end

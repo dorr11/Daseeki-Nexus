@@ -15,11 +15,6 @@ local CARD_H = 96
 local CHRONOBOON_ITEM  = 184937   -- Chronoboon Displacer
 local HEARTHSTONE_ITEM = 6948     -- Hearthstone
 
--- 2-char raid codes (the code IS the label; colored green available / red locked).
-local RAID_CODE = {
-    Naxx = "Nx", AQ40 = "A4", BWL = "BW", MC = "MC", ZG = "ZG", AQ20 = "A2", Ony = "On",
-}
-
 local function fstr(parent, key)
     local f = parent:CreateFontString(nil, "OVERLAY")
     f:SetFontObject(UI.fonts[key] or UI.fonts.body)
@@ -68,17 +63,44 @@ local function makeCard(parent)
     card.loc:SetJustifyH("LEFT")
     card.loc:SetWordWrap(false)
 
-    -- Line 3: raid codes (left) + freshness (right).
+    -- Line 3: raid-lockout diamond pips (parity item 1) + freshness (right).
+    -- Row of green/red diamonds (green = available, red = locked); a hover frame
+    -- spanning the row shows a tooltip naming each raid + its reset time.
     card.raid = {}
     local prev
     for i, key in ipairs(Dashboard.RAID_DISPLAY) do
-        local t = fstr(card, "small")
-        if prev then t:SetPoint("LEFT", prev, "RIGHT", 5, 0)
-        else t:SetPoint("TOPLEFT", card, "TOPLEFT", PADX, -46) end
-        t._raidKey = key
-        card.raid[i] = t
-        prev = t
+        local d = Dashboard.MakeDiamond(card, 9)
+        if prev then d:SetPoint("LEFT", prev, "RIGHT", 6, 0)
+        else d:SetPoint("TOPLEFT", card, "TOPLEFT", PADX + 2, -47) end
+        d._raidKey = key
+        card.raid[i] = d
+        prev = d
     end
+    card.raidHover = CreateFrame("Frame", nil, card)
+    card.raidHover:SetSize(#Dashboard.RAID_DISPLAY * 15 + 8, 16)
+    card.raidHover:SetPoint("TOPLEFT", card, "TOPLEFT", PADX, -42)
+    card.raidHover:EnableMouse(true)
+    card.raidHover:SetScript("OnEnter", function(self)
+        local rec = self._rec
+        if not rec then return end
+        GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+        GameTooltip:AddLine("Raid lockouts", UI.Color("accent"))
+        local nowE = Dashboard.Now()
+        for _, key in ipairs(Dashboard.RAID_DISPLAY) do
+            local expiry = rec.raidLockouts and rec.raidLockouts[key]
+            local locked = expiry and expiry > nowE
+            local full = Dashboard.RAID_FULLNAME[key] or key
+            if locked then
+                GameTooltip:AddDoubleLine(full, "Locked \194\183 " .. Dashboard.FormatDuration(expiry - nowE),
+                    UI.Color("text"), UI.Color("danger"))
+            else
+                GameTooltip:AddDoubleLine(full, "Available", UI.Color("text"), UI.Color("ok"))
+            end
+        end
+        GameTooltip:Show()
+    end)
+    card.raidHover:SetScript("OnLeave", function() GameTooltip:Hide() end)
+
     card.fresh = fstr(card, "small")
     card.fresh:SetPoint("TOPRIGHT", card, "TOPRIGHT", -PADX, -46)
     card.fresh:SetJustifyH("RIGHT")
@@ -147,14 +169,14 @@ local function makeCard(parent)
             self.loc:SetText("Missing location"); self.loc:SetTextColor(UI.Color("danger"))
         end
 
-        -- Raid codes colored by lockout.
+        -- Raid-lockout diamond pips (parity item 1): green available / red locked.
         local nowE = Dashboard.Now()
-        for _, t in ipairs(self.raid) do
-            local expiry = rec.raidLockouts and rec.raidLockouts[t._raidKey]
+        for _, d in ipairs(self.raid) do
+            local expiry = rec.raidLockouts and rec.raidLockouts[d._raidKey]
             local locked = expiry and expiry > nowE
-            t:SetText(RAID_CODE[t._raidKey] or t._raidKey)
-            t:SetTextColor(UI.Color(locked and "danger" or "ok"))
+            Dashboard.SetDiamondColor(d, locked and "danger" or "ok")
         end
+        self.raidHover._rec = rec
 
         self.fresh:SetText(Dashboard.FreshnessText(rec.lastDataUpdate))
         self.fresh:SetTextColor(UI.Color("faint"))

@@ -13,18 +13,38 @@ local HEADER_H  = 24
 local SHARD_MIN = 20   -- warlocks with at least this many shards are "summoners"
 local COL_GAP   = 14   -- inter-column spacing (owner feedback: columns crowded left)
 local SOULSHARD_ITEM = 6265   -- Soul Shard (its icon prefixes the Shards count)
+local SOULSTONE_ICON = "Interface\\Icons\\Spell_Shadow_SoulGem"  -- soulstone availability pip
 
 -- Fixed column widths (Location flexes to fill). Grid discipline: comfortable
 -- widths so the columns distribute across the table instead of bunching left.
+-- The trailing "Soulstone" column (parity item 6) is a non-sortable icon column
+-- (marked `icon`): lit when a soulstone is available, greyed on CD/none/unknown.
 local COLS = {
-    { key = "name",     label = "Name",     w = 158, just = "LEFT"  },
-    { key = "account",  label = "Account",  w = 78,  just = "CENTER"},
-    { key = "shards",   label = "Shards",   w = 84,  just = "CENTER"},
-    { key = "class",    label = "Class",    w = 96,  just = "LEFT"  },
-    { key = "location", label = "Location", w = 0,   just = "LEFT", flex = true },
-    { key = "status",   label = "Status",   w = 78,  just = "CENTER"},
-    { key = "edit",     label = "",         w = 30,  just = "CENTER"},
+    { key = "name",      label = "Name",      w = 158, just = "LEFT"  },
+    { key = "account",   label = "Account",   w = 78,  just = "CENTER"},
+    { key = "shards",    label = "Shards",    w = 84,  just = "CENTER"},
+    { key = "class",     label = "Class",     w = 96,  just = "LEFT"  },
+    { key = "location",  label = "Location",  w = 0,   just = "LEFT", flex = true },
+    { key = "status",    label = "Status",    w = 78,  just = "CENTER"},
+    { key = "soulstone", label = "Soulstone", w = 76,  just = "CENTER", icon = true },
+    { key = "edit",      label = "",          w = 30,  just = "CENTER"},
 }
+
+-- Index of the soulstone icon column (computed so row layout can place its icon).
+local SOUL_COL_INDEX
+for i, c in ipairs(COLS) do if c.key == "soulstone" then SOUL_COL_INDEX = i end end
+
+-- Soulstone availability for a record (parity item 6, engine half not yet landed).
+-- The tracker will write a warlock soulstone-ready flag into the character record;
+-- accept any of the candidate field names so this lights up the moment the engine
+-- ships, and return nil (= unknown / no data) until then. Returns true/false/nil.
+local function soulstoneAvailable(rec)
+    if not rec then return nil end
+    local v = rec.soulstoneReady
+    if v == nil then v = rec.soulstoneAvailable end
+    if v == nil then v = rec.soulstone end
+    return v
+end
 
 local function fstr(parent, key)
     local f = parent:CreateFontString(nil, "OVERLAY")
@@ -149,7 +169,7 @@ Dashboard.RegisterTab("summoners", function(host)
         lbl:SetPoint("LEFT", b, "LEFT", 2, 0)
         lbl:SetText(col.label)
         b._label, b._col = lbl, col
-        if col.key ~= "edit" then
+        if col.key ~= "edit" and not col.icon then
             b:SetScript("OnClick", function()
                 if st.summonerSortKey == col.key then
                     st.summonerSortDir = (st.summonerSortDir == "asc") and "desc" or "asc"
@@ -177,6 +197,29 @@ Dashboard.RegisterTab("summoners", function(host)
             for c = 1, #COLS - 1 do
                 r.cells[c] = fstr(r, "body")
             end
+            -- Soulstone availability icon + hover (parity item 6). Lit when a
+            -- soulstone is available, greyed on cooldown / none / unknown.
+            r.soulIcon = r:CreateTexture(nil, "ARTWORK")
+            r.soulIcon:SetSize(16, 16)
+            r.soulIcon:SetTexture(SOULSTONE_ICON)
+            r.soulIcon:SetTexCoord(0.08, 0.92, 0.08, 0.92)
+            r.soulIcon:Hide()
+            r.soulHit = CreateFrame("Frame", nil, r)
+            r.soulHit:EnableMouse(true)
+            r.soulHit:Hide()
+            r.soulHit:SetScript("OnEnter", function(self)
+                GameTooltip:SetOwner(self, "ANCHOR_TOP")
+                GameTooltip:AddLine("Soulstone", UI.Color("text"))
+                if self._avail == true then
+                    GameTooltip:AddLine("Available", UI.Color("ok"))
+                elseif self._avail == false then
+                    GameTooltip:AddLine("On cooldown or not created", UI.Color("muted"))
+                else
+                    GameTooltip:AddLine("Status unknown \226\128\148 needs a data update", UI.Color("faint"))
+                end
+                GameTooltip:Show()
+            end)
+            r.soulHit:SetScript("OnLeave", function() GameTooltip:Hide() end)
             -- Edit button (last column).
             r.edit = UI.MakeButton(r, { text = "…", variant = "quiet", width = 22, height = 18 })
             obj._rows[i] = r
@@ -267,12 +310,37 @@ Dashboard.RegisterTab("summoners", function(host)
             }
             for c = 1, #COLS - 1 do
                 local fsc = r.cells[c]
-                fsc:ClearAllPoints()
-                fsc:SetPoint("LEFT", r, "LEFT", geom[c].x + 2, 0)
-                fsc:SetWidth(geom[c].w)
-                fsc:SetJustifyH(COLS[c].just)
-                fsc:SetWordWrap(false)
-                fsc:SetText(cells[c])
+                if COLS[c].icon then
+                    fsc:Hide()   -- icon columns are drawn separately, not as text
+                else
+                    fsc:Show()
+                    fsc:ClearAllPoints()
+                    fsc:SetPoint("LEFT", r, "LEFT", geom[c].x + 2, 0)
+                    fsc:SetWidth(geom[c].w)
+                    fsc:SetJustifyH(COLS[c].just)
+                    fsc:SetWordWrap(false)
+                    fsc:SetText(cells[c])
+                end
+            end
+            -- Soulstone availability pip (parity item 6): warlocks only. Lit when
+            -- available, greyed/dim on cooldown, none, or unknown (engine field
+            -- not yet written — nil-guarded, defaults to greyed "unknown").
+            if SOUL_COL_INDEX and rec.classTag == "WARLOCK" then
+                local avail = soulstoneAvailable(rec)
+                local g = geom[SOUL_COL_INDEX]
+                r.soulIcon:ClearAllPoints()
+                r.soulIcon:SetPoint("LEFT", r, "LEFT", g.x + (g.w - 16) / 2, 0)
+                r.soulIcon:SetDesaturated(avail ~= true)
+                r.soulIcon:SetAlpha(avail == true and 1 or 0.4)
+                r.soulIcon:Show()
+                r.soulHit:ClearAllPoints()
+                r.soulHit:SetPoint("LEFT", r, "LEFT", g.x, 0)
+                r.soulHit:SetSize(g.w, ROW_H)
+                r.soulHit._avail = avail
+                r.soulHit:Show()
+            else
+                r.soulIcon:Hide()
+                r.soulHit:Hide()
             end
             -- Edit button.
             r.edit:ClearAllPoints()
