@@ -1552,7 +1552,7 @@ local function buildTimers(flow)
     -- Screen / Chat / Flash checkboxes + a per-row Sound dropdown + Test.
     -- ENGINE DEPENDENCIES (defensive fallbacks; see report):
     --   * cell.enabled  — the "On" master flag (defaults true when absent).
-    --   * cell.soundKey — per-row sound tone (item 14; replaces the old event-level
+    --   * cell.sound — per-row sound tone (item 14; replaces the old event-level
     --     ts.soundKeys). Falls back to "" (None) until the engine schema lands.
     --   * ns.Store.ALERT_EVENT_BUFFS / ALERT_EVENT_TYPES — per-event buff sets +
     --     order (item 24; local fallbacks encode the reference sets).
@@ -1569,11 +1569,13 @@ local function buildTimers(flow)
     })
     register("timers", function() if scDD.Refresh then scDD.Refresh() end end)
 
+    -- Hand-merge reconciliation: the engine shipped the migrated schema
+    -- EVENT-MAJOR (alerts[eventType][buffKey]) — flip the accessor to match.
     local function alertCell(buffKey, evt)
         local ts = TS(); if not ts then return nil end
-        ts.alerts[buffKey] = ts.alerts[buffKey] or {}
-        ts.alerts[buffKey][evt] = ts.alerts[buffKey][evt] or {}
-        return ts.alerts[buffKey][evt]
+        ts.alerts[evt] = ts.alerts[evt] or {}
+        ts.alerts[evt][buffKey] = ts.alerts[evt][buffKey] or {}
+        return ts.alerts[evt][buffKey]
     end
 
     for _, evt in ipairs(alertEventOrder()) do
@@ -1606,8 +1608,8 @@ local function buildTimers(flow)
                 chan("Screen", "notify"); chan("Chat", "chat"); chan("Flash", "flash")
                 local dd = row:Dropdown({
                     width = 120, choices = soundChoices(),
-                    get = function() local c = alertCell(k, evt); return (c and c.soundKey) or "" end,
-                    set = function(v) local c = alertCell(k, evt); if c then c.soundKey = v end end,
+                    get = function() local c = alertCell(k, evt); return (c and c.sound) or "" end,
+                    set = function(v) local c = alertCell(k, evt); if c then c.sound = v end end,
                 })
                 dd._fillWidth = false
                 register("timers", function() if dd.Refresh then dd.Refresh() end end)
@@ -1722,11 +1724,11 @@ local function buildTimers(flow)
         pinSliders[#pinSliders + 1] = s
         return s
     end
-    pinSlider("World map songflower pin (px) — (8-24) default 14", "worldFlowerPinSize", "worldPinSize", 14, 8, 24)
-    pinSlider("World map tuber pin (px) — (8-24) default 14",      "worldTuberPinSize",  "worldPinSize", 14, 8, 24)
-    pinSlider("World map timer font (pt) — (6-20) default 10",     "worldTimerFontSize", "worldTimerFontSize", 10, 6, 20)
-    pinSlider("Minimap songflower pin (px) — (8-24) default 12",   "minimapFlowerPinSize", "minimapPinSize", 12, 8, 24)
-    pinSlider("Minimap tuber pin (px) — (8-24) default 12",        "minimapTuberPinSize",  "minimapPinSize", 12, 8, 24)
+    pinSlider("World map songflower pin (px) — (8-24) default 14", "worldFlowerSize", "worldPinSize", 14, 8, 24)
+    pinSlider("World map tuber pin (px) — (8-24) default 14",      "worldTuberSize",  "worldPinSize", 14, 8, 24)
+    pinSlider("World map timer font (pt) — (6-20) default 10",     "worldTimerFont", "worldTimerFont", 10, 6, 20)
+    pinSlider("Minimap songflower pin (px) — (8-24) default 12",   "minimapFlowerSize", "minimapPinSize", 12, 8, 24)
+    pinSlider("Minimap tuber pin (px) — (8-24) default 12",        "minimapTuberSize",  "minimapPinSize", 12, 8, 24)
     register("timers", function() for _, s in ipairs(pinSliders) do if s.Refresh then s.Refresh() end end end)
 
     -- ── Songflower display ───────────────────────────────────────────────────────

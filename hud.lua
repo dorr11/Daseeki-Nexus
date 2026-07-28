@@ -272,6 +272,8 @@ local function dispatch(buffKey, eventType, message, opts)
 
     message = message or (buffLabel(buffKey) .. " — " .. eventType)
 
+    -- Master "On" toggle (settings writes row.enabled; nil = on). Test bypasses.
+    if row.enabled == false and not test then return end
     -- notify -> screen banner
     if (row.notify or test) and not (not test and raidDisabled("notify")) then
         HUD.ShowBanner(message, 5, opts.colorToken)
