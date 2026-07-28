@@ -1,8 +1,12 @@
 -- Daseeki Nexus — minimap.lua
--- Free-floating, draggable launcher button. Per engine spec §9 it is NOT
--- parented or anchored to the minimap cluster (protected-frame anchoring to the
--- Edit-Mode minimap blanks the minimap on relogin); it free-floats on UIParent
--- and persists its own position.
+-- Standard minimap-ring launcher button (owner feedback 2b): parented to the
+-- Minimap and angle-anchored on the ring like every other minimap button.
+-- Position is stored as an angle in settings.minimap.angle; dragging slides the
+-- button around the ring; SetPoint("CENTER", Minimap, "CENTER", x, y) is derived
+-- from the angle via the standard LibDBIcon-style trig (reused from
+-- Daseeki-Core/minimap.lua). This is safe because our button carries NO secure
+-- bindings (the Alt+Left /camp logout is intentionally omitted), so anchoring to
+-- the minimap cluster never makes the frame protected.
 --
 -- Click matrix (UI spec §8):
 --   Left            invite all online   (ns.Auto soft-guard; N4 tooltip)
@@ -11,8 +15,8 @@
 --   Shift+Right     dashboard Timers tab(ns.UI soft-guard)
 --   Alt+Right       world map -> Felwood
 --   Alt+Left        (OMITTED) /camp logout — a secure /camp macro would make
---                   this frame PROTECTED (engine §9), breaking free-float combat
---                   repositioning. Deferred this wave; documented deviation.
+--                   this frame PROTECTED, and it is exactly that omission that
+--                   keeps ring-anchoring safe. Deferred; documented deviation.
 --
 -- Clean-room build: functional reimplementation from spec; no third-party code.
 
@@ -33,11 +37,64 @@ local FELWOOD_MAP = 1448
 -- Settings access
 ----------------------------------------------------------------------
 
+local DEFAULT_ANGLE = 220   -- degrees on the ring (lower-left, out of the way)
+
 local function minimapCfg()
     local s = ns.Store and ns.Store.GetSettings and ns.Store.GetSettings()
     local m = s and s.minimap
-    if not m then return { point = "CENTER", x = 0, y = 200 } end
+    if not m then return { angle = DEFAULT_ANGLE } end
     return m
+end
+
+----------------------------------------------------------------------
+-- Ring position math (angle -> x,y offset from Minimap center). Reused from
+-- Daseeki-Core/minimap.lua (LibDBIcon-compatible), so our button sits on the
+-- ring identically to the Core button and respects non-round minimap shapes.
+----------------------------------------------------------------------
+
+local MINIMAP_SHAPES = {
+    ["ROUND"]                = { true,  true,  true,  true  },
+    ["SQUARE"]               = { false, false, false, false },
+    ["CORNER-TOPLEFT"]       = { false, false, false, true  },
+    ["CORNER-TOPRIGHT"]      = { false, false, true,  false },
+    ["CORNER-BOTTOMLEFT"]    = { false, true,  false, false },
+    ["CORNER-BOTTOMRIGHT"]   = { true,  false, false, false },
+    ["SIDE-LEFT"]            = { false, true,  false, true  },
+    ["SIDE-RIGHT"]           = { true,  false, true,  false },
+    ["SIDE-TOP"]             = { false, false, true,  true  },
+    ["SIDE-BOTTOM"]          = { true,  true,  false, false },
+    ["TRICORNER-TOPLEFT"]    = { false, true,  true,  true  },
+    ["TRICORNER-TOPRIGHT"]   = { true,  false, true,  true  },
+    ["TRICORNER-BOTTOMLEFT"] = { true,  true,  false, true  },
+    ["TRICORNER-BOTTOMRIGHT"]= { true,  true,  true,  false },
+}
+local MINIMAP_RADIUS = 5
+
+local function updatePosition(btn, angle)
+    angle = (angle or DEFAULT_ANGLE) % 360
+    local rad = math.rad(angle)
+    local cosA, sinA = math.cos(rad), math.sin(rad)
+
+    local q = 1
+    if cosA < 0 then q = q + 1 end
+    if sinA > 0 then q = q + 2 end
+
+    local shape = MINIMAP_SHAPES[(GetMinimapShape and GetMinimapShape()) or "ROUND"]
+    local w = (Minimap:GetWidth()  / 2) + MINIMAP_RADIUS
+    local h = (Minimap:GetHeight() / 2) + MINIMAP_RADIUS
+    local x, y
+
+    if not shape or shape[q] then
+        x, y = cosA * w, sinA * h
+    else
+        local dw = math.sqrt(2 * w * w) - 10
+        local dh = math.sqrt(2 * h * h) - 10
+        x = math.max(-w, math.min(cosA * dw, w))
+        y = math.max(-h, math.min(sinA * dh, h))
+    end
+
+    btn:ClearAllPoints()
+    btn:SetPoint("CENTER", Minimap, "CENTER", x, y)
 end
 
 ----------------------------------------------------------------------
@@ -117,13 +174,13 @@ local function openFelwoodMap()
 end
 
 ----------------------------------------------------------------------
--- Button construction (free-floating; both dimensions set at creation)
+-- Button construction (ring-anchored to the Minimap; both dims set at creation)
 ----------------------------------------------------------------------
 
 local button
 
 local function buildButton()
-    local b = CreateFrame("Button", "DaseekiNexusMinimapButton", UIParent)
+    local b = CreateFrame("Button", "DaseekiNexusMinimapButton", Minimap)
     b:SetSize(32, 32)
     b:SetFrameStrata("MEDIUM")
     b:SetFrameLevel(20)
@@ -159,17 +216,26 @@ local function buildButton()
     b:RegisterForClicks("LeftButtonUp", "RightButtonUp")
     b:RegisterForDrag("LeftButton")
 
+    -- Ring drag: slide around the Minimap by tracking the cursor's angle from the
+    -- minimap center and re-anchoring. Angle persists to settings.minimap.angle.
     b:SetScript("OnDragStart", function(self)
         if minimapCfg().lock then return end
-        self:StartMoving()
         self._moving = true
+        self:SetScript("OnUpdate", function(s)
+            local mx, my = Minimap:GetCenter()
+            local px, py = GetCursorPosition()
+            local scale  = Minimap:GetEffectiveScale()
+            if mx and scale and scale > 0 then
+                px, py = px / scale, py / scale
+                local angle = math.deg(math.atan2(py - my, px - mx)) % 360
+                minimapCfg().angle = angle
+                updatePosition(s, angle)
+            end
+        end)
     end)
     b:SetScript("OnDragStop", function(self)
-        self:StopMovingOrSizing()
+        self:SetScript("OnUpdate", nil)
         self._moving = false
-        local point, _, _, x, y = self:GetPoint(1)
-        local cfg = minimapCfg()
-        cfg.point, cfg.x, cfg.y = point or "CENTER", x or 0, y or 0
     end)
 
     b:SetScript("OnClick", function(self, mouseButton)
@@ -224,21 +290,21 @@ local function buildButton()
         end)
     end)
     b:SetScript("OnLeave", function(self)
+        -- Do not tear down the OnUpdate while a ring-drag is in progress (the
+        -- button slides out from under the cursor, firing OnLeave mid-drag).
+        if self._moving then return end
         self:SetScript("OnUpdate", nil)
         GameTooltip:Hide()
     end)
 
-    b:SetMovable(true)
-    b:SetClampedToScreen(true)
     return b
 end
 
--- Apply saved position + visibility.
+-- Apply saved ring angle + visibility.
 local function applyState()
     if not button then return end
     local cfg = minimapCfg()
-    button:ClearAllPoints()
-    button:SetPoint(cfg.point or "CENTER", UIParent, cfg.point or "CENTER", cfg.x or 0, cfg.y or 200)
+    updatePosition(button, cfg.angle or DEFAULT_ANGLE)
     if cfg.hide then button:Hide() else button:Show() end
 end
 

@@ -95,14 +95,8 @@ local SOUNDKEY_ROWS = {
     { key = "npcRespawned", label = "NPC Respawned" },
 }
 
--- Interact NPCs (spec §6 shipped set — all Alliance-city). Keyed to
--- factionSettings.autoInteract[key]. Faction-filtered at render.
-local INTERACT_NPCS = {
-    { key = "keldric", name = "Keldric Boucher",    faction = "Alliance", meta = "Reagents · Stormwind (Mage Quarter)" },
-    { key = "jaxon",   name = "Auctioneer Jaxon",   faction = "Alliance", meta = "Auctioneer · Stormwind (Trade District)" },
-    { key = "gunther", name = "Gunther Weller",     faction = "Alliance", meta = "Reagents · Stormwind (Mage Quarter)" },
-    { key = "mangorn", name = "Mangorn Flinthammer", faction = "Alliance", meta = "Reagents · Ironforge (The Forlorn Cavern)" },
-}
+-- (Interact NPCs table removed — the Interact feature is cut suite-wide, owner
+-- feedback 2b.)
 
 -- DMF Sayge fortune buff-types (spec §7 Gossip).
 local DMF_BUFF_TYPES = {
@@ -165,6 +159,17 @@ end
 local function sanitizeHex(s)
     s = tostring(s or ""):gsub("[^0-9A-Fa-f]", ""):upper()
     return s:sub(1, 6)
+end
+
+-- Class color r,g,b — matches the rest of the suite (Dashboard.ClassColor): the
+-- user's classColors override first, then Blizzard's RAID_CLASS_COLORS.
+local function classColor(class)
+    local db = DB()
+    local hex = db and db.classColors and db.classColors[class]
+    if type(hex) == "string" and #hex >= 6 then return hexToRGB(hex) end
+    local c = RAID_CLASS_COLORS and RAID_CLASS_COLORS[class]
+    if c then return c.r, c.g, c.b end
+    return 0.8, 0.8, 0.8
 end
 
 -- Newline-joined string <-> ["Name-Realm"]=true map (multi-line list editing).
@@ -269,6 +274,7 @@ local function buildGeneral(flow)
 
     -- ── Behaviour ─────────────────────────────────────────────────────────────
     local sec = flow:AddSection("General")
+    sec:Hint("Core behaviour and this account's mesh identity.")
     local r1 = sec:AddRow({ vAlign = "center" })
     register("general", r1:Checkbox({
         label = "Show minimap button",
@@ -381,6 +387,7 @@ local function buildGeneral(flow)
 
     -- ── Class colors ──────────────────────────────────────────────────────────
     flow:AddSection("Class Colors")
+    flow:Hint("Override any class's color; applied across every Nexus roster and list.")
     buildClassColors(flow)
 end
 
@@ -681,10 +688,12 @@ local function buildMesh(flow)
 
     -- ── Active accounts table ─────────────────────────────────────────────────
     flow:AddSection("Active Accounts")
+    flow:Hint("Every account on your mesh: ID \194\183 status \194\183 characters \194\183 last seen. Remove any account but your own.")
     buildAccountsTable(flow)
 
     -- ── Tombstones ────────────────────────────────────────────────────────────
     flow:AddSection("Removed Accounts (14-day block)")
+    flow:Hint("Recently removed accounts are blocked from re-adding for 14 days. Remove a tombstone to allow re-adding early.")
     buildTombstonesTable(flow)
 end
 
@@ -864,11 +873,13 @@ local function buildAuras(flow)
     flow:AddSection("Duration Thresholds")
     flow:Hint("Minutes remaining below which a buff turns yellow (Normal) then red (Minimum).")
 
-    -- Column header row.
+    -- Column header row — each cell sized so the two muted numeric headers sit
+    -- EXACTLY over their editboxes. Data row is icon(18) + gap(8) + name(168) +
+    -- gap + nBox(82) + gap + mBox(82); the "Aura" header spans icon+gap+name = 194.
     local hdr = flow:AddRow()
-    local hAura = hdr:Label("Aura"); hAura.uiWidth = 190; hAura:SetWidth(190)
-    hdr:Label("Normal (min)", { muted = true })
-    hdr:Label("Minimum (min)", { muted = true })
+    local hAura = hdr:Label("Aura"); hAura.uiWidth = 194; hAura:SetWidth(194)
+    local hNorm = hdr:Label("Normal (min)", { muted = true }); hNorm.uiWidth = 82; hNorm:SetWidth(82)
+    local hMin  = hdr:Label("Minimum (min)", { muted = true }); hMin.uiWidth = 82; hMin:SetWidth(82)
 
     for _, def in ipairs(AURA_DEFS) do
         local row = flow:AddRow({ vAlign = "center" })
@@ -885,13 +896,13 @@ local function buildAuras(flow)
             return fs.auraOpts.thresholds[def.key]
         end
         local nBox = row:EditBox({
-            width = 70, numeric = true,
+            width = 82, numeric = true,
             get = function() local t = thr(); local v = t and t.normal; return v and tostring(math.floor(v / 60)) or "" end,
             set = function(v) local t = thr(); if t then t.normal = (tonumber(v) or 0) * 60 end end,
         })
         nBox._fillWidth = false
         local mBox = row:EditBox({
-            width = 70, numeric = true,
+            width = 82, numeric = true,
             get = function() local t = thr(); local v = t and t.minimum; return v and tostring(math.floor(v / 60)) or "" end,
             set = function(v) local t = thr(); if t then t.minimum = (tonumber(v) or 0) * 60 end end,
         })
@@ -933,18 +944,53 @@ function buildClassRuleGrid(flow, title, optKey, classes)
         return "ignored"
     end
 
+    -- State -> token (Required = green, Optional = amber, Ignored = grey).
+    local STATE_TOKEN = { required = "ok", optional = "warn", ignored = "faint" }
+
+    -- One clickable cell: class-colored name on the left + a small state pill on
+    -- the right (state word in its state color, bordered). Click cycles the state.
+    local CELL_W, PILL_W = 156, 74
+    local function makeClassCell(parent, class)
+        local cell = CreateFrame("Button", nil, parent)
+        cell:SetSize(CELL_W, 24)
+        cell.uiWidth, cell.uiHeight = CELL_W, 24
+
+        local name = cell:CreateFontString(nil, "OVERLAY")
+        name:SetFontObject(UI.fonts.body)
+        name:SetPoint("LEFT", cell, "LEFT", 2, 0)
+        name:SetText(CLASS_LABEL[class] or class)
+
+        local pill = CreateFrame("Frame", nil, cell, "BackdropTemplate")
+        pill:SetSize(PILL_W, 18)
+        pill:SetPoint("RIGHT", cell, "RIGHT", -2, 0)
+        local pl = pill:CreateFontString(nil, "OVERLAY")
+        pl:SetFontObject(UI.fonts.small)
+        pl:SetPoint("CENTER", pill, "CENTER", 0, 0)
+
+        local function paint()
+            name:SetTextColor(classColor(class))
+            local stt = getState(class)
+            local tok = STATE_TOKEN[stt] or "faint"
+            pl:SetText(STATE_LABEL[stt])
+            pl:SetTextColor(UI.Color(tok))
+            pill:SetBackdrop(UI.FLAT_BACKDROP)
+            pill:SetBackdropColor(UI.Color(tok, 0.18))
+            pill:SetBackdropBorderColor(UI.Color(tok))
+        end
+        cell._paint = paint
+        cell:SetScript("OnClick", function() setState(class, nextState(getState(class))); paint() end)
+        UI.Skin(cell, paint)   -- repaint on theme change (class colors + tokens)
+        return cell
+    end
+
     local perRow, i = 3, 0
     local row
     for _, class in ipairs(classes) do
-        if i % perRow == 0 then row = flow:AddRow() end
+        if i % perRow == 0 then row = flow:AddRow({ vAlign = "center" }) end
         i = i + 1
-        local btn = row:Button({
-            width = 150,
-            text = (CLASS_LABEL[class] or class) .. ": " .. STATE_LABEL[getState(class)],
-        })
-        local function paint() btn._label:SetText((CLASS_LABEL[class] or class) .. ": " .. STATE_LABEL[getState(class)]) end
-        btn:SetScript("OnClick", function() setState(class, nextState(getState(class))); paint() end)
-        register("auras", paint)
+        local cell = makeClassCell(row, class)
+        row._items[#row._items + 1] = { w = cell }
+        register("auras", cell._paint)
     end
 end
 
@@ -957,41 +1003,54 @@ local function buildAutomation(flow)
     local DS = _G.DaseekiSuite
     factionHeader(flow, "automation")
 
-    -- ── Group ─────────────────────────────────────────────────────────────────
-    local grp = flow:AddSection("Group")
-    grp:Label("Auto-accept invites from", { muted = true })
-    local function grpCheck(container, label, key)
-        register("automation", container:Checkbox({
-            label = label,
-            get = function() local fs = FS(); return fs and fs.autoGroup[key] end,
-            set = function(v) local fs = FS(); if fs then fs.autoGroup[key] = v and true or false end end,
-        }).Refresh)
+    -- ── Auto-accept invites (category grid) ────────────────────────────────────
+    local grp = flow:AddSection("Auto-Accept Invites From")
+    grp:Hint("Automatically accept party invitations from characters in these categories.")
+    local acceptCats = {
+        { label = "Known roster",   key = "acceptFromRoster"  },
+        { label = "Guild",          key = "acceptFromGuild"   },
+        { label = "Friends & BNet", key = "acceptFromFriends" },
+        { label = "Anyone",         key = "acceptFromAnyone"  },
+    }
+    local acceptItems = {}
+    for _, it in ipairs(acceptCats) do
+        acceptItems[#acceptItems + 1] = {
+            label = it.label,
+            get = function() local fs = FS(); return fs and fs.autoGroup[it.key] end,
+            set = function(v) local fs = FS(); if fs then fs.autoGroup[it.key] = v and true or false end end,
+        }
     end
-    local ga = grp:AddRow({ vAlign = "center" })
-    grpCheck(ga, "Known roster", "acceptFromRoster")
-    grpCheck(ga, "Guild", "acceptFromGuild")
-    local gb = grp:AddRow({ vAlign = "center" })
-    grpCheck(gb, "Friends & BNet", "acceptFromFriends")
-    grpCheck(gb, "Anyone", "acceptFromAnyone")
+    local acceptGrid = grp:AddChecklist(acceptItems)
+    register("automation", function() for _, b in ipairs(acceptGrid._boxes) do b:Refresh() end end)
 
-    local kw = grp:AddRow({ vAlign = "center" })
+    -- ── Whisper-keyword invite ─────────────────────────────────────────────────
+    local kwSec = flow:AddSection("Auto-Invite On Whisper Keyword")
+    kwSec:Hint("When someone whispers you the keyword, invite them if they pass the same category filter above (our engine shares one gate for both directions).")
+    local kw = kwSec:AddRow({ vAlign = "center" })
     register("automation", kw:Checkbox({
-        label = "Auto-invite on whisper keyword",
+        label = "Enabled",
         get = function() local fs = FS(); return fs and fs.autoGroup.sendToRoster end,
         set = function(v) local fs = FS(); if fs then fs.autoGroup.sendToRoster = v and true or false end end,
     }).Refresh)
+    kw:Label("Keyword:")
     local kwBox = kw:EditBox({
-        width = 90,
+        width = 100,
         get = function() local fs = FS(); return fs and fs.autoGroup.inviteKeyword or "" end,
         set = function(v) local fs = FS(); if fs then fs.autoGroup.inviteKeyword = tostring(v or ""):gsub("%s", "") end end,
     })
     kwBox._fillWidth = false
     register("automation", function() if kwBox.Refresh then kwBox.Refresh() end end)
 
-    -- Invite whitelist (multi-line via text dialog; bypasses gates both ways).
-    local wlRow = grp:AddRow({ vAlign = "center" })
-    local wlLabel = wlRow:Label("Whitelist: 0 entries")
-    wlRow:Button({ text = "Edit list…", width = 100, pin = "right", onClick = function()
+    -- ── Invite whitelist ───────────────────────────────────────────────────────
+    -- NOTE: the store has no whitelist-enable flag, so we do NOT fake an Enable
+    -- toggle (standing rule: never fake absent-in-store affordances). The list is
+    -- always in effect while it has entries. Edit button is inline (not pinned
+    -- right) per the "aligned, not floating" feedback.
+    local wlSec = flow:AddSection("Auto-Invite Whitelist")
+    wlSec:Hint("Characters listed here bypass the category filter in both directions. Always in effect while the list has entries.")
+    local wlRow = wlSec:AddRow({ vAlign = "center" })
+    local wlLabel = wlRow:Label("Whitelist: 0 entries"); wlLabel.uiWidth = 170; wlLabel._label:SetWidth(170)
+    wlRow:Button({ text = "Edit list…", width = 110, onClick = function()
         local fs = FS(); if not fs then return end
         DS.ShowTextDialog("Invite Whitelist (one Name-Realm per line)", mapToLines(fs.autoGroup.whitelist), false, function(txt)
             fs.autoGroup.whitelist = linesToMap(txt)
@@ -1004,6 +1063,7 @@ local function buildAutomation(flow)
 
     -- ── Accept Summon ──────────────────────────────────────────────────────────
     local asx = flow:AddSection("Accept Summon")
+    asx:Hint("Automatically accept a warlock or meeting-stone summon under these conditions.")
     local asr = asx:AddRow({ vAlign = "center" })
     register("automation", asr:Checkbox({
         label = "Auto-accept summon",
@@ -1022,7 +1082,7 @@ local function buildAutomation(flow)
     }).Refresh)
 
     local win = asx:AddRow({ vAlign = "center" })
-    win:Label("Fresh-buff window (s)")
+    local winLbl = win:Label("Auto-accept window (seconds)"); winLbl.uiWidth = 190; winLbl._label:SetWidth(190)
     local winBox = win:EditBox({
         width = 60, numeric = true,
         get = function() local fs = FS(); return fs and tostring(fs.autoSummon.freshBuffWindow or 0) or "" end,
@@ -1034,9 +1094,13 @@ local function buildAutomation(flow)
         end,
     })
     winBox._fillWidth = false
+    win:Label("(5-3600)", { muted = true })
     register("automation", function() if winBox.Refresh then winBox.Refresh() end end)
 
-    asx:Label("Accept when one of these buffs is freshly gained", { muted = true })
+    -- Buff triggers sub-group (own header + grid on the same column alignment as
+    -- the Auto-Accept grid above).
+    local bt = flow:AddSection("Buff Triggers")
+    bt:Hint("Accept a pending summon when one of these buffs is freshly gained.")
     local trigItems = {}
     for _, def in ipairs(AURA_DEFS) do
         trigItems[#trigItems + 1] = {
@@ -1045,11 +1109,12 @@ local function buildAutomation(flow)
             set = function(v) local fs = FS(); if fs then fs.autoSummon.triggers[def.key] = v and true or nil end end,
         }
     end
-    local trigGrid = asx:AddChecklist(trigItems)
+    local trigGrid = bt:AddChecklist(trigItems)
     register("automation", function() for _, b in ipairs(trigGrid._boxes) do b:Refresh() end end)
 
     -- ── Gossip ─────────────────────────────────────────────────────────────────
     local gos = flow:AddSection("Gossip")
+    gos:Hint("Automatically pick the right gossip option at these NPCs and portals.")
     local gr = gos:AddRow({ vAlign = "center" })
     register("automation", gr:Checkbox({
         label = "Dire Maul tribute",
@@ -1107,6 +1172,7 @@ local function buildAutomation(flow)
 
     -- ── Quest ──────────────────────────────────────────────────────────────────
     local q = flow:AddSection("Quest")
+    q:Hint("Automatically turn in these repeatable buff quests and pick your rewards.")
     local qa = q:AddRow({ vAlign = "center" })
     register("automation", qa:Checkbox({
         label = "Winterspring E'ko",
@@ -1152,35 +1218,10 @@ local function buildAutomation(flow)
         }).Refresh)
     end
 
-    -- ── Interact ───────────────────────────────────────────────────────────────
-    local ix = flow:AddSection("Interact Buttons")
-    ix:Hint("Per-NPC secure click-to-target buttons appear only near each NPC's location.")
-    local emptyHint = ix:Label("")
-    for _, npc in ipairs(INTERACT_NPCS) do
-        local row = ix:AddRow({ vAlign = "center" })
-        local cb = row:Checkbox({
-            label = npc.name,
-            get = function() local fs = FS(); return fs and fs.autoInteract[npc.key] end,
-            set = function(v) local fs = FS(); if fs then fs.autoInteract[npc.key] = v and true or nil end end,
-        })
-        row:Label(npc.meta, { muted = true })
-        local blk = ix.pane.blocks[#ix.pane.blocks]
-        local origArrange = blk.arrange
-        blk.arrange = function(width)
-            if npc.faction and npc.faction ~= scope.faction then row:Hide(); return 0 end
-            row:Show(); return origArrange(width)
-        end
-        blk._baseGap = blk.topGap
-        register("automation", function()
-            blk.topGap = (npc.faction and npc.faction ~= scope.faction) and 0 or blk._baseGap
-            if cb.Refresh then cb:Refresh() end
-        end)
-    end
-    register("automation", function()
-        local anyShown = false
-        for _, npc in ipairs(INTERACT_NPCS) do if not npc.faction or npc.faction == scope.faction then anyShown = true end end
-        emptyHint._label:SetText(anyShown and "" or ("No Interact NPCs registered for " .. scope.faction .. "."))
-    end)
+    -- ── Interact Buttons: REMOVED (owner feedback 2b) ──────────────────────────
+    -- The Interact feature is cut suite-wide; the engine agent removes
+    -- interact.lua, the autoInteract store keys, the importer mapping and the
+    -- /nexus coord command on their branch. Nothing renders here now.
 end
 
 ----------------------------------------------------------------------
@@ -1219,9 +1260,10 @@ local function buildTimers(flow)
     })
     register("timers", function() if selDD.Refresh then selDD.Refresh() end end)
 
-    -- Column header.
+    -- Column header (Event cell width matches the event rows' label width so the
+    -- first column lines up; the four channel headers sit over their checkboxes).
     local mh = flow:AddRow()
-    local mhE = mh:Label("Event"); mhE.uiWidth = 150; mhE:SetWidth(150)
+    local mhE = mh:Label("Event"); mhE.uiWidth = 138; mhE._label:SetWidth(138)
     mh:Label("Scrn", { muted = true }); mh:Label("Chat", { muted = true })
     mh:Label("Flash", { muted = true }); mh:Label("Snd", { muted = true })
 
@@ -1247,6 +1289,7 @@ local function buildTimers(flow)
 
     -- ── Sounds ─────────────────────────────────────────────────────────────────
     local snd = flow:AddSection("Sounds")
+    snd:Hint("Pick the sound channel and the tone each event plays. Test previews it.")
     local scRow = snd:AddRow({ vAlign = "center" })
     scRow:Label("Sound channel")
     local scDD = scRow:Dropdown({
@@ -1275,6 +1318,7 @@ local function buildTimers(flow)
 
     -- ── Pull-timer bars ────────────────────────────────────────────────────────
     local pb = flow:AddSection("Pull Timer Bars")
+    pb:Hint("On-screen countdown bars for detected pulls. Lock to click through; use the mover to reposition.")
     local pbr = pb:AddRow({ vAlign = "center" })
     register("timers", pbr:Checkbox({
         label = "Lock bars",
@@ -1340,6 +1384,7 @@ local function buildTimers(flow)
 
     -- ── Felwood pins ───────────────────────────────────────────────────────────
     local fw = flow:AddSection("Felwood Pins")
+    fw:Hint("Show Songflower and tuber spawn pins on the world map and minimap.")
     local fwr = fw:AddRow({ vAlign = "center" })
     register("timers", fwr:Checkbox({
         label = "Show flower pins",
@@ -1412,10 +1457,11 @@ local function buildBlacklist(flow)
     local sec = flow:AddSection("Roster Filtering")
     sec:Hint("Blacklisted characters hide from 60s / Summoners (still visible in Online). Whitelist un-hides across the mesh.")
 
-    -- Blacklist list.
+    -- Blacklist list (label fixed-width so the Edit button sits inline/aligned,
+    -- not floating at the far right).
     local blRow = sec:AddRow({ vAlign = "center" })
-    local blLabel = blRow:Label("Blacklist: 0 entries")
-    blRow:Button({ text = "Edit blacklist…", width = 130, pin = "right", onClick = function()
+    local blLabel = blRow:Label("Blacklist: 0 entries"); blLabel.uiWidth = 170; blLabel._label:SetWidth(170)
+    blRow:Button({ text = "Edit blacklist…", width = 130, onClick = function()
         local db = DB(); if not db then return end
         db.ui.blacklist = db.ui.blacklist or {}
         DS.ShowTextDialog("Blacklist (one Name-Realm per line)", mapToLines(db.ui.blacklist), false, function(txt)
@@ -1424,8 +1470,8 @@ local function buildBlacklist(flow)
     end })
 
     local wlRow = sec:AddRow({ vAlign = "center" })
-    local wlLabel = wlRow:Label("Whitelist: 0 entries")
-    wlRow:Button({ text = "Edit whitelist…", width = 130, pin = "right", onClick = function()
+    local wlLabel = wlRow:Label("Whitelist: 0 entries"); wlLabel.uiWidth = 170; wlLabel._label:SetWidth(170)
+    wlRow:Button({ text = "Edit whitelist…", width = 130, onClick = function()
         local db = DB(); if not db then return end
         db.ui.whitelist = db.ui.whitelist or {}
         DS.ShowTextDialog("Whitelist (one Name-Realm per line)", mapToLines(db.ui.whitelist), false, function(txt)
@@ -1451,6 +1497,7 @@ local function buildBlacklist(flow)
 
     -- ── Purge (danger, self-protected) ─────────────────────────────────────────
     local pz = flow:AddSection("Purge (danger)")
+    pz:Hint("Permanently remove all stored data for another account or character. You cannot purge your own account or current character.")
     local paRow = pz:AddRow({ vAlign = "center" })
     paRow:Label("Account ID")
     local paBox = paRow:EditBox({ width = 60, get = function() return "" end })

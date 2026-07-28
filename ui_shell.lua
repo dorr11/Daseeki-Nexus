@@ -439,12 +439,15 @@ Dashboard.tabBuilders = {}   -- id -> build(host) -> tabObj (must expose :Refres
 
 -- scope "faction" = faction-scoped (underline in faction color);
 -- scope "account" = account-wide (split underline).
+-- align "right" pins a tab to the RIGHT end of the bar (owner feedback 2b:
+-- Help sits in a right-aligned group, mirroring the reference's Help/Settings
+-- cluster). Everything else is the left group in declared order.
 local TAB_SLOTS = {
     { id = "sixties",   label = "60s",       scope = "faction" },
     { id = "online",    label = "Online",    scope = "faction" },
     { id = "summoners", label = "Summoners", scope = "faction" },
     { id = "timers",    label = "Timers",    scope = "account" },
-    { id = "help",      label = "Help",      scope = "account" },
+    { id = "help",      label = "Help",      scope = "account", align = "right" },
 }
 
 function Dashboard.RegisterTab(id, buildFn)
@@ -720,13 +723,10 @@ local function buildHeader(w)
         inviteBtn:SetEnabledState(false, "Arrives in a later update.")
     end
 
-    local cancelBtn = makeHeaderButton(header, "Cancel Buffs", function()
-        if ns.HUD and ns.HUD.ShowCancelBuffs then ns.HUD.ShowCancelBuffs() end
-    end, 100)
-    cancelBtn:SetPoint("RIGHT", inviteBtn, "LEFT", -6, 0)
-    if not (ns.HUD and ns.HUD.ShowCancelBuffs) then
-        cancelBtn:SetEnabledState(false, "Cancel-Buffs popup arrives in a later update.")
-    end
+    -- The "Cancel Buffs" header button was removed (owner feedback 2b). The
+    -- Cancel-Buffs popup stays reachable via the /nexus x slash command and the
+    -- minimap button's Ctrl+Right-click. Invite Online is now the leftmost
+    -- header action, so no gap remains where the button used to sit.
 
     w.header = header
     w._updateFactionToggle()
@@ -746,7 +746,8 @@ local function buildTabBar(w)
     UI.Skin(rule, function(self) self:SetColorTexture(UI.Color("borderLite")) end)
 
     local tabs = {}
-    local x = PAD
+    local leftX  = PAD   -- growing offset from the bar's LEFT edge
+    local rightX = PAD   -- growing offset from the bar's RIGHT edge (right group)
     for _, slot in ipairs(TAB_SLOTS) do
         local b = CreateFrame("Button", nil, bar)
         b:SetHeight(TAB_H)
@@ -759,8 +760,14 @@ local function buildTabBar(w)
         b._label = lbl
         local tw = math.max(48, (lbl:GetStringWidth() or 40) + 22)
         b:SetWidth(tw)
-        b:SetPoint("LEFT", bar, "LEFT", x, 0)
-        x = x + tw + 4
+        if slot.align == "right" then
+            -- Anchor to the bar's RIGHT edge so it tracks window resizes.
+            b:SetPoint("RIGHT", bar, "RIGHT", -rightX, 0)
+            rightX = rightX + tw + 4
+        else
+            b:SetPoint("LEFT", bar, "LEFT", leftX, 0)
+            leftX = leftX + tw + 4
+        end
 
         local under = b:CreateTexture(nil, "OVERLAY")
         under:SetHeight(2)
@@ -1211,6 +1218,10 @@ ns:On("STATE_CHANGED", onEngineChange)
 ns:On("TIMER_UPDATED", onEngineChange)
 ns:On("NODE_UPDATED", onEngineChange)
 ns:On("CD_WARNING", onEngineChange)
+-- Bulk store refresh (the importer's dedicated crash-safe signal, replacing an
+-- args-less STATE_CHANGED). Same refresh path so an import — or any future bulk
+-- store change — repaints the active tab + status bar.
+ns:On("STORE_REFRESHED", onEngineChange)
 
 ----------------------------------------------------------------------
 -- SHARED: character detail panel (spec §1; shared by 60s + Online).
@@ -1678,31 +1689,42 @@ ns:RegisterSubcommand("reset",   function() Dashboard.ResetUI() end, "reset dash
 -- Help tab (static, our brand + our commands). Shell-owned.
 ----------------------------------------------------------------------
 
+-- Content uses the :Hint block path (not :Label rows). :Hint's AddBlock arrange
+-- explicitly sets BOTH the block width and the label width and computes wrapped
+-- height, so every line renders deterministically. The prior "Tabs" section used
+-- :Label rows, whose container frame width is left unset (0) — the same
+-- zero-size class the framework guards for height but not for a lone label's
+-- width — which is the most likely cause of that section rendering blank. It is
+-- removed here per owner feedback 2b; the remaining content stays on the robust
+-- :Hint path so the blank-section class can't recur.
 Dashboard.RegisterTab("help", function(host)
     local pane = UI.CreatePane(host)
     local flow = pane.flow
 
     local s = flow:AddSection("Daseeki Nexus")
-    s:Hint("Cross-account world-buff dashboard and timers for the Daseeki suite.")
+    s:Hint("Cross-account world-buff dashboard and timers for the Daseeki suite. "
+        .. "Every account that shares your mesh Token sees the same roster.")
 
+    -- ── Setup Guide (numbered, like the reference's Quick Start) ──────────────
+    local g = flow:AddSection("Setup Guide")
+    g:Hint("1.  Install Daseeki Nexus on every account you want connected.")
+    g:Hint("2.  On each account, open Settings \226\134\146 General and set a unique Account ID.")
+    g:Hint("3.  In Settings \226\134\146 Mesh & Accounts, set the SAME Token on every account, then enable the mesh.")
+    g:Hint("4.  Log out and back in once on each account \226\128\148 characters appear across your accounts within seconds.")
+    g:Hint("5.  Optional: coming from ShadowNetwork? Run /nexus import to carry over your settings, Token and data.")
+    g:Hint("Open Settings from the button at this window's top-right, or with /nexus settings.")
+
+    -- ── Slash commands (one per line, every user-facing subcommand) ───────────
     local c = flow:AddSection("Slash commands")
-    c:Hint("Primary /nexus (short /dnx); /dsn and /daseekinetwork still work.")
-    c:Label("/nexus toggle    — show or hide this dashboard")
-    c:Label("/nexus x         — open the Cancel Buffs popup")
-    c:Label("/nexus resetui   — recenter and reset the window size")
-    c:Label("/nexus account <id>  — show or set this account's mesh ID")
-    c:Label("/nexus help      — full command list in chat")
-
-    local t = flow:AddSection("Tabs")
-    t:Label("60s        — every level-60 alt on the selected faction, with buffs")
-    t:Label("Online     — the full roster, online characters first")
-    t:Label("Summoners  — warlocks available to summon, sortable")
-    t:Label("Timers     — world-buff cooldowns and Felwood songflowers")
-
-    local g = flow:AddSection("Getting started")
-    g:Hint("Set a unique Account ID and the shared Mesh channel/token in the Daseeki hub "
-        .. "(the Settings button, top-right), then relog once. Characters appear across "
-        .. "your accounts within seconds.")
+    c:Hint("Primary /nexus  \194\183  short /dnx  \194\183  aliases /dsn, /daseekinetwork")
+    c:Hint("/nexus toggle \226\128\148 show or hide the dashboard")
+    c:Hint("/nexus x \226\128\148 open the Cancel Buffs popup")
+    c:Hint("/nexus invite \226\128\148 invite all online characters")
+    c:Hint("/nexus resetui \226\128\148 reset the dashboard window position")
+    c:Hint("/nexus account <id> \226\128\148 show or set this account's mesh ID")
+    c:Hint("/nexus settings \226\128\148 open the Daseeki hub to Nexus settings")
+    c:Hint("/nexus import \226\128\148 import ShadowNetwork settings & data ('dry' to preview)")
+    c:Hint("/nexus help \226\128\148 full command list in chat")
 
     pane:Layout()
     return { Refresh = function() pane:Layout() end }
