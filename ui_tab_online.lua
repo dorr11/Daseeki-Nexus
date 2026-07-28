@@ -1,4 +1,4 @@
--- Daseeki Network — ui_tab_online.lua
+-- Daseeki Nexus — ui_tab_online.lua
 -- The "Online" tab (spec §4): the full roster for the selected faction, online
 -- characters first, in the same two-pane shape as 60s and sharing the detail
 -- panel. Warlock cards show a soul-shard count with a severity stripe.

@@ -1,4 +1,4 @@
--- Daseeki Network — tracker.lua
+-- Daseeki Nexus — tracker.lua
 -- Live capture of THIS character's state (spec §6) into the store's self
 -- record, firing the local "STATE_CHANGED" callback the mesh layer hooks
 -- in wave N2.

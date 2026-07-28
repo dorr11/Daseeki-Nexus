@@ -1,11 +1,11 @@
--- Daseeki Network — store.lua
+-- Daseeki Nexus — store.lua
 -- The two-SavedVariables data model (spec §2), its defaults, the
 -- version-stamped data wipe, retention/sweep rules, and the
 -- character-record read/write API consumed by the tracker and (later)
 -- the mesh layer.
 --
--- SV split (design decision): DaseekiNetworkDB holds settings; the
--- churny, large character/timer data lives in DaseekiNetworkData so it
+-- SV split (design decision): DaseekiNexusDB holds settings; the
+-- churny, large character/timer data lives in DaseekiNexusData so it
 -- can be version-wiped independently while settings survive.
 
 local ADDON, ns = ...
@@ -190,6 +190,12 @@ local function defaultTimerSettings()
             showTuberPins  = true,
             worldPinSize   = 14,
             minimapPinSize = 12,
+            -- Songflower display durations (seconds) consumed by the timers-tab
+            -- UP?/minus state machine (timers.lua NodeState). Defaults reproduce
+            -- current behavior exactly: minus-timer counts the 25-min respawn
+            -- (NODE_RESPAWN 1500); flowerUpDuration 0 = "UP?" shown indefinitely.
+            flowerMinusDuration = 1500,
+            flowerUpDuration    = 0,
         },
         pullBar = {
             width   = 220,
@@ -200,6 +206,12 @@ local function defaultTimerSettings()
             locked  = true,
             colorFill = "b02020",   -- token-resolved at render; stored as hex seed
             colorBG   = "202020",
+            -- Idle/small-bar geometry + expand trigger. Defaults match hud.lua's
+            -- runtime fallbacks (smallWidth = floor(width*0.72+0.5)=158,
+            -- smallHeight = max(12, height-4)=14, expandThreshold = 10s).
+            smallWidth      = 158,
+            smallHeight     = 14,
+            expandThreshold = 10,
         },
         soundChannel = "Master",
         soundKeys = {
@@ -319,41 +331,41 @@ Store.NewAccountBucket = newAccountBucket
 
 function Store.Init()
     -- Settings SV
-    if type(DaseekiNetworkDB) ~= "table" then
-        DaseekiNetworkDB = {}
+    if type(DaseekiNexusDB) ~= "table" then
+        DaseekiNexusDB = {}
     end
-    applyDefaults(DaseekiNetworkDB, defaultSettings())
+    applyDefaults(DaseekiNexusDB, defaultSettings())
 
     -- Settings migrations would branch on settingsVersion here.
-    DaseekiNetworkDB.settingsVersion = Store.SETTINGS_VERSION
+    DaseekiNexusDB.settingsVersion = Store.SETTINGS_VERSION
 
     -- Data SV
-    if type(DaseekiNetworkData) ~= "table" then
-        DaseekiNetworkData = defaultData()
+    if type(DaseekiNexusData) ~= "table" then
+        DaseekiNexusData = defaultData()
     end
 
     -- Version-stamped wipe: if the storage schema advanced, discard the
     -- character-graph (accounts) but PRESERVE timers, social, and
     -- manualLocations exactly, per spec.
-    if DaseekiNetworkData.version ~= Store.STORAGE_VERSION then
-        local preservedTimers  = DaseekiNetworkData.timers
-        local preservedSocial  = DaseekiNetworkData.social
-        local preservedManual  = DaseekiNetworkData.manualLocations
-        local preservedDeleted = DaseekiNetworkData.deletedAIDs
+    if DaseekiNexusData.version ~= Store.STORAGE_VERSION then
+        local preservedTimers  = DaseekiNexusData.timers
+        local preservedSocial  = DaseekiNexusData.social
+        local preservedManual  = DaseekiNexusData.manualLocations
+        local preservedDeleted = DaseekiNexusData.deletedAIDs
 
-        DaseekiNetworkData = defaultData()
-        DaseekiNetworkData.version = Store.STORAGE_VERSION
-        if preservedTimers  then DaseekiNetworkData.timers = preservedTimers end
-        if preservedSocial  then DaseekiNetworkData.social = preservedSocial end
-        if preservedManual  then DaseekiNetworkData.manualLocations = preservedManual end
-        if preservedDeleted then DaseekiNetworkData.deletedAIDs = preservedDeleted end
+        DaseekiNexusData = defaultData()
+        DaseekiNexusData.version = Store.STORAGE_VERSION
+        if preservedTimers  then DaseekiNexusData.timers = preservedTimers end
+        if preservedSocial  then DaseekiNexusData.social = preservedSocial end
+        if preservedManual  then DaseekiNexusData.manualLocations = preservedManual end
+        if preservedDeleted then DaseekiNexusData.deletedAIDs = preservedDeleted end
     end
 
     -- Backfill any structure a partial/older DB is missing.
-    applyDefaults(DaseekiNetworkData, defaultData())
+    applyDefaults(DaseekiNexusData, defaultData())
 
-    Store.db   = DaseekiNetworkDB
-    Store.data = DaseekiNetworkData
+    Store.db   = DaseekiNexusDB
+    Store.data = DaseekiNexusData
 end
 
 ----------------------------------------------------------------------

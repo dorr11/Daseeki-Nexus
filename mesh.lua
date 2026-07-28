@@ -1,4 +1,4 @@
--- Daseeki Network — mesh.lua  (WAVE N2a: MESH COMM LAYER)
+-- Daseeki Nexus — mesh.lua  (WAVE N2a: MESH COMM LAYER)
 -- The token-gated P2P overlay that carries cross-account state, timers,
 -- heartbeats and bulk sync between Daseeki-suite accounts.
 --

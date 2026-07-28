@@ -1,4 +1,4 @@
--- Daseeki Network — auto.lua
+-- Daseeki Nexus — auto.lua
 -- Wave N4a: AUTOMATIONS (engine spec §5 + §7).
 --
 -- No-click automation: invite accept/send by trust category, mass alt

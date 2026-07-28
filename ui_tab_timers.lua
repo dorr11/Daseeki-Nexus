@@ -1,4 +1,4 @@
--- Daseeki Network — ui_tab_timers.lua
+-- Daseeki Nexus — ui_tab_timers.lua
 -- The "Timers" tab (spec §3): a World Buff Timers section (Rend, Ony-Horde,
 -- Ony-Alliance) with live status + off-CD stamp + a pop-log popup per buff, a
 -- Songflowers section (10 Felwood nodes with respawn/UP?/no-data states), and a
@@ -34,7 +34,7 @@ local WB_ROWS = {
 
 local function ensurePopLog()
     if Dashboard._popLog then return Dashboard._popLog end
-    local p = CreateFrame("Frame", "DaseekiNetworkPopLog", UIParent, "BackdropTemplate")
+    local p = CreateFrame("Frame", "DaseekiNexusPopLog", UIParent, "BackdropTemplate")
     p:SetFrameStrata("DIALOG")
     p:SetSize(320, 300)
     p:SetPoint("CENTER")
@@ -43,7 +43,7 @@ local function ensurePopLog()
     p:SetScript("OnDragStart", function(self) self:StartMoving() end)
     p:SetScript("OnDragStop", function(self) self:StopMovingOrSizing() end)
     p:Hide()
-    tinsert(UISpecialFrames, "DaseekiNetworkPopLog")
+    tinsert(UISpecialFrames, "DaseekiNexusPopLog")
     UI.Skin(p, function(self)
         self:SetBackdrop(UI.FLAT_BACKDROP)
         self:SetBackdropColor(UI.Color("ground"))

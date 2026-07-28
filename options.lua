@@ -1,4 +1,4 @@
--- Daseeki Network — options.lua  (WAVE N3c: HUB SETTINGS)
+-- Daseeki Nexus — options.lua  (WAVE N3c: HUB SETTINGS)
 -- Every Settings/Auto/Auras surface from the UI spec (§§2/7/8) recomposed as
 -- DaseekiUI flow-API pages living in the Daseeki hub (design decision D1). The
 -- dashboard keeps a gear button that jumps here.
@@ -222,9 +222,32 @@ end
 local function hudShowMover()
     if ns.HUD and ns.HUD.ShowMover then ns:SafeCall(ns.HUD.ShowMover) end
 end
+-- Fire one preview alert through the HUD. Signature mirrors hud.lua
+-- HUD.TestAlert(buffKey, eventType). Soft-guarded (HUD is a later TOC file), but
+-- the "HUD pending" placeholder is gone now that the HUD ships.
 local function hudTestAlert(buffKey, eventKey)
-    if ns.HUD and ns.HUD.TestAlert then ns:SafeCall(ns.HUD.TestAlert, buffKey, eventKey)
-    else ns:Print("alert preview arrives with the HUD (wave N3).") end
+    if ns.HUD and ns.HUD.TestAlert then ns:SafeCall(ns.HUD.TestAlert, buffKey, eventKey) end
+end
+
+-- Sound catalog sourced from the HUD (authoritative runtime list); falls back
+-- to the local static list if the HUD module is somehow absent.
+local function soundChoices()
+    local src = ns.HUD and ns.HUD.SOUNDS
+    if type(src) == "table" and #src > 0 then
+        local out = {}
+        for _, s in ipairs(src) do out[#out + 1] = { value = s.key, text = s.label } end
+        return out
+    end
+    return SOUND_CHOICES
+end
+-- Resolve a stored sound key to a SoundKit id (+ optional FrameXML member name)
+-- via the HUD catalog first, then the local map.
+local function soundIdForKey(key)
+    local src = ns.HUD and ns.HUD.SOUNDS
+    if type(src) == "table" then
+        for _, s in ipairs(src) do if s.key == key then return s.id, s.member end end
+    end
+    return SOUNDKIT_MAP[key or ""]
 end
 
 -- Forward declarations (kept local so nothing leaks into _G).
@@ -1237,13 +1260,14 @@ local function buildTimers(flow)
         local row = snd:AddRow({ vAlign = "center" })
         local lbl = row:Label(sk.label); lbl.uiWidth = 120; lbl:SetWidth(120)
         local dd = row:Dropdown({
-            width = 150, choices = SOUND_CHOICES,
+            width = 150, choices = soundChoices(),
             get = function() local ts = TS(); return ts and ts.soundKeys[sk.key] or "" end,
             set = function(v) local ts = TS(); if ts then ts.soundKeys[sk.key] = v end end,
         })
         row:Button({ text = "Test", width = 56, variant = "quiet", onClick = function()
             local ts = TS(); if not ts then return end
-            local id = SOUNDKIT_MAP[ts.soundKeys[sk.key] or ""]
+            local id, member = soundIdForKey(ts.soundKeys[sk.key] or "")
+            id = (SOUNDKIT and member and SOUNDKIT[member]) or id
             if id and PlaySound then PlaySound(id, ts.soundChannel or "Master") end
         end })
         register("timers", function() if dd.Refresh then dd.Refresh() end end)
@@ -1271,7 +1295,32 @@ local function buildTimers(flow)
         set = function(v) local ts = TS(); if ts then ts.pullBar.height = v end end,
         format = function(v) return tostring(math.floor(v)) end,
     })
-    register("timers", function() if pw.Refresh then pw.Refresh() end; if ph.Refresh then ph.Refresh() end end)
+    -- Idle/small-bar geometry + expand trigger — the HUD's actual runtime keys
+    -- (hud.lua reads pullBar.smallWidth/smallHeight/expandThreshold). Main/small
+    -- positions are mover-managed (mainPos/smallPos), so no controls for those.
+    local psw = pb:Slider({
+        label = "Small bar width", width = 260, min = 80, max = 320, step = 5,
+        get = function() local ts = TS(); return ts and ts.pullBar.smallWidth or 158 end,
+        set = function(v) local ts = TS(); if ts then ts.pullBar.smallWidth = v end end,
+        format = function(v) return tostring(math.floor(v)) end,
+    })
+    local psh = pb:Slider({
+        label = "Small bar height", width = 260, min = 8, max = 32, step = 1,
+        get = function() local ts = TS(); return ts and ts.pullBar.smallHeight or 14 end,
+        set = function(v) local ts = TS(); if ts then ts.pullBar.smallHeight = v end end,
+        format = function(v) return tostring(math.floor(v)) end,
+    })
+    local pex = pb:Slider({
+        label = "Expand-to-center threshold", width = 260, min = 3, max = 30, step = 1,
+        get = function() local ts = TS(); return ts and ts.pullBar.expandThreshold or 10 end,
+        set = function(v) local ts = TS(); if ts then ts.pullBar.expandThreshold = v end end,
+        format = function(v) return tostring(math.floor(v)) .. "s" end,
+    })
+    register("timers", function()
+        if pw.Refresh then pw.Refresh() end; if ph.Refresh then ph.Refresh() end
+        if psw.Refresh then psw.Refresh() end; if psh.Refresh then psh.Refresh() end
+        if pex.Refresh then pex.Refresh() end
+    end)
 
     local colRow = pb:AddRow({ vAlign = "center" })
     colRow:Label("Fill / BG hex")
@@ -1315,6 +1364,25 @@ local function buildTimers(flow)
         format = function(v) return tostring(math.floor(v)) end,
     })
     register("timers", function() if wps.Refresh then wps.Refresh() end; if mps.Refresh then mps.Refresh() end end)
+
+    -- ── Songflower display ───────────────────────────────────────────────────────
+    -- Drives the Timers-tab UP?/minus state machine (timers.lua NodeState).
+    local sf = flow:AddSection("Songflower Display")
+    sf:Hint("Minus-timer counts the respawn; UP? window shows after respawn (0 = always).")
+    local sfMinus = sf:Slider({
+        label = "Minus-timer duration", width = 300, min = 300, max = 3000, step = 30,
+        get = function() local ts = TS(); return ts and ts.felwood.flowerMinusDuration or 1500 end,
+        set = function(v) local ts = TS(); if ts then ts.felwood.flowerMinusDuration = v end end,
+        format = function(v) v = math.floor(v); return ("%d:%02d"):format(math.floor(v / 60), v % 60) end,
+    })
+    local sfUp = sf:Slider({
+        label = "UP? duration", width = 300, min = 0, max = 3600, step = 30,
+        get = function() local ts = TS(); return ts and ts.felwood.flowerUpDuration or 0 end,
+        set = function(v) local ts = TS(); if ts then ts.felwood.flowerUpDuration = v end end,
+        format = function(v) v = math.floor(v); if v <= 0 then return "always" end
+            return ("%d:%02d"):format(math.floor(v / 60), v % 60) end,
+    })
+    register("timers", function() if sfMinus.Refresh then sfMinus.Refresh() end; if sfUp.Refresh then sfUp.Refresh() end end)
 
     -- ── Danger: reset timer data ───────────────────────────────────────────────
     flow:AddSection("Danger Zone")
@@ -1468,12 +1536,12 @@ end
 function Options.Register()
     if not _G.DaseekiSuite then return end
     if not (_G.DaseekiUI and _G.DaseekiUI.Token) then
-        print("|cff4fc3f7Daseeki Network|r requires Daseeki Core — please update Daseeki Core.")
+        print("|cff4fc3f7Daseeki Nexus|r requires Daseeki Core — please update Daseeki Core.")
         return
     end
     DaseekiSuite:RegisterAddon({
-        id    = "network",
-        title = "Network",
+        id    = "nexus",
+        title = "Nexus",
         icon  = "Interface\\Icons\\INV_Misc_Net_01",
         order = 40,
         flow  = true,

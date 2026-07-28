@@ -1,4 +1,4 @@
--- Daseeki Network — timers.lua  (WAVE N2b: world-buff & Felwood-node engine)
+-- Daseeki Nexus — timers.lua  (WAVE N2b: world-buff & Felwood-node engine)
 --
 -- The timer engine: five trust-ranked detector classes, NWB/DBM ingest,
 -- cooldown derivation with false-positive rejection, capped pop logs,
@@ -694,7 +694,11 @@ function Timers.NearestNode(kind, x, y)
 end
 
 -- Compute a node's state at time `t` from its pop epoch. Pure helper.
-function Timers.NodeState(popEpoch, t, respawn)
+-- `respawn` = minus-timer duration (the down-count); `upDuration` = how long
+-- the post-respawn "up" (UP?) window is shown before reverting to "unknown".
+-- upDuration nil/<=0 means the up window is indefinite (default; reproduces the
+-- prior always-up-after-respawn behavior).
+function Timers.NodeState(popEpoch, t, respawn, upDuration)
     respawn = respawn or NODE_RESPAWN
     if not popEpoch or popEpoch <= 0 then
         return { state = "unknown", remaining = 0, since = 0 }
@@ -703,7 +707,11 @@ function Timers.NodeState(popEpoch, t, respawn)
     if elapsed < respawn then
         return { state = "down", remaining = respawn - elapsed, since = elapsed }
     end
-    return { state = "up", remaining = 0, since = elapsed - respawn }
+    local sinceUp = elapsed - respawn
+    if not upDuration or upDuration <= 0 or sinceUp < upDuration then
+        return { state = "up", remaining = 0, since = sinceUp }
+    end
+    return { state = "unknown", remaining = 0, since = sinceUp }
 end
 
 -- Record a node pick. kind ∈ "flower"/"tuber", index 1-based. Applies a
@@ -722,6 +730,13 @@ function Timers.MarkNode(kind, index, epoch, trust)
     return true
 end
 
+-- Felwood display settings (songflower durations). Soft-guarded so the engine
+-- still resolves before the store applies defaults.
+local function felwoodSettings()
+    local s = ns.Store and ns.Store.GetSettings and ns.Store.GetSettings()
+    return (s and s.timerSettings and s.timerSettings.felwood) or {}
+end
+
 -- Public: current state for a node key like "flower3".
 function Timers.GetNodeState(nodeKey)
     local kind, idxStr = nodeKey:match("^(%a+)(%d+)$")
@@ -729,7 +744,15 @@ function Timers.GetNodeState(nodeKey)
     if not kind or not index then return nil end
     local pops = nodePopTable(kind)
     local popEpoch = pops and pops[index] or 0
-    return Timers.NodeState(popEpoch, now(), NODE_RESPAWN)
+    -- Songflowers honor the configurable display durations; tubers keep the
+    -- fixed respawn with an indefinite up window (unchanged).
+    local respawn, upDur = NODE_RESPAWN, 0
+    if kind == "flower" then
+        local fw = felwoodSettings()
+        respawn = fw.flowerMinusDuration or NODE_RESPAWN
+        upDur   = fw.flowerUpDuration or 0
+    end
+    return Timers.NodeState(popEpoch, now(), respawn, upDur)
 end
 
 -- Pick detection from a successful player cast in Felwood.
@@ -1108,6 +1131,17 @@ local function testNodeStateMachine(fails)
         "picked node counts down", fails)
     local stUp = Timers.NodeState(pop, pop + NODE_RESPAWN + 5, NODE_RESPAWN)
     tcheck(stUp.state == "up", "node returns to up after respawn", fails)
+    -- upDuration=0/nil keeps the up window indefinite (default behavior).
+    local stUpForever = Timers.NodeState(pop, pop + NODE_RESPAWN + 100000, NODE_RESPAWN, 0)
+    tcheck(stUpForever.state == "up", "upDuration 0 => up indefinitely", fails)
+    -- A finite upDuration reverts to unknown once the window elapses.
+    local stUpWin = Timers.NodeState(pop, pop + NODE_RESPAWN + 50, NODE_RESPAWN, 100)
+    tcheck(stUpWin.state == "up", "up shown within upDuration window", fails)
+    local stUpExp = Timers.NodeState(pop, pop + NODE_RESPAWN + 200, NODE_RESPAWN, 100)
+    tcheck(stUpExp.state == "unknown", "up window expires after upDuration", fails)
+    -- A shortened minus-timer flips down->up earlier.
+    local stShort = Timers.NodeState(pop, pop + 1300, 1200, 0)
+    tcheck(stShort.state == "up", "shorter minus-timer respawns earlier", fails)
 end
 
 -- DBM / NWB parse helpers.

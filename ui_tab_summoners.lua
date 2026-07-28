@@ -1,4 +1,4 @@
--- Daseeki Network — ui_tab_summoners.lua
+-- Daseeki Nexus — ui_tab_summoners.lua
 -- The "Summoners" tab (spec §5): a single-panel, click-sortable 6-column table
 -- of the faction's warlock summoners (shards >= 20), with alternating row
 -- shading and a per-row location-override popup. Column headers are always

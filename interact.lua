@@ -1,4 +1,4 @@
--- Daseeki Network — interact.lua
+-- Daseeki Nexus — interact.lua
 -- Wave N4a: one-click click-to-target NPC popups (UI spec §6).
 --
 -- Floating SECURE buttons that /targetexact a fixed set of city service NPCs.
@@ -126,7 +126,7 @@ local function buildButton(def)
     if Interact._buttons[def.key] then return Interact._buttons[def.key] end
     if not CreateFrame then return nil end
 
-    local btn = CreateFrame("Button", "DaseekiNetworkInteract_" .. def.key, UIParent,
+    local btn = CreateFrame("Button", "DaseekiNexusInteract_" .. def.key, UIParent,
         "SecureActionButtonTemplate,BackdropTemplate")
     btn:SetSize(120, 32)
     btn:Hide()

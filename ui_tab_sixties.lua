@@ -1,4 +1,4 @@
--- Daseeki Network — ui_tab_sixties.lua
+-- Daseeki Nexus — ui_tab_sixties.lua
 -- The "60s" tab (spec §1): every level-60 character on the selected faction as
 -- a rich card in a drag-reorderable left list, with the shared detail panel on
 -- the right. Card + detail composition follows the DaseekiUI style guide:

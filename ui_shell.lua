@@ -1,4 +1,4 @@
--- Daseeki Network — ui_shell.lua
+-- Daseeki Nexus — ui_shell.lua
 -- The dashboard window shell (spec §0): a free-floating, movable, resizable
 -- DaseekiUI-chrome window with a header bar, tab bar, active-panel host, and a
 -- live status bar. Also the home of the cross-tab shared model + helpers that
@@ -64,9 +64,11 @@ end
 -- threshold key (Silithyst, Boon of Blackfathom) are always optional.
 --
 -- CROSS-FILE CONTRACT: `thresholdKey` values here are the keys the hub's
--- aura-config page (options.lua, parallel wave) writes into
--- GetFactionSettings().auraOpts.thresholds. Keys: dmf, ony, dmtap, dmtsp,
--- dmtstam, songflower, zg, rend (+ battleShout, which has no storage slot).
+-- aura-config page (options.lua AURA_DEFS) writes into
+-- GetFactionSettings().auraOpts.thresholds, and that the importer
+-- (import.lua AURA_SLOT_KEY) resolves SN's positional thresholds onto. Keys
+-- (exact, case-sensitive): dmf, ony, dmtAP, dmtSP, dmtStam, songflower, zg,
+-- rend (+ battleShout, which has no storage slot).
 ----------------------------------------------------------------------
 
 Dashboard.AURA_META = {
@@ -75,9 +77,9 @@ Dashboard.AURA_META = {
     [3]  = { key = "zg",        name = "Spirit of Zandalar",               short = "ZG",   thresholdKey = "zg",        icon = "Interface\\Icons\\Ability_Creature_Poison_05" },
     [4]  = { key = "songflower",name = "Songflower Serenade",              short = "SF",   thresholdKey = "songflower",icon = "Interface\\Icons\\Spell_Holy_MindVision" },
     [5]  = { key = "dmf",       name = "Sayge's Dark Fortune",             short = "DMF",  thresholdKey = "dmf",       icon = "Interface\\Icons\\INV_Misc_Orb_02" },
-    [6]  = { key = "dmtap",     name = "Fengus' Ferocity",                 short = "AP",   thresholdKey = "dmtap",     icon = "Interface\\Icons\\INV_Misc_MonsterClaw_04" },
-    [7]  = { key = "dmtstam",   name = "Mol'dar's Moxie",                  short = "Stam", thresholdKey = "dmtstam",   icon = "Interface\\Icons\\Ability_Racial_Cannibalize" },
-    [8]  = { key = "dmtsp",     name = "Slip'kik's Savvy",                 short = "SP",   thresholdKey = "dmtsp",     icon = "Interface\\Icons\\Spell_Nature_WispSplode" },
+    [6]  = { key = "dmtap",     name = "Fengus' Ferocity",                 short = "AP",   thresholdKey = "dmtAP",     icon = "Interface\\Icons\\INV_Misc_MonsterClaw_04" },
+    [7]  = { key = "dmtstam",   name = "Mol'dar's Moxie",                  short = "Stam", thresholdKey = "dmtStam",   icon = "Interface\\Icons\\Ability_Racial_Cannibalize" },
+    [8]  = { key = "dmtsp",     name = "Slip'kik's Savvy",                 short = "SP",   thresholdKey = "dmtSP",     icon = "Interface\\Icons\\Spell_Nature_WispSplode" },
     [9]  = { key = "silithyst", name = "Traces of Silithyst",             short = "Sili", thresholdKey = nil,         icon = "Interface\\Icons\\INV_Misc_Dust_02" },
     [10] = { key = "boon",      name = "Boon of Blackfathom",              short = "BFD",  thresholdKey = nil,         icon = "Interface\\Icons\\Spell_Frost_FrostArmor02" },
 }
@@ -193,15 +195,23 @@ function Dashboard.GetThreshold(faction, thresholdKey)
     return DEFAULT_THRESHOLD
 end
 
+-- Below-normal auras want an amber "warn". Core now ships a `warn` token; use
+-- it when present, else fall back to "accent" (the prior stand-in) so an older
+-- Core still colors correctly instead of flashing white.
+local function warnToken()
+    local UI = DaseekiUI
+    if UI and UI.Token and type(UI.Token("warn")) == "table" then return "warn" end
+    return "accent"
+end
+
 -- Color token for a present aura's remaining time vs its threshold.
 --   healthy (>= normal)  -> "ok" (green)
---   below-normal         -> "accent" (theme accent stands in for warn/gold —
---                            no dedicated yellow token ships; documented)
+--   below-normal         -> "warn" (amber; "accent" fallback on older Core)
 --   below-minimum        -> "danger" (red)
 function Dashboard.AuraColorToken(remaining, threshold)
     threshold = threshold or DEFAULT_THRESHOLD
     if remaining >= (threshold.normal or 0) then return "ok" end
-    if remaining >= (threshold.minimum or 0) then return "accent" end
+    if remaining >= (threshold.minimum or 0) then return warnToken() end
     return "danger"
 end
 
@@ -509,7 +519,7 @@ local function buildHeader(w)
     local title = header:CreateFontString(nil, "OVERLAY")
     title:SetFontObject(UI.fonts.header)
     title:SetPoint("CENTER", header, "CENTER", 0, 0)
-    title:SetText("Daseeki Network")
+    title:SetText("Daseeki Nexus")
 
     -- Right-side action strip: [Cancel Buffs] [Invite Online] [gear] [close].
     local closeBtn = CreateFrame("Button", nil, header)
@@ -525,7 +535,7 @@ local function buildHeader(w)
 
     local gearBtn = makeHeaderButton(header, "Settings", function()
         if DaseekiSuite and DaseekiSuite.Open then
-            DaseekiSuite:Open("network")
+            DaseekiSuite:Open("nexus")
         else
             ns:Print("Daseeki hub not available.")
         end
@@ -818,7 +828,7 @@ end
 local function ensureWindow()
     if win then return win end
 
-    win = CreateFrame("Frame", "DaseekiNetworkDashboard", UIParent, "BackdropTemplate")
+    win = CreateFrame("Frame", "DaseekiNexusDashboard", UIParent, "BackdropTemplate")
     win:SetFrameStrata("HIGH")
     win:SetToplevel(true)
     win:SetMovable(true)
@@ -833,7 +843,7 @@ local function ensureWindow()
         self:SetBackdropBorderColor(UI.Color("borderLite"))
     end)
 
-    tinsert(UISpecialFrames, "DaseekiNetworkDashboard")   -- Escape closes
+    tinsert(UISpecialFrames, "DaseekiNexusDashboard")   -- Escape closes
 
     buildHeader(win)
     buildTabBar(win)
@@ -1368,15 +1378,16 @@ Dashboard.RegisterTab("help", function(host)
     local pane = UI.CreatePane(host)
     local flow = pane.flow
 
-    local s = flow:AddSection("Daseeki Network")
+    local s = flow:AddSection("Daseeki Nexus")
     s:Hint("Cross-account world-buff dashboard and timers for the Daseeki suite.")
 
     local c = flow:AddSection("Slash commands")
-    c:Label("/dsn toggle    — show or hide this dashboard")
-    c:Label("/dsn x         — open the Cancel Buffs popup")
-    c:Label("/dsn resetui   — recenter and reset the window size")
-    c:Label("/dsn account <id>  — show or set this account's mesh ID")
-    c:Label("/dsn help      — full command list in chat")
+    c:Hint("Primary /nexus (short /dnx); /dsn and /daseekinetwork still work.")
+    c:Label("/nexus toggle    — show or hide this dashboard")
+    c:Label("/nexus x         — open the Cancel Buffs popup")
+    c:Label("/nexus resetui   — recenter and reset the window size")
+    c:Label("/nexus account <id>  — show or set this account's mesh ID")
+    c:Label("/nexus help      — full command list in chat")
 
     local t = flow:AddSection("Tabs")
     t:Label("60s        — every level-60 alt on the selected faction, with buffs")

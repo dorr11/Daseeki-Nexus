@@ -1,4 +1,4 @@
--- Daseeki Network — minimap.lua
+-- Daseeki Nexus — minimap.lua
 -- Free-floating, draggable launcher button. Per engine spec §9 it is NOT
 -- parented or anchored to the minimap cluster (protected-frame anchoring to the
 -- Edit-Mode minimap blanks the minimap on relogin); it free-floats on UIParent
@@ -123,7 +123,7 @@ end
 local button
 
 local function buildButton()
-    local b = CreateFrame("Button", "DaseekiNetworkMinimapButton", UIParent)
+    local b = CreateFrame("Button", "DaseekiNexusMinimapButton", UIParent)
     b:SetSize(32, 32)
     b:SetFrameStrata("MEDIUM")
     b:SetFrameLevel(20)
@@ -195,7 +195,7 @@ local function buildButton()
 
     b:SetScript("OnEnter", function(self)
         GameTooltip:SetOwner(self, "ANCHOR_LEFT")
-        GameTooltip:AddLine("Daseeki Network", UI.Color("accent"))
+        GameTooltip:AddLine("Daseeki Nexus", UI.Color("accent"))
         -- Live world-buff states.
         local rendT, rendC = cdStatus("rend")
         local onyAT, onyAC = cdStatus("onyA")

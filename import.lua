@@ -1,7 +1,7 @@
--- Daseeki Network — import.lua  (WAVE N4b: ShadowNetwork IMPORTER)
+-- Daseeki Nexus — import.lua  (WAVE N4b: ShadowNetwork IMPORTER)
 --
 -- One-way, non-destructive importer that lifts a returning ShadowNetwork
--- user's SavedVariables DATA into Daseeki-Network's store shape, so Drew's
+-- user's SavedVariables DATA into Daseeki-Nexus's store shape, so Drew's
 -- accounts re-mesh and re-populate with zero manual re-setup.
 --
 -- LEGAL / FIREWALL NOTE
@@ -246,27 +246,59 @@ local function invertClassMap(m)
 end
 Import._InvertClassMap = invertClassMap
 
--- Copy SN's positional {normal,minimum} threshold array preserving index.
--- (The 10-slot / aura ordering is the engine's canonical world-buff order,
--- shared by auraStates[i] and these thresholds[i]; auraOpts thresholds are
--- keyed by that ordinal in our store.)
+-- Canonical positional aura order shared by SN's auraOpts.thresholds[i] and
+-- autoSummon.buffTriggers[i]. Source of truth: NETWORK_SPEC_UI §2 Thresholds
+-- table order (DMF, Ony, DMT AP, DMT SP, DMT STAM, Songflower, ZG, Rend,
+-- Battle Shout), which our options.lua AURA_DEFS mirrors 1:1. SN stores these
+-- positionally; our store keys them by aura name, so the importer resolves the
+-- ordinal here. Keys MUST match options.lua AURA_DEFS exactly.
+local AURA_SLOT_KEY = {
+    "dmf", "ony", "dmtAP", "dmtSP", "dmtStam", "songflower", "zg", "rend", "battleShout",
+}
+
+-- Which summon trigger key (auto.lua SUMMON_TRIGGER_BUFFS) each aura slot maps
+-- to. dmf (slot 1) and battleShout (slot 9) have no summon trigger and are
+-- skipped. Keys MUST match auto.lua Auto.SUMMON_TRIGGER_BUFFS.
+local AURA_SLOT_TRIGGER = {
+    [2] = "dragonslayer",  -- ony  -> Rallying Cry of the Dragonslayer
+    [3] = "fengus",        -- dmtAP
+    [4] = "slipkik",       -- dmtSP
+    [5] = "moldar",        -- dmtStam
+    [6] = "songflower",    -- songflower
+    [7] = "zandalar",      -- zg
+    [8] = "warchief",      -- rend -> Warchief's Blessing
+}
+
+-- Map SN's positional {normal,minimum} threshold array onto our NAMED aura
+-- keys (store auraOpts.thresholds is keyed by aura name; ui_shell.GetThreshold
+-- and options.lua both read it by key). Unknown/overflow slots are dropped.
 local function mapThresholds(arr)
     local out = {}
     if type(arr) == "table" then
-        for i = 1, #arr do
+        -- Iterate the canonical slot count (not #arr) so a sparse/short array
+        -- still resolves every present slot to its named key.
+        for i = 1, #AURA_SLOT_KEY do
             local e = arr[i]
-            out[i] = { normal = (e and e.normal) or 0, minimum = (e and e.minimum) or 0 }
+            if e ~= nil then
+                out[AURA_SLOT_KEY[i]] = { normal = (e and e.normal) or 0, minimum = (e and e.minimum) or 0 }
+            end
         end
     end
     return out
 end
 
--- Copy SN's positional 10-slot buffTriggers array preserving index. Aligns
--- with the same canonical world-buff ordering as auraStates[i].
+-- Map SN's positional buffTriggers array onto our summon-trigger KEYS
+-- (auto.lua consumes autoSummon.triggers[key]). Slots without a trigger
+-- (dmf, battleShout) are skipped.
 local function mapBuffTriggers(arr)
     local out = {}
     if type(arr) == "table" then
-        for i = 1, #arr do out[i] = arr[i] and true or false end
+        -- Iterate the canonical slot count (not #arr) so a sparse/short array
+        -- still resolves every trigger-bearing slot to its named key.
+        for i = 1, #AURA_SLOT_KEY do
+            local key = AURA_SLOT_TRIGGER[i]
+            if key and arr[i] ~= nil then out[key] = arr[i] and true or false end
+        end
     end
     return out
 end
@@ -420,6 +452,9 @@ function Import._MapTimerSettings(t)
             showTuberPins  = t.showFelwoodPins,
             worldPinSize   = t.wmFlowerIconSize,
             minimapPinSize = t.mmFlowerIconSize,
+            -- Songflower display durations (nil leaves our store default).
+            flowerMinusDuration = t.flowerMinusTimerDuration,
+            flowerUpDuration    = t.flowerUpDuration,
         },
         pullBar = {
             width     = t.pullTimerMainBarWidth,
@@ -742,15 +777,30 @@ local function selfTest(verbose)
     -- rgb->hex.
     check("rgb->hex", Import._RgbToHex({ 0.2, 0.8, 0.2 }) == "33CC33")
 
-    -- Faction autoInteract flatten + zanza priority + summonWindow rename.
+    -- Faction autoInteract flatten + zanza priority + summonWindow rename +
+    -- positional->keyed thresholds/triggers (canonical aura order).
     local fac = Import._MapFaction({
         autoQuest = { zanzaEnabled = true, zanzaPicks = { spirit = true } },
+        -- buffTriggers slots: 1=dmf(skip) 2=ony 3=dmtAP; so ony->dragonslayer=false,
+        -- dmtAP->fengus=true, dmf dropped.
         autoSummon = { summonWindow = 19, buffTriggers = { true, false, true } },
         autoInteract = { npcs = { ["Auctioneer Jaxon"] = true } },
         autoGroup = { inviteWhitelist = { ["A-B"] = true }, inviteWhitelistDefaultsApplied = true },
+        -- threshold slots: 1=dmf 2=ony 8=rend.
+        auraOpts = { thresholds = {
+            [1] = { normal = 100, minimum = 50 },
+            [2] = { normal = 200, minimum = 90 },
+            [8] = { normal = 800, minimum = 400 },
+        } },
     })
     check("faction summonWindow->freshBuffWindow", fac.autoSummon.freshBuffWindow == 19)
-    check("faction buffTriggers positional", fac.autoSummon.triggers[3] == true and fac.autoSummon.triggers[2] == false)
+    check("faction buffTriggers->keys (dmtAP->fengus)", fac.autoSummon.triggers.fengus == true)
+    check("faction buffTriggers->keys (ony->dragonslayer)", fac.autoSummon.triggers.dragonslayer == false)
+    check("faction buffTriggers dmf skipped", fac.autoSummon.triggers.dmf == nil)
+    check("faction thresholds->keys (slot1->dmf)", fac.auraOpts.thresholds.dmf and fac.auraOpts.thresholds.dmf.normal == 100)
+    check("faction thresholds->keys (slot2->ony)", fac.auraOpts.thresholds.ony and fac.auraOpts.thresholds.ony.minimum == 90)
+    check("faction thresholds->keys (slot8->rend)", fac.auraOpts.thresholds.rend and fac.auraOpts.thresholds.rend.normal == 800)
+    check("faction thresholds unset slot nil", fac.auraOpts.thresholds.zg == nil)
     check("faction zanza priority", fac.autoQuest.zanza.priority.spirit == true)
     check("faction interact flattened", fac.autoInteract["Auctioneer Jaxon"] == true)
     check("faction whitelist", fac.autoGroup.whitelist["A-B"] == true)

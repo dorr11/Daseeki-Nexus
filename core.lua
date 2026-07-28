@@ -1,4 +1,4 @@
--- Daseeki Network — core.lua
+-- Daseeki Nexus — core.lua
 -- Addon namespace, event dispatch, local callback bus, slash routing,
 -- account-ID config accessor, and the init/login lifecycle.
 --
@@ -9,9 +9,9 @@
 local ADDON, ns = ...
 
 ns.ADDON      = ADDON
-ns.DISPLAY    = "Daseeki Network"
+ns.DISPLAY    = "Daseeki Nexus"
 ns.VERSION    = "0.1.0-n1"
-ns.CHAT_TAG   = "|cff4fc3f7Daseeki Network|r"
+ns.CHAT_TAG   = "|cff4fc3f7Daseeki Nexus|r"
 
 ----------------------------------------------------------------------
 -- Small utilities
@@ -41,7 +41,7 @@ end
 -- subscribed handler. handler(event, ...) receives the raw payload.
 ----------------------------------------------------------------------
 
-local eventFrame = CreateFrame("Frame", "DaseekiNetworkEventFrame")
+local eventFrame = CreateFrame("Frame", "DaseekiNexusEventFrame")
 ns.eventFrame = eventFrame
 
 local eventHandlers = {}   -- event -> array of handler fns
@@ -103,7 +103,7 @@ end
 -- Account-ID config accessor
 --
 -- Account identity is a short numeric string (1-2 digits) that keys the
--- mesh roster. Stored in DaseekiNetworkDB.accountID. Store owns the SV
+-- mesh roster. Stored in DaseekiNexusDB.accountID. Store owns the SV
 -- defaults; these accessors are the single point of truth for reads.
 ----------------------------------------------------------------------
 
@@ -114,7 +114,7 @@ function ns:IsValidAccountID(v)
 end
 
 function ns:GetAccountID()
-    local db = DaseekiNetworkDB
+    local db = DaseekiNexusDB
     if db and type(db.accountID) == "string" then
         return db.accountID
     end
@@ -125,7 +125,7 @@ function ns:SetAccountID(v)
     if not ns:IsValidAccountID(v) then
         return false, "account ID must be a 1-2 digit number"
     end
-    local db = DaseekiNetworkDB
+    local db = DaseekiNexusDB
     if not db then return false, "settings not loaded yet" end
     db.accountID = v
     ns:Fire("ACCOUNT_ID_CHANGED", v)
@@ -135,7 +135,9 @@ end
 ----------------------------------------------------------------------
 -- Slash command routing
 --
--- /dsn and /daseekinetwork share one dispatcher. Subcommands mirror the
+-- /nexus (short /dnx) is the primary slash; /dsn and /daseekinetwork stay
+-- registered as compatibility aliases (owner muscle memory). All four share
+-- one dispatcher. Subcommands mirror the
 -- functional spec's surface (toggle / x / invite / coord / resetui /
 -- help) as stubs this wave, plus `debug selftest` which runs the
 -- protocol scaffolding's pure-Lua self-tests.
@@ -188,16 +190,16 @@ end
 ns._debugCommands = debugCommands
 
 local function printHelp()
-    ns:Print("commands:")
-    ns:Print("  /dsn toggle           - show/hide the dashboard (wave N3)")
-    ns:Print("  /dsn x                - cancel-buffs popup (wave N3)")
-    ns:Print("  /dsn invite            - mass alt-invite (wave N4)")
-    ns:Print("  /dsn coord             - manage coordinate overrides (wave N3)")
-    ns:Print("  /dsn resetui           - reset dashboard layout (wave N3)")
-    ns:Print("  /dsn account <id>      - show/set this account's mesh ID")
-    ns:Print("  /dsn settings          - open the Daseeki hub to Network settings")
-    ns:Print("  /dsn debug selftest    - run protocol self-tests")
-    ns:Print("  /dsn help              - this list")
+    ns:Print("commands (primary /nexus; short /dnx; aliases /dsn, /daseekinetwork):")
+    ns:Print("  /nexus toggle           - show/hide the dashboard (wave N3)")
+    ns:Print("  /nexus x                - cancel-buffs popup (wave N3)")
+    ns:Print("  /nexus invite            - mass alt-invite (wave N4)")
+    ns:Print("  /nexus coord             - manage coordinate overrides (wave N3)")
+    ns:Print("  /nexus resetui           - reset dashboard layout (wave N3)")
+    ns:Print("  /nexus account <id>      - show/set this account's mesh ID")
+    ns:Print("  /nexus settings          - open the Daseeki hub to Nexus settings")
+    ns:Print("  /nexus debug selftest    - run protocol self-tests")
+    ns:Print("  /nexus help              - this list")
 end
 
 -- Built-in subcommands. Feature stubs announce their target wave so an
@@ -217,22 +219,22 @@ ns:RegisterSubcommand("coords",  stub("N3"), "coordinate overrides")
 ns:RegisterSubcommand("resetui", stub("N3"), "reset dashboard layout")
 ns:RegisterSubcommand("reset",   stub("N3"), "reset dashboard layout")
 
--- Open the Daseeki hub to the Network settings section (options.lua owns the
+-- Open the Daseeki hub to the Nexus settings section (options.lua owns the
 -- pages; this is just the slash entry point). Guards on the hub being present.
 ns:RegisterSubcommand("settings", function()
     if _G.DaseekiSuite and DaseekiSuite.Open then
-        DaseekiSuite:Open("network")
+        DaseekiSuite:Open("nexus")
     else
         ns:Print("the Daseeki hub (Daseeki Core) is not available.")
     end
-end, "open Network settings")
+end, "open Nexus settings")
 
 ns:RegisterSubcommand("account", function(rest)
     rest = rest and rest:match("^%s*(.-)%s*$") or ""
     if rest == "" then
         local id = ns:GetAccountID()
         if id == "" then
-            ns:Print("no account ID set. Use /dsn account <1-2 digit number>.")
+            ns:Print("no account ID set. Use /nexus account <1-2 digit number>.")
         else
             ns:Print("account ID: " .. id)
         end
@@ -273,13 +275,17 @@ local function dispatch(msg)
     if entry then
         entry.fn(rest)
     else
-        ns:Print("unknown command '" .. cmd .. "'. Try /dsn help.")
+        ns:Print("unknown command '" .. cmd .. "'. Try /nexus help.")
     end
 end
 
-SLASH_DASEEKINETWORK1 = "/dsn"
-SLASH_DASEEKINETWORK2 = "/daseekinetwork"
-SlashCmdList["DASEEKINETWORK"] = dispatch
+-- Primary + short slash; /dsn and /daseekinetwork kept as compat aliases
+-- (owner muscle memory — cheap to preserve, avoids breaking existing macros).
+SLASH_DASEEKINEXUS1 = "/nexus"
+SLASH_DASEEKINEXUS2 = "/dnx"
+SLASH_DASEEKINEXUS3 = "/dsn"
+SLASH_DASEEKINEXUS4 = "/daseekinetwork"
+SlashCmdList["DASEEKINEXUS"] = dispatch
 
 ----------------------------------------------------------------------
 -- Lifecycle

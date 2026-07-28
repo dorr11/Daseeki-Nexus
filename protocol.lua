@@ -1,4 +1,4 @@
--- Daseeki Network — protocol.lua  (WAVE N1: SCAFFOLDING ONLY)
+-- Daseeki Nexus — protocol.lua  (WAVE N1: SCAFFOLDING ONLY)
 -- Prefix constants + registration, and the pure-Lua building blocks the
 -- mesh layer (wave N2) will drive: a per-prefix token bucket, priority
 -- queue, message chunker, and our own compact binary state schema.

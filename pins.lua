@@ -1,4 +1,4 @@
--- Daseeki Network — pins.lua
+-- Daseeki Nexus — pins.lua
 -- Felwood songflower / tuber node pins on the world map and minimap, driven by
 -- Timers.NODES (16 fixed nodes) + the NODE_UPDATED callback.
 --
@@ -64,12 +64,19 @@ local function nodeState(kind, index)
     return { state = "unknown", remaining = 0 }
 end
 
--- Amber literal (no warn token; matches hud.lua's WARN_RGB choice).
+-- Respawning ("down") pins tint amber via Core's `warn` token; fall back to the
+-- historical literal on an older Core that predates the token (UI.Color yields
+-- white for an unknown token, so detect presence via UI.Token).
+local WARN_RGB = { 0.96, 0.76, 0.18 }
+local function warnColor()
+    if UI.Token and type(UI.Token("warn")) == "table" then return UI.Color("warn") end
+    return WARN_RGB[1], WARN_RGB[2], WARN_RGB[3], 1
+end
 local function tintForState(tex, state)
     if state == "up" then
         tex:SetVertexColor(UI.Color("ok"))
     elseif state == "down" then
-        tex:SetVertexColor(0.96, 0.76, 0.18)
+        tex:SetVertexColor(warnColor())
     else
         tex:SetVertexColor(UI.Color("faint"))
     end

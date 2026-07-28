@@ -1,6 +1,6 @@
--- Daseeki Network — syncns.lua  (WAVE N4b: SUITE-INTEGRATION NAMESPACES)
+-- Daseeki Nexus — syncns.lua  (WAVE N4b: SUITE-INTEGRATION NAMESPACES)
 --
--- Two suite-wide namespaces that Daseeki-Network owns and publishes so the
+-- Two suite-wide namespaces that Daseeki-Nexus owns and publishes so the
 -- rest of the addon suite (Bags today, everything later) can consume shared
 -- transport without re-implementing it:
 --
@@ -45,7 +45,7 @@ local Daseeki = Daseeki
 --
 -- N5 MIGRATION (declaration swap — do these together, Bags + Network release):
 --   1. Remove `DaseekiWoWHelperRemote` from Daseeki-Bags.toc SavedVariables.
---   2. Add `DaseekiWoWHelperRemote` to Daseeki-Network.toc SavedVariables.
+--   2. Add `DaseekiWoWHelperRemote` to Daseeki-Nexus.toc SavedVariables.
 --   3. One-time data migration honoring the SV-safety gate: with Network's SV
 --      now authoritative, the first Network load inherits the existing on-disk
 --      table (WoW loads it into the same global name), so NO copy step is

@@ -1,4 +1,4 @@
--- Daseeki Network — hud.lua
+-- Daseeki Nexus — hud.lua
 -- On-screen HUD: pull-timer bars (+ mover mode), screen alert banner, the
 -- four-channel alert dispatcher (notify/chat/flash/sound), and the Cancel
 -- Buffs popup (tracked-aura grid + Chronoboon Boon/Unboon).
@@ -37,13 +37,16 @@ end
 local function frameClock() return (GetTime and GetTime()) or 0 end
 local function lower(s) return s and s:lower() or "" end
 
--- The framework has no warn/amber token (only ok / danger). The pull-bar
--- traffic-light needs a distinct yellow that reads as "warn" across every
--- theme (accent is blue in the Slate theme, so it cannot serve). We define a
--- fixed amber literal and route it through UI.Skin so it can be promoted to a
--- real token later without touching call sites.  ⚠ DEVIATION (documented).
+-- Pull-bar traffic-light "warn" amber. Core now ships a `warn` theme token, so
+-- prefer it (per-theme amber, re-skins on ThemeChanged). Fall back to the
+-- historical literal when running against an older Core that predates the token
+-- (UI.Color returns white for an unknown token, so detect presence via UI.Token
+-- rather than accept a white flash).
 local WARN_RGB = { 0.96, 0.76, 0.18 }
-local function warnColor() return WARN_RGB[1], WARN_RGB[2], WARN_RGB[3], 1 end
+local function warnColor()
+    if UI.Token and type(UI.Token("warn")) == "table" then return UI.Color("warn") end
+    return WARN_RGB[1], WARN_RGB[2], WARN_RGB[3], 1
+end
 
 -- Current real-zone name, lowercased.
 local function zoneNow()
@@ -183,7 +186,7 @@ end
 local banner
 local function ensureBanner()
     if banner then return banner end
-    local f = CreateFrame("Frame", "DaseekiNetworkBanner", UIParent)
+    local f = CreateFrame("Frame", "DaseekiNexusBanner", UIParent)
     f:SetSize(700, 60)
     f:SetPoint("TOP", UIParent, "TOP", 0, -170)
     f:SetFrameStrata("HIGH")
@@ -322,7 +325,7 @@ local function ensureGroups()
     if mainGroup then return end
 
     local function makeGroup(name, defPoint, defX, defY, sizeKeyW, sizeKeyH)
-        local g = CreateFrame("Frame", "DaseekiNetworkBars" .. name, UIParent)
+        local g = CreateFrame("Frame", "DaseekiNexusBars" .. name, UIParent)
         g:SetSize(cfg(sizeKeyW, 220), 40)
         g:SetFrameStrata("MEDIUM")
         g._posKey = name        -- "Main" / "Small"
@@ -619,7 +622,7 @@ function HUD.ShowMover()
     local smallH = cfg("smallHeight", math.max(12, mainH - 4))
 
     if not mover then
-        mover = CreateFrame("Frame", "DaseekiNetworkMover", UIParent)
+        mover = CreateFrame("Frame", "DaseekiNexusMover", UIParent)
         mover:SetAllPoints(UIParent)
         mover:SetFrameStrata("DIALOG")
         mover:EnableMouse(true)   -- swallow clicks to the world beneath
@@ -729,7 +732,7 @@ end
 local cancelPopup
 
 local function buildCancelPopup()
-    local f = CreateFrame("Frame", "DaseekiNetworkCancelBuffs", UIParent)
+    local f = CreateFrame("Frame", "DaseekiNexusCancelBuffs", UIParent)
     local COLS, CELL, PAD, GAP = 3, 74, 12, 8
     local rows = math.ceil(#CANCEL_AURAS / COLS)
     local gridW = COLS * CELL + (COLS - 1) * GAP
@@ -804,7 +807,7 @@ local function buildCancelPopup()
 
     -- Boon / Unboon secure use-item buttons (Chronoboon Displacer).
     local function makeItemButton(name, text, xoff)
-        local b = CreateFrame("Button", "DaseekiNetwork" .. name, f, "SecureActionButtonTemplate")
+        local b = CreateFrame("Button", "DaseekiNexus" .. name, f, "SecureActionButtonTemplate")
         b:SetSize((gridW - GAP) / 2, 24)
         b:SetPoint("BOTTOMLEFT", f, "BOTTOMLEFT", PAD + xoff, PAD)
         b:SetAttribute("type", "item")
