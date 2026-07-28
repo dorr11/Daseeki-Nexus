@@ -492,14 +492,48 @@ function Mesh.PruneDedup(t)
     end
 end
 
+-- Extract the session component of a message id. MakeMessageId() builds
+-- "<aid>-<base36 session>-<base36 seq>" and the account id is always a 1-2 digit
+-- number (core.lua ns:IsValidAccountID), so a well-formed id is exactly three
+-- dash-delimited tokens with no internal dashes. The middle token identifies the
+-- SENDER SESSION; a fresh login/reload randomises it (see Mesh.OnLogin), which is
+-- how FreshSeq tells a sender's pre- and post-reload frames apart. Anything that
+-- does not match the three-token shape is malformed -> "?" (a shared fallback
+-- session slot: the frame still dispatches, it just can't drive a seq reset).
+local function sessionOfMsgId(msgId)
+    if type(msgId) ~= "string" then return "?" end
+    local _, sess, _ = msgId:match("^([^-]+)%-([^-]+)%-([^-]+)$")
+    if sess and sess ~= "" then return sess end
+    return "?"
+end
+Mesh._SessionOfMsgId = sessionOfMsgId   -- exposed for the seq self-tests
+
 -- Session-sequence check: reject stale/out-of-order frames from a sender.
 -- Returns true if the frame is fresh (and records the new high-water mark).
-function Mesh.FreshSeq(sender, seq)
+--
+-- `sess` is the sender's session id (from the frame's msgId). The high-water
+-- record is stored as { sess=<string>, last=<number> } PER (sender,prefix) key.
+-- When the incoming session differs from the stored one the sender has restarted
+-- (e.g. a /reload reset its outgoing seq counter back toward 0): we adopt the new
+-- session and reset the high-water to 0 before comparing, so the fresh session's
+-- low seqs are NOT stale-dropped against the previous session's high-water. This
+-- is the core reload wedge fix — without it a reloaded sender's STATE/HEARTBEAT
+-- frames are silently dropped until its counter climbs past the old mark.
+function Mesh.FreshSeq(sender, seq, sess)
     seq = tonumber(seq) or 0
     if seq == 0 then return true end   -- unsequenced ops (ping/ack) always pass
-    local last = Mesh._inSeq[sender] or 0
-    if seq <= last then return false end
-    Mesh._inSeq[sender] = seq
+    sess = sess or "?"
+    local rec = Mesh._inSeq[sender]
+    if not rec then
+        rec = { sess = sess, last = 0 }
+        Mesh._inSeq[sender] = rec
+    elseif rec.sess ~= sess then
+        -- New sender session: reset the high-water and adopt the new session id.
+        rec.sess = sess
+        rec.last = 0
+    end
+    if seq <= rec.last then return false end
+    rec.last = seq
     return true
 end
 
@@ -1065,9 +1099,11 @@ function Mesh.Dispatch(prefix, frame, sender)
     if not f then return end
     -- Dedup + session freshness. Freshness is keyed per (sender, prefix): seqs
     -- come from one global counter, so cross-prefix interleaving must not let a
-    -- higher-seq message on one prefix stale out a lower-seq one on another.
+    -- higher-seq message on one prefix stale out a lower-seq one on another. The
+    -- session token (middle of the msgId) lets a sender's /reload reset its seq
+    -- counter without the receiver's stale-water dropping every fresh frame.
     if Mesh.SeenBefore(f.msgId) then return end
-    if not Mesh.FreshSeq(sender .. "\1" .. prefix, f.seq) then return end
+    if not Mesh.FreshSeq(sender .. "\1" .. prefix, f.seq, sessionOfMsgId(f.msgId)) then return end
 
     local op = f.op
     if op == OP.STATE then          handleState(f, sender, false)
@@ -1946,8 +1982,19 @@ local function onChatMsgAddon(event, prefix, text, channel, sender)
 end
 
 function Mesh.OnLogin()
-    -- Randomise the session id so message ids don't collide across relogs.
-    Mesh._sessionId = (math.random and math.random(1, 16777216)) or 1
+    -- Session id prefixes every message id (MakeMessageId) and now DRIVES the
+    -- per-session seq reset in FreshSeq, so two consecutive sessions producing the
+    -- same id would defeat the reload fix. Pure random(1,2^24) had a small but real
+    -- birthday collision chance across relogs; mix wall-clock seconds with a random
+    -- jitter so the common rapid-reload case can never collide (time advances) and
+    -- sub-second reloads are separated by the jitter. No determinism need here — the
+    -- id is intentionally unique-per-session, never reproduced. Product stays well
+    -- under 2^53 so toBase36 is exact (time ~1.8e9 * 8192 + jitter < 1.5e13).
+    local t = math.floor(((Store and Store.Now and Store.Now())
+        or (time and time()) or 0))
+    local jitter = (math.random and math.random(0, 8191)) or 0
+    Mesh._sessionId = t * 8192 + jitter
+    if Mesh._sessionId <= 0 then Mesh._sessionId = jitter + 1 end
 
     -- Subscribe to inbound addon messages.
     ns:RegisterEvent("CHAT_MSG_ADDON", onChatMsgAddon)
@@ -2196,12 +2243,66 @@ local function testFrameRoundTrip()
 end
 
 local function testFreshSeq()
+    -- (a) Same-session ordering: duplicate + stale rejected, newer accepted,
+    -- unsequenced (seq 0) always passes. sess held constant = "A".
     Mesh._inSeq = {}
-    if not Mesh.FreshSeq("S", 5) then return false, "first seq rejected" end
-    if Mesh.FreshSeq("S", 5) then return false, "duplicate seq accepted" end
-    if Mesh.FreshSeq("S", 4) then return false, "stale seq accepted" end
-    if not Mesh.FreshSeq("S", 6) then return false, "newer seq rejected" end
-    if not Mesh.FreshSeq("S", 0) then return false, "unsequenced op rejected" end
+    if not Mesh.FreshSeq("S", 5, "A") then return false, "first seq rejected" end
+    if Mesh.FreshSeq("S", 5, "A") then return false, "duplicate seq accepted" end
+    if Mesh.FreshSeq("S", 4, "A") then return false, "stale seq accepted" end
+    if not Mesh.FreshSeq("S", 6, "A") then return false, "newer seq rejected" end
+    if not Mesh.FreshSeq("S", 0, "A") then return false, "unsequenced op rejected" end
+    -- (a) explicit: seq 5 then 3 within one session -> the 3 must drop.
+    Mesh._inSeq = {}
+    if not Mesh.FreshSeq("S", 5, "A") then return false, "seq5 rejected" end
+    if Mesh.FreshSeq("S", 3, "A") then return false, "stale seq3 accepted after 5" end
+
+    -- (b) Sender SESSION RESTART: a high seq on session A, then seq 1 on session B
+    -- (a /reload reset the sender's counter) MUST be accepted, not stale-dropped.
+    -- This is the exact wedge the fix targets.
+    Mesh._inSeq = {}
+    if not Mesh.FreshSeq("S", 900, "A") then return false, "sessA seq900 rejected" end
+    if not Mesh.FreshSeq("S", 1, "B") then return false, "sessB seq1 stale-dropped (the bug)" end
+    -- ...and ordering resumes within the new session.
+    if not Mesh.FreshSeq("S", 2, "B") then return false, "sessB seq2 rejected" end
+    if Mesh.FreshSeq("S", 1, "B") then return false, "sessB seq1 replay accepted" end
+    -- A late straggler from the OLD session (higher seq, old sess) is treated as a
+    -- session switch back and accepted once — acceptable: sessions don't interleave
+    -- in practice, and the alternative (tracking every past session) is unbounded.
+    if not Mesh.FreshSeq("S", 950, "A") then return false, "session switch not adopted" end
+
+    -- (c) Cross-prefix independence: Dispatch keys FreshSeq by sender.."\1"..prefix,
+    -- so a low seq on one prefix must not be staled by a high seq on another.
+    Mesh._inSeq = {}
+    if not Mesh.FreshSeq("Sndr\1P1", 10, "A") then return false, "prefix1 seq rejected" end
+    if not Mesh.FreshSeq("Sndr\1P2", 4, "A") then return false, "prefix2 low seq wrongly staled" end
+    if Mesh.FreshSeq("Sndr\1P1", 4, "A") then return false, "prefix1 stale accepted" end
+    if not Mesh.FreshSeq("Sndr\1P2", 5, "A") then return false, "prefix2 newer rejected" end
+    return true
+end
+
+-- (d) A malformed msgId must not crash Dispatch and must still route to its
+-- handler. Also covers the session-token extractor directly.
+local function testMalformedMsgId()
+    if Mesh._SessionOfMsgId("7-a-b") ~= "a" then return false, "session token misparsed" end
+    if Mesh._SessionOfMsgId("12-zz-1") ~= "zz" then return false, "2-digit aid misparsed" end
+    if Mesh._SessionOfMsgId("garbage") ~= "?" then return false, "no-dash id not '?'" end
+    if Mesh._SessionOfMsgId(nil) ~= "?" then return false, "nil id not '?'" end
+    if Mesh._SessionOfMsgId("7-a-b-c") ~= "?" then return false, "overlong id not '?'" end
+    if Mesh._SessionOfMsgId("7--b") ~= "?" then return false, "empty session not '?'" end
+
+    -- Hand-build a SETTINGS frame with a deliberately malformed msgId and dispatch
+    -- it; the handler fires MESH_SETTINGS_RECEIVED, giving an observable hook.
+    local got = false
+    ns:On("MESH_SETTINGS_RECEIVED", function() got = true end)
+    Mesh._inSeq = {}; Mesh._seenIds = {}
+    local payload = Mesh.Pack({ syncId = "mal-test" })
+    if not payload then return false, "pack unavailable (harness lib gap)" end
+    local frame = table.concat({
+        Mesh.PROTO_VERSION, Mesh.OP.SETTINGS, "garbage", "1", "", payload
+    }, "\t")
+    local ok = pcall(Mesh.Dispatch, Protocol.PREFIX.SYNC, frame, "Mal-Sender")
+    if not ok then return false, "Dispatch crashed on malformed msgId" end
+    if not got then return false, "malformed-id frame did not dispatch" end
     return true
 end
 
@@ -2545,6 +2646,7 @@ function Mesh.RunSelfTests(verbose)
         { name = "dedup window",     fn = testDedupWindow },
         { name = "frame round-trip", fn = testFrameRoundTrip },
         { name = "session seq",      fn = testFreshSeq },
+        { name = "malformed msgId",  fn = testMalformedMsgId },
         { name = "failure skip",     fn = testFailureSkip },
         { name = "join state machine", fn = testJoinStateMachine },
         { name = "reload race rejoin", fn = testReloadRace },
