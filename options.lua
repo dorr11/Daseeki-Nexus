@@ -353,7 +353,10 @@ local function buildTextArea(flow, opts)
     host.Refresh = function() box:SetText(opts.get and (opts.get() or "") or "") end
     host.arrange = function(width)
         host:SetWidth(width); host:SetHeight(height)
+        -- Fill the viewport; the multiline editbox scrolls its own content natively
+        -- when the cursor moves past the visible area (short name lists rarely overflow).
         box:SetWidth(math.max(1, width - 12))
+        box:SetHeight(math.max(1, height - 10))
         return height
     end
     UI.Skin(host, function() end)
