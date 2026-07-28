@@ -388,7 +388,7 @@ local function buildGeneral(flow)
 
     -- ── Behaviour ─────────────────────────────────────────────────────────────
     local sec = flow:AddSection("General")
-    sec:Hint("Core behaviour and this account's mesh identity.")
+    sec:Hint("Core behaviour for this account.")
     -- Parent/child: the lock toggle indents beneath its minimap-button parent
     -- (round-3 item 16).
     local r1 = sec:AddRow({ vAlign = "center" })
@@ -416,26 +416,6 @@ local function buildGeneral(flow)
         get = function() local db = DB(); return db and db.autoAssistAll end,
         set = function(v) local db = DB(); if db then db.autoAssistAll = v and true or false end end,
     }).Refresh)
-
-    -- Account ID with validation feedback.
-    local acctRow = sec:AddRow({ vAlign = "center" })
-    acctRow:Label("Account ID")
-    local acctStatus
-    local acctBox = acctRow:EditBox({
-        width = 70,
-        get = function() return ns:GetAccountID() end,
-        set = function(v)
-            v = tostring(v or ""):gsub("%s", "")
-            local ok, err = ns:SetAccountID(v)
-            if acctStatus then
-                if ok then acctStatus._label:SetText("|cff66dd66saved|r")
-                else acctStatus._label:SetText("|cffdd6666" .. (err or "invalid") .. "|r") end
-            end
-        end,
-    })
-    acctBox._fillWidth = false
-    acctStatus = acctRow:Label("")
-    sec:Hint("1-2 digits (e.g., 1, 02). Must be different on each account.")
 
     -- Location-data status line (round-3 item 16): green when every own
     -- active-faction level-60 has a usable location, amber when some are missing.
@@ -807,7 +787,15 @@ local function buildMesh(flow)
     local function chanRaw() local db = DB(); return (db and db.mesh.channel) or "" end
     local function tokRaw()  local db = DB(); return (db and db.mesh.token) or "" end
 
-    -- Reusable masked credential field (label + masked editbox + eye + status).
+    -- Configured = both credentials present and well-formed. Declared up here because
+    -- the Enable toggle (which now leads the section) and the configured-status line
+    -- both close over it (round-3 item 38).
+    local function isConfigured()
+        local c, t = chanRaw(), tokRaw()
+        return #c >= 16 and c:match("^%w+$") and #t == 6 and t:match("^%w+$") and true or false
+    end
+
+    -- Reusable masked credential field (label + masked editbox + Show/Hide + status).
     local function maskedField(labelText, width, getRaw, setRaw, validate)
         local row = flow:AddRow({ vAlign = "center" })
         local lbl = row:Label(labelText); lbl.uiWidth = 64; lbl._label:SetWidth(64)
@@ -829,8 +817,10 @@ local function buildMesh(flow)
             end,
         })
         box._fillWidth = false
-        row:Button({ text = "Eye", width = 44, variant = "quiet", onClick = function()
+        local eyeBtn
+        eyeBtn = row:Button({ text = "Show", width = 48, variant = "quiet", onClick = function()
             revealed.on = not revealed.on
+            eyeBtn._label:SetText(revealed.on and "Hide" or "Show")
             if box.Refresh then box.Refresh() end
         end })
         status = row:Label("")
@@ -841,32 +831,8 @@ local function buildMesh(flow)
         return box
     end
 
-    maskedField("Channel", 200, chanRaw,
-        function(v) local db = DB(); if db then db.mesh.channel = v end end,
-        function(v)
-            if v == "" then return "" end
-            if #v >= 16 and v:match("^%w+$") then return "|cff66dd66valid|r" end
-            return "|cffddaa44needs 16+ alphanumerics|r"
-        end)
-    flow:Hint("16+ alphanumeric, case sensitive, same on all accounts.")
-
-    maskedField("Token", 160, tokRaw,
-        function(v) local db = DB(); if db then db.mesh.token = v end end,
-        function(v)
-            if v == "" then return "" end
-            if #v == 6 and v:match("^%w+$") then return "|cff66dd66valid|r" end
-            return "|cffddaa44needs 6 alphanumerics|r"
-        end)
-    flow:Hint("Exactly 6 alphanumeric, same on all accounts.")
-
-    -- Configured = both credentials present and well-formed. Surfaced beneath the
-    -- Enable toggle (round-3 item 38).
-    local function isConfigured()
-        local c, t = chanRaw(), tokRaw()
-        return #c >= 16 and c:match("^%w+$") and #t == 6 and t:match("^%w+$") and true or false
-    end
-
-    -- Enable toggle — WIRED to StartJoinSequence / OnDisable.
+    -- Enable toggle leads the section — it is the master switch (owner task 2a).
+    -- WIRED to StartJoinSequence / OnDisable.
     local enRow = flow:AddRow({ vAlign = "center" })
     register("mesh", enRow:Checkbox({
         label = "Enable mesh",
@@ -891,13 +857,47 @@ local function buildMesh(flow)
             refreshPage("mesh")
         end,
     }).Refresh)
-    register("mesh", enRow:Checkbox({
-        label = "Suppress mesh-disabled alert",
-        get = function() local db = DB(); return db and db.mesh.optOut end,
-        set = function(v) local db = DB(); if db then db.mesh.optOut = v and true or false end end,
-    }).Refresh)
 
-    -- Not-configured status line beneath the Enable toggle (round-3 item 38).
+    -- Account ID leads the credential group — the mesh keys off this identity, so it
+    -- sits directly above the channel/token (relocated here from General per owner).
+    local acctRow = flow:AddRow({ vAlign = "center" })
+    acctRow:Label("Account ID")
+    local acctStatus
+    local acctBox = acctRow:EditBox({
+        width = 70,
+        get = function() return ns:GetAccountID() end,
+        set = function(v)
+            v = tostring(v or ""):gsub("%s", "")
+            local ok, err = ns:SetAccountID(v)
+            if acctStatus then
+                if ok then acctStatus._label:SetText("|cff66dd66saved|r")
+                else acctStatus._label:SetText("|cffdd6666" .. (err or "invalid") .. "|r") end
+            end
+        end,
+    })
+    acctBox._fillWidth = false
+    acctStatus = acctRow:Label("")
+    flow:Hint("1-2 digits (e.g., 1, 02). Must be different on each account.")
+
+    maskedField("Channel", 200, chanRaw,
+        function(v) local db = DB(); if db then db.mesh.channel = v end end,
+        function(v)
+            if v == "" then return "" end
+            if #v >= 16 and v:match("^%w+$") then return "|cff66dd66valid|r" end
+            return "|cffddaa44needs 16+ alphanumerics|r"
+        end)
+    flow:Hint("16+ alphanumeric, case sensitive, same on all accounts.")
+
+    maskedField("Token", 160, tokRaw,
+        function(v) local db = DB(); if db then db.mesh.token = v end end,
+        function(v)
+            if v == "" then return "" end
+            if #v == 6 and v:match("^%w+$") then return "|cff66dd66valid|r" end
+            return "|cffddaa44needs 6 alphanumerics|r"
+        end)
+    flow:Hint("Exactly 6 alphanumeric, same on all accounts.")
+
+    -- Not-configured status line beneath the credentials (round-3 item 38).
     local cfgStatus = flow:AddRow():Label("")
     register("mesh", function()
         if isConfigured() then
@@ -906,6 +906,16 @@ local function buildMesh(flow)
             cfgStatus._label:SetText("|cffddaa44Set a channel and token first.|r")
         end
     end)
+
+    -- Suppress mesh-disabled alert — a notification preference. It formerly shared the
+    -- Enable row; since Enable now leads the section alone, this keeps its own row
+    -- rather than crowding a third checkbox onto the transport-toggle row below.
+    local suppRow = flow:AddRow({ vAlign = "center" })
+    register("mesh", suppRow:Checkbox({
+        label = "Suppress mesh-disabled alert",
+        get = function() local db = DB(); return db and db.mesh.optOut end,
+        set = function(v) local db = DB(); if db then db.mesh.optOut = v and true or false end end,
+    }).Refresh)
 
     local alRow = flow:AddRow({ vAlign = "center" })
     register("mesh", alRow:Checkbox({
@@ -921,7 +931,8 @@ local function buildMesh(flow)
 
     -- ── Active accounts table (round-3 item 32) ───────────────────────────────
     local acc = flow:AddSection("Accounts")
-    acc:Hint("Account-wide. Local management only — nothing is broadcast across the mesh.")
+    -- (Section description intentionally omitted — owner crossed out the
+    -- "Account-wide. Local management only…" line; header + table remain.)
     local capLabel = acc:AddRow():Label("Mesh capacity: 1 / " .. MESH_CAP)
     register("mesh", function()
         capLabel._label:SetText("Mesh capacity: " .. math.min(MESH_CAP, math.max(1, knownAccountCount())) .. " / " .. MESH_CAP)
