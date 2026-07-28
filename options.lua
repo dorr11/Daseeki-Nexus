@@ -420,7 +420,6 @@ function Options.CopyFaction(from, to)
             dst.autoGossip.dmf.buffType.PALADIN = keepPal
             dst.autoGossip.dmf.buffType.SHAMAN = keepSha
             dst.autoQuest = clone(src.autoQuest)
-            dst.autoInteract = clone(src.autoInteract)
             -- auraOpts.thresholds preserved; Rend/BS rules copy (they are class rules,
             -- not thresholds).
             dst.auraOpts.rend = clone(src.auraOpts.rend)
