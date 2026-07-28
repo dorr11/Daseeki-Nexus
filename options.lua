@@ -41,7 +41,7 @@ local AURA_DEFS = {
     { key = "ony",      label = "Ony (Rallying Cry)",     spellID = 22888 },  -- Rallying Cry
     { key = "dmtAP",    label = "DMT AP (Fengus' Ferocity)", spellID = 22817 },  -- Fengus' Ferocity
     { key = "dmtSP",    label = "DMT SP (Slip'kik's Savvy)", spellID = 22820 },  -- Slip'kik's Savvy
-    { key = "dmtStam",  label = "DMT Stam (Mol'dar's Moxie)", spellID = 22801 },  -- Mol'dar's Moxie
+    { key = "dmtStam",  label = "DMT Stam (Mol'dar's Moxie)", spellID = 22818 },  -- Mol'dar's Moxie
     { key = "songflower", label = "SF (Songflower Serenade)", spellID = 15366 },  -- Songflower Serenade
     { key = "zg",       label = "ZG (Spirit of Zandalar)", spellID = 24425 },  -- Spirit of Zandalar
     { key = "rend",     label = "Rend (Warchief's)",      spellID = 16609 },  -- Warchief's Blessing
@@ -59,7 +59,7 @@ local TRIGGER_DEFS = {
     { key = "zg",         abbr = "ZG",       name = "Spirit of Zandalar",    spellID = 24425 },
     { key = "dmtAP",      abbr = "DMT AP",   name = "Fengus' Ferocity",      spellID = 22817 },
     { key = "dmtSP",      abbr = "DMT SP",   name = "Slip'kik's Savvy",      spellID = 22820 },
-    { key = "dmtStam",    abbr = "DMT Stam", name = "Mol'dar's Moxie",       spellID = 22801 },
+    { key = "dmtStam",    abbr = "DMT Stam", name = "Mol'dar's Moxie",       spellID = 22818 },
     { key = "songflower", abbr = "SF",       name = "Songflower Serenade",   spellID = 15366 },
     { key = "rend",       abbr = "Rend",     name = "Warchief's Blessing",   spellID = 16609 },
     { key = "battleShout", abbr = "BS",      name = "Battle Shout",          spellID = 6673  },

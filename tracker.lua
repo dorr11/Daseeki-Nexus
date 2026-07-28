@@ -99,6 +99,19 @@ local DMF_BUFF_PREFIX = "sayge's dark fortune"
 
 local function lower(s) return s and s:lower() or "" end
 
+-- Normalize a tooltip/buff string for NAME matching: lowercased, with any
+-- typographic apostrophe folded to ASCII so "Mol'dar's" / "Fengus'" still match
+-- the ASCII-apostrophe prefixes in BUFF_SLOTS regardless of how the client
+-- renders the glyph. Belt-and-suspenders for the boon parse.
+local function normName(s)
+    s = lower(s)
+    s = s:gsub("\226\128\153", "'")   -- U+2019 RIGHT SINGLE QUOTATION MARK (UTF-8)
+    s = s:gsub("\226\128\152", "'")   -- U+2018 LEFT SINGLE QUOTATION MARK  (UTF-8)
+    s = s:gsub("\194\180", "'")        -- U+00B4 ACUTE ACCENT (UTF-8)
+    s = s:gsub("`", "'")               -- ASCII backtick, occasionally substituted
+    return s
+end
+
 local function selfNameRealm()
     local name = UnitName("player")
     local realm = GetRealmName() or ""
@@ -161,7 +174,7 @@ end
 -- Matches a tracked-slot buff name anywhere in the line (the chronoboon tooltip
 -- lists stored buffs); resolves its slot via BUFF_SLOTS. Pure + self-tested.
 function Tracker.ParseBoonLine(text)
-    text = lower(text)
+    text = normName(text)
     if text == "" then return nil end
     for s = 1, #BUFF_SLOTS do
         local def = BUFF_SLOTS[s]
@@ -172,6 +185,39 @@ function Tracker.ParseBoonLine(text)
         end
     end
     return nil
+end
+
+-- Parse a whole Chronoboon tooltip TEXT BLOCK into a per-slot duration map.
+-- ROOT CAUSE of the "only one buff booned" bug: the live Supercharged Chronoboon
+-- Displacer renders ALL suspended world effects inside a SINGLE tooltip
+-- FontString (one NumLines "line" with embedded newlines), e.g.
+--   "World effects suspended:\nFengus' Ferocity (119m)\nMol'dar's Moxie (120m)\n..."
+-- The old scan called the single-match ParseBoonLine on that whole string, which
+-- returned only the FIRST slot prefix found (slot 1, Rallying Cry) with the FIRST
+-- parenthetical (Fengus' 119m -> "1h 59m"). So exactly one buff booned and its
+-- duration was wrong -- matching the owner's live report precisely.
+--
+-- This scans the block for EVERY tracked-slot buff and pairs each with the
+-- parenthetical that follows ITS OWN name, so ordering and newline-vs-space
+-- separation don't matter. Returns (slots, dmf) where slots[slot] = { duration }.
+function Tracker.ParseBoonBlock(text)
+    local slots, dmf = {}, false
+    text = normName(text)
+    if text == "" then return slots, dmf end
+    for s = 1, #BUFF_SLOTS do
+        local def = BUFF_SLOTS[s]
+        if def.prefix ~= "" then
+            local from = text:find(def.prefix, 1, true)
+            if from then
+                -- Duration = first "(...)" AFTER this buff name starts, so each
+                -- buff resolves to its OWN remaining time, not the block's first.
+                local dur = Tracker.ParseBoonDuration(text:sub(from)) or 0
+                slots[def.slot] = { duration = dur }
+                if def.prefix == DMF_BUFF_PREFIX then dmf = true end
+            end
+        end
+    end
+    return slots, dmf
 end
 
 -- Persist the current parsed boon snapshot to DaseekiNexusData.caches.tooltipBoon
@@ -226,34 +272,38 @@ local function scanTooltipForStoredBuffs()
     -- Confirm this tooltip is actually a chronoboon aura before parsing.
     local firstLine = _G["GameTooltipTextLeft1"]
     local title = firstLine and firstLine.GetText and firstLine:GetText()
-    title = lower(title)
+    title = normName(title)
     local isBoon = false
     for i = 1, #CHRONOBOON_MARKERS do
         if title:find(CHRONOBOON_MARKERS[i], 1, true) then isBoon = true break end
     end
     if not isBoon then return end
 
-    -- Parse every line: count stored buffs AND capture per-slot durations.
-    local slots, dmf, count = {}, false, 0
+    -- Concatenate EVERY tooltip FontString into one normalized text block. The
+    -- live Supercharged Chronoboon Displacer packs all suspended effects into a
+    -- SINGLE FontString with embedded newlines; other clients may split them
+    -- across separate FontStrings. Joining + block-parsing handles both, so all
+    -- stored buffs resolve in one scan (fixes "only one buff booned").
+    local parts = {}
     for i = 1, lines do
         local fs = _G["GameTooltipTextLeft" .. i]
-        local text = lower(fs and fs.GetText and fs:GetText())
-        if text ~= "" then
-            -- Count against the full stored-buff list (incl. non-slot extras).
-            for j = 1, #STORED_BUFF_NAMES do
-                if STORED_BUFF_NAMES[j] ~= "" and text:find(STORED_BUFF_NAMES[j], 1, true) then
-                    count = count + 1
-                    break
-                end
-            end
-            -- Parse tracked-slot identity + duration.
-            local slot, dur, isDMF = Tracker.ParseBoonLine(text)
-            if slot then
-                slots[slot] = { duration = dur }
-                if isDMF then dmf = true end
-            end
+        local t = fs and fs.GetText and fs:GetText()
+        if t and t ~= "" then parts[#parts + 1] = t end
+    end
+    local block = normName(table.concat(parts, "\n"))
+
+    -- Count every stored buff present in the block (each name once). Includes the
+    -- non-slot extras (Boon of Blackfathom / Spark of Inspiration) that still
+    -- count toward boonCount but have no dashboard slot.
+    local count = 0
+    for j = 1, #STORED_BUFF_NAMES do
+        if STORED_BUFF_NAMES[j] ~= "" and block:find(STORED_BUFF_NAMES[j], 1, true) then
+            count = count + 1
         end
     end
+
+    -- Per-slot identity + duration from the whole block (see ParseBoonBlock).
+    local slots, dmf = Tracker.ParseBoonBlock(block)
 
     local parsed = { slots = slots, dmf = dmf, count = count }
     Tracker._boonTooltipCount = count
@@ -640,8 +690,54 @@ local function testBoonParsing(fails)
     ck(Tracker.ParseBoonLine("") == nil, "empty line -> nil")
 end
 
+-- REGRESSION (owner live report): the Supercharged Chronoboon Displacer renders
+-- ALL suspended effects inside ONE tooltip FontString, so the old per-line parse
+-- booned only slot 1 (Rallying Cry) and even showed Fengus' 119m ("1h 59m") on
+-- it. ParseBoonBlock must resolve all seven stored buffs in ONE scan, each with
+-- its OWN minute value. Fixture is the owner's exact 7-line tooltip.
+local function testBoonBlock(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+
+    local FIX =
+        "World effects suspended:\n" ..
+        "Fengus' Ferocity (119m)\n" ..
+        "Mol'dar's Moxie (120m)\n" ..
+        "Rallying Cry of the Dragonslayer (115m)\n" ..
+        "Warchief's Blessing (60m)\n" ..
+        "Spirit of Zandalar (114m)\n" ..
+        "Songflower Serenade (59m)\n" ..
+        "Sayge's Dark Fortune (119m)"
+
+    local slots, dmf = Tracker.ParseBoonBlock(FIX)
+    -- All seven tracked slots resolve, each with its OWN duration:
+    ck(slots[1] and slots[1].duration == 115 * 60, "ony/RallyingCry -> slot1, 115m")
+    ck(slots[2] and slots[2].duration ==  60 * 60, "rend/Warchief -> slot2, 60m")
+    ck(slots[3] and slots[3].duration == 114 * 60, "zg/Zandalar -> slot3, 114m")
+    ck(slots[4] and slots[4].duration ==  59 * 60, "songflower -> slot4, 59m")
+    ck(slots[5] and slots[5].duration == 119 * 60, "dmf/Sayge -> slot5, 119m")
+    ck(slots[6] and slots[6].duration == 119 * 60, "dmtAP/Fengus -> slot6, 119m")
+    ck(slots[7] and slots[7].duration == 120 * 60, "dmtStam/Mol'dar -> slot7, 120m")
+    ck(dmf == true, "Sayge present -> dmf flagged")
+
+    local n = 0; for _ in pairs(slots) do n = n + 1 end
+    ck(n == 7, "all 7 tracked slots resolved in one scan (got " .. n .. ")")
+
+    -- Guard the exact visible symptom: slot 1 must NOT inherit Fengus' 119m.
+    ck(not (slots[1] and slots[1].duration == 119 * 60), "slot1 must not show Fengus' 119m (1h59m)")
+
+    -- Apostrophe robustness: same fixture with typographic apostrophes (U+2019)
+    -- must still resolve the apostrophe-named DMT buffs.
+    local CURLY = FIX:gsub("'", "\226\128\153")
+    local cs = Tracker.ParseBoonBlock(CURLY)
+    ck(cs[6] and cs[6].duration == 119 * 60, "curly-apos Fengus -> slot6, 119m")
+    ck(cs[7] and cs[7].duration == 120 * 60, "curly-apos Mol'dar -> slot7, 120m")
+end
+
 function Tracker.RunSelfTests(verbose)
-    local suites = { { name = "boon parsing", fn = testBoonParsing } }
+    local suites = {
+        { name = "boon parsing", fn = testBoonParsing },
+        { name = "boon block (owner 7-line fixture)", fn = testBoonBlock },
+    }
     local allPass = true
     for _, suite in ipairs(suites) do
         local f = {}
