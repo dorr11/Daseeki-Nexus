@@ -282,6 +282,24 @@ function Dashboard.FormatDuration(sec, style)
     return ("%ds"):format(s)
 end
 
+-- Client-side decay of a stored remaining-cooldown value. A record carries the
+-- seconds remaining AT THE MOMENT it was captured (rec.lastDataUpdate); for a
+-- REMOTE character no fresh update may arrive for minutes, so the displayed
+-- countdown must age locally: remaining = stored - (now - lastUpdate), floored at
+-- 0 (an elapsed cooldown reads "ready"). For the self record lastUpdate ~= now so
+-- the subtraction is ~0. Clock skew (future lastUpdate) clamps elapsed to 0 so a
+-- remote clock ahead of ours can't inflate the countdown. Pure + self-tested.
+function Dashboard.DecayRemaining(stored, lastUpdate, nowE)
+    stored = tonumber(stored) or 0
+    if stored <= 0 then return 0 end
+    if nowE == nil then nowE = Dashboard.Now() end
+    local elapsed = nowE - (tonumber(lastUpdate) or 0)
+    if elapsed < 0 then elapsed = 0 end
+    local rem = stored - elapsed
+    if rem < 0 then rem = 0 end
+    return math.floor(rem)
+end
+
 -- "Updated 3m ago" style freshness string from an epoch.
 function Dashboard.FreshnessText(epoch)
     if not epoch or epoch <= 0 then return "no data" end
@@ -1143,9 +1161,10 @@ end
 ----------------------------------------------------------------------
 
 local function installStatusTicker(w)
-    local accum = 0
+    local accum, accumTab = 0, 0
     w:SetScript("OnUpdate", function(self, elapsed)
         accum = accum + elapsed
+        accumTab = accumTab + elapsed
         -- Pulse (every frame) for red-flagged world-buff cells.
         if self.status then
             local t = GetTime()
@@ -1159,6 +1178,16 @@ local function installStatusTicker(w)
         if accum >= 0.25 then
             accum = 0
             Dashboard.RefreshStatusBar()
+        end
+        -- Active-tab repaint ~1/sec so time-based cell text (chrono/hearth
+        -- cooldown countdowns, "Updated Xm ago" freshness) ticks down on its own
+        -- via this SHARED ticker — no per-card OnUpdate. Suppressed mid drag-
+        -- reorder so a relayout can't yank the card out from under the cursor.
+        if accumTab >= 1 then
+            accumTab = 0
+            if not Dashboard._rosterDragging then
+                Dashboard.RefreshActive()
+            end
         end
     end)
 end
@@ -1533,14 +1562,20 @@ function Dashboard.BuildDetailPanel(parent)
         local boonIcon = ("|T%s:14:14|t"):format(Dashboard.ItemIcon(184937))  -- Chronoboon Displacer
         local boonState = rec.chronoboonActive and Dashboard.Colored("Active", "ok")
             or (((rec.boonCount or 0) > 0) and Dashboard.Colored("Ready", "ok") or Dashboard.Colored("None", "faint"))
-        line(("Chronoboon: %s %d in bags · %s"):format(boonIcon, rec.boonCount or 0, boonState), "body")
+        local chronoCDrem = Dashboard.DecayRemaining(rec.itemCooldown, rec.lastDataUpdate, now())
+        local chronoLine = ("Chronoboon: %s %d in bags · %s"):format(boonIcon, rec.boonCount or 0, boonState)
+        if chronoCDrem > 0 then
+            chronoLine = chronoLine .. " · " .. Dashboard.Colored("CD " .. Dashboard.FormatDuration(chronoCDrem), "muted")
+        end
+        line(chronoLine, "body")
         local dmfState
         if rec.dmfInBoon then dmfState = Dashboard.Colored("in Boon", "ok")
         elseif rec.dmfCooldownActive then dmfState = Dashboard.Colored("on cooldown", "muted")
         else dmfState = Dashboard.Colored("DMFable", "ok") end
         line(("Darkmoon fortune: %s · %s"):format(dmfState, Dashboard.FreshnessText(rec.lastDataUpdate)), "body")
-        if (rec.hearthstoneCD or 0) > 0 then
-            line("Hearthstone: " .. Dashboard.FormatDuration(rec.hearthstoneCD), "body")
+        local hearthCDrem = Dashboard.DecayRemaining(rec.hearthstoneCD, rec.lastDataUpdate, now())
+        if hearthCDrem > 0 then
+            line("Hearthstone: " .. Dashboard.FormatDuration(hearthCDrem), "body")
         else
             line("Hearthstone: Ready", "body")
         end
@@ -1722,10 +1757,12 @@ function Dashboard.BuildRosterPane(host, opts)
         card:RegisterForDrag("LeftButton")
         card:SetScript("OnDragStart", function(self)
             R._dragging = self
+            Dashboard._rosterDragging = true   -- pause the shared 1s tab repaint
             self:SetAlpha(0.5)
         end)
         card:SetScript("OnDragStop", function(self)
             self:SetAlpha(1)
+            Dashboard._rosterDragging = nil
             R._insLine:Hide()
             local target = R._dropIndex
             R._dragging = nil
@@ -1889,16 +1926,37 @@ local function testAuraClassRules(fails)
     ck(a5 == true and r5 == "required", "ZG stays required-by-default (not class-ruled)")
 end
 
+-- Self-test: client-side cooldown decay (Task 2). A stored remaining value ages
+-- by wall-clock elapsed since capture, floored at 0, so a remote card's chrono/
+-- hearth countdown decays without a fresh update.
+local function testDecayRemaining(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    ck(Dashboard.DecayRemaining(3600, 1000, 1100) == 3500, "3600 stored, 100s elapsed -> 3500")
+    ck(Dashboard.DecayRemaining(3600, 1000, 4600) == 0, "exactly elapsed -> 0")
+    ck(Dashboard.DecayRemaining(3600, 1000, 999999) == 0, "over-elapsed floors at 0")
+    ck(Dashboard.DecayRemaining(0, 1000, 1100) == 0, "0 stored -> 0")
+    ck(Dashboard.DecayRemaining(3600, 2000, 1000) == 3600, "future lastUpdate clamps elapsed to 0")
+    ck(Dashboard.DecayRemaining(nil, nil, 1000) == 0, "nil stored -> 0")
+end
+
 if ns.RegisterSelfTest then
     ns:RegisterSelfTest("dashboard", function(verbose)
-        local fails = {}
-        local ok = pcall(testAuraClassRules, fails)
-        local passed = ok and #fails == 0
-        if verbose and ns and ns.Print then
-            if passed then ns:Print("  PASS dashboard/aura class rules")
-            elseif not ok then ns:Print("  FAIL dashboard/aura class rules :: error in test")
-            else for _, f in ipairs(fails) do ns:Print("  FAIL dashboard/aura class rules :: " .. f) end end
+        local cases = {
+            { name = "aura class rules", fn = testAuraClassRules },
+            { name = "cooldown decay", fn = testDecayRemaining },
+        }
+        local allPass = true
+        for _, c in ipairs(cases) do
+            local fails = {}
+            local ok = pcall(c.fn, fails)
+            local passed = ok and #fails == 0
+            if not passed then allPass = false end
+            if verbose and ns and ns.Print then
+                if passed then ns:Print("  PASS dashboard/" .. c.name)
+                elseif not ok then ns:Print("  FAIL dashboard/" .. c.name .. " :: error in test")
+                else for _, f in ipairs(fails) do ns:Print("  FAIL dashboard/" .. c.name .. " :: " .. f) end end
+            end
         end
-        return passed
+        return allPass
     end)
 end

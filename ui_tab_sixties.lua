@@ -143,6 +143,13 @@ local function makeCard(parent)
     card.chrono.icon = chIc
     card.chrono:Hide()
 
+    -- Chronoboon Displacer USE-cooldown countdown, LEFT of the chrono icon
+    -- (mirrors the hearthstone's cooldown label below it). Small + muted; hidden
+    -- when the item is ready (icon-only). Decays client-side for remote records.
+    card.chronoCD = fstr(card, "small")
+    card.chronoCD:SetPoint("RIGHT", card.chrono, "LEFT", -3, 0)
+    card.chronoCD:SetJustifyH("RIGHT")
+
     card.hearth = card:CreateTexture(nil, "ARTWORK")
     card.hearth:SetSize(16, 16)
     card.hearth:SetPoint("TOPRIGHT", card.chrono, "BOTTOMRIGHT", 0, -4)
@@ -245,18 +252,39 @@ local function makeCard(parent)
 
         -- Chrono + hearth in the upper-right stack (real item icons; re-set each
         -- refresh so a late item-cache resolve corrects a first-paint question mark).
+        -- Cooldown remainders DECAY client-side off rec.lastDataUpdate so a remote
+        -- card counts down between updates; both hide their label at 0 (icon-only
+        -- = ready). FormatDuration is the card's existing formatter ("59m"/"23m").
         self.hearth:SetTexture(Dashboard.ItemIcon(HEARTHSTONE_ITEM))
         self.chrono.icon:SetTexture(Dashboard.ItemIcon(CHRONOBOON_ITEM))
+        local chronoCDrem = Dashboard.DecayRemaining(rec.itemCooldown, rec.lastDataUpdate, nowE)
+        -- Show the chrono icon while booned (border = boon status) OR while the
+        -- Displacer is on its use cooldown (muted/desaturated) so the countdown
+        -- label always has its icon to sit beside.
         if rec.chronoboonActive then
             self.chrono:Show()
             self.chrono:SetBackdrop(UI.FLAT_BACKDROP)
             self.chrono:SetBackdropColor(UI.Color("inset"))
             self.chrono:SetBackdropBorderColor(UI.Color((rec.boonCount or 0) == 0 and "danger" or "accent"))
+            self.chrono.icon:SetDesaturated(false)
+        elseif chronoCDrem > 0 then
+            self.chrono:Show()
+            self.chrono:SetBackdrop(UI.FLAT_BACKDROP)
+            self.chrono:SetBackdropColor(UI.Color("inset"))
+            self.chrono:SetBackdropBorderColor(UI.Color("border"))
+            self.chrono.icon:SetDesaturated(true)
         else
             self.chrono:Hide()
         end
-        if (rec.hearthstoneCD or 0) > 0 then
-            self.hearthCD:SetText(Dashboard.FormatDuration(rec.hearthstoneCD))
+        if chronoCDrem > 0 then
+            self.chronoCD:SetText(Dashboard.FormatDuration(chronoCDrem))
+            self.chronoCD:SetTextColor(UI.Color("faint"))
+        else
+            self.chronoCD:SetText("")
+        end
+        local hearthCDrem = Dashboard.DecayRemaining(rec.hearthstoneCD, rec.lastDataUpdate, nowE)
+        if hearthCDrem > 0 then
+            self.hearthCD:SetText(Dashboard.FormatDuration(hearthCDrem))
             self.hearthCD:SetTextColor(UI.Color("faint"))
             self.hearth:SetDesaturated(true)
         else

@@ -20,6 +20,13 @@ ns.Tracker = Tracker
 local ITEM_SOUL_SHARD  = 6265
 local ITEM_HEARTHSTONE = 6948
 
+-- Chronoboon Displacer item IDs (Classic Era). The item's USE cooldown is what we
+-- surface as rec.itemCooldown so the roster card can show "when can I re-boon".
+-- 184937 = Chronoboon Displacer, 184938 = Super-charged Chronoboon Displacer.
+-- Both are probed and the max remaining is taken; a character that owns neither
+-- simply gets no cooldown (GetItemCooldown returns nothing for an absent item).
+local CHRONOBOON_ITEMS = { 184937, 184938 }
+
 -- Created Soulstone reagent item IDs (any in bags => a soulstone is available).
 -- Minor / Lesser / (regular) / Greater / Major Soulstone. Item 6.
 local SOULSTONE_ITEMS = { 5232, 16892, 16893, 16895, 16896 }
@@ -110,6 +117,30 @@ local function normName(s)
     s = s:gsub("\194\180", "'")        -- U+00B4 ACUTE ACCENT (UTF-8)
     s = s:gsub("`", "'")               -- ASCII backtick, occasionally substituted
     return s
+end
+
+-- Escape a string's non-ASCII / non-printable bytes to \ddd so a typographic
+-- apostrophe (U+2019 -> \226\128\153) is visible in the debug dump. Pure.
+local function byteEscape(s)
+    if not s or s == "" then return "" end
+    return (s:gsub("[^\32-\126]", function(c) return "\\" .. string.byte(c) end))
+end
+
+-- Return the BUFF_SLOTS slot index whose prefix BEGINS the given (raw) buff
+-- name, or nil. normName folds typographic apostrophes to ASCII first, so a
+-- live buff rendered "Warchief\226\128\153s Blessing" (U+2019) still matches the
+-- ASCII-apostrophe prefix. This is the single matcher used by the live aura scan
+-- AND the self-test, so the wire behaviour and the test can never drift apart.
+function Tracker.MatchBuffSlot(name)
+    local nm = normName(name)
+    if nm == "" then return nil end
+    for s = 1, #BUFF_SLOTS do
+        local def = BUFF_SLOTS[s]
+        if def.prefix ~= "" and nm:find(def.prefix, 1, true) == 1 then
+            return def.slot
+        end
+    end
+    return nil
 end
 
 local function selfNameRealm()
@@ -460,17 +491,32 @@ local function captureSoulstone(rec)
     end
 end
 
--- Hearthstone remaining cooldown (seconds). itemCooldown (a tracked
--- trinket) is left extensible for a later wave and reported as 0 here.
+-- Hearthstone + Chronoboon Displacer remaining cooldowns (seconds).
+-- rec.itemCooldown now carries the Chronoboon Displacer USE cooldown remaining
+-- (max across the two Era item IDs) — it was previously a hardcoded-0 placeholder
+-- but is already an existing u16 wire field, so repurposing it needs no schema
+-- bump. Both values are clamped to the u16 range (<=65535s) before the wire.
+local function itemCooldownRemaining(itemID)
+    local start, duration, enable = C_Container.GetItemCooldown(itemID)
+    if start and duration and duration > 0 and (enable == nil or enable == 1) then
+        local rem = (start + duration) - GetTime()
+        if rem > 0 then return rem end
+    end
+    return 0
+end
+
 local function captureCooldowns(rec)
     rec.itemCooldown = 0
     rec.hearthstoneCD = 0
     if C_Container and C_Container.GetItemCooldown then
-        local start, duration, enable = C_Container.GetItemCooldown(ITEM_HEARTHSTONE)
-        if start and duration and duration > 0 and (enable == nil or enable == 1) then
-            local rem = (start + duration) - GetTime()
-            if rem > 0 then rec.hearthstoneCD = math.floor(rem) end
+        rec.hearthstoneCD = math.min(65535, math.floor(itemCooldownRemaining(ITEM_HEARTHSTONE)))
+        -- Chronoboon Displacer: max remaining across the base + super-charged IDs.
+        local best = 0
+        for i = 1, #CHRONOBOON_ITEMS do
+            local rem = itemCooldownRemaining(CHRONOBOON_ITEMS[i])
+            if rem > best then best = rem end
         end
+        rec.itemCooldown = math.min(65535, math.floor(best))
     end
 end
 
@@ -484,19 +530,21 @@ local function captureAuras(rec)
         for i = 1, 40 do
             local aura = C_UnitAuras.GetBuffDataByIndex("player", i)
             if not aura then break end
-            local nm = lower(aura.name)
+            -- Apostrophe-normalized name for EVERY comparison below. The live
+            -- client can render buff names with a typographic apostrophe (U+2019),
+            -- so a plain lower() missed "Warchief's Blessing" et al and left the
+            -- slot dark (owner-observed). normName folds it to ASCII first.
+            local nm = normName(aura.name)
 
-            -- World-buff slot assignment.
-            for s = 1, #BUFF_SLOTS do
-                local def = BUFF_SLOTS[s]
-                if def.prefix ~= "" and nm:find(def.prefix, 1, true) == 1 then
-                    slots[def.slot] = {
-                        duration = auraRemaining(aura),
-                        option   = 0,     -- per-aura option code (later waves)
-                        source   = 0,     -- 0 = live/self (Store.AURA_SOURCE.LIVE)
-                    }
-                    break
-                end
+            -- World-buff slot assignment (shared matcher so it stays in lockstep
+            -- with the self-test and the boon-tooltip parse).
+            local slot = Tracker.MatchBuffSlot(aura.name)
+            if slot then
+                slots[slot] = {
+                    duration = auraRemaining(aura),
+                    option   = 0,     -- per-aura option code (later waves)
+                    source   = 0,     -- 0 = live/self (Store.AURA_SOURCE.LIVE)
+                }
             end
 
             -- Chronoboon (stored-buff) marker.
@@ -569,7 +617,10 @@ local function captureRaidLockouts(rec)
     for i = 1, n do
         local name, _, reset, _, locked = GetSavedInstanceInfo(i)
         if name and locked and reset and reset > 0 then
-            local lname = lower(name)
+            -- normName (not plain lower): raid names carry apostrophes
+            -- ("Zul'Gurub", "Temple of Ahn'Qiraj"), so fold typographic ones to
+            -- ASCII to match the ASCII-apostrophe needles in RAID_NAME_MAP.
+            local lname = normName(name)
             for _, m in ipairs(RAID_NAME_MAP) do
                 if lname:find(m.needle, 1, true) then
                     rec.raidLockouts[m.key] = now + reset
@@ -664,6 +715,39 @@ function Tracker.OnLogin()
 end
 
 ----------------------------------------------------------------------
+-- Diagnostic: /nexus debug auras
+--
+-- Ground truth for the apostrophe-matching bug. Prints every live player buff:
+-- its raw name, the byte-escaped form (so a typographic apostrophe shows as
+-- \226\128\153), and which dashboard slot it matched (or "none"). If the
+-- normalization ever fails to cure a dark slot in-game, this shows exactly which
+-- byte sequence the client rendered so the fix can target it.
+----------------------------------------------------------------------
+
+function Tracker.DebugAuras()
+    if not (C_UnitAuras and C_UnitAuras.GetBuffDataByIndex) then
+        ns:Print("debug auras: C_UnitAuras.GetBuffDataByIndex unavailable")
+        return
+    end
+    ns:Print("player buffs — [index] raw :: bytes :: slot")
+    local any = false
+    for i = 1, 40 do
+        local aura = C_UnitAuras.GetBuffDataByIndex("player", i)
+        if not aura then break end
+        any = true
+        local raw = aura.name or "?"
+        local slot = Tracker.MatchBuffSlot(raw)
+        ns:Print(string.format("  [%d] %s :: %s :: %s",
+            i, raw, byteEscape(raw), slot and ("slot " .. slot) or "none"))
+    end
+    if not any then ns:Print("  (no player buffs)") end
+end
+
+if ns.RegisterDebugCommand then
+    ns:RegisterDebugCommand("auras", function() Tracker.DebugAuras() end)
+end
+
+----------------------------------------------------------------------
 -- Self-tests (pure Lua; registered as suite "tracker")
 ----------------------------------------------------------------------
 
@@ -733,10 +817,39 @@ local function testBoonBlock(fails)
     ck(cs[7] and cs[7].duration == 120 * 60, "curly-apos Mol'dar -> slot7, 120m")
 end
 
+-- MATCHING MATRIX (owner live report): a world buff whose live name renders with
+-- a typographic apostrophe (U+2019) must still land in its slot. Every BUFF_SLOTS
+-- prefix is asserted to match BOTH the ASCII-apostrophe and the U+2019 rendition
+-- of its own name (the curly variant is built by replacing ' with \226\128\153).
+local function testLiveAuraMatching(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    for s = 1, #BUFF_SLOTS do
+        local def = BUFF_SLOTS[s]
+        if def.prefix ~= "" then
+            ck(Tracker.MatchBuffSlot(def.prefix) == def.slot,
+               "ascii '" .. def.prefix .. "' -> slot " .. def.slot)
+            local curly = def.prefix:gsub("'", "\226\128\153")
+            ck(Tracker.MatchBuffSlot(curly) == def.slot,
+               "typographic-apos '" .. def.prefix .. "' -> slot " .. def.slot)
+        end
+    end
+    -- The exact owner symptom: title-cased "Warchief's Blessing" with U+2019.
+    ck(Tracker.MatchBuffSlot("Warchief\226\128\153s Blessing") == 2,
+       "Warchief's Blessing (U+2019, title case) -> slot 2")
+    -- Apostrophe-heavy DMT names both renditions.
+    ck(Tracker.MatchBuffSlot("Mol\226\128\153dar's Moxie") == 7, "Mol'dar (U+2019) -> slot 7")
+    ck(Tracker.MatchBuffSlot("Slip'kik's Savvy") == 8, "Slip'kik (ascii) -> slot 8")
+    -- Non-buff / empty -> nil.
+    ck(Tracker.MatchBuffSlot("Some Random Buff") == nil, "unmatched -> nil")
+    ck(Tracker.MatchBuffSlot("") == nil, "empty -> nil")
+    ck(Tracker.MatchBuffSlot(nil) == nil, "nil -> nil")
+end
+
 function Tracker.RunSelfTests(verbose)
     local suites = {
         { name = "boon parsing", fn = testBoonParsing },
         { name = "boon block (owner 7-line fixture)", fn = testBoonBlock },
+        { name = "live aura matching (apostrophe matrix)", fn = testLiveAuraMatching },
     }
     local allPass = true
     for _, suite in ipairs(suites) do
