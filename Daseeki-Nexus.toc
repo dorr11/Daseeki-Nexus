@@ -19,8 +19,8 @@ protocol.lua
 tracker.lua
 mesh.lua
 timers.lua
+snbridge.lua
 auto.lua
-interact.lua
 options.lua
 syncns.lua
 import.lua

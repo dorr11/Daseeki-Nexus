@@ -116,7 +116,7 @@ local function defaultFactionBlock()
             roids     = false,
             autoRepair = false,
         },
-        autoInteract = {},                   -- ["npcKey"] = true
+        -- autoInteract removed: the Interact Buttons feature was cut pre-release.
         auraOpts = {
             -- per-aura normal/minimum duration thresholds (seconds)
             thresholds = {},                 -- ["auraKey"] = { normal=, minimum= }

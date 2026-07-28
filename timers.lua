@@ -74,10 +74,35 @@ local STORE_LOG_KEY = { rend = "rend", onyH = "onyH", onyA = "onyA" }
 local WARNED_BUFFS = { "rend", "onyH", "onyA" }
 
 -- Trust ladder. Higher wins; equal-or-higher upgrades an existing entry.
-local TRUST_RANK = { ["local"] = 4, mesh = 3, nwb = 2, dbm = 1 }
+-- Order (spec, N2 round 2): local > mesh > sn > nwb > dbm. "sn" is the
+-- passively-ingested ShadowNetwork broadcast source (snbridge.lua): trusted
+-- above NWB/DBM (it is another player's merged, human-confirmed feed) but
+-- below our own mesh peers (shared-token, first-party) and local detection.
+local TRUST_RANK = { ["local"] = 5, mesh = 4, sn = 3, nwb = 2, dbm = 1 }
 Timers.TRUST_RANK = TRUST_RANK
 
 local function trustRank(t) return TRUST_RANK[t or ""] or 0 end
+
+----------------------------------------------------------------------
+-- Source freshness
+--
+-- Last time (server epoch) we ingested timer data from each of the three
+-- pull/push sources the UI's refresh controls care about:
+--   nexus     = mesh peer snapshot (RequestNexusData reply / broadcaster relay)
+--   nwb       = NovaWorldBuffs traffic (passive + our data-request reply)
+--   snPassive = ShadowNetwork broadcast, passively decoded (snbridge.lua)
+-- Updated on RECEIPT regardless of whether the datum changed state, so the UI
+-- can show "heard from X, Ns ago" even when the payload was a dedup no-op.
+----------------------------------------------------------------------
+
+Timers._freshness = { nexus = 0, nwb = 0, snPassive = 0 }
+
+local function noteFreshness(source)
+    if Timers._freshness[source] ~= nil then
+        Timers._freshness[source] = now()
+    end
+end
+Timers._noteFreshness = noteFreshness
 
 ----------------------------------------------------------------------
 -- Per-buff runtime state
@@ -433,7 +458,25 @@ local NWB_MIN_VERSION = 2.75
 local NODE_RESPAWN = 1500
 Timers.NODE_RESPAWN = NODE_RESPAWN
 
-Timers._nwb = { serializer = nil, deflate = nil, comm = nil, ready = false }
+Timers._nwb = { serializer = nil, libSerialize = nil, deflate = nil, comm = nil, obj = nil, ready = false }
+
+-- NWB 3.39 serializes with LibSerialize; older builds used AceSerializer. Try
+-- LibSerialize first, fall back to AceSerializer, so both inbound formats
+-- decode. Returns ok, value (mirrors both libs' Deserialize signature).
+local function nwbDeserialize(str)
+    local nwb = Timers._nwb
+    if type(str) ~= "string" then return false end
+    if nwb.libSerialize and nwb.libSerialize.Deserialize then
+        local ok, v = nwb.libSerialize:Deserialize(str)
+        if ok then return true, v end
+    end
+    if nwb.serializer and nwb.serializer.Deserialize then
+        local ok, v = nwb.serializer:Deserialize(str)
+        if ok then return true, v end
+    end
+    return false
+end
+Timers._nwbDeserialize = nwbDeserialize
 
 -- Split helper mirroring NWB's space-explode with a field cap.
 local function explodeSpace(str, maxFields)
@@ -496,18 +539,19 @@ function Timers.OnNWBMessage(prefix, message, channel, sender)
     if not decoded then return end
     local decompressed = nwb.deflate:DecompressDeflate(decoded)
     if not decompressed then return end
-    local ok, top = nwb.serializer:Deserialize(decompressed)
+    local ok, top = nwbDeserialize(decompressed)
     if not ok or type(top) ~= "string" then return end
 
     local args = explodeSpace(top, 5)
     local cmd = args[1]
     local remoteVersion = tonumber(args[2]) or 0
     if remoteVersion < NWB_MIN_VERSION then return end   -- version gate
+    noteFreshness("nwb")   -- valid, version-gated NWB traffic seen
     local dataStr = args[5]
 
     if cmd == "data" or cmd == "settings" or cmd == "requestData" then
         if type(dataStr) == "string" and #dataStr > 0 then
-            local ok2, payload = nwb.serializer:Deserialize(dataStr)
+            local ok2, payload = nwbDeserialize(dataStr)
             if ok2 and type(payload) == "table" then
                 Timers.IngestNWBTimers(payload)
             end
@@ -542,6 +586,9 @@ local function setupNWB()
     local comm       = LibStub("AceComm-3.0", true)
     if not (serializer and deflate and comm) then return end
     nwb.serializer, nwb.deflate, nwb.comm = serializer, deflate, comm
+    -- LibSerialize is vendored (used to BUILD the requestData wire and to decode
+    -- modern NWB 3.39 traffic). AceSerializer stays as the legacy decode fallback.
+    nwb.libSerialize = LibStub("LibSerialize", true)
     -- Embed a private object and register the NWB prefix; AceComm's shared
     -- registry reassembles chunks and dispatches to us AND to NWB.
     nwb.obj = nwb.obj or {}
@@ -905,6 +952,7 @@ end
 function Timers.ApplySnapshot(snap, trust)
     if type(snap) ~= "table" then return end
     trust = trust or "mesh"
+    if trust == "mesh" then noteFreshness("nexus") end
     if snap.buffs then
         for k, b in pairs(snap.buffs) do
             if b.lastKilled and b.lastKilled > 0 then
@@ -921,15 +969,43 @@ end
 
 -- Inbound single-timer event from the mesh (peer relay). trust "mesh".
 function Timers.OnMeshTimer(buffKey, epoch, kind, meta)
+    noteFreshness("nexus")
     Timers.Record(buffKey, epoch, "mesh", (meta and meta.who) or "mesh", kind or "pop",
                   meta and meta.zone)
 end
 
 -- Inbound pull event from the mesh with a 10s relay-age gate (spec).
 function Timers.OnMeshPull(buffKey, epoch, duration, zone, meta)
+    noteFreshness("nexus")
     local age = now() - (epoch or now())
     if age > 10 then return end   -- stale relayed pull, drop
     Timers.Record(buffKey, epoch or now(), "mesh", (meta and meta.who) or "mesh", "pop",
+                  zone, duration)
+end
+
+----------------------------------------------------------------------
+-- ShadowNetwork passive ingest entry points  [RECEIVE-ONLY]
+--
+-- snbridge.lua owns the decode chain; it hands us already-translated buff
+-- events here. Trust tag "sn" sits below mesh and above nwb/dbm. These mirror
+-- OnMeshTimer/OnMeshPull but stamp snPassive freshness and route through the
+-- same Record/false-positive/dedup gates. We NEVER transmit on SN prefixes;
+-- this is a one-way data intake only.
+----------------------------------------------------------------------
+
+function Timers.OnSNTimer(buffKey, epoch, kind, meta)
+    noteFreshness("snPassive")
+    if not CD[buffKey] then return end   -- unknown/untranslatable buff: skip
+    Timers.Record(buffKey, epoch or now(), "sn", (meta and meta.who) or "SN",
+                  kind or "pop", meta and meta.zone)
+end
+
+function Timers.OnSNPull(buffKey, epoch, duration, zone, meta)
+    noteFreshness("snPassive")
+    if not CD[buffKey] then return end
+    local age = now() - (epoch or now())
+    if age > 10 then return end   -- stale relayed pull, drop
+    Timers.Record(buffKey, epoch or now(), "sn", (meta and meta.who) or "SN", "pop",
                   zone, duration)
 end
 
@@ -978,9 +1054,10 @@ Timers.MaybeBroadcast = maybeBroadcast
 ----------------------------------------------------------------------
 
 Timers._lastMeshRequest = 0
-local MESH_REQUEST_CD = 30          -- seconds between mesh data requests
+local MESH_REQUEST_CD = 30          -- seconds between login/auto mesh requests
 local NWB_REREQUEST_INTERVAL = 120  -- seconds; re-ask if no NWB seen yet
 
+-- Login / periodic auto-request (30s gate, separate from the button cooldown).
 function Timers.RequestTimerData()
     local t = now()
     if (t - (Timers._lastMeshRequest or 0)) < MESH_REQUEST_CD then return end
@@ -988,6 +1065,93 @@ function Timers.RequestTimerData()
     if ns.Mesh and ns.Mesh.RequestTimers then
         ns:SafeCall(ns.Mesh.RequestTimers)
     end
+end
+
+----------------------------------------------------------------------
+-- Button-callable data requests (published surface for the UI wave)
+--
+--   ns.Timers.RequestNexusData()  -> ok, cooldownRemaining
+--        Asks mesh peers for a merged timer snapshot (60s cooldown). Peers
+--        reply via Mesh.SendTimers -> our Timers.ApplySnapshot. ok=false with
+--        the seconds remaining while cooling down.
+--   ns.Timers.RequestNWBData()    -> boolean
+--        Sends the NovaWorldBuffs guild data request (60s cooldown). Returns
+--        false (no-op) when not in a guild, when NWB is absent, or on cooldown.
+--        The existing NWB ingest handles the reply.
+--   ns.Timers.GetSourceFreshness() -> { nexus, nwb, snPassive }  (epochs)
+----------------------------------------------------------------------
+
+Timers._lastNexusRequest = 0
+local NEXUS_REQUEST_CD = 60
+
+function Timers.RequestNexusData()
+    local t = now()
+    local since = t - (Timers._lastNexusRequest or 0)
+    if since < NEXUS_REQUEST_CD then
+        return false, NEXUS_REQUEST_CD - since
+    end
+    Timers._lastNexusRequest = t
+    if ns.Mesh and ns.Mesh.RequestTimers then
+        ns:SafeCall(ns.Mesh.RequestTimers)
+    end
+    return true, 0
+end
+
+-- NWB protocol version we advertise. Must be >= 2.75 to clear NWB's classic-era
+-- gate so peers reach the modern requestData handler and reply. This is the
+-- documented community-interop protocol number, not an identity claim.
+local NWB_REQ_VERSION = "2.75"
+Timers._lastNWBRequest = 0
+local NWB_REQUEST_CD = 60
+
+-- Build the encoded NWB "requestData" wire exactly as NWB 3.39 does:
+--   inner : LibSerialize:Serialize({})   (we share no NWB-format data; empty)
+--   text  : "requestData <ver> <level> <ktoken> <innerData>"
+--   outer : LibSerialize:Serialize(text)
+--         -> LibDeflate:CompressDeflate(level 9)
+--         -> LibDeflate:EncodeForWoWAddonChannel
+-- Returns the encoded string, or nil when the libs are unavailable.
+-- Build the plaintext NWB wire text (before serialize/deflate/encode). Pure
+-- string assembly so self-tests can validate the field layout without touching
+-- the deflate pipeline. `innerData` is the already-serialized field-5 payload.
+function Timers.BuildNWBText(innerData)
+    local level = (UnitLevel and UnitLevel("player")) or 60
+    local st = (GetServerTime and GetServerTime()) or 0
+    -- NWB's coarse server-time token: (serverTime+1998) stringified, last 3 chopped.
+    local ktoken = tonumber(string.sub(tostring(st + 1998), 1, -4)) or 0
+    return "requestData " .. NWB_REQ_VERSION .. " " .. tostring(level)
+           .. " " .. tostring(ktoken) .. " " .. (innerData or "")
+end
+
+function Timers.BuildNWBRequest()
+    local nwb = Timers._nwb
+    local LS, LD = nwb.libSerialize, nwb.deflate
+    if not (LS and LD) then return nil end
+    local dataStr = LS:Serialize({})
+    local text = Timers.BuildNWBText(dataStr)
+    local outer = LS:Serialize(text)
+    local comp = LD:CompressDeflate(outer, { level = 9 })
+    if not comp then return nil end
+    return LD:EncodeForWoWAddonChannel(comp)
+end
+
+function Timers.RequestNWBData()
+    if not (IsInGuild and IsInGuild()) then return false end
+    local nwb = Timers._nwb
+    if not (nwb and nwb.ready and nwb.obj and nwb.obj.SendCommMessage) then return false end
+    local t = now()
+    if (t - (Timers._lastNWBRequest or 0)) < NWB_REQUEST_CD then return false end
+    local enc = Timers.BuildNWBRequest()
+    if not enc then return false end
+    Timers._lastNWBRequest = t
+    -- Authorized NWB interop transmit (AceComm, GUILD). Never an SN prefix.
+    ns:SafeCall(function() nwb.obj:SendCommMessage("NWB", enc, "GUILD") end)
+    return true
+end
+
+function Timers.GetSourceFreshness()
+    local f = Timers._freshness
+    return { nexus = f.nexus, nwb = f.nwb, snPassive = f.snPassive }
 end
 
 local function startNWBRewatch()
@@ -1163,11 +1327,86 @@ local function testIngestParsers(fails)
         "npc id parsed from GUID", fails)
 end
 
+-- Trust ladder ordering: local > mesh > sn > nwb > dbm (spec, round 2).
+local function testTrustOrdering(fails)
+    tcheck(trustRank("local") > trustRank("mesh"), "local outranks mesh", fails)
+    tcheck(trustRank("mesh") > trustRank("sn"),   "mesh outranks sn", fails)
+    tcheck(trustRank("sn")   > trustRank("nwb"),  "sn outranks nwb", fails)
+    tcheck(trustRank("nwb")  > trustRank("dbm"),  "nwb outranks dbm", fails)
+    tcheck(trustRank("dbm")  > 0,                 "dbm ranks above unknown", fails)
+    tcheck(trustRank("bogus") == 0,               "unknown source ranks 0", fails)
+    -- An "sn" report can upgrade a within-CD nwb/dbm anchor's trust (spec:
+    -- sn sits above nwb). Uses the same Record arbitration as other sources.
+    Timers.state = {}
+    local a = 1500000000
+    Timers.Record("onyH", a, "nwb", "NWB", "pop")
+    tcheck(Timers.state.onyH.trust == "nwb", "onyH first anchored by nwb", fails)
+    local ok = Timers.Record("onyH", a + 600, "sn", "SN", "pop")
+    tcheck(ok == false, "within-CD sn report is not a new anchor", fails)
+    tcheck(Timers.state.onyH.trust == "sn", "trust upgraded nwb->sn", fails)
+    -- A lower-trust nwb report cannot downgrade an sn anchor of the same event.
+    Timers.state = {}
+    Timers.Record("onyH", a, "sn", "SN", "pop")
+    local ok2 = Timers.Record("onyH", a + 5, "nwb", "NWB", "pop")
+    tcheck(ok2 == false, "nwb cannot overwrite a fresh sn anchor", fails)
+    tcheck(Timers.state.onyH.trust == "sn", "sn anchor retained over nwb", fails)
+    Timers.state = {}
+end
+
+-- Request cooldowns: Nexus request returns ok,0 then false,remaining; source
+-- freshness bookkeeping reflects note calls.
+local function testRequestCooldowns(fails)
+    Timers._lastNexusRequest = 0
+    local ok1, rem1 = Timers.RequestNexusData()
+    tcheck(ok1 == true and rem1 == 0, "first nexus request fires (ok,0)", fails)
+    local ok2, rem2 = Timers.RequestNexusData()
+    tcheck(ok2 == false, "second nexus request within 60s is blocked", fails)
+    tcheck(type(rem2) == "number" and rem2 > 0 and rem2 <= 60,
+        "blocked request reports a 0<rem<=60 cooldown", fails)
+    -- RequestNWBData is a no-op false when not in a guild / NWB absent (bare VM).
+    if not (IsInGuild and IsInGuild()) then
+        tcheck(Timers.RequestNWBData() == false, "NWB request no-op false when guildless", fails)
+    end
+    -- Freshness note + accessor.
+    Timers._freshness = { nexus = 0, nwb = 0, snPassive = 0 }
+    Timers._noteFreshness("snPassive")
+    local f = Timers.GetSourceFreshness()
+    tcheck(f.snPassive > 0, "snPassive freshness stamped", fails)
+    tcheck(f.nexus == 0 and f.nwb == 0, "other sources untouched by one note", fails)
+    tcheck(f.nexus ~= nil and f.nwb ~= nil and f.snPassive ~= nil,
+        "GetSourceFreshness returns all three keys", fails)
+end
+
+-- NWB request build. The wire TEXT layout (cmd/version/level/token/data) is
+-- validated purely (no deflate); the encoded string is validated for presence.
+local function testNWBRequestBuild(fails)
+    -- Pure wire-text layout: "requestData <ver> <level> <ktoken> <data>".
+    local text = Timers.BuildNWBText("PAYLOAD")
+    local parts = Timers._explodeSpace(text, 5)
+    tcheck(parts[1] == "requestData", "cmd field is requestData", fails)
+    tcheck(tonumber(parts[2]) ~= nil and tonumber(parts[2]) >= 2.75,
+        "advertised version >= 2.75 (clears NWB classic gate)", fails)
+    tcheck(tonumber(parts[3]) ~= nil, "level field is numeric", fails)
+    tcheck(tonumber(parts[4]) ~= nil, "server-time token is numeric", fails)
+    tcheck(parts[5] == "PAYLOAD", "field 5 carries the serialized data", fails)
+    -- Integration: with the libs present, the full encode yields a wire string.
+    local nwb = Timers._nwb
+    nwb.libSerialize = nwb.libSerialize or (LibStub and LibStub.GetLibrary and LibStub:GetLibrary("LibSerialize", true))
+    nwb.deflate      = nwb.deflate      or (LibStub and LibStub.GetLibrary and LibStub:GetLibrary("LibDeflate", true))
+    if nwb.libSerialize and nwb.deflate then
+        local enc = Timers.BuildNWBRequest()
+        tcheck(type(enc) == "string" and #enc > 0, "BuildNWBRequest returns an encoded wire string", fails)
+    end
+end
+
 function Timers.RunSelfTests(verbose)
     local suites = {
         { name = "cd derivation",     fn = testCDDerivation },
         { name = "false-positive gate", fn = testFalsePositive },
         { name = "trust upgrade",     fn = testTrustUpgrade },
+        { name = "trust ordering",    fn = testTrustOrdering },
+        { name = "request cooldowns", fn = testRequestCooldowns },
+        { name = "nwb request build", fn = testNWBRequestBuild },
         { name = "log dedup",         fn = testLogDedup },
         { name = "node state machine", fn = testNodeStateMachine },
         { name = "ingest parsers",    fn = testIngestParsers },
@@ -1213,6 +1452,38 @@ function Timers.OnLogin()
 
     -- Stand up receive-only NWB ingest if the shared libs are present.
     setupNWB()
+
+    -- Stand up receive-only ShadowNetwork passive ingest (snbridge.lua).
+    if ns.SNBridge and ns.SNBridge.OnLogin then
+        ns:SafeCall(ns.SNBridge.OnLogin)
+    end
+
+    -- Wire the mesh handoffs: peers answer RequestNexusData with a snapshot we
+    -- apply through ApplySnapshot; we answer their requests with GetSnapshot;
+    -- single mesh timer/pull events (future originator path) route through the
+    -- same trust-gated ingestion.
+    if ns.Mesh then
+        if ns.Mesh.RegisterSnapshotProvider then
+            ns.Mesh.RegisterSnapshotProvider(Timers.GetSnapshot)
+        end
+        if ns.Mesh.SetSnapshotHandler then
+            ns.Mesh.SetSnapshotHandler(function(snap)
+                Timers.ApplySnapshot(snap, "mesh")
+            end)
+        end
+        if ns.Mesh.SetTimerHandler then
+            ns.Mesh.SetTimerHandler(function(evt, sender)
+                if type(evt) ~= "table" or not evt.buff then return end
+                if evt.pull then
+                    Timers.OnMeshPull(evt.buff, evt.epoch, evt.duration, evt.zone,
+                                      { who = sender })
+                else
+                    Timers.OnMeshTimer(evt.buff, evt.epoch, evt.kind,
+                                       { who = sender, zone = evt.zone })
+                end
+            end)
+        end
+    end
 
     -- Event detectors.
     ns:RegisterEvent("CHAT_MSG_MONSTER_YELL", onMonsterYell)

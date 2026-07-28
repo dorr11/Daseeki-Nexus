@@ -75,6 +75,7 @@ local OP = {
     BLACKLIST  = "b",   -- blacklist union
     ACK        = "a",   -- settings/blacklist acknowledgement
     TIMER      = "z",   -- timer / pull event (payload from N2b handoff)
+    TIMER_SNAP = "n",   -- Nexus merged timer snapshot (request reply / broadcast)
 }
 Mesh.OP = OP
 
@@ -608,18 +609,54 @@ local function scheduler(prefix)
     return s
 end
 
+-- TRANSMIT-SAFETY HARD RULE (owner-authorized interop boundary).
+-- ShadowNetwork's addon-message prefixes are RECEIVE-ONLY for this suite:
+-- snbridge.lua passively decodes SN timer/pull broadcasts as a data source,
+-- but this client must NEVER transmit on them (no impersonation of SN). Every
+-- mesh send funnels through rawSend, and every queued frame funnels through
+-- Enqueue, so gating BOTH here proves no send path can carry an SN prefix.
+-- (NWB is different: NovaWorldBuffs data requests ARE allowed, and they ride
+-- AceComm's own sender, never this mesh transport — so NWB is not listed.)
+local FORBIDDEN_TX = {
+    SDWW = true,   -- SN timer broadcasts / pull alerts / timer whispers (+ legacy SNT)
+    SNT  = true,   -- SN legacy timer inbound prefix
+    SDWZ = true,   -- SN state pushes / relays
+    SDWY = true,   -- SN heartbeats / discovery
+    SDWX = true,   -- SN handshakes / bulk sync
+}
+Mesh.FORBIDDEN_TX = FORBIDDEN_TX
+Mesh._forbiddenTxBlocked = 0   -- telemetry: guard-fire count (surfaced in debug)
+
+-- PURE guard predicate (harness-testable): is `prefix` a ShadowNetwork prefix
+-- this client is forbidden from transmitting on?
+function Mesh.IsForbiddenTxPrefix(prefix)
+    return FORBIDDEN_TX[prefix] == true
+end
+
 -- Low-level send of one already-enveloped wire string. C_ChatInfo returns a
 -- SendAddonMessageResult; Success is 0. Treat 0 or nil as delivered, anything
 -- else (throttled / invalid target) as a failure for the skip tracker.
 local function rawSend(prefix, wire, chatType, target)
+    -- HARD GUARD: refuse to ever transmit on a ShadowNetwork prefix.
+    if Mesh.IsForbiddenTxPrefix(prefix) then
+        Mesh._forbiddenTxBlocked = (Mesh._forbiddenTxBlocked or 0) + 1
+        return false
+    end
     if not (C_ChatInfo and C_ChatInfo.SendAddonMessage) then return false end
     local res = C_ChatInfo.SendAddonMessage(prefix, wire, chatType, target)
     return res == nil or res == 0
 end
+Mesh._rawSend = rawSend   -- exposed for the transmit-safety self-test
 
 -- Enqueue a fully-built frame for a prefix, chunking as needed.
 -- meta = { op, chatType, target, priority, cost }
 function Mesh.Enqueue(prefix, frame, meta)
+    -- Defense in depth: a forbidden SN prefix can never even enter the queue.
+    -- (rawSend guards the wire; this guards the scheduler.)
+    if Mesh.IsForbiddenTxPrefix(prefix) then
+        Mesh._forbiddenTxBlocked = (Mesh._forbiddenTxBlocked or 0) + 1
+        return
+    end
     meta = meta or {}
     local seq = meta.seq or Mesh._outSeq
     local big = (#frame > Mesh.CHUNK_DATA_MAX)
@@ -751,10 +788,36 @@ local function buildRelayTo(delegatedIDs)
     return joinList(parts, ",")
 end
 
+-- True only when (nameRealm, record) is one of OUR OWN account's characters.
+-- Imported / other-account records must NEVER be broadcast as ours — doing so
+-- would defeat owner-wins + self-immunity on the receiving peers.
+function Mesh.IsSelfRecord(nameRealm, record)
+    if type(record) ~= "table" then return false end
+    local nr = record.nameRealm or nameRealm
+    if type(nr) ~= "string" or nr == "" then return false end
+    if nr == selfNameRealm() then return true end   -- our live character
+    if Store and Store.GetSelfAccount then
+        local selfBucket = Store.GetSelfAccount(false)
+        if selfBucket and selfBucket.characters and selfBucket.characters[nr] then
+            return true
+        end
+    end
+    return false
+end
+
+-- STATE_CHANGED subscriber. Guards the (nameRealm, record) contract: a nil or
+-- non-self record (e.g. a stray args-free fire, or an imported other-account
+-- record) is ignored so it can never be pushed to peers or crash the encoder.
+function Mesh.OnStateChanged(nameRealm, record)
+    if not Mesh.IsSelfRecord(nameRealm, record) then return end
+    ns:SafeCall(Mesh.PushState, nameRealm, record)
+end
+
 -- Push a live character record to the mesh (called on STATE_CHANGED).
 function Mesh.PushState(nameRealm, record)
     if not Mesh.IsEnabled() then return end
     local payload = Protocol.EncodeCharacter(record)
+    if not payload then return end   -- nothing encodable (nil/foreign record)
     local ids = onlinePeerIDs()
     local plan = Mesh.ComputeRelayPlan(ids, Mesh.DIRECT_BUDGET, ns:GetAccountID())
 
@@ -972,6 +1035,10 @@ function Mesh.Dispatch(prefix, frame, sender)
     elseif op == OP.BLACKLIST then  handleBlacklist(f, sender)
     elseif op == OP.ACK then        handleAck(f, sender)
     elseif op == OP.TIMER then      handleTimer(f, sender, true)
+    elseif op == OP.TIMER_SNAP then
+        -- Defined later in the chunk (snapshot handoff section); reach it via
+        -- the Mesh table so this early closure resolves it at call time.
+        if Mesh._handleTimerSnap then Mesh._handleTimerSnap(f, sender) end
     end
 end
 
@@ -1190,11 +1257,22 @@ function Mesh.SendSegment(target, aid, area)
     })
 end
 
+-- Reply to a peer's timer-sync request with a merged Nexus snapshot. Prefers
+-- the registered provider (Timers.GetSnapshot) so the reply routes through the
+-- receiver's Timers.ApplySnapshot; falls back to the legacy raw-store payload
+-- when no provider is registered (provider-less build stays functional).
 function Mesh.SendTimers(target)
-    local payload = Mesh.Pack({ timers = Store.GetTimers and Store.GetTimers() })
+    local snap
+    if Mesh._snapProvider then
+        snap = Mesh._snapProvider()
+    end
+    if type(snap) ~= "table" then
+        snap = { legacyTimers = (Store.GetTimers and Store.GetTimers()) or {} }
+    end
+    local payload = Mesh.Pack(snap)
     if not payload then return end
     local seq = Mesh._outSeq + 1
-    local frame = Mesh.BuildFrame(OP.SEGMENT, payload, { seq = seq })
+    local frame = Mesh.BuildFrame(OP.TIMER_SNAP, payload, { seq = seq })
     Mesh.Enqueue(Protocol.PREFIX.SYNC, frame, {
         op = "sync", chatType = "WHISPER", target = target, seq = seq,
     })
@@ -1289,6 +1367,100 @@ end
 
 function Mesh.SetTimerHandler(fn)
     Mesh._timerHandler = fn
+end
+
+----------------------------------------------------------------------
+-- Nexus merged-snapshot handoff (N2 round 2)
+--
+-- Round-1 shipped a broken timer-sync reply (SendTimers packed the raw store
+-- table on OP.SEGMENT, which handleSegment drops for lack of aid/records).
+-- Round 2 replaces it with a first-class snapshot channel so a peer request
+-- (or the guild-broadcaster relay) round-trips a Timers.GetSnapshot() through
+-- Timers.ApplySnapshot on the receiver:
+--
+--   Mesh.RegisterSnapshotProvider(fn)  -- fn() -> snapshot table (merged timers)
+--   Mesh.SetSnapshotHandler(fn)        -- fn(snap, sender) applied on receipt
+--
+-- Both are optional; without a provider SendTimers falls back to the legacy
+-- raw-store payload so a provider-less build still answers (harmlessly).
+----------------------------------------------------------------------
+
+Mesh._snapProvider = nil
+Mesh._snapHandler  = nil
+
+function Mesh.RegisterSnapshotProvider(fn)
+    Mesh._snapProvider = fn
+end
+
+function Mesh.SetSnapshotHandler(fn)
+    Mesh._snapHandler = fn
+end
+
+-- Inbound merged snapshot (request reply or guild-broadcaster relay).
+local function handleTimerSnap(f, sender)
+    local snap = Mesh.Unpack(f.payload)
+    if type(snap) ~= "table" then return end
+    if Mesh._snapHandler then
+        ns:SafeCall(Mesh._snapHandler, snap, sender)
+    end
+    ns:Fire("MESH_TIMERSNAP_RECEIVED", snap, sender)
+end
+Mesh._handleTimerSnap = handleTimerSnap
+
+-- Ask peers (and, as a fallback, same-guild members we don't know yet) for a
+-- merged Nexus timer snapshot. Peers answer via handleSyncReq -> SendTimers.
+-- The 60s button cooldown lives in the timers layer; this is the transport.
+-- Returns the number of request sends emitted.
+function Mesh.RequestTimers()
+    if not Mesh.IsEnabled() then return 0 end
+    local sent = 0
+    for _, p in pairs(Mesh.peers) do
+        if p.online and p.name then
+            Mesh.RequestSync(p.name, "timers", "timers")
+            sent = sent + 1
+        end
+    end
+    -- Guild fallback so members not yet in our peer table also answer.
+    if IsInGuild and IsInGuild() then
+        local payload = Mesh.Pack({ aid = "timers", area = "timers" })
+        if payload then
+            local frame = Mesh.BuildFrame(OP.SYNC_REQ, payload, {})
+            Mesh.Enqueue(Protocol.PREFIX.SYNC, frame, { op = "sync", chatType = "GUILD" })
+            sent = sent + 1
+        end
+    end
+    return sent
+end
+
+-- Guild-broadcaster relay of a merged snapshot (the <=1/min rate gate and the
+-- broadcaster election both live in the timers layer; this only transports).
+function Mesh.BroadcastTimers(snap)
+    if not Mesh.IsEnabled() then return end
+    if type(snap) ~= "table" then return end
+    local payload = Mesh.Pack(snap)
+    if not payload then return end
+    local seq = Mesh._outSeq + 1
+    local frame = Mesh.BuildFrame(OP.TIMER_SNAP, payload, { seq = seq })
+    if IsInGuild and IsInGuild() then
+        Mesh.Enqueue(Protocol.PREFIX.SYNC, frame,
+            { op = "sync", chatType = "GUILD", seq = seq })
+    end
+    for _, p in pairs(Mesh.peers) do
+        if p.online and p.name then
+            Mesh.Enqueue(Protocol.PREFIX.SYNC, frame,
+                { op = "sync", chatType = "WHISPER", target = p.name, seq = seq })
+        end
+    end
+end
+
+-- Online mesh peers as broadcaster-election rows. The timers layer picks the
+-- lowest account id among these (plus self) as the guild broadcaster.
+function Mesh.GetGuildRoster()
+    local out = {}
+    for aid, p in pairs(Mesh.peers) do
+        if p.online then out[#out + 1] = { accountID = aid, name = p.name } end
+    end
+    return out
 end
 
 local function encodeTimer(evt)
@@ -1758,9 +1930,9 @@ function Mesh.OnLogin()
         ns:SafeCall(Mesh.OnChannelLeaveNotice, playerName, channelBaseName)
     end)
 
-    -- Push live state changes onto the mesh.
+    -- Push live state changes onto the mesh (self-record-guarded).
     ns:On("STATE_CHANGED", function(nameRealm, record)
-        ns:SafeCall(Mesh.PushState, nameRealm, record)
+        Mesh.OnStateChanged(nameRealm, record)
     end)
 
     -- Final flush on the way out.
@@ -2170,8 +2342,88 @@ local function testJoinNoticeThrottle()
     return true
 end
 
+-- TRANSMIT-SAFETY: the SN prefixes must be un-sendable through every path.
+local function testTransmitSafety()
+    -- Predicate covers all five SN prefixes (+ legacy SNT), rejects ours + NWB.
+    for _, p in ipairs({ "SDWW", "SNT", "SDWZ", "SDWY", "SDWX" }) do
+        if not Mesh.IsForbiddenTxPrefix(p) then
+            return false, "SN prefix not forbidden: " .. p
+        end
+    end
+    for _, p in ipairs({ "DSKN0", "DSKN1", "DSKN2", "DSKN3", "NWB", "D5" }) do
+        if Mesh.IsForbiddenTxPrefix(p) then
+            return false, "non-SN prefix wrongly forbidden: " .. p
+        end
+    end
+    -- rawSend refuses an SN prefix and never reaches C_ChatInfo (increments
+    -- the block counter; returns false as a "did-not-send" to callers).
+    local before = Mesh._forbiddenTxBlocked or 0
+    local sent = Mesh._rawSend("SDWW", "any-wire", "GUILD", nil)
+    if sent ~= false then return false, "rawSend did not refuse SDWW" end
+    if (Mesh._forbiddenTxBlocked or 0) ~= before + 1 then
+        return false, "block telemetry did not advance on rawSend"
+    end
+    -- Enqueue drops an SN prefix before it can reach any scheduler queue.
+    Mesh.Enqueue("SDWZ", "1\tz\tmid\t0\t\tpayload", { op = "timer" })
+    if Mesh._sched["SDWZ"] then return false, "SN prefix created a scheduler" end
+    return true
+end
+
+-- Snapshot request reply routes a peer snapshot into the registered handler.
+-- The wire (de)serialization is LibDeflate's responsibility and is exercised
+-- in-game; here we isolate the handoff dispatch by feeding the snapshot table
+-- straight through Unpack, so the test validates OUR routing under any VM.
+local function testSnapshotHandoff()
+    local captured
+    local savedHandler, savedUnpack = Mesh._snapHandler, Mesh.Unpack
+    Mesh.SetSnapshotHandler(function(snap, sender) captured = { snap = snap, sender = sender } end)
+    local snap = { buffs = { rend = { lastPop = 1500000000, trust = "local" } },
+                   flower = { [1] = 1500000123 }, tuber = {}, at = 1500000200 }
+    Mesh.Unpack = function() return snap end
+    Mesh._handleTimerSnap({ payload = "wire" }, "Peer-Realm")
+    Mesh.Unpack, Mesh._snapHandler = savedUnpack, savedHandler
+    if not captured then return false, "handler not invoked" end
+    if captured.sender ~= "Peer-Realm" then return false, "sender not passed" end
+    if not (captured.snap and captured.snap.buffs and captured.snap.buffs.rend
+            and captured.snap.buffs.rend.lastPop == 1500000000) then
+        return false, "snapshot not delivered"
+    end
+    if captured.snap.flower[1] ~= 1500000123 then return false, "flower epoch lost" end
+    return true
+end
+
+-- STATE_CHANGED contract guard: nil/foreign records must not push or crash.
+local function testStateChangedGuard()
+    -- Encoder defends against non-table input (the import.lua crash root cause).
+    if Protocol.EncodeCharacter(nil) ~= nil then return false, "EncodeCharacter(nil) not nil" end
+    if Protocol.EncodeCharacter("import") ~= nil then return false, "EncodeCharacter(string) not nil" end
+    -- IsSelfRecord rejects nil and other-account records.
+    if Mesh.IsSelfRecord("import", nil) ~= false then return false, "nil record judged self" end
+    if Mesh.IsSelfRecord("Foreign-Realm", { nameRealm = "Foreign-Realm" }) ~= false then
+        return false, "foreign record judged self"
+    end
+    -- OnStateChanged must not push a nil or foreign record (spy on PushState).
+    local pushed = 0
+    local savedPush = Mesh.PushState
+    Mesh.PushState = function() pushed = pushed + 1 end
+    Mesh.OnStateChanged("import", nil)                                     -- stray args-free fire
+    Mesh.OnStateChanged("Foreign-Realm", { nameRealm = "Foreign-Realm" })  -- other-account record
+    Mesh.PushState = savedPush
+    if pushed ~= 0 then return false, "nil/foreign record was pushed to mesh" end
+    -- STORE_REFRESHED is a distinct, args-free signal the mesh ignores but the
+    -- callback bus still delivers (dashboard/HUD subscribe to repaint).
+    local refreshed = 0
+    ns:On("STORE_REFRESHED", function() refreshed = refreshed + 1 end)
+    ns:Fire("STORE_REFRESHED")
+    if refreshed ~= 1 then return false, "STORE_REFRESHED not delivered by the bus" end
+    return true
+end
+
 function Mesh.RunSelfTests(verbose)
     local suite = {
+        { name = "transmit safety",  fn = testTransmitSafety },
+        { name = "snapshot handoff", fn = testSnapshotHandoff },
+        { name = "state-changed guard", fn = testStateChangedGuard },
         { name = "relay assignment", fn = testRelayPlan },
         { name = "hash diff",        fn = testHashDiff },
         { name = "dedup window",     fn = testDedupWindow },

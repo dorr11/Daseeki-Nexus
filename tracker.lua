@@ -20,9 +20,12 @@ ns.Tracker = Tracker
 local ITEM_SOUL_SHARD  = 6265
 local ITEM_HEARTHSTONE = 6948
 
--- World-buff aura name -> fixed slot (1..10). Names are matched
+-- World-buff aura name -> fixed slot (1..8). Names are matched
 -- case-insensitively by prefix so localized suffixes (e.g. Sayge's
 -- fortune variants) still land in one slot. Slot layout is Daseeki's own.
+-- Slots 9/10 (Traces of Silithyst, Boon of Blackfathom) were removed as
+-- not-relevant tracked buffs; they were the tail entries, so no live slot
+-- index shifts (the mesh binary schema still reserves up to 10 sparse slots).
 local BUFF_SLOTS = {
     { slot = 1,  prefix = "rallying cry of the dragonslayer" },
     { slot = 2,  prefix = "warchief's blessing" },
@@ -32,8 +35,6 @@ local BUFF_SLOTS = {
     { slot = 6,  prefix = "fengus' ferocity" },
     { slot = 7,  prefix = "mol'dar's moxie" },
     { slot = 8,  prefix = "slip'kik's savvy" },
-    { slot = 9,  prefix = "traces of silithyst" },
-    { slot = 10, prefix = "boon of blackfathom" },
 }
 
 -- Names that mark a stored-buff chronoboon aura (tooltip capture target).

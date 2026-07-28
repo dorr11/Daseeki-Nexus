@@ -309,7 +309,6 @@ function Import._MapFaction(f)
     local as = f.autoSummon or {}
     local ago = f.autoGossip or {}
     local aq = f.autoQuest or {}
-    local ai = f.autoInteract or {}
     local ao = f.auraOpts or {}
     return {
         autoGroup = {
@@ -347,8 +346,7 @@ function Import._MapFaction(f)
             autoRepair = aq.autoRepairEnabled,
             zanza      = { enabled = aq.zanzaEnabled, priority = deepCopy(aq.zanzaPicks) or {} },
         },
-        -- SN nests interact NPCs under `.npcs`; our store keeps them flat.
-        autoInteract = deepCopy(ai.npcs) or {},
+        -- Interact Buttons feature was cut; SN's autoInteract.npcs is dropped.
         auraOpts = {
             thresholds  = mapThresholds(ao.thresholds),
             rend        = invertClassMap(ao.rendClasses),
@@ -692,8 +690,12 @@ function Import.Run(dryRun)
             if ns.Print then ns:Print("import: store not ready; nothing applied.") end
             return false, { settings = sc, data = dc }
         end
-        -- Announce the state change so live views (dashboard/HUD/mesh) refresh.
-        if ns.Fire then ns:Fire("STATE_CHANGED", "import") end
+        -- Announce a bulk data refresh so live views repaint. This is a
+        -- DEDICATED, args-free signal — NOT STATE_CHANGED, whose (nameRealm,
+        -- record) contract the mesh relies on to push our own live character.
+        -- The mesh ignores STORE_REFRESHED (imported other-account data must
+        -- never be broadcast as ours); the dashboard/HUD subscribe to repaint.
+        if ns.Fire then ns:Fire("STORE_REFRESHED") end
         if ns.Print then ns:Print("import complete. Consider disabling ShadowNetwork now.") end
     end
 
@@ -777,14 +779,13 @@ local function selfTest(verbose)
     -- rgb->hex.
     check("rgb->hex", Import._RgbToHex({ 0.2, 0.8, 0.2 }) == "33CC33")
 
-    -- Faction autoInteract flatten + zanza priority + summonWindow rename +
-    -- positional->keyed thresholds/triggers (canonical aura order).
+    -- Faction zanza priority + summonWindow rename + positional->keyed
+    -- thresholds/triggers (canonical aura order). (Interact feature was cut.)
     local fac = Import._MapFaction({
         autoQuest = { zanzaEnabled = true, zanzaPicks = { spirit = true } },
         -- buffTriggers slots: 1=dmf(skip) 2=ony 3=dmtAP; so ony->dragonslayer=false,
         -- dmtAP->fengus=true, dmf dropped.
         autoSummon = { summonWindow = 19, buffTriggers = { true, false, true } },
-        autoInteract = { npcs = { ["Auctioneer Jaxon"] = true } },
         autoGroup = { inviteWhitelist = { ["A-B"] = true }, inviteWhitelistDefaultsApplied = true },
         -- threshold slots: 1=dmf 2=ony 8=rend.
         auraOpts = { thresholds = {
@@ -802,7 +803,7 @@ local function selfTest(verbose)
     check("faction thresholds->keys (slot8->rend)", fac.auraOpts.thresholds.rend and fac.auraOpts.thresholds.rend.normal == 800)
     check("faction thresholds unset slot nil", fac.auraOpts.thresholds.zg == nil)
     check("faction zanza priority", fac.autoQuest.zanza.priority.spirit == true)
-    check("faction interact flattened", fac.autoInteract["Auctioneer Jaxon"] == true)
+    check("faction interact dropped", fac.autoInteract == nil)
     check("faction whitelist", fac.autoGroup.whitelist["A-B"] == true)
 
     -- Data timers: flat flowerN -> array, logs rename.

@@ -273,6 +273,10 @@ local function bit_set(mask, bitpos)
 end
 
 function Protocol.EncodeCharacter(rec)
+    -- Defensive: never index a non-table. Callers (mesh PushState) treat a nil
+    -- return as "nothing to send". This backstops any caller that fires a
+    -- state-change signal without a real record (see import.lua STORE_REFRESHED).
+    if type(rec) ~= "table" then return nil end
     local w = newWriter()
     w.u8(Protocol.SCHEMA_VERSION)
 

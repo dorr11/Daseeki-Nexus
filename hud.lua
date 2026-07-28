@@ -694,8 +694,11 @@ end
 -- buttons (Chronoboon Displacer, item 184937).
 ----------------------------------------------------------------------
 
--- Engine 10-slot tracked-aura layout (matches tracker's BUFF_SLOTS names).
+-- Engine 8-slot tracked-aura layout (matches tracker's BUFF_SLOTS names).
 -- label / namePrefix (lowercased, matched by prefix) / icon (Blizzard built-in).
+-- Silithyst / Boon of Blackfathom removed as not-relevant tracked buffs (they
+-- were the trailing two slots, so nothing else reindexes). The grid geometry
+-- is derived from #CANCEL_AURAS, so it auto-reflows to the new count.
 local CANCEL_AURAS = {
     { label = "Ony",        prefix = "rallying cry of the dragonslayer", icon = "Interface\\Icons\\INV_Misc_Head_Dragon_01" },
     { label = "Rend",       prefix = "warchief's blessing",              icon = "Interface\\Icons\\Ability_Warrior_WarCry" },
@@ -705,8 +708,6 @@ local CANCEL_AURAS = {
     { label = "Fengus",     prefix = "fengus' ferocity",                 icon = "Interface\\Icons\\Ability_Warrior_Rampage" },
     { label = "Mol'dar",    prefix = "mol'dar's moxie",                  icon = "Interface\\Icons\\Ability_Warrior_Charge" },
     { label = "Slip'kik",   prefix = "slip'kik's savvy",                 icon = "Interface\\Icons\\Spell_Nature_MoonKey" },
-    { label = "Silithyst",  prefix = "traces of silithyst",              icon = "Interface\\Icons\\INV_Misc_QirajiCrystal_02" },
-    { label = "Boon BFD",   prefix = "boon of blackfathom",              icon = "Interface\\Icons\\Spell_Frost_FrostArmor02" },
 }
 
 local CHRONOBOON_ITEM_ID = 184937
@@ -945,7 +946,7 @@ local function runSelfTests(verbose)
     check(SOUND_BY_KEY["RaidWarning"] ~= nil, "sound RaidWarning present")
     check(SOUND_BY_KEY["None"].id == nil, "None has no id")
     check(soundKeyForEvent("pullTimer") ~= nil, "event sound resolves")
-    check(#CANCEL_AURAS == 10, "10 cancel auras")
+    check(#CANCEL_AURAS == 8, "8 cancel auras (Silithyst/Boon BFD removed)")
     if verbose then ns:Print("  hud selftest " .. (pass and "PASS" or "FAIL")) end
     return pass
 end
