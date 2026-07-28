@@ -1,0 +1,14 @@
+## Interface: 11509
+## Title: Daseeki Network
+## Notes: Cross-account character dashboard, world-buff timers, and mesh coordination for the Daseeki suite.
+## Author: Daseeki
+## Version: 0.1.0-n1
+## SavedVariables: DaseekiNetworkDB, DaseekiNetworkData
+## Dependencies: Daseeki-Core
+## IconTexture: Interface\Icons\INV_Misc_Net_01
+# ## X-Curse-Project-ID: 000000  (placeholder — set at first CurseForge release)
+
+core.lua
+store.lua
+protocol.lua
+tracker.lua
