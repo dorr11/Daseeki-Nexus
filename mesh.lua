@@ -275,7 +275,6 @@ Mesh._timerHandler = nil -- N2b handoff receive callback
 -- Channel-join retry state machine + discovery telemetry (see §Channel join).
 Mesh._joinState = nil    -- { chanName, attempts, index, joined, gaveUp, pingedOnJoin }
 Mesh._joinGen   = 0      -- generation token: supersedes stale in-flight retry loops
-Mesh._lastJoinPing = 0   -- throttle re-pings triggered by newcomer channel joins
 Mesh._lastSeqStart = 0   -- ts of the last StartJoinSequence (health-check cooldown gate)
 Mesh._lastJoinAttempt = 0 -- ts of the last real JoinTemporaryChannel call (debug telemetry)
 Mesh._disco = {          -- last discovery ping/pong timestamps (for /dsn debug mesh)
@@ -283,12 +282,22 @@ Mesh._disco = {          -- last discovery ping/pong timestamps (for /dsn debug 
     lastPongSent = 0, lastPongRecv = 0,
 }
 
+-- Presence discovery state. The derived channel is a PRESENCE beacon only — on
+-- this client CHANNEL distribution silently drops addon messages, so discovery
+-- pings and heartbeats travel by WHISPER to members we learn from the channel
+-- ROSTER and from CHAT_MSG_CHANNEL_JOIN/LEAVE notices (see §Presence roster).
+Mesh._pingCooldowns  = {}   -- [name] = ts we last whisper-pinged that name
+Mesh._lastRosterSweep = 0   -- ts of the last full roster sweep (debug telemetry)
+
 -- Join-retry tunables: verify GetChannelName after each attempt on a backoff.
 -- Channel joins routinely fail in the first seconds after login, so we issue
 -- the join, then re-check on a widening schedule up to JOIN_MAX_TRIES times.
 Mesh.JOIN_DELAYS     = { 5, 7, 10, 15, 22 }   -- seconds between verification ticks
 Mesh.JOIN_MAX_TRIES  = 5                       -- max join calls before giving up
-Mesh.JOIN_PING_THROTTLE = 3                    -- min seconds between newcomer re-pings
+-- Presence-discovery cadence + anti-storm throttles.
+Mesh.ROSTER_SWEEP_INTERVAL = 60   -- min seconds between full roster ping sweeps
+Mesh.ROSTER_PING_COOLDOWN  = 30   -- per-name min seconds between whisper pings
+Mesh.ROSTER_SCAN_CAP       = 100  -- hard cap on roster indices scanned per sweep
 -- Never trust a single membership snapshot. After a tick resolves to "joined"
 -- we re-check the LIVE index once more, JOIN_REVERIFY_DELAY seconds later: a
 -- /reload briefly reports the PRE-reload channel membership, then drops the
@@ -988,28 +997,152 @@ function Mesh.SendHeartbeat()
     end
     local payload = Mesh.Pack(hb)
     if not payload then return end
-    -- Broadcast to the discovery channel so cross-guild peers hear us.
+    -- Whisper the heartbeat to every KNOWN peer (the channel is presence-only:
+    -- CHANNEL distribution can't carry addon messages on this client). The GUILD
+    -- fallback lets same-guild members who aren't known peers yet still hear us.
     local seq = Mesh._outSeq + 1
     local frame = Mesh.BuildFrame(OP.HEARTBEAT, payload, { seq = seq })
-    Mesh.BroadcastChannel(Protocol.PREFIX.HEARTBEAT, frame, { op = "heartbeat", seq = seq })
+    Mesh.WhisperKnownPeers(Protocol.PREFIX.HEARTBEAT, frame, { op = "heartbeat", seq = seq })
+    Mesh.GuildBroadcast(Protocol.PREFIX.HEARTBEAT, frame, { op = "heartbeat", seq = seq })
 end
 
--- Discovery ping/pong. `target` nil => broadcast ping to the channel.
+-- Discovery ping/pong — ALWAYS a directed WHISPER. `target` is required: the
+-- discovery channel is presence-only (CHANNEL distribution silently drops addon
+-- messages on this client), so pings go to roster members / join-notice names
+-- and pongs go back to the pinger. A nil target is a no-op.
 function Mesh.SendDiscovery(op, target)
     if not Mesh.IsEnabled() then return end
+    if not target or target == "" then return end
     local payload = Mesh.Pack({ aid = ns:GetAccountID(), name = selfNameRealm() })
     if not payload then return end
     -- Telemetry: record when we emit a discovery ping/pong (surfaced in debug).
     if op == OP.PING then Mesh._disco.lastPingSent = now()
     elseif op == OP.PONG then Mesh._disco.lastPongSent = now() end
     local frame = Mesh.BuildFrame(op, payload, {})
-    if target then
-        Mesh.Enqueue(Protocol.PREFIX.HEARTBEAT, frame, {
-            op = "discovery", chatType = "WHISPER", target = target,
-        })
-    else
-        Mesh.BroadcastChannel(Protocol.PREFIX.HEARTBEAT, frame, { op = "discovery" })
+    Mesh.Enqueue(Protocol.PREFIX.HEARTBEAT, frame, {
+        op = "discovery", chatType = "WHISPER", target = target,
+    })
+end
+
+----------------------------------------------------------------------
+-- Presence roster: discovery over channel presence + whisper transport
+--
+-- The derived channel is a PRESENCE beacon; addon data can never ride it on
+-- this client. We learn who is present by enumerating the channel ROSTER and
+-- by CHAT_MSG_CHANNEL_JOIN/LEAVE notices, then whisper discovery pings to those
+-- names. Once a peer answers (PONG) or heartbeats, it becomes a known peer and
+-- the heartbeat whisper path keeps it alive.
+--
+-- Roster enumeration — verified against the API catalog (1.15.9.68808):
+--   * C_ChatInfo.GetChannelRosterInfo(channelIndex, rosterIndex)
+--         -> name, owner, moderator, guid          (functions.txt:514)
+--   * GetNumChannelMembers                          (globals.txt:5333, count
+--         fast-path; name-only in the catalog so it is capability-guarded)
+--   * GetChannelName                                (globals.txt:4909, already
+--         used to resolve our channel index)
+-- Shipped path: if GetNumChannelMembers is present we trust its count and read
+-- exactly that many roster rows; otherwise we iterate rosterIndex from 1 and
+-- stop at the first empty row. Both branches are hard-capped by ROSTER_SCAN_CAP.
+----------------------------------------------------------------------
+
+-- Enumerate the members of a resolved channel index -> list of Name(-Realm).
+-- Impure (reads live channel state); the ping-SELECTION logic below is pure.
+function Mesh.ChannelRoster(channelIndex)
+    local out = {}
+    if not channelIndex or channelIndex <= 0 then return out end
+    local getRoster = C_ChatInfo and C_ChatInfo.GetChannelRosterInfo
+    if not getRoster then return out end
+    local haveCount = (GetNumChannelMembers ~= nil)
+    local count = haveCount and (GetNumChannelMembers(channelIndex) or 0) or 0
+    if not haveCount or count <= 0 then count = Mesh.ROSTER_SCAN_CAP end
+    if count > Mesh.ROSTER_SCAN_CAP then count = Mesh.ROSTER_SCAN_CAP end
+    for r = 1, count do
+        local name = getRoster(channelIndex, r)
+        if name and name ~= "" then
+            out[#out + 1] = name
+        elseif not haveCount then
+            break   -- iterate-until-empty fallback: first gap ends the roster
+        end
     end
+    return out
+end
+
+-- Set of names we already track as peers (skip-pinging them on a sweep).
+local function knownPeerNames()
+    local set = {}
+    for _, p in pairs(Mesh.peers) do
+        if p.name then set[p.name] = true end
+    end
+    return set
+end
+
+-- PURE: per-name cooldown gate. True if `name` may be pinged at nowT.
+function Mesh.ShouldPingName(name, cooldowns, nowT, cooldownWin)
+    if not name or name == "" then return false end
+    cooldownWin = cooldownWin or Mesh.ROSTER_PING_COOLDOWN
+    local last = cooldowns and cooldowns[name]
+    if last and (nowT - last) < cooldownWin then return false end
+    return true
+end
+
+-- PURE: given a roster, our self name, the set of already-known peer names, a
+-- per-name cooldown map and now, return the names to ping this sweep. Excludes
+-- self, already-known peers, and names still inside their cooldown window.
+function Mesh.SelectRosterPings(roster, selfName, knownNames, cooldowns, nowT, cooldownWin)
+    local out = {}
+    for i = 1, #roster do
+        local name = roster[i]
+        if name and name ~= "" and name ~= selfName
+           and not (knownNames and knownNames[name])
+           and Mesh.ShouldPingName(name, cooldowns, nowT, cooldownWin) then
+            out[#out + 1] = name
+        end
+    end
+    return out
+end
+
+-- Prune cooldown entries older than a few windows so the map can't grow forever.
+local function pruneCooldowns(t)
+    local horizon = (Mesh.ROSTER_PING_COOLDOWN or 30) * 4
+    for name, ts in pairs(Mesh._pingCooldowns) do
+        if (t - (ts or 0)) > horizon then Mesh._pingCooldowns[name] = nil end
+    end
+end
+
+-- Live roster sweep: resolve our channel, enumerate the roster, whisper a
+-- discovery ping to every eligible member, and record the sweep time.
+function Mesh.PingRoster()
+    if not Mesh.IsEnabled() then return end
+    local chanName = Mesh.GetChannelName()
+    if not chanName then return end
+    -- Resolve our channel index inline (GetChannelName is a FrameXML global,
+    -- catalog globals.txt:4909); the local getChannelIndex wrapper is declared
+    -- further down the file, so we can't close over it from here.
+    local idx = (chanName and GetChannelName) and (GetChannelName(chanName) or 0) or 0
+    local t = now()
+    Mesh._lastRosterSweep = t
+    if not idx or idx <= 0 then return end   -- not joined yet; nothing to sweep
+    local roster = Mesh.ChannelRoster(idx)
+    -- Drop self-echoes robustly (roster may report bare Name or Name-Realm).
+    local filtered = {}
+    for i = 1, #roster do
+        if not Mesh.IsSelfSender(roster[i]) then filtered[#filtered + 1] = roster[i] end
+    end
+    local targets = Mesh.SelectRosterPings(filtered, selfNameRealm(),
+        knownPeerNames(), Mesh._pingCooldowns, t, Mesh.ROSTER_PING_COOLDOWN)
+    for i = 1, #targets do
+        Mesh._pingCooldowns[targets[i]] = t
+        Mesh.SendDiscovery(OP.PING, targets[i])
+    end
+    pruneCooldowns(t)
+end
+
+-- Slow periodic sweep gate (piggybacks the heartbeat loop): only sweep once per
+-- ROSTER_SWEEP_INTERVAL so an N-member channel can't cause ping storms.
+function Mesh.MaybeRosterSweep()
+    if not Mesh.IsEnabled() then return end
+    if (now() - (Mesh._lastRosterSweep or 0)) < Mesh.ROSTER_SWEEP_INTERVAL then return end
+    Mesh.PingRoster()
 end
 
 function Mesh.RequestSync(target, aid, area)
@@ -1218,28 +1351,36 @@ function Mesh.RebroadcastTimerLocal(payload)
 end
 
 ----------------------------------------------------------------------
--- Channel broadcast helper (discovery + heartbeats reach cross-guild peers)
+-- Broadcast helpers (whisper fan-out + guild fallback)
+--
+-- BroadcastChannel is retired: CHANNEL distribution can never carry addon
+-- messages on this client, so there is no channel send path left. What used to
+-- ride the channel (discovery pings + heartbeats) now fans out over whispers to
+-- known peers; the GUILD fallback below is retained so same-guild members who
+-- aren't known peers yet still converge.
 ----------------------------------------------------------------------
 
-function Mesh.BroadcastChannel(prefix, frame, meta)
+-- Whisper an already-built frame to every known ONLINE peer (broadcast-by-
+-- whisper; all recipients share the frame's seq — each sees one send from us).
+function Mesh.WhisperKnownPeers(prefix, frame, meta)
     meta = meta or {}
-    local chanName = Mesh.GetChannelName()
-    local idx = 0
-    if chanName and GetChannelName then
-        idx = GetChannelName(chanName) or 0
-    end
-    if idx and idx > 0 then
-        meta.chatType = "CHANNEL"
-        meta.target = tostring(idx)
-        Mesh.Enqueue(prefix, frame, meta)
-    else
-        -- No channel available (not joined yet): fall back to guild so at least
-        -- same-guild mesh members converge.
-        if IsInGuild and IsInGuild() then
-            meta.chatType = "GUILD"
-            meta.target = nil
-            Mesh.Enqueue(prefix, frame, meta)
+    for _, p in pairs(Mesh.peers) do
+        if p.online and p.name then
+            Mesh.Enqueue(prefix, frame, {
+                op = meta.op, chatType = "WHISPER", target = p.name, seq = meta.seq,
+            })
         end
+    end
+end
+
+-- GUILD fallback broadcast: only same-guild members hear it, but it lets guildies
+-- who aren't yet known peers pick us up before the roster sweep does.
+function Mesh.GuildBroadcast(prefix, frame, meta)
+    meta = meta or {}
+    if IsInGuild and IsInGuild() then
+        Mesh.Enqueue(prefix, frame, {
+            op = meta.op, chatType = "GUILD", target = nil, seq = meta.seq,
+        })
     end
 end
 
@@ -1283,11 +1424,12 @@ end
 -- Channel membership lifecycle
 --
 -- The discovery channel is what lets cross-guild / unguilded mesh accounts
--- find each other: heartbeats + discovery pings ride it (see BroadcastChannel).
--- The catch is timing — JoinTemporaryChannel silently no-ops in the first few
--- seconds after login/reload (the chat system isn't ready), so a one-shot join
--- at PLAYER_LOGIN leaves GetChannelName() == 0 forever and every broadcast
--- falls back to GUILD-only. So we drive the join through a small retry state
+-- find each other: it is a PRESENCE beacon whose roster + JOIN/LEAVE notices
+-- drive our whisper discovery (see §Presence roster). The catch is timing —
+-- JoinTemporaryChannel silently no-ops in the first few seconds after
+-- login/reload (the chat system isn't ready), so a one-shot join at
+-- PLAYER_LOGIN leaves GetChannelName() == 0 forever and we never see the
+-- roster. So we drive the join through a small retry state
 -- machine: issue the join, verify via GetChannelName on a widening backoff, and
 -- only stop once the index resolves (or we exhaust JOIN_MAX_TRIES).
 --
@@ -1387,11 +1529,11 @@ local function doJoinChannel(chanName)
     if JoinTemporaryChannel then JoinTemporaryChannel(chanName) end
 end
 
--- Announce ourselves once the channel index first resolves so peers already on
--- the channel (and we, to them) converge immediately rather than waiting for the
--- next 17-23s heartbeat.
+-- Announce ourselves once the channel index first resolves: sweep the roster and
+-- whisper a discovery ping to everyone already present, so we converge with peers
+-- who joined before us instead of waiting for the next 17-23s heartbeat.
 function Mesh.OnChannelResolved()
-    ns:SafeCall(Mesh.SendDiscovery, OP.PING, nil)
+    ns:SafeCall(Mesh.PingRoster)
 end
 
 -- One tick of the live join loop: advance the state, then schedule the next
@@ -1427,7 +1569,7 @@ function Mesh._runJoinTick(gen)
             C_Timer.After(delay or 5, function() ns:SafeCall(Mesh._runJoinTick, gen) end)
         end
     end
-    -- "gaveup"/"noop": stop the loop. BroadcastChannel's GUILD fallback keeps
+    -- "gaveup"/"noop": stop the loop. The heartbeat GUILD fallback keeps
     -- same-guild peers converging even without the channel; the heartbeat health
     -- check (Mesh.HealthCheckChannel) re-attempts a dead channel on a cooldown.
 end
@@ -1512,20 +1654,51 @@ function Mesh.OnEnteringWorld(isInitialLogin, isReloadingUi)
     Mesh.StartJoinSequence()
 end
 
--- CHAT_MSG_CHANNEL_JOIN handler: when a peer joins our discovery channel, emit
--- a throttled discovery ping so late arrivals converge fast instead of waiting a
--- full heartbeat cycle. Ignores our own join and joins on unrelated channels.
+-- Return true if `channelBaseName` names OUR discovery channel.
+local function isOurChannel(channelBaseName)
+    local chanName = Mesh.GetChannelName()
+    if not chanName then return false end
+    local base = channelBaseName and tostring(channelBaseName):lower() or ""
+    return base ~= "" and base == chanName:lower()
+end
+
+-- CHAT_MSG_CHANNEL_JOIN handler: a specific character just joined our presence
+-- channel. Whisper THEM a discovery ping directly (the join notice hands us the
+-- name), throttled by the per-name cooldown so a flapping joiner can't storm us.
+-- Ignores our own join and joins on unrelated channels.
 function Mesh.OnChannelJoinNotice(playerName, channelBaseName)
     if not Mesh.IsEnabled() then return end
-    local chanName = Mesh.GetChannelName()
-    if not chanName then return end
-    local base = channelBaseName and tostring(channelBaseName):lower() or ""
-    if base == "" or base ~= chanName:lower() then return end
-    if playerName and Mesh.IsSelfSender(playerName) then return end
+    if not isOurChannel(channelBaseName) then return end
+    if not playerName or playerName == "" then return end
+    if Mesh.IsSelfSender(playerName) then return end
     local t = now()
-    if t - (Mesh._lastJoinPing or 0) < Mesh.JOIN_PING_THROTTLE then return end
-    Mesh._lastJoinPing = t
-    ns:SafeCall(Mesh.SendDiscovery, OP.PING, nil)
+    if not Mesh.ShouldPingName(playerName, Mesh._pingCooldowns, t, Mesh.ROSTER_PING_COOLDOWN) then
+        return
+    end
+    Mesh._pingCooldowns[playerName] = t
+    ns:SafeCall(Mesh.SendDiscovery, OP.PING, playerName)
+end
+
+-- CHAT_MSG_CHANNEL_LEAVE handler: a character left our presence channel. Mark
+-- any peer with that name offline (presence-driven offline detection augmenting
+-- the heartbeat timeout). Ignores our own leave and unrelated channels.
+function Mesh.OnChannelLeaveNotice(playerName, channelBaseName)
+    if not Mesh.IsEnabled() then return end
+    if not isOurChannel(channelBaseName) then return end
+    if not playerName or playerName == "" then return end
+    if Mesh.IsSelfSender(playerName) then return end
+    Mesh.MarkPresenceStale(playerName)
+end
+
+-- Flag every peer matching `name` as offline (presence gone). Best-effort name
+-- match against the peer table; the heartbeat path re-flips it online on return.
+function Mesh.MarkPresenceStale(name)
+    for _, p in pairs(Mesh.peers) do
+        if p.name == name then
+            p.online = false
+            p.presenceStale = true
+        end
+    end
 end
 
 ----------------------------------------------------------------------
@@ -1540,9 +1713,9 @@ local function onChatMsgAddon(event, prefix, text, channel, sender)
     end
     if not ours then return end
     if not Mesh.IsEnabled() then return end
-    -- Ignore our own echoes (guild/raid/yell/channel broadcasts loop back). The
-    -- `channel` origin arg is NOT filtered here: CHANNEL-distributed addon
-    -- messages arrive with channel="CHANNEL" and are dispatched like any other.
+    -- Ignore our own echoes (guild/raid/yell/whisper sends can loop back). All
+    -- mesh data now arrives by WHISPER (channel="WHISPER") or guild fallback;
+    -- the presence channel carries no addon data, so there is no CHANNEL path.
     if Mesh.IsSelfSender(sender) then return end
     -- De-envelope, reassemble, then dispatch.
     local env = Mesh.DeEnvelope(text)
@@ -1568,14 +1741,21 @@ function Mesh.OnLogin()
         ns:SafeCall(Mesh.OnEnteringWorld, isInitialLogin, isReloadingUi)
     end)
 
-    -- Newcomer convergence: ping when someone joins our discovery channel.
-    -- CHAT_MSG_CHANNEL_JOIN args (1-indexed): text, playerName(2), languageName,
-    -- channelName, playerName2, specialFlags, zoneChannelID, channelIndex,
-    -- channelBaseName(9).
+    -- Newcomer convergence: whisper-ping whoever joins our presence channel.
+    -- CHAT_MSG_CHANNEL_JOIN / _LEAVE args (1-indexed): text, playerName(2),
+    -- languageName, channelName, playerName2, specialFlags, zoneChannelID,
+    -- channelIndex, channelBaseName(9). (catalog events.txt:246/247)
     ns:RegisterEvent("CHAT_MSG_CHANNEL_JOIN", function(_, ...)
         local playerName      = select(2, ...)
         local channelBaseName = select(9, ...)
         ns:SafeCall(Mesh.OnChannelJoinNotice, playerName, channelBaseName)
+    end)
+
+    -- Presence-driven offline detection: mark peers stale when they leave.
+    ns:RegisterEvent("CHAT_MSG_CHANNEL_LEAVE", function(_, ...)
+        local playerName      = select(2, ...)
+        local channelBaseName = select(9, ...)
+        ns:SafeCall(Mesh.OnChannelLeaveNotice, playerName, channelBaseName)
     end)
 
     -- Push live state changes onto the mesh.
@@ -1613,6 +1793,9 @@ function Mesh.OnLogin()
                 -- Self-heal channel membership against any drop (reload race,
                 -- server kick, zone transition) before we advertise on it.
                 ns:SafeCall(Mesh.HealthCheckChannel)
+                -- Slow presence sweep (gated to ROSTER_SWEEP_INTERVAL) catches
+                -- members whose JOIN notice we missed; then heartbeat known peers.
+                ns:SafeCall(Mesh.MaybeRosterSweep)
                 ns:SafeCall(Mesh.SendHeartbeat)
                 scheduleHeartbeat()
             end)
@@ -1653,6 +1836,14 @@ local function debugMesh()
     ns:Print(string.format("  discovery: pingSent=%s pongRecv=%s pingRecv=%s pongSent=%s",
         tostring(d.lastPingSent or 0), tostring(d.lastPongRecv or 0),
         tostring(d.lastPingRecv or 0), tostring(d.lastPongSent or 0)))
+
+    -- Presence roster: live channel members (up to 5 names) + last sweep time.
+    local roster = {}
+    if liveIdx and liveIdx > 0 then roster = Mesh.ChannelRoster(liveIdx) end
+    local shown = {}
+    for i = 1, math.min(5, #roster) do shown[i] = roster[i] end
+    ns:Print(string.format("  roster: members=%d [%s] lastSweep=%s",
+        #roster, table.concat(shown, ", "), tostring(Mesh._lastRosterSweep or 0)))
 
     local n = 0
     for aid, p in pairs(Mesh.peers) do
@@ -1940,6 +2131,45 @@ local function testHealthCheck()
     return true
 end
 
+-- Roster ping-selection: given a channel roster, our name, the known-peer set
+-- and per-name cooldowns, prove we ping exactly the eligible strangers and skip
+-- self, known peers, cooled-down names, and empty rows.
+local function testRosterPingSelection()
+    local roster = { "Self-R", "Ally-R", "Ally2-R", "Known-R", "" }
+    local known = { ["Known-R"] = true }
+    local cooldowns = { ["Ally2-R"] = 100 }
+    -- now=110, window=30: self out, known out, Ally2 in cooldown (10<30) -> Ally-R only.
+    local sel = Mesh.SelectRosterPings(roster, "Self-R", known, cooldowns, 110, 30)
+    if #sel ~= 1 or sel[1] ~= "Ally-R" then
+        return false, "sweep1 wrong: " .. table.concat(sel, ",")
+    end
+    -- now=140: Ally2 cooldown expired (40>=30) -> Ally-R then Ally2-R (roster order).
+    local sel2 = Mesh.SelectRosterPings(roster, "Self-R", known, cooldowns, 140, 30)
+    if #sel2 ~= 2 or sel2[1] ~= "Ally-R" or sel2[2] ~= "Ally2-R" then
+        return false, "sweep2 wrong: " .. table.concat(sel2, ",")
+    end
+    -- empty roster -> nothing.
+    if #Mesh.SelectRosterPings({}, "Self-R", known, cooldowns, 200, 30) ~= 0 then
+        return false, "empty roster produced pings"
+    end
+    -- nil cooldown map -> every stranger eligible (self + known still excluded).
+    local sel3 = Mesh.SelectRosterPings(roster, "Self-R", known, nil, 0, 30)
+    if #sel3 ~= 2 then return false, "nil-cooldown count wrong: " .. #sel3 end
+    return true
+end
+
+-- Join-notice throttle: the per-name cooldown gate that fires on CHANNEL_JOIN.
+local function testJoinNoticeThrottle()
+    local cd = {}
+    if not Mesh.ShouldPingName("New-R", cd, 100, 30) then return false, "first ping blocked" end
+    cd["New-R"] = 100   -- record as the live handler does after pinging
+    if Mesh.ShouldPingName("New-R", cd, 120, 30) then return false, "cooldown not honoured" end
+    if not Mesh.ShouldPingName("New-R", cd, 130, 30) then return false, "cooldown edge blocked" end
+    if Mesh.ShouldPingName("", cd, 200, 30) then return false, "empty name pinged" end
+    if Mesh.ShouldPingName(nil, cd, 200, 30) then return false, "nil name pinged" end
+    return true
+end
+
 function Mesh.RunSelfTests(verbose)
     local suite = {
         { name = "relay assignment", fn = testRelayPlan },
@@ -1951,6 +2181,8 @@ function Mesh.RunSelfTests(verbose)
         { name = "join state machine", fn = testJoinStateMachine },
         { name = "reload race rejoin", fn = testReloadRace },
         { name = "channel health check", fn = testHealthCheck },
+        { name = "roster ping selection", fn = testRosterPingSelection },
+        { name = "join notice throttle", fn = testJoinNoticeThrottle },
     }
     local allPass, results = true, {}
     for _, t in ipairs(suite) do
