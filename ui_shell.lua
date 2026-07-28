@@ -1491,7 +1491,10 @@ function Dashboard.BuildDetailPanel(parent)
                     -- green "(Boon)" suffix ("1h 59m (Boon)") per the reference,
                     -- regardless of threshold. The engine (tracker tooltip parse)
                     -- writes source="boon" + the parsed remaining into the slot.
-                    local booned = (st.source == "boon")
+                    -- Hand-merge reconciliation: engine ships numeric sources
+                    -- (Store.AURA_SOURCE.BOON == 2), not the string "boon".
+                    local BOON = (ns.Store and ns.Store.AURA_SOURCE and ns.Store.AURA_SOURCE.BOON) or 2
+                    local booned = (st.source == BOON or st.source == "boon")
                     if booned then tok = "ok" end
                     r.icon:SetDesaturated(false); r.icon:SetVertexColor(1, 1, 1); r.icon:SetAlpha(1)
                     r.name:SetText(label); r.name:SetTextColor(UI.Color(tok))
