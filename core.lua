@@ -195,6 +195,7 @@ local function printHelp()
     ns:Print("  /dsn coord             - manage coordinate overrides (wave N3)")
     ns:Print("  /dsn resetui           - reset dashboard layout (wave N3)")
     ns:Print("  /dsn account <id>      - show/set this account's mesh ID")
+    ns:Print("  /dsn settings          - open the Daseeki hub to Network settings")
     ns:Print("  /dsn debug selftest    - run protocol self-tests")
     ns:Print("  /dsn help              - this list")
 end
@@ -215,6 +216,16 @@ ns:RegisterSubcommand("coord",   stub("N3"), "coordinate overrides")
 ns:RegisterSubcommand("coords",  stub("N3"), "coordinate overrides")
 ns:RegisterSubcommand("resetui", stub("N3"), "reset dashboard layout")
 ns:RegisterSubcommand("reset",   stub("N3"), "reset dashboard layout")
+
+-- Open the Daseeki hub to the Network settings section (options.lua owns the
+-- pages; this is just the slash entry point). Guards on the hub being present.
+ns:RegisterSubcommand("settings", function()
+    if _G.DaseekiSuite and DaseekiSuite.Open then
+        DaseekiSuite:Open("network")
+    else
+        ns:Print("the Daseeki hub (Daseeki Core) is not available.")
+    end
+end, "open Network settings")
 
 ns:RegisterSubcommand("account", function(rest)
     rest = rest and rest:match("^%s*(.-)%s*$") or ""

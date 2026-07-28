@@ -21,3 +21,4 @@ mesh.lua
 timers.lua
 auto.lua
 interact.lua
+options.lua
