@@ -276,6 +276,8 @@ Mesh._timerHandler = nil -- N2b handoff receive callback
 Mesh._joinState = nil    -- { chanName, attempts, index, joined, gaveUp, pingedOnJoin }
 Mesh._joinGen   = 0      -- generation token: supersedes stale in-flight retry loops
 Mesh._lastJoinPing = 0   -- throttle re-pings triggered by newcomer channel joins
+Mesh._lastSeqStart = 0   -- ts of the last StartJoinSequence (health-check cooldown gate)
+Mesh._lastJoinAttempt = 0 -- ts of the last real JoinTemporaryChannel call (debug telemetry)
 Mesh._disco = {          -- last discovery ping/pong timestamps (for /dsn debug mesh)
     lastPingSent = 0, lastPingRecv = 0,
     lastPongSent = 0, lastPongRecv = 0,
@@ -287,6 +289,15 @@ Mesh._disco = {          -- last discovery ping/pong timestamps (for /dsn debug 
 Mesh.JOIN_DELAYS     = { 5, 7, 10, 15, 22 }   -- seconds between verification ticks
 Mesh.JOIN_MAX_TRIES  = 5                       -- max join calls before giving up
 Mesh.JOIN_PING_THROTTLE = 3                    -- min seconds between newcomer re-pings
+-- Never trust a single membership snapshot. After a tick resolves to "joined"
+-- we re-check the LIVE index once more, JOIN_REVERIFY_DELAY seconds later: a
+-- /reload briefly reports the PRE-reload channel membership, then drops the
+-- temporary channel as the world finalises, so the first snapshot lies. If the
+-- re-check finds the index gone we restart a fresh sequence. The heartbeat
+-- health check is the continuous backstop against ANY later drop (kick, zone,
+-- latency); JOIN_HEALTH_COOLDOWN caps how often it may re-kick a join.
+Mesh.JOIN_REVERIFY_DELAY  = 10                 -- s after "joined" to re-verify the live index
+Mesh.JOIN_HEALTH_COOLDOWN = 30                 -- min s between health-check-driven rejoins
 
 ----------------------------------------------------------------------
 -- Lib + game API access (guarded so the pure core loads without them)
@@ -1329,6 +1340,40 @@ function Mesh.JoinAdvance(st, deps)
     return "retry", delay
 end
 
+-- Post-joined re-verification (pure). A tick that returned "joined" may have
+-- trusted a stale pre-reload snapshot; re-read the LIVE index once more:
+--   "ok"      -- index still resolves; membership is real, refresh st.index
+--   "dropped" -- index is gone; caller must restart a fresh join sequence
+--   "noop"    -- state is not in the joined phase (nothing to verify)
+function Mesh.JoinReverify(st, deps)
+    if not st or not st.joined then return "noop" end
+    local idx = deps.getIndex(st.chanName) or 0
+    if idx > 0 then
+        st.index = idx
+        return "ok"
+    end
+    return "dropped"
+end
+
+-- Continuous health-check decision (pure). Should the heartbeat loop re-kick a
+-- join? Only when the live channel is gone, no retry loop is already working it,
+-- and we are past the cooldown since the last sequence start (so a persistently
+-- dead channel is re-attempted at most once per cooldown, never hammered).
+function Mesh.ShouldHealthRejoin(liveIdx, inFlight, nowT, lastSeqStart, cooldown)
+    if liveIdx and liveIdx > 0 then return false end   -- channel healthy
+    if inFlight then return false end                  -- a live loop owns it
+    cooldown = cooldown or Mesh.JOIN_HEALTH_COOLDOWN
+    if (nowT or 0) - (lastSeqStart or 0) < cooldown then return false end
+    return true
+end
+
+-- A join sequence is "in flight" while its state exists and is neither resolved
+-- (joined) nor exhausted (gaveUp) — i.e. the retry loop is still ticking.
+function Mesh.SeqInFlight()
+    local st = Mesh._joinState
+    return st ~= nil and not st.joined and not st.gaveUp
+end
+
 -- Impure wrappers around the two game APIs (verified in the API catalog:
 -- GetChannelName / JoinTemporaryChannel are FrameXML globals on this client).
 local function getChannelIndex(chanName)
@@ -1338,6 +1383,7 @@ local function getChannelIndex(chanName)
     return 0
 end
 local function doJoinChannel(chanName)
+    Mesh._lastJoinAttempt = now()
     if JoinTemporaryChannel then JoinTemporaryChannel(chanName) end
 end
 
@@ -1368,31 +1414,69 @@ function Mesh._runJoinTick(gen)
             st.pingedOnJoin = true
             Mesh.OnChannelResolved()
         end
+        -- Never trust the single snapshot that flipped us to "joined": schedule
+        -- one re-verification. On a /reload the index we just read is the stale
+        -- pre-reload membership and will drop within seconds; the re-check
+        -- restarts a fresh sequence if the channel is actually gone.
+        if C_Timer and C_Timer.After then
+            C_Timer.After(Mesh.JOIN_REVERIFY_DELAY,
+                function() ns:SafeCall(Mesh._reverifyJoin, gen) end)
+        end
     elseif action == "retry" then
         if C_Timer and C_Timer.After then
             C_Timer.After(delay or 5, function() ns:SafeCall(Mesh._runJoinTick, gen) end)
         end
     end
     -- "gaveup"/"noop": stop the loop. BroadcastChannel's GUILD fallback keeps
-    -- same-guild peers converging even without the channel.
+    -- same-guild peers converging even without the channel; the heartbeat health
+    -- check (Mesh.HealthCheckChannel) re-attempts a dead channel on a cooldown.
 end
 
--- Start (or restart) the join sequence. Idempotent per PLAYER_ENTERING_WORLD:
--- if we are already on the channel (e.g. after /reload) we skip the retry loop
--- and just re-announce; otherwise we kick off a fresh retry sequence. Bumping
--- the generation token retires any retry loop still in flight.
+-- Re-verify a state that reached "joined". Fenced by generation so a newer
+-- sequence cancels a stale re-check. If the live index has dropped to 0 (the
+-- classic /reload race, or a mid-session kick), restart a fresh sequence.
+function Mesh._reverifyJoin(gen)
+    if gen ~= Mesh._joinGen then return end   -- superseded by a newer sequence
+    local st = Mesh._joinState
+    local result = Mesh.JoinReverify(st, {
+        getIndex = getChannelIndex,
+        doJoin   = doJoinChannel,
+    })
+    if result == "dropped" then
+        Mesh.StartJoinSequence()
+    end
+end
+
+-- Continuous self-healing: called each heartbeat tick. If the mesh is live but
+-- the discovery channel index has fallen to 0 and no retry loop is currently
+-- working it, re-drive the join — but no more than once per JOIN_HEALTH_COOLDOWN
+-- so a genuinely dead channel is retried gently, not hammered.
+function Mesh.HealthCheckChannel()
+    if not Mesh.IsEnabled() then return end
+    local chanName = Mesh.GetChannelName()
+    if not chanName then return end
+    local liveIdx = getChannelIndex(chanName)
+    if Mesh.ShouldHealthRejoin(liveIdx, Mesh.SeqInFlight(), now(),
+                               Mesh._lastSeqStart, Mesh.JOIN_HEALTH_COOLDOWN) then
+        Mesh.StartJoinSequence()
+    end
+end
+
+-- Start (or restart) the join sequence. Bumping the generation token retires
+-- any retry loop OR pending re-verification still in flight, so parallel loops
+-- can never compound. We ALWAYS run the verified tick loop now — the old fast
+-- path that trusted a single getChannelIndex>0 snapshot and marked us
+-- permanently joined was the /reload trap: during the loading screen the client
+-- reports the stale pre-reload membership, so that snapshot lied and the retry
+-- loop never ran. The tick's own getIndex check still resolves the genuinely-
+-- still-joined case in one step, and the post-joined re-verification (scheduled
+-- by _runJoinTick) catches the stale-snapshot case and restarts.
 function Mesh.StartJoinSequence()
     if not Mesh.IsEnabled() then return end
     local chanName = Mesh.GetChannelName()
     if not chanName then return end
     Mesh._joinGen = Mesh._joinGen + 1
-    if getChannelIndex(chanName) > 0 then
-        local st = Mesh.NewJoinState(chanName)
-        st.index, st.joined, st.pingedOnJoin = getChannelIndex(chanName), true, true
-        Mesh._joinState = st
-        Mesh.OnChannelResolved()
-        return
-    end
+    Mesh._lastSeqStart = now()
     Mesh._joinState = Mesh.NewJoinState(chanName)
     Mesh._runJoinTick(Mesh._joinGen)
 end
@@ -1526,6 +1610,9 @@ function Mesh.OnLogin()
         local delay = Mesh.HB_BASE + jitter
         if C_Timer and C_Timer.After then
             C_Timer.After(delay, function()
+                -- Self-heal channel membership against any drop (reload race,
+                -- server kick, zone transition) before we advertise on it.
+                ns:SafeCall(Mesh.HealthCheckChannel)
                 ns:SafeCall(Mesh.SendHeartbeat)
                 scheduleHeartbeat()
             end)
@@ -1543,18 +1630,23 @@ local function debugMesh()
         .. " | account " .. (ns:GetAccountID() ~= "" and ns:GetAccountID() or "<unset>"))
 
     -- Channel join diagnostics — the heart of the "no peers known" smoke test.
+    -- The LIVE index is the single source of truth for "joined" so this line can
+    -- no longer self-contradict; the state machine's phase is reported SEPARATELY
+    -- (a stale loop can say "joined" while the live channel is gone — that
+    -- mismatch is exactly what we want to see, not paper over).
     local chanName = Mesh.GetChannelName()
     local liveIdx = 0
     if chanName and GetChannelName then liveIdx = GetChannelName(chanName) or 0 end
     local st = Mesh._joinState
-    local joinedStr = (liveIdx and liveIdx > 0) and ("index " .. liveIdx) or "NOT JOINED"
-    local attempts = st and st.attempts or 0
-    local status = ""
-    if st and st.gaveUp then status = " (gave up)"
-    elseif st and st.joined then status = " (joined)"
-    elseif attempts > 0 then status = " (joining)" end
-    ns:Print(string.format("  channel: %s | %s | joinAttempts=%d%s",
-        chanName or "<none>", joinedStr, attempts, status))
+    local liveStr = (liveIdx and liveIdx > 0) and ("index " .. liveIdx) or "NOT JOINED"
+    local loop
+    if not st then loop = "idle"
+    elseif st.gaveUp then loop = "gaveup"
+    elseif st.joined then loop = "joined"
+    elseif (st.attempts or 0) > 0 then loop = "joining(" .. st.attempts .. ")"
+    else loop = "idle" end
+    ns:Print(string.format("  channel: %s | live=%s | loop=%s | lastJoinAttempt=%s",
+        chanName or "<none>", liveStr, loop, tostring(Mesh._lastJoinAttempt or 0)))
 
     -- Discovery ping/pong telemetry (0 == never).
     local d = Mesh._disco or {}
@@ -1767,6 +1859,87 @@ local function testJoinStateMachine()
     return true
 end
 
+-- Reload race: the first membership snapshot is the STALE pre-reload channel
+-- (index > 0) and every read afterwards is 0 as the temporary channel drops.
+-- Prove the machine does NOT get stuck "joined": the post-joined re-verification
+-- detects the drop and a fresh sequence re-issues the join until a real index
+-- resolves. Drives the pure JoinAdvance + JoinReverify exactly as the live
+-- _runJoinTick / _reverifyJoin wrappers do, minus the C_Timer scheduling.
+local function testReloadRace()
+    -- Scripted live-index reads, in call order:
+    --   1) 4  -> tick1 trusts stale pre-reload membership -> "joined" (no join)
+    --   2) 0  -> re-verify: channel dropped -> "dropped" -> restart
+    --   3) 0  -> new tick1: still not ready -> issue join#1, retry
+    --   4) 7  -> new tick2: real index resolves -> "joined"
+    local seq, i, joins = { 4, 0, 0, 7 }, 0, 0
+    local deps = {
+        getIndex = function() i = i + 1; return seq[i] or 0 end,
+        doJoin   = function() joins = joins + 1 end,
+        maxTries = 3, delays = { 5, 7, 10 },
+    }
+
+    local st = Mesh.NewJoinState("dsnX")
+    local a1 = Mesh.JoinAdvance(st, deps)          -- reads 4
+    if a1 ~= "joined" then return false, "race tick1: expected joined, got " .. tostring(a1) end
+    if joins ~= 0 then return false, "race tick1: should not have issued a join" end
+    if not st.joined then return false, "race tick1: joined flag not set" end
+
+    local rv = Mesh.JoinReverify(st, deps)         -- reads 0
+    if rv ~= "dropped" then return false, "race reverify: expected dropped, got " .. tostring(rv) end
+
+    -- Restart (what _reverifyJoin does on "dropped"): fresh state, same deps.
+    st = Mesh.NewJoinState("dsnX")
+    local b1 = Mesh.JoinAdvance(st, deps)          -- reads 0 -> join#1
+    if b1 ~= "retry" then return false, "race re-tick1: expected retry, got " .. tostring(b1) end
+    if joins ~= 1 then return false, "race re-tick1: expected 1 join, got " .. tostring(joins) end
+    local b2 = Mesh.JoinAdvance(st, deps)          -- reads 7 -> joined
+    if b2 ~= "joined" then return false, "race re-tick2: expected joined, got " .. tostring(b2) end
+    if st.index ~= 7 then return false, "race: resolved index wrong: " .. tostring(st.index) end
+
+    -- And a re-verify on the REAL join confirms it stays put (no false restart).
+    local seq2, j = { 7 }, 0
+    local okDeps = { getIndex = function() j = j + 1; return seq2[j] or 7 end, doJoin = function() end }
+    if Mesh.JoinReverify(st, okDeps) ~= "ok" then return false, "race: genuine join falsely dropped" end
+
+    return true
+end
+
+-- Mid-session drop: the channel index falls to 0 long after login (server kick,
+-- zone transition). Prove the heartbeat health check re-kicks a join — but only
+-- when nothing else is working it and only once per cooldown. Pure decision fn,
+-- so no timers needed.
+local function testHealthCheck()
+    local CD = Mesh.JOIN_HEALTH_COOLDOWN
+    -- Healthy channel (index up) -> never rejoin.
+    if Mesh.ShouldHealthRejoin(3, false, 1000, 900, CD) then
+        return false, "health: rejoined a healthy channel"
+    end
+    -- Dropped, idle loop, cooldown elapsed -> rejoin (the recovery case).
+    if not Mesh.ShouldHealthRejoin(0, false, 1000, 1000 - CD, CD) then
+        return false, "health: failed to recover a mid-session drop"
+    end
+    -- Dropped but a retry loop is already in flight -> don't stomp it.
+    if Mesh.ShouldHealthRejoin(0, true, 5000, 0, CD) then
+        return false, "health: stomped an in-flight sequence"
+    end
+    -- Dropped but still inside the cooldown window -> hold off (no hammering).
+    if Mesh.ShouldHealthRejoin(0, false, 1000, 1000 - (CD - 1), CD) then
+        return false, "health: rejoined inside the cooldown window"
+    end
+    -- SeqInFlight reflects the live state machine phases.
+    local saved = Mesh._joinState
+    Mesh._joinState = nil
+    if Mesh.SeqInFlight() then return false, "inFlight: nil state should be false" end
+    Mesh._joinState = { attempts = 2, joined = false, gaveUp = false }
+    if not Mesh.SeqInFlight() then return false, "inFlight: mid-retry should be true" end
+    Mesh._joinState = { joined = true }
+    if Mesh.SeqInFlight() then return false, "inFlight: joined should be false" end
+    Mesh._joinState = { gaveUp = true }
+    if Mesh.SeqInFlight() then return false, "inFlight: gaveUp should be false" end
+    Mesh._joinState = saved
+    return true
+end
+
 function Mesh.RunSelfTests(verbose)
     local suite = {
         { name = "relay assignment", fn = testRelayPlan },
@@ -1776,6 +1949,8 @@ function Mesh.RunSelfTests(verbose)
         { name = "session seq",      fn = testFreshSeq },
         { name = "failure skip",     fn = testFailureSkip },
         { name = "join state machine", fn = testJoinStateMachine },
+        { name = "reload race rejoin", fn = testReloadRace },
+        { name = "channel health check", fn = testHealthCheck },
     }
     local allPass, results = true, {}
     for _, t in ipairs(suite) do
