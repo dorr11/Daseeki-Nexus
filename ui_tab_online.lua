@@ -103,19 +103,23 @@ Dashboard.RegisterTab("online", function(host)
     local pane
     pane = Dashboard.BuildRosterPane(host, {
         listTitle = "Online Roster",
-        listHint  = "online first",
+        listHint  = "online only",
         cardHeight = CARD_H,
         enableDrag = false,
         makeCard = makeCard,
+        emptyText = "No characters online",
         gather = function()
+            -- Owner feedback: show ONLY currently-online characters (like the
+            -- reference), not the full roster sorted online-first. Empty list ->
+            -- the muted "No characters online" state (opts.emptyText).
             local faction = Dashboard.GetFaction()
             local roster = Dashboard.GatherRoster(faction, { includeHomeless = true })
-            -- Online first, then by name.
-            table.sort(roster, function(a, b)
-                if a.online ~= b.online then return a.online end
-                return a.nameRealm < b.nameRealm
-            end)
-            return roster
+            local online = {}
+            for _, e in ipairs(roster) do
+                if e.online then online[#online + 1] = e end
+            end
+            table.sort(online, function(a, b) return a.nameRealm < b.nameRealm end)
+            return online
         end,
     })
     return { Refresh = pane.Refresh, _pane = pane }

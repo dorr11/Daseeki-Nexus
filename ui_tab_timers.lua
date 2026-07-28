@@ -140,7 +140,7 @@ Dashboard.RegisterTab("timers", function(host)
         r.icon = r:CreateTexture(nil, "ARTWORK")
         r.icon:SetSize(18, 18); r.icon:SetPoint("LEFT", r, "LEFT", 2, 0)
         r.icon:SetTexCoord(0.08, 0.92, 0.08, 0.92)
-        r.icon:SetTexture(Dashboard.AURA_META[def.slot].icon)
+        r.icon:SetTexture(Dashboard.AuraIcon(def.slot))   -- real-spell icon (shared source)
         r.name = fstr(r, "body"); r.name:SetPoint("LEFT", r.icon, "RIGHT", 8, 0); r.name:SetText(def.label)
         r.status = fstr(r, "body"); r.status:SetPoint("LEFT", r.name, "RIGHT", 12, 0)
         r.log = UI.MakeButton(r, { text = "Log", variant = "quiet", width = 44, height = 20,

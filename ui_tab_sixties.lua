@@ -10,6 +10,11 @@ local Dashboard = ns.Dashboard
 
 local CARD_H = 96
 
+-- Real item IDs for the card's cooldown icons (owner feedback #7). Resolved to
+-- their true inventory art via Dashboard.ItemIcon (C_Item.GetItemIconByID).
+local CHRONOBOON_ITEM  = 184937   -- Chronoboon Displacer
+local HEARTHSTONE_ITEM = 6948     -- Hearthstone
+
 -- 2-char raid codes (the code IS the label; colored green available / red locked).
 local RAID_CODE = {
     Naxx = "Nx", AQ40 = "A4", BWL = "BW", MC = "MC", ZG = "ZG", AQ20 = "A2", Ony = "On",
@@ -96,7 +101,7 @@ local function makeCard(parent)
     card.hearth = card:CreateTexture(nil, "ARTWORK")
     card.hearth:SetSize(16, 16)
     card.hearth:SetPoint("BOTTOMRIGHT", card, "BOTTOMRIGHT", -PADX, 8)
-    card.hearth:SetTexture("Interface\\Icons\\INV_Misc_Rune_01")
+    card.hearth:SetTexture(Dashboard.ItemIcon(HEARTHSTONE_ITEM))
     card.hearth:SetTexCoord(0.08, 0.92, 0.08, 0.92)
     card.hearthCD = fstr(card, "small")
     card.hearthCD:SetPoint("BOTTOMRIGHT", card.hearth, "BOTTOMLEFT", -2, 2)
@@ -108,7 +113,7 @@ local function makeCard(parent)
     local chIc = card.chrono:CreateTexture(nil, "ARTWORK")
     chIc:SetPoint("TOPLEFT", card.chrono, "TOPLEFT", 1, -1)
     chIc:SetPoint("BOTTOMRIGHT", card.chrono, "BOTTOMRIGHT", -1, 1)
-    chIc:SetTexture("Interface\\Icons\\Spell_Nature_TimeStop")
+    chIc:SetTexture(Dashboard.ItemIcon(CHRONOBOON_ITEM))
     chIc:SetTexCoord(0.08, 0.92, 0.08, 0.92)
     card.chrono.icon = chIc
     card.chrono:Hide()
@@ -154,30 +159,49 @@ local function makeCard(parent)
         self.fresh:SetText(Dashboard.FreshnessText(rec.lastDataUpdate))
         self.fresh:SetTextColor(UI.Color("faint"))
 
-        -- Collapsing buff-icon strip (present auras only, in display order).
+        -- Collapsing buff-icon strip. Icons derive from the real spell (owner
+        -- feedback #1). Missing state (owner feedback #3): present = full color +
+        -- threshold border; missing+required = greyed icon + danger border;
+        -- missing+optional = greyed icon, no border. Non-applicable (ignored
+        -- class / absent seasonal) collapses out so icons hug left.
         for _, s in ipairs(self.buffSlots) do s:Hide() end
         local placed, x = 0, 0
         for _, slotIdx in ipairs(Dashboard.AURA_DISPLAY_ORDER) do
             local meta = Dashboard.AURA_META[slotIdx]
             local st = rec.auraStates and rec.auraStates[slotIdx]
-            if st and (st.duration or 0) > 0 then
+            local present = st and (st.duration or 0) > 0
+            local applicable, requirement = Dashboard.AuraRequirement(slotIdx, rec, entry.faction or rec.faction)
+            if present or applicable then
                 placed = placed + 1
                 local slot = self.buffSlots[placed]
-                slot:ClearAllPoints()
-                slot:SetPoint("BOTTOMLEFT", self, "BOTTOMLEFT", PADX + x, 8)
-                slot.icon:SetTexture(meta.icon)
-                slot.icon:SetDesaturated(false)
-                local th = Dashboard.GetThreshold(entry.faction or rec.faction, meta.thresholdKey)
-                local tok = Dashboard.AuraColorToken(st.duration, th)
-                slot:SetBackdrop(UI.FLAT_BACKDROP)
-                slot:SetBackdropColor(UI.Color("inset"))
-                slot:SetBackdropBorderColor(UI.Color(tok))
-                slot:Show()
-                x = x + 20
+                if slot then
+                    slot:ClearAllPoints()
+                    slot:SetPoint("BOTTOMLEFT", self, "BOTTOMLEFT", PADX + x, 8)
+                    slot.icon:SetTexture(Dashboard.AuraIcon(slotIdx))
+                    slot:SetBackdrop(UI.FLAT_BACKDROP)
+                    slot:SetBackdropColor(UI.Color("inset"))
+                    if present then
+                        slot.icon:SetDesaturated(false); slot.icon:SetVertexColor(1, 1, 1); slot.icon:SetAlpha(1)
+                        local th = Dashboard.GetThreshold(entry.faction or rec.faction, meta.thresholdKey)
+                        slot:SetBackdropBorderColor(UI.Color(Dashboard.AuraColorToken(st.duration, th)))
+                    else
+                        slot.icon:SetDesaturated(true); slot.icon:SetVertexColor(0.6, 0.6, 0.6); slot.icon:SetAlpha(0.5)
+                        if requirement == "required" then
+                            slot:SetBackdropBorderColor(UI.Color("danger"))
+                        else
+                            slot:SetBackdropBorderColor(UI.Color("border", 0))   -- no border
+                        end
+                    end
+                    slot:Show()
+                    x = x + 20
+                end
             end
         end
 
-        -- Chrono + hearth.
+        -- Chrono + hearth (real item icons; re-set each refresh so a late
+        -- item-cache resolve corrects a first-paint question mark).
+        self.hearth:SetTexture(Dashboard.ItemIcon(HEARTHSTONE_ITEM))
+        self.chrono.icon:SetTexture(Dashboard.ItemIcon(CHRONOBOON_ITEM))
         if rec.chronoboonActive then
             self.chrono:Show()
             self.chrono:SetBackdrop(UI.FLAT_BACKDROP)
@@ -207,14 +231,18 @@ Dashboard.RegisterTab("sixties", function(host)
     local pane
     pane = Dashboard.BuildRosterPane(host, {
         listTitle = "Tracked 60s",
-        listHint  = "drag to reorder",
+        listHint  = "online first · drag to reorder",
         cardHeight = CARD_H,
         enableDrag = true,
         makeCard = makeCard,
         gather = function()
+            -- Drag order first (persisted per faction), THEN a stable online-
+            -- first partition (owner feedback #4): online characters float to
+            -- the top automatically while drag order persists within each group.
             local faction = Dashboard.GetFaction()
             local roster = Dashboard.GatherRoster(faction, { minLevel = 60 })
-            return Dashboard.OrderRoster(faction, roster)
+            local ordered = Dashboard.OrderRoster(faction, roster)
+            return Dashboard.PartitionOnlineFirst(ordered)
         end,
     })
     return { Refresh = pane.Refresh, _pane = pane }

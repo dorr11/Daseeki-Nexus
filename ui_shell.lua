@@ -50,6 +50,20 @@ local FACTION_CREST = {
 }
 local CREST_COORD = { 0.02, 0.62, 0.03, 0.63 }
 
+-- Canonical faction identity colors (Alliance royal blue / Horde crimson).
+-- These are GAME identity, not theme decoration, so they are deliberately NOT
+-- theme tokens (the active theme's accent can be ember/fel/ice and must never
+-- stand in for "Alliance"). The task sanctions literal faction colors routed
+-- through UI.Skin; the segmented faction toggle re-skins from these. r,g,b 0..1.
+local FACTION_COLOR = {
+    Alliance = { 0.15, 0.35, 0.85 },
+    Horde    = { 0.75, 0.14, 0.14 },
+}
+function Dashboard.FactionColor(faction)
+    local c = FACTION_COLOR[faction] or FACTION_COLOR.Alliance
+    return c[1], c[2], c[3]
+end
+
 function Dashboard.FactionCrest(faction)
     return FACTION_CREST[faction] or FACTION_CREST.Alliance
 end
@@ -59,30 +73,81 @@ end
 --
 -- Storage authority is tracker.lua: it fills record.auraStates[1..10] by a
 -- FIXED slot layout. AURA_META mirrors that slot layout exactly (index == slot)
--- and adds presentation (name/short/icon) plus the per-faction threshold key
--- used to color the buff (spec §2's 9 configurable auras). Slots without a
--- threshold key (Silithyst, Boon of Blackfathom) are always optional.
+-- and adds presentation (name/short) plus the per-faction threshold key used to
+-- color the buff (spec §2's 9 configurable auras). Slots without a threshold
+-- key (Silithyst, Boon of Blackfathom) are always optional.
+--
+-- ICON SOURCE OF TRUTH (owner feedback #1 — "buff icons arent correct"): icons
+-- are NOT hardcoded Interface\Icons guesses any more. Each slot carries the
+-- REAL game `spellID` (the same catalogue options.lua AURA_DEFS uses) and the
+-- icon is derived at runtime via Dashboard.AuraIcon(slot) →
+-- C_Spell.GetSpellTexture(spellID) (question-mark fallback). This is the single
+-- source shared by ui_shell (detail), ui_tab_sixties (cards) and ui_tab_timers.
 --
 -- CROSS-FILE CONTRACT: `thresholdKey` values here are the keys the hub's
 -- aura-config page (options.lua AURA_DEFS) writes into
 -- GetFactionSettings().auraOpts.thresholds, and that the importer
 -- (import.lua AURA_SLOT_KEY) resolves SN's positional thresholds onto. Keys
 -- (exact, case-sensitive): dmf, ony, dmtAP, dmtSP, dmtStam, songflower, zg,
--- rend (+ battleShout, which has no storage slot).
+-- rend (+ battleShout, which has no storage slot). `spellID` values mirror
+-- options.lua AURA_DEFS one-for-one; the two tail slots add their own real IDs.
 ----------------------------------------------------------------------
 
 Dashboard.AURA_META = {
-    [1]  = { key = "ony",       name = "Rallying Cry of the Dragonslayer", short = "Ony",  thresholdKey = "ony",       icon = "Interface\\Icons\\INV_Misc_Head_Dragon_01" },
-    [2]  = { key = "rend",      name = "Warchief's Blessing",              short = "Rend", thresholdKey = "rend",      icon = "Interface\\Icons\\Spell_Holy_LayOnHands" },
-    [3]  = { key = "zg",        name = "Spirit of Zandalar",               short = "ZG",   thresholdKey = "zg",        icon = "Interface\\Icons\\Ability_Creature_Poison_05" },
-    [4]  = { key = "songflower",name = "Songflower Serenade",              short = "SF",   thresholdKey = "songflower",icon = "Interface\\Icons\\Spell_Holy_MindVision" },
-    [5]  = { key = "dmf",       name = "Sayge's Dark Fortune",             short = "DMF",  thresholdKey = "dmf",       icon = "Interface\\Icons\\INV_Misc_Orb_02" },
-    [6]  = { key = "dmtap",     name = "Fengus' Ferocity",                 short = "AP",   thresholdKey = "dmtAP",     icon = "Interface\\Icons\\INV_Misc_MonsterClaw_04" },
-    [7]  = { key = "dmtstam",   name = "Mol'dar's Moxie",                  short = "Stam", thresholdKey = "dmtStam",   icon = "Interface\\Icons\\Ability_Racial_Cannibalize" },
-    [8]  = { key = "dmtsp",     name = "Slip'kik's Savvy",                 short = "SP",   thresholdKey = "dmtSP",     icon = "Interface\\Icons\\Spell_Nature_WispSplode" },
-    [9]  = { key = "silithyst", name = "Traces of Silithyst",             short = "Sili", thresholdKey = nil,         icon = "Interface\\Icons\\INV_Misc_Dust_02" },
-    [10] = { key = "boon",      name = "Boon of Blackfathom",              short = "BFD",  thresholdKey = nil,         icon = "Interface\\Icons\\Spell_Frost_FrostArmor02" },
+    [1]  = { key = "ony",       name = "Rallying Cry of the Dragonslayer", short = "Ony",  thresholdKey = "ony",        spellID = 22888 },
+    [2]  = { key = "rend",      name = "Warchief's Blessing",              short = "Rend", thresholdKey = "rend",       spellID = 16609 },
+    [3]  = { key = "zg",        name = "Spirit of Zandalar",               short = "ZG",   thresholdKey = "zg",         spellID = 24425 },
+    [4]  = { key = "songflower",name = "Songflower Serenade",              short = "SF",   thresholdKey = "songflower", spellID = 15366 },
+    [5]  = { key = "dmf",       name = "Sayge's Dark Fortune",             short = "DMF",  thresholdKey = "dmf",        spellID = 23768 },
+    [6]  = { key = "dmtap",     name = "Fengus' Ferocity",                 short = "AP",   thresholdKey = "dmtAP",      spellID = 22817 },
+    [7]  = { key = "dmtstam",   name = "Mol'dar's Moxie",                  short = "Stam", thresholdKey = "dmtStam",    spellID = 22801 },
+    [8]  = { key = "dmtsp",     name = "Slip'kik's Savvy",                 short = "SP",   thresholdKey = "dmtSP",      spellID = 22820 },
+    [9]  = { key = "silithyst", name = "Traces of Silithyst",             short = "Sili", thresholdKey = nil,          spellID = 29534 },
+    [10] = { key = "boon",      name = "Boon of Blackfathom",              short = "BFD",  thresholdKey = nil,          spellID = 430947 },
 }
+
+-- Explicit unknown marker (Blizzard built-in) — NOT a guess at any buff's art,
+-- just the graceful fallback when a spell/item icon cannot be resolved.
+local QUESTION_ICON = "Interface\\Icons\\INV_Misc_QuestionMark"
+
+-- Resolve a tracked-aura slot's icon from its real spellID. Catalog-verified
+-- (build 1.15.9): C_Spell.GetSpellTexture(spellID) -> iconID, with the legacy
+-- global GetSpellTexture as a fallback. Successful lookups are cached; a nil
+-- (spell not loaded / not in this client, e.g. the SoD-only Boon) is NOT cached
+-- so a later refresh retries, and renders the question mark until then.
+local _auraIconCache = {}
+function Dashboard.AuraIcon(slot)
+    local meta = Dashboard.AURA_META[slot]
+    if not meta then return QUESTION_ICON end
+    local cached = _auraIconCache[slot]
+    if cached then return cached end
+    local tex
+    local id = meta.spellID
+    if id then
+        if C_Spell and C_Spell.GetSpellTexture then
+            tex = C_Spell.GetSpellTexture(id)
+        elseif GetSpellTexture then
+            tex = GetSpellTexture(id)
+        end
+    end
+    if tex then _auraIconCache[slot] = tex; return tex end
+    return QUESTION_ICON
+end
+
+-- Resolve a real item's inventory icon by itemID (owner feedback #7 — the
+-- Chronoboon Displacer 184937 and Hearthstone 6948 were guessed). Catalog:
+-- C_Item.GetItemIconByID(itemID) -> icon:fileID, legacy GetItemIcon fallback.
+local _itemIconCache = {}
+function Dashboard.ItemIcon(itemID, fallback)
+    if not itemID then return fallback or QUESTION_ICON end
+    local cached = _itemIconCache[itemID]
+    if cached then return cached end
+    local icon
+    if C_Item and C_Item.GetItemIconByID then icon = C_Item.GetItemIconByID(itemID) end
+    if not icon and GetItemIcon then icon = GetItemIcon(itemID) end
+    if icon then _itemIconCache[itemID] = icon; return icon end
+    return fallback or QUESTION_ICON
+end
 
 -- Presentation order for the card's collapsing icon strip (spec §1): DMF, Ony,
 -- ZG, DMT-AP, DMT-SP, DMT-STAM, Songflower, Rend, then the two optional tail
@@ -149,18 +214,31 @@ function Dashboard.ShortName(nameRealm)
     return (nameRealm or "?"):match("^([^%-]+)") or nameRealm or "?"
 end
 
--- Compact duration: 2h, 1h05m, 45m, 30s. Clamped at 0.
-function Dashboard.FormatDuration(sec)
+-- Shared duration formatter (owner feedback #2 — "time values are in hours, not
+-- days"). One function for cards, detail, status bar and DMF. Breaks seconds
+-- into a d/h/m ladder and shows the TWO LARGEST non-zero units, so long spans
+-- read in days: 300h38m -> "12d 12h", 463h31m -> "19d 7h". Sub-hour spans show
+-- a single unit ("45m", "30s"). `style`:
+--   nil/"short"  -> spaced, human ("12d 12h", "1h 05m", "45m")
+--   "compact"    -> no spaces, for tight cells ("12d12h", "1h05m")
+-- Clamped at 0.
+function Dashboard.FormatDuration(sec, style)
     sec = math.max(0, math.floor(sec or 0))
-    if sec >= 3600 then
-        local h = math.floor(sec / 3600)
-        local m = math.floor((sec % 3600) / 60)
-        if m > 0 then return ("%dh%02dm"):format(h, m) end
+    local sep = (style == "compact") and "" or " "
+    local d = math.floor(sec / 86400)
+    local h = math.floor((sec % 86400) / 3600)
+    local m = math.floor((sec % 3600) / 60)
+    local s = sec % 60
+    if d > 0 then
+        if h > 0 then return ("%dd%s%dh"):format(d, sep, h) end
+        return ("%dd"):format(d)
+    elseif h > 0 then
+        if m > 0 then return ("%dh%s%02dm"):format(h, sep, m) end
         return ("%dh"):format(h)
-    elseif sec >= 60 then
-        return ("%dm"):format(math.floor(sec / 60))
+    elseif m > 0 then
+        return ("%dm"):format(m)
     end
-    return ("%ds"):format(sec)
+    return ("%ds"):format(s)
 end
 
 -- "Updated 3m ago" style freshness string from an epoch.
@@ -213,6 +291,69 @@ function Dashboard.AuraColorToken(remaining, threshold)
     if remaining >= (threshold.normal or 0) then return "ok" end
     if remaining >= (threshold.minimum or 0) then return warnToken() end
     return "danger"
+end
+
+----------------------------------------------------------------------
+-- Aura applicability / requirement (owner feedback #3 — "missing buffs arent
+-- displayed"). Shared by the 60s card strip and the detail panel so both agree
+-- on what a MISSING slot should look like.
+--
+-- Rules (spec §1):
+--   * Rend (slot 2) is governed by the per-class rule map
+--     GetFactionSettings().auraOpts.rend {required|optional|ignored}[class].
+--     Ignored classes are non-applicable (hidden).
+--   * Every other threshold-bearing world buff (Ony/ZG/Songflower/DMF/DMT×3)
+--     is required-by-default: applicable + "required" for everyone.
+--   * The two tail slots without a threshold key (Silithyst, Boon of Blackfathom)
+--     are OPTIONAL and treated as non-applicable when ABSENT, so they collapse
+--     out of the strip/detail instead of littering every card with two grey
+--     seasonal/PvP icons (spec §1 "seasonal-absent hidden"; style-guide prime
+--     directive "clean and compact"). When PRESENT they still render normally.
+--     ⚠ Deviation from a literal "all others required-by-default": the tail
+--     slots stay optional/collapsing — flagged for cheap owner override.
+--   * Battle Shout has no storage slot here, so its class map drives no display
+--     row (the engine still consumes it elsewhere).
+----------------------------------------------------------------------
+
+-- Class rule state for an aura opt map ("rend"/"battleShout") on a faction.
+function Dashboard.ClassRuleState(optKey, classTag, faction)
+    if not classTag then return "ignored" end
+    local fs = ns.Store and ns.Store.GetFactionSettings and ns.Store.GetFactionSettings(faction)
+    local o = fs and fs.auraOpts and fs.auraOpts[optKey]
+    if not o then return "ignored" end
+    if o.required and o.required[classTag] then return "required" end
+    if o.optional and o.optional[classTag] then return "optional" end
+    return "ignored"
+end
+
+-- Returns applicable(bool), requirement("required"|"optional") for a slot on a
+-- character. applicable=false means "hide this slot when the buff is absent".
+function Dashboard.AuraRequirement(slot, rec, faction)
+    local meta = Dashboard.AURA_META[slot]
+    if not meta then return false end
+    if meta.thresholdKey == "rend" then
+        local st = Dashboard.ClassRuleState("rend", rec and rec.classTag, faction)
+        if st == "ignored" then return false, "optional" end
+        return true, st
+    end
+    if not meta.thresholdKey then
+        -- Optional tail slots collapse when absent (see rationale above).
+        return false, "optional"
+    end
+    return true, "required"
+end
+
+-- Stable online-first partition (owner feedback #4). Preserves the incoming
+-- (drag) order WITHIN each group, so drag-reorder still persists while online
+-- characters automatically float to the top. table.sort is unstable, so this is
+-- done by hand rather than a comparator.
+function Dashboard.PartitionOnlineFirst(list)
+    local onlineGrp, offlineGrp = {}, {}
+    for _, e in ipairs(list) do
+        if e.online then onlineGrp[#onlineGrp + 1] = e else offlineGrp[#offlineGrp + 1] = e end
+    end
+    for _, e in ipairs(offlineGrp) do onlineGrp[#onlineGrp + 1] = e end
+    return onlineGrp
 end
 
 ----------------------------------------------------------------------
@@ -484,35 +625,61 @@ local function buildHeader(w)
     bg:SetPoint("BOTTOMRIGHT", header, "BOTTOMRIGHT", -1, 0)
     UI.Skin(bg, function(self) self:SetColorTexture(UI.Color("panel")) end)
 
-    -- Faction toggle (two crest buttons at the left).
-    local CREST = 28
-    local function crestButton(faction, x)
-        local b = CreateFrame("Button", nil, header)
-        b:SetSize(CREST, CREST)
-        b:SetPoint("LEFT", header, "LEFT", x, 0)
-        local tex = b:CreateTexture(nil, "ARTWORK")
-        tex:SetAllPoints()
-        tex:SetTexture(Dashboard.FactionCrest(faction))
-        tex:SetTexCoord(unpack(CREST_COORD))
-        b._tex = tex
+    -- Faction toggle (owner feedback #5 — "make it look more like the SN one"):
+    -- a proper labelled segmented control, two touching halves "Alliance" /
+    -- "Horde" each with crest + text, the ACTIVE half filled with its faction
+    -- color (Alliance blue / Horde red) and the inactive half dimmed. Compact,
+    -- sized for the 44px header (style guide: clean + compact, one grid).
+    local SEG_H, SEG_W = 26, 92
+    local segTop = math.floor((HEADER_H - SEG_H) / 2)   -- vertically centered
+    local factionSegs = {}
+    local function factionSeg(faction, label, x)
+        local b = CreateFrame("Button", nil, header, "BackdropTemplate")
+        b:SetSize(SEG_W, SEG_H)
+        b:SetPoint("TOPLEFT", header, "TOPLEFT", x, -segTop)
+        b._faction = faction
+
+        local crest = b:CreateTexture(nil, "ARTWORK")
+        crest:SetSize(16, 16)
+        crest:SetPoint("LEFT", b, "LEFT", 8, 0)
+        crest:SetTexture(Dashboard.FactionCrest(faction))
+        crest:SetTexCoord(unpack(CREST_COORD))
+        b._crest = crest
+
+        local lbl = b:CreateFontString(nil, "OVERLAY")
+        lbl:SetFontObject(UI.fonts.body)
+        lbl:SetPoint("LEFT", crest, "RIGHT", 5, 0)
+        lbl:SetText(label)
+        b._lbl = lbl
+
+        b._setActive = function(self, on)
+            self:SetBackdrop(UI.FLAT_BACKDROP)
+            if on then
+                local r, g, bl = Dashboard.FactionColor(faction)
+                self:SetBackdropColor(r, g, bl, 0.85)
+                self:SetBackdropBorderColor(r, g, bl, 1)
+                self._crest:SetDesaturated(false); self._crest:SetAlpha(1)
+                self._lbl:SetTextColor(UI.Color("text"))
+            else
+                self:SetBackdropColor(UI.Color("control"))
+                self:SetBackdropBorderColor(UI.Color("controlBorder"))
+                self._crest:SetDesaturated(true); self._crest:SetAlpha(0.5)
+                self._lbl:SetTextColor(UI.Color("faint"))
+            end
+        end
         b:SetScript("OnClick", function() Dashboard.SetFaction(faction) end)
-        b:SetScript("OnEnter", function(self)
-            GameTooltip:SetOwner(self, "ANCHOR_BOTTOM")
-            GameTooltip:AddLine(faction, UI.Color("text"))
-            GameTooltip:Show()
-        end)
-        b:SetScript("OnLeave", function() GameTooltip:Hide() end)
+        -- Re-skin on theme change (inactive side reads theme tokens; active side
+        -- reads the faction color) — both routed through the active state.
+        UI.Skin(b, function(self) self:_setActive(Dashboard.GetFaction() == faction) end)
+        factionSegs[#factionSegs + 1] = b
         return b
     end
-    local allyBtn  = crestButton("Alliance", 10)
-    local hordeBtn = crestButton("Horde", 10 + CREST + 4)
+    factionSeg("Alliance", "Alliance", PAD)
+    factionSeg("Horde", "Horde", PAD + SEG_W)   -- touching halves, shared seam
 
     w._updateFactionToggle = function()
         local f = Dashboard.GetFaction()
-        allyBtn._tex:SetDesaturated(f ~= "Alliance")
-        hordeBtn._tex:SetDesaturated(f ~= "Horde")
-        allyBtn._tex:SetAlpha(f == "Alliance" and 1 or 0.5)
-        hordeBtn._tex:SetAlpha(f == "Horde" and 1 or 0.5)
+        for _, b in ipairs(factionSegs) do b:_setActive(b._faction == f) end
     end
 
     -- Centered title (serif header font).
@@ -638,7 +805,98 @@ local function buildTabBar(w)
     return bar
 end
 
--- Status bar: Rend / Ony-A / Ony-H live states, guild-online count, DMF.
+----------------------------------------------------------------------
+-- Status-bar request buttons (owner feedback #6 + spec §0). Two compact
+-- circular buttons: request Nexus data / request NWB (guild) data. Wired to the
+-- parallel agent's ns.Timers.Request* APIs via soft guards, with state colors
+-- (grey none-available / green ready / red cooldown) and freshness tooltips
+-- from ns.Timers.GetSourceFreshness().
+----------------------------------------------------------------------
+
+local REQUEST_COOLDOWN = 30            -- local throttle between our requests (s)
+local _requestSent = { nexus = 0, nwb = 0 }
+local REQ_API  = { nexus = "RequestNexusData", nwb = "RequestNWBData" }
+local REQ_NAME = { nexus = "Nexus", nwb = "NWB (guild)" }
+-- Blizzard built-in circular status indicators (green/red/grey dots).
+local INDICATOR = {
+    grey  = "Interface\\COMMON\\Indicator-Gray",
+    green = "Interface\\COMMON\\Indicator-Green",
+    red   = "Interface\\COMMON\\Indicator-Red",
+}
+
+local function requestApiPresent(sourceKey)
+    return (ns.Timers and ns.Timers[REQ_API[sourceKey]]) and true or false
+end
+
+-- Soft-guard around ns.Timers.GetSourceFreshness() -> { nexus, nwb, snPassive }.
+function Dashboard.SourceFreshness(sourceKey)
+    local T = ns.Timers
+    if not (T and T.GetSourceFreshness) then return nil end
+    local ok, tbl = pcall(T.GetSourceFreshness)
+    if ok and type(tbl) == "table" then
+        local ts = tbl[sourceKey]
+        if ts and ts > 0 then return ts end
+    end
+    return nil
+end
+
+-- Returns state("disabled"|"grey"|"green"|"red"), remaining(seconds).
+function Dashboard.RequestState(sourceKey)
+    if not requestApiPresent(sourceKey) then return "disabled", 0 end
+    local rem = ((_requestSent[sourceKey] or 0) + REQUEST_COOLDOWN) - now()
+    if rem > 0 then return "red", rem end
+    -- NWB data comes from the guild; grey when nobody is online to answer.
+    if sourceKey == "nwb" and #(Dashboard._guildOnline or {}) == 0 then
+        return "grey", 0
+    end
+    return "green", 0
+end
+
+function Dashboard.OnRequestClick(sourceKey)
+    if Dashboard.RequestState(sourceKey) ~= "green" then return end
+    local fn = ns.Timers and ns.Timers[REQ_API[sourceKey]]
+    if fn then ns:SafeCall(fn) end
+    _requestSent[sourceKey] = now()
+    Dashboard.RefreshStatusBar()
+end
+
+function Dashboard.FillRequestTooltip(sourceKey)
+    local name = REQ_NAME[sourceKey] or sourceKey
+    GameTooltip:AddLine("Request " .. name .. " data", UI.Color("text"))
+    local state, rem = Dashboard.RequestState(sourceKey)
+    if state == "disabled" then
+        GameTooltip:AddLine("Not available in this build yet.", UI.Color("muted"))
+    elseif state == "red" then
+        GameTooltip:AddLine("On cooldown — " .. Dashboard.FormatDuration(rem) .. " left.", UI.Color("danger"))
+    elseif state == "grey" then
+        GameTooltip:AddLine("No guild members online to answer.", UI.Color("muted"))
+    else
+        GameTooltip:AddLine("Click to request now.", UI.Color("ok"))
+    end
+    local fresh = Dashboard.SourceFreshness(sourceKey)
+    if fresh then
+        GameTooltip:AddLine("Last update: " .. Dashboard.FormatDuration(now() - fresh) .. " ago", UI.Color("muted"))
+    end
+end
+
+-- Paint a request button's dot + interactivity from its live state.
+function Dashboard.ApplyRequestButton(b)
+    local state = Dashboard.RequestState(b._sourceKey)
+    local tex = INDICATOR.grey
+    if state == "green" then tex = INDICATOR.green
+    elseif state == "red" then tex = INDICATOR.red end
+    b._dot:SetTexture(tex)
+    if state == "disabled" then
+        b._dot:SetDesaturated(true); b:SetAlpha(0.5)
+        b._lbl:SetTextColor(UI.Color("faint"))
+    else
+        b._dot:SetDesaturated(false); b:SetAlpha(1)
+        b._lbl:SetTextColor(UI.Color("text"))
+    end
+end
+
+-- Status bar: Rend / Ony-A / Ony-H live states, request buttons, guild-online
+-- count, DMF.
 local function buildStatusBar(w)
     local bar = UI.FlatFrame(w, "panel", "border")
     bar:SetHeight(STATUS_H)
@@ -662,17 +920,40 @@ local function buildStatusBar(w)
     local sep2   = seg(onyAFS, 8);  sep2:SetText(Dashboard.Colored("·","faint"))
     local onyHFS = seg(sep2, 8)
 
-    -- Two spaced request-button slots (their request plumbing is N4); reserve
-    -- the space per the task so the later wave drops in without reflow.
-    local slotA = CreateFrame("Frame", nil, bar); slotA:SetSize(18, 18)
-    slotA:SetPoint("LEFT", onyHFS, "RIGHT", 16, 0)
-    local slotB = CreateFrame("Frame", nil, bar); slotB:SetSize(18, 18)
-    slotB:SetPoint("LEFT", slotA, "RIGHT", 6, 0)
+    -- Two compact circular request buttons (Nexus / NWB-guild). Wired to the
+    -- parallel agent's soft-guarded ns.Timers.Request* APIs; state + tooltip via
+    -- the Dashboard request module above.
+    local function requestButton(sourceKey, letter, anchorTo)
+        local b = CreateFrame("Button", nil, bar)
+        b:SetSize(16, 16)
+        if anchorTo then b:SetPoint("LEFT", anchorTo, "RIGHT", 8, 0)
+        else b:SetPoint("LEFT", onyHFS, "RIGHT", 18, 0) end
+        b._sourceKey = sourceKey
+        local dot = b:CreateTexture(nil, "ARTWORK")
+        dot:SetAllPoints()
+        b._dot = dot
+        local lbl = b:CreateFontString(nil, "OVERLAY")
+        lbl:SetFontObject(UI.fonts.small)
+        lbl:SetPoint("CENTER", b, "CENTER", 0, 0)
+        lbl:SetText(letter)
+        b._lbl = lbl
+        b:SetScript("OnClick", function(self) Dashboard.OnRequestClick(self._sourceKey) end)
+        b:SetScript("OnEnter", function(self)
+            GameTooltip:SetOwner(self, "ANCHOR_TOP")
+            Dashboard.FillRequestTooltip(self._sourceKey)
+            GameTooltip:Show()
+        end)
+        b:SetScript("OnLeave", function() GameTooltip:Hide() end)
+        UI.Skin(b, function(self) Dashboard.ApplyRequestButton(self) end)
+        return b
+    end
+    local reqNexus = requestButton("nexus", "N", nil)
+    local reqNWB   = requestButton("nwb", "G", reqNexus)
 
     -- Guild-online count (green), hover list.
     local guildFS = bar:CreateFontString(nil, "OVERLAY")
     guildFS:SetFontObject(UI.fonts.small)
-    guildFS:SetPoint("LEFT", slotB, "RIGHT", 16, 0)
+    guildFS:SetPoint("LEFT", reqNWB, "RIGHT", 16, 0)
     local guildHover = CreateFrame("Frame", nil, bar)
     guildHover:SetPoint("TOPLEFT", guildFS, "TOPLEFT", -2, 4)
     guildHover:SetPoint("BOTTOMRIGHT", guildFS, "BOTTOMRIGHT", 2, -4)
@@ -713,7 +994,7 @@ local function buildStatusBar(w)
     dmfHover:SetScript("OnLeave", function() GameTooltip:Hide() end)
 
     w.status = { bar = bar, rend = rendFS, onyA = onyAFS, onyH = onyHFS,
-                 guild = guildFS, dmf = dmfFS }
+                 guild = guildFS, dmf = dmfFS, reqNexus = reqNexus, reqNWB = reqNWB }
     return bar
 end
 
@@ -767,6 +1048,10 @@ function Dashboard.RefreshStatusBar()
     local list = Dashboard.QueryGuildOnline()
     Dashboard._guildOnline = list
     s.guild:SetText(Dashboard.Colored(("Guild: %d online"):format(#list),"ok"))
+
+    -- Request buttons (state depends on the guild-online snapshot just taken).
+    if s.reqNexus then Dashboard.ApplyRequestButton(s.reqNexus) end
+    if s.reqNWB then Dashboard.ApplyRequestButton(s.reqNWB) end
 
     -- DMF.
     local d = Dashboard.GetDMFSchedule()
@@ -1119,33 +1404,42 @@ function Dashboard.BuildDetailPanel(parent)
         locBox:Show()
         y = y + 26
 
-        -- Buffs.
+        -- Buffs (owner feedback #3 — list EVERY applicable tracked aura, with a
+        -- red "Missing" when absent; non-applicable rows collapse). Icons come
+        -- from the real spell (owner feedback #1) via Dashboard.AuraIcon.
         header("Buffs")
         for _, slot in ipairs(Dashboard.AURA_DISPLAY_ORDER) do
             local meta = Dashboard.AURA_META[slot]
             local st = rec.auraStates and rec.auraStates[slot]
-            bi = bi + 1
-            local r = getBuffRow(bi)
-            r.icon:SetTexture(meta.icon)
-            r:ClearAllPoints()
-            r:SetPoint("TOPLEFT", child, "TOPLEFT", 0, -y)
-            r:SetWidth(W)
-            if st and (st.duration or 0) > 0 then
-                local th = Dashboard.GetThreshold(entry.faction or rec.faction, meta.thresholdKey)
-                local tok = Dashboard.AuraColorToken(st.duration, th)
-                r.icon:SetDesaturated(false)
-                r.name:SetText(meta.name); r.name:SetTextColor(UI.Color(tok))
-                local annot = rec.chronoboonActive and "  (Boon)" or ""
-                r.val:SetText(Dashboard.FormatDuration(st.duration) .. annot)
-                r.val:SetTextColor(UI.Color(tok))
-            else
-                r.icon:SetDesaturated(true)
-                r.name:SetText(meta.name); r.name:SetTextColor(UI.Color("faint"))
-                local missTxt = rec.chronoboonActive and "UNBOONED" or "Missing"
-                r.val:SetText(missTxt); r.val:SetTextColor(UI.Color("faint"))
+            local present = st and (st.duration or 0) > 0
+            local applicable, requirement = Dashboard.AuraRequirement(slot, rec, entry.faction or rec.faction)
+            if present or applicable then
+                bi = bi + 1
+                local r = getBuffRow(bi)
+                r.icon:SetTexture(Dashboard.AuraIcon(slot))
+                r:ClearAllPoints()
+                r:SetPoint("TOPLEFT", child, "TOPLEFT", 0, -y)
+                r:SetWidth(W)
+                if present then
+                    local th = Dashboard.GetThreshold(entry.faction or rec.faction, meta.thresholdKey)
+                    local tok = Dashboard.AuraColorToken(st.duration, th)
+                    r.icon:SetDesaturated(false); r.icon:SetVertexColor(1, 1, 1); r.icon:SetAlpha(1)
+                    r.name:SetText(meta.name); r.name:SetTextColor(UI.Color(tok))
+                    local annot = rec.chronoboonActive and "  (Boon)" or ""
+                    r.val:SetText(Dashboard.FormatDuration(st.duration) .. annot)
+                    r.val:SetTextColor(UI.Color(tok))
+                else
+                    -- Missing + applicable: greyed icon; name + "Missing" in
+                    -- danger (required) or warn/amber (optional).
+                    local tok = (requirement == "optional") and warnToken() or "danger"
+                    r.icon:SetDesaturated(true); r.icon:SetVertexColor(0.7, 0.7, 0.7); r.icon:SetAlpha(0.5)
+                    r.name:SetText(meta.name); r.name:SetTextColor(UI.Color(tok))
+                    local missTxt = rec.chronoboonActive and "UNBOONED" or "Missing"
+                    r.val:SetText(missTxt); r.val:SetTextColor(UI.Color(tok))
+                end
+                r:Show()
+                y = y + 22
             end
-            r:Show()
-            y = y + 22
         end
 
         -- Cooldowns.
@@ -1253,6 +1547,14 @@ function Dashboard.BuildRosterPane(host, opts)
     UI.Skin(insLine, function(self) self:SetColorTexture(UI.Color("accent")) end)
     R._insLine = insLine
 
+    -- Muted list empty-state (opts.emptyText). Used by the Online tab to show
+    -- "No characters online" when the filtered list is empty (owner feedback).
+    local emptyLabel = fs(listChild, "muted")
+    emptyLabel:SetPoint("TOPLEFT", listChild, "TOPLEFT", 4, -4)
+    emptyLabel:SetText(opts.emptyText or "")
+    emptyLabel:Hide()
+    R._emptyLabel = emptyLabel
+
     -- Right: shared detail panel.
     local right = CreateFrame("Frame", nil, host)
     right:SetPoint("TOPLEFT", left, "TOPRIGHT", GAP, 0)
@@ -1299,6 +1601,8 @@ function Dashboard.BuildRosterPane(host, opts)
             y = y + cardH + 6
         end
         listChild:SetHeight(math.max(y, 1))
+        -- List empty-state (e.g. Online tab with nobody online).
+        if R._emptyLabel then R._emptyLabel:SetShown(#roster == 0 and (opts.emptyText or "") ~= "") end
         -- Keep detail current for the selected entry (data may have changed).
         if R._selected then
             for _, e in ipairs(roster) do

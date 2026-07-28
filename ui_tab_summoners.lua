@@ -11,16 +11,19 @@ local Dashboard = ns.Dashboard
 local ROW_H     = 22
 local HEADER_H  = 24
 local SHARD_MIN = 20   -- warlocks with at least this many shards are "summoners"
+local COL_GAP   = 14   -- inter-column spacing (owner feedback: columns crowded left)
+local SOULSHARD_ITEM = 6265   -- Soul Shard (its icon prefixes the Shards count)
 
--- Fixed column widths (Location flexes to fill). Grid discipline.
+-- Fixed column widths (Location flexes to fill). Grid discipline: comfortable
+-- widths so the columns distribute across the table instead of bunching left.
 local COLS = {
-    { key = "name",     label = "Name",     w = 130, just = "LEFT"  },
-    { key = "account",  label = "Acct",     w = 46,  just = "CENTER"},
-    { key = "shards",   label = "Shards",   w = 58,  just = "CENTER"},
-    { key = "class",    label = "Class",    w = 78,  just = "LEFT"  },
+    { key = "name",     label = "Name",     w = 158, just = "LEFT"  },
+    { key = "account",  label = "Account",  w = 78,  just = "CENTER"},
+    { key = "shards",   label = "Shards",   w = 84,  just = "CENTER"},
+    { key = "class",    label = "Class",    w = 96,  just = "LEFT"  },
     { key = "location", label = "Location", w = 0,   just = "LEFT", flex = true },
-    { key = "status",   label = "Status",   w = 62,  just = "CENTER"},
-    { key = "edit",     label = "",         w = 26,  just = "CENTER"},
+    { key = "status",   label = "Status",   w = 78,  just = "CENTER"},
+    { key = "edit",     label = "",         w = 30,  just = "CENTER"},
 }
 
 local function fstr(parent, key)
@@ -185,13 +188,13 @@ Dashboard.RegisterTab("summoners", function(host)
     local function layoutColumns(totalW)
         local fixed = 0
         for _, c in ipairs(COLS) do if not c.flex then fixed = fixed + c.w end end
-        local flexW = math.max(80, totalW - fixed - (#COLS - 1) * 6)
+        local flexW = math.max(120, totalW - fixed - (#COLS - 1) * COL_GAP)
         local x = 0
         local geom = {}
         for i, c in ipairs(COLS) do
             local w = c.flex and flexW or c.w
             geom[i] = { x = x, w = w }
-            x = x + w + 6
+            x = x + w + COL_GAP
         end
         return geom
     end
@@ -244,10 +247,20 @@ Dashboard.RegisterTab("summoners", function(host)
             r:SetWidth(totalW)
             r.bg:SetColorTexture(UI.Color((i % 2 == 0) and "raised" or "panel", 0.5))
             local rec = e.rec
+            -- Shards cell: warlocks show the real Soul Shard item icon before the
+            -- count (owner feedback); "-" for non-warlocks. Inline texture escape
+            -- keeps it in one sortable FontString cell.
+            local shardCell
+            if rec.classTag == "WARLOCK" then
+                local ic = Dashboard.ItemIcon(SOULSHARD_ITEM)
+                shardCell = ("|T%s:13:13:0:0|t %d"):format(ic, rec.shardCount or 0)
+            else
+                shardCell = "-"
+            end
             local cells = {
                 Dashboard.ColoredName(e.nameRealm, rec.classTag),
                 (e.aid ~= "" and e.aid) or "-",
-                tostring(rec.shardCount or 0),
+                shardCell,
                 rec.className or "?",
                 rec.location or Dashboard.Colored("Missing","danger"),
                 e.online and Dashboard.Colored("Online","ok") or Dashboard.Colored("Offline","faint"),
