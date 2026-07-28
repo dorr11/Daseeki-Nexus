@@ -34,17 +34,36 @@ ns.Options = Options
 local QUESTION = "Interface\\Icons\\INV_Misc_QuestionMark"
 
 -- The nine configurable world-buff auras (spec §2). FFF is excluded per spec.
--- spellID drives the row icon only (cosmetic — GetSpellTexture, guarded).
+-- Labels use the reference's "ABBR (Source)" format (round-3 item 31). spellID
+-- drives the row icon only (cosmetic — GetSpellTexture, guarded).
 local AURA_DEFS = {
-    { key = "dmf",      label = "Darkmoon Faire",  spellID = 23768 },  -- Sayge's Dark Fortune
-    { key = "ony",      label = "Onyxia",          spellID = 22888 },  -- Rallying Cry
-    { key = "dmtAP",    label = "DMT — Attack",    spellID = 22817 },  -- Fengus' Ferocity
-    { key = "dmtSP",    label = "DMT — Spell",     spellID = 22820 },  -- Slip'kik's Savvy
-    { key = "dmtStam",  label = "DMT — Stamina",   spellID = 22801 },  -- Mol'dar's Moxie
-    { key = "songflower", label = "Songflower",    spellID = 15366 },  -- Songflower Serenade
-    { key = "zg",       label = "Zandalar (ZG)",   spellID = 24425 },  -- Spirit of Zandalar
-    { key = "rend",     label = "Rend (Warchief)", spellID = 16609 },  -- Warchief's Blessing
-    { key = "battleShout", label = "Battle Shout", spellID = 6673  },  -- Battle Shout
+    { key = "dmf",      label = "DMF (Sayge's Fortune)",  spellID = 23768 },  -- Sayge's Dark Fortune
+    { key = "ony",      label = "Ony (Rallying Cry)",     spellID = 22888 },  -- Rallying Cry
+    { key = "dmtAP",    label = "DMT AP (Fengus' Ferocity)", spellID = 22817 },  -- Fengus' Ferocity
+    { key = "dmtSP",    label = "DMT SP (Slip'kik's Savvy)", spellID = 22820 },  -- Slip'kik's Savvy
+    { key = "dmtStam",  label = "DMT Stam (Mol'dar's Moxie)", spellID = 22801 },  -- Mol'dar's Moxie
+    { key = "songflower", label = "SF (Songflower Serenade)", spellID = 15366 },  -- Songflower Serenade
+    { key = "zg",       label = "ZG (Spirit of Zandalar)", spellID = 24425 },  -- Spirit of Zandalar
+    { key = "rend",     label = "Rend (Warchief's)",      spellID = 16609 },  -- Warchief's Blessing
+    { key = "battleShout", label = "BS (NPC)",            spellID = 6673  },  -- Battle Shout (NPC)
+}
+
+-- The full ten summon-trigger buffs (round-3 item 23). Rendered as "ABBR - Full
+-- Name" rows with spell icons. FFF is the seasonal buff (no stable spellID here —
+-- cosmetic question-mark fallback). The engine owns the authoritative trigger set
+-- (anticipated ns.Store.SUMMON_TRIGGER_BUFFS); this catalog is the UI's label/icon
+-- source and the pre-merge fallback ordering.
+local TRIGGER_DEFS = {
+    { key = "dmf",        abbr = "DMF",      name = "Sayge's Dark Fortune",  spellID = 23768 },
+    { key = "ony",        abbr = "Ony",      name = "Rallying Cry of the Dragonslayer", spellID = 22888 },
+    { key = "zg",         abbr = "ZG",       name = "Spirit of Zandalar",    spellID = 24425 },
+    { key = "dmtAP",      abbr = "DMT AP",   name = "Fengus' Ferocity",      spellID = 22817 },
+    { key = "dmtSP",      abbr = "DMT SP",   name = "Slip'kik's Savvy",      spellID = 22820 },
+    { key = "dmtStam",    abbr = "DMT Stam", name = "Mol'dar's Moxie",       spellID = 22801 },
+    { key = "songflower", abbr = "SF",       name = "Songflower Serenade",   spellID = 15366 },
+    { key = "rend",       abbr = "Rend",     name = "Warchief's Blessing",   spellID = 16609 },
+    { key = "battleShout", abbr = "BS",      name = "Battle Shout",          spellID = 6673  },
+    { key = "fff",        abbr = "FFF",      name = "Fervor of the Fallen (seasonal)", spellID = nil },
 }
 
 -- Classes for the Rend rule cycler (all nine) and the Battle Shout cycler
@@ -59,16 +78,54 @@ local CLASS_LABEL  = {
 local CLASS_FACTION = { PALADIN = "Alliance", SHAMAN = "Horde" }
 
 -- Alert matrix keys (mirror store.ALERT_BUFF_KEYS / ALERT_EVENT_TYPES exactly).
+-- Per-buff meta drives the event-major layout's icon + name (round-3 item 13);
+-- ALERT_BUFF_LABEL is retained as the short-name fallback.
 local ALERT_BUFF_LABEL = {
     rend = "Rend", onyH = "Onyxia (Horde)", onyA = "Onyxia (Alliance)",
     nefH = "Nefarian (Horde)", nefA = "Nefarian (Alliance)",
-    zg = "Zandalar", battleShout = "Battle Shout",
+    zg = "Zandalar", battleShout = "Battle Shout", dmf = "Darkmoon Faire",
 }
+local ALERT_BUFF_META = {
+    rend        = { name = "Rend",             spellID = 16609 },
+    onyH        = { name = "Onyxia (Horde)",   spellID = 22888 },
+    onyA        = { name = "Onyxia (Alliance)", spellID = 22888 },
+    nefH        = { name = "Nefarian (Horde)", spellID = nil },
+    nefA        = { name = "Nefarian (Alliance)", spellID = nil },
+    zg          = { name = "Zandalar",         spellID = 24425 },
+    battleShout = { name = "Battle Shout",     spellID = 6673  },
+    dmf         = { name = "Darkmoon Faire",   spellID = 23768 },
+}
+-- Reference sub-header names for the event-major matrix (round-3 item 13).
 local ALERT_EVENT_LABEL = {
-    questHandin = "Quest Hand-in", pullTimer = "Pull Timer", npcDied = "NPC Died",
-    npcRespawned = "NPC Respawned", cdWarning = "CD Warning", cdExpired = "CD Expired",
-    buffGain = "Buff Gain",
+    questHandin = "Quest Hand-in Alerts", pullTimer = "Pull Timer / Buff Incoming",
+    npcDied = "NPC Died", npcRespawned = "NPC Respawned",
+    cdWarning = "CD Warning (5min / 1min)", cdExpired = "CD Expired",
+    buffGain = "Buff Gain Notice",
 }
+-- Which buff rows appear under each event sub-header. Mirrors the reference's
+-- per-event sets (round-3 items 13/24). ENGINE DEPENDENCY: the engine agent owns
+-- the authoritative mapping (anticipated ns.Store.ALERT_EVENT_BUFFS); this is the
+-- pre-merge fallback and is superseded by that table when present.
+local ALERT_EVENT_BUFFS_FALLBACK = {
+    questHandin  = { "rend", "onyH", "onyA", "nefH", "nefA", "zg" },
+    pullTimer    = { "rend", "onyH", "onyA", "nefH", "nefA", "zg", "battleShout" },
+    npcDied      = { "onyH", "onyA", "nefH", "nefA" },
+    npcRespawned = { "onyH", "onyA", "nefH", "nefA" },
+    cdWarning    = { "onyH", "onyA", "rend" },
+    cdExpired    = { "onyH", "onyA", "rend" },
+    buffGain     = { "rend", "onyH", "onyA", "nefH", "nefA", "zg", "battleShout", "dmf" },
+}
+local function alertEventBuffs(evt)
+    local eng = ns.Store and ns.Store.ALERT_EVENT_BUFFS
+    if type(eng) == "table" and type(eng[evt]) == "table" then return eng[evt] end
+    return ALERT_EVENT_BUFFS_FALLBACK[evt] or {}
+end
+-- Event order for the matrix: prefer the engine's ALERT_EVENT_TYPES, else fallback.
+local function alertEventOrder()
+    local eng = ns.Store and ns.Store.ALERT_EVENT_TYPES
+    if type(eng) == "table" and #eng > 0 then return eng end
+    return { "questHandin", "pullTimer", "npcDied", "npcRespawned", "cdWarning", "cdExpired", "buffGain" }
+end
 
 -- Curated Blizzard sound choices (design D3 — built-in SoundKit IDs, zero shipped
 -- assets). Store keeps the string key; the map resolves it to an ID for Test.
@@ -87,13 +144,8 @@ local SOUNDKIT_MAP = {
 }
 local SOUND_CHANNELS = { "Master", "SFX", "Music", "Ambience", "Dialog" }
 
--- The four named per-event sound-key slots (store.timerSettings.soundKeys).
-local SOUNDKEY_ROWS = {
-    { key = "pullTimer",   label = "Pull Timer" },
-    { key = "cdWarning",   label = "CD Warning" },
-    { key = "npcDied",     label = "NPC Died" },
-    { key = "npcRespawned", label = "NPC Respawned" },
-}
+-- (The old event-level soundKeys UI was retired when the alert matrix went
+-- event-major with per-row sound dropdowns — round-3 item 13/14.)
 
 -- (Interact NPCs table removed — the Interact feature is cut suite-wide, owner
 -- feedback 2b.)
@@ -102,9 +154,12 @@ local SOUNDKEY_ROWS = {
 local DMF_BUFF_TYPES = {
     "damage", "agility", "intellect", "spirit", "stamina", "strength", "armor", "resistance",
 }
+-- Effect text mirrors the reference's descriptive dropdown labels (round-3 item 30).
 local DMF_BUFF_TYPE_LABEL = {
-    damage = "Damage", agility = "Agility", intellect = "Intellect", spirit = "Spirit",
-    stamina = "Stamina", strength = "Strength", armor = "Armor", resistance = "Resistance",
+    damage = "Damage (+10% Dmg)", agility = "Agility (+10% Agi)",
+    intellect = "Intellect (+10% Int)", spirit = "Spirit (+10% Spi)",
+    stamina = "Stamina (+10% Sta)", strength = "Strength (+10% Str)",
+    armor = "Armor (+25% Armor)", resistance = "Resistance (+25 All Res)",
 }
 
 -- Zanza pick keys (spec §7 Quest — Yojamba Zanza buffs).
@@ -255,6 +310,59 @@ local function soundIdForKey(key)
     return SOUNDKIT_MAP[key or ""]
 end
 
+-- Inline multi-line text editor as a flow block (round-3 items 29 / 33). A
+-- token-skinned bordered viewport wrapping a multi-line EditBox; commits the whole
+-- buffer on focus-lost via opts.set(text), reverts on Escape. opts:
+--   { height = <px>, get = function()->string, set = function(text), register = "page" }
+-- Returns the host frame (with .Refresh + .editBox).
+local function buildTextArea(flow, opts)
+    local UI = DaseekiUI
+    local height = opts.height or 96
+    local host = UI.FlatFrame(flow.pane.child, "inset", "border")
+    host.uiHeight, host._fillWidth = height, true
+
+    local scroll = CreateFrame("ScrollFrame", nil, host)
+    scroll:SetPoint("TOPLEFT", host, "TOPLEFT", 5, -5)
+    scroll:SetPoint("BOTTOMRIGHT", host, "BOTTOMRIGHT", -5, 5)
+    scroll:SetClipsChildren(true); scroll:EnableMouseWheel(true)
+
+    local box = CreateFrame("EditBox", nil, scroll)
+    box:SetMultiLine(true); box:SetAutoFocus(false); box:SetMaxLetters(0)
+    box:SetFontObject(UI.fonts.body); box:SetTextInsets(2, 2, 2, 2)
+    box:SetWidth(1)
+    scroll:SetScrollChild(box)
+
+    scroll:SetScript("OnMouseWheel", function(self, delta)
+        local maxs = math.max(0, box:GetHeight() - self:GetHeight())
+        if maxs > 0 then self:SetVerticalScroll(math.max(0, math.min(maxs, self:GetVerticalScroll() - delta * 24)))
+        elseif UI.ForwardWheelToPane then UI.ForwardWheelToPane(self, delta) end
+    end)
+    -- Clicking anywhere in the viewport focuses the editbox.
+    scroll:EnableMouse(true)
+    scroll:SetScript("OnMouseDown", function() box:SetFocus() end)
+
+    local function commit()
+        if opts.set then opts.set(box:GetText() or "") end
+    end
+    box:SetScript("OnEditFocusLost", commit)
+    box:SetScript("OnEscapePressed", function(self)
+        self:SetText(opts.get and (opts.get() or "") or ""); self:ClearFocus()
+    end)
+
+    host.editBox = box
+    host.Refresh = function() box:SetText(opts.get and (opts.get() or "") or "") end
+    host.arrange = function(width)
+        host:SetWidth(width); host:SetHeight(height)
+        box:SetWidth(math.max(1, width - 12))
+        return height
+    end
+    UI.Skin(host, function() end)
+    flow.pane:AddBlock(host, host.arrange, 8, 0)
+    host.Refresh()
+    if opts.register then register(opts.register, host.Refresh) end
+    return host
+end
+
 -- Forward declarations (kept local so nothing leaks into _G).
 local buildCoordPane, buildClassColors, buildClassRuleGrid
 local buildAccountsTable, buildTombstonesTable
@@ -275,14 +383,18 @@ local function buildGeneral(flow)
     -- ── Behaviour ─────────────────────────────────────────────────────────────
     local sec = flow:AddSection("General")
     sec:Hint("Core behaviour and this account's mesh identity.")
+    -- Parent/child: the lock toggle indents beneath its minimap-button parent
+    -- (round-3 item 16).
     local r1 = sec:AddRow({ vAlign = "center" })
     register("general", r1:Checkbox({
         label = "Show minimap button",
         get = function() local db = DB(); return db and not db.minimap.hide end,
         set = function(v) local db = DB(); if db then db.minimap.hide = not v end end,
     }).Refresh)
-    register("general", r1:Checkbox({
-        label = "Lock button",
+    local rLock = sec:AddRow({ vAlign = "center" })
+    rLock._indent = rLock._indent + 20
+    register("general", rLock:Checkbox({
+        label = "Lock button position (no dragging)",
         get = function() local db = DB(); return db and db.minimap.lock end,
         set = function(v) local db = DB(); if db then db.minimap.lock = v and true or false end end,
     }).Refresh)
@@ -317,10 +429,42 @@ local function buildGeneral(flow)
     })
     acctBox._fillWidth = false
     acctStatus = acctRow:Label("")
-    sec:Hint("A unique 1–2 digit number that keys this account on the mesh.")
+    sec:Hint("1-2 digits (e.g., 1, 02). Must be different on each account.")
+
+    -- Location-data status line (round-3 item 16): green when every own
+    -- active-faction level-60 has a usable location, amber when some are missing.
+    local locStatus = sec:AddRow():Label("")
+    local function locationDataStatus()
+        local bucket = ns.Store and ns.Store.GetSelfAccount and ns.Store.GetSelfAccount(false)
+        if not bucket then return 0, 0 end
+        local myFaction = UnitFactionGroup and UnitFactionGroup("player") or nil
+        local total, missing = 0, 0
+        for _, rec in pairs(bucket.characters or {}) do
+            if (not myFaction) or rec.faction == myFaction or rec.faction == nil then
+                if (rec.level or 0) >= 60 then
+                    total = total + 1
+                    local loc = rec.location
+                    local manual = ns.Store.GetManualLocation and ns.Store.GetManualLocation(rec.nameRealm)
+                    if (not loc or loc == "") and (not manual or manual == "") then missing = missing + 1 end
+                end
+            end
+        end
+        return total, missing
+    end
+    register("general", function()
+        local total, missing = locationDataStatus()
+        if total == 0 then
+            locStatus._label:SetText("|cff888888No tracked level-60 characters yet.|r")
+        elseif missing == 0 then
+            locStatus._label:SetText("|cff66dd66All own active-faction characters have usable location data.|r")
+        else
+            locStatus._label:SetText("|cffddaa44" .. missing .. " own character(s) are missing location data.|r")
+        end
+    end)
 
     -- ── Data management ───────────────────────────────────────────────────────
     local dm = flow:AddSection("Data Management")
+    dm:Hint("Local operation — excludes aura thresholds, Paladins/Shamans, and the Auto-Invite Whitelist.")
     local dmRow = dm:AddRow()
     dmRow:Button({ text = "Export Settings", width = 140, onClick = function()
         local db = DB(); if not db then return end
@@ -360,6 +504,17 @@ local function buildGeneral(flow)
     end })
     dm:Hint("Cross-faction copy excludes aura thresholds, Paladin/Shaman rows and the invite whitelist.")
 
+    -- Mesh status line above the Sync button (round-3 item 16).
+    local meshStatus = dm:AddRow():Label("")
+    register("general", function()
+        local aid = ns:GetAccountID()
+        local online = 0
+        for _, p in pairs((ns.Mesh and ns.Mesh.peers) or {}) do
+            if p.online then online = online + 1 end
+        end
+        meshStatus._label:SetText("Mesh: AID " .. (aid ~= "" and aid or "(unset)") ..
+            " |cff888888|||r Online: " .. online .. " peer(s)")
+    end)
     dm:AddRow():Button({ text = "Sync Settings to Mesh", width = 200, onClick = function()
         if not (ns.Mesh and ns.Mesh.IsEnabled and ns.Mesh.IsEnabled()) then
             ns:Print("mesh is not enabled — nothing to sync to."); return
@@ -380,15 +535,14 @@ local function buildGeneral(flow)
         })
     end })
 
-    -- ── Coordinate overrides (two-pane list + editor) ────────────────────────
-    flow:AddSection("Coordinate Overrides")
-    flow:Hint("Rules that relabel a character's location when they stand inside a zone box.")
-    buildCoordPane(flow)
+    -- ── Locations (numbered coordinate-override table) ───────────────────────
+    local loc = flow:AddSection("Locations")
+    buildCoordPane(loc)
 
     -- ── Class colors ──────────────────────────────────────────────────────────
-    flow:AddSection("Class Colors")
-    flow:Hint("Override any class's color; applied across every Nexus roster and list.")
-    buildClassColors(flow)
+    local col = flow:AddSection("Colors")
+    col:Hint("Customize class colors used for character names across every Nexus roster and list.")
+    buildClassColors(col)
 end
 
 -- Copy one faction's automation block to the other, excluding the spec's
@@ -430,41 +584,142 @@ function Options.CopyFaction(from, to)
     })
 end
 
--- Two-pane coordinate-override editor (list left, fields right).
+-- Numbered coordinate-override table (round-3 item 15): header row
+-- (# · Name · X · Y · Tolerance) over up to 15 rows, each with a per-row "Here",
+-- plus Reset to Defaults. The store keeps box-bounds (minX/maxX/minY/maxY); the UI
+-- presents centre X/Y + a symmetric Tolerance and converts to bounds on save.
+local COORD_CAP = 15
+-- Column x-offsets (shared by header + rows; measured from the block's left edge).
+local CC = { num = 4, name = 28, x = 188, y = 262, tol = 336, here = 410, del = 462 }
+local CW = { name = 152, x = 66, y = 66, tol = 66, here = 46, del = 58 }
+
 function buildCoordPane(flow)
     local UI = DaseekiUI
-    local split = CreateFrame("Frame", nil, flow.pane.child)
-    local leftCol  = UI.CreateColumn(split)
-    local rightCol = UI.CreateColumn(split)
-    local L, R = leftCol.flow, rightCol.flow
 
-    local list = L:List({
-        height = 150,
-        items = function()
-            local out = {}
-            for i, rule in ipairs(coordList()) do
-                out[#out + 1] = { text = (rule.label or rule.name or ("Rule " .. i)), value = i, status = "faint" }
-            end
-            if #out == 0 then out[#out + 1] = { header = true, text = "NO RULES" } end
-            return out
-        end,
-        selected = coord.selected,
-        onSelect = function(i) coord.selected = i; refreshPage("general") end,
-    })
-    coord._list = list
+    -- Hint with the reference's colored tolerance callouts (round-3 item 15).
+    flow:Hint("Relabels a character's location when they stand near a point. Coordinates accurate to 6 decimals. " ..
+        "Default tolerance |cff69ccf00.02|r (custom) / |cffffd100.08|r (normal).")
 
-    local addRow = L:AddRow()
-    addRow:Button({ text = "Add", width = 71, onClick = function()
+    local function fmt(v) return string.format("%.6f", v or 0) end
+    local function cx(r)  return ((r.minX or 0) + (r.maxX or 0)) / 2 end
+    local function cy(r)  return ((r.minY or 0) + (r.maxY or 0)) / 2 end
+    local function tolOf(r) return math.abs((r.maxX or 0) - (r.minX or 0)) / 2 end
+    local function setCX(r, n)  local t = tolOf(r); r.minX = n - t; r.maxX = n + t end
+    local function setCY(r, n)  local t = tolOf(r); r.minY = n - t; r.maxY = n + t end
+    local function setTolR(r, t) local X, Y = cx(r), cy(r); r.minX = X - t; r.maxX = X + t; r.minY = Y - t; r.maxY = Y + t end
+
+    local host = CreateFrame("Frame", nil, flow.pane.child)
+    host._rows = {}
+    local ROW_H, HDR_H = 28, 22
+
+    -- Header fontstrings (aligned to the same column offsets as data rows).
+    local function mkHdr(text, x, w)
+        local fs = host:CreateFontString(nil, "OVERLAY"); fs:SetFontObject(UI.fonts.small)
+        fs:SetPoint("TOPLEFT", host, "TOPLEFT", x, -3); if w then fs:SetWidth(w) end
+        fs:SetText(text); return fs
+    end
+    local h1 = mkHdr("#", CC.num, 20)
+    local h2 = mkHdr("Name", CC.name, CW.name)
+    local h3 = mkHdr("X", CC.x, CW.x)
+    local h4 = mkHdr("Y", CC.y, CW.y)
+    local h5 = mkHdr("Tolerance", CC.tol, CW.tol)
+    UI.Skin(host, function()
+        for _, fs in ipairs({ h1, h2, h3, h4, h5 }) do fs:SetTextColor(UI.Color("muted")) end
+    end)
+
+    local rebuild   -- forward
+    local function makeCell(row, x, w)
+        local box = CreateFrame("EditBox", nil, row, "BackdropTemplate")
+        box:SetSize(w, 22); box:SetPoint("LEFT", row, "LEFT", x, 0)
+        box:SetAutoFocus(false); box:SetFontObject(UI.fonts.body); box:SetTextInsets(6, 6, 0, 0)
+        UI.Skin(box, function(self)
+            self:SetBackdrop(UI.FLAT_BACKDROP)
+            self:SetBackdropColor(UI.Color("inset")); self:SetBackdropBorderColor(UI.Color("controlBorder"))
+        end)
+        return box
+    end
+
+    rebuild = function()
         local rules = coordList()
-        if #rules >= 15 then ns:Print("coordinate override limit is 15."); return end
-        rules[#rules + 1] = { name = "New Rule", zone = "", label = "New Rule",
-                              minX = 0, maxX = 0, minY = 0, maxY = 0 }
-        coord.selected = #rules
-        refreshPage("general")
+        for _, r in ipairs(host._rows) do r:Hide() end
+        for i = 1, #rules do
+            local row = host._rows[i]
+            if not row then
+                row = CreateFrame("Frame", nil, host); row:SetHeight(ROW_H)
+                row.num = row:CreateFontString(nil, "OVERLAY"); row.num:SetFontObject(UI.fonts.body)
+                row.num:SetPoint("LEFT", row, "LEFT", CC.num, 0); row.num:SetWidth(20)
+                row.name = makeCell(row, CC.name, CW.name)
+                row.x    = makeCell(row, CC.x,   CW.x)
+                row.y    = makeCell(row, CC.y,   CW.y)
+                row.tol  = makeCell(row, CC.tol, CW.tol)
+                row.here = UI.MakeButton(row, { text = "Here", width = CW.here, height = 22, variant = "quiet" })
+                row.here:ClearAllPoints(); row.here:SetPoint("LEFT", row, "LEFT", CC.here, 0)
+                row.del  = UI.MakeButton(row, { text = "Del", width = CW.del, height = 22, variant = "danger" })
+                row.del:ClearAllPoints(); row.del:SetPoint("LEFT", row, "LEFT", CC.del, 0)
+                UI.Skin(row, function() row.num:SetTextColor(UI.Color("muted")) end)
+                host._rows[i] = row
+            end
+            local idx = i
+            row.num:SetText(tostring(idx))
+            row.name:SetText(rules[idx].label or "")
+            row.x:SetText(fmt(cx(rules[idx])))
+            row.y:SetText(fmt(cy(rules[idx])))
+            row.tol:SetText(fmt(tolOf(rules[idx])))
+            local function bindText(box, apply)
+                box:SetScript("OnEnterPressed", function(self) apply(self:GetText()); self:ClearFocus(); rebuild() end)
+                box:SetScript("OnEditFocusLost", function(self) apply(self:GetText()); rebuild() end)
+                box:SetScript("OnEscapePressed", function(self) rebuild(); self:ClearFocus() end)
+            end
+            bindText(row.name, function(t) local r = coordList()[idx]; if r then r.label = t end end)
+            bindText(row.x,   function(t) local r = coordList()[idx]; local n = tonumber(t); if r and n then setCX(r, n) end end)
+            bindText(row.y,   function(t) local r = coordList()[idx]; local n = tonumber(t); if r and n then setCY(r, n) end end)
+            bindText(row.tol, function(t) local r = coordList()[idx]; local n = tonumber(t); if r and n then setTolR(r, n) end end)
+            row.here:SetScript("OnClick", function()
+                local r = coordList()[idx]; if not r then return end
+                local mapID = C_Map and C_Map.GetBestMapForUnit and C_Map.GetBestMapForUnit("player")
+                local pos = mapID and C_Map.GetPlayerMapPosition and C_Map.GetPlayerMapPosition(mapID, "player")
+                if not pos then ns:Print("could not read your position here."); return end
+                local px, py = pos:GetXY()
+                setCX(r, px); setCY(r, py); if tolOf(r) <= 0 then setTolR(r, 0.02) end
+                local info = mapID and C_Map.GetMapInfo and C_Map.GetMapInfo(mapID)
+                if info and info.name then r.zone = info.name; if (r.label or "") == "" then r.label = info.name end end
+                rebuild()
+            end)
+            row.del:SetScript("OnClick", function()
+                table.remove(coordList(), idx); rebuild()
+            end)
+            row:ClearAllPoints()
+            row:SetPoint("TOPLEFT", host, "TOPLEFT", 0, -(HDR_H + (i - 1) * ROW_H))
+            row:SetPoint("TOPRIGHT", host, "TOPRIGHT", 0, -(HDR_H + (i - 1) * ROW_H))
+            row:Show()
+        end
+        if flow.pane and flow.pane.Layout then flow.pane:Layout() end
+    end
+
+    host.arrange = function(width)
+        local n = #coordList()
+        local h = HDR_H + math.max(1, n) * ROW_H
+        host:SetWidth(width); host:SetHeight(h)
+        return h
+    end
+    coord._rebuild = rebuild
+    register("general", rebuild)
+    UI.Skin(host, function() end)
+    flow.pane:AddBlock(host, host.arrange, 8, 0)
+    rebuild()
+
+    -- Add row + Reset to Defaults (round-3 item 15).
+    local act = flow:AddRow()
+    act:Button({ text = "Add Location", width = 130, onClick = function()
+        local rules = coordList()
+        if #rules >= COORD_CAP then ns:Print("location limit is " .. COORD_CAP .. "."); return end
+        rules[#rules + 1] = { name = "", zone = "", label = "New Location",
+                              minX = 0, maxX = 0.02, minY = 0, maxY = 0.02 }
+        rebuild()
     end })
-    addRow:Button({ text = "Reset", width = 71, variant = "danger", onClick = function()
-        UI.Confirm({ title = "Reset Coordinate Overrides", danger = true,
-            text = "Restore the default coordinate override rules? Your custom rules are removed.",
+    act:Button({ text = "Reset to Defaults", width = 160, variant = "danger", onClick = function()
+        UI.Confirm({ title = "Reset Locations", danger = true,
+            text = "Restore the default location rules? Your custom rules are removed.",
             acceptText = "Reset",
             onAccept = function()
                 local db = DB(); if not db then return end
@@ -473,84 +728,9 @@ function buildCoordPane(flow)
                     { name = "Rend South Staging", zone = "Durotar",   minX = 0.40, maxX = 0.60, minY = 0.10, maxY = 0.30, label = "Rend Staging (S)" },
                     { name = "DMF Mulgore",        zone = "Mulgore",   minX = 0.30, maxX = 0.50, minY = 0.55, maxY = 0.75, label = "Darkmoon Faire" },
                 }
-                coord.selected = nil
-                refreshPage("general")
+                rebuild()
             end })
     end })
-
-    -- Right editor (plain flow rows so every field + both buttons reflow and are
-    -- never clipped — an EditorCard's fixed-height noBar pane would crop the last row).
-    R:AddSection("Rule")
-    local function rule() local r = coordList(); return coord.selected and r[coord.selected] or nil end
-    local function field(label, key, numeric)
-        local row = R:AddRow({ vAlign = "center" })
-        row:Label(label)
-        local box = row:EditBox({
-            width = 120, numeric = numeric,
-            get = function() local ru = rule(); if not ru then return "" end
-                  local v = ru[key]; if numeric then return v and tostring(v) or "" end; return v or "" end,
-            set = function(v) local ru = rule(); if not ru then return end
-                  if numeric then ru[key] = tonumber(v) or 0 else ru[key] = v end
-                  if key == "label" and coord._list then coord._list:Rebuild() end end,
-        })
-        box._fillWidth = false
-        return box
-    end
-    coord._fields = {
-        field("Label", "label", false),
-        field("Name", "name", false),
-        field("Zone", "zone", false),
-        field("Min X", "minX", true),
-        field("Max X", "maxX", true),
-        field("Min Y", "minY", true),
-        field("Max Y", "maxY", true),
-    }
-    local actRow = R:AddRow()
-    actRow:Button({ text = "Here", width = 90, onClick = function()
-        local ru = rule(); if not ru then ns:Print("select a rule first."); return end
-        local mapID = C_Map and C_Map.GetBestMapForUnit and C_Map.GetBestMapForUnit("player")
-        local pos = mapID and C_Map.GetPlayerMapPosition and C_Map.GetPlayerMapPosition(mapID, "player")
-        if not pos then ns:Print("could not read your position here."); return end
-        local x, y = pos:GetXY()
-        local tol = 0.02
-        ru.minX, ru.maxX = x - tol, x + tol
-        ru.minY, ru.maxY = y - tol, y + tol
-        local info = mapID and C_Map.GetMapInfo and C_Map.GetMapInfo(mapID)
-        if info and info.name then ru.zone = info.name end
-        refreshPage("general")
-    end })
-    actRow:Button({ text = "Delete", width = 90, variant = "danger", pin = "right", onClick = function()
-        if not coord.selected then return end
-        table.remove(coordList(), coord.selected)
-        coord.selected = nil
-        refreshPage("general")
-    end })
-
-    register("general", function()
-        if coord._list then coord._list:SetSelected(coord.selected) end
-        for _, f in ipairs(coord._fields or {}) do if f.Refresh then f.Refresh() end end
-    end)
-
-    local SPLIT_LEFT, SPLIT_GAP, SPLIT_MIN = 300, 16, 640
-    split.arrange = function(width)
-        split:SetWidth(width)
-        if width >= SPLIT_MIN then
-            local lw = SPLIT_LEFT
-            local rw = math.max(1, width - lw - SPLIT_GAP)
-            local lh = leftCol:Layout(lw)
-            local rh = rightCol:Layout(rw)
-            leftCol.frame:ClearAllPoints(); leftCol.frame:SetPoint("TOPLEFT", split, "TOPLEFT", 0, 0)
-            rightCol.frame:ClearAllPoints(); rightCol.frame:SetPoint("TOPLEFT", split, "TOPLEFT", lw + SPLIT_GAP, 0)
-            local total = math.max(lh, rh); split:SetHeight(math.max(total, 1)); return total
-        else
-            local lh = leftCol:Layout(width)
-            local rh = rightCol:Layout(width)
-            leftCol.frame:ClearAllPoints(); leftCol.frame:SetPoint("TOPLEFT", split, "TOPLEFT", 0, 0)
-            rightCol.frame:ClearAllPoints(); rightCol.frame:SetPoint("TOPLEFT", split, "TOPLEFT", 0, -(lh + SPLIT_GAP))
-            local total = lh + SPLIT_GAP + rh; split:SetHeight(math.max(total, 1)); return total
-        end
-    end
-    flow.pane:AddBlock(split, split.arrange, 10, 0)
 end
 
 -- Class-color rows: swatch + class name + hex editbox, plus Reset All.
@@ -565,12 +745,14 @@ function buildClassColors(flow)
         -- swatch
         local sw = UI.FlatFrame(row, "panel", "border")
         sw:SetSize(18, 18); sw.uiWidth, sw.uiHeight = 18, 18
+        row._items[#row._items + 1] = { w = sw }
+        -- Class name rendered in its own (live) color (round-3 item 17).
+        local nameLbl = row:Label(CLASS_LABEL[class] or class); nameLbl.uiWidth = 90; nameLbl._label:SetWidth(90)
         local function paint()
             local db = DB(); local hex = db and db.classColors[class] or DEFAULTS[class]
             sw:SetBackdropColor(hexToRGB(hex))
+            nameLbl._label:SetTextColor(hexToRGB(hex))
         end
-        row._items[#row._items + 1] = { w = sw }
-        row:Label(CLASS_LABEL[class] or class)
         local box = row:EditBox({
             width = 90,
             get = function() local db = DB(); return db and (db.classColors[class] or DEFAULTS[class]) or "" end,
@@ -610,39 +792,72 @@ local function buildMesh(flow)
     local UI = DaseekiUI
 
     flow:AddSection("Mesh")
-    flow:Hint("The channel is derived automatically from your token — every account that shares the token meets on the same hidden channel.")
+    flow:Hint("Your accounts meet on a private hidden channel. Set the SAME channel name and token on every account, then enable.")
 
-    -- Token field (masked, eye reveal, validation).
-    local tokRow = flow:AddRow({ vAlign = "center" })
-    tokRow:Label("Token")
-    local revealed = { on = false }
-    local tokStatus
-    local function tokenText()
-        local db = DB(); local t = (db and db.mesh.token) or ""
-        if revealed.on then return t end
-        return (t ~= "" and string.rep("*", #t)) or ""
+    -- Read helpers for the two credential fields. ENGINE DEPENDENCY (round-3 item
+    -- 38): mesh.channel is added by the engine agent; defensive `or ""` fallback
+    -- keeps this field harmless until that key lands.
+    local function chanRaw() local db = DB(); return (db and db.mesh.channel) or "" end
+    local function tokRaw()  local db = DB(); return (db and db.mesh.token) or "" end
+
+    -- Reusable masked credential field (label + masked editbox + eye + status).
+    local function maskedField(labelText, width, getRaw, setRaw, validate)
+        local row = flow:AddRow({ vAlign = "center" })
+        local lbl = row:Label(labelText); lbl.uiWidth = 64; lbl._label:SetWidth(64)
+        local revealed = { on = false }
+        local status
+        local box
+        box = row:EditBox({
+            width = width,
+            get = function()
+                local t = getRaw()
+                if revealed.on then return t end
+                return (t ~= "" and string.rep("*", #t)) or ""
+            end,
+            set = function(v)
+                v = tostring(v or ""):gsub("%s", "")
+                if v:match("^%*+$") then return end   -- ignore edits to the mask
+                setRaw(v)
+                if status then status._label:SetText(validate(v)) end
+            end,
+        })
+        box._fillWidth = false
+        row:Button({ text = "Eye", width = 44, variant = "quiet", onClick = function()
+            revealed.on = not revealed.on
+            if box.Refresh then box.Refresh() end
+        end })
+        status = row:Label("")
+        register("mesh", function()
+            if box.Refresh then box.Refresh() end
+            status._label:SetText(validate(getRaw()))
+        end)
+        return box
     end
-    local tokBox = tokRow:EditBox({
-        width = 160,
-        get = function() return tokenText() end,
-        set = function(v)
-            local db = DB(); if not db then return end
-            v = tostring(v or ""):gsub("%s", "")
-            -- Only commit when the field holds real (revealed) input, not the mask.
-            if v:match("^%*+$") then return end
-            db.mesh.token = v
-            if tokStatus then
-                local okLen = (#v == 6 and v:match("^%w+$"))
-                tokStatus._label:SetText(okLen and "|cff66dd66valid|r" or (v == "" and "" or "|cffddaa44needs 6 alphanumerics|r"))
-            end
-        end,
-    })
-    tokBox._fillWidth = false
-    tokRow:Button({ text = "Eye", width = 44, variant = "quiet", onClick = function()
-        revealed.on = not revealed.on
-        if tokBox.Refresh then tokBox.Refresh() end
-    end })
-    tokStatus = tokRow:Label("")
+
+    maskedField("Channel", 200, chanRaw,
+        function(v) local db = DB(); if db then db.mesh.channel = v end end,
+        function(v)
+            if v == "" then return "" end
+            if #v >= 16 and v:match("^%w+$") then return "|cff66dd66valid|r" end
+            return "|cffddaa44needs 16+ alphanumerics|r"
+        end)
+    flow:Hint("16+ alphanumeric, case sensitive, same on all accounts.")
+
+    maskedField("Token", 160, tokRaw,
+        function(v) local db = DB(); if db then db.mesh.token = v end end,
+        function(v)
+            if v == "" then return "" end
+            if #v == 6 and v:match("^%w+$") then return "|cff66dd66valid|r" end
+            return "|cffddaa44needs 6 alphanumerics|r"
+        end)
+    flow:Hint("Exactly 6 alphanumeric, same on all accounts.")
+
+    -- Configured = both credentials present and well-formed. Surfaced beneath the
+    -- Enable toggle (round-3 item 38).
+    local function isConfigured()
+        local c, t = chanRaw(), tokRaw()
+        return #c >= 16 and c:match("^%w+$") and #t == 6 and t:match("^%w+$") and true or false
+    end
 
     -- Enable toggle — WIRED to StartJoinSequence / OnDisable.
     local enRow = flow:AddRow({ vAlign = "center" })
@@ -651,6 +866,12 @@ local function buildMesh(flow)
         get = function() local db = DB(); return db and db.mesh.enabled end,
         set = function(v)
             local db = DB(); if not db then return end
+            if v and not isConfigured() then
+                ns:Print("set a channel and token first.")
+                if db.mesh then db.mesh.enabled = false end
+                refreshPage("mesh")
+                return
+            end
             db.mesh.enabled = v and true or false
             if not ns.Mesh then return end
             if v then
@@ -660,6 +881,7 @@ local function buildMesh(flow)
                 if ns.Mesh.OnDisable then ns:SafeCall(ns.Mesh.OnDisable) end
                 ns:Print("mesh disabled — left channel.")
             end
+            refreshPage("mesh")
         end,
     }).Refresh)
     register("mesh", enRow:Checkbox({
@@ -667,6 +889,16 @@ local function buildMesh(flow)
         get = function() local db = DB(); return db and db.mesh.optOut end,
         set = function(v) local db = DB(); if db then db.mesh.optOut = v and true or false end end,
     }).Refresh)
+
+    -- Not-configured status line beneath the Enable toggle (round-3 item 38).
+    local cfgStatus = flow:AddRow():Label("")
+    register("mesh", function()
+        if isConfigured() then
+            cfgStatus._label:SetText("|cff66dd66Channel and token set — ready to enable.|r")
+        else
+            cfgStatus._label:SetText("|cffddaa44Set a channel and token first.|r")
+        end
+    end)
 
     local alRow = flow:AddRow({ vAlign = "center" })
     register("mesh", alRow:Checkbox({
@@ -680,20 +912,34 @@ local function buildMesh(flow)
         set = function(v) local db = DB(); if db then db.hardThrottle = v and true or false end end,
     }).Refresh)
 
-    local capLabel = flow:Label("Mesh capacity: 1 / " .. MESH_CAP)
+    -- ── Active accounts table (round-3 item 32) ───────────────────────────────
+    local acc = flow:AddSection("Accounts")
+    acc:Hint("Account-wide. Local management only — nothing is broadcast across the mesh.")
+    local capLabel = acc:AddRow():Label("Mesh capacity: 1 / " .. MESH_CAP)
     register("mesh", function()
         capLabel._label:SetText("Mesh capacity: " .. math.min(MESH_CAP, math.max(1, knownAccountCount())) .. " / " .. MESH_CAP)
     end)
 
-    -- ── Active accounts table ─────────────────────────────────────────────────
-    flow:AddSection("Active Accounts")
-    flow:Hint("Every account on your mesh: ID \194\183 status \194\183 characters \194\183 last seen. Remove any account but your own.")
-    buildAccountsTable(flow)
+    -- Column header row (aligned to buildAccountsTable's column offsets: the table
+    -- host insets its scroll by 4px, so header x = 4 + column offset).
+    do
+        local hdr = CreateFrame("Frame", nil, acc.pane.child); hdr:SetHeight(16)
+        local function hl(text, x, w)
+            local fs = hdr:CreateFontString(nil, "OVERLAY"); fs:SetFontObject(UI.fonts.small)
+            fs:SetPoint("LEFT", hdr, "LEFT", x, 0); if w then fs:SetWidth(w) end; fs:SetText(text); return fs
+        end
+        local cells = { hl("AID", 12, 44), hl("Status", 60, 80), hl("Characters", 144, 70),
+                        hl("Last seen", 218, 90), hl("Action", 0) }
+        cells[5]:ClearAllPoints(); cells[5]:SetPoint("RIGHT", hdr, "RIGHT", -12, 0)
+        UI.Skin(hdr, function() for _, c in ipairs(cells) do c:SetTextColor(UI.Color("muted")) end end)
+        acc.pane:AddBlock(hdr, function(width) hdr:SetWidth(width); return 16 end, 6, acc._indent)
+    end
+    buildAccountsTable(acc)
 
-    -- ── Tombstones ────────────────────────────────────────────────────────────
-    flow:AddSection("Removed Accounts (14-day block)")
-    flow:Hint("Recently removed accounts are blocked from re-adding for 14 days. Remove a tombstone to allow re-adding early.")
-    buildTombstonesTable(flow)
+    -- ── Tombstones (round-3 item 32) ──────────────────────────────────────────
+    local tomb = flow:AddSection("Tombstones")
+    tomb:Hint("(deleted, will block re-add until expiry)")
+    buildTombstonesTable(tomb)
 end
 
 -- A simple token-skinned data table with a fixed column layout + live rebuild.
@@ -762,9 +1008,10 @@ function buildAccountsTable(flow)
             local peer = ns.Mesh and ns.Mesh.peers and ns.Mesh.peers[entry.aid]
             local nChars = 0; for _ in pairs(entry.bucket.characters or {}) do nChars = nChars + 1 end
             row.aid:SetText("#" .. entry.aid)
-            if isSelf then row.status:SetText("|cff66dd66You|r")
-            elseif peer and peer.online then row.status:SetText("|cff66dd66Online|r")
-            else row.status:SetText("|cff888888Offline|r") end
+            -- Status glyphs (round-3 item 32): ● green You / ● green Online / ○ grey Offline.
+            if isSelf then row.status:SetText("|cff66dd66\226\151\143 You|r")
+            elseif peer and peer.online then row.status:SetText("|cff66dd66\226\151\143 Online|r")
+            else row.status:SetText("|cff888888\226\151\139 Offline|r") end
             row.chars:SetText(nChars .. " char" .. (nChars == 1 and "" or "s"))
             row.seen:SetText(agoLabel(peer and peer.lastSeen))
             local aid = entry.aid
@@ -838,6 +1085,14 @@ function buildTombstonesTable(flow)
             row:Show()
         end
         child:SetHeight(math.max(1, i * ROW_H)); if i == 0 then child:SetHeight(1) end
+        -- Empty state (round-3 item 32).
+        if not host._empty then
+            host._empty = child:CreateFontString(nil, "OVERLAY"); host._empty:SetFontObject(UI.fonts.small)
+            host._empty:SetPoint("TOPLEFT", child, "TOPLEFT", 8, -6)
+            UI.Skin(host._empty, function(self) self:SetTextColor(UI.Color("muted")) end)
+        end
+        host._empty:SetText("(No active tombstones.)")
+        host._empty:SetShown(i == 0)
     end
     host._rebuild = rebuild
     register("mesh", rebuild)
@@ -866,6 +1121,7 @@ end
 
 local function buildAuras(flow)
     local UI = DaseekiUI
+    flow:Hint("These settings/information are saved per faction.")
     factionHeader(flow, "auras")
 
     -- ── Threshold table (Aura · Normal · Minimum, in minutes) ────────────────
@@ -922,7 +1178,8 @@ function buildClassRuleGrid(flow, title, optKey, classes)
     flow:Hint("Required = red when missing · Optional = yellow · Ignored = hidden.")
 
     local STATES = { "required", "optional", "ignored" }
-    local STATE_LABEL = { required = "Required", optional = "Optional", ignored = "Ignored" }
+    -- Lowercase colored pill text (round-3 item 31).
+    local STATE_LABEL = { required = "required", optional = "optional", ignored = "ignored" }
     local function getState(class)
         local fs = FS(); if not fs then return "ignored" end
         local o = fs.auraOpts[optKey]
@@ -1022,15 +1279,30 @@ local function buildAutomation(flow)
     local acceptGrid = grp:AddChecklist(acceptItems)
     register("automation", function() for _, b in ipairs(acceptGrid._boxes) do b:Refresh() end end)
 
-    -- ── Whisper-keyword invite ─────────────────────────────────────────────────
+    -- ── Whisper-keyword invite (per-category send gates, round-3 item 22) ───────
+    -- The reference has four SEPARATE whisper-invite category checkboxes (parallel
+    -- to the four accept-from gates). ENGINE DEPENDENCY: the send-category keys
+    -- (sendToGuild/sendToFriends/sendToAnyone) are added by the engine agent; only
+    -- sendToRoster exists today, so the other three read nil (unchecked) until merge.
     local kwSec = flow:AddSection("Auto-Invite On Whisper Keyword")
-    kwSec:Hint("When someone whispers you the keyword, invite them if they pass the same category filter above (our engine shares one gate for both directions).")
+    kwSec:Hint("When someone whispers you the keyword, invite them if they fall in one of these categories.")
+    local sendCats = {
+        { label = "Known roster",   key = "sendToRoster"  },
+        { label = "Guild",          key = "sendToGuild"   },
+        { label = "Friends & BNet", key = "sendToFriends" },
+        { label = "Anyone",         key = "sendToAnyone"  },
+    }
+    local sendItems = {}
+    for _, it in ipairs(sendCats) do
+        sendItems[#sendItems + 1] = {
+            label = it.label,
+            get = function() local fs = FS(); return fs and fs.autoGroup[it.key] end,
+            set = function(v) local fs = FS(); if fs then fs.autoGroup[it.key] = v and true or false end end,
+        }
+    end
+    local sendGrid = kwSec:AddChecklist(sendItems)
+    register("automation", function() for _, b in ipairs(sendGrid._boxes) do b:Refresh() end end)
     local kw = kwSec:AddRow({ vAlign = "center" })
-    register("automation", kw:Checkbox({
-        label = "Enabled",
-        get = function() local fs = FS(); return fs and fs.autoGroup.sendToRoster end,
-        set = function(v) local fs = FS(); if fs then fs.autoGroup.sendToRoster = v and true or false end end,
-    }).Refresh)
     kw:Label("Keyword:")
     local kwBox = kw:EditBox({
         width = 100,
@@ -1040,29 +1312,33 @@ local function buildAutomation(flow)
     kwBox._fillWidth = false
     register("automation", function() if kwBox.Refresh then kwBox.Refresh() end end)
 
-    -- ── Invite whitelist ───────────────────────────────────────────────────────
-    -- NOTE: the store has no whitelist-enable flag, so we do NOT fake an Enable
-    -- toggle (standing rule: never fake absent-in-store affordances). The list is
-    -- always in effect while it has entries. Edit button is inline (not pinned
-    -- right) per the "aligned, not floating" feedback.
+    -- ── Invite whitelist (Enable toggle + inline editor, round-3 items 35 / 29) ──
+    -- ENGINE DEPENDENCY: autoGroup.whitelistEnabled is added by the engine agent.
+    -- Fallback preserves the prior "true-when-populated" semantics: when the key is
+    -- absent (nil), the list is treated as enabled while it has entries.
     local wlSec = flow:AddSection("Auto-Invite Whitelist")
-    wlSec:Hint("Characters listed here bypass the category filter in both directions. Always in effect while the list has entries.")
-    local wlRow = wlSec:AddRow({ vAlign = "center" })
-    local wlLabel = wlRow:Label("Whitelist: 0 entries"); wlLabel.uiWidth = 170; wlLabel._label:SetWidth(170)
-    wlRow:Button({ text = "Edit list…", width = 110, onClick = function()
-        local fs = FS(); if not fs then return end
-        DS.ShowTextDialog("Invite Whitelist (one Name-Realm per line)", mapToLines(fs.autoGroup.whitelist), false, function(txt)
-            fs.autoGroup.whitelist = linesToMap(txt)
-            refreshPage("automation")
-        end)
-    end })
-    register("automation", function()
-        local fs = FS(); wlLabel._label:SetText("Whitelist: " .. countMap(fs and fs.autoGroup.whitelist) .. " entries")
-    end)
+    wlSec:Hint("Characters listed here bypass the category filter in both directions. One Name-Realm per line. Auto-capitalized on save.")
+    register("automation", wlSec:Checkbox({
+        label = "Enable Whitelist",
+        get = function()
+            local fs = FS(); if not fs then return false end
+            local v = fs.autoGroup.whitelistEnabled
+            if v == nil then return countMap(fs.autoGroup.whitelist) > 0 end
+            return v
+        end,
+        set = function(v) local fs = FS(); if fs then fs.autoGroup.whitelistEnabled = v and true or false end end,
+    }).Refresh)
+    buildTextArea(wlSec, {
+        height = 96, register = "automation",
+        get = function() local fs = FS(); return fs and mapToLines(fs.autoGroup.whitelist) or "" end,
+        set = function(txt) local fs = FS(); if fs then fs.autoGroup.whitelist = linesToMap(txt); refreshPage("automation") end end,
+    })
 
     -- ── Accept Summon ──────────────────────────────────────────────────────────
     local asx = flow:AddSection("Accept Summon")
-    asx:Hint("Automatically accept a warlock or meeting-stone summon under these conditions.")
+    asx:Hint("Automatically accept a warlock or meeting-stone summon when it lands. " ..
+        "A buff counts as \"fresh\" if it was gained within the window below. " ..
+        "Auto-accept fires only while at least one Buff Trigger below is fresh (or Always Accept is on).")
     local asr = asx:AddRow({ vAlign = "center" })
     register("automation", asr:Checkbox({
         label = "Auto-accept summon",
@@ -1096,20 +1372,41 @@ local function buildAutomation(flow)
     win:Label("(5-3600)", { muted = true })
     register("automation", function() if winBox.Refresh then winBox.Refresh() end end)
 
-    -- Buff triggers sub-group (own header + grid on the same column alignment as
-    -- the Auto-Accept grid above).
+    -- Buff triggers sub-group (round-3 item 23): all ten trigger buffs, each as an
+    -- icon + "ABBR - Full Name" checkbox row (two per row for compactness).
+    -- ENGINE DEPENDENCY: the authoritative set is ns.Store.SUMMON_TRIGGER_BUFFS;
+    -- TRIGGER_DEFS is the UI label/icon source and the pre-merge ordering fallback.
     local bt = flow:AddSection("Buff Triggers")
     bt:Hint("Accept a pending summon when one of these buffs is freshly gained.")
-    local trigItems = {}
-    for _, def in ipairs(AURA_DEFS) do
-        trigItems[#trigItems + 1] = {
-            label = def.label,
-            get = function() local fs = FS(); return fs and fs.autoSummon.triggers[def.key] end,
-            set = function(v) local fs = FS(); if fs then fs.autoSummon.triggers[def.key] = v and true or nil end end,
-        }
+    local triggerKeys = ns.Store and ns.Store.SUMMON_TRIGGER_BUFFS
+    local function trigMeta(key)
+        for _, d in ipairs(TRIGGER_DEFS) do if d.key == key then return d end end
+        return { key = key, abbr = key, name = key, spellID = nil }
     end
-    local trigGrid = bt:AddChecklist(trigItems)
-    register("automation", function() for _, b in ipairs(trigGrid._boxes) do b:Refresh() end end)
+    local trigList = {}
+    if type(triggerKeys) == "table" and #triggerKeys > 0 then
+        for _, k in ipairs(triggerKeys) do trigList[#trigList + 1] = trigMeta(k) end
+    else
+        trigList = TRIGGER_DEFS
+    end
+    local btRow, perRow, count = nil, 2, 0
+    for _, def in ipairs(trigList) do
+        if count % perRow == 0 then btRow = bt:AddRow({ vAlign = "center" }) end
+        count = count + 1
+        -- icon
+        local ico = CreateFrame("Frame", nil, btRow); ico:SetSize(18, 18); ico.uiWidth, ico.uiHeight = 18, 18
+        local tex = ico:CreateTexture(nil, "ARTWORK"); tex:SetAllPoints()
+        tex:SetTexCoord(0.08, 0.92, 0.08, 0.92); tex:SetTexture(auraIcon(def.spellID))
+        btRow._items[#btRow._items + 1] = { w = ico }
+        local key = def.key
+        local cb = btRow:Checkbox({
+            label = def.abbr .. " - " .. def.name,
+            get = function() local fs = FS(); return fs and fs.autoSummon.triggers[key] end,
+            set = function(v) local fs = FS(); if fs then fs.autoSummon.triggers[key] = v and true or nil end end,
+        })
+        cb.uiWidth = 230
+        register("automation", cb.Refresh)
+    end
 
     -- ── Gossip ─────────────────────────────────────────────────────────────────
     local gos = flow:AddSection("Gossip")
@@ -1137,7 +1434,7 @@ local function buildAutomation(flow)
         get = function() local fs = FS(); return fs and fs.autoGossip.dmf.skipCookie end,
         set = function(v) local fs = FS(); if fs then fs.autoGossip.dmf.skipCookie = v and true or false end end,
     }).Refresh)
-    gos:Hint("Sayge's fortunes are permanent for the day — choose the per-class buff carefully.")
+    gos:Hint("|cffffd100Caution: Sayge's fortune is permanent for the day — choose the per-class buff carefully.|r")
 
     gos:Label("Sayge buff type per class", { muted = true })
     local choices = {}
@@ -1195,16 +1492,19 @@ local function buildAutomation(flow)
         set = function(v) local fs = FS(); if fs then fs.autoQuest.autoRepair = v and true or false end end,
     }).Refresh)
 
+    -- Zanza parent + indented sub-picks (round-3 item 30).
     local zr = q:AddRow({ vAlign = "center" })
     register("automation", zr:Checkbox({
         label = "Zanza buffs",
         get = function() local fs = FS(); return fs and fs.autoQuest.zanza.enabled end,
         set = function(v) local fs = FS(); if fs then fs.autoQuest.zanza.enabled = v and true or false end end,
     }).Refresh)
+    local zpick = q:AddRow({ vAlign = "center" })
+    zpick._indent = zpick._indent + 20
     -- Zanza pick membership (priority list). Order fixed; membership toggled.
     local function pickIndex(list, key) for i, k in ipairs(list or {}) do if k == key then return i end end return nil end
     for _, pick in ipairs(ZANZA_PICKS) do
-        register("automation", zr:Checkbox({
+        register("automation", zpick:Checkbox({
             label = pick.label,
             get = function() local fs = FS(); return fs and pickIndex(fs.autoQuest.zanza.priority, pick.key) ~= nil end,
             set = function(v)
@@ -1227,8 +1527,6 @@ end
 -- 5. TIMERS & ALERTS
 ----------------------------------------------------------------------
 
-local alertSel = { buff = "rend" }
-
 local function buildTimers(flow)
     local UI = DaseekiUI
 
@@ -1245,52 +1543,22 @@ local function buildTimers(flow)
     end
     roCheck("Screen", "notify"); roCheck("Chat", "chat"); roCheck("Flash", "flash"); roCheck("Sound", "sound")
 
-    -- ── Alert matrix (buff selector + per-event channel rows) ─────────────────
+    -- ── Alert matrix (EVENT-MAJOR, round-3 items 13/14/24) ────────────────────
+    -- The reference groups by event type: each event is a sub-header, under which
+    -- sit the buff rows for that event, each row = buff icon + name + inline On /
+    -- Screen / Chat / Flash checkboxes + a per-row Sound dropdown + Test.
+    -- ENGINE DEPENDENCIES (defensive fallbacks; see report):
+    --   * cell.enabled  — the "On" master flag (defaults true when absent).
+    --   * cell.soundKey — per-row sound tone (item 14; replaces the old event-level
+    --     ts.soundKeys). Falls back to "" (None) until the engine schema lands.
+    --   * ns.Store.ALERT_EVENT_BUFFS / ALERT_EVENT_TYPES — per-event buff sets +
+    --     order (item 24; local fallbacks encode the reference sets).
     flow:AddSection("Alert Matrix")
-    flow:Hint("Pick a buff, then set which channels each event fires. Test previews one cell.")
-    local buffChoices = {}
-    for _, k in ipairs(ns.Store.ALERT_BUFF_KEYS) do buffChoices[#buffChoices + 1] = { value = k, text = ALERT_BUFF_LABEL[k] or k } end
-    local selRow = flow:AddRow({ vAlign = "center" })
-    selRow:Label("Buff")
-    local selDD = selRow:Dropdown({
-        width = 180, choices = buffChoices,
-        get = function() return alertSel.buff end,
-        set = function(v) alertSel.buff = v; refreshPage("timers") end,
-    })
-    register("timers", function() if selDD.Refresh then selDD.Refresh() end end)
+    flow:Hint("Timer alert settings — control notifications per event type.")
 
-    -- Column header (Event cell width matches the event rows' label width so the
-    -- first column lines up; the four channel headers sit over their checkboxes).
-    local mh = flow:AddRow()
-    local mhE = mh:Label("Event"); mhE.uiWidth = 138; mhE._label:SetWidth(138)
-    mh:Label("Scrn", { muted = true }); mh:Label("Chat", { muted = true })
-    mh:Label("Flash", { muted = true }); mh:Label("Snd", { muted = true })
-
-    for _, evt in ipairs(ns.Store.ALERT_EVENT_TYPES) do
-        local row = flow:AddRow({ vAlign = "center" })
-        local lbl = row:Label(ALERT_EVENT_LABEL[evt] or evt); lbl.uiWidth = 138; lbl:SetWidth(138)
-        local function cell(chan)
-            local function m() local ts = TS(); if not ts then return nil end
-                ts.alerts[alertSel.buff] = ts.alerts[alertSel.buff] or {}
-                ts.alerts[alertSel.buff][evt] = ts.alerts[alertSel.buff][evt] or {}
-                return ts.alerts[alertSel.buff][evt] end
-            local cb = row:Checkbox({
-                get = function() local c = m(); return c and c[chan] end,
-                set = function(v) local c = m(); if c then c[chan] = v and true or false end end,
-            })
-            register("timers", function() if cb.Refresh then cb:Refresh() end end)
-        end
-        cell("notify"); cell("chat"); cell("flash"); cell("sound")
-        row:Button({ text = "Test", width = 56, variant = "quiet", pin = "right", onClick = function()
-            hudTestAlert(alertSel.buff, evt)
-        end })
-    end
-
-    -- ── Sounds ─────────────────────────────────────────────────────────────────
-    local snd = flow:AddSection("Sounds")
-    snd:Hint("Pick the sound channel and the tone each event plays. Test previews it.")
-    local scRow = snd:AddRow({ vAlign = "center" })
-    scRow:Label("Sound channel")
+    -- Sound channel (global; spec §8 Sound Channel dropdown).
+    local scRow = flow:AddRow({ vAlign = "center" })
+    local scLbl = scRow:Label("Sound channel"); scLbl.uiWidth = 100; scLbl._label:SetWidth(100)
     local scDD = scRow:Dropdown({
         width = 140, choices = SOUND_CHANNELS,
         get = function() local ts = TS(); return ts and ts.soundChannel or "Master" end,
@@ -1298,21 +1566,53 @@ local function buildTimers(flow)
     })
     register("timers", function() if scDD.Refresh then scDD.Refresh() end end)
 
-    for _, sk in ipairs(SOUNDKEY_ROWS) do
-        local row = snd:AddRow({ vAlign = "center" })
-        local lbl = row:Label(sk.label); lbl.uiWidth = 120; lbl:SetWidth(120)
-        local dd = row:Dropdown({
-            width = 150, choices = soundChoices(),
-            get = function() local ts = TS(); return ts and ts.soundKeys[sk.key] or "" end,
-            set = function(v) local ts = TS(); if ts then ts.soundKeys[sk.key] = v end end,
-        })
-        row:Button({ text = "Test", width = 56, variant = "quiet", onClick = function()
-            local ts = TS(); if not ts then return end
-            local id, member = soundIdForKey(ts.soundKeys[sk.key] or "")
-            id = (SOUNDKIT and member and SOUNDKIT[member]) or id
-            if id and PlaySound then PlaySound(id, ts.soundChannel or "Master") end
-        end })
-        register("timers", function() if dd.Refresh then dd.Refresh() end end)
+    local function alertCell(buffKey, evt)
+        local ts = TS(); if not ts then return nil end
+        ts.alerts[buffKey] = ts.alerts[buffKey] or {}
+        ts.alerts[buffKey][evt] = ts.alerts[buffKey][evt] or {}
+        return ts.alerts[buffKey][evt]
+    end
+
+    for _, evt in ipairs(alertEventOrder()) do
+        local buffs = alertEventBuffs(evt)
+        if #buffs > 0 then
+            local es = flow:AddSection(ALERT_EVENT_LABEL[evt] or evt)
+            for _, k in ipairs(buffs) do
+                local meta = ALERT_BUFF_META[k] or { name = ALERT_BUFF_LABEL[k] or k }
+                local row = es:AddRow({ vAlign = "center" })
+                -- icon
+                local ico = CreateFrame("Frame", nil, row); ico:SetSize(18, 18); ico.uiWidth, ico.uiHeight = 18, 18
+                local tex = ico:CreateTexture(nil, "ARTWORK"); tex:SetAllPoints()
+                tex:SetTexCoord(0.08, 0.92, 0.08, 0.92); tex:SetTexture(auraIcon(meta.spellID))
+                row._items[#row._items + 1] = { w = ico }
+                local nlbl = row:Label(meta.name); nlbl.uiWidth = 118; nlbl._label:SetWidth(118)
+                -- On (master enable; defaults true when the engine key is absent).
+                register("timers", row:Checkbox({
+                    label = "On",
+                    get = function() local c = alertCell(k, evt); if not c then return false end
+                        if c.enabled == nil then return true end; return c.enabled end,
+                    set = function(v) local c = alertCell(k, evt); if c then c.enabled = v and true or false end end,
+                }).Refresh)
+                local function chan(label, key)
+                    register("timers", row:Checkbox({
+                        label = label,
+                        get = function() local c = alertCell(k, evt); return c and c[key] end,
+                        set = function(v) local c = alertCell(k, evt); if c then c[key] = v and true or false end end,
+                    }).Refresh)
+                end
+                chan("Screen", "notify"); chan("Chat", "chat"); chan("Flash", "flash")
+                local dd = row:Dropdown({
+                    width = 120, choices = soundChoices(),
+                    get = function() local c = alertCell(k, evt); return (c and c.soundKey) or "" end,
+                    set = function(v) local c = alertCell(k, evt); if c then c.soundKey = v end end,
+                })
+                dd._fillWidth = false
+                register("timers", function() if dd.Refresh then dd.Refresh() end end)
+                row:Button({ text = "Test", width = 52, variant = "quiet", pin = "right", onClick = function()
+                    hudTestAlert(k, evt)
+                end })
+            end
+        end
     end
 
     -- ── Pull-timer bars ────────────────────────────────────────────────────────
@@ -1327,13 +1627,13 @@ local function buildTimers(flow)
     pbr:Button({ text = "Move Pull Timers", width = 150, pin = "right", onClick = hudShowMover })
 
     local pw = pb:Slider({
-        label = "Bar width", width = 260, min = 100, max = 400, step = 5,
+        label = "Bar width (px) — (100-400) default 220", width = 260, min = 100, max = 400, step = 5,
         get = function() local ts = TS(); return ts and ts.pullBar.width or 220 end,
         set = function(v) local ts = TS(); if ts then ts.pullBar.width = v end end,
         format = function(v) return tostring(math.floor(v)) end,
     })
     local ph = pb:Slider({
-        label = "Bar height", width = 260, min = 10, max = 40, step = 1,
+        label = "Bar height (px) — (10-40) default 18", width = 260, min = 10, max = 40, step = 1,
         get = function() local ts = TS(); return ts and ts.pullBar.height or 18 end,
         set = function(v) local ts = TS(); if ts then ts.pullBar.height = v end end,
         format = function(v) return tostring(math.floor(v)) end,
@@ -1342,19 +1642,19 @@ local function buildTimers(flow)
     -- (hud.lua reads pullBar.smallWidth/smallHeight/expandThreshold). Main/small
     -- positions are mover-managed (mainPos/smallPos), so no controls for those.
     local psw = pb:Slider({
-        label = "Small bar width", width = 260, min = 80, max = 320, step = 5,
+        label = "Small bar width (px) — (80-320) default 158", width = 260, min = 80, max = 320, step = 5,
         get = function() local ts = TS(); return ts and ts.pullBar.smallWidth or 158 end,
         set = function(v) local ts = TS(); if ts then ts.pullBar.smallWidth = v end end,
         format = function(v) return tostring(math.floor(v)) end,
     })
     local psh = pb:Slider({
-        label = "Small bar height", width = 260, min = 8, max = 32, step = 1,
+        label = "Small bar height (px) — (8-32) default 14", width = 260, min = 8, max = 32, step = 1,
         get = function() local ts = TS(); return ts and ts.pullBar.smallHeight or 14 end,
         set = function(v) local ts = TS(); if ts then ts.pullBar.smallHeight = v end end,
         format = function(v) return tostring(math.floor(v)) end,
     })
     local pex = pb:Slider({
-        label = "Expand-to-center threshold", width = 260, min = 3, max = 30, step = 1,
+        label = "Expand-to-center threshold (s) — (3-30) default 10", width = 260, min = 3, max = 30, step = 1,
         get = function() local ts = TS(); return ts and ts.pullBar.expandThreshold or 10 end,
         set = function(v) local ts = TS(); if ts then ts.pullBar.expandThreshold = v end end,
         format = function(v) return tostring(math.floor(v)) .. "s" end,
@@ -1395,32 +1695,52 @@ local function buildTimers(flow)
         get = function() local ts = TS(); return ts and ts.felwood.showTuberPins end,
         set = function(v) local ts = TS(); if ts then ts.felwood.showTuberPins = v and true or false end end,
     }).Refresh)
-    local wps = fw:Slider({
-        label = "World map pin size", width = 260, min = 8, max = 24, step = 1,
-        get = function() local ts = TS(); return ts and ts.felwood.worldPinSize or 14 end,
-        set = function(v) local ts = TS(); if ts then ts.felwood.worldPinSize = v end end,
-        format = function(v) return tostring(math.floor(v)) end,
-    })
-    local mps = fw:Slider({
-        label = "Minimap pin size", width = 260, min = 8, max = 24, step = 1,
-        get = function() local ts = TS(); return ts and ts.felwood.minimapPinSize or 12 end,
-        set = function(v) local ts = TS(); if ts then ts.felwood.minimapPinSize = v end end,
-        format = function(v) return tostring(math.floor(v)) end,
-    })
-    register("timers", function() if wps.Refresh then wps.Refresh() end; if mps.Refresh then mps.Refresh() end end)
+    -- Show songflower picked-chat alerts (round-3 item 28). ENGINE DEPENDENCY:
+    -- felwood.pickedChatAlerts is added by the engine agent; nil reads as off.
+    register("timers", fw:Checkbox({
+        label = "Show songflower picked chat alerts",
+        get = function() local ts = TS(); return ts and ts.felwood.pickedChatAlerts end,
+        set = function(v) local ts = TS(); if ts then ts.felwood.pickedChatAlerts = v and true or false end end,
+    }).Refresh)
+
+    -- Full 5-field pin sizing (round-3 item 26). ENGINE DEPENDENCY: the split
+    -- fields (worldFlowerPinSize / worldTuberPinSize / worldTimerFontSize /
+    -- minimapFlowerPinSize / minimapTuberPinSize) are added by the engine agent;
+    -- each read falls back to the current single worldPinSize / minimapPinSize.
+    local pinSliders = {}
+    local function pinSlider(label, key, fallbackKey, defVal, lo, hi)
+        local s = fw:Slider({
+            label = label, width = 300, min = lo, max = hi, step = 1,
+            get = function() local ts = TS(); if not ts then return defVal end
+                return ts.felwood[key] or ts.felwood[fallbackKey] or defVal end,
+            set = function(v) local ts = TS(); if ts then ts.felwood[key] = v end end,
+            format = function(v) return tostring(math.floor(v)) end,
+        })
+        pinSliders[#pinSliders + 1] = s
+        return s
+    end
+    pinSlider("World map songflower pin (px) — (8-24) default 14", "worldFlowerPinSize", "worldPinSize", 14, 8, 24)
+    pinSlider("World map tuber pin (px) — (8-24) default 14",      "worldTuberPinSize",  "worldPinSize", 14, 8, 24)
+    pinSlider("World map timer font (pt) — (6-20) default 10",     "worldTimerFontSize", "worldTimerFontSize", 10, 6, 20)
+    pinSlider("Minimap songflower pin (px) — (8-24) default 12",   "minimapFlowerPinSize", "minimapPinSize", 12, 8, 24)
+    pinSlider("Minimap tuber pin (px) — (8-24) default 12",        "minimapTuberPinSize",  "minimapPinSize", 12, 8, 24)
+    register("timers", function() for _, s in ipairs(pinSliders) do if s.Refresh then s.Refresh() end end end)
 
     -- ── Songflower display ───────────────────────────────────────────────────────
     -- Drives the Timers-tab UP?/minus state machine (timers.lua NodeState).
     local sf = flow:AddSection("Songflower Display")
     sf:Hint("Minus-timer counts the respawn; UP? window shows after respawn (0 = always).")
+    -- NOTE: range/default hints per round-3 item 25. Item 27 (ENGINE) will revise
+    -- these ranges/defaults (UP? 1-30s default 5; minus 30-600s default 120) and
+    -- drop the 0="always" sentinel — reconcile min/max + labels at merge.
     local sfMinus = sf:Slider({
-        label = "Minus-timer duration", width = 300, min = 300, max = 3000, step = 30,
+        label = "Minus-timer duration — (5:00-50:00) default 25:00", width = 300, min = 300, max = 3000, step = 30,
         get = function() local ts = TS(); return ts and ts.felwood.flowerMinusDuration or 1500 end,
         set = function(v) local ts = TS(); if ts then ts.felwood.flowerMinusDuration = v end end,
         format = function(v) v = math.floor(v); return ("%d:%02d"):format(math.floor(v / 60), v % 60) end,
     })
     local sfUp = sf:Slider({
-        label = "UP? duration", width = 300, min = 0, max = 3600, step = 30,
+        label = "UP? duration — (0-60:00) default always", width = 300, min = 0, max = 3600, step = 30,
         get = function() local ts = TS(); return ts and ts.felwood.flowerUpDuration or 0 end,
         set = function(v) local ts = TS(); if ts then ts.felwood.flowerUpDuration = v end end,
         format = function(v) v = math.floor(v); if v <= 0 then return "always" end
@@ -1453,37 +1773,24 @@ local function buildBlacklist(flow)
     local UI = DaseekiUI
     local DS = _G.DaseekiSuite
 
-    local sec = flow:AddSection("Roster Filtering")
-    sec:Hint("Blacklisted characters hide from 60s / Summoners (still visible in Online). Whitelist un-hides across the mesh.")
+    -- ── Character Blacklist (inline textareas, round-3 item 33) ────────────────
+    local sec = flow:AddSection("Character Blacklist")
+    sec:Hint("Hide characters from 60s and Summoners tabs. They still appear in Online and function normally.")
+    buildTextArea(sec, {
+        height = 110, register = "blacklist",
+        get = function() local db = DB(); return db and mapToLines(db.ui.blacklist) or "" end,
+        set = function(txt) local db = DB(); if db then db.ui.blacklist = linesToMap(txt); refreshPage("blacklist") end end,
+    })
 
-    -- Blacklist list (label fixed-width so the Edit button sits inline/aligned,
-    -- not floating at the far right).
-    local blRow = sec:AddRow({ vAlign = "center" })
-    local blLabel = blRow:Label("Blacklist: 0 entries"); blLabel.uiWidth = 170; blLabel._label:SetWidth(170)
-    blRow:Button({ text = "Edit blacklist…", width = 130, onClick = function()
-        local db = DB(); if not db then return end
-        db.ui.blacklist = db.ui.blacklist or {}
-        DS.ShowTextDialog("Blacklist (one Name-Realm per line)", mapToLines(db.ui.blacklist), false, function(txt)
-            db.ui.blacklist = linesToMap(txt); refreshPage("blacklist")
-        end)
-    end })
+    local wl = flow:AddSection("Blacklist Whitelist")
+    wl:Hint("Removes characters from blacklists on all online mesh accounts. One Name-Realm per line.")
+    buildTextArea(wl, {
+        height = 96, register = "blacklist",
+        get = function() local db = DB(); return db and mapToLines(db.ui.whitelist) or "" end,
+        set = function(txt) local db = DB(); if db then db.ui.whitelist = linesToMap(txt); refreshPage("blacklist") end end,
+    })
 
-    local wlRow = sec:AddRow({ vAlign = "center" })
-    local wlLabel = wlRow:Label("Whitelist: 0 entries"); wlLabel.uiWidth = 170; wlLabel._label:SetWidth(170)
-    wlRow:Button({ text = "Edit whitelist…", width = 130, onClick = function()
-        local db = DB(); if not db then return end
-        db.ui.whitelist = db.ui.whitelist or {}
-        DS.ShowTextDialog("Whitelist (one Name-Realm per line)", mapToLines(db.ui.whitelist), false, function(txt)
-            db.ui.whitelist = linesToMap(txt); refreshPage("blacklist")
-        end)
-    end })
-    register("blacklist", function()
-        local db = DB()
-        blLabel._label:SetText("Blacklist: " .. countMap(db and db.ui.blacklist) .. " entries")
-        wlLabel._label:SetText("Whitelist: " .. countMap(db and db.ui.whitelist) .. " entries")
-    end)
-
-    sec:AddRow():Button({ text = "Sync Blacklist to Mesh", width = 200, onClick = function()
+    wl:AddRow():Button({ text = "Sync Blacklist to Mesh", width = 200, onClick = function()
         if not (ns.Mesh and ns.Mesh.IsEnabled and ns.Mesh.IsEnabled()) then
             ns:Print("mesh is not enabled — nothing to sync."); return
         end
@@ -1494,9 +1801,9 @@ local function buildBlacklist(flow)
         ns:Print("blacklist sync sent to " .. sent .. " account(s).")
     end })
 
-    -- ── Purge (danger, self-protected) ─────────────────────────────────────────
-    local pz = flow:AddSection("Purge (danger)")
-    pz:Hint("Permanently remove all stored data for another account or character. You cannot purge your own account or current character.")
+    -- ── Purge Account Data (danger, self-protected; round-3 item 33) ───────────
+    local pz = flow:AddSection("Purge Account Data")
+    pz:Hint("Permanently remove all stored data for another account. You cannot purge your own account.")
     local paRow = pz:AddRow({ vAlign = "center" })
     paRow:Label("Account ID")
     local paBox = paRow:EditBox({ width = 60, get = function() return "" end })
@@ -1518,7 +1825,10 @@ local function buildBlacklist(flow)
             end })
     end })
 
-    local pcRow = pz:AddRow({ vAlign = "center" })
+    -- ── Character Purge (danger, self-protected; round-3 item 33) ──────────────
+    local cpz = flow:AddSection("Character Purge")
+    cpz:Hint("Recoverable if that character logs in again. Cannot purge your current character.")
+    local pcRow = cpz:AddRow({ vAlign = "center" })
     pcRow:Label("Character")
     local pcBox = pcRow:EditBox({ width = 160, get = function() return "" end })
     pcBox._fillWidth = false
