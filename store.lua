@@ -485,10 +485,17 @@ function Store.EnsureSelfCharacter(nameRealm)
     return rec
 end
 
--- Inbound (relayed) write helper for wave N2. Enforces self-immunity and
--- the owner/epoch tiebreaker so it is safe to call today from tests.
+-- Inbound (relayed) write helper. Enforces self-immunity and the
+-- owner/epoch tiebreaker. `senderAID` (optional) is the account ID of the
+-- mesh peer that relayed this record; when two inbound writes carry an EQUAL
+-- ownerEpoch the one from the LOWEST account ID wins (spec §3/§6 tiebreak).
+-- The winning writer's id is stamped on the record (_srcAID) so a later
+-- equal-epoch write can be compared against it deterministically.
 -- Returns true if the write was applied.
-function Store.WriteInboundCharacter(aid, nameRealm, record)
+--
+-- Wave N2a: added the optional 4th `senderAID` param and the lowest-account-ID
+-- tie resolution. Callers passing 3 args keep the N1 behaviour (ties rejected).
+function Store.WriteInboundCharacter(aid, nameRealm, record, senderAID)
     if Store.IsSelfAccount(aid) then
         return false   -- never overwrite our own data from the wire
     end
@@ -502,11 +509,22 @@ function Store.WriteInboundCharacter(aid, nameRealm, record)
         if na < ea then
             return false
         elseif na == ea then
-            -- lowest-account-id tiebreaker not decidable without sender id;
-            -- keep existing to stay deterministic. Mesh layer supplies id.
-            return false
+            -- Equal epoch: resolve by lowest relaying account ID when known.
+            -- Without a sender id (legacy 3-arg call) keep existing.
+            if senderAID == nil then return false end
+            local existingSrc = existing._srcAID
+            if existingSrc ~= nil then
+                local es = tonumber(existingSrc)
+                local ns_ = tonumber(senderAID)
+                if es ~= nil and ns_ ~= nil then
+                    if ns_ >= es then return false end   -- not strictly lower
+                elseif tostring(senderAID) >= tostring(existingSrc) then
+                    return false
+                end
+            end
         end
     end
+    record._srcAID = senderAID
     bucket.characters[nameRealm] = record
     return true
 end

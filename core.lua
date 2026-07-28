@@ -148,6 +148,45 @@ function ns:RegisterSubcommand(name, fn, help)
     subcommands[name] = { fn = fn, help = help }
 end
 
+-- Debug sub-command + self-test registries (wave N2 addition).
+--
+-- Later modules register their own `/dsn debug <name>` handlers and pure-Lua
+-- self-test suites here instead of editing the debug dispatcher, so parallel
+-- feature branches (mesh, timers) never collide on the same lines.
+local debugCommands = {}   -- name -> fn(args)
+local selfTests     = {}   -- ordered { name, fn(verbose) -> ok, results }
+
+function ns:RegisterDebugCommand(name, fn)
+    debugCommands[name] = fn
+end
+
+function ns:RegisterSelfTest(name, fn)
+    selfTests[#selfTests + 1] = { name = name, fn = fn }
+end
+
+-- Run the protocol suite plus every registered module suite. Returns overall
+-- pass boolean; prints per-suite headers when verbose.
+function ns:RunRegisteredSelfTests(verbose)
+    local allPass = true
+    if ns.Protocol and ns.Protocol.RunSelfTests then
+        if verbose then ns:Print("selftest: protocol") end
+        local ok = ns.Protocol.RunSelfTests(verbose)
+        allPass = allPass and ok
+    end
+    for i = 1, #selfTests do
+        if verbose then ns:Print("selftest: " .. selfTests[i].name) end
+        local ok = selfTests[i].fn(verbose)
+        allPass = allPass and ok
+    end
+    if verbose then
+        ns:Print(allPass and "selftest: ALL SUITES PASS"
+                          or "selftest: FAILURES ABOVE")
+    end
+    return allPass
+end
+
+ns._debugCommands = debugCommands
+
 local function printHelp()
     ns:Print("commands:")
     ns:Print("  /dsn toggle           - show/hide the dashboard (wave N3)")
@@ -198,14 +237,17 @@ end, "show/set account ID")
 
 ns:RegisterSubcommand("debug", function(rest)
     rest = rest and rest:match("^%s*(.-)%s*$") or ""
-    if rest == "selftest" or rest == "" then
-        if ns.Protocol and ns.Protocol.RunSelfTests then
-            ns.Protocol.RunSelfTests(true)
-        else
-            ns:Print("protocol module not loaded.")
-        end
+    local sub, args = rest:match("^(%S*)%s*(.-)$")
+    sub = (sub or ""):lower()
+    if sub == "selftest" or sub == "" then
+        ns:RunRegisteredSelfTests(true)
+        return
+    end
+    local handler = debugCommands[sub]
+    if handler then
+        handler(args)
     else
-        ns:Print("unknown debug command: " .. rest)
+        ns:Print("unknown debug command: " .. sub)
     end
 end, "debug tools")
 
