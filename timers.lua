@@ -67,6 +67,20 @@ Timers.CD = CD
 local DISPLAY_GRACE = 5
 Timers.DISPLAY_GRACE = DISPLAY_GRACE
 
+-- Pull-bar freshness gate. A PULL_DETECTED event raises the HUD pull bar and the
+-- "X incoming!" alert ONLY while the underlying pop/kill is recent enough to
+-- still be genuinely "incoming". This is the reload-safety gate: after a /reload
+-- the in-memory timer state is empty, so the first network re-sync (mesh
+-- snapshot / SN / NWB / any Record caller) re-applies HOURS-OLD anchors as if
+-- new; without this gate each re-apply raised a false pull bar for a long-past
+-- event. DEFAULT_PULL_WINDOW mirrors hud.lua's fallback of the same name (hud
+-- owns the display default; we own the fire gate — keep the two in sync).
+-- PULL_FRESH_SLACK tolerates minor clock skew / relay lag at the window edge.
+local DEFAULT_PULL_WINDOW = 40
+Timers.DEFAULT_PULL_WINDOW = DEFAULT_PULL_WINDOW
+local PULL_FRESH_SLACK = 5
+Timers.PULL_FRESH_SLACK = PULL_FRESH_SLACK
+
 -- Which buff keys own a persisted store log, and the store log key.
 local STORE_LOG_KEY = { rend = "rend", onyH = "onyH", onyA = "onyA" }
 
@@ -244,10 +258,25 @@ function Timers.Record(buffKey, epoch, trust, who, kind, zone, pullDuration)
         ns.Store.AddTimerLog(logKey, entry)
     end
 
-    -- Fan out to the UI wave.
+    -- Fan out to the UI wave. TIMER_UPDATED always fires (historical anchors
+    -- still repopulate the Timers tab and CD countdowns after a reload).
     ns:Fire("TIMER_UPDATED", buffKey)
+
+    -- Pull bar / "incoming!" alert: recency-gated so ONLY genuinely fresh
+    -- events raise it. A pop/kill older than its pull window (plus a small
+    -- slack) is a historical anchor — it still applied, persisted, and (below)
+    -- broadcasts, but it must not raise a pull bar for a past event. We pass the
+    -- REMAINING window (full window minus elapsed since the event) so a pull
+    -- heard 20s late shows a ~20s bar, not a fresh full one.
     if isKill or kind == "pop" then
-        ns:Fire("PULL_DETECTED", buffKey, pullDuration or 0, trust, zone)
+        local window = (pullDuration and pullDuration > 0) and pullDuration or DEFAULT_PULL_WINDOW
+        local elapsed = now() - epoch
+        if elapsed <= window + PULL_FRESH_SLACK then
+            local remaining = window - elapsed
+            if remaining > window then remaining = window end   -- future/clock-skew clamp
+            if remaining < 1 then remaining = 1 end              -- keep a visible sliver at the edge
+            ns:Fire("PULL_DETECTED", buffKey, remaining, trust, zone)
+        end
     end
 
     -- (Re)seed warnings for the CD-scheduled buffs.
@@ -1384,6 +1413,51 @@ local function testFalsePositive(fails)
     Timers.state = {}
 end
 
+-- Pull recency gate (reload false-positive fix). A fresh pop raises
+-- PULL_DETECTED with ~full window; a late pop raises it with a reduced
+-- remaining window; an hours-old anchor still APPLIES (TIMER_UPDATED fires,
+-- anchor set) but raises NO pull bar. An explicit pullDuration is honored as
+-- the window. Captures both events off the callback bus.
+local function testPullRecencyGate(fails)
+    local cap = { pull = nil, timerUpdated = {} }
+    ns:On("PULL_DETECTED", function(buffKey, duration)
+        cap.pull = { buff = buffKey, duration = duration }
+    end)
+    ns:On("TIMER_UPDATED", function(buffKey) cap.timerUpdated[buffKey] = true end)
+
+    local W = Timers.DEFAULT_PULL_WINDOW
+    local t = now()
+
+    -- (a) fresh pop (epoch == now) -> PULL_DETECTED with ~full window.
+    Timers.state = {}; cap.pull = nil; cap.timerUpdated = {}
+    Timers.Record("rend", t, "local", "live", "pop")
+    tcheck(cap.pull ~= nil and cap.pull.buff == "rend", "fresh pop raises PULL_DETECTED", fails)
+    tcheck(cap.pull and math.abs(cap.pull.duration - W) <= 1,
+        "fresh pop shows ~full window", fails)
+
+    -- (b) pop heard 20s late -> PULL_DETECTED with reduced remaining window.
+    Timers.state = {}; cap.pull = nil
+    Timers.Record("onyH", t - 20, "local", "late", "pop")
+    tcheck(cap.pull ~= nil, "late pop still raises PULL_DETECTED", fails)
+    tcheck(cap.pull and math.abs(cap.pull.duration - (W - 20)) <= 1,
+        "late pop shows reduced remaining window (~W-20)", fails)
+
+    -- (c) hours-old anchor -> applied + TIMER_UPDATED, but NO pull bar.
+    Timers.state = {}; cap.pull = nil; cap.timerUpdated = {}
+    local ok = Timers.Record("nefH", t - 3600, "mesh", "peer", "pop")
+    tcheck(ok == true, "stale anchor still applied", fails)
+    tcheck(cap.timerUpdated["nefH"] == true, "stale anchor fires TIMER_UPDATED", fails)
+    tcheck(cap.pull == nil, "stale anchor does NOT raise PULL_DETECTED (reload fix)", fails)
+
+    -- (d) explicit pullDuration is used as the fresh window (mesh/SN pull relay).
+    Timers.state = {}; cap.pull = nil
+    Timers.Record("zg", t, "sn", "SN", "pop", nil, 25)
+    tcheck(cap.pull ~= nil and math.abs(cap.pull.duration - 25) <= 1,
+        "explicit pullDuration used as the fresh window", fails)
+
+    Timers.state = {}
+end
+
 -- Confirmation upgrade: a lower-trust anchor, then higher trust inside CD
 -- upgrades trust without a new anchor.
 local function testTrustUpgrade(fails)
@@ -1585,6 +1659,7 @@ function Timers.RunSelfTests(verbose)
     local suites = {
         { name = "cd derivation",     fn = testCDDerivation },
         { name = "false-positive gate", fn = testFalsePositive },
+        { name = "pull recency gate", fn = testPullRecencyGate },
         { name = "trust upgrade",     fn = testTrustUpgrade },
         { name = "trust ordering",    fn = testTrustOrdering },
         { name = "request cooldowns", fn = testRequestCooldowns },
