@@ -272,6 +272,22 @@ Mesh._sessionId = 0      -- randomised at login to prefix message ids
 Mesh._timerCodec = nil   -- N2b handoff codec (see §Timer handoff)
 Mesh._timerHandler = nil -- N2b handoff receive callback
 
+-- Channel-join retry state machine + discovery telemetry (see §Channel join).
+Mesh._joinState = nil    -- { chanName, attempts, index, joined, gaveUp, pingedOnJoin }
+Mesh._joinGen   = 0      -- generation token: supersedes stale in-flight retry loops
+Mesh._lastJoinPing = 0   -- throttle re-pings triggered by newcomer channel joins
+Mesh._disco = {          -- last discovery ping/pong timestamps (for /dsn debug mesh)
+    lastPingSent = 0, lastPingRecv = 0,
+    lastPongSent = 0, lastPongRecv = 0,
+}
+
+-- Join-retry tunables: verify GetChannelName after each attempt on a backoff.
+-- Channel joins routinely fail in the first seconds after login, so we issue
+-- the join, then re-check on a widening schedule up to JOIN_MAX_TRIES times.
+Mesh.JOIN_DELAYS     = { 5, 7, 10, 15, 22 }   -- seconds between verification ticks
+Mesh.JOIN_MAX_TRIES  = 5                       -- max join calls before giving up
+Mesh.JOIN_PING_THROTTLE = 3                    -- min seconds between newcomer re-pings
+
 ----------------------------------------------------------------------
 -- Lib + game API access (guarded so the pure core loads without them)
 ----------------------------------------------------------------------
@@ -317,6 +333,16 @@ local function selfNameRealm()
     return name .. "-" .. realm
 end
 Mesh.SelfNameRealm = selfNameRealm
+
+-- True if `sender` is us. CHAT_MSG_ADDON reports a full "Name-Realm" for our own
+-- channel/guild echoes, but some paths (and CHAT_MSG_CHANNEL_JOIN) report the
+-- bare "Name", so match both forms to reliably drop self-echoes.
+function Mesh.IsSelfSender(sender)
+    if not sender or sender == "" then return false end
+    if sender == selfNameRealm() then return true end
+    local bare = UnitName and UnitName("player") or "player"
+    return sender == bare
+end
 
 function Mesh.MeshSettings()
     local db = Store and Store.GetSettings and Store.GetSettings()
@@ -810,8 +836,11 @@ local function handleDiscovery(f, sender, isPing)
     local aid = d and d.aid
     if aid then Mesh.NotePeer(aid, sender, now()) end
     if isPing then
+        Mesh._disco.lastPingRecv = now()
         -- respond with a PONG whisper announcing ourselves
         Mesh.SendDiscovery(OP.PONG, sender)
+    else
+        Mesh._disco.lastPongRecv = now()
     end
 end
 
@@ -959,6 +988,9 @@ function Mesh.SendDiscovery(op, target)
     if not Mesh.IsEnabled() then return end
     local payload = Mesh.Pack({ aid = ns:GetAccountID(), name = selfNameRealm() })
     if not payload then return end
+    -- Telemetry: record when we emit a discovery ping/pong (surfaced in debug).
+    if op == OP.PING then Mesh._disco.lastPingSent = now()
+    elseif op == OP.PONG then Mesh._disco.lastPongSent = now() end
     local frame = Mesh.BuildFrame(op, payload, {})
     if target then
         Mesh.Enqueue(Protocol.PREFIX.HEARTBEAT, frame, {
@@ -1238,23 +1270,178 @@ end
 
 ----------------------------------------------------------------------
 -- Channel membership lifecycle
+--
+-- The discovery channel is what lets cross-guild / unguilded mesh accounts
+-- find each other: heartbeats + discovery pings ride it (see BroadcastChannel).
+-- The catch is timing — JoinTemporaryChannel silently no-ops in the first few
+-- seconds after login/reload (the chat system isn't ready), so a one-shot join
+-- at PLAYER_LOGIN leaves GetChannelName() == 0 forever and every broadcast
+-- falls back to GUILD-only. So we drive the join through a small retry state
+-- machine: issue the join, verify via GetChannelName on a widening backoff, and
+-- only stop once the index resolves (or we exhaust JOIN_MAX_TRIES).
+--
+-- The state machine core (NewJoinState + JoinAdvance) is PURE: every game/timer
+-- call is injected through `deps`, so it is exercised headless by the self-test.
 ----------------------------------------------------------------------
 
-function Mesh.JoinMeshChannel()
-    local chanName = Mesh.GetChannelName()
-    if not chanName then return end
-    if JoinTemporaryChannel then
-        JoinTemporaryChannel(chanName)
-    end
+-- Fresh join-state for a channel name.
+function Mesh.NewJoinState(chanName)
+    return {
+        chanName     = chanName,
+        attempts     = 0,       -- JoinTemporaryChannel calls issued so far
+        index        = 0,       -- resolved channel index (0 == not joined)
+        joined       = false,
+        gaveUp       = false,
+        pingedOnJoin = false,
+    }
 end
 
+-- Advance the join state one tick. Pure: deps = {
+--   getIndex = function(chanName) -> number   (GetChannelName wrapper),
+--   doJoin   = function(chanName)             (JoinTemporaryChannel wrapper),
+--   maxTries = number, delays = { seconds, ... },
+-- }
+-- Returns an action string plus (for "retry") the delay to the next tick:
+--   "joined"  -- index resolved; caller should announce on the channel
+--   "retry"   -- join (re)issued; re-check after the returned delay
+--   "gaveup"  -- exhausted attempts; guild fallback continues to carry peers
+--   "noop"    -- already joined or already gave up
+function Mesh.JoinAdvance(st, deps)
+    if st.joined or st.gaveUp then return "noop" end
+    local idx = deps.getIndex(st.chanName) or 0
+    if idx > 0 then
+        st.index  = idx
+        st.joined = true
+        return "joined"
+    end
+    local maxTries = deps.maxTries or Mesh.JOIN_MAX_TRIES
+    if st.attempts >= maxTries then
+        st.gaveUp = true
+        return "gaveup"
+    end
+    -- Issue (or re-issue) the join. Re-joining an already-joined channel is
+    -- harmless — JoinTemporaryChannel just returns the existing index — so this
+    -- is also the /reload-safe path.
+    deps.doJoin(st.chanName)
+    st.attempts = st.attempts + 1
+    local delays = deps.delays or Mesh.JOIN_DELAYS
+    local delay  = delays[st.attempts] or delays[#delays] or 5
+    return "retry", delay
+end
+
+-- Impure wrappers around the two game APIs (verified in the API catalog:
+-- GetChannelName / JoinTemporaryChannel are FrameXML globals on this client).
+local function getChannelIndex(chanName)
+    if chanName and GetChannelName then
+        return GetChannelName(chanName) or 0
+    end
+    return 0
+end
+local function doJoinChannel(chanName)
+    if JoinTemporaryChannel then JoinTemporaryChannel(chanName) end
+end
+
+-- Announce ourselves once the channel index first resolves so peers already on
+-- the channel (and we, to them) converge immediately rather than waiting for the
+-- next 17-23s heartbeat.
+function Mesh.OnChannelResolved()
+    ns:SafeCall(Mesh.SendDiscovery, OP.PING, nil)
+end
+
+-- One tick of the live join loop: advance the state, then schedule the next
+-- verification (retry) or fire discovery (joined). `gen` fences the loop so a
+-- newer StartJoinSequence (relog / reload / re-enable) cancels stale timers
+-- instead of compounding parallel tickers.
+function Mesh._runJoinTick(gen)
+    if gen ~= Mesh._joinGen then return end   -- superseded by a newer sequence
+    local st = Mesh._joinState
+    if not st then return end
+    local deps = {
+        getIndex = getChannelIndex,
+        doJoin   = doJoinChannel,
+        maxTries = Mesh.JOIN_MAX_TRIES,
+        delays   = Mesh.JOIN_DELAYS,
+    }
+    local action, delay = Mesh.JoinAdvance(st, deps)
+    if action == "joined" then
+        if not st.pingedOnJoin then
+            st.pingedOnJoin = true
+            Mesh.OnChannelResolved()
+        end
+    elseif action == "retry" then
+        if C_Timer and C_Timer.After then
+            C_Timer.After(delay or 5, function() ns:SafeCall(Mesh._runJoinTick, gen) end)
+        end
+    end
+    -- "gaveup"/"noop": stop the loop. BroadcastChannel's GUILD fallback keeps
+    -- same-guild peers converging even without the channel.
+end
+
+-- Start (or restart) the join sequence. Idempotent per PLAYER_ENTERING_WORLD:
+-- if we are already on the channel (e.g. after /reload) we skip the retry loop
+-- and just re-announce; otherwise we kick off a fresh retry sequence. Bumping
+-- the generation token retires any retry loop still in flight.
+function Mesh.StartJoinSequence()
+    if not Mesh.IsEnabled() then return end
+    local chanName = Mesh.GetChannelName()
+    if not chanName then return end
+    Mesh._joinGen = Mesh._joinGen + 1
+    if getChannelIndex(chanName) > 0 then
+        local st = Mesh.NewJoinState(chanName)
+        st.index, st.joined, st.pingedOnJoin = getChannelIndex(chanName), true, true
+        Mesh._joinState = st
+        Mesh.OnChannelResolved()
+        return
+    end
+    Mesh._joinState = Mesh.NewJoinState(chanName)
+    Mesh._runJoinTick(Mesh._joinGen)
+end
+
+-- Backwards-compatible one-shot entry (kept for callers/tests); the retry loop
+-- is the real path now.
+function Mesh.JoinMeshChannel()
+    Mesh.StartJoinSequence()
+end
+
+-- Leave OUR discovery channel unconditionally on mesh disable / logout. The
+-- settings' autoLeaveChannel flag governs the spec'd standard/bond auto-leave
+-- list — it does NOT gate teardown of our own mesh channel.
 function Mesh.LeaveMeshChannel()
     local chanName = Mesh.GetChannelName()
     if not chanName then return end
-    local m = Mesh.MeshSettings()
-    if m and m.autoLeaveChannel and LeaveChannelByName then
+    if LeaveChannelByName then
         LeaveChannelByName(chanName)
     end
+    Mesh._joinState = nil
+    Mesh._joinGen = Mesh._joinGen + 1   -- retire any in-flight retry loop
+end
+
+-- Mesh turned off at runtime: leave the channel and halt the join loop.
+function Mesh.OnDisable()
+    Mesh.LeaveMeshChannel()
+end
+
+-- Fired on PLAYER_ENTERING_WORLD (initial login AND every /reload): (re)drive
+-- the join. Guarded so a disabled mesh stays dormant.
+function Mesh.OnEnteringWorld(isInitialLogin, isReloadingUi)
+    if not Mesh.IsEnabled() then return end
+    Mesh.StartJoinSequence()
+end
+
+-- CHAT_MSG_CHANNEL_JOIN handler: when a peer joins our discovery channel, emit
+-- a throttled discovery ping so late arrivals converge fast instead of waiting a
+-- full heartbeat cycle. Ignores our own join and joins on unrelated channels.
+function Mesh.OnChannelJoinNotice(playerName, channelBaseName)
+    if not Mesh.IsEnabled() then return end
+    local chanName = Mesh.GetChannelName()
+    if not chanName then return end
+    local base = channelBaseName and tostring(channelBaseName):lower() or ""
+    if base == "" or base ~= chanName:lower() then return end
+    if playerName and Mesh.IsSelfSender(playerName) then return end
+    local t = now()
+    if t - (Mesh._lastJoinPing or 0) < Mesh.JOIN_PING_THROTTLE then return end
+    Mesh._lastJoinPing = t
+    ns:SafeCall(Mesh.SendDiscovery, OP.PING, nil)
 end
 
 ----------------------------------------------------------------------
@@ -1269,8 +1456,10 @@ local function onChatMsgAddon(event, prefix, text, channel, sender)
     end
     if not ours then return end
     if not Mesh.IsEnabled() then return end
-    -- Ignore our own echoes (guild/raid/yell/channel broadcasts loop back).
-    if sender == selfNameRealm() then return end
+    -- Ignore our own echoes (guild/raid/yell/channel broadcasts loop back). The
+    -- `channel` origin arg is NOT filtered here: CHANNEL-distributed addon
+    -- messages arrive with channel="CHANNEL" and are dispatched like any other.
+    if Mesh.IsSelfSender(sender) then return end
     -- De-envelope, reassemble, then dispatch.
     local env = Mesh.DeEnvelope(text)
     if not env then return end
@@ -1287,6 +1476,24 @@ function Mesh.OnLogin()
     -- Subscribe to inbound addon messages.
     ns:RegisterEvent("CHAT_MSG_ADDON", onChatMsgAddon)
 
+    -- PLAYER_ENTERING_WORLD drives the channel join (fires on initial login AND
+    -- every /reload; the handler self-guards on IsEnabled). This is the fix for
+    -- the "no peers known" bug: a one-shot join at login lands before the chat
+    -- system is ready, so we (re)drive a verified retry loop here instead.
+    ns:RegisterEvent("PLAYER_ENTERING_WORLD", function(_, isInitialLogin, isReloadingUi)
+        ns:SafeCall(Mesh.OnEnteringWorld, isInitialLogin, isReloadingUi)
+    end)
+
+    -- Newcomer convergence: ping when someone joins our discovery channel.
+    -- CHAT_MSG_CHANNEL_JOIN args (1-indexed): text, playerName(2), languageName,
+    -- channelName, playerName2, specialFlags, zoneChannelID, channelIndex,
+    -- channelBaseName(9).
+    ns:RegisterEvent("CHAT_MSG_CHANNEL_JOIN", function(_, ...)
+        local playerName      = select(2, ...)
+        local channelBaseName = select(9, ...)
+        ns:SafeCall(Mesh.OnChannelJoinNotice, playerName, channelBaseName)
+    end)
+
     -- Push live state changes onto the mesh.
     ns:On("STATE_CHANGED", function(nameRealm, record)
         ns:SafeCall(Mesh.PushState, nameRealm, record)
@@ -1302,11 +1509,9 @@ function Mesh.OnLogin()
         return   -- mesh disabled / no token / no account id: stay dormant
     end
 
-    -- Join the discovery channel and announce ourselves.
-    Mesh.JoinMeshChannel()
-    if C_Timer and C_Timer.After then
-        C_Timer.After(3, function() ns:SafeCall(Mesh.SendDiscovery, OP.PING, nil) end)
-    end
+    -- Kick the join sequence immediately too (idempotent with the PEW path via
+    -- the generation token) so we don't wait on a possibly-already-fired PEW.
+    Mesh.StartJoinSequence()
 
     -- Start the 50ms drain ticker.
     if C_Timer and C_Timer.NewTicker then
@@ -1335,8 +1540,28 @@ end
 
 local function debugMesh()
     ns:Print("mesh: " .. (Mesh.IsEnabled() and "ENABLED" or "disabled")
-        .. " | account " .. (ns:GetAccountID() ~= "" and ns:GetAccountID() or "<unset>")
-        .. " | channel " .. (Mesh.GetChannelName() or "<none>"))
+        .. " | account " .. (ns:GetAccountID() ~= "" and ns:GetAccountID() or "<unset>"))
+
+    -- Channel join diagnostics — the heart of the "no peers known" smoke test.
+    local chanName = Mesh.GetChannelName()
+    local liveIdx = 0
+    if chanName and GetChannelName then liveIdx = GetChannelName(chanName) or 0 end
+    local st = Mesh._joinState
+    local joinedStr = (liveIdx and liveIdx > 0) and ("index " .. liveIdx) or "NOT JOINED"
+    local attempts = st and st.attempts or 0
+    local status = ""
+    if st and st.gaveUp then status = " (gave up)"
+    elseif st and st.joined then status = " (joined)"
+    elseif attempts > 0 then status = " (joining)" end
+    ns:Print(string.format("  channel: %s | %s | joinAttempts=%d%s",
+        chanName or "<none>", joinedStr, attempts, status))
+
+    -- Discovery ping/pong telemetry (0 == never).
+    local d = Mesh._disco or {}
+    ns:Print(string.format("  discovery: pingSent=%s pongRecv=%s pingRecv=%s pongSent=%s",
+        tostring(d.lastPingSent or 0), tostring(d.lastPongRecv or 0),
+        tostring(d.lastPingRecv or 0), tostring(d.lastPongSent or 0)))
+
     local n = 0
     for aid, p in pairs(Mesh.peers) do
         n = n + 1
@@ -1471,6 +1696,77 @@ local function testFailureSkip()
     return true
 end
 
+-- Join-retry state machine: every game/timer call is injected, so the whole
+-- machine runs headless here. Covers immediate-resolve (/reload), resolve-after-
+-- retries, give-up-after-max, backoff-delay sequencing, and post-terminal inertness.
+local function testJoinStateMachine()
+    -- Build deps whose getIndex replays a scripted sequence of channel indices
+    -- and whose doJoin counts issued joins. maxTries=3 keeps the tables small.
+    local function makeDeps(indexSeq)
+        local i, joins = 0, 0
+        return {
+            getIndex = function() i = i + 1; return indexSeq[i] or 0 end,
+            doJoin   = function() joins = joins + 1 end,
+            maxTries = 3,
+            delays   = { 5, 7, 10 },
+            _joins   = function() return joins end,
+        }
+    end
+
+    -- 1. Already on the channel (e.g. after /reload): resolve on the first tick,
+    --    no join issued.
+    local st = Mesh.NewJoinState("dsnX")
+    local deps = makeDeps({ 4 })
+    local action = Mesh.JoinAdvance(st, deps)
+    if action ~= "joined" then return false, "immediate: expected joined, got " .. tostring(action) end
+    if st.index ~= 4 or not st.joined then return false, "immediate: index/joined not set" end
+    if deps._joins() ~= 0 then return false, "immediate: should not issue join" end
+
+    -- 2. Two failed verifications, then resolve; backoff delays honoured.
+    st = Mesh.NewJoinState("dsnX")
+    deps = makeDeps({ 0, 0, 9 })
+    local a1, d1 = Mesh.JoinAdvance(st, deps)   -- idx 0 -> join#1, retry 5
+    if a1 ~= "retry" or d1 ~= 5 then return false, "tick1: " .. tostring(a1) .. "/" .. tostring(d1) end
+    local a2, d2 = Mesh.JoinAdvance(st, deps)   -- idx 0 -> join#2, retry 7
+    if a2 ~= "retry" or d2 ~= 7 then return false, "tick2: " .. tostring(a2) .. "/" .. tostring(d2) end
+    local a3 = Mesh.JoinAdvance(st, deps)        -- idx 9 -> joined
+    if a3 ~= "joined" then return false, "tick3: expected joined, got " .. tostring(a3) end
+    if st.index ~= 9 then return false, "resolved index wrong: " .. tostring(st.index) end
+    if deps._joins() ~= 2 then return false, "expected 2 joins, got " .. tostring(deps._joins()) end
+
+    -- 3. Never resolves -> give up after exactly maxTries join attempts.
+    st = Mesh.NewJoinState("dsnX")
+    deps = makeDeps({})   -- getIndex always 0
+    local guard, act = 0, nil
+    repeat
+        act = Mesh.JoinAdvance(st, deps)
+        guard = guard + 1
+    until act == "gaveup" or guard > 20
+    if act ~= "gaveup" then return false, "expected gaveup, got " .. tostring(act) end
+    if st.attempts ~= 3 then return false, "expected 3 attempts, got " .. tostring(st.attempts) end
+    if deps._joins() ~= 3 then return false, "expected 3 joins, got " .. tostring(deps._joins()) end
+    if not st.gaveUp then return false, "gaveUp flag not set" end
+
+    -- 4. Terminal states are inert.
+    if Mesh.JoinAdvance(st, deps) ~= "noop" then return false, "post-giveup not noop" end
+    local joinedSt = Mesh.NewJoinState("dsnX"); joinedSt.joined = true
+    if Mesh.JoinAdvance(joinedSt, makeDeps({ 0 })) ~= "noop" then return false, "post-joined not noop" end
+
+    -- 5. Backoff clamps to the last delay if attempts exceed the table length.
+    local delays = { 5, 7 }
+    st = Mesh.NewJoinState("dsnX")
+    local dd = { getIndex = function() return 0 end, doJoin = function() end,
+                 maxTries = 5, delays = delays }
+    local _, db1 = Mesh.JoinAdvance(st, dd)   -- attempt1 -> delays[1]=5
+    local _, db2 = Mesh.JoinAdvance(st, dd)   -- attempt2 -> delays[2]=7
+    local _, db3 = Mesh.JoinAdvance(st, dd)   -- attempt3 -> clamp to 7
+    if db1 ~= 5 or db2 ~= 7 or db3 ~= 7 then
+        return false, "backoff clamp wrong: " .. tostring(db1) .. "," .. tostring(db2) .. "," .. tostring(db3)
+    end
+
+    return true
+end
+
 function Mesh.RunSelfTests(verbose)
     local suite = {
         { name = "relay assignment", fn = testRelayPlan },
@@ -1479,6 +1775,7 @@ function Mesh.RunSelfTests(verbose)
         { name = "frame round-trip", fn = testFrameRoundTrip },
         { name = "session seq",      fn = testFreshSeq },
         { name = "failure skip",     fn = testFailureSkip },
+        { name = "join state machine", fn = testJoinStateMachine },
     }
     local allPass, results = true, {}
     for _, t in ipairs(suite) do
