@@ -15,9 +15,59 @@ local CARD_H = 96
 local CHRONOBOON_ITEM  = 184937   -- Chronoboon Displacer
 local HEARTHSTONE_ITEM = 6948     -- Hearthstone
 
+-- Naxx raid-diamond prototype (owner task 7): the leftmost raid diamond ("Naxx")
+-- renders the raid's identifying item icon clipped to a diamond, keeping the
+-- green(available)/red(locked) state via a tinted diamond rim. Icon source is a
+-- real item (C_Item.GetItemIconByID via Dashboard.ItemIcon); the diamond shape
+-- comes from a brand-original alpha mask shipped with the addon.
+local NAXX_KEY     = "Naxx"
+local NAXX_ITEM    = 22520   -- The Phylactery of Kel'Thuzad (KT quest drop)
+local DIAMOND_MASK = "Interface\\AddOns\\Daseeki-Nexus\\textures\\diamond-mask"
+
 local function fstr(parent, key)
     local f = parent:CreateFontString(nil, "OVERLAY")
     f:SetFontObject(UI.fonts[key] or UI.fonts.body)
+    return f
+end
+
+-- Card name reads one readable step above body (owner task 1): a card-scoped
+-- title font at bodySize+2 (12 -> 14). Built on the framework font-object path
+-- (SetFontObject), not a raw per-string SetFont, and rebuilt on theme change so a
+-- future body-face swap tracks. The name's own colour comes from ColoredName's
+-- inline class-colour escape codes, so this object only carries face + size (its
+-- SetTextColor is a harmless default the class colour overrides).
+local NAME_FONT = CreateFont("DaseekiNexusSixtyCardNameFont")
+local function applyNameFont()
+    local face = (UI.Token and UI.Token("bodyFace")) or "Fonts\\FRIZQT__.TTF"
+    local size = ((UI.Token and UI.Token("bodySize")) or 12) + 2
+    NAME_FONT:SetFont(face, size, "")
+    NAME_FONT:SetTextColor(UI.Color("text"))
+    NAME_FONT:SetJustifyH("LEFT")
+end
+applyNameFont()
+if UI.OnThemeChanged then UI.OnThemeChanged(applyNameFont) end
+
+-- Build the Naxx compound diamond (owner task 7 prototype). A nominal 9px slot
+-- frame (so the raid row's pitch is IDENTICAL to the plain diamonds) holds a
+-- diamond-masked raid icon over a tinted diamond rim, both centered and drawn a
+-- touch larger so the icon is legible at diamond scale. Falls back gracefully:
+-- the rim is a full green/red diamond, so an uncached icon still reads as the
+-- correct lockout state until the next paint resolves the art.
+local function makeNaxxDiamond(parent)
+    local ICON, RIM = 15, 17
+    local f = CreateFrame("Frame", nil, parent)
+    f:SetSize(9, 9)   -- layout footprint == one plain diamond
+    local rim = Dashboard.MakeDiamond(f, RIM, "BACKGROUND")
+    rim:SetPoint("CENTER", f, "CENTER", 0, 0)
+    local icon = f:CreateTexture(nil, "ARTWORK")
+    icon:SetSize(ICON, ICON)
+    icon:SetPoint("CENTER", f, "CENTER", 0, 0)
+    icon:SetTexCoord(0.08, 0.92, 0.08, 0.92)
+    local mask = f:CreateMaskTexture()
+    mask:SetAllPoints(icon)
+    mask:SetTexture(DIAMOND_MASK, "CLAMPTOBLACKADDITIVE", "CLAMPTOBLACKADDITIVE")
+    icon:AddMaskTexture(mask)
+    f._naxx, f._rim, f._icon, f._mask = true, rim, icon, mask
     return f
 end
 
@@ -44,8 +94,10 @@ local function makeCard(parent)
     card.pip:SetPoint("TOPLEFT", card, "TOPLEFT", PADX, -10)
 
     card.name = fstr(card, "body")
+    card.name:SetFontObject(NAME_FONT)         -- one readable step above body (task 1)
     card.name:SetPoint("LEFT", card.pip, "RIGHT", 6, 0)
     card.name:SetJustifyH("LEFT")
+    card.name:SetWordWrap(false)               -- keep the taller name on one line
 
     card.acct = fstr(card, "small")
     card.acct:SetPoint("LEFT", card.name, "RIGHT", 6, 0)
@@ -59,31 +111,32 @@ local function makeCard(parent)
     card.crest:SetTexCoord(0.02, 0.62, 0.03, 0.63)
     card.crest:Hide()
 
-    -- Line 2: location.
+    -- Location (owner task 8a): no longer a line under the name — it now sits in
+    -- the card's bottom-right, directly ABOVE the "Updated" freshness. Created here
+    -- but anchored after the freshness label exists (below). Right-aligned, single
+    -- line, truncating with an ellipsis so a long zone name can't run wide.
     card.loc = fstr(card, "small")
-    card.loc:SetPoint("TOPLEFT", card, "TOPLEFT", PADX, -30)
-    -- RIGHT edge is bounded to the upper-right chrono/hearth stack (built below),
-    -- so a long location never slides under those icons (owner nit #3 reflow).
-    card.loc:SetJustifyH("LEFT")
+    card.loc:SetJustifyH("RIGHT")
     card.loc:SetWordWrap(false)
 
-    -- Line 3: raid-lockout diamond pips (parity item 1). The upper-right corner
-    -- of this band now holds the stacked chrono/hearth indicators (owner nit #3).
-    -- Row of green/red diamonds (green = available, red = locked); a hover frame
-    -- spanning the row shows a tooltip naming each raid + its reset time.
+    -- Raid-lockout diamond pips (parity item 1). Row moved UP into the space the
+    -- location line vacated (owner task 8a) so no dead band opens under the name.
+    -- Green = available, red = locked; a hover frame spanning the row shows a
+    -- tooltip naming each raid + its reset time. The leftmost ("Naxx") diamond is
+    -- a masked-icon prototype (owner task 7); the rest stay plain diamonds.
     card.raid = {}
     local prev
     for i, key in ipairs(Dashboard.RAID_DISPLAY) do
-        local d = Dashboard.MakeDiamond(card, 9)
+        local d = (key == NAXX_KEY) and makeNaxxDiamond(card) or Dashboard.MakeDiamond(card, 9)
         if prev then d:SetPoint("LEFT", prev, "RIGHT", 6, 0)
-        else d:SetPoint("TOPLEFT", card, "TOPLEFT", PADX + 2, -47) end
+        else d:SetPoint("TOPLEFT", card, "TOPLEFT", PADX + 2, -34) end
         d._raidKey = key
         card.raid[i] = d
         prev = d
     end
     card.raidHover = CreateFrame("Frame", nil, card)
     card.raidHover:SetSize(#Dashboard.RAID_DISPLAY * 15 + 8, 16)
-    card.raidHover:SetPoint("TOPLEFT", card, "TOPLEFT", PADX, -42)
+    card.raidHover:SetPoint("TOPLEFT", card, "TOPLEFT", PADX, -30)
     card.raidHover:EnableMouse(true)
     card.raidHover:SetScript("OnEnter", function(self)
         local rec = self._rec
@@ -159,11 +212,11 @@ local function makeCard(parent)
     card.hearthCD:SetPoint("RIGHT", card.hearth, "LEFT", -3, 0)
     card.hearthCD:SetJustifyH("RIGHT")
 
-    -- Now that the corner stack exists, bound the location line's right edge to
-    -- the hearthstone label so a long location can't slide under the icons. The
-    -- empty label collapses onto the hearth's left edge, so the clearance tracks
-    -- whatever the label currently shows.
-    card.loc:SetPoint("RIGHT", card.hearthCD, "LEFT", -6, 0)
+    -- Location sits directly above the freshness line in the bottom-right (owner
+    -- task 8a). Its LEFT is bounded well clear of the bottom-left buff strip so a
+    -- long zone name truncates (ellipsis) instead of colliding at narrow widths.
+    card.loc:SetPoint("BOTTOMRIGHT", card.fresh, "TOPRIGHT", 0, 3)
+    card.loc:SetPoint("LEFT", card, "LEFT", PADX + 108, 0)
 
     -- Raid-code row tooltip (explains the abbreviations).
     card:SetScript("OnEnter", function() end)  -- highlight handled by texture
@@ -176,7 +229,9 @@ local function makeCard(parent)
         self.pip:SetColorTexture(UI.Color(entry.online and "ok" or "faint"))
         self.name:SetText(Dashboard.ColoredName(entry.nameRealm, rec.classTag))
         if entry.aid and entry.aid ~= "" then
-            self.acct:SetText("#" .. entry.aid); self.acct:SetTextColor(UI.Color("accent")); self.acct:Show()
+            -- Bare account number, no "#" prefix (owner task 8b); colour/size keep
+            -- it subordinate to the (now larger) name.
+            self.acct:SetText(entry.aid); self.acct:SetTextColor(UI.Color("accent")); self.acct:Show()
         else
             self.acct:SetText(""); self.acct:Hide()
         end
@@ -200,11 +255,21 @@ local function makeCard(parent)
         end
 
         -- Raid-lockout diamond pips (parity item 1): green available / red locked.
+        -- The Naxx slot (owner task 7 prototype) tints its diamond RIM with the
+        -- same token and shows the raid's item icon clipped to the diamond; the
+        -- locked state also desaturates the icon so it reads dimmer.
         local nowE = Dashboard.Now()
         for _, d in ipairs(self.raid) do
             local expiry = rec.raidLockouts and rec.raidLockouts[d._raidKey]
             local locked = expiry and expiry > nowE
-            Dashboard.SetDiamondColor(d, locked and "danger" or "ok")
+            local tok = locked and "danger" or "ok"
+            if d._naxx then
+                Dashboard.SetDiamondColor(d._rim, tok)
+                d._icon:SetTexture(Dashboard.ItemIcon(NAXX_ITEM))  -- re-set: late item-cache resolve
+                d._icon:SetDesaturated(locked and true or false)
+            else
+                Dashboard.SetDiamondColor(d, tok)
+            end
         end
         self.raidHover._rec = rec
 
@@ -278,14 +343,14 @@ local function makeCard(parent)
         end
         if chronoCDrem > 0 then
             self.chronoCD:SetText(Dashboard.FormatDuration(chronoCDrem))
-            self.chronoCD:SetTextColor(UI.Color("faint"))
+            self.chronoCD:SetTextColor(UI.Color("danger"))   -- RED while on cooldown (owner task 2)
         else
             self.chronoCD:SetText("")
         end
         local hearthCDrem = Dashboard.DecayRemaining(rec.hearthstoneCD, rec.lastDataUpdate, nowE)
         if hearthCDrem > 0 then
             self.hearthCD:SetText(Dashboard.FormatDuration(hearthCDrem))
-            self.hearthCD:SetTextColor(UI.Color("faint"))
+            self.hearthCD:SetTextColor(UI.Color("danger"))   -- RED while on cooldown (owner task 2)
             self.hearth:SetDesaturated(true)
         else
             self.hearthCD:SetText("")
@@ -303,8 +368,9 @@ end
 Dashboard.RegisterTab("sixties", function(host)
     local pane
     pane = Dashboard.BuildRosterPane(host, {
-        listTitle = "Tracked 60s",
-        listHint  = "online first · drag to reorder",
+        listTitle = "Characters",              -- renamed (owner task 11)
+        enableOnlineFilter = true,             -- All | Online toggle replaces the hint + Online tab
+        emptyText = "No characters online",
         cardHeight = CARD_H,
         enableDrag = true,
         makeCard = makeCard,

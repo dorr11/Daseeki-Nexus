@@ -1798,7 +1798,7 @@ local function buildBlacklist(flow)
 
     -- ── Character Blacklist (inline textareas, round-3 item 33) ────────────────
     local sec = flow:AddSection("Character Blacklist")
-    sec:Hint("Hide characters from 60s and Summoners tabs. They still appear in Online and function normally.")
+    sec:Hint("Hide characters from the 60s and Summoners tabs. They still function normally in-game.")
     buildTextArea(sec, {
         height = 110, register = "blacklist",
         get = function() local db = DB(); return db and mapToLines(db.ui.blacklist) or "" end,

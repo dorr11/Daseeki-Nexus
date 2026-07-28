@@ -401,18 +401,16 @@ local function captureFlags(rec)
     rec._instanceType = instanceType
 end
 
--- Zone / location: coordinate overrides first, then a user manual label,
--- then the game's zone text.
+-- Zone / location: coordinate overrides first, then the game's zone text.
+-- (Owner task 10) The manual-location override is no longer blended into the
+-- captured record — rec.location is always the game-captured zone. The free-text
+-- per-character annotation now lives in the separate Notes field (Store.*Note);
+-- Store.GetManualLocation/SetManualLocation remain for data preservation but are
+-- no longer consumed at capture time.
 local function captureLocation(rec)
-    local nameRealm = rec.nameRealm
     local override = Tracker.ResolveCoordinateOverride()
     if override then
         rec.location = override
-        return
-    end
-    local manual = ns.Store.GetManualLocation(nameRealm)
-    if manual and manual ~= "" then
-        rec.location = manual
         return
     end
     local sub = GetSubZoneText()

@@ -300,6 +300,28 @@ function Dashboard.DecayRemaining(stored, lastUpdate, nowE)
     return math.floor(rem)
 end
 
+-- DMF cooldown remaining (owner task 4 — the "DMFable" tracker, folded onto the
+-- DMF buff row). The engine models the Darkmoon-fortune cooldown as a boolean
+-- (rec.dmfCooldownActive) plus rec.dmfCooldown.offlineSince; the only duration in
+-- the model is the sibling ~8h resting-offline auto-clear (store.lua's private
+-- DMF_OFFLINE_CLEAR + Store.SweepOfflineDMF). We must not touch store.lua here
+-- (a concurrent branch owns it), so: prefer a Store accessor if that branch adds
+-- one, otherwise mirror the 8h rule locally. Returns seconds until the CD would
+-- auto-clear, or 0 when not on cooldown / online (offlineSince == 0 → no clock).
+-- ⚠ The mirrored constant duplicates store.lua's private one; the clean end state
+-- is Store exposing Store.DMFCooldownRemaining and this fallback being deleted.
+local DMF_OFFLINE_CLEAR = 8 * 3600
+local function dmfCooldownRemaining(rec, nowE)
+    if ns.Store and ns.Store.DMFCooldownRemaining then
+        return ns.Store.DMFCooldownRemaining(rec, nowE) or 0
+    end
+    if not (rec and rec.dmfCooldownActive and rec.dmfCooldown) then return 0 end
+    local since = rec.dmfCooldown.offlineSince or 0
+    if since <= 0 then return 0 end
+    local rem = (since + DMF_OFFLINE_CLEAR) - (nowE or now())
+    return rem > 0 and math.floor(rem) or 0
+end
+
 -- "Updated 3m ago" style freshness string from an epoch.
 function Dashboard.FreshnessText(epoch)
     if not epoch or epoch <= 0 then return "no data" end
@@ -511,8 +533,9 @@ Dashboard.tabBuilders = {}   -- id -> build(host) -> tabObj (must expose :Refres
 -- Help sits in a right-aligned group, mirroring the reference's Help/Settings
 -- cluster). Everything else is the left group in declared order.
 local TAB_SLOTS = {
+    -- "Online" tab retired (owner task 11): folded into the 60s ("Characters")
+    -- tab as an All | Online list filter.
     { id = "sixties",   label = "60s",       scope = "faction" },
-    { id = "online",    label = "Online",    scope = "faction" },
     { id = "summoners", label = "Summoners", scope = "faction" },
     { id = "timers",    label = "Timers",    scope = "account" },
     { id = "help",      label = "Help",      scope = "account", align = "right" },
@@ -530,32 +553,57 @@ end
 -- via Dashboard.SetDMFSchedule. Clearly labelled "(est.)" in the status bar.
 ----------------------------------------------------------------------
 
--- Anchor: a Monday when a faire began (2024-02-05 was a Mulgore-week Monday).
-local DMF_ANCHOR   = 1707091200   -- 2024-02-05 00:00 UTC (approx)
-local DMF_PERIOD   = 28 * 86400   -- 4-week cadence
 local DMF_DURATION = 7 * 86400
 local Dmf_override  -- { active, zone, startEpoch, endEpoch }
 
 function Dashboard.SetDMFSchedule(sched) Dmf_override = sched end
 
-function Dashboard.GetDMFSchedule()
-    if Dmf_override then return Dmf_override end
-    local t = now()
-    local phase = (t - DMF_ANCHOR) % DMF_PERIOD
-    local cycleStart = t - phase
-    local active = phase < DMF_DURATION
-    -- Zone alternates each cycle.
-    local cycleIdx = math.floor((cycleStart - DMF_ANCHOR) / DMF_PERIOD)
-    local zone = (cycleIdx % 2 == 0) and "Mulgore" or "Elwynn Forest"
-    if active then
-        return { active = true, zone = zone, startEpoch = cycleStart,
-                 endEpoch = cycleStart + DMF_DURATION, estimated = true }
+-- Day-of-week (0=Sunday .. 6=Saturday) for a Gregorian Y-M-D via Sakamoto's
+-- method — pure arithmetic, no os.* — so the calendar rule is self-testable.
+local DOW_T = { 0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4 }
+local function dayOfWeek(y, m, d)
+    if m < 3 then y = y - 1 end
+    return (y + math.floor(y / 4) - math.floor(y / 100) + math.floor(y / 400) + DOW_T[m] + d) % 7
+end
+
+-- PURE Darkmoon Faire plan for a calendar month (owner task 12). The faire opens
+-- the Monday AFTER the month's first Friday (00:00) and runs 7 days. Zone
+-- alternates by calendar month, anchored so an EVEN month is Mulgore (Aug 2026)
+-- and an ODD month is Elwynn Forest (Jul/Sep 2026). Returns
+-- { firstFriday, opensDay, zone } as day-of-month numbers — no os.* calls.
+function Dashboard.DMFMonthPlan(year, month)
+    local fri = 1
+    for d = 1, 7 do
+        if dayOfWeek(year, month, d) == 5 then fri = d; break end
     end
-    -- Next faire.
-    local nextStart = cycleStart + DMF_PERIOD
-    local nextZone = ((cycleIdx + 1) % 2 == 0) and "Mulgore" or "Elwynn Forest"
-    return { active = false, zone = nextZone, startEpoch = nextStart,
-             endEpoch = nextStart + DMF_DURATION, estimated = true }
+    return { firstFriday = fri, opensDay = fri + 3,   -- Monday after the first Friday
+             zone = (month % 2 == 0) and "Mulgore" or "Elwynn Forest" }
+end
+
+-- Live schedule off the real calendar. `nowOverride` (epoch) is a test seam. Uses
+-- os.time/os.date when present (real in the harness; the harness's global `time`
+-- stub ignores its table argument, so os.time is preferred), else the WoW `time`/
+-- `date` globals in-game. Keeps now()'s clock base for the active/next decision.
+function Dashboard.GetDMFSchedule(nowOverride)
+    if Dmf_override then return Dmf_override end
+    local _time = os.time or time
+    local _date = os.date or date
+    local t = nowOverride or now()
+    local c = _date("*t", t)
+    local y, m = c.year, c.month
+    local function monthWindow(yy, mm)
+        local plan = Dashboard.DMFMonthPlan(yy, mm)
+        local startE = _time({ year = yy, month = mm, day = plan.opensDay, hour = 0, min = 0, sec = 0 })
+        return plan, startE, startE + DMF_DURATION
+    end
+    local plan, startEpoch, endEpoch = monthWindow(y, m)
+    if t >= endEpoch then
+        -- This month's faire has ended — advance to next month's estimate.
+        m = m + 1; if m > 12 then m = 1; y = y + 1 end
+        plan, startEpoch, endEpoch = monthWindow(y, m)
+    end
+    return { active = (t >= startEpoch and t < endEpoch), zone = plan.zone,
+             startEpoch = startEpoch, endEpoch = endEpoch, estimated = true }
 end
 
 ----------------------------------------------------------------------
@@ -1390,7 +1438,17 @@ function Dashboard.BuildDetailPanel(parent)
         return r
     end
 
-    -- Manual-location override editbox (created once; retargeted per Show).
+    -- Per-character Notes editbox (owner task 9 — replaces the old manual-location
+    -- override; Location now shows the game-captured zone only). Reads/writes the
+    -- Store.GetNote/SetNote API being added CONCURRENTLY in store.lua; calls are
+    -- GUARDED so this branch parses + self-tests green standalone before the merge.
+    local function noteGet(nameRealm)
+        if ns.Store and ns.Store.GetNote then return ns.Store.GetNote(nameRealm) end
+        return nil
+    end
+    local function noteSet(nameRealm, text)
+        if ns.Store and ns.Store.SetNote then ns.Store.SetNote(nameRealm, text) end
+    end
     local locBox = CreateFrame("EditBox", nil, child, "BackdropTemplate")
     locBox:SetHeight(22); locBox:SetAutoFocus(false)
     locBox:SetFontObject(UI.fonts.body); locBox:SetTextInsets(8, 8, 0, 0)
@@ -1401,15 +1459,47 @@ function Dashboard.BuildDetailPanel(parent)
     end)
     locBox:SetScript("OnEnterPressed", function(self) self:ClearFocus() end)
     locBox:SetScript("OnEscapePressed", function(self)
-        self:SetText(ns.Store.GetManualLocation(D._current or "") or ""); self:ClearFocus()
+        self:SetText(noteGet(D._current or "") or ""); self:ClearFocus()
     end)
     locBox:SetScript("OnEditFocusLost", function(self)
         if D._current then
             local t = self:GetText()
-            ns.Store.SetManualLocation(D._current, (t ~= "" and t) or nil)
+            noteSet(D._current, (t ~= "" and t) or nil)   -- empty string clears (nil)
         end
     end)
     D.locBox = locBox
+    D._noteGet = noteGet
+
+    -- Chrono + hearth cooldown ICONS (owner task 5): the old Cooldowns text lines
+    -- become an icons-only stack in the panel's top-right, mirroring the roster
+    -- card's corner stack (chrono on top, hearth below; chrono holds a fixed slot
+    -- so hearth never shifts). No text labels — a tooltip carries the old detail.
+    local function detailIcon(size)
+        local f = CreateFrame("Frame", nil, child, "BackdropTemplate")
+        f:SetSize(size, size)
+        local ic = f:CreateTexture(nil, "ARTWORK")
+        ic:SetPoint("TOPLEFT", f, "TOPLEFT", 1, -1)
+        ic:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", -1, 1)
+        ic:SetTexCoord(0.08, 0.92, 0.08, 0.92)
+        f.icon = ic
+        f:EnableMouse(true)
+        f:SetScript("OnEnter", function(self)
+            if not self._tip then return end
+            GameTooltip:SetOwner(self, "ANCHOR_LEFT")
+            for _, ln in ipairs(self._tip) do GameTooltip:AddLine(ln[1], ln[2], ln[3], ln[4]) end
+            GameTooltip:Show()
+        end)
+        f:SetScript("OnLeave", function() GameTooltip:Hide() end)
+        return f
+    end
+    local chronoIcon = detailIcon(18)
+    chronoIcon:SetPoint("TOPRIGHT", child, "TOPRIGHT", 0, -2)
+    local hearthIcon = detailIcon(18)
+    hearthIcon:SetPoint("TOPRIGHT", chronoIcon, "BOTTOMRIGHT", 0, -4)
+    D.chronoIcon, D.hearthIcon = chronoIcon, hearthIcon
+    -- Right-side reserve for the top header lines so they never run under the
+    -- icon stack at narrow panel widths (owner task 5 collision guard).
+    D.ICON_RESERVE = 26
 
     local function hideAll()
         for _, h in ipairs(D._headers) do h:Hide() end
@@ -1417,6 +1507,7 @@ function Dashboard.BuildDetailPanel(parent)
         for _, r in ipairs(D._buffRows) do r:Hide() end
         for _, r in ipairs(D._raidRows) do r:Hide() end
         locBox:Hide()
+        chronoIcon:Hide(); hearthIcon:Hide()
     end
 
     function D:Show(entry)
@@ -1424,9 +1515,18 @@ function Dashboard.BuildDetailPanel(parent)
         if not entry or not entry.rec then
             empty:Show()
             child:SetHeight(1)
+            D._shownId = nil
             return
         end
         empty:Hide()
+        -- Scroll preservation (owner task 6): the shared ~1s ticker re-Shows the
+        -- selected character every tick, which used to snap the scroll to the top.
+        -- The content structure is identical between ticks for the same character
+        -- (only VALUES change), so a full rebuild is geometry-stable — capture the
+        -- offset before the rebuild and restore it (clamped) when the character is
+        -- unchanged; jump to the top only when a DIFFERENT character is selected.
+        local sameChar = (D._shownId ~= nil and D._shownId == entry.nameRealm)
+        local prevScroll = scroll:GetVerticalScroll()
         D._current = entry.nameRealm
         D._entry = entry
         local rec = entry.rec
@@ -1435,17 +1535,18 @@ function Dashboard.BuildDetailPanel(parent)
         local y = 0
         local li, bi, ri, hi = 0, 0, 0, 0
 
-        local function line(text, fontKey, tokenOverride)
+        local function line(text, fontKey, tokenOverride, rightReserve)
             li = li + 1
             local l = getLine(li)
             l:SetFontObject(UI.fonts[fontKey or "body"])
             if tokenOverride then l:SetTextColor(UI.Color(tokenOverride)) end
             l:ClearAllPoints()
             l:SetPoint("TOPLEFT", child, "TOPLEFT", 0, -y)
-            l:SetWidth(W)
+            l:SetWidth(W - (rightReserve or 0))
             l:SetText(text)
             l:Show()
             y = y + (l:GetStringHeight() or 14) + 4
+            return l
         end
         local function header(text)
             hi = hi + 1
@@ -1458,23 +1559,26 @@ function Dashboard.BuildDetailPanel(parent)
             y = y + h.uiHeight + 2
         end
 
-        -- Name (class-colored header).
+        -- Name (class-colored header). Width is reserved on the right so the name
+        -- can't run under the top-right cooldown-icon stack (owner task 5).
+        local RSV = D.ICON_RESERVE or 26
         li = li + 1
         local nameFS = getLine(li)
         nameFS:SetFontObject(UI.fonts.header)
         nameFS:ClearAllPoints()
         nameFS:SetPoint("TOPLEFT", child, "TOPLEFT", 0, -y)
-        nameFS:SetWidth(W)
+        nameFS:SetWidth(W - RSV)
+        nameFS:SetWordWrap(false)
         nameFS:SetText(Dashboard.ColoredName(entry.nameRealm, rec.classTag))
         nameFS:Show()
         y = y + 22
 
-        -- Status + last update.
+        -- Status + last update (right-reserved to clear the icon stack).
         local onlineTxt = entry.online and Dashboard.Colored("Online","ok") or Dashboard.Colored("Offline","faint")
-        line(("Status: %s  |  %s"):format(onlineTxt, Dashboard.FreshnessText(rec.lastDataUpdate)), "muted")
+        line(("Status: %s  |  %s"):format(onlineTxt, Dashboard.FreshnessText(rec.lastDataUpdate)), "muted", nil, RSV)
         -- Meta.
         local acct = (entry.aid ~= "" and entry.aid) or "?"
-        line(("Account %s  |  %s  |  %s"):format(acct, rec.className or "?", rec.faction or "?"), "muted")
+        line(("Account %s  |  %s  |  %s"):format(acct, rec.className or "?", rec.faction or "?"), "muted", nil, RSV)
         -- PvP-flagged warning (parity item 4): red "PVP Flagged" with the
         -- character's faction crest inline (sub-rect of the PvP crest art).
         if rec.pvpFlagged then
@@ -1484,21 +1588,59 @@ function Dashboard.BuildDetailPanel(parent)
             line(crest .. "PVP Flagged", "body", "danger")
         end
 
-        -- Location + source + manual override.
+        -- Top-right cooldown ICONS (owner task 5): icons only, state mirrored from
+        -- the roster card (chrono shows while booned OR on use-CD; hearth always
+        -- shows, desaturated while on CD). Anchored to the child, so they sit
+        -- beside the header block. Tooltips carry what the old text lines said.
+        do
+            local nowE0 = now()
+            hearthIcon.icon:SetTexture(Dashboard.ItemIcon(6948))    -- Hearthstone
+            chronoIcon.icon:SetTexture(Dashboard.ItemIcon(184937))  -- Chronoboon Displacer
+            local chronoRem = Dashboard.DecayRemaining(rec.itemCooldown, rec.lastDataUpdate, nowE0)
+            if rec.chronoboonActive then
+                chronoIcon:Show(); chronoIcon:SetBackdrop(UI.FLAT_BACKDROP)
+                chronoIcon:SetBackdropColor(UI.Color("inset"))
+                chronoIcon:SetBackdropBorderColor(UI.Color((rec.boonCount or 0) == 0 and "danger" or "accent"))
+                chronoIcon.icon:SetDesaturated(false)
+            elseif chronoRem > 0 then
+                chronoIcon:Show(); chronoIcon:SetBackdrop(UI.FLAT_BACKDROP)
+                chronoIcon:SetBackdropColor(UI.Color("inset"))
+                chronoIcon:SetBackdropBorderColor(UI.Color("border"))
+                chronoIcon.icon:SetDesaturated(true)
+            else
+                chronoIcon:Hide()
+            end
+            local hearthRem = Dashboard.DecayRemaining(rec.hearthstoneCD, rec.lastDataUpdate, nowE0)
+            hearthIcon:Show()
+            hearthIcon.icon:SetDesaturated(hearthRem > 0)
+            -- Tooltips (nice-to-have): the old Cooldowns lines' content.
+            local boonState = rec.chronoboonActive and "Active"
+                or (((rec.boonCount or 0) > 0) and "Ready" or "None")
+            local chTip = {{ "Chronoboon Displacer", UI.Color("accent") },
+                { ("%d in bags  ·  %s"):format(rec.boonCount or 0, boonState), UI.Color("text") }}
+            if chronoRem > 0 then chTip[#chTip+1] = { "Cooldown " .. Dashboard.FormatDuration(chronoRem), UI.Color("danger") } end
+            chronoIcon._tip = chTip
+            local hTok = hearthRem > 0 and "danger" or "ok"
+            hearthIcon._tip = {{ "Hearthstone", UI.Color("accent") },
+                { hearthRem > 0 and Dashboard.FormatDuration(hearthRem) or "Ready", UI.Color(hTok) }}
+        end
+
+        -- Location (owner task 9: game-captured zone only — no manual override) +
+        -- a free-text per-character Notes field.
         header("Location")
         line("Current: " .. (rec.location or Dashboard.Colored("Missing location","danger")), "body")
         li = li + 1
-        local lblManual = getLine(li)
-        lblManual:SetFontObject(UI.fonts.small)
-        lblManual:ClearAllPoints()
-        lblManual:SetPoint("TOPLEFT", child, "TOPLEFT", 0, -y)
-        lblManual:SetWidth(W); lblManual:SetText("Manual override:")
-        lblManual:Show()
+        local lblNotes = getLine(li)
+        lblNotes:SetFontObject(UI.fonts.small)
+        lblNotes:ClearAllPoints()
+        lblNotes:SetPoint("TOPLEFT", child, "TOPLEFT", 0, -y)
+        lblNotes:SetWidth(W); lblNotes:SetText("Notes:")
+        lblNotes:Show()
         y = y + 16
         locBox:ClearAllPoints()
         locBox:SetPoint("TOPLEFT", child, "TOPLEFT", 0, -y)
         locBox:SetWidth(math.min(280, W))
-        locBox:SetText(ns.Store.GetManualLocation(entry.nameRealm) or "")
+        locBox:SetText(noteGet(entry.nameRealm) or "")
         locBox:Show()
         y = y + 26
 
@@ -1521,6 +1663,7 @@ function Dashboard.BuildDetailPanel(parent)
                 -- Row label is "ABBR - Full Name" (parity item 3), e.g.
                 -- "DMF - Sayge's Dark Fortune", "SF - Songflower Serenade".
                 local label = ("%s - %s"):format(meta.short, meta.name)
+                local baseVal, baseTok
                 if present then
                     local th = Dashboard.GetThreshold(entry.faction or rec.faction, meta.thresholdKey)
                     local tok = Dashboard.AuraColorToken(st.duration, th)
@@ -1537,49 +1680,45 @@ function Dashboard.BuildDetailPanel(parent)
                     r.icon:SetDesaturated(false); r.icon:SetVertexColor(1, 1, 1); r.icon:SetAlpha(1)
                     r.name:SetText(label); r.name:SetTextColor(UI.Color(tok))
                     local annot = booned and " (Boon)" or ""
-                    r.val:SetText(Dashboard.FormatDuration(st.duration) .. annot)
-                    r.val:SetTextColor(UI.Color(tok))
+                    baseVal, baseTok = Dashboard.FormatDuration(st.duration) .. annot, tok
                 else
-                    -- Missing + applicable: greyed icon; "ABBR - Full Name" +
-                    -- "Missing" in danger (required) or warn/amber (optional).
-                    -- When a chronoboon is active but this slot was not captured
-                    -- as boon contents, it reads "UNBOONED" (parity item 37).
+                    -- Missing + applicable: greyed icon; "ABBR - Full Name" + a red
+                    -- "MISSING" (owner task 3 — was "Missing"/"UNBOONED"). Required
+                    -- stays danger; optional keeps its warn/amber treatment.
                     local tok = (requirement == "optional") and warnToken() or "danger"
                     r.icon:SetDesaturated(true); r.icon:SetVertexColor(0.7, 0.7, 0.7); r.icon:SetAlpha(0.5)
                     r.name:SetText(label); r.name:SetTextColor(UI.Color(tok))
-                    local missTxt = rec.chronoboonActive and "UNBOONED" or "Missing"
-                    r.val:SetText(missTxt); r.val:SetTextColor(UI.Color(tok))
+                    baseVal, baseTok = "MISSING", tok
                 end
+                -- DMF-ability parenthetical (owner task 4): on the DMF row only,
+                -- append the Darkmoon-fortune cooldown state IN ADDITION to the
+                -- buff-state label — green "(READY)" when a new fortune can be
+                -- taken, else the remaining cooldown in red. Inline-tokened so it
+                -- keeps its own colour beside the row's state colour.
+                if meta.key == "dmf" then
+                    local par, ptok
+                    if not rec.dmfCooldownActive then
+                        par, ptok = "(READY)", "ok"
+                    else
+                        local rem = dmfCooldownRemaining(rec, now())
+                        if rem > 0 then par, ptok = "(" .. Dashboard.FormatDuration(rem) .. ")", "danger"
+                        else par, ptok = "(on CD)", "danger" end
+                    end
+                    baseVal = baseVal .. "  " .. Dashboard.Colored(par, ptok)
+                end
+                r.val:SetText(baseVal); r.val:SetTextColor(UI.Color(baseTok))
                 r:Show()
                 y = y + 22
             end
         end
 
-        -- Cooldowns (parity item 5): boon count + Chronoboon icon + Active/Ready;
-        -- DMF state (in Boon / DMFable / on cooldown) with freshness; Hearthstone
-        -- Ready/countdown; warlock soul shards.
-        header("Cooldowns")
-        local boonIcon = ("|T%s:14:14|t"):format(Dashboard.ItemIcon(184937))  -- Chronoboon Displacer
-        local boonState = rec.chronoboonActive and Dashboard.Colored("Active", "ok")
-            or (((rec.boonCount or 0) > 0) and Dashboard.Colored("Ready", "ok") or Dashboard.Colored("None", "faint"))
-        local chronoCDrem = Dashboard.DecayRemaining(rec.itemCooldown, rec.lastDataUpdate, now())
-        local chronoLine = ("Chronoboon: %s %d in bags · %s"):format(boonIcon, rec.boonCount or 0, boonState)
-        if chronoCDrem > 0 then
-            chronoLine = chronoLine .. " · " .. Dashboard.Colored("CD " .. Dashboard.FormatDuration(chronoCDrem), "muted")
-        end
-        line(chronoLine, "body")
-        local dmfState
-        if rec.dmfInBoon then dmfState = Dashboard.Colored("in Boon", "ok")
-        elseif rec.dmfCooldownActive then dmfState = Dashboard.Colored("on cooldown", "muted")
-        else dmfState = Dashboard.Colored("DMFable", "ok") end
-        line(("Darkmoon fortune: %s · %s"):format(dmfState, Dashboard.FreshnessText(rec.lastDataUpdate)), "body")
-        local hearthCDrem = Dashboard.DecayRemaining(rec.hearthstoneCD, rec.lastDataUpdate, now())
-        if hearthCDrem > 0 then
-            line("Hearthstone: " .. Dashboard.FormatDuration(hearthCDrem), "body")
-        else
-            line("Hearthstone: Ready", "body")
-        end
+        -- Cooldowns (owner task 5): the chronoboon + hearthstone cooldowns now
+        -- render as the icons-only stack in the panel's top-right, and the Darkmoon
+        -- fortune state moved onto its buff row (owner task 4). The section header
+        -- is therefore dropped entirely for the common case; only warlocks keep a
+        -- section (soul-shard count) so no EMPTY section header is ever shown.
         if rec.classTag == "WARLOCK" then
+            header("Cooldowns")
             line("Soul shards: " .. (rec.shardCount or 0), "body")
         end
 
@@ -1615,7 +1754,17 @@ function Dashboard.BuildDetailPanel(parent)
         end
 
         child:SetHeight(math.max(y + 8, 1))
-        scroll:SetVerticalScroll(0)
+        -- Scroll preservation (owner task 6): jump to the top only when a DIFFERENT
+        -- character was just selected; when the same character is re-Shown (the ~1s
+        -- ticker, or a resize relayout), keep the reader's scroll offset, clamped to
+        -- the new content height.
+        if sameChar then
+            local maxs = math.max(0, child:GetHeight() - scroll:GetHeight())
+            scroll:SetVerticalScroll(math.min(prevScroll, maxs))
+        else
+            scroll:SetVerticalScroll(0)
+        end
+        D._shownId = entry.nameRealm
     end
 
     box:SetScript("OnSizeChanged", function()
@@ -1655,9 +1804,44 @@ function Dashboard.BuildRosterPane(host, opts)
     local title = fs(left, "accent")
     title:SetPoint("TOPLEFT", left, "TOPLEFT", 10, -8)
     title:SetText(opts.listTitle or "Roster")
-    local hint = fs(left, "small")
-    hint:SetPoint("TOPRIGHT", left, "TOPRIGHT", -10, -10)
-    hint:SetText(opts.listHint or "")
+    if opts.enableOnlineFilter then
+        -- "All | Online" list filter (owner task 11 — replaces the Online tab), in
+        -- the header's right slot where the hint used to sit. Default All (current
+        -- online-first behavior); Online filters to currently-online characters.
+        -- State persists in UI settings (additive key), and re-tints each Refresh
+        -- so it tracks theme changes.
+        R._onlineOnly = uiState().sixtiesOnlineOnly and true or false
+        local bar = CreateFrame("Frame", nil, left)
+        bar:SetPoint("TOPRIGHT", left, "TOPRIGHT", -10, -8)
+        bar:SetSize(96, 16)
+        local onBtn = CreateFrame("Button", nil, bar)
+        local onT = onBtn:CreateFontString(nil, "OVERLAY"); onT:SetFontObject(UI.fonts.small)
+        onT:SetText("Online"); onT:SetPoint("RIGHT", bar, "RIGHT", 0, 0)
+        onBtn:SetAllPoints(onT)
+        local sep = fs(bar, "small"); sep:SetText("|"); sep:SetPoint("RIGHT", onT, "LEFT", -4, 0)
+        local allBtn = CreateFrame("Button", nil, bar)
+        local allT = allBtn:CreateFontString(nil, "OVERLAY"); allT:SetFontObject(UI.fonts.small)
+        allT:SetText("All"); allT:SetPoint("RIGHT", sep, "LEFT", -4, 0)
+        allBtn:SetAllPoints(allT)
+        local function paint()
+            sep:SetTextColor(UI.Color("faint"))
+            allT:SetTextColor(UI.Color(R._onlineOnly and "muted" or "accent"))
+            onT:SetTextColor(UI.Color(R._onlineOnly and "accent" or "muted"))
+        end
+        local function setMode(onlineOnly)
+            R._onlineOnly = onlineOnly and true or false
+            uiState().sixtiesOnlineOnly = R._onlineOnly
+            paint(); R.Refresh()
+        end
+        allBtn:SetScript("OnClick", function() setMode(false) end)
+        onBtn:SetScript("OnClick", function() setMode(true) end)
+        R._filterPaint = paint
+        paint()
+    else
+        local hint = fs(left, "small")
+        hint:SetPoint("TOPRIGHT", left, "TOPRIGHT", -10, -10)
+        hint:SetText(opts.listHint or "")
+    end
 
     local listScroll = CreateFrame("ScrollFrame", nil, left)
     listScroll:SetPoint("TOPLEFT", left, "TOPLEFT", 8, -28)
@@ -1718,7 +1902,13 @@ function Dashboard.BuildRosterPane(host, opts)
     R.Select = selectEntry
 
     function R.Refresh()
+        if R._filterPaint then R._filterPaint() end   -- keep toggle tint theme-current
         local roster = opts.gather()
+        if opts.enableOnlineFilter and R._onlineOnly then
+            local filtered = {}
+            for _, e in ipairs(roster) do if e.online then filtered[#filtered + 1] = e end end
+            roster = filtered
+        end
         R._ordered = roster
         local W = listScroll:GetWidth(); if W < 1 then W = LIST_W - 16 end
         listChild:SetWidth(W)
@@ -1735,8 +1925,16 @@ function Dashboard.BuildRosterPane(host, opts)
             y = y + cardH + 6
         end
         listChild:SetHeight(math.max(y, 1))
-        -- List empty-state (e.g. Online tab with nobody online).
-        if R._emptyLabel then R._emptyLabel:SetShown(#roster == 0 and (opts.emptyText or "") ~= "") end
+        -- List empty-state. With the All | Online filter (owner task 11) the
+        -- message reflects the active mode.
+        if R._emptyLabel then
+            local emptyText = opts.emptyText or ""
+            if opts.enableOnlineFilter then
+                emptyText = R._onlineOnly and "No characters online" or "No characters tracked"
+                R._emptyLabel:SetText(emptyText)
+            end
+            R._emptyLabel:SetShown(#roster == 0 and emptyText ~= "")
+        end
         -- Keep detail current for the selected entry (data may have changed).
         if R._selected then
             for _, e in ipairs(roster) do
@@ -1939,11 +2137,43 @@ local function testDecayRemaining(fails)
     ck(Dashboard.DecayRemaining(nil, nil, 1000) == 0, "nil stored -> 0")
 end
 
+-- Self-test: DMF calendar rule (owner task 12). The pure DMFMonthPlan drives the
+-- first-Friday / opens-Monday / alternating-zone math; GetDMFSchedule (with a
+-- test-seam `now`) covers mid-faire active-with-end and the month rollover.
+local function testDMFSchedule(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local aug = Dashboard.DMFMonthPlan(2026, 8)
+    ck(aug.firstFriday == 7, "Aug 2026 first Friday == 7 (got " .. tostring(aug.firstFriday) .. ")")
+    ck(aug.opensDay == 10, "Aug 2026 opens Mon == 10 (got " .. tostring(aug.opensDay) .. ")")
+    ck(aug.zone == "Mulgore", "Aug 2026 zone == Mulgore")
+    local sep = Dashboard.DMFMonthPlan(2026, 9)
+    ck(sep.firstFriday == 4, "Sep 2026 first Friday == 4 (got " .. tostring(sep.firstFriday) .. ")")
+    ck(sep.opensDay == 7, "Sep 2026 opens Mon == 7")
+    ck(sep.zone == "Elwynn Forest", "Sep 2026 zone == Elwynn Forest")
+    ck(Dashboard.DMFMonthPlan(2026, 7).zone == "Elwynn Forest", "Jul 2026 (odd) zone == Elwynn Forest")
+
+    -- Live-window cases via the test seam. Build reference epochs the same way
+    -- GetDMFSchedule does so timezone handling matches.
+    local _time = os.time or time
+    local augOpen = _time({ year = 2026, month = 8, day = 10, hour = 0, min = 0, sec = 0 })
+    local mid = Dashboard.GetDMFSchedule(augOpen + 3 * 86400)   -- Aug 13, mid-faire
+    ck(mid.active == true, "mid-faire -> active")
+    ck(mid.zone == "Mulgore", "mid-faire -> Mulgore")
+    ck(mid.endEpoch == augOpen + DMF_DURATION, "mid-faire end == open + 7d")
+    local roll = Dashboard.GetDMFSchedule(augOpen + 9 * 86400)  -- Aug 19, past Aug end
+    ck(roll.active == false, "post-Aug pre-Sep -> not active")
+    ck(roll.zone == "Elwynn Forest", "post-Aug rollover -> Sep Elwynn Forest")
+    local before = Dashboard.GetDMFSchedule(augOpen - 2 * 86400) -- Aug 8, before this month's faire
+    ck(before.active == false, "before Aug open -> not active")
+    ck(before.zone == "Mulgore", "before Aug open -> shows Aug Mulgore")
+end
+
 if ns.RegisterSelfTest then
     ns:RegisterSelfTest("dashboard", function(verbose)
         local cases = {
             { name = "aura class rules", fn = testAuraClassRules },
             { name = "cooldown decay", fn = testDecayRemaining },
+            { name = "dmf schedule", fn = testDMFSchedule },
         }
         local allPass = true
         for _, c in ipairs(cases) do
