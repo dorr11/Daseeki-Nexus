@@ -22,3 +22,5 @@ timers.lua
 auto.lua
 interact.lua
 options.lua
+syncns.lua
+import.lua
