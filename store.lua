@@ -137,6 +137,19 @@ local function defaultFactionBlock()
             -- per-class required/optional/ignored maps for Rend & Battle Shout
             rend        = { required = {}, optional = {}, ignored = {} },
             battleShout = { required = {}, optional = {}, ignored = {} },
+            -- Slip'kik's Savvy (DMT SP): physical damage users typically don't
+            -- want it, so Warrior/Rogue/Hunter default to IGNORED (hidden from
+            -- their cards); every caster/hybrid defaults to OPTIONAL (greyed,
+            -- no border, when missing). Owner-adjustable in the Auras page; the
+            -- three maps carry all 9 classes explicitly so the defaults are
+            -- self-documenting (absence would also read as ignored). Faction
+            -- filtering happens in the UI, so both factions share these seeds.
+            dmtSP       = {
+                required = {},
+                optional = { MAGE = true, WARLOCK = true, PRIEST = true,
+                             DRUID = true, PALADIN = true, SHAMAN = true },
+                ignored  = { WARRIOR = true, ROGUE = true, HUNTER = true },
+            },
         },
     }
 end

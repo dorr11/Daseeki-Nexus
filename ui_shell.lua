@@ -340,11 +340,14 @@ end
 -- on what a MISSING slot should look like.
 --
 -- Rules (spec §1):
---   * Rend (slot 2) is governed by the per-class rule map
---     GetFactionSettings().auraOpts.rend {required|optional|ignored}[class].
---     Ignored classes are non-applicable (hidden).
---   * Every other threshold-bearing world buff (Ony/ZG/Songflower/DMF/DMT×3)
---     is required-by-default: applicable + "required" for everyone.
+--   * Rend (slot 2) and Slip'kik's Savvy / DMT SP (slot 8) are governed by
+--     per-class rule maps GetFactionSettings().auraOpts.{rend,dmtSP}
+--     {required|optional|ignored}[class] (see CLASS_RULED_KEYS). Ignored
+--     classes are non-applicable (hidden); optional = greyed-no-border when
+--     missing; required = danger border / red "Missing". Slip'kik defaults
+--     physical classes (War/Rogue/Hunter) to ignored, casters to optional.
+--   * Every other threshold-bearing world buff (Ony/ZG/Songflower/DMF/DMT AP/
+--     DMT Stam) is required-by-default: applicable + "required" for everyone.
 --   * The two tail slots without a threshold key (Silithyst, Boon of Blackfathom)
 --     are OPTIONAL and treated as non-applicable when ABSENT, so they collapse
 --     out of the strip/detail instead of littering every card with two grey
@@ -356,7 +359,13 @@ end
 --     row (the engine still consumes it elsewhere).
 ----------------------------------------------------------------------
 
--- Class rule state for an aura opt map ("rend"/"battleShout") on a faction.
+-- Threshold keys whose applicability is governed by a per-class
+-- required/optional/ignored map in auraOpts (keyed identically to the
+-- thresholdKey). Rend was the first; Slip'kik's Savvy (dmtSP) joins it so
+-- physical classes hide it by default while casters see it as optional.
+local CLASS_RULED_KEYS = { rend = true, dmtSP = true }
+
+-- Class rule state for an aura opt map ("rend"/"battleShout"/"dmtSP") on a faction.
 function Dashboard.ClassRuleState(optKey, classTag, faction)
     if not classTag then return "ignored" end
     local fs = ns.Store and ns.Store.GetFactionSettings and ns.Store.GetFactionSettings(faction)
@@ -372,8 +381,8 @@ end
 function Dashboard.AuraRequirement(slot, rec, faction)
     local meta = Dashboard.AURA_META[slot]
     if not meta then return false end
-    if meta.thresholdKey == "rend" then
-        local st = Dashboard.ClassRuleState("rend", rec and rec.classTag, faction)
+    if meta.thresholdKey and CLASS_RULED_KEYS[meta.thresholdKey] then
+        local st = Dashboard.ClassRuleState(meta.thresholdKey, rec and rec.classTag, faction)
         if st == "ignored" then return false, "optional" end
         return true, st
     end
@@ -1847,3 +1856,49 @@ Dashboard.RegisterTab("help", function(host)
     pane:Layout()
     return { Refresh = function() pane:Layout() end }
 end)
+
+----------------------------------------------------------------------
+-- Self-test: class-rule aura applicability matrix (spec §5). Verifies the
+-- Slip'kik's Savvy (dmtSP) class rule drives Dashboard.AuraRequirement the same
+-- way Rend does: ignored class => hidden (collapses when missing); optional =>
+-- greyed/no-border yellow when missing; required => danger/red "Missing".
+-- Registered as suite "dashboard" so the headless harness exercises it.
+----------------------------------------------------------------------
+
+local function testAuraClassRules(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local SP_SLOT, REND_SLOT, FAC = 8, 2, "Alliance"
+    -- Ignored default (Rogue): non-applicable -> hidden / collapses when missing.
+    local appl = Dashboard.AuraRequirement(SP_SLOT, { classTag = "ROGUE" }, FAC)
+    ck(appl == false, "dmtSP Rogue (ignored) is non-applicable (hidden)")
+    -- Optional default (Mage): applicable + optional -> amber "Missing".
+    local a2, r2 = Dashboard.AuraRequirement(SP_SLOT, { classTag = "MAGE" }, FAC)
+    ck(a2 == true and r2 == "optional", "dmtSP Mage (optional) is applicable+optional")
+    -- Required (flip Warrior required, then restore): applicable + required (red).
+    local o = ns.Store.GetFactionSettings(FAC).auraOpts.dmtSP
+    local pReq, pIgn = o.required.WARRIOR, o.ignored.WARRIOR
+    o.ignored.WARRIOR = nil; o.required.WARRIOR = true
+    local a3, r3 = Dashboard.AuraRequirement(SP_SLOT, { classTag = "WARRIOR" }, FAC)
+    ck(a3 == true and r3 == "required", "dmtSP Warrior (required) is applicable+required")
+    o.required.WARRIOR = pReq; o.ignored.WARRIOR = pIgn   -- restore defaults
+    -- Regression guard: Rend stays class-ruled (empty default map => hidden).
+    local a4 = Dashboard.AuraRequirement(REND_SLOT, { classTag = "MAGE" }, FAC)
+    ck(a4 == false, "rend default (no class in map) stays hidden")
+    -- Regression guard: a non-class-ruled buff (ZG, slot 3) stays required.
+    local a5, r5 = Dashboard.AuraRequirement(3, { classTag = "ROGUE" }, FAC)
+    ck(a5 == true and r5 == "required", "ZG stays required-by-default (not class-ruled)")
+end
+
+if ns.RegisterSelfTest then
+    ns:RegisterSelfTest("dashboard", function(verbose)
+        local fails = {}
+        local ok = pcall(testAuraClassRules, fails)
+        local passed = ok and #fails == 0
+        if verbose and ns and ns.Print then
+            if passed then ns:Print("  PASS dashboard/aura class rules")
+            elseif not ok then ns:Print("  FAIL dashboard/aura class rules :: error in test")
+            else for _, f in ipairs(fails) do ns:Print("  FAIL dashboard/aura class rules :: " .. f) end end
+        end
+        return passed
+    end)
+end

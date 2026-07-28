@@ -370,6 +370,10 @@ function Import._MapFaction(f)
             thresholds  = mapThresholds(ao.thresholds),
             rend        = invertClassMap(ao.rendClasses),
             battleShout = invertClassMap(ao.bsClasses),
+            -- Slip'kik's Savvy (dmtSP) is a Nexus-only class rule — SN has no
+            -- source map, so we emit NOTHING here. _Apply's overwriteMerge only
+            -- replaces keys present in this partial, so the store's dmtSP default
+            -- (physical=ignored, casters=optional) survives an import untouched.
         },
     }
 end
@@ -844,6 +848,9 @@ local function selfTest(verbose)
     check("faction thresholds->keys (slot2->ony)", fac.auraOpts.thresholds.ony and fac.auraOpts.thresholds.ony.minimum == 90)
     check("faction thresholds->keys (slot8->rend)", fac.auraOpts.thresholds.rend and fac.auraOpts.thresholds.rend.normal == 800)
     check("faction thresholds unset slot nil", fac.auraOpts.thresholds.zg == nil)
+    -- Slip'kik's Savvy (dmtSP) is Nexus-only: the importer must emit no map, so
+    -- overwriteMerge leaves the store's dmtSP default intact after an import.
+    check("faction dmtSP not imported (default survives)", fac.auraOpts.dmtSP == nil)
     check("faction zanza priority", fac.autoQuest.zanza.priority.spirit == true)
     check("faction interact dropped", fac.autoInteract == nil)
     check("faction whitelist", fac.autoGroup.whitelist["A-B"] == true)

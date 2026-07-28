@@ -70,6 +70,9 @@ local TRIGGER_DEFS = {
 -- (melee/hunter only, per spec §2).
 local REND_CLASSES = { "WARRIOR", "PALADIN", "HUNTER", "ROGUE", "PRIEST", "SHAMAN", "MAGE", "WARLOCK", "DRUID" }
 local BS_CLASSES   = { "WARRIOR", "ROGUE", "HUNTER" }
+-- Slip'kik's Savvy / DMT SP covers all 9 classes (same as Rend); defaults live
+-- in store.lua (physical = ignored, casters = optional), editable per faction.
+local SLIPKIK_CLASSES = { "WARRIOR", "PALADIN", "HUNTER", "ROGUE", "PRIEST", "SHAMAN", "MAGE", "WARLOCK", "DRUID" }
 local CLASS_LABEL  = {
     WARRIOR = "Warrior", PALADIN = "Paladin", HUNTER = "Hunter", ROGUE = "Rogue",
     PRIEST = "Priest", SHAMAN = "Shaman", MAGE = "Mage", WARLOCK = "Warlock", DRUID = "Druid",
@@ -581,6 +584,7 @@ function Options.CopyFaction(from, to)
             -- not thresholds).
             dst.auraOpts.rend = clone(src.auraOpts.rend)
             dst.auraOpts.battleShout = clone(src.auraOpts.battleShout)
+            dst.auraOpts.dmtSP = clone(src.auraOpts.dmtSP)
             ns:Print(from .. " → " .. to .. " copied.")
             refreshPage("general")
         end,
@@ -1171,6 +1175,9 @@ local function buildAuras(flow)
     -- ── Rend / Battle Shout class rules (cycling buttons) ─────────────────────
     buildClassRuleGrid(flow, "Rend — Required Classes", "rend", REND_CLASSES)
     buildClassRuleGrid(flow, "Battle Shout — Required Classes", "battleShout", BS_CLASSES)
+    -- Slip'kik's Savvy (DMT SP): physical damage users typically don't want it,
+    -- so it ships ignored for War/Rogue/Hunter and optional for casters.
+    buildClassRuleGrid(flow, "Slip'kik's Savvy (DMT SP) — Required Classes", "dmtSP", SLIPKIK_CLASSES)
 end
 
 -- A grid of cycling buttons: each class steps Required → Optional → Ignored.
