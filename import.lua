@@ -120,14 +120,26 @@ end
 
 -- Our alert matrix is keyed by faction-split buff keys; SN's alert matrix uses
 -- faction-agnostic keys. Expansion: an SN "ony" entry seeds BOTH onyH & onyA.
--- SN "dmf" has no buff-key home in our ALERT_BUFF_KEYS -> dropped (documented).
+-- R3 item 24: DMF now HAS a buff-row home (buffGain), so it maps to our "dmf".
 local ALERT_BUFF_EXPANSION = {
     rend        = { "rend" },
     ony         = { "onyH", "onyA" },
     nef         = { "nefH", "nefA" },
     zan         = { "zg" },
     battleshout = { "battleShout" },
-    -- dmf = nil  (intentionally unmapped; no faction/world-buff slot for it)
+    dmf         = { "dmf" },
+}
+
+-- Per-event default sound key (mirrors Store.ALERT_EVENT_SOUND) so an SN row with
+-- a sound enabled but an unmappable token still lands on a sensible key.
+local ALERT_EVENT_DEFAULT_SOUND = {
+    questHandin  = "QuestListOpen",
+    pullTimer    = "RaidWarning",
+    npcDied      = "TellMessage",
+    npcRespawned = "TellMessage",
+    cdWarning    = "AuctionWindowOpen",
+    cdExpired    = "ReadyCheck",
+    buffGain     = "CheckboxOn",
 }
 
 -- SN dmfBuffTypes / auraOpts states are passed through verbatim (same string
@@ -253,20 +265,24 @@ Import._InvertClassMap = invertClassMap
 -- positionally; our store keys them by aura name, so the importer resolves the
 -- ordinal here. Keys MUST match options.lua AURA_DEFS exactly.
 local AURA_SLOT_KEY = {
-    "dmf", "ony", "dmtAP", "dmtSP", "dmtStam", "songflower", "zg", "rend", "battleShout",
+    "dmf", "ony", "dmtAP", "dmtSP", "dmtStam", "songflower", "zg", "rend",
+    "battleShout", "fff",   -- item 23/36: FFF is the 10th positional slot
 }
 
 -- Which summon trigger key (auto.lua SUMMON_TRIGGER_BUFFS) each aura slot maps
--- to. dmf (slot 1) and battleShout (slot 9) have no summon trigger and are
--- skipped. Keys MUST match auto.lua Auto.SUMMON_TRIGGER_BUFFS.
+-- to. R3 item 23: ALL 10 world buffs are summon triggers now (dmf/battleShout/
+-- fff gained triggers). Keys MUST match auto.lua Auto.SUMMON_TRIGGER_BUFFS.
 local AURA_SLOT_TRIGGER = {
-    [2] = "dragonslayer",  -- ony  -> Rallying Cry of the Dragonslayer
-    [3] = "fengus",        -- dmtAP
-    [4] = "slipkik",       -- dmtSP
-    [5] = "moldar",        -- dmtStam
-    [6] = "songflower",    -- songflower
-    [7] = "zandalar",      -- zg
-    [8] = "warchief",      -- rend -> Warchief's Blessing
+    [1]  = "dmf",          -- Sayge's Dark Fortune
+    [2]  = "dragonslayer", -- ony  -> Rallying Cry of the Dragonslayer
+    [3]  = "fengus",       -- dmtAP
+    [4]  = "slipkik",      -- dmtSP
+    [5]  = "moldar",       -- dmtStam
+    [6]  = "songflower",   -- songflower
+    [7]  = "zandalar",     -- zg
+    [8]  = "warchief",     -- rend -> Warchief's Blessing
+    [9]  = "battleShout",  -- Battle Shout
+    [10] = "fff",          -- seasonal FFF
 }
 
 -- Map SN's positional {normal,minimum} threshold array onto our NAMED aura
@@ -316,12 +332,15 @@ function Import._MapFaction(f)
             acceptFromGuild   = ag.acceptFromGuild,
             acceptFromFriends = ag.acceptFromFriends,
             acceptFromAnyone  = ag.acceptFromAnyone,
+            -- Per-category whisper-invite send gates (item 22) — now first-class.
             sendToRoster      = ag.sendToRoster,
+            sendToGuild       = ag.sendToGuild,
+            sendToFriends     = ag.sendToFriends,
+            sendToAnyone      = ag.sendToAnyone,
             inviteKeyword     = ag.inviteKeyword,
             whitelist         = deepCopy(ag.inviteWhitelist) or {},
+            whitelistEnabled  = ag.inviteWhitelistEnabled,   -- item 35 (was dropped)
             defaultsApplied   = ag.inviteWhitelistDefaultsApplied,
-            -- SN sendToGuild/sendToFriends/sendToAnyone/inviteWhitelistEnabled
-            -- have no slot in our simplified send model (sendToRoster only).
         },
         autoSummon = {
             enabled         = as.enabled,
@@ -394,6 +413,9 @@ local ALERT_EVENTS = {
     "cdWarning", "cdExpired", "buffGain",
 }
 
+-- Output is EVENT-MAJOR (R3 item 14): out[eventType][ourBuffKey] =
+--   { notify, chat, flash, sound = <soundKey> }, where sound is now a HUD.SOUNDS
+-- KEY string ("None" = silent) mapped from SN's per-row sound token (item 14).
 function Import._MapAlertMatrix(snAlerts)
     local out = {}
     local entries = 0
@@ -406,16 +428,22 @@ function Import._MapAlertMatrix(snAlerts)
                 if targets and type(cell) == "table" then
                     -- SN's per-cell `enabled=false` disables every channel.
                     local on = cell.enabled ~= false
+                    -- Per-row sound token -> our SoundKit key; unmapped-but-set
+                    -- falls back to the event's default key; off/none -> "None".
+                    local soundKey = "None"
+                    if on and cell.sound ~= nil and cell.sound ~= "none" and cell.sound ~= "" then
+                        soundKey = mapSound(cell.sound)
+                            or ALERT_EVENT_DEFAULT_SOUND[evt] or "RaidWarning"
+                    end
                     local mapped = {
                         notify = on and (cell.notify or false) or false,
                         chat   = on and (cell.chat or false) or false,
                         flash  = on and (cell.flash or false) or false,
-                        sound  = on and (cell.sound ~= nil and cell.sound ~= "none"
-                                          and cell.sound ~= "") or false,
+                        sound  = soundKey,
                     }
+                    out[evt] = out[evt] or {}
                     for _, ourBuff in ipairs(targets) do
-                        out[ourBuff] = out[ourBuff] or {}
-                        out[ourBuff][evt] = deepCopy(mapped)
+                        out[evt][ourBuff] = deepCopy(mapped)
                         entries = entries + 1
                     end
                 end
@@ -448,8 +476,16 @@ function Import._MapTimerSettings(t)
             -- SN has a single master `showFelwoodPins`; our store splits pins.
             showFlowerPins = t.showFelwoodPins,
             showTuberPins  = t.showFelwoodPins,
+            -- Legacy single sizes (kept for back-compat).
             worldPinSize   = t.wmFlowerIconSize,
             minimapPinSize = t.mmFlowerIconSize,
+            -- Full 5-field pin sizing (item 26). SN's per-node icon sizes map 1:1;
+            -- nil leaves our store default for any field SN doesn't carry.
+            worldFlowerSize   = t.wmFlowerIconSize,
+            worldTuberSize    = t.wmTuberIconSize,
+            worldTimerFont    = t.wmTimerFontSize,
+            minimapFlowerSize = t.mmFlowerIconSize,
+            minimapTuberSize  = t.mmTuberIconSize,
             -- Songflower display durations (nil leaves our store default).
             flowerMinusDuration = t.flowerMinusTimerDuration,
             flowerUpDuration    = t.flowerUpDuration,
@@ -502,12 +538,12 @@ function Import._MapSettings(sn)
         },
         mesh = {
             token            = mesh.meshToken,     -- 6-char SN token; our validation is non-empty
+            channel          = mesh.mainChannel,   -- item 38: the owner's SN channel name
+                                                   -- carries over so his accounts reconnect
             enabled          = mesh.mainEnabled,
             optOut           = mesh.meshOptOut,
             bondChannels     = deepCopy(mesh.bondChannels) or { "", "", "" },
             autoLeaveChannel = mesh.autoLeaveEnabled,
-            -- SN mainChannel name is not carried: our channel is derived from
-            -- the token (Mesh.GetChannelName).
         },
         classColors         = deepCopy(sn.classColors) or {},
         coordinateOverrides = coords,
@@ -753,19 +789,21 @@ local function selfTest(verbose)
     check("invert ignored", inv.ignored.HUNTER == true)
     check("invert absent", inv.optional.WARRIOR == nil)
 
-    -- Alert transpose + buff expansion + sound-string->bool + enabled gate.
+    -- Alert transpose (EVENT-MAJOR) + buff expansion + sound token->key + gate.
     local am = Import._MapAlertMatrix({
         pullTimer = {
             ony  = { enabled = true, notify = true, chat = false, flash = true, sound = "clear_announce" },
             zan  = { enabled = false, notify = true, chat = true, flash = true, sound = "bell" },
-            dmf  = { enabled = true, notify = true, sound = "bell" },  -- no target
+        },
+        buffGain = {
+            dmf  = { enabled = true, notify = true, sound = "bell" },  -- item 24: dmf now maps
         },
     })
-    check("alert transpose ony->onyH", am.onyH and am.onyH.pullTimer and am.onyH.pullTimer.notify == true)
-    check("alert ony->onyA duplicated", am.onyA and am.onyA.pullTimer and am.onyA.pullTimer.flash == true)
-    check("alert sound name->bool", am.onyH.pullTimer.sound == true)
-    check("alert zan->zg disabled gate", am.zg and am.zg.pullTimer and am.zg.pullTimer.notify == false and am.zg.pullTimer.sound == false)
-    check("alert dmf dropped", am.dmf == nil)
+    check("alert event-major ony->onyH", am.pullTimer and am.pullTimer.onyH and am.pullTimer.onyH.notify == true)
+    check("alert ony->onyA duplicated", am.pullTimer.onyA and am.pullTimer.onyA.flash == true)
+    check("alert sound token->key", am.pullTimer.onyH.sound == "RaidWarning")
+    check("alert zan->zg disabled gate", am.pullTimer.zg and am.pullTimer.zg.notify == false and am.pullTimer.zg.sound == "None")
+    check("alert dmf maps to buffGain.dmf", am.buffGain and am.buffGain.dmf and am.buffGain.dmf.sound == "AuctionWindowOpen")
 
     -- coordinateOverrides point+tol -> box, empties skipped.
     local co = Import._MapCoordinateOverrides({
@@ -783,10 +821,14 @@ local function selfTest(verbose)
     -- thresholds/triggers (canonical aura order). (Interact feature was cut.)
     local fac = Import._MapFaction({
         autoQuest = { zanzaEnabled = true, zanzaPicks = { spirit = true } },
-        -- buffTriggers slots: 1=dmf(skip) 2=ony 3=dmtAP; so ony->dragonslayer=false,
-        -- dmtAP->fengus=true, dmf dropped.
+        -- buffTriggers slots: 1=dmf 2=ony 3=dmtAP -> dmf=true, dragonslayer=false,
+        -- fengus=true (item 23: all 10 slots are triggers now).
         autoSummon = { summonWindow = 19, buffTriggers = { true, false, true } },
-        autoGroup = { inviteWhitelist = { ["A-B"] = true }, inviteWhitelistDefaultsApplied = true },
+        autoGroup = {
+            inviteWhitelist = { ["A-B"] = true }, inviteWhitelistDefaultsApplied = true,
+            inviteWhitelistEnabled = false,
+            sendToRoster = true, sendToGuild = true, sendToFriends = false, sendToAnyone = true,
+        },
         -- threshold slots: 1=dmf 2=ony 8=rend.
         auraOpts = { thresholds = {
             [1] = { normal = 100, minimum = 50 },
@@ -797,7 +839,7 @@ local function selfTest(verbose)
     check("faction summonWindow->freshBuffWindow", fac.autoSummon.freshBuffWindow == 19)
     check("faction buffTriggers->keys (dmtAP->fengus)", fac.autoSummon.triggers.fengus == true)
     check("faction buffTriggers->keys (ony->dragonslayer)", fac.autoSummon.triggers.dragonslayer == false)
-    check("faction buffTriggers dmf skipped", fac.autoSummon.triggers.dmf == nil)
+    check("faction buffTriggers dmf mapped (item 23)", fac.autoSummon.triggers.dmf == true)
     check("faction thresholds->keys (slot1->dmf)", fac.auraOpts.thresholds.dmf and fac.auraOpts.thresholds.dmf.normal == 100)
     check("faction thresholds->keys (slot2->ony)", fac.auraOpts.thresholds.ony and fac.auraOpts.thresholds.ony.minimum == 90)
     check("faction thresholds->keys (slot8->rend)", fac.auraOpts.thresholds.rend and fac.auraOpts.thresholds.rend.normal == 800)
@@ -805,6 +847,25 @@ local function selfTest(verbose)
     check("faction zanza priority", fac.autoQuest.zanza.priority.spirit == true)
     check("faction interact dropped", fac.autoInteract == nil)
     check("faction whitelist", fac.autoGroup.whitelist["A-B"] == true)
+    -- Item 22 per-category send gates + item 35 whitelist enable.
+    check("faction sendToGuild mapped", fac.autoGroup.sendToGuild == true)
+    check("faction sendToFriends mapped", fac.autoGroup.sendToFriends == false)
+    check("faction sendToAnyone mapped", fac.autoGroup.sendToAnyone == true)
+    check("faction whitelistEnabled mapped", fac.autoGroup.whitelistEnabled == false)
+
+    -- Settings-level: mesh channel (item 38) + 5-field pin sizing (item 26).
+    local st = Import._MapSettings({
+        mesh = { meshToken = "abc123", mainChannel = "MyGuildBuffChannel", mainEnabled = true },
+        timerSettings = {
+            wmFlowerIconSize = 18, wmTuberIconSize = 16, wmTimerFontSize = 11,
+            mmFlowerIconSize = 13, mmTuberIconSize = 12,
+        },
+    })
+    check("mesh channel imported (item 38)", st.mesh.channel == "MyGuildBuffChannel")
+    check("pin worldFlowerSize", st.timerSettings.felwood.worldFlowerSize == 18)
+    check("pin worldTuberSize", st.timerSettings.felwood.worldTuberSize == 16)
+    check("pin worldTimerFont", st.timerSettings.felwood.worldTimerFont == 11)
+    check("pin minimapTuberSize", st.timerSettings.felwood.minimapTuberSize == 12)
 
     -- Data timers: flat flowerN -> array, logs rename.
     local dp = Import._MapData({

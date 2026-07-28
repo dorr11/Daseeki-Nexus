@@ -233,7 +233,8 @@ end
 -- Field order (must match decode exactly):
 --   u8  schema version
 --   u8  flags  (bit0 inInstance, bit1 isResting, bit2 pvpFlagged,
---               bit3 chronoboonActive, bit4 dmfInBoon, bit5 dmfCooldownActive)
+--               bit3 chronoboonActive, bit4 dmfInBoon, bit5 dmfCooldownActive,
+--               bit6 soulstoneReady)
 --   u8  classIndex (into Store.CLASS_ORDER; 0 = unknown)
 --   u8  faction    (0 none, 1 Alliance, 2 Horde)
 --   u8  level
@@ -287,6 +288,7 @@ function Protocol.EncodeCharacter(rec)
     if rec.chronoboonActive  then flags = flags + 8  end
     if rec.dmfInBoon         then flags = flags + 16 end
     if rec.dmfCooldownActive then flags = flags + 32 end
+    if rec.soulstoneReady    then flags = flags + 64 end
     w.u8(flags)
 
     w.u8(classIndexOf(rec.classTag))
@@ -354,6 +356,7 @@ function Protocol.DecodeCharacter(bytes)
     rec.chronoboonActive  = bit_set(flags, 3)
     rec.dmfInBoon         = bit_set(flags, 4)
     rec.dmfCooldownActive = bit_set(flags, 5)
+    rec.soulstoneReady    = bit_set(flags, 6)
 
     local classIdx = r.u8()
     rec.classTag = ns.Store.CLASS_ORDER[classIdx] or nil
@@ -423,7 +426,7 @@ local function recordsMatch(a, b)
     end
     local bools = {
         "inInstance", "isResting", "pvpFlagged", "chronoboonActive",
-        "dmfInBoon", "dmfCooldownActive",
+        "dmfInBoon", "dmfCooldownActive", "soulstoneReady",
     }
     for _, k in ipairs(bools) do
         if not approxEqualField(a[k], b[k]) then
@@ -480,6 +483,7 @@ local function testRoundTrip()
     rec.hearthstoneCD = 420
     rec.dmfInBoon = true
     rec.dmfCooldownActive = true
+    rec.soulstoneReady = true
     rec.dmfCooldown = { offlineSince = 1784990000 }
     rec.raidLockouts = { MC = 1785200000, BWL = 1785300000, Ony = 1785100000 }
     rec.auraStates = {

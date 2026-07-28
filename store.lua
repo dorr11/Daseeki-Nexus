@@ -17,8 +17,15 @@ ns.Store = Store
 -- Version / retention constants
 ----------------------------------------------------------------------
 
-Store.SETTINGS_VERSION = 1
+Store.SETTINGS_VERSION = 2     -- R3: alert matrix flipped buff-major -> event-major (migration below)
 Store.STORAGE_VERSION  = 1     -- bump wipes character data, keeps timers/social/manualLocations
+
+-- Aura-slot source codes (the numeric `source` field on each auraStates slot).
+-- LIVE   = captured live from this character's own auras (self, highest trust).
+-- RELAYED= arrived over the mesh from a peer (set by the mesh receive path).
+-- BOON    = parsed out of a Chronoboon Displacement tooltip (stored/frozen buff);
+--           the dashboard renders these durations with a "(Boon)" suffix (item 37).
+Store.AURA_SOURCE = { LIVE = 0, RELAYED = 1, BOON = 2 }
 
 local LOG_CAP            = 15
 local LOG_EXPIRY         = 48 * 3600     -- 48h
@@ -88,9 +95,16 @@ local function defaultFactionBlock()
             acceptFromGuild   = true,
             acceptFromFriends = true,
             acceptFromAnyone  = false,
+            -- Per-category whisper-invite SEND gates (item 22). The N4a build
+            -- collapsed sends to a single roster gate; the reference gates each
+            -- trust category independently, matching the four accept-from gates.
             sendToRoster      = true,
+            sendToGuild       = false,
+            sendToFriends     = false,
+            sendToAnyone      = false,
             inviteKeyword     = "inv",
             whitelist         = {},          -- ["Name-Realm"] = true
+            whitelistEnabled  = true,        -- master gate for whitelist bypass (item 35)
             defaultsApplied   = false,       -- one-time seeding guard
         },
         autoSummon = {
@@ -161,24 +175,51 @@ local function defaultClassColors()
     }
 end
 
--- The per-buff alert matrix. Each buff key gets, per event type, four
--- channel toggles (notify / chat / flash / sound).
-local ALERT_BUFF_KEYS = {
-    "rend", "onyH", "onyA", "nefH", "nefA", "zg", "battleShout",
-}
+-- The alert matrix (R3 item 13/14/24). EVENT-MAJOR:
+--   alerts[eventType][buffKey] = { notify, chat, flash, sound = <soundKey> }
+-- (was buff-major with a boolean `sound`; migrated in-place by MigrateSettings.)
+-- `sound` is now a HUD.SOUNDS *key* string per row ("None" = silent), so every
+-- buff row on every event can carry its own tone (item 14). Each event lists the
+-- buff rows the reference shows for it (item 24 — buff gain gains DMF, pull gains
+-- Battle Shout, CD is Ony/Rend, NPC events are Ony/Nef).
 local ALERT_EVENT_TYPES = {
     "questHandin", "pullTimer", "npcDied", "npcRespawned",
     "cdWarning", "cdExpired", "buffGain",
 }
+-- All buff-row keys the alert matrix can carry (superset across events).
+local ALERT_BUFF_KEYS = {
+    "rend", "onyH", "onyA", "nefH", "nefA", "zg", "battleShout", "dmf",
+}
+-- Per-event buff-row sets (reference-aligned; item 24).
+local ALERT_EVENT_BUFFS = {
+    questHandin  = { "rend", "onyH", "onyA", "nefH", "nefA", "zg" },
+    pullTimer    = { "rend", "onyH", "onyA", "nefH", "nefA", "zg", "battleShout" },
+    npcDied      = { "onyH", "onyA", "nefH", "nefA" },
+    npcRespawned = { "onyH", "onyA", "nefH", "nefA" },
+    cdWarning    = { "rend", "onyH", "onyA" },
+    cdExpired    = { "rend", "onyH", "onyA" },
+    buffGain     = { "rend", "onyH", "onyA", "nefH", "nefA", "zg", "battleShout", "dmf" },
+}
+-- Default per-event sound key (a HUD.SOUNDS key). Seeds every row's sound.
+local ALERT_EVENT_SOUND = {
+    questHandin  = "QuestListOpen",
+    pullTimer    = "RaidWarning",
+    npcDied      = "TellMessage",
+    npcRespawned = "TellMessage",
+    cdWarning    = "AuctionWindowOpen",
+    cdExpired    = "ReadyCheck",
+    buffGain     = "CheckboxOn",
+}
 
 local function defaultAlertMatrix()
     local matrix = {}
-    for _, buff in ipairs(ALERT_BUFF_KEYS) do
-        local perEvent = {}
-        for _, evt in ipairs(ALERT_EVENT_TYPES) do
-            perEvent[evt] = { notify = true, chat = false, flash = false, sound = true }
+    for _, evt in ipairs(ALERT_EVENT_TYPES) do
+        local perBuff = {}
+        local snd = ALERT_EVENT_SOUND[evt] or "RaidWarning"
+        for _, buff in ipairs(ALERT_EVENT_BUFFS[evt]) do
+            perBuff[buff] = { notify = true, chat = false, flash = false, sound = snd }
         end
-        matrix[buff] = perEvent
+        matrix[evt] = perBuff
     end
     return matrix
 end
@@ -188,14 +229,24 @@ local function defaultTimerSettings()
         felwood = {
             showFlowerPins = true,
             showTuberPins  = true,
+            -- Legacy single sizes kept for back-compat with any older reader.
             worldPinSize   = 14,
             minimapPinSize = 12,
+            -- Full 5-field pin sizing (item 26): worldmap songflower/tuber px,
+            -- worldmap timer font pt, minimap songflower/tuber px. pins.lua +
+            -- options.lua consume these (published in SURFACES). Defaults keep the
+            -- prior single-size look (14 world / 12 minimap, 10pt timer font).
+            worldFlowerSize   = 14,
+            worldTuberSize    = 14,
+            worldTimerFont    = 10,
+            minimapFlowerSize = 12,
+            minimapTuberSize  = 12,
             -- Songflower display durations (seconds) consumed by the timers-tab
-            -- UP?/minus state machine (timers.lua NodeState). Defaults reproduce
-            -- current behavior exactly: minus-timer counts the 25-min respawn
-            -- (NODE_RESPAWN 1500); flowerUpDuration 0 = "UP?" shown indefinitely.
-            flowerMinusDuration = 1500,
-            flowerUpDuration    = 0,
+            -- UP?/minus state machine (timers.lua NodeState). Reference-aligned
+            -- defaults (item 27): UP? window 5s, minus-timer 120s — replacing the
+            -- prior 0="always" / 1500 sentinels.
+            flowerMinusDuration = 120,
+            flowerUpDuration    = 5,
         },
         pullBar = {
             width   = 220,
@@ -245,6 +296,8 @@ local function defaultSettings()
         },
         mesh = {
             token       = "",
+            channel     = "",                -- required user-set channel name (item 38);
+                                             -- mesh stays down until channel + token are set
             enabled     = false,
             optOut      = false,
             bondChannels = { "", "", "" },   -- unimplemented slots preserved for parity
@@ -288,8 +341,10 @@ local function defaultData()
     }
 end
 
-Store.ALERT_BUFF_KEYS   = ALERT_BUFF_KEYS
-Store.ALERT_EVENT_TYPES = ALERT_EVENT_TYPES
+Store.ALERT_BUFF_KEYS    = ALERT_BUFF_KEYS
+Store.ALERT_EVENT_TYPES  = ALERT_EVENT_TYPES
+Store.ALERT_EVENT_BUFFS  = ALERT_EVENT_BUFFS   -- per-event buff-row sets (UI/hud)
+Store.ALERT_EVENT_SOUND  = ALERT_EVENT_SOUND   -- per-event default sound key
 
 ----------------------------------------------------------------------
 -- Defaults application (recursive fill, never clobbers existing values)
@@ -309,6 +364,54 @@ local function applyDefaults(target, defaults)
     return target
 end
 Store.ApplyDefaults = applyDefaults
+
+----------------------------------------------------------------------
+-- Settings migration (settingsVersion 1 -> 2)
+--
+-- v1 stored the alert matrix BUFF-MAJOR with a boolean `sound`:
+--     alerts[buffKey][eventType] = { notify, chat, flash, sound=bool }
+-- v2 stores it EVENT-MAJOR with a per-row sound KEY (item 13/14/24):
+--     alerts[eventType][buffKey] = { notify, chat, flash, sound=<soundKey> }
+-- The transpose preserves every channel toggle a user set; a v1 sound=true maps
+-- to that event's default sound key, sound=false/absent maps to "None".
+-- Idempotent + shape-detected, so it is safe if settingsVersion is missing.
+----------------------------------------------------------------------
+
+function Store.MigrateSettings(db)
+    if type(db) ~= "table" then return end
+    if (db.settingsVersion or 1) >= 2 then return end   -- already current
+
+    local ts = db.timerSettings
+    local alerts = ts and ts.alerts
+    -- Old buff-major shape: top-level keys are buff keys, not event types.
+    local looksBuffMajor = type(alerts) == "table"
+        and alerts.questHandin == nil
+        and (alerts.rend ~= nil or alerts.onyH ~= nil or alerts.zg ~= nil
+             or alerts.battleShout ~= nil)
+    if looksBuffMajor then
+        local newM = {}
+        for _, evt in ipairs(ALERT_EVENT_TYPES) do newM[evt] = {} end
+        for buffKey, perEvent in pairs(alerts) do
+            if type(perEvent) == "table" then
+                for evt, cell in pairs(perEvent) do
+                    if newM[evt] and type(cell) == "table" then
+                        local snd = (cell.sound == true)
+                            and (ALERT_EVENT_SOUND[evt] or "RaidWarning") or "None"
+                        newM[evt][buffKey] = {
+                            notify = cell.notify and true or false,
+                            chat   = cell.chat and true or false,
+                            flash  = cell.flash and true or false,
+                            sound  = snd,
+                        }
+                    end
+                end
+            end
+        end
+        ts.alerts = newM
+    end
+
+    db.settingsVersion = Store.SETTINGS_VERSION
+end
 
 ----------------------------------------------------------------------
 -- Account bucket shape
@@ -334,9 +437,12 @@ function Store.Init()
     if type(DaseekiNexusDB) ~= "table" then
         DaseekiNexusDB = {}
     end
-    applyDefaults(DaseekiNexusDB, defaultSettings())
 
-    -- Settings migrations would branch on settingsVersion here.
+    -- Settings migrations run BEFORE applyDefaults so a legacy shape is
+    -- transformed first, then any still-missing keys are backfilled.
+    Store.MigrateSettings(DaseekiNexusDB)
+
+    applyDefaults(DaseekiNexusDB, defaultSettings())
     DaseekiNexusDB.settingsVersion = Store.SETTINGS_VERSION
 
     -- Data SV
@@ -445,6 +551,8 @@ function Store.NewCharacterRecord(nameRealm)
         chronoboonLastSeen = 0,
         boonCount       = 0,
         shardCount      = 0,       -- warlock soul shards
+        soulstoneReady  = false,   -- warlock: a soulstone is available (item in bags
+                                   -- and/or Create Soulstone off cooldown) — item 6
         itemCooldown    = 0,       -- remaining seconds on the tracked trinket/item
         hearthstoneCD   = 0,       -- remaining seconds
         dmfInBoon       = false,   -- currently holding a Darkmoon fortune
@@ -737,4 +845,87 @@ end
 function Store.GetFactionSettings(faction)
     local fs = Store.db.factionSettings
     return fs[faction] or fs.Alliance
+end
+
+----------------------------------------------------------------------
+-- Self-tests (pure Lua; registered as suite "store")
+----------------------------------------------------------------------
+
+local function testDefaults(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local s = defaultSettings()
+    -- R3 schema additions.
+    ck(s.mesh.channel == "", "mesh.channel default empty")
+    local ag = s.factionSettings.Alliance.autoGroup
+    ck(ag.sendToGuild == false and ag.sendToFriends == false
+        and ag.sendToAnyone == false, "per-category send gates default off")
+    ck(ag.whitelistEnabled == true, "whitelistEnabled default true")
+    local fw = s.timerSettings.felwood
+    ck(fw.flowerUpDuration == 5, "songflower UP? default 5s")
+    ck(fw.flowerMinusDuration == 120, "songflower minus default 120s")
+    ck(fw.worldFlowerSize == 14 and fw.worldTuberSize == 14
+        and fw.worldTimerFont == 10 and fw.minimapFlowerSize == 12
+        and fw.minimapTuberSize == 12, "5-field pin sizing present")
+    -- Alert matrix is event-major with per-row sound KEYS.
+    local a = s.timerSettings.alerts
+    ck(a.questHandin ~= nil and a.rend == nil, "alert matrix event-major")
+    ck(a.buffGain and a.buffGain.dmf ~= nil, "buffGain has a DMF row (item 24)")
+    ck(a.pullTimer and a.pullTimer.battleShout ~= nil, "pull has battleShout row")
+    ck(type(a.pullTimer.rend.sound) == "string", "per-row sound is a key string")
+    -- Character record has the soulstone field.
+    local rec = Store.NewCharacterRecord("X-Y")
+    ck(rec.soulstoneReady == false, "record has soulstoneReady field")
+end
+
+local function testAlertMigration(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    -- v1 buff-major DB with a mix of sound bools + channel toggles.
+    local db = {
+        settingsVersion = 1,
+        timerSettings = { alerts = {
+            rend = {
+                pullTimer = { notify = true, chat = true, flash = false, sound = true },
+                cdWarning = { notify = false, chat = false, flash = true, sound = false },
+            },
+            onyH = {
+                buffGain = { notify = true, chat = false, flash = false, sound = true },
+            },
+        } },
+    }
+    Store.MigrateSettings(db)
+    local a = db.timerSettings.alerts
+    ck(a.rend == nil, "old buff-major key removed")
+    ck(a.pullTimer and a.pullTimer.rend, "transposed to event-major")
+    ck(a.pullTimer.rend.chat == true, "channel toggles preserved")
+    ck(a.pullTimer.rend.sound == "RaidWarning", "sound=true -> event default key")
+    ck(a.cdWarning.rend.sound == "None", "sound=false -> None")
+    ck(a.buffGain.onyH.notify == true, "onyH buffGain migrated")
+    ck(db.settingsVersion == 2, "settingsVersion bumped to 2")
+    -- Idempotent: re-running does not corrupt the event-major shape.
+    Store.MigrateSettings(db)
+    ck(db.timerSettings.alerts.pullTimer.rend.chat == true, "migration idempotent")
+end
+
+function Store.RunSelfTests(verbose)
+    local suites = {
+        { name = "defaults",        fn = testDefaults },
+        { name = "alert migration", fn = testAlertMigration },
+    }
+    local allPass = true
+    for _, suite in ipairs(suites) do
+        local fails = {}
+        local ok = pcall(suite.fn, fails)
+        local passed = ok and #fails == 0
+        if not passed then allPass = false end
+        if verbose and ns and ns.Print then
+            if passed then ns:Print("  PASS store/" .. suite.name)
+            elseif not ok then ns:Print("  FAIL store/" .. suite.name .. " :: error in test")
+            else for _, f in ipairs(fails) do ns:Print("  FAIL store/" .. suite.name .. " :: " .. f) end end
+        end
+    end
+    return allPass
+end
+
+if ns.RegisterSelfTest then
+    ns:RegisterSelfTest("store", Store.RunSelfTests)
 end

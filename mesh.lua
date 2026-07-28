@@ -370,24 +370,46 @@ function Mesh.MeshSettings()
     return db and db.mesh or nil
 end
 
--- Mesh is live only with a token, enabled, not opted out, and a valid AID.
-function Mesh.IsEnabled()
-    local m = Mesh.MeshSettings()
-    if not m then return false end
-    if not m.enabled or m.optOut then return false end
-    if not m.token or m.token == "" then return false end
-    local aid = ns:GetAccountID()
-    return aid ~= "" and ns:IsValidAccountID(aid)
+-- Channel-name validation (item 38): the reference requires a user-set channel
+-- name of 16+ ALPHANUMERIC characters, case-sensitive. Only surrounding
+-- whitespace is trimmed (never internal — the credential must match exactly
+-- across accounts, so we do not silently rewrite it). Any internal non-alnum
+-- character (incl. a space) rejects the name. Returns the trimmed name or nil.
+function Mesh.ValidateChannel(raw)
+    if type(raw) ~= "string" then return nil end
+    local name = raw:gsub("^%s+", ""):gsub("%s+$", "")
+    if #name < 16 then return nil end
+    if name:find("[^%w]") then return nil end   -- alphanumeric only (no spaces)
+    return name
 end
 
--- Discovery channel name derived from the shared token so every mesh member
--- lands on the same hidden channel with zero extra config. Channel names are
--- capped short and alnum for safety.
+-- Why the mesh is currently down (item 20/38 diagnostics). Returns nil when
+-- fully enabled, else a short human reason string for /nexus debug mesh.
+function Mesh.DisabledReason()
+    local m = Mesh.MeshSettings()
+    if not m then return "settings not loaded" end
+    if m.optOut then return "opted out" end
+    if not m.enabled then return "mesh disabled in settings" end
+    if not m.token or m.token == "" then return "token not set" end
+    if not Mesh.ValidateChannel(m.channel) then return "channel not set (need 16+ alphanumeric)" end
+    local aid = ns:GetAccountID()
+    if aid == "" or not ns:IsValidAccountID(aid) then return "account ID not set" end
+    return nil
+end
+
+-- Mesh is live only with a token, a VALID channel, enabled, not opted out, and a
+-- valid AID. The channel is now a REQUIRED user-set credential (item 38): there
+-- is no token-derived fallback — accounts must match on BOTH channel + token.
+function Mesh.IsEnabled()
+    return Mesh.DisabledReason() == nil
+end
+
+-- User-set discovery channel name (item 38). No token derivation: returns the
+-- validated mesh.channel or nil. Join/health-check logic re-reads this unchanged.
 function Mesh.GetChannelName()
     local m = Mesh.MeshSettings()
-    if not m or not m.token or m.token == "" then return nil end
-    -- Channel names must be alphanumeric; strip the hash separator.
-    return "dsn" .. (fnv1a(m.token):gsub("%-", ""))
+    if not m then return nil end
+    return Mesh.ValidateChannel(m.channel)
 end
 
 -- Count current mesh members (including self) for the 8-account cap.
@@ -892,9 +914,34 @@ local function handleState(f, sender, isRelay)
     end
 end
 
+-- Account-ID conflict detection (item 18): a heartbeat carrying OUR OWN account
+-- ID from another character means two accounts share an ID on the mesh. Warn the
+-- owner (throttled) and refuse to admit them as a peer.
+Mesh._conflictWarned = {}   -- [sender] = ts of last warning
+local CONFLICT_WARN_COOLDOWN = 60
+
+function Mesh.CheckAccountConflict(aid, sender, t)
+    t = t or now()
+    if not aid or aid == "" then return false end
+    if aid ~= ns:GetAccountID() then return false end
+    if Mesh.IsSelfSender(sender) then return false end   -- our own echo: not a conflict
+    local last = Mesh._conflictWarned[sender] or 0
+    if (t - last) >= CONFLICT_WARN_COOLDOWN then
+        Mesh._conflictWarned[sender] = t
+        if ns.Print then
+            ns:Print("|cffff4040ACCOUNT ID CONFLICT!|r Account ID '" .. aid ..
+                "' is used by both you and " .. tostring(sender) ..
+                ". Change your Account ID (/nexus account <n>) so the mesh can tell you apart.")
+        end
+    end
+    return true
+end
+
 local function handleHeartbeat(f, sender)
     local hb = Mesh.Unpack(f.payload)
     if not hb or not hb.aid then return end
+    -- Two accounts sharing an ID: warn + drop (never admit as a peer).
+    if Mesh.CheckAccountConflict(hb.aid, sender, now()) then return end
     local p = Mesh.NotePeer(hb.aid, sender, now())
     if not p then return end
     p.hashes = hb.hashes or {}
@@ -1981,8 +2028,25 @@ end
 ----------------------------------------------------------------------
 
 local function debugMesh()
-    ns:Print("mesh: " .. (Mesh.IsEnabled() and "ENABLED" or "disabled")
+    local reason = Mesh.DisabledReason()
+    ns:Print("mesh: " .. (reason == nil and "ENABLED" or ("disabled — " .. reason))
         .. " | account " .. (ns:GetAccountID() ~= "" and ns:GetAccountID() or "<unset>"))
+
+    -- Same-faction constraint (item 20): custom chat channels are faction-bound,
+    -- so only same-faction characters can converge on the mesh channel. This is
+    -- the clear answer to "why aren't my other accounts meshing?" for a
+    -- cross-faction login — no error, they simply never share the channel.
+    local myFaction = (UnitFactionGroup and UnitFactionGroup("player")) or "?"
+    ns:Print("  faction: " .. tostring(myFaction)
+        .. " | mesh is SAME-FACTION only (custom channels are faction-bound — log"
+        .. " same-faction characters to mesh accounts together)")
+
+    -- Channel mode (item 38): the channel is a required user-set credential; it
+    -- is printed plainly (masking is a UI concern).
+    local m = Mesh.MeshSettings() or {}
+    local rawChan = m.channel or ""
+    ns:Print("  channel-cred: " .. (rawChan ~= "" and rawChan or "<not set>")
+        .. (Mesh.ValidateChannel(rawChan) and " (valid)" or " (INVALID — need 16+ alphanumeric)"))
 
     -- Channel join diagnostics — the heart of the "no peers known" smoke test.
     -- The LIVE index is the single source of truth for "joined" so this line can
@@ -2419,6 +2483,58 @@ local function testStateChangedGuard()
     return true
 end
 
+-- Channel-credential gating (item 38): validation + enable-matrix over
+-- no-channel / short-channel / valid-channel while token + AID are present.
+local function testChannelGating()
+    -- Pure validator.
+    if Mesh.ValidateChannel("shorty") ~= nil then return false, "short channel accepted" end
+    if Mesh.ValidateChannel("has space innit here") ~= nil then return false, "spaced channel accepted" end
+    if Mesh.ValidateChannel("bad!channel!name!!") ~= nil then return false, "non-alnum accepted" end
+    if Mesh.ValidateChannel("MyGuildBuffChannel") ~= "MyGuildBuffChannel" then
+        return false, "valid channel rejected"
+    end
+    -- Enable-matrix via a stubbed MeshSettings + AID.
+    local savedMS, savedAID = Mesh.MeshSettings, ns.GetAccountID
+    ns.GetAccountID = function() return "1" end
+    local ms = { enabled = true, optOut = false, token = "tok" }
+    Mesh.MeshSettings = function() return ms end
+    ms.channel = ""
+    local ok1 = (Mesh.DisabledReason() ~= nil) and not Mesh.IsEnabled()
+    ms.channel = "tooshort"
+    local ok2 = (Mesh.DisabledReason() ~= nil) and not Mesh.IsEnabled()
+    ms.channel = "MyGuildBuffChannel"
+    local ok3 = Mesh.IsEnabled() and (Mesh.DisabledReason() == nil)
+    Mesh.MeshSettings, ns.GetAccountID = savedMS, savedAID
+    if not ok1 then return false, "empty channel should disable mesh" end
+    if not ok2 then return false, "short channel should disable mesh" end
+    if not ok3 then return false, "valid channel + token + AID should enable mesh" end
+    return true
+end
+
+-- Account-ID conflict detection (item 18).
+local function testAccountConflict()
+    local savedAID, savedSelf = ns.GetAccountID, Mesh.IsSelfSender
+    ns.GetAccountID = function() return "3" end
+    Mesh.IsSelfSender = function(s) return s == "Me-Realm" end
+    Mesh._conflictWarned = {}
+    -- Peer heartbeat carrying OUR id from a different character => conflict.
+    if not Mesh.CheckAccountConflict("3", "Other-Realm", 1000) then
+        Mesh.GetAccountID = savedAID; return false, "shared AID not flagged"
+    end
+    -- Different id => no conflict.
+    if Mesh.CheckAccountConflict("4", "Other-Realm", 1000) then
+        ns.GetAccountID, Mesh.IsSelfSender = savedAID, savedSelf
+        return false, "distinct AID wrongly flagged"
+    end
+    -- Our own echo of our id => not a conflict.
+    if Mesh.CheckAccountConflict("3", "Me-Realm", 1000) then
+        ns.GetAccountID, Mesh.IsSelfSender = savedAID, savedSelf
+        return false, "self echo flagged as conflict"
+    end
+    ns.GetAccountID, Mesh.IsSelfSender = savedAID, savedSelf
+    return true
+end
+
 function Mesh.RunSelfTests(verbose)
     local suite = {
         { name = "transmit safety",  fn = testTransmitSafety },
@@ -2435,6 +2551,8 @@ function Mesh.RunSelfTests(verbose)
         { name = "channel health check", fn = testHealthCheck },
         { name = "roster ping selection", fn = testRosterPingSelection },
         { name = "join notice throttle", fn = testJoinNoticeThrottle },
+        { name = "channel gating",   fn = testChannelGating },
+        { name = "account conflict", fn = testAccountConflict },
     }
     local allPass, results = true, {}
     for _, t in ipairs(suite) do

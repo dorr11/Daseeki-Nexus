@@ -20,12 +20,28 @@ ns.Tracker = Tracker
 local ITEM_SOUL_SHARD  = 6265
 local ITEM_HEARTHSTONE = 6948
 
+-- Created Soulstone reagent item IDs (any in bags => a soulstone is available).
+-- Minor / Lesser / (regular) / Greater / Major Soulstone. Item 6.
+local SOULSTONE_ITEMS = { 5232, 16892, 16893, 16895, 16896 }
+-- Create Soulstone spell (rank-agnostic; highest known rank id is fine for a
+-- cooldown probe — a ready spell also means a soulstone can be made). [verify id]
+local SPELL_CREATE_SOULSTONE = 20758
+
+-- FFF seasonal world buff. Its exact in-game aura name is NOT a clean-room fact
+-- (the spec calls it only "seasonal FFF"); this prefix is a best-guess PLACEHOLDER
+-- the owner confirms in-game and corrects here if it differs. A non-match simply
+-- leaves slot 10 empty (safe) — it never errors. [verify — owner in-game]
+local FFF_AURA_PREFIX = "fervor of the first feast"
+
 -- World-buff aura name -> fixed slot (1..8). Names are matched
 -- case-insensitively by prefix so localized suffixes (e.g. Sayge's
 -- fortune variants) still land in one slot. Slot layout is Daseeki's own.
 -- Slots 9/10 (Traces of Silithyst, Boon of Blackfathom) were removed as
 -- not-relevant tracked buffs; they were the tail entries, so no live slot
 -- index shifts (the mesh binary schema still reserves up to 10 sparse slots).
+-- Additive trailing slots 9 (Battle Shout) + 10 (seasonal FFF) added in R3
+-- (item 36). The removed Silithyst/Blackfathom were the tail entries, so slots
+-- 1-8 keep their indices — the mesh binary schema already reserves up to 10.
 local BUFF_SLOTS = {
     { slot = 1,  prefix = "rallying cry of the dragonslayer" },
     { slot = 2,  prefix = "warchief's blessing" },
@@ -35,6 +51,8 @@ local BUFF_SLOTS = {
     { slot = 6,  prefix = "fengus' ferocity" },
     { slot = 7,  prefix = "mol'dar's moxie" },
     { slot = 8,  prefix = "slip'kik's savvy" },
+    { slot = 9,  prefix = "battle shout" },            -- world Battle Shout ("Fallen Hero")
+    { slot = 10, prefix = FFF_AURA_PREFIX },           -- seasonal FFF [verify prefix]
 }
 
 -- Names that mark a stored-buff chronoboon aura (tooltip capture target).
@@ -44,6 +62,8 @@ local CHRONOBOON_MARKERS = {
 }
 
 -- Names counted as stored world buffs when scanning the chronoboon tooltip.
+-- Includes the two new tracked slots plus the chronoboon-only extras that count
+-- toward boonCount but have no dashboard slot (Boon of Blackfathom / Spark).
 local STORED_BUFF_NAMES = {
     "rallying cry of the dragonslayer",
     "warchief's blessing",
@@ -53,6 +73,8 @@ local STORED_BUFF_NAMES = {
     "fengus' ferocity",
     "mol'dar's moxie",
     "slip'kik's savvy",
+    "battle shout",
+    FFF_AURA_PREFIX,
     "boon of blackfathom",
     "spark of inspiration",
 }
@@ -95,22 +117,113 @@ local function auraRemaining(aura)
 end
 
 ----------------------------------------------------------------------
--- Chronoboon tooltip capture
+-- Chronoboon tooltip capture + booned-buff parsing (item 37, HEADLINE)
 --
--- The stored-buff count is not exposed through the aura API, so we hook
--- the tooltip: whenever GameTooltip renders the chronoboon aura, scan its
--- text lines and count recognised stored world buffs. The most recent
--- count is cached and folded into the next capture.
+-- The stored-buff durations are not exposed through the aura API, so we hook
+-- the tooltip: whenever GameTooltip renders the Chronoboon Displacement (or the
+-- Supercharged Chronoboon Displacer) aura, we scan its text lines and parse each
+-- recognised stored buff's IDENTITY + remaining duration ("Fengus' Ferocity
+-- (119m)" -> slot 6, 119min). The parsed set is written into the character
+-- record's aura slots with source = BOON so the dashboard renders "1h 59m
+-- (Boon)". The snapshot is cached in DaseekiNexusData (tooltipBoon) so a relog
+-- keeps it (the stored durations are frozen while booned). Re-parsed on every
+-- hover; cleared when the boon aura vanishes (unboon).
 ----------------------------------------------------------------------
 
 Tracker._boonTooltipCount = 0
 Tracker._boonTooltipSeen  = 0
+-- Parsed boon snapshot: { slots = { [slot] = { duration=sec }, ... },
+--                         dmf = bool, count = n }.  Nil until first parse.
+Tracker._boonParsed = nil
+
+local BOON_SOURCE = 2   -- Store.AURA_SOURCE.BOON (kept local so the pure parser
+                        -- runs even before Store loads in the self-test harness).
+
+-- Parse a Chronoboon tooltip duration parenthetical into SECONDS.
+-- Accepts "(119m)", "(1h)", "(1h 59m)", "(59m)" case-insensitively; returns the
+-- seconds or nil if no duration is present. Pure + self-tested.
+function Tracker.ParseBoonDuration(text)
+    text = lower(text)
+    local paren = text:match("%(([^)]*)%)")
+    if not paren then return nil end
+    local h = tonumber(paren:match("(%d+)%s*h"))
+    local m = tonumber(paren:match("(%d+)%s*m"))
+    if not h and not m then
+        -- Bare number in parens (some clients render "(119)") -> minutes.
+        local bare = tonumber(paren:match("^%s*(%d+)%s*$"))
+        if bare then m = bare end
+    end
+    if not h and not m then return nil end
+    return (h or 0) * 3600 + (m or 0) * 60
+end
+
+-- Parse ONE tooltip line to (slotIndex, durationSeconds, isDMF) or nil.
+-- Matches a tracked-slot buff name anywhere in the line (the chronoboon tooltip
+-- lists stored buffs); resolves its slot via BUFF_SLOTS. Pure + self-tested.
+function Tracker.ParseBoonLine(text)
+    text = lower(text)
+    if text == "" then return nil end
+    for s = 1, #BUFF_SLOTS do
+        local def = BUFF_SLOTS[s]
+        if def.prefix ~= "" and text:find(def.prefix, 1, true) then
+            local dur = Tracker.ParseBoonDuration(text) or 0
+            local isDMF = (def.prefix == DMF_BUFF_PREFIX)
+            return def.slot, dur, isDMF
+        end
+    end
+    return nil
+end
+
+-- Persist the current parsed boon snapshot to DaseekiNexusData.caches.tooltipBoon
+-- keyed by our Name-Realm, so a relog can rehydrate it before the next hover.
+local function persistBoonCache(nameRealm, parsed)
+    local data = ns.Store and ns.Store.GetData and ns.Store.GetData()
+    local caches = data and data.caches
+    if not caches then return end
+    caches.tooltipBoon = caches.tooltipBoon or {}
+    if parsed and (next(parsed.slots) ~= nil or parsed.dmf) then
+        caches.tooltipBoon[nameRealm] = {
+            slots = parsed.slots, dmf = parsed.dmf, count = parsed.count,
+            at = ns.Store.Now and ns.Store.Now() or 0,
+        }
+    else
+        caches.tooltipBoon[nameRealm] = nil   -- unboon / empty -> drop the cache
+    end
+end
+
+-- Rehydrate the parsed boon snapshot from the persisted cache (login path).
+function Tracker.RehydrateBoonCache()
+    local nameRealm = selfNameRealm()
+    local data = ns.Store and ns.Store.GetData and ns.Store.GetData()
+    local cached = data and data.caches and data.caches.tooltipBoon
+                   and data.caches.tooltipBoon[nameRealm]
+    if type(cached) == "table" and type(cached.slots) == "table" then
+        Tracker._boonParsed = { slots = cached.slots, dmf = cached.dmf or false,
+                                count = cached.count or 0 }
+        Tracker._boonTooltipCount = cached.count or 0
+    end
+end
+
+-- Shallow-equality of two parsed boon snapshots (for change detection).
+local function boonSnapshotsEqual(a, b)
+    if (a == nil) ~= (b == nil) then return false end
+    if a == nil then return true end
+    if a.dmf ~= b.dmf or a.count ~= b.count then return false end
+    for slot, cell in pairs(a.slots) do
+        local other = b.slots[slot]
+        if not other or other.duration ~= cell.duration then return false end
+    end
+    for slot in pairs(b.slots) do
+        if not a.slots[slot] then return false end
+    end
+    return true
+end
 
 local function scanTooltipForStoredBuffs()
     if not GameTooltip or not GameTooltip.NumLines then return end
     local lines = GameTooltip:NumLines()
     if not lines or lines < 1 then return end
-    -- Confirm this tooltip is actually a chronoboon aura before counting.
+    -- Confirm this tooltip is actually a chronoboon aura before parsing.
     local firstLine = _G["GameTooltipTextLeft1"]
     local title = firstLine and firstLine.GetText and firstLine:GetText()
     title = lower(title)
@@ -120,21 +233,40 @@ local function scanTooltipForStoredBuffs()
     end
     if not isBoon then return end
 
-    local count = 0
+    -- Parse every line: count stored buffs AND capture per-slot durations.
+    local slots, dmf, count = {}, false, 0
     for i = 1, lines do
         local fs = _G["GameTooltipTextLeft" .. i]
         local text = lower(fs and fs.GetText and fs:GetText())
         if text ~= "" then
+            -- Count against the full stored-buff list (incl. non-slot extras).
             for j = 1, #STORED_BUFF_NAMES do
-                if text:find(STORED_BUFF_NAMES[j], 1, true) then
+                if STORED_BUFF_NAMES[j] ~= "" and text:find(STORED_BUFF_NAMES[j], 1, true) then
                     count = count + 1
                     break
                 end
             end
+            -- Parse tracked-slot identity + duration.
+            local slot, dur, isDMF = Tracker.ParseBoonLine(text)
+            if slot then
+                slots[slot] = { duration = dur }
+                if isDMF then dmf = true end
+            end
         end
     end
+
+    local parsed = { slots = slots, dmf = dmf, count = count }
     Tracker._boonTooltipCount = count
     Tracker._boonTooltipSeen  = GetTime()
+
+    -- Only re-capture/propagate when the parsed set actually changed (a hover
+    -- fires this repeatedly; we don't want a STATE_CHANGED storm).
+    local changed = not boonSnapshotsEqual(parsed, Tracker._boonParsed)
+    Tracker._boonParsed = parsed
+    persistBoonCache(selfNameRealm(), parsed)
+    if changed then
+        Tracker.RequestCapture()   -- fold boon slots into the record + fire STATE_CHANGED
+    end
 end
 
 local function installTooltipHooks()
@@ -248,6 +380,36 @@ local function captureShards(rec)
     end
 end
 
+-- Warlock soulstone availability (item 6): a created soulstone item is in bags,
+-- OR the Create Soulstone spell is off cooldown (so one can be made now).
+local function captureSoulstone(rec)
+    rec.soulstoneReady = false
+    if rec.classTag ~= "WARLOCK" then return end
+    -- 1) A soulstone reagent already sitting in bags.
+    if C_Item and C_Item.GetItemCount then
+        for i = 1, #SOULSTONE_ITEMS do
+            if (C_Item.GetItemCount(SOULSTONE_ITEMS[i]) or 0) > 0 then
+                rec.soulstoneReady = true
+                return
+            end
+        end
+    end
+    -- 2) Create Soulstone spell off cooldown (C_Spell in 11509).
+    if C_Spell and C_Spell.GetSpellCooldown then
+        local cd = C_Spell.GetSpellCooldown(SPELL_CREATE_SOULSTONE)
+        if type(cd) == "table" then
+            -- Ready when there is no active cooldown (duration 0 or elapsed).
+            local dur = cd.duration or 0
+            local start = cd.startTime or 0
+            if dur <= 1.6 then                      -- <=GCD => effectively ready
+                rec.soulstoneReady = true
+            elseif start > 0 and (start + dur) - GetTime() <= 0 then
+                rec.soulstoneReady = true
+            end
+        end
+    end
+end
+
 -- Hearthstone remaining cooldown (seconds). itemCooldown (a tracked
 -- trinket) is left extensible for a later wave and reported as 0 here.
 local function captureCooldowns(rec)
@@ -277,11 +439,11 @@ local function captureAuras(rec)
             -- World-buff slot assignment.
             for s = 1, #BUFF_SLOTS do
                 local def = BUFF_SLOTS[s]
-                if nm:find(def.prefix, 1, true) == 1 then
+                if def.prefix ~= "" and nm:find(def.prefix, 1, true) == 1 then
                     slots[def.slot] = {
                         duration = auraRemaining(aura),
                         option   = 0,     -- per-aura option code (later waves)
-                        source   = 0,     -- 0 = live/self (trust); relayed set by mesh
+                        source   = 0,     -- 0 = live/self (Store.AURA_SOURCE.LIVE)
                     }
                     break
                 end
@@ -302,20 +464,40 @@ local function captureAuras(rec)
         end
     end
 
-    rec.auraStates = slots
-
-    -- Chronoboon fields (count sourced from the tooltip hook cache).
+    -- Chronoboon fields (count sourced from the tooltip parse cache).
     rec.chronoboonActive = chronoActive
     if chronoActive then
         rec.chronoboonLastSeen = ns.Store.Now()
-        rec.boonCount = Tracker._boonTooltipCount or 0
+        -- Fold the parsed booned buffs into the aura slots as source = BOON so
+        -- the dashboard shows their frozen durations with "(Boon)" (item 37).
+        -- Booned buffs are NOT live on the character, so only inject slots that
+        -- live capture did not already fill.
+        local parsed = Tracker._boonParsed
+        if parsed then
+            for slot, cell in pairs(parsed.slots) do
+                if not slots[slot] then
+                    slots[slot] = { duration = cell.duration or 0, option = 0, source = BOON_SOURCE }
+                end
+            end
+            if parsed.dmf then dmfInBoon = true end
+            rec.boonCount = parsed.count or Tracker._boonTooltipCount or 0
+        else
+            rec.boonCount = Tracker._boonTooltipCount or 0
+        end
     else
         rec.boonCount = 0
+        -- Unboon: drop any boon-sourced state so stale frozen slots don't linger.
+        if Tracker._boonParsed then
+            Tracker._boonParsed = nil
+            persistBoonCache(rec.nameRealm, nil)
+        end
     end
 
-    -- DMF lifecycle: holding a fortune means the daily has been taken, so
-    -- the cooldown is active. offlineSince stays 0 while online; the store
-    -- stamps it at logout and clears it after ~8h offline.
+    rec.auraStates = slots
+
+    -- DMF lifecycle: holding a fortune (live OR stored-in-boon) means the daily
+    -- has been taken, so the cooldown is active. offlineSince stays 0 while
+    -- online; the store stamps it at logout and clears it after ~8h offline.
     rec.dmfInBoon = dmfInBoon
     if dmfInBoon then
         rec.dmfCooldownActive = true
@@ -362,6 +544,7 @@ function Tracker.Capture()
     captureFlags(rec)
     captureLocation(rec)
     captureShards(rec)
+    captureSoulstone(rec)
     captureCooldowns(rec)
     captureAuras(rec)
     captureRaidLockouts(rec)
@@ -392,6 +575,10 @@ end
 
 function Tracker.OnLogin()
     installTooltipHooks()
+
+    -- Rehydrate the booned-buff snapshot from the persisted cache so a relog
+    -- keeps showing "(Boon)" durations before the next tooltip hover (item 37).
+    Tracker.RehydrateBoonCache()
 
     -- Ask the server for our saved-instance (lockout) data.
     if RequestRaidInfo then RequestRaidInfo() end
@@ -424,4 +611,52 @@ function Tracker.OnLogin()
 
     -- First snapshot once the world is ready.
     Tracker.RequestCapture()
+end
+
+----------------------------------------------------------------------
+-- Self-tests (pure Lua; registered as suite "tracker")
+----------------------------------------------------------------------
+
+local function testBoonParsing(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+
+    -- Duration parsing across the reference formats.
+    ck(Tracker.ParseBoonDuration("Fengus' Ferocity (119m)") == 119 * 60, "(119m) -> 7140s")
+    ck(Tracker.ParseBoonDuration("Rallying Cry (1h 59m)") == 3600 + 59 * 60, "(1h 59m) -> 7140s")
+    ck(Tracker.ParseBoonDuration("Warchief's Blessing (1h)") == 3600, "(1h) -> 3600s")
+    ck(Tracker.ParseBoonDuration("Songflower Serenade (25m)") == 25 * 60, "(25m) -> 1500s")
+    ck(Tracker.ParseBoonDuration("no parens here") == nil, "no duration -> nil")
+
+    -- Line identity -> slot + DMF detection (incl. the two new slots).
+    local slot, dur, dmf = Tracker.ParseBoonLine("Fengus' Ferocity (119m)")
+    ck(slot == 6 and dur == 7140 and dmf == false, "Fengus -> slot 6, 7140s, not DMF")
+    slot, dur, dmf = Tracker.ParseBoonLine("Sayge's Dark Fortune: Damage (57m)")
+    ck(slot == 5 and dmf == true, "Sayge -> slot 5, DMF flagged")
+    slot = Tracker.ParseBoonLine("Rallying Cry of the Dragonslayer (55m)")
+    ck(slot == 1, "Rallying Cry -> slot 1")
+    slot = Tracker.ParseBoonLine("Battle Shout (110m)")
+    ck(slot == 9, "Battle Shout -> slot 9 (new)")
+    ck(Tracker.ParseBoonLine("Chronoboon Displacement") == nil, "boon aura title itself not a slot")
+    ck(Tracker.ParseBoonLine("") == nil, "empty line -> nil")
+end
+
+function Tracker.RunSelfTests(verbose)
+    local suites = { { name = "boon parsing", fn = testBoonParsing } }
+    local allPass = true
+    for _, suite in ipairs(suites) do
+        local f = {}
+        local ok = pcall(suite.fn, f)
+        local passed = ok and #f == 0
+        if not passed then allPass = false end
+        if verbose and ns and ns.Print then
+            if passed then ns:Print("  PASS tracker/" .. suite.name)
+            elseif not ok then ns:Print("  FAIL tracker/" .. suite.name .. " :: error in test")
+            else for _, m in ipairs(f) do ns:Print("  FAIL tracker/" .. suite.name .. " :: " .. m) end end
+        end
+    end
+    return allPass
+end
+
+if ns.RegisterSelfTest then
+    ns:RegisterSelfTest("tracker", Tracker.RunSelfTests)
 end

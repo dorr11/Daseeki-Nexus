@@ -105,6 +105,10 @@ local BUFF_META = {
     nefA        = { label = "Ally Nef",   icon = "Interface\\Icons\\INV_Misc_Head_Dragon_Black",    zones = { ["stormwind city"] = true } },
     zg          = { label = "Zandalar",   icon = "Interface\\Icons\\INV_Jewelry_Talisman_14",       zones = { ["stranglethorn vale"] = true, ["yojamba isle"] = true } },
     battleShout = { label = "Battle Shout", icon = "Interface\\Icons\\Ability_Warrior_BattleShout", zones = {} },
+    -- R3: DMF alert row (item 24) + seasonal FFF slot (item 36). Non-pull buffs,
+    -- so no zone relevance. Icons are cosmetic (missing path renders blank).
+    dmf         = { label = "DMF",         icon = "Interface\\Icons\\INV_Misc_Ticket_Tarot_Blessings_01", zones = {} },
+    fff         = { label = "FFF",         icon = "Interface\\Icons\\INV_Misc_Food_15",                   zones = {} },
 }
 HUD.BUFF_META = BUFF_META
 
@@ -234,12 +238,13 @@ end
 local DEDUP_WINDOW = 3            -- seconds
 local lastAlertAt = {}           -- "buff:event" -> frameClock
 
--- alerts matrix lookup with an all-off fallback so a missing row never errors.
+-- alerts matrix lookup (EVENT-MAJOR now — item 14): alerts[eventType][buffKey].
+-- All-off fallback so a missing row never errors.
 local function alertRow(buffKey, eventType)
     local ts = timerSettings()
     local m = ts.alerts
-    local perBuff = m and m[buffKey]
-    local row = perBuff and perBuff[eventType]
+    local perBuff = m and m[eventType]
+    local row = perBuff and perBuff[buffKey]
     return row or {}
 end
 
@@ -279,9 +284,15 @@ local function dispatch(buffKey, eventType, message, opts)
     if (row.flash or test) and not (not test and raidDisabled("flash")) then
         if FlashClientIcon then FlashClientIcon() end
     end
-    -- sound
-    if (row.sound or test) and not (not test and raidDisabled("sound")) then
-        playSoundKey(soundKeyForEvent(eventType))
+    -- sound: per-row sound KEY now (item 14). "None"/empty/false => silent.
+    -- Test always previews the row's key (falling back to the event default).
+    local rowSound = row.sound
+    local wantSound = test or (rowSound ~= nil and rowSound ~= false
+                               and rowSound ~= "None" and rowSound ~= "")
+    if wantSound and not (not test and raidDisabled("sound")) then
+        local key = (type(rowSound) == "string" and rowSound ~= "None" and rowSound ~= "")
+                    and rowSound or soundKeyForEvent(eventType)
+        playSoundKey(key)
     end
 end
 
@@ -694,20 +705,21 @@ end
 -- buttons (Chronoboon Displacer, item 184937).
 ----------------------------------------------------------------------
 
--- Engine 8-slot tracked-aura layout (matches tracker's BUFF_SLOTS names).
--- label / namePrefix (lowercased, matched by prefix) / icon (Blizzard built-in).
--- Silithyst / Boon of Blackfathom removed as not-relevant tracked buffs (they
--- were the trailing two slots, so nothing else reindexes). The grid geometry
--- is derived from #CANCEL_AURAS, so it auto-reflows to the new count.
+-- Engine tracked-aura layout (matches tracker's BUFF_SLOTS names). R3 item 36
+-- adds Battle Shout + seasonal FFF as trailing slots 9/10. The grid geometry is
+-- derived from #CANCEL_AURAS, so it auto-reflows to the new count. The FFF prefix
+-- is a best-guess PLACEHOLDER the owner confirms in-game (mirrors tracker.lua).
 local CANCEL_AURAS = {
-    { label = "Ony",        prefix = "rallying cry of the dragonslayer", icon = "Interface\\Icons\\INV_Misc_Head_Dragon_01" },
-    { label = "Rend",       prefix = "warchief's blessing",              icon = "Interface\\Icons\\Ability_Warrior_WarCry" },
-    { label = "ZG",         prefix = "spirit of zandalar",               icon = "Interface\\Icons\\INV_Jewelry_Talisman_14" },
-    { label = "Songflower", prefix = "songflower serenade",              icon = "Interface\\Icons\\Spell_Holy_MindVision" },
-    { label = "DMF",        prefix = "sayge's dark fortune",             icon = "Interface\\Icons\\INV_Misc_Ticket_Tarot_Blessings_01" },
-    { label = "Fengus",     prefix = "fengus' ferocity",                 icon = "Interface\\Icons\\Ability_Warrior_Rampage" },
-    { label = "Mol'dar",    prefix = "mol'dar's moxie",                  icon = "Interface\\Icons\\Ability_Warrior_Charge" },
-    { label = "Slip'kik",   prefix = "slip'kik's savvy",                 icon = "Interface\\Icons\\Spell_Nature_MoonKey" },
+    { label = "Ony",         prefix = "rallying cry of the dragonslayer", icon = "Interface\\Icons\\INV_Misc_Head_Dragon_01" },
+    { label = "Rend",        prefix = "warchief's blessing",              icon = "Interface\\Icons\\Ability_Warrior_WarCry" },
+    { label = "ZG",          prefix = "spirit of zandalar",               icon = "Interface\\Icons\\INV_Jewelry_Talisman_14" },
+    { label = "Songflower",  prefix = "songflower serenade",              icon = "Interface\\Icons\\Spell_Holy_MindVision" },
+    { label = "DMF",         prefix = "sayge's dark fortune",             icon = "Interface\\Icons\\INV_Misc_Ticket_Tarot_Blessings_01" },
+    { label = "Fengus",      prefix = "fengus' ferocity",                 icon = "Interface\\Icons\\Ability_Warrior_Rampage" },
+    { label = "Mol'dar",     prefix = "mol'dar's moxie",                  icon = "Interface\\Icons\\Ability_Warrior_Charge" },
+    { label = "Slip'kik",    prefix = "slip'kik's savvy",                 icon = "Interface\\Icons\\Spell_Nature_MoonKey" },
+    { label = "Battle Shout", prefix = "battle shout",                    icon = "Interface\\Icons\\Ability_Warrior_BattleShout" },
+    { label = "FFF",         prefix = "fervor of the first feast",        icon = "Interface\\Icons\\INV_Misc_Food_15" },  -- [verify prefix]
 }
 
 local CHRONOBOON_ITEM_ID = 184937
@@ -946,7 +958,8 @@ local function runSelfTests(verbose)
     check(SOUND_BY_KEY["RaidWarning"] ~= nil, "sound RaidWarning present")
     check(SOUND_BY_KEY["None"].id == nil, "None has no id")
     check(soundKeyForEvent("pullTimer") ~= nil, "event sound resolves")
-    check(#CANCEL_AURAS == 8, "8 cancel auras (Silithyst/Boon BFD removed)")
+    check(#CANCEL_AURAS == 10, "10 cancel auras (added Battle Shout + FFF)")
+    check(buffLabel("dmf") == "DMF" and buffLabel("fff") == "FFF", "dmf/fff BUFF_META present")
     if verbose then ns:Print("  hud selftest " .. (pass and "PASS" or "FAIL")) end
     return pass
 end

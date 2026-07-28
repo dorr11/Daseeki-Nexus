@@ -47,6 +47,87 @@ local XOR_KEY = "ShadowNt"
 -- indicator that is not this value is rejected (spec: "rejected if ≠2").
 local SN_PROTO_VERSION = 2
 
+-- Wire-capture ring buffer cap (item 41). Persisted frames for the orchestrator
+-- to derive SN's chunk envelope empirically from real broadcast evidence.
+local CAPTURE_CAP = 50
+
+----------------------------------------------------------------------
+-- Diagnostics: per-stage counters (item 41). Every decode stage is counted so
+-- `/nexus debug snbridge` shows exactly where a broadcast is being dropped —
+-- especially "suspected fragment" (a chunked frame that fails to inflate). The
+-- ingest itself stays SILENT in chat; only the counters move.
+----------------------------------------------------------------------
+
+SNBridge._stats = {
+    heard = 0, byChannel = {},
+    channelDecodeOK = 0, inflateOK = 0, deserializeOK = 0, versionOK = 0, translated = 0,
+    drop = {
+        notRecvPrefix = 0, channelDecode = 0, suspectedFragment = 0,
+        deserialize = 0, notTable = 0, versionGate = 0, translateZero = 0,
+    },
+}
+
+local function snBump(path, key)
+    local t = SNBridge._stats[path]
+    if type(t) == "table" then t[key] = (t[key] or 0) + 1 end
+end
+
+----------------------------------------------------------------------
+-- Wire capture ring buffer (item 41), persisted to DaseekiNexusData.snCapture.
+-- OFF by default. Capturing bytes arriving at the owner's own client is
+-- legitimate interop practice; we store bytes only, never code.
+----------------------------------------------------------------------
+
+-- Escape a raw wire string to a printable \xHH form so SavedVariables stays
+-- valid text and the dump is copy-safe. Pure + self-tested.
+function SNBridge.EscapeBytes(s)
+    if type(s) ~= "string" then return "" end
+    return (s:gsub("[%z\1-\31\127-\255\\]", function(c)
+        return string.format("\\x%02X", string.byte(c))
+    end))
+end
+
+-- The persisted capture table (creates it lazily). nil if the data store is
+-- unavailable (bare-VM self-test path just skips persistence).
+local function captureStore(create)
+    local data = ns.Store and ns.Store.GetData and ns.Store.GetData()
+    if not data then return nil end
+    if not data.snCapture and create then
+        data.snCapture = { enabled = false, frames = {}, dropped = 0 }
+    end
+    return data.snCapture
+end
+
+function SNBridge.CaptureEnabled()
+    local cap = captureStore(false)
+    return cap ~= nil and cap.enabled == true
+end
+
+function SNBridge.SetCapture(on)
+    local cap = captureStore(true)
+    if not cap then return false end
+    cap.enabled = on and true or false
+    if on and type(cap.frames) ~= "table" then cap.frames = {} end
+    return true
+end
+
+-- Append one raw frame to the capped ring buffer (oldest evicted at cap).
+function SNBridge.CaptureFrame(sender, channel, raw)
+    local cap = captureStore(true)
+    if not cap or not cap.enabled then return end
+    cap.frames = cap.frames or {}
+    cap.frames[#cap.frames + 1] = {
+        sender = sender, channel = channel,
+        len = (type(raw) == "string" and #raw) or 0,
+        at = (ns.Store and ns.Store.Now and ns.Store.Now()) or 0,
+        raw = SNBridge.EscapeBytes(raw),
+    }
+    while #cap.frames > CAPTURE_CAP do
+        table.remove(cap.frames, 1)
+        cap.dropped = (cap.dropped or 0) + 1
+    end
+end
+
 ----------------------------------------------------------------------
 -- Lib access (guarded; the pure translation logic loads without them)
 ----------------------------------------------------------------------
@@ -159,10 +240,13 @@ end
 -- Entirely defensive: any step failing returns nil (silent skip). Never errors.
 ----------------------------------------------------------------------
 
+-- Returns (payload, reason). reason is a stage label on failure (nil on success),
+-- and each stage bumps a diagnostic counter (item 41). An inflate failure is the
+-- prime suspect for a chunked broadcast fragment ("suspectedFragment").
 function SNBridge.Decode(wire, channel)
-    if type(wire) ~= "string" or #wire == 0 then return nil end
+    if type(wire) ~= "string" or #wire == 0 then return nil, "empty" end
     local LS, LD = libSerialize(), libDeflate()
-    if not (LS and LD) then return nil end
+    if not (LS and LD) then return nil, "libsAbsent" end
     -- channel-safe decode (addon channel; world YELL/SAY uses the chat variant).
     local dec
     if channel == "YELL" or channel == "SAY" then
@@ -170,12 +254,22 @@ function SNBridge.Decode(wire, channel)
     else
         dec = LD.DecodeForWoWAddonChannel and LD:DecodeForWoWAddonChannel(wire)
     end
-    if not dec then return nil end
+    if not dec then snBump("drop", "channelDecode"); return nil, "channelDecode" end
+    SNBridge._stats.channelDecodeOK = SNBridge._stats.channelDecodeOK + 1
     local xored = SNBridge.XorCrypt(dec, XOR_KEY)
     local raw = LD:DecompressDeflate(xored)
-    if not raw then return nil end
+    if not raw then
+        -- Partial deflate stream => almost certainly a multi-fragment envelope
+        -- our single-frame path can't reassemble yet (reassembly deferred to
+        -- captured wire evidence — item 41).
+        snBump("drop", "suspectedFragment"); return nil, "suspectedFragment"
+    end
+    SNBridge._stats.inflateOK = SNBridge._stats.inflateOK + 1
     local ok, payload = LS:Deserialize(raw)
-    if not ok or type(payload) ~= "table" then return nil end
+    if not ok or type(payload) ~= "table" then
+        snBump("drop", "deserialize"); return nil, "deserialize"
+    end
+    SNBridge._stats.deserializeOK = SNBridge._stats.deserializeOK + 1
     return payload
 end
 
@@ -260,17 +354,26 @@ SNBridge._isRecvPrefix = isRecvPrefix
 -- single-fragment in practice, so we decode each message independently and
 -- silently skip anything that isn't a self-contained frame.
 function SNBridge.Ingest(prefix, text, channel, sender)
-    if not isRecvPrefix(prefix) then return 0 end
+    if not isRecvPrefix(prefix) then snBump("drop", "notRecvPrefix"); return 0 end
+    local stats = SNBridge._stats
+    stats.heard = stats.heard + 1
+    stats.byChannel[channel or "?"] = (stats.byChannel[channel or "?"] or 0) + 1
+    -- Capture the raw frame (bytes only) BEFORE decode so fragments — the ones
+    -- that fail to inflate — are preserved for the deferred reassembly evidence.
+    ns:SafeCall(SNBridge.CaptureFrame, sender, channel, text)
     local ok, handled = pcall(function()
         local payload = SNBridge.Decode(text, channel)
         if not payload then return 0 end
-        if not SNBridge.VersionOK(payload) then return 0 end
+        if not SNBridge.VersionOK(payload) then snBump("drop", "versionGate"); return 0 end
+        stats.versionOK = stats.versionOK + 1
         -- Heard valid, version-gated SN timer traffic — stamp freshness even if
         -- nothing translated (so the UI can show "SN seen Ns ago").
         if ns.Timers and ns.Timers._noteFreshness then
             ns.Timers._noteFreshness("snPassive")
         end
-        return SNBridge.Translate(payload, sender)
+        local n = SNBridge.Translate(payload, sender)
+        if n == 0 then snBump("drop", "translateZero") else stats.translated = stats.translated + n end
+        return n
     end)
     if not ok then return 0 end   -- silent skip on ANY error
     return handled or 0
@@ -315,6 +418,50 @@ function SNBridge.DebugDump()
     local f = ns.Timers and ns.Timers.GetSourceFreshness and ns.Timers.GetSourceFreshness()
     if f then
         ns:Print(string.format("  snPassive last-seen epoch = %d", f.snPassive or 0))
+    end
+    -- Per-stage counters (item 41).
+    local s = SNBridge._stats
+    local chans = {}
+    for ch, n in pairs(s.byChannel) do chans[#chans + 1] = ch .. "=" .. n end
+    ns:Print(string.format("  heard=%d [%s]", s.heard, table.concat(chans, " ")))
+    ns:Print(string.format("  stages: chanDecodeOK=%d inflateOK=%d deserializeOK=%d versionOK=%d translated=%d",
+        s.channelDecodeOK, s.inflateOK, s.deserializeOK, s.versionOK, s.translated))
+    ns:Print(string.format("  drops: notRecvPrefix=%d chanDecode=%d SUSPECTED-FRAGMENT=%d deserialize=%d versionGate=%d translateZero=%d",
+        s.drop.notRecvPrefix, s.drop.channelDecode, s.drop.suspectedFragment,
+        s.drop.deserialize, s.drop.versionGate, s.drop.translateZero))
+    local cap = ns.Store and ns.Store.GetData and ns.Store.GetData() and ns.Store.GetData().snCapture
+    if cap then
+        ns:Print(string.format("  capture: %s | frames=%d (cap %d, evicted %d) — /nexus debug sncapture dump",
+            cap.enabled and "ON" or "off", cap.frames and #cap.frames or 0, CAPTURE_CAP, cap.dropped or 0))
+    else
+        ns:Print("  capture: off (use /nexus debug sncapture on)")
+    end
+end
+
+-- /nexus debug sncapture on|off|dump  (item 41). Wire-capture control + dump.
+function SNBridge.CaptureCommand(arg)
+    arg = (arg or ""):lower():gsub("^%s+", ""):gsub("%s+$", "")
+    if arg == "on" then
+        if SNBridge.SetCapture(true) then ns:Print("snbridge capture: ON (raw SDWW/SNT frames -> DaseekiNexusData.snCapture, cap " .. CAPTURE_CAP .. ").")
+        else ns:Print("snbridge capture: data store unavailable.") end
+    elseif arg == "off" then
+        SNBridge.SetCapture(false)
+        ns:Print("snbridge capture: off.")
+    elseif arg == "dump" then
+        local cap = captureStore(false)
+        if not cap or not cap.frames or #cap.frames == 0 then
+            ns:Print("snbridge capture: no frames captured.")
+            return
+        end
+        ns:Print(string.format("snbridge capture dump: %d frame(s) (newest last):", #cap.frames))
+        for i = 1, #cap.frames do
+            local fr = cap.frames[i]
+            ns:Print(string.format("  [%d] %s via %s @%d len=%d", i,
+                tostring(fr.sender), tostring(fr.channel), fr.at or 0, fr.len or 0))
+            ns:Print("      " .. tostring(fr.raw))
+        end
+    else
+        ns:Print("usage: /nexus debug sncapture on|off|dump")
     end
 end
 
@@ -475,6 +622,36 @@ local function testDecodeChain(fails)
     ns.Timers.OnSNTimer, ns.Timers.OnSNPull = savedTimer, savedPull
 end
 
+-- Capture ring-buffer mechanics (item 41): escape format, cap eviction, dump shape.
+local function testCaptureRing(fails)
+    if not (ns.Store and ns.Store.GetData and ns.Store.GetData()) then
+        return   -- skip: no data store in this VM
+    end
+    -- Escape: control/high bytes + backslash -> \xHH; printable ASCII untouched.
+    tcheck(SNBridge.EscapeBytes("AB\1\255\\") == "AB\\x01\\xFF\\x5C", "escape bytes to \\xHH", fails)
+    tcheck(SNBridge.EscapeBytes("plain text") == "plain text", "printable untouched", fails)
+    -- Fresh capture store, enable, overflow the cap, verify eviction + order.
+    local data = ns.Store.GetData()
+    data.snCapture = { enabled = false, frames = {}, dropped = 0 }
+    SNBridge.SetCapture(true)
+    tcheck(SNBridge.CaptureEnabled() == true, "capture enables", fails)
+    for i = 1, CAPTURE_CAP + 5 do
+        SNBridge.CaptureFrame("S" .. i .. "-R", "GUILD", "raw" .. i)
+    end
+    local cap = data.snCapture
+    tcheck(#cap.frames == CAPTURE_CAP, "ring capped at CAPTURE_CAP", fails)
+    tcheck(cap.dropped == 5, "evicted count tracked", fails)
+    tcheck(cap.frames[#cap.frames].sender == "S" .. (CAPTURE_CAP + 5) .. "-R", "newest frame retained", fails)
+    tcheck(cap.frames[1].sender == "S6-R", "oldest 5 evicted (FIFO)", fails)
+    tcheck(cap.frames[1].len == #("raw6"), "frame length recorded", fails)
+    -- Disable stops capture.
+    SNBridge.SetCapture(false)
+    local before = #cap.frames
+    SNBridge.CaptureFrame("X-R", "GUILD", "nope")
+    tcheck(#cap.frames == before, "disabled capture is a no-op", fails)
+    data.snCapture = nil   -- leave the store clean for other suites
+end
+
 function SNBridge.RunSelfTests(verbose)
     local suites = {
         { name = "xor round-trip", fn = testXorRoundTrip },
@@ -482,6 +659,7 @@ function SNBridge.RunSelfTests(verbose)
         { name = "version gate",   fn = testVersionGate },
         { name = "translate",      fn = testTranslate },
         { name = "decode chain",   fn = testDecodeChain },
+        { name = "capture ring",   fn = testCaptureRing },
     }
     local allPass = true
     for _, suite in ipairs(suites) do
@@ -513,6 +691,7 @@ if ns.RegisterSelfTest then
 end
 if ns.RegisterDebugCommand then
     ns:RegisterDebugCommand("snbridge", function() SNBridge.DebugDump() end)
+    ns:RegisterDebugCommand("sncapture", function(args) SNBridge.CaptureCommand(args) end)
 end
 
 -- Activate at login (Core fires "LOGIN"); OnLogin self-guards on re-entry.

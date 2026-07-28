@@ -138,11 +138,19 @@ function Auto.DecideAccept(ctx)
     return false, nil
 end
 
+-- Whitelist membership gated by the master enable toggle (item 35). Default-on
+-- semantics preserved: a nil `whitelistEnabled` (older DB) still bypasses.
+local function whitelisted(ag, nameRealm)
+    return (ag.whitelistEnabled ~= false
+        and ag.whitelist and ag.whitelist[nameRealm] == true) or false
+end
+Auto._Whitelisted = whitelisted
+
 -- Live wrapper: build the ctx from settings + membership and decide.
 function Auto.ShouldAcceptInvite(nameRealm)
     local ag = agBlock()
     return Auto.DecideAccept({
-        whitelisted      = ag.whitelist and ag.whitelist[nameRealm] == true,
+        whitelisted      = whitelisted(ag, nameRealm),
         acceptFromAnyone = ag.acceptFromAnyone == true,
         acceptFromRoster = ag.acceptFromRoster == true,
         acceptFromGuild  = ag.acceptFromGuild == true,
@@ -153,26 +161,28 @@ function Auto.ShouldAcceptInvite(nameRealm)
     })
 end
 
--- Pure decision function for keyword-invite SENDING. The store models a single
--- `sendToRoster` send-gate (parity with the source's send toggle set which we
--- fold to one switch); whitelist always bypasses, and when sending is enabled
--- any known-trust sender is invited while strangers require acceptFromAnyone.
+-- Pure decision function for keyword-invite SENDING (item 22). The reference
+-- gates SENDS per trust category independently, mirroring the four accept-from
+-- gates: sendToRoster / sendToGuild / sendToFriends / sendToAnyone. Whitelist
+-- always bypasses. A member of multiple categories is invited if ANY of its
+-- enabled send-gates admits it. Returns (invite:boolean, category:string|nil).
 function Auto.DecideKeywordInvite(ctx)
     if ctx.whitelisted then return true, "whitelist" end
-    if not ctx.sendEnabled then return false, nil end
-    if ctx.isRoster then return true, "roster" end
-    if ctx.isGuild  then return true, "guild" end
-    if ctx.isFriend then return true, "friends" end
-    if ctx.acceptFromAnyone then return true, "anyone" end
+    if ctx.sendToAnyone then return true, "anyone" end
+    if ctx.sendToRoster and ctx.isRoster then return true, "roster" end
+    if ctx.sendToGuild  and ctx.isGuild  then return true, "guild" end
+    if ctx.sendToFriends and ctx.isFriend then return true, "friends" end
     return false, nil
 end
 
 function Auto.ShouldInviteKeyword(nameRealm)
     local ag = agBlock()
     return Auto.DecideKeywordInvite({
-        whitelisted      = ag.whitelist and ag.whitelist[nameRealm] == true,
-        sendEnabled      = ag.sendToRoster == true,
-        acceptFromAnyone = ag.acceptFromAnyone == true,
+        whitelisted   = whitelisted(ag, nameRealm),
+        sendToRoster  = ag.sendToRoster == true,
+        sendToGuild   = ag.sendToGuild == true,
+        sendToFriends = ag.sendToFriends == true,
+        sendToAnyone  = ag.sendToAnyone == true,
         isRoster = Auto.IsRoster(nameRealm),
         isGuild  = Auto.IsGuild(nameRealm),
         isFriend = Auto.IsFriend(nameRealm),
@@ -310,6 +320,9 @@ end
 -- autoSummon.triggers set (options.lua wires the UI in N3) references these
 -- keys; a freshly-gained trigger buff within the window means "I'm buffed and
 -- want the summon to raid". Exposed so options.lua can enumerate them.
+-- All 10 world buffs are summon triggers (item 23): the reference gates summon
+-- acceptance on holding ANY of DMF, Ony, ZG, DMT AP/SP/STAM, Songflower, Rend,
+-- Battle Shout, FFF. (Prior build had only 7 — no dmf/battleShout/fff.)
 Auto.SUMMON_TRIGGER_BUFFS = {
     { key = "dragonslayer", prefix = "rallying cry of the dragonslayer" },
     { key = "warchief",     prefix = "warchief's blessing" },
@@ -318,6 +331,9 @@ Auto.SUMMON_TRIGGER_BUFFS = {
     { key = "fengus",       prefix = "fengus' ferocity" },
     { key = "moldar",       prefix = "mol'dar's moxie" },
     { key = "slipkik",      prefix = "slip'kik's savvy" },
+    { key = "dmf",          prefix = "sayge's dark fortune" },
+    { key = "battleShout",  prefix = "battle shout" },
+    { key = "fff",          prefix = "fervor of the first feast" },  -- seasonal [verify prefix]
 }
 
 -- Most-recent trigger-buff gain timestamp (GetTime seconds). Refreshed as
@@ -789,14 +805,41 @@ local function testTrustTruthTable()
     a = Auto.DecideAccept({ isRoster = true, isGuild = true, isFriend = true })
     if a then return false, "reject with all toggles off" end
 
-    -- keyword-invite send gate: disabled -> reject even for roster.
-    a = Auto.DecideKeywordInvite({ sendEnabled = false, isRoster = true })
-    if a then return false, "keyword send disabled" end
-    -- enabled + roster -> invite; whitelist bypass even when send disabled.
-    a = Auto.DecideKeywordInvite({ sendEnabled = true, isRoster = true })
-    if not a then return false, "keyword send roster" end
-    a = Auto.DecideKeywordInvite({ sendEnabled = false, whitelisted = true })
-    if not a then return false, "keyword whitelist bypass" end
+    -- keyword-invite per-category send gates (item 22):
+    -- roster member, sendToRoster OFF -> reject.
+    a = Auto.DecideKeywordInvite({ sendToRoster = false, isRoster = true })
+    if a then return false, "keyword send roster gate off" end
+    -- roster member, sendToRoster ON -> invite as roster.
+    a, cat = Auto.DecideKeywordInvite({ sendToRoster = true, isRoster = true })
+    if not (a and cat == "roster") then return false, "keyword send roster" end
+    -- guild member, only sendToGuild ON (roster gate off) -> invite as guild.
+    a, cat = Auto.DecideKeywordInvite({ sendToRoster = false, sendToGuild = true,
+                                        isGuild = true, isRoster = true })
+    if not (a and cat == "guild") then return false, "keyword send guild independent" end
+    -- friend, sendToFriends OFF -> reject.
+    a = Auto.DecideKeywordInvite({ sendToFriends = false, isFriend = true })
+    if a then return false, "keyword send friends gate off" end
+    -- stranger, sendToAnyone ON -> invite.
+    a, cat = Auto.DecideKeywordInvite({ sendToAnyone = true })
+    if not (a and cat == "anyone") then return false, "keyword send anyone" end
+    -- whitelist bypasses even with every send gate off.
+    a, cat = Auto.DecideKeywordInvite({ whitelisted = true })
+    if not (a and cat == "whitelist") then return false, "keyword whitelist bypass" end
+    -- nothing enabled -> reject.
+    a = Auto.DecideKeywordInvite({ isRoster = true, isGuild = true, isFriend = true })
+    if a then return false, "keyword reject all gates off" end
+
+    -- whitelist ENABLE toggle (item 35): a listed name bypasses only when enabled.
+    local wl = { ["A-B"] = true }
+    if not Auto._Whitelisted({ whitelist = wl, whitelistEnabled = true }, "A-B") then
+        return false, "whitelist enabled admits listed name"
+    end
+    if Auto._Whitelisted({ whitelist = wl, whitelistEnabled = false }, "A-B") then
+        return false, "whitelist disabled blocks listed name"
+    end
+    if not Auto._Whitelisted({ whitelist = wl }, "A-B") then
+        return false, "nil whitelistEnabled defaults to on (back-compat)"
+    end
     return true
 end
 

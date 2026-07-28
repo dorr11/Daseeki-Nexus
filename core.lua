@@ -196,6 +196,7 @@ local function printHelp()
     ns:Print("  /nexus invite            - mass alt-invite (wave N4)")
     ns:Print("  /nexus resetui           - reset dashboard layout (wave N3)")
     ns:Print("  /nexus account <id>      - show/set this account's mesh ID")
+    ns:Print("  /nexus w <Char[-Server]> <msg> - whisper (server optional -> own realm)")
     ns:Print("  /nexus settings          - open the Daseeki hub to Nexus settings")
     ns:Print("  /nexus debug selftest    - run protocol self-tests")
     ns:Print("  /nexus help              - this list")
@@ -244,6 +245,37 @@ ns:RegisterSubcommand("account", function(rest)
         ns:Print("could not set account ID: " .. tostring(err))
     end
 end, "show/set account ID")
+
+-- Whisper helper (item 12): `/nexus w <Char[-Server]> <message...>`. A bare
+-- character name (no "-Server") targets our own realm. Parsing + normalization
+-- are pure (ns.ParseWhisper) so the routing is self-testable; the actual
+-- SendChatMessage is user-initiated (the owner typed the command).
+function ns:ParseWhisper(rest, ownRealm)
+    rest = rest and rest:match("^%s*(.-)%s*$") or ""
+    if rest == "" then return nil, nil, "usage: /nexus w <Char[-Server]> <message>" end
+    local target, message = rest:match("^(%S+)%s+(.+)$")
+    if not target or not message or message == "" then
+        return nil, nil, "usage: /nexus w <Char[-Server]> <message>"
+    end
+    if not target:find("-", 1, true) then
+        ownRealm = ownRealm or ""
+        if ownRealm ~= "" then target = target .. "-" .. ownRealm end
+    end
+    return target, message
+end
+
+ns:RegisterSubcommand("w", function(rest)
+    local ownRealm = (GetNormalizedRealmName and GetNormalizedRealmName())
+        or (GetRealmName and (GetRealmName():gsub("%s+", ""))) or ""
+    local target, message, err = ns:ParseWhisper(rest, ownRealm)
+    if not target then
+        ns:Print(err)
+        return
+    end
+    if SendChatMessage then
+        SendChatMessage(message, "WHISPER", nil, target)
+    end
+end, "whisper a character (server optional)")
 
 ns:RegisterSubcommand("debug", function(rest)
     rest = rest and rest:match("^%s*(.-)%s*$") or ""
@@ -295,6 +327,24 @@ SlashCmdList["DASEEKINEXUS"] = dispatch
 ----------------------------------------------------------------------
 
 ns.state = { loaded = false, loggedIn = false }
+
+-- Self-test for the whisper-helper parser (item 12).
+ns:RegisterSelfTest("core", function(verbose)
+    local pass = true
+    local function ck(c, m) if not c then pass = false; if verbose then ns:Print("  FAIL core/" .. m) end end end
+    local tgt, msg = ns:ParseWhisper("Bob hi there", "Whitemane")
+    ck(tgt == "Bob-Whitemane" and msg == "hi there", "bare name gets own realm")
+    tgt, msg = ns:ParseWhisper("Bob-Faerlina hello", "Whitemane")
+    ck(tgt == "Bob-Faerlina" and msg == "hello", "explicit realm preserved")
+    tgt, msg = ns:ParseWhisper("Bob multiple word message here", "Whitemane")
+    ck(tgt == "Bob-Whitemane" and msg == "multiple word message here", "multi-word message kept")
+    local t2 = ns:ParseWhisper("", "Whitemane")
+    ck(t2 == nil, "empty input rejected")
+    local t3 = ns:ParseWhisper("BobOnly", "Whitemane")
+    ck(t3 == nil, "target without message rejected")
+    if verbose and pass then ns:Print("  PASS core/parse-whisper") end
+    return pass
+end)
 
 ns:RegisterEvent("ADDON_LOADED", function(_, loaded)
     if loaded ~= ADDON then return end

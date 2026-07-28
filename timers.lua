@@ -460,6 +460,26 @@ Timers.NODE_RESPAWN = NODE_RESPAWN
 
 Timers._nwb = { serializer = nil, libSerialize = nil, deflate = nil, comm = nil, obj = nil, ready = false }
 
+-- NWB diagnostics (item 40): every stage counted so `/nexus debug nwb` can
+-- self-diagnose the owner's next request press. No silent skips in the counters
+-- (the ingest itself stays silent in chat).
+Timers._nwbStats = {
+    requestsSent = 0, lastRequestAt = 0, lastRequestBytes = 0,
+    heard = 0, lastHeardAt = 0, byChannel = {},
+    -- per-stage drop counts (each with a reason label)
+    drop = {
+        notReady = 0, channelDecode = 0, decompress = 0, deserialize = 0,
+        notString = 0, versionGate = 0, emptyData = 0, payloadNotTable = 0,
+    },
+    serializerPath = { libSerialize = 0, aceSerializer = 0 },
+    ingested = 0, lastCmd = nil, lastCmdAt = 0, lastApplied = nil,
+}
+
+local function nwbBump(path, key)
+    local t = Timers._nwbStats[path]
+    if type(t) == "table" then t[key] = (t[key] or 0) + 1 end
+end
+
 -- NWB 3.39 serializes with LibSerialize; older builds used AceSerializer. Try
 -- LibSerialize first, fall back to AceSerializer, so both inbound formats
 -- decode. Returns ok, value (mirrors both libs' Deserialize signature).
@@ -468,11 +488,11 @@ local function nwbDeserialize(str)
     if type(str) ~= "string" then return false end
     if nwb.libSerialize and nwb.libSerialize.Deserialize then
         local ok, v = nwb.libSerialize:Deserialize(str)
-        if ok then return true, v end
+        if ok then nwbBump("serializerPath", "libSerialize"); return true, v end
     end
     if nwb.serializer and nwb.serializer.Deserialize then
         local ok, v = nwb.serializer:Deserialize(str)
-        if ok then return true, v end
+        if ok then nwbBump("serializerPath", "aceSerializer"); return true, v end
     end
     return false
 end
@@ -507,28 +527,70 @@ local function nwbEpoch(v)
     return nil
 end
 
--- Ingest a decoded NWB timer payload table (short keys). Faction-resolves
--- ony/nef into our key space; ingests flower/tuber pops.
-function Timers.IngestNWBTimers(payload)
-    if type(payload) ~= "table" then return end
-    local r = nwbEpoch(payload.n); if r then Timers.Record("rend", r, "nwb", "NWB", "pop") end
-    local o = nwbEpoch(payload.s); if o then Timers.Record(factionKey("ony"), o, "nwb", "NWB", "pop") end
-    local nf = nwbEpoch(payload.y); if nf then Timers.Record(factionKey("nef"), nf, "nwb", "NWB", "pop") end
-    -- Songflowers f1..f10, tubers t1..t6 (epoch of last pick).
+-- Read the world-buff + node timer fields out of ONE NWB data table. Verified
+-- against NWB 3.39 source (Modules\Data.lua shortKeys): wire SHORT keys are
+-- n=rendTimer, s=onyTimer, y=nefTimer, f1..f10=flower1..10, t1..t6=tuber1..6.
+-- We also tolerate the WORD keys (rendTimer/onyTimer/nefTimer/flowerN/tuberN) in
+-- case a layer sub-table was not key-compacted. ZG/Zandalar is NOT transmitted
+-- by NWB at all, so there is no zan field to read. `applied` accumulates counts.
+local function readNWBTimerFields(tbl, applied)
+    if type(tbl) ~= "table" then return end
+    local r = nwbEpoch(tbl.n) or nwbEpoch(tbl.rendTimer)
+    if r then Timers.Record("rend", r, "nwb", "NWB", "pop"); applied.rend = true end
+    local o = nwbEpoch(tbl.s) or nwbEpoch(tbl.onyTimer)
+    if o then Timers.Record(factionKey("ony"), o, "nwb", "NWB", "pop"); applied.ony = true end
+    local nf = nwbEpoch(tbl.y) or nwbEpoch(tbl.nefTimer)
+    if nf then Timers.Record(factionKey("nef"), nf, "nwb", "NWB", "pop"); applied.nef = true end
     for i = 1, 10 do
-        local e = nwbEpoch(payload["f" .. i])
-        if e then Timers.MarkNode("flower", i, e, "nwb") end
+        local e = nwbEpoch(tbl["f" .. i]) or nwbEpoch(tbl["flower" .. i])
+        if e then Timers.MarkNode("flower", i, e, "nwb"); applied.flower = (applied.flower or 0) + 1 end
     end
     for i = 1, 6 do
-        local e = nwbEpoch(payload["t" .. i])
-        if e then Timers.MarkNode("tuber", i, e, "nwb") end
+        local e = nwbEpoch(tbl["t" .. i]) or nwbEpoch(tbl["tuber" .. i])
+        if e then Timers.MarkNode("tuber", i, e, "nwb"); applied.tuber = (applied.tuber or 0) + 1 end
     end
 end
+Timers._readNWBTimerFields = readNWBTimerFields
 
--- Handle one fully-reassembled NWB message (called by AceComm).
+-- Ingest a decoded NWB timer payload table. Handles BOTH flat (non-layered) and
+-- LAYERED realms (item 40): on layered realms NWB nests per-layer timer tables
+-- one level down under a "layers" map. The short key for "layers" is not a
+-- clean-room fact, so we scan defensively — any sub-table whose values are
+-- themselves tables is treated as a layer map and each layer is read. Reading is
+-- idempotent (Record's CD gate dedups), so scanning is safe.
+function Timers.IngestNWBTimers(payload)
+    if type(payload) ~= "table" then return end
+    local applied = {}
+    readNWBTimerFields(payload, applied)
+    for _, v in pairs(payload) do
+        if type(v) == "table" then
+            local looksLayerMap = false
+            for _, lv in pairs(v) do
+                if type(lv) == "table" then looksLayerMap = true break end
+            end
+            if looksLayerMap then
+                for _, layer in pairs(v) do readNWBTimerFields(layer, applied) end
+            end
+        end
+    end
+    Timers._nwbStats.lastApplied = applied
+    return applied
+end
+
+-- Handle one fully-reassembled NWB message (called by AceComm — AceComm owns the
+-- multi-part reassembly via the shared LibStub instance; both NWB's and our
+-- RegisterComm("NWB") callbacks fire, so `message` is already whole). Every
+-- drop path is counted for `/nexus debug nwb` (item 40).
 function Timers.OnNWBMessage(prefix, message, channel, sender)
+    local stats = Timers._nwbStats
+    stats.heard = stats.heard + 1
+    stats.lastHeardAt = now()
+    stats.byChannel[channel or "?"] = (stats.byChannel[channel or "?"] or 0) + 1
+
     local nwb = Timers._nwb
-    if not nwb.ready or not nwb.serializer or not nwb.deflate then return end
+    if not nwb.ready or not nwb.serializer or not nwb.deflate then
+        nwbBump("drop", "notReady"); return
+    end
     -- World-buff timer data rides GUILD (also YELL/SAY world broadcast).
     local decoded
     if channel == "YELL" or channel == "SAY" then
@@ -536,25 +598,33 @@ function Timers.OnNWBMessage(prefix, message, channel, sender)
     else
         decoded = nwb.deflate.DecodeForWoWAddonChannel and nwb.deflate:DecodeForWoWAddonChannel(message)
     end
-    if not decoded then return end
+    if not decoded then nwbBump("drop", "channelDecode"); return end
     local decompressed = nwb.deflate:DecompressDeflate(decoded)
-    if not decompressed then return end
+    if not decompressed then nwbBump("drop", "decompress"); return end
     local ok, top = nwbDeserialize(decompressed)
-    if not ok or type(top) ~= "string" then return end
+    if not ok then nwbBump("drop", "deserialize"); return end
+    if type(top) ~= "string" then nwbBump("drop", "notString"); return end
 
     local args = explodeSpace(top, 5)
     local cmd = args[1]
     local remoteVersion = tonumber(args[2]) or 0
-    if remoteVersion < NWB_MIN_VERSION then return end   -- version gate
+    if remoteVersion < NWB_MIN_VERSION then nwbBump("drop", "versionGate"); return end
     noteFreshness("nwb")   -- valid, version-gated NWB traffic seen
+    stats.lastCmd = cmd
+    stats.lastCmdAt = now()
     local dataStr = args[5]
 
     if cmd == "data" or cmd == "settings" or cmd == "requestData" then
         if type(dataStr) == "string" and #dataStr > 0 then
             local ok2, payload = nwbDeserialize(dataStr)
-            if ok2 and type(payload) == "table" then
-                Timers.IngestNWBTimers(payload)
+            if not ok2 or type(payload) ~= "table" then
+                nwbBump("drop", "payloadNotTable")
+            else
+                local applied = Timers.IngestNWBTimers(payload)
+                if applied and next(applied) ~= nil then stats.ingested = stats.ingested + 1 end
             end
+        else
+            nwbBump("drop", "emptyData")
         end
         Timers._sawNWB = true
     elseif cmd == "yell" or cmd == "yell2" then
@@ -882,22 +952,47 @@ local function seedAllWarnings()
 end
 
 -- Rebuild in-memory anchors from the store's newest-first pop logs so the
--- scheduler and false-positive gate survive a relog.
+-- scheduler and false-positive gate survive a relog AND so a freshly-imported
+-- account derives live CD state from its imported pop logs (item 39 — the owner
+-- hit "no data" after /nexus import because live state was never seeded from the
+-- logs). Entries older than a full CD are ignored (the buff is long-available =
+-- no meaningful countdown). Fires TIMER_UPDATED per seeded buff so the UI repaints.
+-- Returns the number of buffs seeded.
 function Timers.RehydrateFromStore()
-    if not (ns.Store and ns.Store.GetTimers) then return end
+    if not (ns.Store and ns.Store.GetTimers) then return 0 end
     local logs = ns.Store.GetTimers().logs or {}
+    local t = now()
+    local seeded = 0
     for buffKey, logKey in pairs(STORE_LOG_KEY) do
         local list = logs[logKey]
         if list and list[1] then
             local newest = list[1]
-            local s = stateOf(buffKey)
-            if newest.killed then
-                s.lastKilled = math.max(s.lastKilled or 0, newest.epoch or 0)
-            else
-                s.lastPop = math.max(s.lastPop or 0, newest.epoch or 0)
+            local epoch = newest.epoch or 0
+            local cd = CD[buffKey]
+            -- Ignore entries older than a full CD (no live countdown to show).
+            if epoch > 0 and cd and (t - epoch) < cd then
+                local s = stateOf(buffKey)
+                if newest.killed then
+                    s.lastKilled = math.max(s.lastKilled or 0, epoch)
+                else
+                    s.lastPop = math.max(s.lastPop or 0, epoch)
+                end
+                s.trust = s.trust or newest.trust or "local"
+                seeded = seeded + 1
+                ns:Fire("TIMER_UPDATED", buffKey)
             end
-            s.trust = s.trust or newest.trust or "local"
         end
+    end
+    return seeded
+end
+
+-- Re-seed live CD state + warnings after a bulk store refresh (e.g. /nexus
+-- import fired STORE_REFRESHED). Without this, imported pop logs never populated
+-- live timer state and the Timers tab showed "no data" (item 39).
+function Timers.OnStoreRefreshed()
+    Timers.RehydrateFromStore()
+    for i = 1, #WARNED_BUFFS do
+        if scheduleWarnings then scheduleWarnings(WARNED_BUFFS[i]) end
     end
 end
 
@@ -1144,6 +1239,9 @@ function Timers.RequestNWBData()
     local enc = Timers.BuildNWBRequest()
     if not enc then return false end
     Timers._lastNWBRequest = t
+    Timers._nwbStats.requestsSent = Timers._nwbStats.requestsSent + 1
+    Timers._nwbStats.lastRequestAt = t
+    Timers._nwbStats.lastRequestBytes = #enc
     -- Authorized NWB interop transmit (AceComm, GUILD). Never an SN prefix.
     ns:SafeCall(function() nwb.obj:SendCommMessage("NWB", enc, "GUILD") end)
     return true
@@ -1204,6 +1302,37 @@ function Timers.DebugDump()
     end
     ns:Print("broadcaster=" .. tostring(Timers.IsGuildBroadcaster()) ..
              " nwbIngest=" .. tostring(Timers._nwb and Timers._nwb.ready == true))
+end
+
+-- /nexus debug nwb — NWB ingest self-diagnosis (item 40). Prints the last
+-- request, raw messages heard (by channel), per-stage drop counts + reasons,
+-- decode serializer path, and the last successfully-ingested command + fields.
+function Timers.NWBDebugDump()
+    local s = Timers._nwbStats
+    local nwb = Timers._nwb
+    ns:Print("nwb ingest: ready=" .. tostring(nwb and nwb.ready == true)
+        .. " | libSerialize=" .. tostring(nwb and nwb.libSerialize ~= nil)
+        .. " aceSerializer=" .. tostring(nwb and nwb.serializer ~= nil)
+        .. " deflate=" .. tostring(nwb and nwb.deflate ~= nil)
+        .. " | inGuild=" .. tostring(IsInGuild and IsInGuild() == true))
+    ns:Print(string.format("  request: sent=%d lastAt=%d lastBytes=%d",
+        s.requestsSent, s.lastRequestAt, s.lastRequestBytes))
+    local chans = {}
+    for ch, n in pairs(s.byChannel) do chans[#chans + 1] = ch .. "=" .. n end
+    ns:Print(string.format("  heard: total=%d lastAt=%d [%s]",
+        s.heard, s.lastHeardAt, table.concat(chans, " ")))
+    ns:Print(string.format("  drops: notReady=%d chanDecode=%d decompress=%d deserialize=%d notString=%d versionGate=%d emptyData=%d payloadNotTable=%d",
+        s.drop.notReady, s.drop.channelDecode, s.drop.decompress, s.drop.deserialize,
+        s.drop.notString, s.drop.versionGate, s.drop.emptyData, s.drop.payloadNotTable))
+    ns:Print(string.format("  decode: libSerialize=%d aceSerializer=%d",
+        s.serializerPath.libSerialize, s.serializerPath.aceSerializer))
+    local applied = s.lastApplied or {}
+    local af = {}
+    for k, v in pairs(applied) do af[#af + 1] = k .. "=" .. tostring(v) end
+    ns:Print(string.format("  ingested=%d lastCmd=%s (at %d) lastApplied=[%s]",
+        s.ingested, tostring(s.lastCmd), s.lastCmdAt, table.concat(af, " ")))
+    ns:Print("  NOTE: NWB never transmits ZG/Zandalar; layered realms nest timers"
+        .. " under a layers map (handled). Reassembly is AceComm's, shared-instance.")
 end
 
 ----------------------------------------------------------------------
@@ -1399,6 +1528,50 @@ local function testNWBRequestBuild(fails)
     end
 end
 
+-- Item 39: imported/persisted pop logs seed live CD state; stale logs do not.
+local function testRehydrateFromStore(fails)
+    if not (ns.Store and ns.Store.GetTimers) then
+        fails[#fails + 1] = "store absent for rehydrate test"; return
+    end
+    local logs = ns.Store.GetTimers().logs
+    local t = now()
+    -- Fresh rend pop (1h ago, within the 3h CD).
+    Timers.state = {}
+    logs.rend, logs.onyH, logs.onyA = { { epoch = t - 3600, who = "imp", trust = "sn" } }, {}, {}
+    local seeded = Timers.RehydrateFromStore()
+    tcheck(seeded >= 1, "fresh rend log seeds an anchor", fails)
+    local s = Timers.state.rend
+    tcheck(s and (s.lastPop or 0) > 0, "rend anchor set from imported log", fails)
+    local cd = Timers.ComputeCD("rend", anchorEpoch(s), t)
+    tcheck(cd.onCD and cd.remaining > 0, "ComputeCD reports remaining after import seed", fails)
+    -- Stale rend pop (older than the 3h CD) -> no seed.
+    Timers.state = {}
+    logs.rend = { { epoch = t - (4 * 3600), who = "old", trust = "sn" } }
+    Timers.RehydrateFromStore()
+    tcheck((Timers.state.rend == nil) or ((Timers.state.rend.lastPop or 0) == 0),
+        "stale log (older than CD) not seeded", fails)
+    logs.rend, Timers.state = {}, {}
+end
+
+-- Item 40: NWB timer payload ingest — flat short keys, layered realms, word keys.
+local function testNWBIngest(fails)
+    local t = now()
+    Timers.state = {}
+    local a1 = Timers.IngestNWBTimers({ n = t - 100, s = t - 200, f1 = t - 50, t3 = t - 60 })
+    tcheck(a1.rend and a1.ony, "flat n/s short keys ingested", fails)
+    tcheck((a1.flower or 0) >= 1 and (a1.tuber or 0) >= 1, "flat flower/tuber ingested", fails)
+    -- Layered realm: timers nested under a layers-like map.
+    Timers.state = {}
+    local a2 = Timers.IngestNWBTimers({ layers = { [1] = { n = t - 300, f2 = t - 70 } } })
+    tcheck(a2.rend, "layered rend ingested (item 40)", fails)
+    tcheck((a2.flower or 0) >= 1, "layered flower ingested", fails)
+    -- Word keys tolerated (un-compacted layer).
+    Timers.state = {}
+    local a3 = Timers.IngestNWBTimers({ rendTimer = t - 100, flower5 = t - 40 })
+    tcheck(a3.rend and (a3.flower or 0) >= 1, "word keys tolerated", fails)
+    Timers.state = {}
+end
+
 function Timers.RunSelfTests(verbose)
     local suites = {
         { name = "cd derivation",     fn = testCDDerivation },
@@ -1410,6 +1583,8 @@ function Timers.RunSelfTests(verbose)
         { name = "log dedup",         fn = testLogDedup },
         { name = "node state machine", fn = testNodeStateMachine },
         { name = "ingest parsers",    fn = testIngestParsers },
+        { name = "rehydrate from store", fn = testRehydrateFromStore },
+        { name = "nwb payload ingest", fn = testNWBIngest },
     }
     local allPass = true
     for _, suite in ipairs(suites) do
@@ -1449,6 +1624,11 @@ function Timers.OnLogin()
 
     -- Seed CD-warning scheduler from persisted anchors (no backfire).
     seedAllWarnings()
+
+    -- Re-seed live CD state when a bulk store refresh lands (import etc. — item 39).
+    if ns.On then
+        ns:On("STORE_REFRESHED", function() ns:SafeCall(Timers.OnStoreRefreshed) end)
+    end
 
     -- Stand up receive-only NWB ingest if the shared libs are present.
     setupNWB()
@@ -1514,6 +1694,7 @@ if ns.RegisterSelfTest then
 end
 if ns.RegisterDebugCommand then
     ns:RegisterDebugCommand("timers", function() Timers.DebugDump() end)
+    ns:RegisterDebugCommand("nwb", function() Timers.NWBDebugDump() end)
 end
 
 -- Go active at login (Core fires Tracker/Protocol OnLogin already; we hook
