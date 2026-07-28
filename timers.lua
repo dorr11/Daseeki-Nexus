@@ -588,7 +588,9 @@ function Timers.OnNWBMessage(prefix, message, channel, sender)
     stats.byChannel[channel or "?"] = (stats.byChannel[channel or "?"] or 0) + 1
 
     local nwb = Timers._nwb
-    if not nwb.ready or not nwb.serializer or not nwb.deflate then
+    -- Require the receiver wired + deflate + at least one deserializer
+    -- (AceSerializer is optional; LibSerialize is the primary path).
+    if not nwb.ready or not nwb.deflate or not (nwb.libSerialize or nwb.serializer) then
         nwbBump("drop", "notReady"); return
     end
     -- World-buff timer data rides GUILD (also YELL/SAY world broadcast).
@@ -650,15 +652,22 @@ end
 local function setupNWB()
     local nwb = Timers._nwb
     if nwb.ready then return end
-    if type(LibStub) ~= "function" then return end   -- libs absent -> no ingest
+    -- LibStub is a TABLE with a __call metamethod (not a function) — the old
+    -- `type(LibStub) ~= "function"` guard ALWAYS returned here, so the NWB
+    -- receiver was never wired and no NWB data ever ingested (item 40 root
+    -- cause). Presence is all we need: LibStub("X", true) is guarded per-lib.
+    if not LibStub then return end
     local serializer = LibStub("AceSerializer-3.0", true)
     local deflate    = LibStub("LibDeflate", true)
     local comm       = LibStub("AceComm-3.0", true)
-    if not (serializer and deflate and comm) then return end
-    nwb.serializer, nwb.deflate, nwb.comm = serializer, deflate, comm
     -- LibSerialize is vendored (used to BUILD the requestData wire and to decode
-    -- modern NWB 3.39 traffic). AceSerializer stays as the legacy decode fallback.
+    -- modern NWB 3.39 traffic). AceSerializer is only the LEGACY decode fallback,
+    -- so it is OPTIONAL: require deflate + comm + at least one deserializer. This
+    -- degrades gracefully if a future NWB drops AceSerializer (LibSerialize-first
+    -- already handles decode).
     nwb.libSerialize = LibStub("LibSerialize", true)
+    if not (deflate and comm and (nwb.libSerialize or serializer)) then return end
+    nwb.serializer, nwb.deflate, nwb.comm = serializer, deflate, comm
     -- Embed a private object and register the NWB prefix; AceComm's shared
     -- registry reassembles chunks and dispatches to us AND to NWB.
     nwb.obj = nwb.obj or {}
