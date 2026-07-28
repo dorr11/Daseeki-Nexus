@@ -24,3 +24,8 @@ interact.lua
 options.lua
 syncns.lua
 import.lua
+ui_shell.lua
+ui_tab_sixties.lua
+ui_tab_online.lua
+ui_tab_summoners.lua
+ui_tab_timers.lua
