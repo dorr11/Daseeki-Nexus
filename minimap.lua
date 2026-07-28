@@ -144,23 +144,17 @@ local function inviteAll()
     end
 end
 
+-- Hand-merge reconciliation: the dashboard shell registers as ns.Dashboard
+-- (Toggle/Show), not the ns.UI surface this file originally guessed at.
 local function toggleDashboard()
-    local u = ns.UI
-    if u then
-        local fn = u.Toggle or u.ToggleDashboard or u.Show
-        if fn then ns:SafeCall(fn); return end
-    end
+    local d = ns.Dashboard
+    if d and d.Toggle then ns:SafeCall(d.Toggle); return end
     ns:Print("dashboard arrives with the UI module.")
 end
 
 local function openDashboardTimers()
-    local u = ns.UI
-    if u then
-        if u.OpenTab then ns:SafeCall(u.OpenTab, "Timers"); return end
-        if u.ShowTab then ns:SafeCall(u.ShowTab, "Timers"); return end
-        local fn = u.Toggle or u.ToggleDashboard or u.Show
-        if fn then ns:SafeCall(fn); return end
-    end
+    local d = ns.Dashboard
+    if d and d.Show then ns:SafeCall(d.Show, "timers"); return end
     ns:Print("dashboard Timers tab arrives with the UI module.")
 end
 
