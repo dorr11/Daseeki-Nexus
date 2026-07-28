@@ -19,3 +19,5 @@ protocol.lua
 tracker.lua
 mesh.lua
 timers.lua
+auto.lua
+interact.lua
