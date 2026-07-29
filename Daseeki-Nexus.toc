@@ -18,6 +18,7 @@ store.lua
 protocol.lua
 tracker.lua
 mesh.lua
+instances.lua
 timers.lua
 snbridge.lua
 auto.lua

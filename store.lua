@@ -308,6 +308,10 @@ local function defaultSettings()
         autoConvertToRaid = false,
         autoAssistAll     = false,
         hardThrottle      = false,
+        -- Instances tab: chat warning on entry when the account hits the hourly
+        -- warn threshold ("4 of 5 hourly instances used."). Default ON. ADDITIVE;
+        -- the engine only READS this key — the options UI lands with the tab wave.
+        instancesWarnOnEntry = true,
         accountID         = "",           -- user sets via /dsn account
         minimap = {
             hide = false,
@@ -360,6 +364,8 @@ local function defaultData()
         manualLocations = {},   -- ["Name-Realm"] = "label" (legacy location override; retained, no longer edited via UI)
         notes = {},             -- ["Name-Realm"] = "free-text note" (replaces the location-override concept)
         notesMigrated = false,  -- one-time marker: legacy manualLocations copied into empty notes
+        instances = {},         -- [aid] = { ["Name-Realm"] = { entries = { {t,name,mapID,dur,gold,xp,merged}, ... capped 60 } } }
+                                -- instance-entry ledger (NEXUS_INSTANCES_DESIGN). ADDITIVE; version-wipe-preserved like notes.
         social = {
             guild   = {},       -- ["Name-Realm"] = true
             friends = {},       -- ["Name-Realm"] = true
@@ -538,6 +544,9 @@ function Store.Init()
         local preservedNotes   = DaseekiNexusData.notes
         local preservedNotesMig = DaseekiNexusData.notesMigrated
         local preservedDeleted = DaseekiNexusData.deletedAIDs
+        -- Instance ledger is account-scoped state the wipe must PRESERVE (like
+        -- notes/manualLocations): the caps math is only useful across sessions.
+        local preservedInstances = DaseekiNexusData.instances
 
         DaseekiNexusData = defaultData()
         DaseekiNexusData.version = Store.STORAGE_VERSION
@@ -547,6 +556,7 @@ function Store.Init()
         if preservedNotes   then DaseekiNexusData.notes = preservedNotes end
         if preservedNotesMig ~= nil then DaseekiNexusData.notesMigrated = preservedNotesMig end
         if preservedDeleted then DaseekiNexusData.deletedAIDs = preservedDeleted end
+        if preservedInstances then DaseekiNexusData.instances = preservedInstances end
     end
 
     -- Backfill any structure a partial/older DB is missing.
@@ -918,6 +928,12 @@ end
 function Store.GetSettings()      return Store.db end
 function Store.GetData()          return Store.data end
 function Store.GetTimers()        return Store.data.timers end
+-- Instance ledger accessors (consumed by instances.lua + the mesh sync path).
+function Store.GetInstances()     return Store.data.instances end
+function Store.GetInstancesForAID(aid)
+    local all = Store.data.instances
+    return all and all[aid or ""] or nil
+end
 function Store.GetSocial()        return Store.data.social end
 function Store.GetManualLocation(nameRealm)
     return Store.data.manualLocations[nameRealm]
@@ -976,6 +992,10 @@ local function testDefaults(fails)
     -- Character record has the soulstone field.
     local rec = Store.NewCharacterRecord("X-Y")
     ck(rec.soulstoneReady == false, "record has soulstoneReady field")
+    -- Instances tab additive keys.
+    ck(s.instancesWarnOnEntry == true, "instancesWarnOnEntry default ON")
+    local d = defaultData()
+    ck(type(d.instances) == "table", "defaultData has an instances table")
 end
 
 local function testAlertMigration(fails)

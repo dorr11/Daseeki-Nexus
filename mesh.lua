@@ -76,6 +76,7 @@ local OP = {
     ACK        = "a",   -- settings/blacklist acknowledgement
     TIMER      = "z",   -- timer / pull event (payload from N2b handoff)
     TIMER_SNAP = "n",   -- Nexus merged timer snapshot (request reply / broadcast)
+    INSTANCES  = "i",   -- account instance-ledger sync (additive; see §Instances sync)
 }
 Mesh.OP = OP
 
@@ -174,6 +175,32 @@ function Mesh.HashTimers(timers)
     for i = 1, 6 do parts[#parts + 1] = tostring(tuber[i] or 0) end
     parts[#parts + 1] = tostring(timers.timerVersion or 0)
     return fnv1a(joinList(parts, ","))
+end
+
+-- Hash an account's instance ledger (the char->entries map) to a short id.
+-- Instances are NOT character-segment records, so — like timers — they ride a
+-- SEPARATE heartbeat hash field (instancesHash) and a dedicated sync area rather
+-- than the AccountHashes segment bundle. Deterministic: nameRealm keys sorted,
+-- each entry reduced to t:name:merged so a divergence in any of those trips a sync.
+function Mesh.HashInstances(charMap)
+    if not charMap then return "0" end
+    local names = {}
+    for nr in pairs(charMap) do names[#names + 1] = tostring(nr) end
+    if #names == 0 then return "0" end
+    table.sort(names)
+    local parts = {}
+    for i = 1, #names do
+        local nr = names[i]
+        parts[#parts + 1] = nr
+        local crec = charMap[nr]
+        local entries = (crec and crec.entries) or {}
+        for j = 1, #entries do
+            local e = entries[j]
+            parts[#parts + 1] = tostring(e.t or 0) .. ":" .. tostring(e.name or "")
+                .. ":" .. (e.merged and "1" or "0")
+        end
+    end
+    return fnv1a(joinList(parts, "\30"))
 end
 
 -- Compute the hash bundle we advertise for an account bucket.
@@ -992,6 +1019,12 @@ local function handleHeartbeat(f, sender)
     if hb.timerHash and hb.timerHash ~= localTimerHash then
         Mesh.RequestSync(sender, "timers", "timers")
     end
+    -- Instance-ledger divergence for the SENDER's account -> pull its ledger.
+    local localInstHash = Mesh.HashInstances(
+        Store.GetInstancesForAID and Store.GetInstancesForAID(hb.aid))
+    if hb.instancesHash and hb.instancesHash ~= localInstHash then
+        Mesh.RequestSync(sender, hb.aid, "instances")
+    end
 end
 
 local function handleDiscovery(f, sender, isPing)
@@ -1013,6 +1046,8 @@ local function handleSyncReq(f, sender)
     if not req then return end
     if req.area == "timers" then
         Mesh.SendTimers(sender)
+    elseif req.area == "instances" then
+        Mesh.SendInstances(sender, req.aid)
     else
         Mesh.SendManifest(sender, req.aid, req.area)
         Mesh.SendSegment(sender, req.aid, req.area)
@@ -1033,6 +1068,18 @@ local function handleSegment(f, sender)
     local senderAID = aidForName(sender)
     for nameRealm, rec in pairs(seg.records) do
         Store.WriteInboundCharacter(seg.aid, nameRealm, rec, senderAID)
+    end
+end
+
+-- Inbound instance ledger for an account. The dedup + ring-cap + self-immunity
+-- all live in the instances layer (Instances.MergeInbound), so this is pure
+-- transport: unpack and hand off. Guarded so a mesh-only build (instances layer
+-- absent) simply drops it.
+local function handleInstances(f, sender)
+    local seg = Mesh.Unpack(f.payload)
+    if not seg or not seg.aid or type(seg.records) ~= "table" then return end
+    if ns.Instances and ns.Instances.MergeInbound then
+        ns.Instances.MergeInbound(seg.aid, seg.records)
     end
 end
 
@@ -1114,6 +1161,7 @@ function Mesh.Dispatch(prefix, frame, sender)
     elseif op == OP.SYNC_REQ then   handleSyncReq(f, sender)
     elseif op == OP.MANIFEST then   handleManifest(f, sender)
     elseif op == OP.SEGMENT then    handleSegment(f, sender)
+    elseif op == OP.INSTANCES then  handleInstances(f, sender)
     elseif op == OP.SETTINGS then   handleSettings(f, sender)
     elseif op == OP.BLACKLIST then  handleBlacklist(f, sender)
     elseif op == OP.ACK then        handleAck(f, sender)
@@ -1138,6 +1186,10 @@ function Mesh.SendHeartbeat()
         aid       = aid,
         hashes    = bucket and Mesh.AccountHashes(bucket) or {},
         timerHash = Mesh.HashTimers(Store.GetTimers and Store.GetTimers()),
+        -- Instance-ledger hash for OUR OWN account (additive field; older clients
+        -- ignore it, so no protocol version bump). Follows the timerHash pattern.
+        instancesHash = Mesh.HashInstances(
+            Store.GetInstancesForAID and Store.GetInstancesForAID(aid)),
         online    = {},   -- online-character hint (Name-Realm list)
     }
     if bucket then
@@ -1335,6 +1387,21 @@ function Mesh.SendSegment(target, aid, area)
     if not payload then return end
     local seq = Mesh._outSeq + 1
     local frame = Mesh.BuildFrame(OP.SEGMENT, payload, { seq = seq })
+    Mesh.Enqueue(Protocol.PREFIX.SYNC, frame, {
+        op = "sync", chatType = "WHISPER", target = target, seq = seq,
+    })
+end
+
+-- Reply to a peer's instance-ledger sync request: pack the whole char->entries
+-- map for the requested account and send it on the additive INSTANCES op. Rides
+-- the existing SYNC prefix + scheduler (op="sync") exactly like a segment reply.
+function Mesh.SendInstances(target, aid)
+    local charMap = Store.GetInstancesForAID and Store.GetInstancesForAID(aid)
+    if not charMap then return end
+    local payload = Mesh.Pack({ aid = aid, records = charMap })
+    if not payload then return end
+    local seq = Mesh._outSeq + 1
+    local frame = Mesh.BuildFrame(OP.INSTANCES, payload, { seq = seq })
     Mesh.Enqueue(Protocol.PREFIX.SYNC, frame, {
         op = "sync", chatType = "WHISPER", target = target, seq = seq,
     })
@@ -2198,6 +2265,36 @@ local function testHashDiff()
     return true
 end
 
+-- Instance-ledger hash: order-independent over characters, deterministic over
+-- entries, and sensitive to a divergence in t / name / merged (so a heartbeat
+-- mismatch trips the instances sync). Empty/absent -> "0".
+local function testInstancesHash()
+    if Mesh.HashInstances(nil) ~= "0" then return false, "nil ledger not '0'" end
+    if Mesh.HashInstances({}) ~= "0" then return false, "empty ledger not '0'" end
+    local a = { ["A-R"] = { entries = { { t = 1, name = "MC", merged = false } } },
+                ["B-R"] = { entries = { { t = 2, name = "ZG", merged = true  } } } }
+    -- Same content, characters inserted in the other order -> identical hash.
+    local b = { ["B-R"] = { entries = { { t = 2, name = "ZG", merged = true  } } },
+                ["A-R"] = { entries = { { t = 1, name = "MC", merged = false } } } }
+    if Mesh.HashInstances(a) ~= Mesh.HashInstances(b) then
+        return false, "char-order changed the hash"
+    end
+    -- A merged-flag flip must change the hash.
+    local c = { ["A-R"] = { entries = { { t = 1, name = "MC", merged = true } } },
+                ["B-R"] = { entries = { { t = 2, name = "ZG", merged = true } } } }
+    if Mesh.HashInstances(a) == Mesh.HashInstances(c) then
+        return false, "merged-flag flip not detected"
+    end
+    -- A new entry must change the hash.
+    local d = { ["A-R"] = { entries = { { t = 1, name = "MC", merged = false },
+                                        { t = 3, name = "MC", merged = false } } },
+                ["B-R"] = { entries = { { t = 2, name = "ZG", merged = true } } } }
+    if Mesh.HashInstances(a) == Mesh.HashInstances(d) then
+        return false, "added entry not detected"
+    end
+    return true
+end
+
 local function testDedupWindow()
     -- fresh id at t=100 -> not seen; again at t=150 (within 120) -> seen;
     -- again at t=100+121 -> expired -> not seen.
@@ -2643,6 +2740,7 @@ function Mesh.RunSelfTests(verbose)
         { name = "state-changed guard", fn = testStateChangedGuard },
         { name = "relay assignment", fn = testRelayPlan },
         { name = "hash diff",        fn = testHashDiff },
+        { name = "instances hash",   fn = testInstancesHash },
         { name = "dedup window",     fn = testDedupWindow },
         { name = "frame round-trip", fn = testFrameRoundTrip },
         { name = "session seq",      fn = testFreshSeq },
