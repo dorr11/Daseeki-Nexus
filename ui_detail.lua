@@ -40,10 +40,10 @@ local COL_GAP   = 14
 -- (that's the compact CARD strip, §5b). The name carries buff IDENTITY; the status
 -- column carries STATE color (Missing / duration / Boon / DMF parenthetical).
 local BUFF_ICON   = 16        -- row icon edge (cropped/framed)
-local BUFF_ROW_H  = 20        -- buff row height
-local BUFF_ROW_GAP = 2        -- gap between rows (pitch = BUFF_ROW_H + gap = 22)
+local BUFF_ROW_H  = 18        -- buff row height (round-4: 18 so all 10 slots fit the
+local BUFF_ROW_GAP = 2        -- shorter 284 pane — pitch 20, 10 rows = 200px)
 local BUFF_TOP    = 18        -- list top offset below the eyebrow label
-local TILE_RIM  = "controlBorder"
+local TILE_RIM  = "borderLite"   -- neutral held/boon icon rim (pop pass — visible edge)
 
 -- Per-buff FAMILY HUE (echoes each spell icon's dominant color, reference-style) —
 -- these are buff IDENTITY colors (like class/faction colors), deliberately NOT theme
@@ -234,28 +234,42 @@ local function fstr(parent, fontKey, justify)
     return f
 end
 
--- microLabel eyebrow (ARIALN, uppercase, faint) — the control-panel section label.
+-- microLabel eyebrow (ARIALN, uppercase). Pop pass (round-4): section labels read at
+-- `muted` (a tier up from faint) so headers carry.
 local function microLabel(parent, text)
     local l = fstr(parent, "microLabel")
-    l:SetTextColor(UI.Color("faint"))
+    l:SetTextColor(UI.Color("muted"))
     if text then l:SetText(text) end
     return l
 end
 
--- Resolve a buff name's tint: its family hue, unless that hue's contrast against the
--- active theme's ground is too weak (light themes), in which case fall back to the
--- cream "text" token. Returns r,g,b (0..1) for SetTextColor.
+-- Brightened class color for the detail header name (pop pass) — class identity hue
+-- lifted ~12% toward white. Returns r,g,b (falls back to cream if no class color).
+local function brightClass(classTag)
+    local r, g, b = ns.Dashboard and ns.Dashboard.ClassColor and ns.Dashboard.ClassColor(classTag)
+    if not r then return UI.Color("text") end
+    local t = 0.12
+    return r + (1 - r) * t, g + (1 - g) * t, b + (1 - b) * t
+end
+
+-- Resolve a buff name's tint: its family hue LIFTED a tier brighter (pop pass), unless
+-- that hue's contrast against the active theme's ground is too weak (light themes), in
+-- which case fall back to the cream "text" token. Returns r,g,b (0..1) for SetTextColor.
 local function relLum(r, g, b) return 0.2126 * r + 0.7152 * g + 0.0722 * b end
 local function nameColor(slot)
     local D = ns.Dashboard
     local meta = D and D.AURA_META and D.AURA_META[slot]
     local hue = meta and BUFF_HUE[meta.key]
     if not hue then return UI.Color("text") end
+    local lift = 0.14
+    local hr = hue[1] + (1 - hue[1]) * lift
+    local hg = hue[2] + (1 - hue[2]) * lift
+    local hb = hue[3] + (1 - hue[3]) * lift
     local gr, gg, gb = UI.Color("ground")
-    if math.abs(relLum(hue[1], hue[2], hue[3]) - relLum(gr, gg, gb)) < 0.20 then
+    if math.abs(relLum(hr, hg, hb) - relLum(gr, gg, gb)) < 0.20 then
         return UI.Color("text")   -- insufficient contrast on this theme -> cream
     end
-    return hue[1], hue[2], hue[3]
+    return hr, hg, hb
 end
 
 -- A LABELED BUFF ROW: cropped/framed ~16px icon · buff name (family-hue tinted) ·
@@ -318,8 +332,8 @@ function Detail.Attach(parent)
     statusDot:SetSize(8, 8); statusDot:SetPoint("RIGHT", statusFS, "LEFT", -6, 0)
     D.nameFS, D.subFS, D.statusFS, D.statusDot = nameFS, subFS, statusFS, statusDot
 
-    -- Header bottom hairline (one sharp rule, §9 UI.Hairline).
-    local hrule = UI.Hairline(parent, { token = "border" })
+    -- Header bottom hairline (one sharp rule, §9 UI.Hairline). Pop pass: borderLite.
+    local hrule = UI.Hairline(parent, { token = "borderLite" })
     hrule:SetPoint("TOPLEFT", header, "BOTTOMLEFT", 0, -6)
     hrule:SetPoint("TOPRIGHT", header, "BOTTOMRIGHT", 0, -6)
 
@@ -370,7 +384,7 @@ function Detail.Attach(parent)
     cdLbl:SetPoint("TOPLEFT", rightCol, "TOPLEFT", 0, 0)
     tag(cdLbl, "detail.cdlabel")
     local function cdRow(keyText, y)
-        local kf = fstr(rightCol, "microLabel"); kf:SetTextColor(UI.Color("faint")); kf:SetText(keyText)
+        local kf = fstr(rightCol, "microLabel"); kf:SetTextColor(UI.Color("muted")); kf:SetText(keyText)
         kf:SetPoint("TOPLEFT", rightCol, "TOPLEFT", 0, y)
         local vf = fstr(rightCol, "numeral", "RIGHT")
         vf:SetPoint("TOPRIGHT", rightCol, "TOPLEFT", CD_W, y)   -- right edge at CD_W
@@ -388,14 +402,16 @@ function Detail.Attach(parent)
     tallyFS:SetPoint("RIGHT", rightCol, "RIGHT", 0, 0); tallyFS:SetJustifyH("LEFT"); tallyFS:SetWordWrap(true)
     D.tallyFS = tallyFS
 
-    -- NOTE block (bottom) — label + editbox, full column width, where the buttons were.
-    local noteLbl = microLabel(rightCol, "NOTE")
-    noteLbl:SetPoint("TOPLEFT", rightCol, "TOPLEFT", 0, -66)
-    tag(noteLbl, "detail.notelabel")
+    -- NOTE block — PINNED TO THE PANE BOTTOM (owner round-4 item 2): the editbox sits
+    -- flush at the right column's bottom (just above the dock divider), the label rides
+    -- above it. Full column width.
     local noteBox = CreateFrame("EditBox", nil, rightCol, "BackdropTemplate")
-    noteBox:SetPoint("TOPLEFT", noteLbl, "BOTTOMLEFT", 0, -5)
+    noteBox:SetPoint("BOTTOMLEFT", rightCol, "BOTTOMLEFT", 0, 0)
     noteBox:SetPoint("RIGHT", rightCol, "RIGHT", 0, 0)
     noteBox:SetHeight(22); noteBox:SetAutoFocus(false)
+    local noteLbl = microLabel(rightCol, "NOTE")
+    noteLbl:SetPoint("BOTTOMLEFT", noteBox, "TOPLEFT", 0, 4)
+    tag(noteLbl, "detail.notelabel")
     noteBox:SetFontObject(UI.fonts.body); noteBox:SetTextInsets(7, 7, 0, 0)
     UI.Skin(noteBox, function(self)
         self:SetBackdrop(UI.FLAT_BACKDROP)
@@ -438,8 +454,9 @@ function Detail.Attach(parent)
         local e = nowE()
         local faction = entry.faction or rec.faction
 
-        -- Header.
-        nameFS:SetText(Dd.ColoredName(entry.nameRealm, rec.classTag))
+        -- Header. Name = short (realm stripped) in the brightened class hue (pop pass).
+        nameFS:SetText(Dd.ShortName(entry.nameRealm))
+        nameFS:SetTextColor(brightClass(rec.classTag))
         local acct = (entry.aid and entry.aid ~= "" and ("#" .. entry.aid)) or ""
         subFS:SetText(("Level %s %s  %s"):format(rec.level or 60, rec.className or rec.classTag or "?", acct))
         local online = entry.online

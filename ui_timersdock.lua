@@ -31,11 +31,14 @@ ns.TimersDock = TimersDock
 ----------------------------------------------------------------------
 local PAD_V     = 11
 local PAD_H     = 14
-local WB_ROW_H  = 25
+-- Round-4: the dock grew to 292 (from 260). Rows + songflower cells BREATHE into the
+-- reclaimed space (taller WB rows; 2-line songflower cells) so the content fills the
+-- dock top-down instead of leaving a dead band above/below Broadcast.
+local WB_ROW_H  = 31
 local WB_TILE   = 18
 local SF_COLS   = 5
-local SF_GAP    = 4
-local SF_CELL_H = 22
+local SF_GAP    = 6
+local SF_CELL_H = 38
 local SF_IMMINENT = 20 * 60   -- CD ≤ 20 min = danger + brighten pulse
 
 -- Raise luminance of a color toward white (never darkens) — an imminent countdown
@@ -108,9 +111,10 @@ local function fstr(parent, key, justify)
     if justify then f:SetJustifyH(justify) end
     return f
 end
+-- Pop pass (round-4): section labels read at `muted` (a tier up from faint).
 local function microLabel(parent, text)
     local l = fstr(parent, "microLabel")
-    l:SetTextColor(UI.Color("faint"))
+    l:SetTextColor(UI.Color("muted"))
     if text then l:SetText(text) end
     return l
 end
@@ -120,7 +124,7 @@ local function makeIconTile(parent, size)
     UI.Skin(t, function(self)
         self:SetBackdrop(UI.FLAT_BACKDROP)
         self:SetBackdropColor(UI.Color("inset"))
-        self:SetBackdropBorderColor(UI.Color("controlBorder"))
+        self:SetBackdropBorderColor(UI.Color("borderLite"))   -- pop pass: visible edge
     end)
     local ic = t:CreateTexture(nil, "ARTWORK")
     ic:SetPoint("TOPLEFT", t, "TOPLEFT", 1, -1)
@@ -220,7 +224,7 @@ function TimersDock.Attach(parent)
     wbHdr:SetPoint("TOPLEFT", parent, "TOPLEFT", PAD_H, -PAD_V)
     local wbMeta = fstr(parent, "microLabel", "RIGHT")
     wbMeta:SetPoint("TOPRIGHT", parent, "TOPRIGHT", -PAD_H, -PAD_V)
-    wbMeta:SetTextColor(UI.Color("faint"))
+    wbMeta:SetTextColor(UI.Color("muted"))   -- pop pass
     D.wbMeta = wbMeta
 
     -- Rows container (tagged so the geometry checker can target the WB rows block).
@@ -246,6 +250,7 @@ function TimersDock.Attach(parent)
         r.tile = makeIconTile(r, WB_TILE); r.tile:SetPoint("LEFT", r, "LEFT", 0, 0)
         r.tile.icon:SetTexture(Dashboard.AuraIcon(def.slot))
         r.name = fstr(r, "body"); r.name:SetPoint("LEFT", r.tile, "RIGHT", 8, 0); r.name:SetText(def.label)
+        r.name:SetTextColor(UI.Color("text"))   -- pop pass: full text white
         if def.crest then
             r.crest = r:CreateTexture(nil, "ARTWORK")
             r.crest:SetSize(14, 14); r.crest:SetPoint("LEFT", r.name, "RIGHT", 5, 0)
@@ -256,10 +261,10 @@ function TimersDock.Attach(parent)
             onClick = function() showPopLog(def.logKey, (def.title or def.label) .. " — Pop Log") end })
         r.log:SetPoint("RIGHT", r, "RIGHT", 0, 0)
         r.stamp = fstr(r, "microLabel", "RIGHT"); r.stamp:SetPoint("RIGHT", r.log, "LEFT", -8, 0)
-        r.stamp:SetTextColor(UI.Color("faint"))
+        r.stamp:SetTextColor(UI.Color("muted"))   -- pop pass (off-CD stamp is secondary)
         r.status = fstr(r, "numeral", "RIGHT"); r.status:SetPoint("RIGHT", r.stamp, "LEFT", -10, 0)
-        -- One hairline per row (sharp control-panel rule).
-        r.rule = UI.Hairline(r, { token = "border" })
+        -- One hairline per row (sharp control-panel rule). Pop pass: borderLite.
+        r.rule = UI.Hairline(r, { token = "borderLite" })
         r.rule:SetPoint("BOTTOMLEFT", r, "BOTTOMLEFT", 0, 0)
         r.rule:SetPoint("BOTTOMRIGHT", r, "BOTTOMRIGHT", 0, 0)
         D._wbRows[i] = r
@@ -273,7 +278,7 @@ function TimersDock.Attach(parent)
     sfMeta:SetPoint("TOPRIGHT", parent, "TOPRIGHT", -PAD_H, 0)
     -- keep the meta baseline aligned with the SF header.
     sfMeta:SetPoint("TOP", sfHdr, "TOP", 0, 0)
-    sfMeta:SetTextColor(UI.Color("faint"))
+    sfMeta:SetTextColor(UI.Color("muted"))   -- pop pass
     D.sfMeta = sfMeta
 
     local sfGrid = CreateFrame("Frame", nil, parent)
@@ -290,12 +295,13 @@ function TimersDock.Attach(parent)
         UI.Skin(cell, function(self)
             self:SetBackdrop(UI.FLAT_BACKDROP)
             self:SetBackdropColor(UI.Color("inset"))
-            self:SetBackdropBorderColor(UI.Color("border"))
+            self:SetBackdropBorderColor(UI.Color("borderLite"))   -- pop pass
         end)
-        cell.nm = fstr(cell, "microLabel"); cell.nm:SetPoint("LEFT", cell, "LEFT", 6, 0)
-        cell.nm:SetWordWrap(false); cell.nm:SetTextColor(UI.Color("faint"))
+        -- Two-line cell (fills the taller round-4 cell): "N Label" on top, status below.
+        cell.nm = fstr(cell, "microLabel"); cell.nm:SetPoint("TOPLEFT", cell, "TOPLEFT", 6, -5)
+        cell.nm:SetWordWrap(false); cell.nm:SetTextColor(UI.Color("muted"))   -- pop pass
         cell.nm:SetText(("%d %s"):format(i, nodes[i].label or ("Node " .. i)))
-        cell.st = fstr(cell, "numeral", "RIGHT"); cell.st:SetPoint("RIGHT", cell, "RIGHT", -6, 0)
+        cell.st = fstr(cell, "numeral"); cell.st:SetPoint("BOTTOMLEFT", cell, "BOTTOMLEFT", 6, 6)
         cell._nodeKey = "flower" .. i
         D._sfCells[i] = cell
     end
@@ -308,7 +314,7 @@ function TimersDock.Attach(parent)
             cell:ClearAllPoints()
             cell:SetPoint("TOPLEFT", sfGrid, "TOPLEFT", g.x, g.y)
             cell:SetWidth(g.w)
-            cell.nm:SetWidth(g.w - 34)
+            cell.nm:SetWidth(g.w - 10)   -- name on its own top line (2-line cell)
         end
     end
     D._layoutGrid = layoutGrid
@@ -327,7 +333,11 @@ function TimersDock.Attach(parent)
             end
         end,
     })
-    bcast:SetPoint("BOTTOMLEFT", parent, "BOTTOMLEFT", PAD_H, PAD_V)
+    -- Flow the Broadcast button directly below the songflower grid (round-4) rather
+    -- than pinning it to the dock bottom — with the taller rows/cells the content now
+    -- fills top-down and the small remaining margin sits below the button, not as a
+    -- dead mid-pane gap.
+    bcast:SetPoint("TOPLEFT", sfGrid, "BOTTOMLEFT", 0, -12)
     D.bcast = bcast
 
     -- ── Refresh ──────────────────────────────────────────────────────────────

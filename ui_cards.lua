@@ -36,15 +36,17 @@ ns.Cards = Cards
 local COL_W      = 380      -- left column width
 local CHIP_H     = 44       -- chip bar height
 local LIST_PAD   = 12       -- card list padding
-local CARD_H     = 74       -- compact card height
+local CARD_H     = 84       -- card height (round-4: +10 for the "Updated X ago" body line)
 local CARD_GAP   = 6        -- gap between cards
 local CARD_PAD_H = 11       -- card horizontal padding
 local CARD_PAD_V = 9        -- card vertical padding
 local TILE       = 18       -- buff strip tile edge
 local TILE_GAP   = 3
 local CD_ICON    = 15       -- chrono/hearth cooldown icon edge (right-edge stack)
-local DETAIL_H   = 316      -- right-top detail pane height
--- dock fills the remaining 260 (576 - 316).
+local DETAIL_H   = 284      -- right-top detail pane height (round-4: was 316 — the
+                            -- detail reserved a hollow band; shrink it and let the
+                            -- dock take the reclaimed space so WORLD BUFF TIMERS rises).
+-- dock fills the remaining 292 (576 - 284).
 
 local STALE_AGE = 30 * 60
 
@@ -278,6 +280,16 @@ local function fstr(parent, key, justify)
 end
 local function now() return (Dashboard and Dashboard.Now and Dashboard.Now()) or (GetServerTime and GetServerTime()) or time() end
 
+-- Pop pass (round-4): a class-colored NAME rendered a tier brighter — the class hue
+-- lifted ~12% toward white so muddy classes (warlock/rogue) read on the dark ground,
+-- returned as r,g,b for SetTextColor (class color is a sanctioned identity color).
+local function brightName(classTag)
+    local r, g, b = Dashboard.ClassColor(classTag)
+    if not r then return UI.Color("text") end
+    local t = 0.12
+    return r + (1 - r) * t, g + (1 - g) * t, b + (1 - b) * t
+end
+
 ----------------------------------------------------------------------
 -- A compact card (mockup .card anatomy). Pooled; :Populate(entry, selected).
 ----------------------------------------------------------------------
@@ -285,12 +297,19 @@ local function makeCard(parent, pane)
     local card = CreateFrame("Button", nil, parent, "BackdropTemplate")
     card:SetHeight(CARD_H)
     card:RegisterForClicks("LeftButtonUp")
+    -- Pop pass (round-4): resting card OUTLINE = borderLite (visible edge, like the
+    -- reference's cards); selected = accent border + a raised fill + an accent WASH.
     UI.Skin(card, function(self)
         self:SetBackdrop(UI.FLAT_BACKDROP)
         self:SetBackdropColor(UI.Color(self._sel and "raised" or "panel"))
-        self:SetBackdropBorderColor(UI.Color(self._sel and "accent" or "border"))
+        self:SetBackdropBorderColor(UI.Color(self._sel and "accent" or "borderLite"))
     end)
-    -- Selection accent edge (mockup .card.sel:before — 3px accent bar).
+    -- Accent wash over the selected card (clearly distinct from a resting card).
+    card.wash = card:CreateTexture(nil, "BACKGROUND")
+    card.wash:SetPoint("TOPLEFT", card, "TOPLEFT", 1, -1)
+    card.wash:SetPoint("BOTTOMRIGHT", card, "BOTTOMRIGHT", -1, 1)
+    card.wash:Hide()
+    -- Selection accent edge (mockup .card.sel:before — a 3px accent bar).
     card.edge = card:CreateTexture(nil, "OVERLAY")
     card.edge:SetPoint("TOPLEFT", card, "TOPLEFT", 0, 0)
     card.edge:SetPoint("BOTTOMLEFT", card, "BOTTOMLEFT", 0, 0)
@@ -328,8 +347,11 @@ local function makeCard(parent, pane)
     -- cluster; owner round-2 item 6 — acct stays inline by the name).
     card.dot = card:CreateTexture(nil, "OVERLAY")
     card.dot:SetSize(8, 8); card.dot:SetPoint("TOPLEFT", card, "TOPLEFT", CARD_PAD_H, -CARD_PAD_V - 3)
+    -- Name: brightened class color + one font step up (pop pass). No right bound; the
+    -- acct tag hugs the name (compact cards, short names).
     card.name = fstr(card, "body"); card.name:SetPoint("LEFT", card.dot, "RIGHT", 8, 0)
     card.name:SetJustifyH("LEFT"); card.name:SetWordWrap(false)
+    do local f, sz, fl = card.name:GetFont(); if f then card.name:SetFont(f, (sz or 13) + 1, fl) end end
     card.acct = fstr(card, "microLabel"); card.acct:SetPoint("LEFT", card.name, "RIGHT", 6, 0)
     card.acct:SetTextColor(UI.Color("muted"))
     card.pvp = card:CreateTexture(nil, "ARTWORK")
@@ -339,11 +361,11 @@ local function makeCard(parent, pane)
     card.strike:SetHeight(1); card.strike:Hide()
     card.strike:SetPoint("LEFT", card.name, "LEFT", 0, 0)
 
-    -- Row 2: location (left) + updated-ago (right, inset clear of the CD stack).
-    card.loc = fstr(card, "small"); card.loc:SetPoint("TOPLEFT", card.dot, "BOTTOMLEFT", 0, -5)
+    -- Row 2: location (left). Row 3: "Updated X ago" in the BODY, under the location
+    -- (owner round-4 item 4 — off the right edge, which belongs to the CD stack).
+    card.loc = fstr(card, "small"); card.loc:SetPoint("TOPLEFT", card.dot, "BOTTOMLEFT", 0, -6)
     card.loc:SetWordWrap(false)
-    card.upd = fstr(card, "microLabel", "RIGHT")
-    card.upd:SetPoint("TOPRIGHT", card, "TOPRIGHT", -CD_COL, -28)
+    card.upd = fstr(card, "microLabel"); card.upd:SetPoint("TOPLEFT", card.loc, "BOTTOMLEFT", 0, -3)
 
     -- Row 3: buff-icon strip (real-icon tiles; §5a lit/desat + state border).
     card.tiles = {}
@@ -368,12 +390,17 @@ local function makeCard(parent, pane)
         local rec = entry.rec
         local nowE = now()
         self:SetBackdropColor(UI.Color(selected and "raised" or "panel"))
-        self:SetBackdropBorderColor(UI.Color(selected and "accent" or "border"))
+        self:SetBackdropBorderColor(UI.Color(selected and "accent" or "borderLite"))
         self.edge:SetShown(selected)
         if selected then self.edge:SetColorTexture(UI.Color("accent")) end
+        -- Selected accent wash (clearly distinct from a resting card).
+        self.wash:SetShown(selected)
+        if selected then local ar, ag, ab = UI.Color("accent"); self.wash:SetColorTexture(ar, ag, ab, 0.10) end
 
         self.dot:SetColorTexture(UI.Color(entry.online and "ok" or "faint"))
-        self.name:SetText(Dashboard.ColoredName(entry.nameRealm, rec.classTag))
+        -- Name: short (realm stripped) in the brightened class hue (pop pass).
+        self.name:SetText(Dashboard.ShortName(entry.nameRealm))
+        self.name:SetTextColor(brightName(rec.classTag))
         self.acct:SetText((entry.aid and entry.aid ~= "" and ("#" .. entry.aid)) or "")
 
         local struck = Cards.IsStruck(entry.nameRealm)
@@ -385,14 +412,17 @@ local function makeCard(parent, pane)
             self.strike:Hide()
         end
 
+        -- Location reads at full `text` (pop pass — it's meaningful, not tertiary).
         local loc = rec.location
         if loc and loc ~= "" then
-            self.loc:SetText(loc); self.loc:SetTextColor(UI.Color("muted"))
+            self.loc:SetText(loc); self.loc:SetTextColor(UI.Color("text"))
         else
             self.loc:SetText("Unknown"); self.loc:SetTextColor(UI.Color("danger"))
         end
+        -- "Updated X ago" in the body under the location (tertiary -> muted; warn stale).
         local ago, stale = Cards.AgoText(rec, nowE)
-        self.upd:SetText(ago); self.upd:SetTextColor(UI.Color(stale and "warn" or freshToken(rec, nowE)))
+        self.upd:SetText("Updated " .. ago .. " ago")
+        self.upd:SetTextColor(UI.Color(stale and "warn" or "muted"))
 
         -- PvP-flagged crest inline in the name/acct cluster.
         if rec.pvpFlagged and rec.faction then
@@ -482,22 +512,24 @@ local function makeChip(parent, def, kind, pane)
         self:SetBackdrop(UI.FLAT_BACKDROP)
         self._lbl:SetText(def.label:upper())
         self._cnt:SetText(count and tostring(count) or "")
+        -- Pop pass (round-4): inactive chip LABELS read at `text` (not muted); the
+        -- outline is borderLite; the count stays a tertiary `muted`.
         if kind == "scope" then
             if active then
                 self:SetBackdropColor(UI.Color("accent")); self:SetBackdropBorderColor(UI.Color("accent"))
                 self._lbl:SetTextColor(UI.Color("ground")); self._cnt:SetTextColor(UI.Color("ground"))
             else
-                self:SetBackdropColor(0, 0, 0, 0); self:SetBackdropBorderColor(UI.Color("border"))
-                self._lbl:SetTextColor(UI.Color("muted")); self._cnt:SetTextColor(UI.Color("faint"))
+                self:SetBackdropColor(0, 0, 0, 0); self:SetBackdropBorderColor(UI.Color("borderLite"))
+                self._lbl:SetTextColor(UI.Color("text")); self._cnt:SetTextColor(UI.Color("muted"))
             end
         else
             if active then
                 local ar, ag, ab = UI.Color("accent")
-                self:SetBackdropColor(ar, ag, ab, 0.14); self:SetBackdropBorderColor(UI.Color("accent"))
+                self:SetBackdropColor(ar, ag, ab, 0.18); self:SetBackdropBorderColor(UI.Color("accent"))
                 self._lbl:SetTextColor(UI.Color("accent")); self._cnt:SetTextColor(UI.Color("accent"))
             else
-                self:SetBackdropColor(0, 0, 0, 0); self:SetBackdropBorderColor(UI.Color("border"))
-                self._lbl:SetTextColor(UI.Color("muted")); self._cnt:SetTextColor(UI.Color("faint"))
+                self:SetBackdropColor(0, 0, 0, 0); self:SetBackdropBorderColor(UI.Color("borderLite"))
+                self._lbl:SetTextColor(UI.Color("text")); self._cnt:SetTextColor(UI.Color("muted"))
             end
         end
         -- Size to content (label + count + padding).
@@ -531,7 +563,7 @@ Dashboard.RegisterTab("characters", function(host)
     vdiv:SetWidth(1)
     vdiv:SetPoint("TOPLEFT", col, "TOPRIGHT", 0, 0)
     vdiv:SetPoint("BOTTOMLEFT", col, "BOTTOMRIGHT", 0, 0)
-    UI.Skin(vdiv, function(self) self:SetColorTexture(UI.Color("border")) end)
+    UI.Skin(vdiv, function(self) self:SetColorTexture(UI.Color("borderLite")) end)
 
     -- Chip bar (44) at the top of the left column.
     local chipbar = CreateFrame("Frame", nil, col)
@@ -540,7 +572,7 @@ Dashboard.RegisterTab("characters", function(host)
     chipbar:SetHeight(CHIP_H)
     tag(chipbar, "cards.chipbar")
     pane.chipbar = chipbar
-    local chipRule = UI.Hairline(col, { token = "border" })
+    local chipRule = UI.Hairline(col, { token = "borderLite" })
     chipRule:SetPoint("BOTTOMLEFT", chipbar, "BOTTOMLEFT", 0, 0)
     chipRule:SetPoint("BOTTOMRIGHT", chipbar, "BOTTOMRIGHT", 0, 0)
 
@@ -560,7 +592,7 @@ Dashboard.RegisterTab("characters", function(host)
     -- A small vertical divider texture between scope and modifier groups.
     local chipSep = chipbar:CreateTexture(nil, "OVERLAY")
     chipSep:SetSize(1, 18)
-    UI.Skin(chipSep, function(self) self:SetColorTexture(UI.Color("border")) end)
+    UI.Skin(chipSep, function(self) self:SetColorTexture(UI.Color("borderLite")) end)
     pane._chipSep = chipSep
 
     -- ── Card list (scroll) ───────────────────────────────────────────────────
@@ -597,7 +629,7 @@ Dashboard.RegisterTab("characters", function(host)
     pane.dockHost = dockHost
 
     -- Seam hairline between detail and dock (the 1px divider).
-    local seam = UI.Hairline(host, { token = "border" })
+    local seam = UI.Hairline(host, { token = "borderLite" })
     seam:SetPoint("TOPLEFT", detailHost, "BOTTOMLEFT", 0, 0)
     seam:SetPoint("TOPRIGHT", detailHost, "BOTTOMRIGHT", 0, 0)
 

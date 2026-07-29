@@ -847,6 +847,28 @@ local function buildHeader(w)
         for _, b in ipairs(factionSegs) do b:_setActive(b._faction == f) end
     end
 
+    -- Settings launcher (owner round-4: the shell rebuild dropped it — a regression).
+    -- CHOICE: a right-cluster TEXT BUTTON left of the faction toggle, NOT a tab. Settings
+    -- is an ACTION (opens the Core hub), not a dashboard pane, so a tab would be
+    -- semantically wrong and would need one built lazily; the right-cluster text button
+    -- reads as the reference's right-side Help/Settings pairing while Help stays a real
+    -- tab. Opens the Daseeki hub to the Nexus section (the old header wiring).
+    local settingsBtn = CreateFrame("Button", nil, header)
+    settingsBtn:SetHeight(HEADER_H)
+    local sLbl = settingsBtn:CreateFontString(nil, "OVERLAY")
+    sLbl:SetFontObject(UI.fonts.body)
+    sLbl:SetPoint("CENTER", settingsBtn, "CENTER", 0, 0)
+    sLbl:SetText("Settings")
+    settingsBtn:SetWidth((sLbl:GetStringWidth() or 52) + 16)
+    settingsBtn:SetPoint("RIGHT", segA, "LEFT", -12, 0)
+    settingsBtn:SetScript("OnEnter", function() sLbl:SetFontObject(UI.fonts.accent) end)
+    settingsBtn:SetScript("OnLeave", function() sLbl:SetFontObject(UI.fonts.body) end)
+    settingsBtn:SetScript("OnClick", function()
+        if DaseekiSuite and DaseekiSuite.Open then DaseekiSuite:Open("nexus")
+        else ns:Print("the Daseeki hub (Daseeki Core) is not available.") end
+    end)
+    w.settingsBtn = settingsBtn
+
     -- Tabs, folded into the titlebar after the wordmark (left group). Each button
     -- fills the titlebar height with an accent underline on the active tab.
     local tabs = {}
@@ -895,11 +917,12 @@ local function buildHeader(w)
     end
 
     -- Titlebar bottom rule (1px) — the seam between the 44px bar and the 576 body.
+    -- Pop pass (round-4): borderLite so the seam reads like the reference's edges.
     local rule = w:CreateTexture(nil, "ARTWORK")
     rule:SetHeight(1)
     rule:SetPoint("TOPLEFT", w, "TOPLEFT", 1, -HEADER_H)
     rule:SetPoint("TOPRIGHT", w, "TOPRIGHT", -1, -HEADER_H)
-    UI.Skin(rule, function(self) self:SetColorTexture(UI.Color("border")) end)
+    UI.Skin(rule, function(self) self:SetColorTexture(UI.Color("borderLite")) end)
 
     -- Content host = the full 576 body (edge-to-edge; panes own their own insets).
     local host = CreateFrame("Frame", nil, w)
