@@ -33,3 +33,4 @@ ui_tab_instances.lua
 hud.lua
 pins.lua
 minimap.lua
+layoutaudit.lua
