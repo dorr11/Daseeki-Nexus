@@ -58,7 +58,7 @@ local SIDE_W     = 172          -- right column inner width
 local COL_GAP    = 16
 local DESIGN_W   = PAD + MAIN_W + COL_GAP + SIDE_W + PAD   -- 512
 local TILE       = 34
-local TILE_GAP   = 6
+local TILE_GAP   = 8            -- widened so 34px captions never touch (item E)
 local TILE_LABEL = 13           -- duration line height under a tile
 local ROW_GAP    = 8
 local STALE_SECS = 30 * 60      -- ink cools past this (freshness)
@@ -101,7 +101,23 @@ function LedgerPage.DMFParenthetical(rec, e)
     return "on CD", "danger"
 end
 
--- Display state for one buff slot (attention-inverted). Returns a table:
+-- Compact tile-caption duration ("1h59", "59m", "45s", "2d3h") — fits the 34px
+-- tile width on ONE line (item E: the FormatDuration form "1h 59m" overflowed and
+-- collided with the neighbour). The full "1h 59m" form stays on the hover tooltip.
+function LedgerPage.CompactDuration(secs)
+    secs = math.floor(tonumber(secs) or 0)
+    if secs <= 0 then return "0" end
+    local d = math.floor(secs / 86400)
+    local h = math.floor((secs % 86400) / 3600)
+    local m = math.floor((secs % 3600) / 60)
+    local s = secs % 60
+    if d > 0 then return ("%dd%dh"):format(d, h) end
+    if h > 0 then return ("%dh%02d"):format(h, m) end
+    if m > 0 then return ("%dm"):format(m) end
+    return ("%ds"):format(s)
+end
+
+-- Display state for one buff slot. Returns a table:
 --   { shown, slot, missing, boon, calm, tint, durText, durTok, spellID }
 -- shown=false  -> hide the tile (ignored class-rule slot / collapsing tail slot, absent).
 -- Mirrors ui_shell's buff-row logic: class-rule severity via AuraRequirement,
@@ -123,30 +139,34 @@ function LedgerPage.BuffTileState(slot, rec, faction, e)
     if present then
         local BOON = (ns.Store and ns.Store.AURA_SOURCE and ns.Store.AURA_SOURCE.BOON) or 2
         local booned = (st.source == BOON or st.source == "boon")
-        local tok
+        local full = D.FormatDuration(st.duration)
         if booned then
-            tok = "ok"
-        else
-            local th = D.GetThreshold(faction, meta.thresholdKey)
-            tok = D.AuraColorToken(st.duration, th)
+            -- item E: (Boon) REPLACES the duration on the tile caption (green
+            -- "Boon"); the full duration + "(Boon)" live on the hover tooltip.
+            return { shown = true, slot = slot, missing = false, boon = true,
+                     calm = true, tint = "ok", durText = "Boon", durTok = "ok",
+                     fullText = full .. " (Boon)", spellID = meta.spellID }
         end
-        local calm = (tok == "ok")               -- owned + healthy/boon = calm idle tile
-        local durText = D.FormatDuration(st.duration) .. (booned and " (Boon)" or "")
-        return { shown = true, slot = slot, missing = false, boon = booned,
-                 calm = calm, tint = tok, durText = durText, durTok = tok, spellID = meta.spellID }
+        local th  = D.GetThreshold(faction, meta.thresholdKey)
+        local tok = D.AuraColorToken(st.duration, th)    -- ok / warn / danger
+        return { shown = true, slot = slot, missing = false, boon = false,
+                 calm = (tok == "ok"), tint = tok,
+                 durText = LedgerPage.CompactDuration(st.duration), durTok = tok,
+                 fullText = full, spellID = meta.spellID }
     end
 
     -- Absent DMF still renders, surfacing its re-acquire window (READY / on-CD).
     if isDMF then
         local par, ptok = LedgerPage.DMFParenthetical(rec, e)
         return { shown = true, slot = slot, missing = true, boon = false, calm = false,
-                 tint = ptok, durText = "(" .. par .. ")", durTok = ptok, spellID = meta.spellID }
+                 tint = ptok, durText = par, durTok = ptok,
+                 fullText = "(" .. par .. ")", spellID = meta.spellID }
     end
 
     -- Missing but applicable: required = danger, optional = warn (attention pops).
     local tok = (requirement == "optional") and "warn" or "danger"
     return { shown = true, slot = slot, missing = true, boon = false, calm = false,
-             tint = tok, durText = nil, durTok = tok, spellID = meta.spellID }
+             tint = tok, durText = nil, durTok = tok, fullText = nil, spellID = meta.spellID }
 end
 
 -- Raid tally rows + counts. locked when expiry > now.
@@ -230,11 +250,21 @@ end
 function LedgerPage._render(nameRealm)
     local f = LedgerPage.EnsureFrame()
     if not f then return end
+    -- Order (item M — the page "stutters open" when the reveal fights a relayout):
+    -- (1) Populate once → final height, (2) host it in the row slot (position +
+    -- one-delta reflow), THEN (3) start the 120ms tween. `_revealing` guards the
+    -- live repaint path so a mid-tween Populate can't yank the frame.
     local h = LedgerPage.Populate(nameRealm) or f.uiHeight or 0
     if ns.Roster and ns.Roster.HostOpenEntry then
         ns.Roster.HostOpenEntry(nameRealm, f, h)
     end
+    LedgerPage._revealing = true
     if UI and UI.Animate then UI.Animate.ScaleReveal(f) else f:Show() end
+    if C_Timer and C_Timer.After then
+        C_Timer.After(0.13, function() LedgerPage._revealing = false end)
+    else
+        LedgerPage._revealing = false
+    end
 end
 
 -- ════════════════════════════════════════════════════════════════════════════
@@ -267,7 +297,13 @@ function LedgerPage.Build()
     UI.PaintLedgerGround(f, { grainToken = "raised", keyline = false })
 
     -- WoW-native ESC close + a discoverable top-right ✕ (§8).
-    f:SetFrameStrata("HIGH")
+    -- NOTE: do NOT pin an explicit strata here. This page is reparented INTO the
+    -- roster's scroll child (Roster.HostOpenEntry) and must inherit that child's
+    -- strata so the ScrollFrame scrolls AND clips it with the register rows. A
+    -- pinned "HIGH" strata detached it from the scroll group — it rendered as a
+    -- fixed overlay that ignored the scroll offset while the rows moved under it
+    -- (the P0-A bug). Inheriting strata + a raised frame level (set in
+    -- HostOpenEntry) keeps it above the row fills yet scrolling with them.
     local GNAME = "DaseekiNexusLedgerPage"
     _G[GNAME] = f
     if type(UISpecialFrames) == "table" then
@@ -345,6 +381,8 @@ function LedgerPage.Build()
         t.icon:SetTexCoord(0.08, 0.92, 0.08, 0.92)
         t.dur = numFS(t)
         t.dur:SetPoint("TOP", t, "BOTTOM", 0, -2)
+        t.dur:SetWidth(TILE)          -- caption = tile width, ONE line (item E, no overlap)
+        t.dur:SetWordWrap(false)
         t.dur:SetJustifyH("CENTER")
         t:EnableMouse(true)
         t:SetScript("OnEnter", function(self)
@@ -394,10 +432,10 @@ function LedgerPage.Build()
     f.rSay = rSay
 
     local tallyFS = f:CreateFontString(nil, "OVERLAY")
-    tallyFS:SetFontObject(UI.fonts.body)                  -- ruled initials (color per lock state)
+    tallyFS:SetFontObject(UI.fonts.small)                 -- one step down so all 7 initials fit ONE ruled line (item H)
     tallyFS:SetPoint("TOPLEFT", rEyebrow, "BOTTOMLEFT", 0, -6)
     tallyFS:SetWidth(SIDE_W); tallyFS:SetJustifyH("LEFT")
-    tallyFS:SetWordWrap(true)
+    tallyFS:SetWordWrap(false)
     tallyFS:EnableMouse(true)
     tallyFS:SetScript("OnEnter", function(self)
         if not self._tip then return end
@@ -502,19 +540,25 @@ function LedgerPage.Populate(nameRealm)
             t:ClearAllPoints()
             t:SetPoint("TOPLEFT", f._tileHost, "TOPLEFT", x, y)
             t.icon:SetTexture(D.AuraIcon(s.slot))
+            -- §5a: a real spell icon reads WoW-native — OWNED = full-color lit,
+            -- MISSING = desaturated (unlit) with a danger/warn EDGE.
             t.icon:SetDesaturated(s.missing and true or false)
             local meta = D.AURA_META[s.slot]
             t._name = meta and meta.name
-            t._tipLine = s.missing and "missing" or (s.durText)
-            -- attention inversion: calm owned = idle border/no-pop; else tint pops
+            t._tipLine = s.fullText or (s.missing and "missing") or nil
             t:SetBackdrop(UI.FLAT_BACKDROP)
             t:SetBackdropColor(UI.Color("inset"))
-            t:SetBackdropBorderColor(UI.Color(s.calm and "idle" or s.tint))
-            if s.missing and not s.durText then
-                t.dur:SetText("")
+            -- Edge: missing pops its tint; owned stays quiet (boon gets a soft green).
+            t:SetBackdropBorderColor(UI.Color(s.missing and s.tint or (s.boon and "ok" or "border")))
+            -- Caption (§5a de-dull): green Boon / cream healthy / amber low / red critical.
+            if s.durText and s.durText ~= "" then
+                local capTok = s.boon and "ok"
+                    or (s.durTok == "ok" and "text")   -- healthy = cream (not muted)
+                    or s.durTok
+                t.dur:SetText(s.durText)
+                t.dur:SetTextColor(UI.Color(capTok))
             else
-                t.dur:SetText(s.durText or "")
-                t.dur:SetTextColor(UI.Color(s.calm and "muted" or s.durTok))
+                t.dur:SetText("")
             end
         end
     end
@@ -546,7 +590,7 @@ function LedgerPage.Populate(nameRealm)
             tip[#tip + 1] = { r.full .. ": open", 0.66, 0.61, 0.52 }
         end
     end
-    f.tallyFS:SetText(table.concat(parts, "  "))
+    f.tallyFS:SetText(table.concat(parts, " "))   -- single space: 7 initials on ONE line (item H)
     f.tallyFS._tip = tip
 
     -- anchor the right column's y to the buff eyebrow's y so both columns align at top
@@ -596,7 +640,7 @@ function LedgerPage.Populate(nameRealm)
     local headerH = PAD + 12 + 5 + 14 + 6 + 1 + 8   -- pad + seal + gap + subhead + gap + rule + gap
     local rightBlockH = 14 + 6 + (rows > 0 and 0 or 0)  -- eyebrow + gap
     -- right block: eyebrow(14)+gap(6)+tally(~2 lines 32)+gap(10)+chrono(18)+hearth(18)+[shard 20]+gap(10)+actions(22)
-    local tallyLines = math.max(1, math.ceil(#rowsList / 5))
+    local tallyLines = 1   -- forced onto one ruled line (item H)
     local rightH = 14 + 6 + tallyLines * 16 + 10 + 18 + 4 + 18
         + (rec.classTag == "WARLOCK" and 24 or 0) + 10 + 22
     local leftH = 14 + mainBlockH
@@ -615,8 +659,14 @@ end
 if ns.On then
     ns:On("ROSTER_ROW_CLICKED", function(nameRealm) LedgerPage.Open(nameRealm) end)
 
+    -- The roster asks us to close when the open character leaves the visible view
+    -- (faction switch, an excluding filter, or any rebuild without that row) —
+    -- item B. Close() clears openKey AND releases the roster's hosted slot.
+    ns:On("ROSTER_CLOSE_OPEN_ENTRY", function() LedgerPage.Close() end)
+
     -- Live repaint in place while open (no rebuild → no scroll reset).
     local function repaint()
+        if LedgerPage._revealing then return end   -- don't fight the reveal tween (item M)
         if LedgerPage.openKey and LedgerPage.frame and LedgerPage.frame:IsShown() then
             LedgerPage.Populate(LedgerPage.openKey)
         end
@@ -747,11 +797,13 @@ local function testBuffMatrix(fails)
     local st = LedgerPage.BuffTileState(onySlot, rec, "Horde", e)
     if not (st.shown and st.calm and not st.missing) then fails[#fails + 1] = "owned healthy buff should be shown+calm" end
 
-    -- (Boon) source -> ok/green + boon flag + calm + "(Boon)" text
+    -- (Boon) source -> ok/green + boon flag + caption "Boon" REPLACES the duration
+    -- (item E); the full duration + "(Boon)" move to the hover tooltip (fullText).
     rec.auraStates[onySlot] = { duration = 1200, source = BOON }
     st = LedgerPage.BuffTileState(onySlot, rec, "Horde", e)
-    if not (st.boon and st.tint == "ok" and st.durText:find("%(Boon%)")) then
-        fails[#fails + 1] = "boon buff should be ok/green with (Boon) annotation"
+    if not (st.boon and st.tint == "ok" and st.durText == "Boon"
+            and st.fullText and st.fullText:find("%(Boon%)")) then
+        fails[#fails + 1] = "boon buff caption should be 'Boon' (green) with full dur+(Boon) on tooltip"
     end
 
     -- required class-rule slot MISSING (rend on WARRIOR) -> shown + danger
@@ -780,6 +832,38 @@ local function testBuffMatrix(fails)
     if ns.Store then ns.Store.GetFactionSettings = savedGFS end
 end
 
+-- item E "caption width math": the compact caption must fit the 34px tile on one
+-- line (<= 5 chars in our number font) and the owned tile must read lit (not missing).
+local function testCaptionCompact(fails)
+    local C = LedgerPage.CompactDuration
+    local cases = {
+        { 3600 + 59 * 60, "1h59" },        -- 1h 59m -> "1h59"
+        { 3600 + 5 * 60,  "1h05" },        -- zero-padded minutes
+        { 59 * 60,        "59m"  },
+        { 45,             "45s"  },
+        { 2 * 86400 + 3 * 3600, "2d3h" },
+        { 0,              "0"    },
+    }
+    for _, c in ipairs(cases) do
+        local got = C(c[1])
+        if got ~= c[2] then
+            fails[#fails + 1] = ("CompactDuration(%d)=%q expected %q"):format(c[1], got, c[2])
+        end
+        if #got > 5 then fails[#fails + 1] = ("caption %q exceeds 5-char tile budget"):format(got) end
+    end
+    -- Owned healthy tile: full-color icon (missing=false) + compact caption.
+    local D = ns.Dashboard
+    if D and D.AURA_META then
+        local onySlot; for s, m in pairs(D.AURA_META) do if m.key == "ony" then onySlot = s end end
+        if onySlot then
+            local rec = { classTag = "WARRIOR", auraStates = { [onySlot] = { duration = 3600 } } }
+            local st = LedgerPage.BuffTileState(onySlot, rec, "Horde", 1000000)
+            if st.missing ~= false then fails[#fails + 1] = "owned tile must not be 'missing' (§5a lit icon)" end
+            if not (st.durText and #st.durText <= 5) then fails[#fails + 1] = "owned caption should be compact (<=5 chars)" end
+        end
+    end
+end
+
 local function testRaidTally(fails)
     local e = 1000000
     local rec = { raidLockouts = { MC = e + 3600, BWL = e - 10, Ony = e + 7200 } }
@@ -796,6 +880,7 @@ if ns.RegisterSelfTest then
             { name = "auto-open event",   fn = testAutoOpenEvent },
             { name = "dmf parenthetical", fn = testDMFParenthetical },
             { name = "buff display matrix", fn = testBuffMatrix },
+            { name = "caption compact",   fn = testCaptionCompact },
             { name = "raid tally",        fn = testRaidTally },
         }
         local allPass = true

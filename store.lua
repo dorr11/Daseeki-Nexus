@@ -711,6 +711,19 @@ end
 -- Wave N2a: added the optional 4th `senderAID` param and the lowest-account-ID
 -- tie resolution. Callers passing 3 args keep the N1 behaviour (ties rejected).
 function Store.WriteInboundCharacter(aid, nameRealm, record, senderAID)
+    -- Guard: a nil/empty nameRealm would index bucket.characters[nil] below and
+    -- error, DROPPING this record AND error-storming the rest of the receive
+    -- batch — which is how a peer's characters silently stopped showing online.
+    -- Inbound frames legitimately arrive nameless: Protocol.EncodeCharacter writes
+    -- `rec.nameRealm or ""` and Protocol.DecodeCharacter turns "" back into nil
+    -- (protocol.lua:398), so any push of a record without a nameRealm (an early-
+    -- login self record before the name is stamped, or the import STORE_REFRESHED
+    -- backstop noted in EncodeCharacter) lands here with nameRealm==nil. Drop it
+    -- deterministically and count it for diagnostics rather than crashing.
+    if type(nameRealm) ~= "string" or nameRealm == "" then
+        Store._droppedNamelessInbound = (Store._droppedNamelessInbound or 0) + 1
+        return false
+    end
     if Store.IsSelfAccount(aid) then
         return false   -- never overwrite our own data from the wire
     end
@@ -1078,12 +1091,35 @@ local function testNotes(fails)
     ck(data.notes["B-Realm"] == nil, "note migration idempotent via marker")
 end
 
+-- K guard: a nameless inbound record must be dropped (never crash the receive
+-- batch). Regression for the "other account's characters not showing online" bug.
+local function testInboundNameGuard(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local savedCount = Store._droppedNamelessInbound
+    Store._droppedNamelessInbound = 0
+    local rec = Store.NewCharacterRecord(nil)
+    rec.ownerEpoch = 1
+    -- nil / empty nameRealm from a non-self account: dropped, not applied, no error.
+    local okNil   = Store.WriteInboundCharacter("42", nil, rec, "42")
+    local okEmpty = Store.WriteInboundCharacter("42", "",  rec, "42")
+    ck(okNil == false,   "nil nameRealm inbound dropped (no crash)")
+    ck(okEmpty == false, "empty nameRealm inbound dropped")
+    ck(Store._droppedNamelessInbound == 2, "dropped-nameless counter incremented twice")
+    -- A real nameRealm from a non-self account still writes through.
+    local okReal = Store.WriteInboundCharacter("42", "Peer-Realm", rec, "42")
+    ck(okReal == true, "named inbound from another account still applied")
+    -- Cleanup the throwaway account bucket so the shared store is left untouched.
+    if Store.data and Store.data.accounts then Store.data.accounts["42"] = nil end
+    Store._droppedNamelessInbound = savedCount
+end
+
 function Store.RunSelfTests(verbose)
     local suites = {
         { name = "defaults",        fn = testDefaults },
         { name = "alert migration", fn = testAlertMigration },
         { name = "songflower migration", fn = testSongflowerMigration },
         { name = "notes",           fn = testNotes },
+        { name = "inbound name guard", fn = testInboundNameGuard },
     }
     local allPass = true
     for _, suite in ipairs(suites) do

@@ -39,11 +39,12 @@ local GRID_ROW_H     = 22
 local REG_GAP        = 3
 local GRID_GAP       = 2
 local PAD            = 8
-local SEAL_SIZE      = 8      -- wax seal diamond edge (one per row — §5)
+local SEAL_SIZE      = 9      -- wax seal diamond edge (one per row — §5; +1 so online crimson reads clearly, §O)
 local TILE           = 18     -- register buff-icon tile
 local PIP            = 14     -- grid square coverage pip
 local HDR_TILE       = 16     -- grid column-header buff tile
-local NAME_W         = 150    -- grid name column (keeps pips aligned to headers)
+local NAME_W         = 140    -- grid name column (fixed; pips pack tight right after it — item F)
+local PIP_PITCH      = 26     -- grid pip column pitch (tight fixed, NOT window-spread — item F)
 local STALE_AGE      = 30 * 60
 
 -- The adaptive-path facet map (Expert-C law: ONE row primitive, a density param).
@@ -73,7 +74,7 @@ local RAID_TALLY = {
     { k = "BWL",  lbl = "BWL"  },
     { k = "ZG",   lbl = "ZG"   },
     { k = "AQ40", lbl = "AQ40" },
-    { k = "Naxx", lbl = "Nax"  },
+    { k = "Naxx", lbl = "Naxx" },   -- item G: "Naxx" everywhere (register + open page)
     { k = "Ony",  lbl = "Ony"  },
     { k = "AQ20", lbl = "AQ20" },
 }
@@ -262,12 +263,17 @@ local function freshToken(rec, nowE)
     return "idle"
 end
 
--- Attention-inverted token for a buff slot on a character.
---   present  -> "owned"      calm idle
---   missing (required) -> "missing"   danger tint (pops)
---   missing (optional) -> "warn"      amber
---   non-applicable     -> "na"        faint (grid: empty pip; register: collapse)
-local function slotState(entry, slot)
+-- State + abstract-pip token for a buff slot on a character. The ABSTRACT square
+-- pip (Coverage Board / grid) keeps BRAND_SPEC §5 attention-inversion: owned/held
+-- = calm idle, MISSING = danger tint (required) / warn (optional), non-applicable
+-- = faint. (§5a's WoW-native lit=have grammar applies to real spell-ICON tiles —
+-- the register strip — NOT to these abstract pips.) Promoted onto Roster so the
+-- headless harness can pin the mapping and catch any future inversion (item C).
+--   present  -> "owned",   "idle"
+--   missing (required) -> "missing", "danger"
+--   missing (optional) -> "warn",    "warn"
+--   non-applicable     -> "na",      "faint"
+function Roster.SlotState(entry, slot)
     local rec = entry.rec
     local st = rec.auraStates and rec.auraStates[slot]
     local present = st and (st.duration or 0) > 0
@@ -277,6 +283,7 @@ local function slotState(entry, slot)
     if requirement == "optional" then return "warn", "warn" end
     return "missing", "danger"
 end
+local slotState = Roster.SlotState
 
 ----------------------------------------------------------------------
 -- The ONE adaptive RosterRow (register + grid densities, one pooled frame set).
@@ -438,14 +445,14 @@ local function makeRosterRow(parent, pane)
                     t.icon:SetTexture(Dashboard.AuraIcon(slot))
                     t:SetBackdrop(UI.FLAT_BACKDROP)
                     if state == "owned" then
-                        -- calm: desaturated icon, idle backdrop
-                        t.icon:SetDesaturated(true); t.icon:SetVertexColor(1, 1, 1); t.icon:SetAlpha(0.85)
-                        t:SetBackdropColor(UI.Color("idle", 0.5))
+                        -- §5a: real spell icon = OWNED reads WoW-native full-color LIT.
+                        t.icon:SetDesaturated(false); t.icon:SetVertexColor(1, 1, 1); t.icon:SetAlpha(1)
+                        t:SetBackdropColor(UI.Color("inset"))
                         t:SetBackdropBorderColor(UI.Color("border"))
                     else
-                        -- missing: danger/warn-tinted tile that pops
-                        t.icon:SetDesaturated(false); t.icon:SetVertexColor(1, 1, 1); t.icon:SetAlpha(1)
-                        t:SetBackdropColor(UI.Color(token, 0.30))
+                        -- §5a: MISSING = desaturated (unlit) icon + danger/warn EDGE.
+                        t.icon:SetDesaturated(true); t.icon:SetVertexColor(1, 1, 1); t.icon:SetAlpha(0.85)
+                        t:SetBackdropColor(UI.Color(token, 0.25))
                         t:SetBackdropBorderColor(UI.Color(token))
                     end
                     t:Show()
@@ -485,10 +492,39 @@ end
 -- Hover-peek tooltip (§8 GameTooltip house style).
 ----------------------------------------------------------------------
 
+-- Adaptive peek side (item D): default the tip to the RIGHT of the cursor; if the
+-- cursor sits in the right band of the window the tip would clip the right edge,
+-- so flip LEFT. Pure so the harness can pin the flip threshold.
+function Roster.PeekAnchor(cursorX, screenW, frac)
+    frac = frac or 0.6
+    if screenW and screenW > 0 and cursorX and cursorX > screenW * frac then
+        return "left"
+    end
+    return "right"
+end
+
 function Roster.ShowPeek(anchor, entry)
     if not (GameTooltip and entry and entry.rec) then return end
     local rec = entry.rec
-    GameTooltip:SetOwner(anchor, "ANCHOR_RIGHT")
+    -- Anchor to the cursor and flip side near the right bound so the black tip box
+    -- never gets cut off at the window edge (item D). Full-width rows made a plain
+    -- ANCHOR_RIGHT clip every time.
+    local screenW = (UIParent and UIParent.GetRight and UIParent:GetRight())
+        or (GetScreenWidth and GetScreenWidth()) or 0
+    local cx, cy = 0, 0
+    if GetCursorPosition then
+        local scale = (UIParent and UIParent.GetEffectiveScale and UIParent:GetEffectiveScale()) or 1
+        if not scale or scale == 0 then scale = 1 end
+        cx, cy = GetCursorPosition()
+        cx, cy = cx / scale, cy / scale
+    end
+    GameTooltip:SetOwner(anchor, "ANCHOR_NONE")
+    GameTooltip:ClearAllPoints()
+    if Roster.PeekAnchor(cx, screenW) == "left" then
+        GameTooltip:SetPoint("TOPRIGHT", UIParent, "BOTTOMLEFT", cx - 12, cy)
+    else
+        GameTooltip:SetPoint("TOPLEFT", UIParent, "BOTTOMLEFT", cx + 12, cy)
+    end
     GameTooltip:AddLine(Dashboard.ColoredName(entry.nameRealm, rec.classTag) ..
         (entry.online and "  " .. Dashboard.Colored("online", "ok") or ""))
     local loc = (rec.location and rec.location ~= "" and rec.location)
@@ -688,12 +724,13 @@ Dashboard.RegisterTab("characters", function(host)
     pane.emptyLabel = emptyLabel
 
     -- Column geometry for grid (pip columns aligned to header tiles).
+    -- Coverage Board columns: name column is fixed, then the 10 pip columns at a
+    -- TIGHT fixed pitch immediately after it — NOT spread across the whole window
+    -- (item F: full-width spread destroyed scanability). Right side carries nothing.
     local function pipGeom(width)
         local x0 = PAD + SEAL_SIZE + 8 + NAME_W + 8
-        local avail = math.max(10, width - x0 - PAD)
-        local colW = avail / 10
         local cols = {}
-        for i = 1, 10 do cols[i] = { x = x0 + (i - 1) * colW, w = colW } end
+        for i = 1, 10 do cols[i] = { x = x0 + (i - 1) * PIP_PITCH, w = PIP_PITCH } end
         return cols
     end
 
@@ -709,8 +746,13 @@ Dashboard.RegisterTab("characters", function(host)
     -- The single layout pass (data-refresh and open-entry reflow both call this).
     -- Walks cumulative Y; if a row is the open entry, its slot hosts the R1-B page
     -- frame instead (the row hides) and everything below shifts by the single
-    -- (pageH − rowH) delta. Scroll is clamped so the open page is never clipped.
-    local function layout()
+    -- (pageH − rowH) delta.
+    --   reveal=true  → this is a fresh OPEN: nudge/clamp scroll so the page shows.
+    --   reveal=false → steady repaint (ticker/data event): PRESERVE the user's
+    --     scroll (only clamp to the valid range). The old code clamped-to-open on
+    --     EVERY repaint, so with the top char auto-opened the register snapped back
+    --     to the top a beat after any manual scroll (item L).
+    local function layout(reveal)
         local density = rosterUIState().rosterDensity
         local dkey = (density == "grid") and "grid" or "register"
         local desc = Roster.DENSITY[dkey]
@@ -744,13 +786,17 @@ Dashboard.RegisterTab("characters", function(host)
         end
         child:SetHeight(math.max(y, 1))
 
-        -- Clamp/nudge scroll so an open entry is fully visible (Expert-C cond 3).
-        if openTop then
+        -- Scroll handling. Always clamp to the valid range (so a shrunk list can't
+        -- strand the view past the bottom); only NUDGE toward the open entry on a
+        -- fresh reveal (Expert-C cond 3) — never on steady repaints (item L).
+        do
             local viewH = scroll:GetHeight()
             local maxScroll = math.max(0, child:GetHeight() - viewH)
             local stp = scroll:GetVerticalScroll()
-            if openBottom > stp + viewH then stp = openBottom - viewH end
-            if openTop < stp then stp = openTop end
+            if reveal and openTop then
+                if openBottom > stp + viewH then stp = openBottom - viewH end
+                if openTop < stp then stp = openTop end
+            end
             scroll:SetVerticalScroll(math.max(0, math.min(maxScroll, stp)))
         end
 
@@ -772,10 +818,20 @@ Dashboard.RegisterTab("characters", function(host)
         pane.nameHdr:SetShown(dkey == "grid")
     end
     pane.layout = layout
-    pane.Reflow = layout
+    pane.Reflow       = function() layout(false) end   -- release / steady reflow (preserve scroll)
+    pane.RevealReflow = function() layout(true)  end   -- fresh open (nudge into view)
+
+    -- A cheap signature of WHICH view we're showing. A change here (scope, active
+    -- modifiers, or faction) is a real view change — it re-permits an auto-open and
+    -- forces a full recompute; a plain data tick does not.
+    local function viewKey(scope, mods, faction)
+        local m = {}
+        for _, def in ipairs(MOD_DEFS) do if mods[def.key] then m[#m + 1] = def.key end end
+        return (faction or "?") .. "|" .. (scope or "?") .. "|" .. table.concat(m, ",")
+    end
 
     function obj.Refresh()
-        -- Density toggle paint.
+        -- Density toggle paint (cheap; always).
         local density = rosterUIState().rosterDensity
         for key, b in pairs(pane.densityBtns) do
             local active = (key == density)
@@ -785,8 +841,30 @@ Dashboard.RegisterTab("characters", function(host)
             b._t:SetTextColor(UI.Color(active and "text" or "muted"))
         end
 
-        -- Gather the faction roster (all accounts), stamp self + faction.
         local faction = Dashboard.GetFaction()
+        local vk = viewKey(pane.scope, pane.mods, faction)
+        local viewChanged = (vk ~= pane._lastViewKey)
+
+        -- Per-tick cost audit (coordinator): the register is repainted ~1×/sec by
+        -- the shared ticker. Re-gathering every account + re-sorting the whole
+        -- roster on every one of those repaints was wasteful. Only do the full
+        -- model recompute when something structural changed — a data event set the
+        -- dirty flag, the view (scope/mods/faction) changed, or it's the first run.
+        -- Otherwise take the LIGHT path: relayout in place (live buff/freshness
+        -- fields read straight off the shared records, and scroll is preserved).
+        local full = pane._dirty or viewChanged or not pane._listBuilt
+        if not full then
+            layout(false)
+            return
+        end
+        pane._dirty = false
+        pane._listBuilt = true
+        if viewChanged then
+            pane._lastViewKey = vk
+            pane._autoOpened = false   -- a genuine scope/faction change may re-auto-open
+        end
+
+        -- Gather the faction roster (all accounts), stamp self + faction.
         local entries = Dashboard.GatherRoster(faction, { includeHomeless = true })
         for _, e in ipairs(entries) do
             e.faction = faction
@@ -805,7 +883,15 @@ Dashboard.RegisterTab("characters", function(host)
             c:Apply(pane.mods[c._def.key] and true or false, counts.mod[c._def.key])
         end
 
-        layout()
+        -- Close the open page if its character is no longer in the visible set
+        -- (item B: faction switch, an excluding filter, or any rebuild that drops
+        -- the row). We EMIT — LedgerPage owns Close(), which releases our slot.
+        local openKey = ns.LedgerPage and ns.LedgerPage.GetOpen and ns.LedgerPage.GetOpen()
+        if openKey and not Roster.OpenEntryInView(openKey, list) then
+            ns:Fire("ROSTER_CLOSE_OPEN_ENTRY", openKey)
+        end
+
+        layout(false)
 
         -- Empty state.
         if #list == 0 then
@@ -815,16 +901,26 @@ Dashboard.RegisterTab("characters", function(host)
             pane.emptyLabel:Hide()
         end
 
-        -- Auto-open the highest-sorted ONLINE character once per show (self first).
-        -- R1-B owns actually opening (it listens for ROSTER_ROW_CLICKED).
+        -- Auto-open the highest-sorted ONLINE character (self first). Fires once per
+        -- view: the latch clears on show and on a real scope/faction change, NOT on
+        -- every repaint. R1-B owns opening (it listens for ROSTER_ROW_CLICKED).
         if not pane._autoOpened and not pane._openName and #list > 0 and list[1].online then
             pane._autoOpened = true
             ns:Fire("ROSTER_ROW_CLICKED", list[1].nameRealm, pane.rows[1])
         end
     end
 
-    -- Reset auto-open each time the tab becomes visible.
-    host:HookScript("OnShow", function() pane._autoOpened = false end)
+    -- Data-event dirty flags: a full recompute happens at most on the next tick
+    -- after real store movement, never on the bare time ticker (item L cost audit).
+    if ns.On then
+        local function markDirty() pane._dirty = true end
+        ns:On("STORE_REFRESHED", markDirty)
+        ns:On("STATE_CHANGED",   markDirty)
+        ns:On("NODE_UPDATED",    markDirty)
+    end
+
+    -- Reset auto-open + force a full rebuild each time the tab becomes visible.
+    host:HookScript("OnShow", function() pane._autoOpened = false; pane._dirty = true end)
     scroll:SetScript("OnSizeChanged", function() obj.Refresh() end)
 
     return obj
@@ -859,8 +955,26 @@ function Roster.HostOpenEntry(nameRealm, pageFrame, pageHeight)
     P._openName  = nameRealm
     P._openPage  = pageFrame
     P._openPageH = pageHeight or (Roster.RowPitch() * 6)
-    if pageFrame.SetParent then pageFrame:SetParent(P.child) end
-    if P.Reflow then P.Reflow() end
+    if pageFrame.SetParent then
+        pageFrame:SetParent(P.child)
+        -- The page inherits the scroll child's strata (it must NOT pin its own —
+        -- see ui_ledgerpage Build) so the ScrollFrame scrolls AND clips it with the
+        -- rows; raise its frame level so it still draws above the row fills (A).
+        if pageFrame.SetFrameLevel and P.child and P.child.GetFrameLevel then
+            pageFrame:SetFrameLevel((P.child:GetFrameLevel() or 0) + 5)
+        end
+    end
+    -- Fresh open → nudge the page into view (reveal); steady reflows preserve scroll.
+    if P.RevealReflow then P.RevealReflow() elseif P.Reflow then P.Reflow() end
+end
+
+-- Is the open character still present in the freshly computed view? (item B).
+function Roster.OpenEntryInView(openKey, list)
+    if not openKey then return true end
+    for _, e in ipairs(list or {}) do
+        if e.nameRealm == openKey then return true end
+    end
+    return false
 end
 
 function Roster.ReleaseOpenEntry()
@@ -888,6 +1002,55 @@ local function mkEntry(name, aid, opts)
             raidLockouts = opts.locks or {}, auraStates = opts.auras or {},
         },
     }
+end
+
+-- Abstract-pip inversion lock (item C) + open-entry view membership (item B) +
+-- hover-peek anchor flip (item D). Kept in its own suite entry so the pip mapping
+-- can never silently invert again.
+local function testSlotStateAndAnchors(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local D = Dashboard
+    if not (D and D.AURA_META) then ck(false, "Dashboard.AURA_META unavailable"); return end
+    local function slotOf(key) for s, m in pairs(D.AURA_META) do if m.key == key then return s end end end
+
+    -- ABSTRACT square pip = attention inversion: owned=idle(calm), MISSING=danger.
+    local onySlot = slotOf("ony")     -- required-by-default (threshold-bearing)
+    if onySlot then
+        local ownedE = { faction = "Horde", rec = { classTag = "WARRIOR", auraStates = { [onySlot] = { duration = 3600 } } } }
+        local missE  = { faction = "Horde", rec = { classTag = "WARRIOR", auraStates = {} } }
+        local s1, tok1 = Roster.SlotState(ownedE, onySlot)
+        local s2, tok2 = Roster.SlotState(missE,  onySlot)
+        ck(s1 == "owned"   and tok1 == "idle",   "owned buff -> calm idle pip (NOT red)")
+        ck(s2 == "missing" and tok2 == "danger", "missing required buff -> danger pip (NOT calm)")
+    end
+    local boonSlot = slotOf("boon")   -- tail, no threshold -> non-applicable when absent
+    if boonSlot then
+        local absentE = { faction = "Horde", rec = { classTag = "MAGE", auraStates = {} } }
+        local s3, tok3 = Roster.SlotState(absentE, boonSlot)
+        ck(s3 == "na" and tok3 == "faint", "non-applicable absent slot -> faint pip")
+    end
+    local rendSlot = slotOf("rend")   -- class-ruled; optional-for-MAGE via the stub
+    if rendSlot then
+        local savedGFS = ns.Store and ns.Store.GetFactionSettings
+        ns.Store = ns.Store or {}
+        ns.Store.GetFactionSettings = function()
+            return { auraOpts = { rend = { required = {}, optional = { MAGE = true } }, thresholds = {} } }
+        end
+        local mageE = { faction = "Horde", rec = { classTag = "MAGE", auraStates = {} } }
+        local s4, tok4 = Roster.SlotState(mageE, rendSlot)
+        ck(s4 == "warn" and tok4 == "warn", "optional missing buff -> warn pip")
+        ns.Store.GetFactionSettings = savedGFS
+    end
+
+    -- item B: OpenEntryInView drives the close-when-gone decision on rebuild.
+    local list = { { nameRealm = "A-R" }, { nameRealm = "B-R" } }
+    ck(Roster.OpenEntryInView("A-R", list) == true,  "open entry present -> stays open")
+    ck(Roster.OpenEntryInView("Z-R", list) == false, "open entry gone from view -> close")
+    ck(Roster.OpenEntryInView(nil, list) == true,    "nothing open -> trivially in view")
+
+    -- item D: peek anchor flips left near the right bound, else right of cursor.
+    ck(Roster.PeekAnchor(100, 1000) == "right", "cursor left of bound -> right anchor")
+    ck(Roster.PeekAnchor(950, 1000) == "left",  "cursor near right bound -> left anchor (no clip)")
 end
 
 local function testRosterLogic(fails)
@@ -988,7 +1151,9 @@ end
 if ns.RegisterSelfTest then
     ns:RegisterSelfTest("roster", function(verbose)
         local fails = {}
-        local ok = pcall(testRosterLogic, fails)
+        local ok1 = pcall(testRosterLogic, fails)
+        local ok2 = pcall(testSlotStateAndAnchors, fails)
+        local ok = ok1 and ok2
         local passed = ok and #fails == 0
         if verbose and ns and ns.Print then
             if passed then ns:Print("  PASS roster/logic")

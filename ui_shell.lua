@@ -590,8 +590,13 @@ end
 -- `date` globals in-game. Keeps now()'s clock base for the active/next decision.
 function Dashboard.GetDMFSchedule(nowOverride)
     if Dmf_override then return Dmf_override end
-    local _time = os.time or time
-    local _date = os.date or date
+    -- WoW has NO global `os` table; `os.time` would error ("attempt to index
+    -- global 'os' (a nil value)") BEFORE the `or time` fallback ever ran, so this
+    -- function was dead in-game and error-stormed the status-bar tick. Presence-
+    -- check via rawget so the harness (real Lua, os present) still prefers os.*.
+    local osT   = rawget(_G, "os")
+    local _time = (osT and osT.time) or time
+    local _date = (osT and osT.date) or date
     local t = nowOverride or now()
     local c = _date("*t", t)
     local y, m = c.year, c.month
@@ -1170,8 +1175,9 @@ function Dashboard.RefreshStatusBar()
         fs:SetTextColor(UI.Color(token))
     end
     apply(s.rend, "Rend", "rend")
-    apply(s.onyA, "Ony-A", "onyA")
-    apply(s.onyH, "Ony-H", "onyH")
+    -- Full names per the mockup status bar (BRAND_SPEC §7 "Onyxia (H): Open").
+    apply(s.onyA, "Onyxia (A)", "onyA")
+    apply(s.onyH, "Onyxia (H)", "onyH")
 
     -- Guild online.
     local list = Dashboard.QueryGuildOnline()
@@ -1186,9 +1192,9 @@ function Dashboard.RefreshStatusBar()
     local d = Dashboard.GetDMFSchedule()
     local dtext
     if d.active then
-        dtext = ("DMF (est.): %s, ends %s"):format(d.zone, Dashboard.FormatDuration(d.endEpoch - now()))
+        dtext = ("Darkmoon: %s, ends %s (est.)"):format(d.zone, Dashboard.FormatDuration(d.endEpoch - now()))
     else
-        dtext = ("DMF (est.): %s in %s"):format(d.zone, Dashboard.FormatDuration(d.startEpoch - now()))
+        dtext = ("Darkmoon: %s in %s (est.)"):format(d.zone, Dashboard.FormatDuration(d.startEpoch - now()))
     end
     s.dmf:SetText(dtext)
     s.dmf:SetTextColor(UI.Color("muted"))
