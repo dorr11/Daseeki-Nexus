@@ -271,7 +271,7 @@ local function FS() return ns.Store and ns.Store.GetFactionSettings and ns.Store
 -- `alerts` is the split-off event matrix page (was folded into `timers`); `wizard`
 -- serves the first-run setup dialog's live get/set widgets.
 local refreshers = { auras = {}, automation = {}, mesh = {}, general = {}, timers = {},
-                     alerts = {}, blacklist = {}, wizard = {} }
+                     alerts = {}, blacklist = {}, wizard = {}, instances = {} }
 local function register(page, fn) local l = refreshers[page]; l[#l + 1] = fn end
 local function refreshPage(page)
     local l = refreshers[page]
@@ -2192,6 +2192,29 @@ local function buildBlacklist(flow)
 end
 
 ----------------------------------------------------------------------
+-- 8. INSTANCES  (NovaInstanceTracker absorption — the Instances tab's settings)
+----------------------------------------------------------------------
+
+local function buildInstances(flow)
+    local sec = flow:AddSection("Instances")
+    sec:Hint("The Instances tab tracks dungeon/raid entries against the server's rolling "
+        .. "caps (5 per hour, 30 per day, per account).")
+
+    -- Warn-on-entry chat notice. Wires the existing DaseekiNexusDB.instancesWarnOnEntry
+    -- (store default ON); the engine (instances.lua) reads this flag and prints
+    -- "4 of 5 hourly instances used." when the account first reaches the warn threshold.
+    local r = sec:AddRow({ vAlign = "center" })
+    register("instances", r:Checkbox({
+        label = "Warn in chat when nearing the hourly cap",
+        get = function() local db = DB(); return db and db.instancesWarnOnEntry ~= false end,
+        set = function(v) local db = DB(); if db then db.instancesWarnOnEntry = v and true or false end end,
+    }).Refresh)
+    sec:Hint("Prints a one-line notice on the entry that reaches "
+        .. tostring((ns.Instances and ns.Instances.WARN_HOURLY) or 4) .. " of "
+        .. tostring((ns.Instances and ns.Instances.HOURLY_CAP) or 5) .. " hourly instances.")
+end
+
+----------------------------------------------------------------------
 -- Live-refresh ticker (Accounts / Tombstones update while visible)
 ----------------------------------------------------------------------
 
@@ -2251,6 +2274,9 @@ function Options.Register()
             { id = "timers",     title = "Timers",
               build = function(flow) once("timers", flow.pane, function() buildTimers(flow) end) end,
               refresh = function() refreshPage("timers") end },
+            { id = "instances",  title = "Instances",
+              build = function(flow) once("instances", flow.pane, function() buildInstances(flow) end) end,
+              refresh = function() refreshPage("instances") end },
             { id = "alerts",     title = "Alerts",
               build = function(flow) once("alerts", flow.pane, function() buildAlerts(flow) end) end,
               refresh = function() refreshPage("alerts") end },

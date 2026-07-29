@@ -286,6 +286,9 @@ function Instances.MergeInbound(aid, incoming)
             added = added + n
         end
     end
+    -- Inbound mesh entries landed: repaint the tab (additive; no-op with no listener,
+    -- and skipped when nothing changed so the merge self-tests stay quiet).
+    if added > 0 and ns.Fire then ns:Fire("INSTANCES_CHANGED") end
     return added
 end
 
@@ -339,6 +342,10 @@ function Instances._recordEntry()
     -- Chat warning on the account hitting the hourly warn threshold (merged
     -- re-entries don't advance the count, so this only fires on real slots).
     if not merged then Instances._maybeWarn(aid, t) end
+    -- Additive repaint signal for the Instances tab (UI wave 2/2). No-op when no
+    -- listener is registered (ns:Fire early-returns), so the engine self-tests are
+    -- unaffected.
+    if ns.Fire then ns:Fire("INSTANCES_CHANGED") end
 end
 
 -- EXIT: an inside->outside transition closes the open run with its stats.
@@ -359,6 +366,9 @@ function Instances._closeRun()
         -- stored raw, owner can tune. Below 60 within one run it is a clean gain.
         e.xp = xpNow - sample.xp
     end
+    -- Duration + gold/xp deltas are now final: repaint the tab (additive; no-op with
+    -- no listener).
+    if ns.Fire then ns:Fire("INSTANCES_CHANGED") end
 end
 
 -- Chat warning (design §6). Setting-gated (DaseekiNexusDB.instancesWarnOnEntry,

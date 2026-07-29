@@ -539,6 +539,9 @@ local TAB_SLOTS = {
     -- (ui_roster.lua), and the open-entry register replaces the two-pane detail.
     { id = "characters", label = "Characters", scope = "faction" },
     { id = "timers",     label = "Timers",     scope = "account" },
+    -- Instance-entry ledger + cap meters (NovaInstanceTracker absorption). Account-
+    -- wide (the caps are enforced per account; the tab's ALL row is cross-account).
+    { id = "instances",  label = "Instances",  scope = "account" },
     { id = "help",       label = "Help",       scope = "account", align = "right" },
 }
 

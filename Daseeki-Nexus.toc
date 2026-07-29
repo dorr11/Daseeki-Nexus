@@ -29,6 +29,7 @@ ui_shell.lua
 ui_roster.lua
 ui_ledgerpage.lua
 ui_tab_timers.lua
+ui_tab_instances.lua
 hud.lua
 pins.lua
 minimap.lua
