@@ -8,11 +8,13 @@
 -- bindings (the Alt+Left /camp logout is intentionally omitted), so anchoring to
 -- the minimap cluster never makes the frame protected.
 --
--- Click matrix (UI spec §8 — R2-c remap; mass-invite is NEVER an unmodified
--- single click, and the unmodified click is the SAFE default):
+-- Click matrix (owner directive: both unmodified clicks toggle the dashboard;
+-- the context menu moves to Shift+Right. Mass-invite is NEVER an unmodified
+-- single click, and both unmodified clicks are the SAFE default):
 --   Left            toggle dashboard    (safe default)
+--   Right           toggle dashboard    (restored; owner's standing expectation)
 --   Shift+Left      invite online       (mass-invite -> ns.Auto.InviteOnline)
---   Right           context menu (native dropdown):
+--   Shift+Right     context menu (native dropdown):
 --                     Toggle dashboard / Invite online / Timers tab /
 --                     Cancel Buffs / Felwood map / Lock minimap button / Settings
 --   Alt+Left        (OMITTED) /camp logout — a secure /camp macro would make
@@ -331,7 +333,11 @@ local function buildButton()
                 toggleDashboard()     -- safe default: unmodified click opens dashboard
             end
         elseif mouseButton == "RightButton" then
-            showContextMenu(self)
+            if IsShiftKeyDown() then
+                showContextMenu(self)  -- context menu is a MODIFIED right-click
+            else
+                toggleDashboard()      -- owner directive: plain right-click toggles dashboard
+            end
         end
     end)
 
@@ -347,8 +353,9 @@ local function buildButton()
         GameTooltip:AddDoubleLine("Ony (H)",  onyHT, UI.Color("muted"))
         GameTooltip:AddLine(" ")
         GameTooltip:AddLine("Left: toggle dashboard",        UI.Color("faint"))
+        GameTooltip:AddLine("Right: toggle dashboard",       UI.Color("faint"))
         GameTooltip:AddLine("Shift-Left: invite online",     UI.Color("faint"))
-        GameTooltip:AddLine("Right: menu",                   UI.Color("faint"))
+        GameTooltip:AddLine("Shift-Right: menu",             UI.Color("faint"))
         if not minimapCfg().lock then
             GameTooltip:AddLine("Drag to move",              UI.Color("faint"))
         end
