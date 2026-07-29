@@ -8,12 +8,13 @@
 -- bindings (the Alt+Left /camp logout is intentionally omitted), so anchoring to
 -- the minimap cluster never makes the frame protected.
 --
--- Click matrix (UI spec §8):
---   Left            invite all online   (ns.Auto soft-guard; N4 tooltip)
---   Right           toggle dashboard    (ns.UI soft-guard)
---   Ctrl+Right      Cancel Buffs        (ns.HUD.ShowCancelBuffs)
---   Shift+Right     dashboard Timers tab(ns.UI soft-guard)
---   Alt+Right       world map -> Felwood
+-- Click matrix (UI spec §8 — R2-c remap; mass-invite is NEVER an unmodified
+-- single click, and the unmodified click is the SAFE default):
+--   Left            toggle dashboard    (safe default)
+--   Shift+Left      invite online       (mass-invite -> ns.Auto.InviteOnline)
+--   Right           context menu (native dropdown):
+--                     Toggle dashboard / Invite online / Timers tab /
+--                     Cancel Buffs / Felwood map / Lock minimap button / Settings
 --   Alt+Left        (OMITTED) /camp logout — a secure /camp macro would make
 --                   this frame PROTECTED, and it is exactly that omission that
 --                   keeps ring-anchoring safe. Deferred; documented deviation.
@@ -126,7 +127,9 @@ local function cdStatus(buffKey)
     local anchor = anchorOf(buffKey)
     if anchor <= 0 then return "no data", "faint" end
     local info = ns.Timers.ComputeCD(buffKey, anchor, nowEpoch())
-    if info.ready then return "Can Pop", "ok" end
+    -- BRAND_SPEC §6: a world buff off-cooldown is green "Open" (the old
+    -- pop-phrasing is retired suite-wide).
+    if info.ready then return "Open", "ok" end
     -- pulse semantics live in the dashboard; the tooltip just states time.
     local token = (info.remaining <= 20 * 60) and "danger" or "accent"
     return fmtRemaining(info.remaining), token
@@ -137,10 +140,11 @@ end
 ----------------------------------------------------------------------
 
 local function inviteAll()
-    if ns.Auto and ns.Auto.InviteAllOnline then
-        ns.Auto.InviteAllOnline()
+    -- Real engine entry point is ns.Auto.InviteOnline(skipConvert) (auto.lua).
+    if ns.Auto and ns.Auto.InviteOnline then
+        ns.Auto.InviteOnline()
     else
-        ns:Print("mass invite arrives in wave N4.")
+        ns:Print("mass invite is unavailable (auto module not loaded).")
     end
 end
 
@@ -165,6 +169,90 @@ local function openFelwoodMap()
         elseif ShowUIPanel then ShowUIPanel(WorldMapFrame) end
     end
     if WorldMapFrame.SetMapID then WorldMapFrame:SetMapID(FELWOOD_MAP) end
+end
+
+local function openSettings()
+    if _G.DaseekiSuite and DaseekiSuite.Open then
+        DaseekiSuite:Open("nexus")
+    else
+        ns:Print("the Daseeki hub (Daseeki Core) is not available.")
+    end
+end
+
+local function toggleLock()
+    local cfg = minimapCfg()
+    cfg.lock = not cfg.lock
+    ns:Print(cfg.lock and "minimap button locked." or "minimap button unlocked (drag to move).")
+end
+
+----------------------------------------------------------------------
+-- Right-click context menu (§8: minimap included). Native dropdown built on the
+-- catalog-verified UIDropDownMenu surface (UIDropDownMenu_Initialize /
+-- _CreateInfo / _AddButton / ToggleDropDownMenu). Built lazily on first use so
+-- the headless harness (no dropdown globals) loads without error.
+----------------------------------------------------------------------
+
+local contextMenu
+
+local function buildContextMenu()
+    if contextMenu then return contextMenu end
+    if type(UIDropDownMenu_Initialize) ~= "function" then return nil end
+
+    contextMenu = CreateFrame("Frame", "DaseekiNexusMinimapMenu", UIParent, "UIDropDownMenuTemplate")
+
+    local function add(level, text, fn, checked)
+        local info = UIDropDownMenu_CreateInfo()
+        info.text = text
+        info.notCheckable = (checked == nil) and true or nil
+        if checked ~= nil then
+            info.isNotRadio = true
+            info.checked = checked and true or false
+        end
+        info.func = fn
+        UIDropDownMenu_AddButton(info, level)
+    end
+
+    local function separator(level)
+        local info = UIDropDownMenu_CreateInfo()
+        info.text = ""
+        info.disabled = true
+        info.notClickable = true
+        info.notCheckable = true
+        UIDropDownMenu_AddButton(info, level)
+    end
+
+    UIDropDownMenu_Initialize(contextMenu, function(_, level)
+        if not level then return end
+        local title = UIDropDownMenu_CreateInfo()
+        title.text = "Daseeki Nexus"
+        title.isTitle = true
+        title.notCheckable = true
+        UIDropDownMenu_AddButton(title, level)
+
+        add(level, "Toggle dashboard", function() toggleDashboard() end)
+        add(level, "Invite online",    function() inviteAll() end)
+        add(level, "Timers tab",       function() openDashboardTimers() end)
+        add(level, "Cancel Buffs",     function()
+            if ns.HUD and ns.HUD.ShowCancelBuffs then ns.HUD.ShowCancelBuffs() end
+        end)
+        add(level, "Felwood map",      function() openFelwoodMap() end)
+        separator(level)
+        add(level, "Lock minimap button", function() toggleLock() end, minimapCfg().lock and true or false)
+        add(level, "Settings",         function() openSettings() end)
+        add(level, "Close",            function() if CloseDropDownMenus then CloseDropDownMenus() end end)
+    end, "MENU")
+
+    return contextMenu
+end
+
+local function showContextMenu(anchor)
+    local menu = buildContextMenu()
+    if not (menu and type(ToggleDropDownMenu) == "function") then
+        ns:Print("right-click menu unavailable (dropdown API missing).")
+        return
+    end
+    -- Anchor at the cursor so the menu opens beside the button (WoW-native).
+    ToggleDropDownMenu(1, nil, menu, "cursor", 0, 0)
 end
 
 ----------------------------------------------------------------------
@@ -237,19 +325,13 @@ local function buildButton()
             if IsAltKeyDown() then
                 -- Alt+Left logout intentionally omitted (see header).
                 ns:Print("Alt+Left logout is disabled this build (secure-frame safety).")
+            elseif IsShiftKeyDown() then
+                inviteAll()          -- mass-invite is a MODIFIED click (§8)
             else
-                inviteAll()
+                toggleDashboard()     -- safe default: unmodified click opens dashboard
             end
         elseif mouseButton == "RightButton" then
-            if IsControlKeyDown() then
-                if ns.HUD and ns.HUD.ShowCancelBuffs then ns.HUD.ShowCancelBuffs() end
-            elseif IsShiftKeyDown() then
-                openDashboardTimers()
-            elseif IsAltKeyDown() then
-                openFelwoodMap()
-            else
-                toggleDashboard()
-            end
+            showContextMenu(self)
         end
     end)
 
@@ -264,11 +346,9 @@ local function buildButton()
         GameTooltip:AddDoubleLine("Ony (A)",  onyAT, UI.Color("muted"))
         GameTooltip:AddDoubleLine("Ony (H)",  onyHT, UI.Color("muted"))
         GameTooltip:AddLine(" ")
-        GameTooltip:AddLine("Left: invite online",           UI.Color("faint"))
-        GameTooltip:AddLine("Right: toggle dashboard",       UI.Color("faint"))
-        GameTooltip:AddLine("Ctrl+Right: Cancel Buffs",      UI.Color("faint"))
-        GameTooltip:AddLine("Shift+Right: Timers tab",       UI.Color("faint"))
-        GameTooltip:AddLine("Alt+Right: Felwood map",        UI.Color("faint"))
+        GameTooltip:AddLine("Left: toggle dashboard",        UI.Color("faint"))
+        GameTooltip:AddLine("Shift-Left: invite online",     UI.Color("faint"))
+        GameTooltip:AddLine("Right: menu",                   UI.Color("faint"))
         if not minimapCfg().lock then
             GameTooltip:AddLine("Drag to move",              UI.Color("faint"))
         end

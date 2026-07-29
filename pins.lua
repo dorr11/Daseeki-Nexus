@@ -5,9 +5,16 @@
 -- Map-pin strategy (decision): own minimal placement, NOT a vendored map lib.
 -- The node set is fixed (10 flowers + 6 tubers on one zone, uiMap 1448), so a
 -- self-contained C_Map placement is smaller than vendoring HereBeDragons +
--- CallbackHandler and adds no cross-agent toc/lib merge surface. World-map pins
--- use exact C_Map canvas coordinates; minimap pins use a documented planar
--- approximation (north-up only) — the fuzzy part is isolated and calibratable.
+-- CallbackHandler and adds no cross-agent toc/lib merge surface.
+--   World-map pins use exact C_Map canvas coordinates (already correct).
+--   Minimap pins now use a PROPER world projection (R2-c): each node's fixed
+--   normalized map position is converted to continent/world yards ONCE via
+--   C_Map.GetWorldPosFromMapPos; the player's world position is converted each
+--   refresh; the world-space delta is scaled to minimap pixels by the live
+--   zoom radius. This is correct at every zoom level (replacing the old planar
+--   normalized-scale approximation) and handles a rotating minimap via
+--   GetPlayerFacing. Projection math is fresh HereBeDragons-style geometry, no
+--   third-party code.
 --
 -- Clean-room build: functional reimplementation from spec; no third-party code.
 
@@ -18,11 +25,8 @@ local UI = DaseekiUI
 local Pins = {}
 ns.Pins = Pins
 
-if type(UI) ~= "table" or type(UI.Color) ~= "function" then
-    return   -- Core absent; HUD.lua already surfaced the notice.
-end
-
 local FELWOOD_MAP = 1448
+local WHITE = "Interface\\Buttons\\WHITE8X8"
 
 -- Node kind presentation. Icons are Blizzard built-ins (a missing path renders
 -- blank, never an error).
@@ -30,6 +34,82 @@ local KIND_ICON = {
     flower = "Interface\\Icons\\INV_Misc_Herb_Fellotus",
     tuber  = "Interface\\Icons\\INV_Misc_Food_59",
 }
+
+local function fmtCountdown(sec)
+    sec = math.max(0, math.floor(sec + 0.5))
+    if sec >= 60 then
+        return string.format("%d:%02d", math.floor(sec / 60), sec % 60)
+    end
+    return sec .. "s"
+end
+
+----------------------------------------------------------------------
+-- Pure minimap projection (registered ABOVE the DaseekiUI guard so the
+-- fixture self-test runs headless).
+--
+-- WoW world/continent coordinates (as returned by GetWorldPosFromMapPos):
+--   worldX increases toward NORTH, worldY increases toward WEST.
+-- The north-up minimap has +x = EAST (right), +y = NORTH (up). So for a node
+-- relative to the player:
+--   eastPixels  = (playerWorldY - nodeWorldY) * pixelsPerYard   (west is -x)
+--   northPixels = (nodeWorldX  - playerWorldX) * pixelsPerYard   (north is +y)
+-- A rotating minimap puts the player's facing at the top: rotate the (E,N)
+-- vector by GetPlayerFacing (radians, CCW from north).
+----------------------------------------------------------------------
+
+local MINIMAP_YARDS_OUTDOOR = {
+    [0] = 466 + 2/3, [1] = 400, [2] = 333 + 1/3, [3] = 266 + 2/3, [4] = 200, [5] = 133 + 1/3,
+}
+local MINIMAP_YARDS_INDOOR = {
+    [0] = 300, [1] = 240, [2] = 180, [3] = 120, [4] = 80, [5] = 50,
+}
+
+-- world coords -> minimap pixel offset (dx east+, dy north+). Pure; the caller
+-- supplies pixelsPerYard (from the live minimap zoom) and an optional facing.
+function Pins._ProjectMinimap(pWX, pWY, nWX, nWY, pixelsPerYard, facing)
+    local E = (pWY - nWY) * pixelsPerYard   -- east pixels (+right)
+    local N = (nWX - pWX) * pixelsPerYard   -- north pixels (+up)
+    facing = facing or 0
+    if facing ~= 0 then
+        local cs, sn = math.cos(facing), math.sin(facing)
+        E, N = E * cs + N * sn, -E * sn + N * cs
+    end
+    return E, N
+end
+
+-- Self-test: pure geometry helpers + minimap projection fixture (headless).
+ns:RegisterSelfTest("pins", function(verbose)
+    local pass = true
+    local function check(c, m) if not c then pass = false; if verbose then ns:Print("  FAIL: " .. m) end end end
+    check(fmtCountdown(90) == "1:30", "fmtCountdown 90 -> 1:30")
+    check(fmtCountdown(5) == "5s", "fmtCountdown 5 -> 5s")
+    check(KIND_ICON.flower ~= nil and KIND_ICON.tuber ~= nil, "kind icons present")
+
+    -- Projection: fixture world coords -> expected minimap offsets (north-up).
+    -- player @ (0,0); node 100yd north (worldX+100) and 100yd east (worldY-100),
+    -- at 0.5 px/yd -> (+50 right, +50 up).
+    local dx, dy = Pins._ProjectMinimap(0, 0, 100, -100, 0.5, 0)
+    check(math.abs(dx - 50) < 1e-6 and math.abs(dy - 50) < 1e-6, "projection north-up fixture")
+    -- Axis sanity: node due east -> +x only; node due north -> +y only.
+    local ex, ey = Pins._ProjectMinimap(0, 0, 0, -100, 1, 0)
+    check(ex > 0 and math.abs(ey) < 1e-6, "east node -> +x")
+    local nx, ny = Pins._ProjectMinimap(0, 0, 100, 0, 1, 0)
+    check(ny > 0 and math.abs(nx) < 1e-6, "north node -> +y")
+    -- Rotation: facing 90deg (pi/2) rotates the (E,N)=(50,50) vector to (50,-50).
+    local rx, ry = Pins._ProjectMinimap(0, 0, 100, -100, 0.5, math.pi / 2)
+    check(math.abs(rx - 50) < 1e-4 and math.abs(ry + 50) < 1e-4, "projection rotated 90deg")
+
+    if verbose then ns:Print("  pins selftest " .. (pass and "PASS" or "FAIL")) end
+    return pass
+end)
+
+----------------------------------------------------------------------
+-- Everything below needs DaseekiUI (tokens/widgets). Degrade to the pure
+-- surface above if Core is absent (HUD.lua already surfaces the notice).
+----------------------------------------------------------------------
+if type(UI) ~= "table" or type(UI.Color) ~= "function" then
+    return
+end
 
 ----------------------------------------------------------------------
 -- Settings access
@@ -53,7 +133,7 @@ local function minimapPinSize() return felwoodCfg().minimapPinSize or 12 end
 ----------------------------------------------------------------------
 -- Node state colouring (via Timers)
 --   up      -> available now (green / ok)
---   down    -> respawning (dim orange), world pin shows countdown
+--   down    -> respawning (amber / warn), world pin shows countdown
 --   unknown -> no data (faint)
 ----------------------------------------------------------------------
 
@@ -72,29 +152,54 @@ local function warnColor()
     if UI.Token and type(UI.Token("warn")) == "table" then return UI.Color("warn") end
     return WARN_RGB[1], WARN_RGB[2], WARN_RGB[3], 1
 end
-local function tintForState(tex, state)
+
+-- BRAND_SPEC §5: pins are a diamond BACKING (state-tinted) with a PLAIN icon on
+-- top — the icon is never masked (masked-icon diamonds are >=24px hero spots
+-- only, never repeated). State tint lives on the backing, icon stays legible.
+local function tintPin(pin, state)
+    local back = pin._back
+    if not back then return end
     if state == "up" then
-        tex:SetVertexColor(UI.Color("ok"))
+        back:SetVertexColor(UI.Color("ok"))
     elseif state == "down" then
-        tex:SetVertexColor(warnColor())
+        back:SetVertexColor(warnColor())
     else
-        tex:SetVertexColor(UI.Color("faint"))
+        back:SetVertexColor(UI.Color("faint"))
     end
 end
 
-local function fmtCountdown(sec)
-    sec = math.max(0, math.floor(sec + 0.5))
-    if sec >= 60 then
-        return string.format("%d:%02d", math.floor(sec / 60), sec % 60)
+-- Shared pin styling: a rotated-square diamond backing on BACKGROUND (tinted by
+-- state) + a plain square icon on ARTWORK above it. `sz` is the pin box size;
+-- the diamond side is sized so its diagonal ~= the box (points reach the edges)
+-- and the icon sits centered inside, unmasked.
+local function stylePin(pin, kind, sz)
+    local back = pin._back
+    if not back then
+        back = pin:CreateTexture(nil, "BACKGROUND")
+        back:SetTexture(WHITE)
+        back:SetRotation(math.rad(45))
+        back:SetPoint("CENTER", pin, "CENTER", 0, 0)
+        pin._back = back
     end
-    return sec .. "s"
+    back:SetSize(sz * 0.72, sz * 0.72)
+
+    local tex = pin._tex
+    if not tex then
+        tex = pin:CreateTexture(nil, "ARTWORK")
+        tex:SetPoint("CENTER", pin, "CENTER", 0, 0)
+        tex:SetTexCoord(0.08, 0.92, 0.08, 0.92)
+        pin._tex = tex
+    end
+    tex:SetTexture(KIND_ICON[kind])
+    tex:SetSize(sz * 0.58, sz * 0.58)
 end
 
 ----------------------------------------------------------------------
 -- World-map pins
 --
 -- Parented to the WorldMapFrame canvas; shown only while the displayed map is
--- Felwood. Positioned by exact normalized node coords × canvas size.
+-- Felwood. Positioned by exact normalized node coords × canvas size (already
+-- correct — normalized placement is kept verbatim).
 ----------------------------------------------------------------------
 
 local worldPins = {}   -- "kind"..index -> pin frame
@@ -118,12 +223,7 @@ local function ensureWorldPin(kind, index, node)
     local sz = worldPinSize()
     pin:SetSize(sz, sz)
     pin:SetFrameStrata("HIGH")
-
-    local tex = pin:CreateTexture(nil, "OVERLAY")
-    tex:SetAllPoints(pin)
-    tex:SetTexture(KIND_ICON[kind])
-    tex:SetTexCoord(0.08, 0.92, 0.08, 0.92)
-    pin._tex = tex
+    stylePin(pin, kind, sz)
 
     local timer = pin:CreateFontString(nil, "OVERLAY")
     timer:SetFontObject(UI.fonts.small)
@@ -176,10 +276,11 @@ local function refreshWorldPins()
                 if pin then
                     local sz = worldPinSize()
                     pin:SetSize(sz, sz)
+                    stylePin(pin, kind, sz)
                     pin:ClearAllPoints()
                     pin:SetPoint("CENTER", canvas, "TOPLEFT", node.x * cw, -node.y * ch)
                     local st = nodeState(kind, index)
-                    tintForState(pin._tex, st.state)
+                    tintPin(pin, st.state)
                     if st.state == "down" then
                         pin._timer:SetText(fmtCountdown(st.remaining))
                         pin._timer:SetTextColor(UI.Color("muted"))
@@ -197,19 +298,61 @@ local function refreshWorldPins()
 end
 
 ----------------------------------------------------------------------
--- Minimap pins (approximate; north-up only)
---
--- Placed only when the player is in Felwood and the minimap is not rotating.
--- Position = (node - player) normalized delta scaled to minimap pixels via a
--- calibratable constant, clamped inside the minimap circle. This is the
--- documented approximation in lieu of a map lib.  [in-game calibrate]
+-- Minimap pins — proper world projection (R2-c). Pixels-per-yard from the live
+-- minimap zoom (outdoor table: Felwood pins only ever render in the outdoor
+-- world zone; the indoor table is kept for defensive completeness).
 ----------------------------------------------------------------------
 
 local minimapPins = {}
--- Normalized-coordinate → minimap-pixel scale. Felwood spans a large area, so
--- one normalized unit is many minimap radii; this constant is tuned so nearby
--- nodes land sensibly at default zoom. Calibrated in-game against real nodes.
-local MINIMAP_NORM_SCALE = 900
+local nodeWorld   = {}   -- "kind"..index -> {wx, wy}, computed once (nodes are fixed)
+
+-- Live pixels-per-yard from the current minimap zoom. nil if unresolvable.
+local function minimapPixelsPerYard()
+    local w = (Minimap and Minimap.GetWidth and Minimap:GetWidth()) or 140
+    local zoom = (Minimap and Minimap.GetZoom and Minimap:GetZoom()) or 0
+    local indoors = IsInInstance and IsInInstance()
+    local tbl = indoors and MINIMAP_YARDS_INDOOR or MINIMAP_YARDS_OUTDOOR
+    local diameter = tbl[zoom] or tbl[0]
+    if not diameter or diameter <= 0 or not w or w <= 0 then return nil end
+    return w / diameter
+end
+
+-- Resolve the projection facing. Returns (facing, ok):
+--   north-up             -> (0, true)
+--   rotating + facing     -> (facing, true)
+--   rotating, no facing   -> (nil, false)  [cannot project; caller hides pins]
+local function minimapProjectionFacing()
+    local rotating = GetCVar and GetCVar("rotateMinimap") == "1"
+    if rotating then
+        if GetPlayerFacing then return GetPlayerFacing() or 0, true end
+        return nil, false
+    end
+    return 0, true
+end
+
+-- Continent/world position of a fixed node — computed once and cached.
+local function nodeWorldPos(kind, index, node)
+    local key = kind .. index
+    local cached = nodeWorld[key]
+    if cached then return cached[1], cached[2] end
+    if not (C_Map and C_Map.GetWorldPosFromMapPos and CreateVector2D) then return nil end
+    local _, wpos = C_Map.GetWorldPosFromMapPos(FELWOOD_MAP, CreateVector2D(node.x, node.y))
+    if not wpos then return nil end
+    local wx, wy = wpos:GetXY()
+    if not wx then return nil end
+    nodeWorld[key] = { wx, wy }
+    return wx, wy
+end
+
+-- Continent/world position of the player, recomputed each refresh.
+local function playerWorldPos()
+    if not (C_Map and C_Map.GetWorldPosFromMapPos and C_Map.GetPlayerMapPosition) then return nil end
+    local mpos = C_Map.GetPlayerMapPosition(FELWOOD_MAP, "player")
+    if not mpos then return nil end
+    local _, wpos = C_Map.GetWorldPosFromMapPos(FELWOOD_MAP, mpos)
+    if not wpos then return nil end
+    return wpos:GetXY()
+end
 
 local function ensureMinimapPin(kind, index, node)
     local key = kind .. index
@@ -219,13 +362,13 @@ local function ensureMinimapPin(kind, index, node)
     local sz = minimapPinSize()
     pin:SetSize(sz, sz)
     pin:SetFrameStrata("HIGH")
-    local tex = pin:CreateTexture(nil, "OVERLAY")
-    tex:SetAllPoints(pin)
-    tex:SetTexture(KIND_ICON[kind])
-    tex:SetTexCoord(0.08, 0.92, 0.08, 0.92)
-    pin._tex = tex
+    stylePin(pin, kind, sz)
     minimapPins[key] = pin
     return pin
+end
+
+local function hideAllMinimapPins()
+    for _, p in pairs(minimapPins) do p:Hide() end
 end
 
 local function refreshMinimapPins()
@@ -233,20 +376,27 @@ local function refreshMinimapPins()
     -- Only in Felwood.
     local mapID = C_Map and C_Map.GetBestMapForUnit and C_Map.GetBestMapForUnit("player")
     if mapID ~= FELWOOD_MAP then
-        for _, p in pairs(minimapPins) do p:Hide() end
+        hideAllMinimapPins()
         return
     end
-    -- North-up only (skip when the minimap rotates; our math assumes fixed north).
-    if GetCVar and GetCVar("rotateMinimap") == "1" then
-        for _, p in pairs(minimapPins) do p:Hide() end
+    -- Projection facing (handles rotating minimap; hides if unresolvable).
+    local facing, projOK = minimapProjectionFacing()
+    if not projOK then
+        hideAllMinimapPins()
         return
     end
-    local pos = C_Map and C_Map.GetPlayerMapPosition and C_Map.GetPlayerMapPosition(FELWOOD_MAP, "player")
-    if not pos then return end
-    local px, py = pos:GetXY()
-    if not px then return end
+    local ppy = minimapPixelsPerYard()
+    if not ppy then
+        hideAllMinimapPins()
+        return
+    end
+    local pWX, pWY = playerWorldPos()
+    if not pWX then
+        hideAllMinimapPins()
+        return
+    end
 
-    local radius = (Minimap:GetWidth() or 140) / 2
+    local radius = ((Minimap.GetWidth and Minimap:GetWidth()) or 140) / 2
     local nodes = ns.Timers and ns.Timers.NODES
     if not nodes then return end
 
@@ -257,18 +407,21 @@ local function refreshMinimapPins()
                 local pin = ensureMinimapPin(kind, index, node)
                 local sz = minimapPinSize()
                 pin:SetSize(sz, sz)
-                -- normalized delta -> minimap pixels (y inverted: map y grows down)
-                local dx = (node.x - px) * MINIMAP_NORM_SCALE
-                local dy = -(node.y - py) * MINIMAP_NORM_SCALE
-                local dist = math.sqrt(dx * dx + dy * dy)
-                if dist <= radius then
-                    pin:ClearAllPoints()
-                    pin:SetPoint("CENTER", Minimap, "CENTER", dx, dy)
-                    local st = nodeState(kind, index)
-                    tintForState(pin._tex, st.state)
-                    pin:Show()
+                stylePin(pin, kind, sz)
+                local nWX, nWY = nodeWorldPos(kind, index, node)
+                if nWX then
+                    local dx, dy = Pins._ProjectMinimap(pWX, pWY, nWX, nWY, ppy, facing)
+                    local dist = math.sqrt(dx * dx + dy * dy)
+                    if dist <= radius then
+                        pin:ClearAllPoints()
+                        pin:SetPoint("CENTER", Minimap, "CENTER", dx, dy)
+                        tintPin(pin, nodeState(kind, index).state)
+                        pin:Show()
+                    else
+                        pin:Hide()   -- outside the minimap view
+                    end
                 else
-                    pin:Hide()   -- outside the minimap view
+                    pin:Hide()       -- projection API unavailable / node not resolvable
                 end
             else
                 local p = minimapPins[kind .. index]
@@ -316,15 +469,4 @@ ns:On("LOGIN", function()
         WorldMapFrame:HookScript("OnShow", function() ns:SafeCall(refreshWorldPins) end)
     end
     ns:SafeCall(refreshAll)
-end)
-
--- Self-test: pure geometry helpers.
-ns:RegisterSelfTest("pins", function(verbose)
-    local pass = true
-    local function check(c, m) if not c then pass = false; if verbose then ns:Print("  FAIL: " .. m) end end end
-    check(fmtCountdown(90) == "1:30", "fmtCountdown 90 -> 1:30")
-    check(fmtCountdown(5) == "5s", "fmtCountdown 5 -> 5s")
-    check(KIND_ICON.flower ~= nil and KIND_ICON.tuber ~= nil, "kind icons present")
-    if verbose then ns:Print("  pins selftest " .. (pass and "PASS" or "FAIL")) end
-    return pass
 end)

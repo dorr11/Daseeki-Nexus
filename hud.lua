@@ -19,6 +19,61 @@ local Suite = DaseekiSuite   -- hub registry (guard on Suite.available before us
 local HUD = {}
 ns.HUD = HUD
 
+-- ── Pure group-assignment logic (registered ABOVE the DaseekiUI guard so the
+--    regression suite runs headless) ───────────────────────────────────────────
+-- A pull bar renders in the Main group (large, centered) when its buff's zone is
+-- relevant OR it is imminent (remaining <= expand threshold); otherwise the Small
+-- group (idle, top-right). CRITICAL (R2-c fix): a bar must NOT physically jump
+-- groups mid-countdown when the expand threshold is crossed. Group assignment is
+-- FROZEN and only recomputed at a STRUCTURAL event (a new bar spawns, or a bar
+-- expires): HUD._AssignGroups does that recompute; reflow reads frozen groups.
+
+-- Recompute each entry's group from live state. Mutates entry.group; returns a
+-- key->group map. `list` = array of { key=, rem=, zoneRelevant=bool }.
+function HUD._AssignGroups(list, threshold)
+    local map = {}
+    for _, e in ipairs(list) do
+        local g = (e.zoneRelevant or (e.rem <= threshold)) and "main" or "small"
+        e.group = g
+        map[e.key] = g
+    end
+    return map
+end
+
+-- Partition by FROZEN group (ignores rem — a mid-countdown threshold crossing
+-- never moves a bar). Returns mainCount, smallCount for a list of { group= }.
+function HUD._PartitionFrozen(list)
+    local m, s = 0, 0
+    for _, e in ipairs(list) do
+        if e.group == "main" then m = m + 1 else s = s + 1 end
+    end
+    return m, s
+end
+
+-- Group-jump regression suite (headless — no DaseekiUI needed).
+ns:RegisterSelfTest("hudgroups", function(verbose)
+    local pass = true
+    local function check(c, m) if not c then pass = false; if verbose then ns:Print("  FAIL: " .. m) end end end
+    local threshold = 10
+    local a = { key = "rend", rem = 40, zoneRelevant = false }
+    HUD._AssignGroups({ a }, threshold)
+    check(a.group == "small", "spawn far from expand -> small")
+    -- Time passes; rem crosses the threshold with NO structural event.
+    a.rem = 3
+    local m, s = HUD._PartitionFrozen({ a })
+    check(m == 0 and s == 1, "no mid-countdown group jump (stays small)")
+    -- A new bar spawns -> structural event -> re-partition allowed.
+    local b = { key = "zg", rem = 40, zoneRelevant = false }
+    HUD._AssignGroups({ a, b }, threshold)
+    check(a.group == "main" and b.group == "small", "regroup allowed on new-bar spawn")
+    -- Zone relevance forces main regardless of remaining.
+    local z = { key = "onyH", rem = 999, zoneRelevant = true }
+    HUD._AssignGroups({ z }, threshold)
+    check(z.group == "main", "zone-relevant -> main")
+    if verbose then ns:Print("  hudgroups selftest " .. (pass and "PASS" or "FAIL")) end
+    return pass
+end)
+
 -- Hard dependency guard: if Core somehow did not load, degrade to inert stubs
 -- rather than erroring on every event. The toc dependency makes this defensive.
 if type(UI) ~= "table" or type(UI.Color) ~= "function" then
@@ -205,15 +260,26 @@ local function ensureBanner()
     f._text = fs
 
     f._timer = 0
+    -- No hard on/off: fade out over 120ms once the hold elapses (§8). A single
+    -- _fading latch stops us re-triggering the fade every frame.
     f:SetScript("OnUpdate", function(self, elapsed)
+        if not self:IsShown() then return end
         self._timer = self._timer - elapsed
-        if self._timer <= 0 then self:Hide() end
+        if self._timer <= 0 and not self._fading then
+            self._fading = true
+            if UI.Animate and UI.Animate.FadeOut then
+                UI.Animate.FadeOut(self, 120)   -- hides OnFinished
+            else
+                self:Hide()
+            end
+        end
     end)
     banner = f
     return f
 end
 
 -- Show banner text for `hold` seconds (default 5). `colorToken` overrides accent.
+-- Reveal is a 120ms grow/fade (95%->100% + fade in), never a hard pop (§8).
 function HUD.ShowBanner(text, hold, colorToken)
     local f = ensureBanner()
     f._text:SetText(text or "")
@@ -222,8 +288,14 @@ function HUD.ShowBanner(text, hold, colorToken)
     else
         f._text:SetTextColor(UI.Color("accent"))
     end
-    f._timer = hold or 5
-    f:Show()
+    f._timer  = hold or 5
+    f._fading = false
+    if UI.Animate and UI.Animate.ScaleReveal then
+        UI.Animate.ScaleReveal(f, 120)   -- shows + fades/scales in
+    else
+        f:SetAlpha(1)
+        f:Show()
+    end
 end
 
 ----------------------------------------------------------------------
@@ -315,22 +387,44 @@ end
 ----------------------------------------------------------------------
 -- Pull-timer bars
 --
--- A bar is a StatusBar (drain fill) with an icon, label and countdown, on a
--- token FlatFrame background. Bars group into Main (large; centered when the
--- buff's zone is relevant OR the countdown is under the expand threshold) and
--- Small (idle; top-right). ≤8 total. Colors: green (ok) -> yellow (warn, under
--- expand threshold) -> pulsing red (danger, ≤3s). Draggable while unlocked,
--- click-through while locked. Trust tags drive confirmation chat notices; a
--- just-expired key is blocked from restarting for 60s.
+-- A bar is built on UI.MakeStatusBar (Core kit): interpolated drain fill + a
+-- spark riding the fill edge (the HUD's only continuous motion, §8), an icon,
+-- a buff label and a numeral countdown. Bars group into Main (large; centered)
+-- and Small (idle; top-right), ≤8 total, with FROZEN group assignment (no mid-
+-- pull jumps — see HUD._AssignGroups above). Colours keep the owner-approved
+-- traffic language: green (ok) -> amber (warn, under expand threshold) -> red
+-- (danger, ≤3s). Crossing T-3s calls bar:SetUrgent(true): the fill + countdown
+-- BRIGHTEN and the countdown goes solid — never the old math.sin alpha pulse
+-- that dimmed the whole bar (BRAND_SPEC §7/§8: urgency raises luminance, never
+-- dims). Draggable while unlocked; trust tags drive confirmation chat notices;
+-- a just-expired key is blocked from restarting for 60s.
 ----------------------------------------------------------------------
 
-local bars = {}              -- buffKey -> bar frame
+local bars = {}              -- buffKey -> bar frame (outer)
 local barOrder = {}          -- insertion order (for cap eviction: oldest first)
 local recentlyExpired = {}   -- buffKey -> frameClock of expiry
 local mainGroup, smallGroup  -- container frames
 
 local function expandThreshold()
     return cfg("expandThreshold", 10)
+end
+
+-- Brighten a token colour toward white (never darkens) — mirrors the kit's
+-- urgency-brighten so the traffic-light fill matches the countdown's brighten.
+local function brighten(r, g, b, t)
+    t = t or 0.35
+    return r + (1 - r) * t, g + (1 - g) * t, b + (1 - b) * t
+end
+
+-- Apply the bar's current state colour to its fill. Registered via UI.Skin AFTER
+-- the kit's own reskin, so on a live theme switch this wins for the fill hue.
+-- Reads bar._stateToken (traffic light) + bar._urgent (kit flag) so a brightened
+-- bar stays brightened across a theme change. The kit's SetUrgent independently
+-- brightens the numeral countdown text (kept solid — no alpha pulse).
+local function applyBarVisual(sb)
+    local r, gg, bb = UI.Color(sb._stateToken or "ok")
+    if sb._urgent then r, gg, bb = brighten(r, gg, bb) end
+    sb:SetStatusBarColor(r, gg, bb)
 end
 
 -- Group containers hold and position their bars; draggable when unlocked.
@@ -377,6 +471,10 @@ function HUD.SaveGroupPosition(g)
 end
 
 -- Build one pull bar (both dimensions set at creation, per style rule).
+-- Structure: outer Frame (positioned by the group) → token FlatFrame bg →
+-- UI.MakeStatusBar fill (interpolation + spark + numeral countdown). Icon and
+-- label are children of the STATUS BAR (drawn above the fill), so they never sit
+-- behind the drain. The countdown is the kit's own text FS (numeral, right).
 local function createBar(buffKey)
     local bar = CreateFrame("Frame", nil, UIParent)
     bar:SetSize(220, 18)
@@ -385,35 +483,35 @@ local function createBar(buffKey)
     bg:SetAllPoints(bar)
     bar._bg = bg
 
-    local sb = CreateFrame("StatusBar", nil, bar)
+    local sb = UI.MakeStatusBar(bar, {
+        spark      = true,
+        text       = true,
+        textFont   = "numeral",
+        textJustify = "RIGHT",
+        fillToken  = "ok",       -- baseline; hue is driven per-state by applyBarVisual
+        bgToken    = "inset",
+    })
     sb:SetPoint("TOPLEFT", bar, "TOPLEFT", 1, -1)
     sb:SetPoint("BOTTOMRIGHT", bar, "BOTTOMRIGHT", -1, 1)
-    sb:SetStatusBarTexture("Interface\\Buttons\\WHITE8X8")
-    sb:SetMinMaxValues(0, 1)
-    sb:SetValue(1)
+    sb._stateToken = "ok"
     bar._sb = sb
 
-    local icon = bar:CreateTexture(nil, "OVERLAY")
-    icon:SetPoint("LEFT", bar, "LEFT", 2, 0)
+    -- Our fill-hue reskin, registered AFTER the kit's, so it wins for the fill
+    -- colour on a live theme switch (the kit still owns the countdown brighten).
+    UI.Skin(sb, applyBarVisual)
+
+    -- Icon (left) + label (buff name) live ON the status bar → above the fill.
+    local icon = sb:CreateTexture(nil, "OVERLAY")
+    icon:SetPoint("LEFT", sb, "LEFT", 2, 0)
     icon:SetTexCoord(0.08, 0.92, 0.08, 0.92)
     bar._icon = icon
 
-    local label = bar:CreateFontString(nil, "OVERLAY")
+    local label = sb:CreateFontString(nil, "OVERLAY")
     label:SetFontObject(UI.fonts.body)
     label:SetPoint("LEFT", icon, "RIGHT", 4, 0)
     label:SetJustifyH("LEFT")
     bar._label = label
-
-    local time = bar:CreateFontString(nil, "OVERLAY")
-    time:SetFontObject(UI.fonts.accent)
-    time:SetPoint("RIGHT", bar, "RIGHT", -4, 0)
-    time:SetJustifyH("RIGHT")
-    bar._time = time
-
-    -- Re-tint text/background on theme change.
-    UI.Skin(bar, function()
-        label:SetTextColor(UI.Color("text"))
-    end)
+    UI.Skin(label, function(self) self:SetTextColor(UI.Color("text")) end)
 
     bar:Hide()
     return bar
@@ -429,30 +527,52 @@ local function evictIfNeeded()
     end
 end
 
--- Colour + fill a bar for its remaining/duration.
+-- Colour + fill a bar for its remaining/duration. The kit interpolates the fill
+-- (SetBarValue) and rides the spark; we set the traffic-light hue + urgency.
+-- NO alpha pulse anywhere — the bar never dims (BRAND_SPEC §7/§8).
 local function paintBar(bar, remaining, duration)
     local sb = bar._sb
-    local frac = duration > 0 and (remaining / duration) or 0
-    sb:SetMinMaxValues(0, duration > 0 and duration or 1)
-    sb:SetValue(remaining)
+    sb:SetBarValue(remaining)   -- interpolated drain toward `remaining`; spark tracks it
 
+    local token, urgent
     if remaining <= RED_PULSE_AT then
-        -- pulsing red
-        local pulse = 0.55 + 0.35 * math.abs(math.sin(frameClock() * 4))
-        sb:SetStatusBarColor(UI.Color("danger"))
-        sb:SetAlpha(pulse)
+        token, urgent = "danger", true      -- T-3s: brighten (never dim), solid text
     elseif remaining <= expandThreshold() then
-        sb:SetStatusBarColor(warnColor())
-        sb:SetAlpha(1)
+        token, urgent = "warn", false
     else
-        sb:SetStatusBarColor(UI.Color("ok"))
-        sb:SetAlpha(1)
+        token, urgent = "ok", false
     end
-    -- silence unused-var lint on frac (kept for readability/future geometry)
-    local _ = frac
+
+    sb._stateToken = token
+    if sb._urgent ~= urgent then
+        sb:SetUrgent(urgent)    -- kit: brighten + solidify the numeral countdown text
+    end
+    applyBarVisual(sb)          -- apply the (possibly brightened) fill hue
 end
 
--- Lay out bars into their groups and size each per current settings.
+-- Recompute every bar's FROZEN group. Called ONLY at a structural event (a new
+-- bar spawns, or a bar expires) — never on the periodic tick — so a bar never
+-- jumps groups mid-countdown when the expand threshold is crossed. Delegates to
+-- the pure HUD._AssignGroups (the same code the regression suite exercises).
+local function assignGroups()
+    local list = {}
+    for i = 1, #barOrder do
+        local k = barOrder[i]
+        local b = bars[k]
+        if b then
+            list[#list + 1] = {
+                key = k,
+                rem = (b._endTime or 0) - frameClock(),
+                zoneRelevant = zoneRelevant(k),
+                bar = b,
+            }
+        end
+    end
+    HUD._AssignGroups(list, expandThreshold())
+    for _, e in ipairs(list) do e.bar._group = e.group end
+end
+
+-- Lay out bars into their groups (by FROZEN _group) and size each per settings.
 local function reflow()
     ensureGroups()
     local mainW  = cfg("width", 220)
@@ -465,9 +585,7 @@ local function reflow()
         local k = barOrder[i]
         local b = bars[k]
         if b and b:IsShown() then
-            local rem = (b._endTime or 0) - frameClock()
-            local isMain = zoneRelevant(k) or (rem <= expandThreshold())
-            if isMain then mainBars[#mainBars + 1] = b else smallBars[#smallBars + 1] = b end
+            if b._group == "main" then mainBars[#mainBars + 1] = b else smallBars[#smallBars + 1] = b end
         end
     end
 
@@ -513,14 +631,19 @@ local function ensureTicker()
                 else
                     local dur = b._duration or DEFAULT_PULL_WINDOW
                     paintBar(b, rem, dur)
-                    b._time:SetText(rem >= 60
+                    b._sb:SetBarText(rem >= 60
                         and string.format("%d:%02d", math.floor(rem / 60), math.floor(rem % 60))
                         or  string.format("%.0fs", rem))
                 end
             end
         end
-        -- Re-partition periodically (zone/expand transitions) or on expiry.
-        if doReflow or self._accum >= 0.5 then
+        -- Expiry is a STRUCTURAL event → re-partition groups, then reflow. The
+        -- periodic 0.5s pass only repositions (frozen groups → no mid-pull jump).
+        if doReflow then
+            ns:SafeCall(assignGroups)
+            self._accum = 0
+            ns:SafeCall(reflow)
+        elseif self._accum >= 0.5 then
             self._accum = 0
             ns:SafeCall(reflow)
         end
@@ -550,17 +673,22 @@ local function onPullDetected(buffKey, duration, trust, zone)
 
     duration = (duration and duration > 0) and duration or DEFAULT_PULL_WINDOW
 
+    local isNew = false
     local bar = bars[buffKey]
     if bar then
-        -- Existing bar: refresh window + possible trust upgrade.
+        -- Existing bar: refresh window + possible trust upgrade. NOT a structural
+        -- event → group stays frozen (no jump), only the fill range refreshes.
         local wasTrust = bar._trust
         bar._endTime = frameClock() + duration
         bar._duration = duration
+        bar._sb:SetBarRange(0, duration)
+        bar._sb:SetBarValue(duration, true)   -- refill to full immediately
         if trust and trust ~= wasTrust then
             bar._trust = trust
             trustNotice(buffKey, trust, true)
         end
     else
+        isNew = true
         evictIfNeeded()
         bar = createBar(buffKey)
         bar._icon:SetTexture(buffIcon(buffKey))
@@ -568,11 +696,17 @@ local function onPullDetected(buffKey, duration, trust, zone)
         bar._endTime = frameClock() + duration
         bar._duration = duration
         bar._trust = trust
+        bar._sb:SetBarRange(0, duration)
+        bar._sb:SetBarValue(duration, true)   -- start full (no drain-in pop)
         bar:Show()
         bars[buffKey] = bar
         barOrder[#barOrder + 1] = buffKey
         trustNotice(buffKey, trust, false)
     end
+
+    -- A new bar spawning is a STRUCTURAL event → re-partition groups (spec-allowed
+    -- regroup point). A plain refresh keeps every bar's frozen group.
+    if isNew then ns:SafeCall(assignGroups) end
 
     -- Route a pull-timer alert through the dispatcher.
     HUD.Alert(buffKey, "pullTimer", buffLabel(buffKey) .. " incoming!")
