@@ -243,14 +243,26 @@ local function microLabel(parent, text)
     return l
 end
 
--- Brightened class color for the detail header name (pop pass) — class identity hue
--- lifted ~12% toward white. Returns r,g,b (falls back to cream if no class color).
-local function brightClass(classTag)
-    local r, g, b = ns.Dashboard and ns.Dashboard.ClassColor and ns.Dashboard.ClassColor(classTag)
-    if not r then return UI.Color("text") end
-    local t = 0.12
+-- Lift an r,g,b color a fraction `t` toward white (pure; returns THREE numbers).
+-- Shared by the class-name and buff-name pop-pass tints; unit-tested headless.
+function Detail.Lighten(r, g, b, t)
     return r + (1 - r) * t, g + (1 - g) * t, b + (1 - b) * t
 end
+
+-- Brightened class color for the detail header name (pop pass) — class identity hue
+-- lifted ~12% toward white. Returns r,g,b (falls back to cream if no class color).
+-- NOTE (round-4 hotfix): the class-color read MUST be a plain guarded statement, not a
+-- `local r,g,b = A and B and Call()` — an and-chain truncates the multi-return to ONE
+-- value, so g/b came back nil and the arithmetic below crashed (BugSack ui_detail:252).
+function Detail.BrightClass(classTag)
+    local r, g, b
+    if ns.Dashboard and ns.Dashboard.ClassColor then
+        r, g, b = ns.Dashboard.ClassColor(classTag)
+    end
+    if not (r and g and b) then return UI.Color("text") end
+    return Detail.Lighten(r, g, b, 0.12)
+end
+local brightClass = Detail.BrightClass
 
 -- Resolve a buff name's tint: its family hue LIFTED a tier brighter (pop pass), unless
 -- that hue's contrast against the active theme's ground is too weak (light themes), in
@@ -261,10 +273,7 @@ local function nameColor(slot)
     local meta = D and D.AURA_META and D.AURA_META[slot]
     local hue = meta and BUFF_HUE[meta.key]
     if not hue then return UI.Color("text") end
-    local lift = 0.14
-    local hr = hue[1] + (1 - hue[1]) * lift
-    local hg = hue[2] + (1 - hue[2]) * lift
-    local hb = hue[3] + (1 - hue[3]) * lift
+    local hr, hg, hb = Detail.Lighten(hue[1], hue[2], hue[3], 0.14)
     local gr, gg, gb = UI.Color("ground")
     if math.abs(relLum(hr, hg, hb) - relLum(gr, gg, gb)) < 0.20 then
         return UI.Color("text")   -- insufficient contrast on this theme -> cream
@@ -640,6 +649,27 @@ local function testRowStatus(fails)
     ck(t == "", "hidden slot -> empty status")
 end
 
+-- Pop-pass COLOR functions must return THREE numbers (round-4 hotfix regression guard).
+-- The crash was `local r,g,b = A and B and Call()` truncating the multi-return so g/b
+-- were nil and the brighten arithmetic threw. These assert all three components.
+local function testColorFns(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    -- Pure lift preserves the multi-return.
+    local a, b, c = Detail.Lighten(0.5, 0.4, 0.9, 0.12)
+    ck(type(a) == "number" and type(b) == "number" and type(c) == "number",
+        ("Lighten must return 3 numbers, got %s/%s/%s"):format(type(a), type(b), type(c)))
+    -- BrightClass with a RESOLVABLE class color (stub the settings so ClassColor never
+    -- reaches its UI.Color fallback) must return 3 numbers — the exact crash path.
+    local savedGS = ns.Store and ns.Store.GetSettings
+    ns.Store = ns.Store or {}
+    ns.Store.GetSettings = function() return { classColors = { WARRIOR = "c69b6d" } } end
+    local r, g, bl = Detail.BrightClass("WARRIOR")
+    ck(type(r) == "number" and type(g) == "number" and type(bl) == "number",
+        ("BrightClass must return 3 numbers (no and-chain truncation), got %s/%s/%s")
+        :format(type(r), type(g), type(bl)))
+    ns.Store.GetSettings = savedGS
+end
+
 if ns.RegisterSelfTest then
     ns:RegisterSelfTest("detail", function(verbose)
         local cases = {
@@ -648,6 +678,7 @@ if ns.RegisterSelfTest then
             { name = "caption compact",     fn = testCaptionCompact },
             { name = "raid tally",          fn = testRaidTally },
             { name = "row status",          fn = testRowStatus },
+            { name = "color fns (rgb)",     fn = testColorFns },
         }
         local allPass = true
         for _, c in ipairs(cases) do
