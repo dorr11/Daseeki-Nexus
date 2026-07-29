@@ -569,12 +569,22 @@ local function makeChip(parent, def, kind, pane)
     b:SetScript("OnLeave", function() GameTooltip:Hide() end)
 
     -- Paint by active state; label carries the live count. Uppercase by hand.
+    -- Quiet, low-chrome pills (annot round-2 pin 3 / mockup .chip intent): inactive =
+    -- muted text on a barely-raised fill with NO visible border (edge blended into the
+    -- fill); active = a brand-TINTED wash (not a solid crimson block) + cream text +
+    -- brandBright count. The count is a dimmer suffix, always. Reads like the approved
+    -- mockup, not the old boxy bordered buttons.
     function b:Apply(active, count)
         self:SetBackdrop(UI.FLAT_BACKDROP)
-        self:SetBackdropColor(UI.Color(active and "brand" or "control", active and 0.85 or 1))
-        self:SetBackdropBorderColor(UI.Color(active and "brand" or "controlBorder"))
+        if active then
+            self:SetBackdropColor(UI.Color("brand", 0.28))        -- tinted wash over the panel
+            self:SetBackdropBorderColor(UI.Color("brand", 0.55))  -- soft brand edge, no hard chrome
+        else
+            self:SetBackdropColor(UI.Color("raised"))             -- barely-raised fill
+            self:SetBackdropBorderColor(UI.Color("raised"))       -- edge == fill => no visible border
+        end
         self._lbl:SetText(("%s %s"):format(self._def.label:upper(),
-            Dashboard.Colored(tostring(count or 0), active and "text" or "faint")))
+            Dashboard.Colored(tostring(count or 0), active and "brandBright" or "faint")))
         self._lbl:SetTextColor(UI.Color(active and "text" or "muted"))
         local w = (self._lbl:GetStringWidth() or 40) + 16
         self:SetWidth(math.max(40, w))
@@ -626,11 +636,12 @@ Dashboard.RegisterTab("characters", function(host)
         x = x + c:GetWidth() + 5
         pane.scopeChips[#pane.scopeChips + 1] = c
     end
-    -- A faint separator between scope singles and modifier toggles.
-    local sep = chipRow:CreateFontString(nil, "OVERLAY")
-    sep:SetFontObject(UI.fonts.microLabel)
-    sep:SetText("|"); sep:SetTextColor(UI.Color("faint"))
-    sep:SetPoint("LEFT", chipRow, "LEFT", x + 2, 0)
+    -- Single-pixel separation between scope singles and modifier toggles (mockup
+    -- .chipdiv — a 1px rule, not a glyph).
+    local sep = chipRow:CreateTexture(nil, "ARTWORK")
+    sep:SetColorTexture(UI.Color("border"))
+    sep:SetSize(1, 14)
+    sep:SetPoint("LEFT", chipRow, "LEFT", x + 4, 0)
     x = x + 12
     for _, def in ipairs(MOD_DEFS) do
         local c = makeChip(chipRow, def, "mod", pane)
@@ -647,10 +658,25 @@ Dashboard.RegisterTab("characters", function(host)
     hdr:SetHeight(GRID_ROW_H)
     pane.hdr = hdr
 
-    local function densityBtn(label, key, anchorRight)
-        local b = CreateFrame("Button", nil, hdr, "BackdropTemplate")
-        b:SetSize(48, 18)
-        b:SetPoint("RIGHT", hdr, "RIGHT", anchorRight, 0)
+    -- Card ⇄ Grid segmented toggle (annot round-2 pin 3 / mockup .vseg): ONE quiet
+    -- container with a soft bronze keyline (no heavy per-button chrome); two touching
+    -- segments; the active segment carries a brand tint + brandBright label, the idle
+    -- segment is transparent (shows the container fill) with muted text.
+    local SEG_W, SEG_H = 46, 18
+    local segWrap = UI.FlatFrame(hdr, "control", "controlBorder")
+    segWrap:SetSize(SEG_W * 2 + 2, SEG_H + 2)
+    segWrap:SetPoint("RIGHT", hdr, "RIGHT", -4, 0)
+    UI.Skin(segWrap, function(self)
+        self:SetBackdropColor(UI.Color("control"))
+        self:SetBackdropBorderColor(UI.Color("bronzeDim", 0.55))
+    end)
+    pane.segWrap = segWrap
+
+    local function densityBtn(label, key, side)   -- side: "left" | "right"
+        local b = CreateFrame("Button", nil, segWrap, "BackdropTemplate")
+        b:SetSize(SEG_W, SEG_H)
+        if side == "right" then b:SetPoint("RIGHT", segWrap, "RIGHT", -1, 0)
+        else                    b:SetPoint("LEFT", segWrap, "LEFT", 1, 0) end
         local t = b:CreateFontString(nil, "OVERLAY")
         t:SetFontObject(UI.fonts.microLabel)
         t:SetPoint("CENTER", b, "CENTER", 0, 0)
@@ -662,8 +688,9 @@ Dashboard.RegisterTab("characters", function(host)
         end)
         return b
     end
-    local gridBtn = densityBtn("Grid", "grid", -4)
-    local cardBtn = densityBtn("Card", "card", -56)
+    -- Grid on the left, Card on the right (matches the mockup's Grid|Card order).
+    local gridBtn = densityBtn("Grid", "grid", "left")
+    local cardBtn = densityBtn("Card", "card", "right")
     pane.densityBtns = { card = cardBtn, grid = gridBtn }
 
     -- Grid column-header buff tiles (real icons), shown only in grid density; one
@@ -831,14 +858,21 @@ Dashboard.RegisterTab("characters", function(host)
     end
 
     function obj.Refresh()
-        -- Density toggle paint (cheap; always).
+        -- Density toggle paint (cheap; always). Active segment = brand tint (border ==
+        -- fill, no chrome); idle segment = transparent so the container fill shows
+        -- through. Quiet segmented look — mockup .vseg, not two boxy buttons.
         local density = rosterUIState().rosterDensity
         for key, b in pairs(pane.densityBtns) do
             local active = (key == density)
             b:SetBackdrop(UI.FLAT_BACKDROP)
-            b:SetBackdropColor(UI.Color(active and "brand" or "control", active and 0.85 or 1))
-            b:SetBackdropBorderColor(UI.Color(active and "brand" or "controlBorder"))
-            b._t:SetTextColor(UI.Color(active and "text" or "muted"))
+            if active then
+                b:SetBackdropColor(UI.Color("brand", 0.22))
+                b:SetBackdropBorderColor(UI.Color("brand", 0.22))
+            else
+                b:SetBackdropColor(UI.Color("control", 0))
+                b:SetBackdropBorderColor(UI.Color("control", 0))
+            end
+            b._t:SetTextColor(UI.Color(active and "brandBright" or "muted"))
         end
 
         local faction = Dashboard.GetFaction()

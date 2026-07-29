@@ -1046,11 +1046,43 @@ local function buildStatusBar(w)
         return fs
     end
 
-    local rendFS = seg(nil, 10)
-    local sep1   = seg(rendFS, 8);  sep1:SetText(Dashboard.Colored("·","faint"))
-    local onyAFS = seg(sep1, 8)
-    local sep2   = seg(onyAFS, 8);  sep2:SetText(Dashboard.Colored("·","faint"))
-    local onyHFS = seg(sep2, 8)
+    -- Icon-tile label (annot round-2 pin 1/2): the status-bar readouts' TEXT LABELS
+    -- ("Rend:", "Onyxia (A):", "Onyxia (H):") become real icon tiles — the Rend buff
+    -- spell icon and the Alliance/Horde faction crests — while the live VALUE stays
+    -- text (BRAND_SPEC §5a/§7). `coord` crops the source art (spell icons trim the
+    -- 1px border; crests use CREST_COORD, the same rect the Timers rows use).
+    local ICON = 14
+    local function iconTile(anchorTo, gap, tex, coord)
+        local t = bar:CreateTexture(nil, "ARTWORK")
+        t:SetSize(ICON, ICON)
+        if anchorTo then t:SetPoint("LEFT", anchorTo, "RIGHT", gap, 0)
+        else             t:SetPoint("LEFT", bar, "LEFT", gap, 0) end
+        t:SetTexture(tex)
+        t:SetTexCoord(unpack(coord or { 0.08, 0.92, 0.08, 0.92 }))
+        return t
+    end
+
+    -- Rend: spell-icon tile (slot 2 = Warchief's Blessing) then the live value.
+    local rendIcon = iconTile(nil, 10, Dashboard.AuraIcon(2))
+    local rendFS   = seg(rendIcon, 5)
+    local sep1     = seg(rendFS, 8);  sep1:SetText(Dashboard.Colored("·","faint"))
+    -- Onyxia: ONE shared Ony spell-icon (slot 1 = Rallying Cry of the Dragonslayer)
+    -- identifies the buff, then each faction crest + its value. (Owner left the shared
+    -- icon optional — kept, because A/H crests alone don't say "Onyxia"; the spell art
+    -- does the identifying and the crests disambiguate faction.)
+    local onyIcon  = iconTile(sep1, 8, Dashboard.AuraIcon(1))
+    local crestA   = iconTile(onyIcon, 5, Dashboard.FactionCrest("Alliance"), CREST_COORD)
+    local onyAFS   = seg(crestA, 5)
+    local sep2     = seg(onyAFS, 8);  sep2:SetText(Dashboard.Colored("·","faint"))
+    local crestH   = iconTile(sep2, 8, Dashboard.FactionCrest("Horde"), CREST_COORD)
+    local onyHFS   = seg(crestH, 5)
+
+    -- Pulse companions: when a cell red-flags (CD<=20m), the value text fades — carry
+    -- its label icon(s) with it so the pair reads as one flagged unit. The shared Ony
+    -- spell icon stays steady (it labels both cells).
+    rendFS._pulseMates = { rendIcon }
+    onyAFS._pulseMates = { crestA }
+    onyHFS._pulseMates = { crestH }
 
     -- Two compact circular request buttons (Nexus / NWB-guild). Wired to the
     -- parallel agent's soft-guarded ns.Timers.Request* APIs; state + tooltip via
@@ -1126,6 +1158,7 @@ local function buildStatusBar(w)
     dmfHover:SetScript("OnLeave", function() GameTooltip:Hide() end)
 
     w.status = { bar = bar, rend = rendFS, onyA = onyAFS, onyH = onyHFS,
+                 rendIcon = rendIcon, onyIcon = onyIcon, crestA = crestA, crestH = crestH,
                  guild = guildFS, dmf = dmfFS, reqNexus = reqNexus, reqNWB = reqNWB }
     return bar
 end
@@ -1141,26 +1174,27 @@ local function anchorOf(state)
     return math.max(state.lastPop or 0, state.lastKilled or 0)
 end
 
--- Returns text, token, pulse(bool) for a buff key.
-local function worldBuffCell(label, buffKey)
+-- Returns VALUE text, token, pulse(bool) for a buff key. The label is now an icon
+-- tile (annot round-2), so this returns only the live readout value — BRAND_SPEC
+-- §5a/§7: status-bar readouts keep their TEXT values; only the labels became icons.
+local function worldBuffCell(buffKey)
     local T = ns.Timers
-    if not T then return label .. ": —", "faint", false end
+    if not T then return "—", "faint", false end
     local state = T.state and T.state[buffKey]
     local anchor = anchorOf(state)
     local info = T.ComputeCD and T.ComputeCD(buffKey, anchor, now())
     if not info or anchor <= 0 then
-        return label .. ": no data", "faint", false
+        return "no data", "faint", false
     end
     if info.ready then
-        -- Off-cooldown world buff = green "Open" (BRAND_SPEC §6 binding; the
-        -- approved status-bar live readout in §7 is "Onyxia (H): Open").
-        return label .. ": Open", "ok", false
+        -- Off-cooldown world buff = green "Open" (BRAND_SPEC §6 binding).
+        return "Open", "ok", false
     end
     local rem = info.remaining or 0
     if rem <= 20 * 60 then
-        return label .. ": " .. Dashboard.FormatDuration(rem), "danger", true
+        return Dashboard.FormatDuration(rem), "danger", true
     end
-    return label .. ": " .. Dashboard.FormatDuration(rem), "accent", false
+    return Dashboard.FormatDuration(rem), "accent", false
 end
 
 function Dashboard.RefreshStatusBar()
@@ -1168,16 +1202,20 @@ function Dashboard.RefreshStatusBar()
     local s = win.status
     local faction = Dashboard.GetFaction()
 
-    local function apply(fs, label, key)
-        local text, token, pulse = worldBuffCell(label, key)
+    local function apply(fs, key)
+        local text, token, pulse = worldBuffCell(key)
         fs._token, fs._pulse = token, pulse
         fs:SetText(text)
         fs:SetTextColor(UI.Color(token))
     end
-    apply(s.rend, "Rend", "rend")
-    -- Full names per the mockup status bar (BRAND_SPEC §7 "Onyxia (H): Open").
-    apply(s.onyA, "Onyxia (A)", "onyA")
-    apply(s.onyH, "Onyxia (H)", "onyH")
+    apply(s.rend, "rend")
+    apply(s.onyA, "onyA")
+    apply(s.onyH, "onyH")
+
+    -- Re-resolve the spell-icon tiles: at build time the spell art may not have been
+    -- loaded (AuraIcon returns the ? fallback uncached), so refresh once it's in.
+    if s.rendIcon then s.rendIcon:SetTexture(Dashboard.AuraIcon(2)) end
+    if s.onyIcon  then s.onyIcon:SetTexture(Dashboard.AuraIcon(1))  end
 
     -- Guild online.
     local list = Dashboard.QueryGuildOnline()
@@ -1231,7 +1269,13 @@ local function installStatusTicker(w)
             local a = 0.5 + 0.5 * math.abs(math.sin(t * 3))
             for _, key in ipairs({ "rend", "onyA", "onyH" }) do
                 local fs = self.status[key]
-                if fs and fs._pulse then fs:SetAlpha(a) else if fs then fs:SetAlpha(1) end end
+                if fs then
+                    local av = fs._pulse and a or 1
+                    fs:SetAlpha(av)
+                    if fs._pulseMates then
+                        for _, m in ipairs(fs._pulseMates) do m:SetAlpha(av) end
+                    end
+                end
             end
         end
         -- Text refresh ~4x/sec.
