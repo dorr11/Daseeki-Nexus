@@ -61,9 +61,14 @@ local CAPTURE_CAP = 50
 SNBridge._stats = {
     heard = 0, byChannel = {},
     channelDecodeOK = 0, inflateOK = 0, deserializeOK = 0, versionOK = 0, translated = 0,
+    -- Chunk-reassembly telemetry (item: sn-chunk-reassembly).
+    reasmOpened = 0, reasmCompleted = 0, reasmMiddle = 0,
     drop = {
         notRecvPrefix = 0, channelDecode = 0, suspectedFragment = 0,
         deserialize = 0, notTable = 0, versionGate = 0, translateZero = 0,
+        -- Reassembly drop reasons.
+        reasmTimeout = 0, reasmEvicted = 0, reasmOrphan = 0, reasmIncomplete = 0,
+        unknownType = 0,
     },
 }
 
@@ -85,6 +90,15 @@ function SNBridge.EscapeBytes(s)
     return (s:gsub("[%z\1-\31\127-\255\\]", function(c)
         return string.format("\\x%02X", string.byte(c))
     end))
+end
+
+-- Inverse of EscapeBytes: turn a printable \xHH dump back into raw wire bytes.
+-- Exact reverse of the escape above so a captured frame round-trips to the
+-- byte-exact CHAT_MSG_ADDON `text`. Used by the permanent fixture regression
+-- test (harness snfixture.lua) to replay real captured frames. Pure.
+function SNBridge.UnescapeBytes(s)
+    if type(s) ~= "string" then return "" end
+    return (s:gsub("\\x(%x%x)", function(h) return string.char(tonumber(h, 16)) end))
 end
 
 -- The persisted capture table (creates it lazily). nil if the data store is
@@ -232,6 +246,52 @@ local function pick(tbl, ...)
     return nil
 end
 
+-- SN "Broadcast Timers" log-array key -> our buff key. rend/ony(H/A) are proven
+-- against the real capture; nef/zg are defensive (SN may add them, same shape).
+local SN_LOG_BUFF = {
+    rendLog = "rend", onyLogH = "onyH", onyLogA = "onyA",
+    nefLogH = "nefH", nefLogA = "nefA", zgLog = "zg",
+}
+
+-- Songflower/node translation. Accepts ONLY unambiguous indexed-epoch shapes and
+-- routes through the public Timers.MarkNode surface with "sn" trust. Returns the
+-- number of node picks applied. Defensive/forward-looking: the current real
+-- capture carries no node data, so this is a no-op against today's fixture.
+local function markNodesFrom(map, kind)
+    if type(map) ~= "table" then return 0 end
+    local n = 0
+    for idx, epoch in pairs(map) do
+        local i = tonumber(idx)
+        local z = tonumber(epoch)
+        if i and i >= 1 and z and z > 1000000000 then
+            if ns.Timers.MarkNode(kind, i, z, "sn") then n = n + 1 end
+        end
+    end
+    return n
+end
+
+local function translateNodes(payload)
+    if not ns.Timers.MarkNode then return 0 end
+    local n = 0
+    -- Sub-table form: { flower = {1=epoch,...}, tuber = {1=epoch,...} }.
+    n = n + markNodesFrom(pick(payload, "flower", "flowers", "songflower"), "flower")
+    n = n + markNodesFrom(pick(payload, "tuber", "tubers", "nightdragon"), "tuber")
+    -- Flat "flowerN"/"tuberN" keys.
+    for k, v in pairs(payload) do
+        if type(k) == "string" then
+            local fi = k:match("^flower(%d+)$")
+            local ti = k:match("^tuber(%d+)$")
+            local z = tonumber(v)
+            if fi and z and z > 1000000000 then
+                if ns.Timers.MarkNode("flower", tonumber(fi), z, "sn") then n = n + 1 end
+            elseif ti and z and z > 1000000000 then
+                if ns.Timers.MarkNode("tuber", tonumber(ti), z, "sn") then n = n + 1 end
+            end
+        end
+    end
+    return n
+end
+
 ----------------------------------------------------------------------
 -- Decode chain (production, RECEIVE)
 --
@@ -332,13 +392,133 @@ function SNBridge.Translate(payload, sender)
         handled = handled + 1
     end
 
+    -- SN "Broadcast Timers" per-buff pop/kill LOGS. This is the shape the real
+    -- captured GUILD broadcasts actually carry (see harness snfixture.lua):
+    --   rendLog / onyLogH / onyLogA = { { z=<epoch>, who=<name>?, killed=<bool>?,
+    --                                     quest=<bool>? }, ... }  (newest-ish first)
+    -- We anchor the NEWEST entry per log through the sn ingest path. Recording
+    -- only the newest keeps the anchor current; Timers.Record's recency gate then
+    -- decides whether it is fresh enough to raise a pull bar — so an old broadcast
+    -- repopulates state WITHOUT an alert storm. nef/zg log keys are wired
+    -- defensively in case SN begins broadcasting them; absent keys are no-ops.
+    for logKey, buff in pairs(SN_LOG_BUFF) do
+        local log = payload[logKey]
+        if type(log) == "table" then
+            local best
+            for _, e in pairs(log) do
+                if type(e) == "table" then
+                    local z = tonumber(pick(e, "z", "epoch", "e", "time", "ts"))
+                    if z and z > 1000000000 and (not best or z > best.z) then
+                        best = { z = z, who = e.who, killed = e.killed, quest = e.quest }
+                    end
+                end
+            end
+            if best then
+                local kind = best.killed and "killed" or (best.quest and "quest" or "pop")
+                ns.Timers.OnSNTimer(buff, best.z, kind, { who = best.who or who })
+                handled = handled + 1
+            end
+        end
+    end
+
+    -- Songflower / node picks, IF a future SN broadcast carries them. The real
+    -- capture in hand contains NO node data, so the exact SN key shape is unproven;
+    -- we accept only an unambiguous indexed-epoch map ("flowerN"/"tuberN" or a
+    -- flower/tuber sub-table of index->epoch) and route via the public MarkNode
+    -- surface. Anything we do not recognize is silently ignored (never guessed).
+    handled = handled + translateNodes(payload)
+
     return handled
 end
 
 ----------------------------------------------------------------------
--- Inbound message handler (RECEIVE). Fully pcall-guarded: SN traffic can
--- never error us, whatever shape it arrives in.
+-- Chunk envelope + reassembly (RECEIVE)
+--
+-- SN chunks logical messages > ~255 bytes with a small leading envelope,
+-- derived from the owner's wire capture (harness snfixture.lua) and VERIFIED
+-- byte-for-byte against it:
+--   byte 1  = frame type:
+--               'S' complete single message
+--               'F' first chunk   (byte 3 = total chunk count)
+--               'L' last  chunk
+--               'M'/'N' speculative middle (NOT observed in the wild, but 3+-chunk
+--                       messages exist; handled in arrival order, decode-guarded)
+--   byte 2  = message counter (uint8) grouping the chunks of one logical message
+--   byte 3  = 'F' ONLY: total chunk count
+--   rest    = payload fragment. The FULL logical payload (after reassembly) is
+--             <1-byte opcode><channel-encoded XOR+deflate+serialize stream>; we
+--             strip the opcode and hand the remainder to the existing Decode
+--             chain (channel-decode -> XOR "ShadowNt" -> inflate -> deserialize).
+--             PROVEN order: reassemble F..L -> drop opcode -> SNBridge.Decode.
+--
+-- Everything is defensive: unknown type bytes, orphan/incomplete/oversized
+-- reassemblies and format drift all decode to nothing and NEVER error. We NEVER
+-- transmit — this is a pure one-way intake.
 ----------------------------------------------------------------------
+
+local REASM_TIMEOUT     = 30    -- seconds an incomplete reassembly may linger
+local REASM_MAX_PENDING = 8     -- cap on concurrent in-flight reassemblies
+local FRAME_TYPES  = { S = true, F = true, L = true, M = true, N = true }
+local FRAME_MIDDLE = { M = true, N = true }
+
+-- Clock indirection (server epoch). Overridable in self-tests to exercise the
+-- reassembly timeout deterministically.
+function SNBridge._now()
+    return (ns.Store and ns.Store.Now and ns.Store.Now())
+        or (GetServerTime and GetServerTime())
+        or (time and time()) or 0
+end
+
+-- Parse the chunk envelope. Returns a table {type,counter,total?,payload} for a
+-- recognized frame, or nil for a headerless/unknown frame (caller falls back to
+-- the legacy single-frame decode, then to capture-and-skip). Pure.
+function SNBridge._parseEnvelope(text)
+    if type(text) ~= "string" or #text < 2 then return nil end
+    local t = text:sub(1, 1)
+    if not FRAME_TYPES[t] then return nil end
+    local counter = text:byte(2)
+    if t == "F" then
+        if #text < 3 then return nil end
+        return { type = t, counter = counter, total = text:byte(3), payload = text:sub(4) }
+    end
+    -- S / L / M / N: 2-byte header, payload follows.
+    return { type = t, counter = counter, payload = text:sub(3) }
+end
+
+SNBridge._reasm = {}   -- key -> { total, parts = {}, opened }
+
+local function reasmKey(sender, prefix, counter)
+    return tostring(sender) .. "\0" .. tostring(prefix) .. "\0" .. tostring(counter)
+end
+
+local function reasmCount()
+    local n = 0
+    for _ in pairs(SNBridge._reasm) do n = n + 1 end
+    return n
+end
+
+-- Drop reassemblies older than REASM_TIMEOUT. Cheap, opportunistic sweep run on
+-- every inbound frame (SN traffic is low-rate; no dedicated ticker needed).
+local function reasmSweep(nowT)
+    for k, e in pairs(SNBridge._reasm) do
+        if (nowT - (e.opened or 0)) > REASM_TIMEOUT then
+            SNBridge._reasm[k] = nil
+            snBump("drop", "reasmTimeout")
+        end
+    end
+end
+
+-- Evict the oldest pending reassembly when at capacity (before opening a new one).
+local function reasmEvictOldest()
+    local oldestK, oldestT
+    for k, e in pairs(SNBridge._reasm) do
+        if not oldestT or (e.opened or 0) < oldestT then oldestK, oldestT = k, (e.opened or 0) end
+    end
+    if oldestK then
+        SNBridge._reasm[oldestK] = nil
+        snBump("drop", "reasmEvicted")
+    end
+end
 
 local function isRecvPrefix(prefix)
     for i = 1, #SNBridge.RECV_PREFIXES do
@@ -348,32 +528,100 @@ local function isRecvPrefix(prefix)
 end
 SNBridge._isRecvPrefix = isRecvPrefix
 
+-- Shared decode -> version -> freshness -> translate tail. `stream` is the raw
+-- channel-encoded payload (opcode already stripped), from either a single frame
+-- or a completed reassembly. Returns handled-count.
+local function ingestStream(stream, channel, sender)
+    local stats = SNBridge._stats
+    local payload = SNBridge.Decode(stream, channel)
+    if not payload then return 0 end
+    -- Test/diagnostic seam: observe every successfully-decoded table (before the
+    -- version gate). Never set in production. pcall so a test hook can't break us.
+    if SNBridge._onDecoded then pcall(SNBridge._onDecoded, payload, sender, channel) end
+    if not SNBridge.VersionOK(payload) then snBump("drop", "versionGate"); return 0 end
+    stats.versionOK = stats.versionOK + 1
+    -- Heard valid, version-gated SN timer traffic — stamp freshness even if
+    -- nothing translated (so the UI can show "SN seen Ns ago").
+    if ns.Timers and ns.Timers._noteFreshness then
+        ns.Timers._noteFreshness("snPassive")
+    end
+    local n = SNBridge.Translate(payload, sender)
+    if n == 0 then snBump("drop", "translateZero") else stats.translated = stats.translated + n end
+    return n
+end
+
+-- Strip the 1-byte inner opcode and run the shared decode tail on a completed
+-- logical payload (single or reassembled).
+local function decodeLogical(logical, channel, sender)
+    if type(logical) ~= "string" or #logical < 1 then return 0 end
+    return ingestStream(logical:sub(2), channel, sender)
+end
+
 -- Core ingest for one raw SN message. Returns handled-count (0 on any skip).
--- NOTE: SN chunks messages > ~255 bytes with its own envelope; the exact
--- framing is not a clean-room fact. Timer/pull payloads are small and arrive
--- single-fragment in practice, so we decode each message independently and
--- silently skip anything that isn't a self-contained frame.
+-- Fully pcall-guarded: SN traffic can never error us, whatever shape it arrives
+-- in. A single 'S' frame decodes immediately; 'F'/'M'/'L' feed the reassembly
+-- buffer and only decode once the 'L' closes the set; an unrecognized envelope
+-- falls back to the legacy headerless decode (and then to capture-and-skip).
 function SNBridge.Ingest(prefix, text, channel, sender)
     if not isRecvPrefix(prefix) then snBump("drop", "notRecvPrefix"); return 0 end
     local stats = SNBridge._stats
     stats.heard = stats.heard + 1
     stats.byChannel[channel or "?"] = (stats.byChannel[channel or "?"] or 0) + 1
-    -- Capture the raw frame (bytes only) BEFORE decode so fragments — the ones
-    -- that fail to inflate — are preserved for the deferred reassembly evidence.
+    -- Capture the raw frame (bytes only) BEFORE decode so fragments are preserved.
     ns:SafeCall(SNBridge.CaptureFrame, sender, channel, text)
     local ok, handled = pcall(function()
-        local payload = SNBridge.Decode(text, channel)
-        if not payload then return 0 end
-        if not SNBridge.VersionOK(payload) then snBump("drop", "versionGate"); return 0 end
-        stats.versionOK = stats.versionOK + 1
-        -- Heard valid, version-gated SN timer traffic — stamp freshness even if
-        -- nothing translated (so the UI can show "SN seen Ns ago").
-        if ns.Timers and ns.Timers._noteFreshness then
-            ns.Timers._noteFreshness("snPassive")
+        local nowT = SNBridge._now()
+        reasmSweep(nowT)
+
+        local env = SNBridge._parseEnvelope(text)
+        if not env then
+            -- Headerless / unknown-first-byte: try the legacy single-frame decode
+            -- (backward compatibility + defensive), else capture-and-skip.
+            local payload = SNBridge.Decode(text, channel)
+            if not payload then snBump("drop", "unknownType"); return 0 end
+            if SNBridge._onDecoded then pcall(SNBridge._onDecoded, payload, sender, channel) end
+            if not SNBridge.VersionOK(payload) then snBump("drop", "versionGate"); return 0 end
+            stats.versionOK = stats.versionOK + 1
+            if ns.Timers and ns.Timers._noteFreshness then ns.Timers._noteFreshness("snPassive") end
+            local n = SNBridge.Translate(payload, sender)
+            if n == 0 then snBump("drop", "translateZero") else stats.translated = stats.translated + n end
+            return n
         end
-        local n = SNBridge.Translate(payload, sender)
-        if n == 0 then snBump("drop", "translateZero") else stats.translated = stats.translated + n end
-        return n
+
+        if env.type == "S" then
+            -- Complete single logical message: <opcode><stream>.
+            return decodeLogical(env.payload, channel, sender)
+        end
+
+        -- Chunked: F opens, M/N append (arrival order), L closes.
+        local key = reasmKey(sender, prefix, env.counter)
+        if env.type == "F" then
+            if not SNBridge._reasm[key] and reasmCount() >= REASM_MAX_PENDING then
+                reasmEvictOldest()
+            end
+            -- A fresh 'F' for this (sender,prefix,counter) REPLACES any stale pending
+            -- set (counter reuse from the same sender).
+            SNBridge._reasm[key] = { total = env.total, parts = { env.payload }, opened = nowT }
+            stats.reasmOpened = stats.reasmOpened + 1
+            return 0
+        elseif FRAME_MIDDLE[env.type] then
+            local e = SNBridge._reasm[key]
+            if not e then snBump("drop", "reasmOrphan"); return 0 end
+            e.parts[#e.parts + 1] = env.payload
+            stats.reasmMiddle = stats.reasmMiddle + 1
+            return 0
+        elseif env.type == "L" then
+            local e = SNBridge._reasm[key]
+            if not e then snBump("drop", "reasmOrphan"); return 0 end
+            SNBridge._reasm[key] = nil
+            e.parts[#e.parts + 1] = env.payload
+            -- If a total was advertised and we are short, still best-effort assemble;
+            -- a truncated stream simply fails to inflate and is skipped.
+            if e.total and #e.parts < e.total then snBump("drop", "reasmIncomplete") end
+            stats.reasmCompleted = stats.reasmCompleted + 1
+            return decodeLogical(table.concat(e.parts), channel, sender)
+        end
+        return 0
     end)
     if not ok then return 0 end   -- silent skip on ANY error
     return handled or 0
@@ -429,6 +677,11 @@ function SNBridge.DebugDump()
     ns:Print(string.format("  drops: notRecvPrefix=%d chanDecode=%d SUSPECTED-FRAGMENT=%d deserialize=%d versionGate=%d translateZero=%d",
         s.drop.notRecvPrefix, s.drop.channelDecode, s.drop.suspectedFragment,
         s.drop.deserialize, s.drop.versionGate, s.drop.translateZero))
+    local pending = 0
+    for _ in pairs(SNBridge._reasm) do pending = pending + 1 end
+    ns:Print(string.format("  reasm: opened=%d completed=%d middle=%d pending=%d | drops timeout=%d evicted=%d orphan=%d incomplete=%d unknownType=%d",
+        s.reasmOpened, s.reasmCompleted, s.reasmMiddle, pending,
+        s.drop.reasmTimeout, s.drop.reasmEvicted, s.drop.reasmOrphan, s.drop.reasmIncomplete, s.drop.unknownType))
     local cap = ns.Store and ns.Store.GetData and ns.Store.GetData() and ns.Store.GetData().snCapture
     if cap then
         ns:Print(string.format("  capture: %s | frames=%d (cap %d, evicted %d) — /nexus debug sncapture dump",
@@ -470,12 +723,17 @@ end
 --
 -- Mirrors the documented SDWW encode pipeline so the self-tests can prove the
 -- decode chain round-trips: short-keyed table -> serialize -> deflate(level 9)
--- -> XOR "ShadowNt" -> channel-safe encode. This function is NOT reachable from
--- any SendAddonMessage / SendCommMessage call site; grep-verify it is only used
--- inside RunSelfTests below.
+-- -> XOR "ShadowNt" -> channel-safe encode, then the SN chunk envelope. These
+-- functions are NOT reachable from any SendAddonMessage / SendCommMessage call
+-- site; grep-verify they are only used inside RunSelfTests below.
 ----------------------------------------------------------------------
 
-function SNBridge._TEST_encode(payload, channel)
+-- Inner opcode bytes observed in the real capture (single vs chunked). Opaque to
+-- decode (always stripped); mirrored here so test frames match the wire exactly.
+local OPCODE_SINGLE, OPCODE_CHUNK = 0x11, 0x10
+
+-- Produce the raw channel-encoded XOR+deflate+serialize stream (no envelope).
+local function testEncodeStream(payload, channel)
     local LS, LD = libSerialize(), libDeflate()
     if not (LS and LD) then return nil end
     local ser = LS:Serialize(payload)
@@ -485,6 +743,38 @@ function SNBridge._TEST_encode(payload, channel)
         return LD:EncodeForWoWChatChannel(xored)
     end
     return LD:EncodeForWoWAddonChannel(xored)
+end
+
+-- A complete single 'S' frame: "S" <counter> <opcode> <stream>.
+function SNBridge._TEST_encode(payload, channel, counter)
+    local stream = testEncodeStream(payload, channel)
+    if not stream then return nil end
+    return "S" .. string.char(counter or 1) .. string.char(OPCODE_SINGLE) .. stream
+end
+
+-- Split one logical payload into nchunks F/(M...)/L frames sharing a counter.
+-- The logical payload is <opcode><stream>; it is chunked byte-wise exactly as SN
+-- does on the wire. Returns an array of frame strings in F..L order.
+function SNBridge._TEST_chunkEncode(payload, channel, counter, nchunks)
+    local stream = testEncodeStream(payload, channel)
+    if not stream then return nil end
+    counter = counter or 1
+    nchunks = nchunks or 2
+    local logical = string.char(OPCODE_CHUNK) .. stream
+    local piece = math.ceil(#logical / nchunks)
+    local frames, idx = {}, 1
+    for c = 1, nchunks do
+        local part = logical:sub(idx, idx + piece - 1)
+        idx = idx + piece
+        if c == 1 then
+            frames[c] = "F" .. string.char(counter) .. string.char(nchunks) .. part
+        elseif c == nchunks then
+            frames[c] = "L" .. string.char(counter) .. part
+        else
+            frames[c] = "M" .. string.char(counter) .. part
+        end
+    end
+    return frames
 end
 
 ----------------------------------------------------------------------
@@ -622,6 +912,132 @@ local function testDecodeChain(fails)
     ns.Timers.OnSNTimer, ns.Timers.OnSNPull = savedTimer, savedPull
 end
 
+-- EscapeBytes / UnescapeBytes are exact inverses over arbitrary bytes (pure).
+local function testEscapeRoundTrip(fails)
+    local s = string.char(0, 1, 9, 10, 13, 31, 32, 65, 66, 127, 200, 255) ..
+              [["quoted"]] .. string.char(92) .. "tail"
+    local esc = SNBridge.EscapeBytes(s)
+    tcheck(SNBridge.UnescapeBytes(esc) == s, "unescape(escape(x)) == x over all byte classes", fails)
+    tcheck(SNBridge.UnescapeBytes("AB\\x01\\xFF\\x5C") == "AB\1\255\\", "unescape decodes \\xHH", fails)
+end
+
+-- Log-array + node translation in isolation (no crypto) — validates the REAL SN
+-- "Broadcast Timers" payload shape (rendLog/onyLogH/onyLogA + node keys) routes
+-- to OnSNTimer/MarkNode. Runs under ANY VM.
+local function testLogTranslate(fails)
+    if not (ns.Timers and ns.Timers.OnSNTimer) then
+        fails[#fails + 1] = "timers layer absent"; return
+    end
+    local savedT, savedP, savedN = ns.Timers.OnSNTimer, ns.Timers.OnSNPull, ns.Timers.MarkNode
+    local seen, nodes = {}, {}
+    ns.Timers.OnSNTimer = function(buff, epoch, kind, meta)
+        seen[#seen + 1] = { buff = buff, epoch = epoch, kind = kind, who = meta and meta.who }
+    end
+    ns.Timers.OnSNPull = function() end
+    ns.Timers.MarkNode = function(kind, i, e) nodes[#nodes + 1] = { kind = kind, i = i, e = e }; return true end
+    local function restore() ns.Timers.OnSNTimer, ns.Timers.OnSNPull, ns.Timers.MarkNode = savedT, savedP, savedN end
+
+    local now = 1785279000
+    -- Newest entry per log anchors; 'killed' flag normalizes; empty log = 0.
+    local h = SNBridge.Translate({
+        v = 2,
+        rendLog = { { z = now - 3600, who = "old" }, { z = now, who = "fresh", killed = true } },
+        onyLogH = { { z = now - 100, who = "h" } },
+        onyLogA = {},
+    }, "Broadcaster")
+    local byBuff = {}
+    for _, e in ipairs(seen) do byBuff[e.buff] = e end
+    tcheck(byBuff.rend and byBuff.rend.epoch == now, "rendLog newest entry anchored", fails)
+    tcheck(byBuff.rend and byBuff.rend.kind == "killed" and byBuff.rend.who == "fresh",
+        "rendLog killed flag + who carried", fails)
+    tcheck(byBuff.onyH and byBuff.onyH.epoch == now - 100, "onyLogH anchored", fails)
+    tcheck(byBuff.onyA == nil, "empty onyLogA -> no anchor", fails)
+    tcheck(h == 2, "two logs -> 2 anchors", fails)
+
+    -- Flat node keys route through MarkNode (defensive/forward-looking shape).
+    seen, nodes = {}, {}
+    SNBridge.Translate({ v = 2, flower1 = now, tuber3 = now - 5 }, "B")
+    local haveF, haveT = false, false
+    for _, n in ipairs(nodes) do
+        if n.kind == "flower" and n.i == 1 then haveF = true end
+        if n.kind == "tuber" and n.i == 3 then haveT = true end
+    end
+    tcheck(haveF and haveT, "flowerN/tuberN keys route to MarkNode", fails)
+
+    restore()
+end
+
+-- Chunk reassembly: interleaved two-sender, 3-chunk, timeout, unknown-type.
+-- Uses the TEST-ONLY chunk encoder; skipped when libs / deflate cannot round-trip.
+local function testReassembly(fails)
+    local LS, LD = libSerialize(), libDeflate()
+    if not (LS and LD) then return end
+    if not deflateRoundTrips() then return end
+    if not (ns.Timers and ns.Timers.OnSNTimer) then
+        fails[#fails + 1] = "timers layer absent for reassembly test"; return
+    end
+    local savedT, savedP = ns.Timers.OnSNTimer, ns.Timers.OnSNPull
+    local seen = {}
+    ns.Timers.OnSNTimer = function(buff, epoch, kind, meta)
+        seen[#seen + 1] = { buff = buff, epoch = epoch, kind = kind, who = meta and meta.who }
+    end
+    ns.Timers.OnSNPull = function() end
+    local function restore() ns.Timers.OnSNTimer, ns.Timers.OnSNPull = savedT, savedP end
+
+    SNBridge._reasm = {}   -- isolate
+    local now = 1785279000
+
+    -- (b) Interleaved chunks, TWO senders, SAME counter -> keyed independently.
+    local fa = SNBridge._TEST_chunkEncode({ v = 2, rendLog = { { z = now, who = "AAA" } } }, "GUILD", 1, 2)
+    local fb = SNBridge._TEST_chunkEncode({ v = 2, onyLogH = { { z = now, who = "BBB" } } }, "GUILD", 1, 2)
+    if not (fa and fb and #fa == 2 and #fb == 2) then fails[#fails + 1] = "chunk encoder failed"; restore(); return end
+    tcheck(fa[1]:sub(1, 1) == "F" and fa[2]:sub(1, 1) == "L", "chunk encoder emits F..L", fails)
+    -- Interleave: F_A, F_B, L_A, L_B.
+    SNBridge.Ingest("SDWW", fa[1], "GUILD", "Alpha-R")
+    SNBridge.Ingest("SDWW", fb[1], "GUILD", "Bravo-R")
+    local hA = SNBridge.Ingest("SDWW", fa[2], "GUILD", "Alpha-R")
+    local hB = SNBridge.Ingest("SDWW", fb[2], "GUILD", "Bravo-R")
+    tcheck(hA == 1 and hB == 1, "both interleaved reassemblies completed", fails)
+    local byBuff = {}
+    for _, e in ipairs(seen) do byBuff[e.buff] = e end
+    tcheck(byBuff.rend and byBuff.rend.who == "AAA", "sender A -> rend (no cross-contamination)", fails)
+    tcheck(byBuff.onyH and byBuff.onyH.who == "BBB", "sender B -> onyH (no cross-contamination)", fails)
+
+    -- 3-chunk F/M/L reassembles.
+    seen = {}; SNBridge._reasm = {}
+    local f3 = SNBridge._TEST_chunkEncode({ v = 2, rendLog = { { z = now, who = "MID" } } }, "GUILD", 7, 3)
+    tcheck(f3 and #f3 == 3 and f3[2]:sub(1, 1) == "M", "3-chunk encoder emits F/M/L", fails)
+    SNBridge.Ingest("SDWW", f3[1], "GUILD", "Char-R")
+    SNBridge.Ingest("SDWW", f3[2], "GUILD", "Char-R")
+    local h3 = SNBridge.Ingest("SDWW", f3[3], "GUILD", "Char-R")
+    tcheck(h3 == 1 and seen[1] and seen[1].buff == "rend", "3-chunk F/M/L reassembled+translated", fails)
+
+    -- (c) Incomplete reassembly times out cleanly (no error, pending cleared).
+    seen = {}; SNBridge._reasm = {}
+    local savedNow = SNBridge._now
+    local clock = now
+    SNBridge._now = function() return clock end
+    local f2 = SNBridge._TEST_chunkEncode({ v = 2, rendLog = { { z = now, who = "X" } } }, "GUILD", 9, 2)
+    SNBridge.Ingest("SDWW", f2[1], "GUILD", "Dangle-R")   -- F only, never closed
+    local pendingBefore = 0; for _ in pairs(SNBridge._reasm) do pendingBefore = pendingBefore + 1 end
+    tcheck(pendingBefore == 1, "incomplete reassembly is pending", fails)
+    clock = now + REASM_TIMEOUT + 5
+    -- Any subsequent inbound frame triggers the sweep.
+    SNBridge.Ingest("SDWW", "Zx", "GUILD", "Other-R")
+    local pendingAfter = 0; for _ in pairs(SNBridge._reasm) do pendingAfter = pendingAfter + 1 end
+    tcheck(pendingAfter == 0, "stale incomplete reassembly swept after timeout", fails)
+    SNBridge._now = savedNow
+
+    -- (d) Unknown type byte -> ignored without error (0 handled).
+    seen = {}
+    local okZ = pcall(function() return SNBridge.Ingest("SDWW", "Z\1garbage-bytes", "GUILD", "U-R") end)
+    tcheck(okZ, "unknown type byte does not error", fails)
+    tcheck(SNBridge.Ingest("SDWW", "\240\5\6\7", "GUILD", "U-R") == 0, "high-byte unknown frame skipped", fails)
+
+    SNBridge._reasm = {}
+    restore()
+end
+
 -- Capture ring-buffer mechanics (item 41): escape format, cap eviction, dump shape.
 local function testCaptureRing(fails)
     if not (ns.Store and ns.Store.GetData and ns.Store.GetData()) then
@@ -658,7 +1074,10 @@ function SNBridge.RunSelfTests(verbose)
         { name = "buff resolve",   fn = testBuffResolve },
         { name = "version gate",   fn = testVersionGate },
         { name = "translate",      fn = testTranslate },
+        { name = "escape roundtrip", fn = testEscapeRoundTrip },
+        { name = "log translate",  fn = testLogTranslate },
         { name = "decode chain",   fn = testDecodeChain },
+        { name = "reassembly",     fn = testReassembly },
         { name = "capture ring",   fn = testCaptureRing },
     }
     local allPass = true
