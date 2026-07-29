@@ -11,12 +11,14 @@
 --     ns.HUD.TestAlert(buffKey, eventKey)   -- fire one test alert through the
 --                                              dispatcher for a matrix cell
 --
--- Section map (spec's 9 sub-tabs → 6 scannable pages, style-guide consolidation):
+-- Section map (spec's 9 sub-tabs → 7 scannable pages, style-guide consolidation):
 --   General          = General + Locations + Colors
---   Mesh & Accounts  = Mesh + Accounts
+--   Mesh & Accounts  = Mesh (Generate credentials · Copy/Paste setup bundle ·
+--                      Setup guide wizard) + Accounts + Tombstones
 --   Auras            = per-faction thresholds + Rend/Battle-Shout class rules
 --   Automation       = Auto (Group / Accept Summon / Gossip / Quest / Interact)
---   Timers & Alerts  = Timers (raid overrides, alert matrix, sounds, bars, pins)
+--   Timers           = Raid overrides + pull-bar geometry + Felwood pins/songflower
+--   Alerts           = event×channel alert matrix + sound channel
 --   Blacklist        = Blacklist / Whitelist + sync + purge
 --
 -- Every control maps 1:1 to a field in the store defaults tree (store.lua). No
@@ -175,6 +177,85 @@ local ZANZA_PICKS = {
 local MESH_CAP = 8
 
 ----------------------------------------------------------------------
+-- Mesh credential kit — generate / validate / setup-bundle codec.
+--
+-- All pure (no WoW globals except math.random, per mesh.lua's RNG convention)
+-- so the harness can round-trip them. The bundle REUSES ns.Mesh.Pack/Unpack (the
+-- LibSerialize→Deflate→channel-encode pipeline) — no new crypto is introduced —
+-- and carries ONLY {channel, token}. The Account ID is deliberately excluded: it
+-- must differ per account, so sharing it would break the mesh.
+----------------------------------------------------------------------
+
+-- Case-sensitive alphanumeric charset (matches Lua %w exactly: no underscore).
+local CRED_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+local function randCred(n)
+    local t = {}
+    for i = 1, n do
+        local idx = (math.random and math.random(1, #CRED_CHARS)) or 1
+        t[i] = CRED_CHARS:sub(idx, idx)
+    end
+    return table.concat(t)
+end
+
+-- Well-formedness checks mirror mesh.lua/buildMesh: channel 16+ alnum (we mint
+-- 20), token EXACTLY 6 alnum. Kept local + exposed for the wizard and harness.
+local function validChannel(c) return type(c) == "string" and #c >= 16 and c:match("^%w+$") ~= nil end
+local function validToken(t)   return type(t) == "string" and #t == 6  and t:match("^%w+$") ~= nil end
+Options.ValidChannel, Options.ValidToken = validChannel, validToken
+
+-- Strong random credentials. Generation NEVER enables the mesh by itself — the
+-- caller writes the fields and the user still flips Enable.
+function Options.GenerateChannel() return randCred(20) end
+function Options.GenerateToken()   return randCred(6)  end
+
+-- Setup bundle: "DSKB1" prefix + Mesh.Pack{ c=channel, t=token }. Returns the
+-- copy/paste string, or nil if the credentials are malformed or the codec libs
+-- are absent.
+local BUNDLE_PREFIX = "DSKB1"
+function Options.EncodeBundle(channel, token)
+    if not (validChannel(channel) and validToken(token)) then return nil end
+    if not (ns.Mesh and ns.Mesh.Pack) then return nil end
+    local body = ns.Mesh.Pack({ c = channel, t = token })
+    if type(body) ~= "string" or body == "" then return nil end
+    return BUNDLE_PREFIX .. body
+end
+
+-- Reverse of EncodeBundle. Trims only surrounding whitespace (the encoded body
+-- has none internally). Returns channel, token on success; nil on any malformed
+-- input (missing/wrong prefix, undecodable body, or credentials that fail
+-- validation) so callers can print one clean error.
+function Options.DecodeBundle(str)
+    if type(str) ~= "string" then return nil end
+    str = str:gsub("^%s+", ""):gsub("%s+$", "")
+    if str:sub(1, #BUNDLE_PREFIX) ~= BUNDLE_PREFIX then return nil end
+    local body = str:sub(#BUNDLE_PREFIX + 1)
+    if body == "" or not (ns.Mesh and ns.Mesh.Unpack) then return nil end
+    local tbl = ns.Mesh.Unpack(body)
+    if type(tbl) ~= "table" then return nil end
+    if not (validChannel(tbl.c) and validToken(tbl.t)) then return nil end
+    return tbl.c, tbl.t
+end
+
+-- Merged pin-size write-through (IA cleanup: five Felwood sliders → two). One
+-- control writes the legacy base key AND both split keys additively, so every
+-- historical reader (worldPinSize fallback, worldFlowerSize/worldTuberSize splits)
+-- keeps working. No store key is ever removed — only the redundant CONTROLS are.
+local function writeWorldPinSize(fw, v)
+    if type(fw) ~= "table" then return end
+    fw.worldPinSize   = v   -- legacy base key (fallback source for old readers)
+    fw.worldFlowerSize = v  -- split key
+    fw.worldTuberSize  = v  -- split key
+end
+local function writeMinimapPinSize(fw, v)
+    if type(fw) ~= "table" then return end
+    fw.minimapPinSize   = v
+    fw.minimapFlowerSize = v
+    fw.minimapTuberSize  = v
+end
+Options._writeWorldPinSize   = writeWorldPinSize
+Options._writeMinimapPinSize = writeMinimapPinSize
+
+----------------------------------------------------------------------
 -- Small helpers
 ----------------------------------------------------------------------
 
@@ -187,7 +268,10 @@ local scope = { faction = "Alliance" }
 local function FS() return ns.Store and ns.Store.GetFactionSettings and ns.Store.GetFactionSettings(scope.faction) or nil end
 
 -- Per-page refresher registries (called on faction toggle / section show).
-local refreshers = { auras = {}, automation = {}, mesh = {}, general = {}, timers = {}, blacklist = {} }
+-- `alerts` is the split-off event matrix page (was folded into `timers`); `wizard`
+-- serves the first-run setup dialog's live get/set widgets.
+local refreshers = { auras = {}, automation = {}, mesh = {}, general = {}, timers = {},
+                     alerts = {}, blacklist = {}, wizard = {} }
 local function register(page, fn) local l = refreshers[page]; l[#l + 1] = fn end
 local function refreshPage(page)
     local l = refreshers[page]
@@ -777,9 +861,10 @@ end
 
 local function buildMesh(flow)
     local UI = DaseekiUI
+    local DS = _G.DaseekiSuite
 
     flow:AddSection("Mesh")
-    flow:Hint("Your accounts meet on a private hidden channel. Set the SAME channel name and token on every account, then enable.")
+    flow:Hint("Your accounts meet on a private hidden channel. Set the same channel and token on every account, then enable.")
 
     -- Read helpers for the two credential fields. ENGINE DEPENDENCY (round-3 item
     -- 38): mesh.channel is added by the engine agent; defensive `or ""` fallback
@@ -907,6 +992,73 @@ local function buildMesh(flow)
         end
     end)
 
+    -- ── Credential actions: Generate · Copy/Paste bundle · Setup guide ─────────
+    -- These make the hardest first-run task (matching two case-sensitive secrets
+    -- byte-for-byte across accounts) one click. Generate fills the fields but does
+    -- NOT enable the mesh; the user still flips Enable above.
+    local genRow = flow:AddRow({ vAlign = "center" })
+    local genLine = flow:AddRow():Label("")
+    genRow:Button({ text = "Generate credentials", width = 180, onClick = function()
+        local db = DB(); if not db then return end
+        local c, t = Options.GenerateChannel(), Options.GenerateToken()
+        db.mesh.channel, db.mesh.token = c, t
+        genLine._label:SetText("|cff66dd66Generated a 20-character channel and 6-character token. Copy the setup bundle to your other accounts, then enable the mesh.|r")
+        ns:Print("credentials generated. Copy the setup bundle to your other accounts, then enable the mesh.")
+        refreshPage("mesh")
+    end })
+
+    local bundleRow = flow:AddRow({ vAlign = "center" })
+    bundleRow:Button({ text = "Copy setup bundle", width = 160, onClick = function()
+        local str = Options.EncodeBundle(chanRaw(), tokRaw())
+        if not str then
+            ns:Print("set a valid channel and token first (Generate credentials does this).")
+            return
+        end
+        if DS and DS.ShowTextDialog then
+            DS.ShowTextDialog("Copy setup bundle", str, true)
+        else
+            ns:Print("setup bundle: " .. str)
+        end
+    end })
+    bundleRow:Button({ text = "Paste setup bundle", width = 160, variant = "quiet", onClick = function()
+        if not (DS and DS.ShowTextDialog) then
+            ns:Print("paste is unavailable — update Daseeki Core.")
+            return
+        end
+        DS.ShowTextDialog("Paste setup bundle", "", false, function(txt)
+            local c, t = Options.DecodeBundle(txt)
+            if not c then
+                ns:Print("that bundle could not be read. Copy the whole string and try again.")
+                return
+            end
+            local db = DB(); if not db then return end
+            db.mesh.channel, db.mesh.token = c, t
+            local aid = ns:GetAccountID()
+            if aid == "" or not ns:IsValidAccountID(aid) then
+                ns:Print("Channel and token accepted. Set this account's ID, then enable the mesh.")
+            else
+                ns:Print("Channel and token accepted. Enable the mesh, then relog.")
+            end
+            refreshPage("mesh")
+        end)
+    end })
+    flow:Hint("Generate on your first account, Copy the bundle, then Paste it on each other account. The Account ID stays unique per account and is never shared in the bundle.")
+
+    -- First-run guide entry: a Setup guide button is always available; when the
+    -- mesh is unconfigured a prompt line leads the user to it.
+    local guideRow = flow:AddRow({ vAlign = "center" })
+    guideRow:Button({ text = "Setup guide", width = 130, onClick = function()
+        Options.ShowSetupWizard()
+    end })
+    local guideLine = guideRow:Label("")
+    register("mesh", function()
+        if isConfigured() then
+            guideLine._label:SetText("")
+        else
+            guideLine._label:SetText("|cffddaa44New here? Open the setup guide to connect this account in three steps.|r")
+        end
+    end)
+
     -- Suppress mesh-disabled alert — a notification preference. It formerly shared the
     -- Enable row; since Enable now leads the section alone, this keeps its own row
     -- rather than crowding a third checkbox onto the transport-toggle row below.
@@ -956,8 +1108,162 @@ local function buildMesh(flow)
 
     -- ── Tombstones (round-3 item 32) ──────────────────────────────────────────
     local tomb = flow:AddSection("Tombstones")
-    tomb:Hint("(deleted, will block re-add until expiry)")
+    tomb:Hint("Deleted accounts are hidden here and blocked from re-adding until the tombstone expires.")
     buildTombstonesTable(tomb)
+end
+
+----------------------------------------------------------------------
+-- First-run setup wizard (movable, ESC-closable Classic dialog).
+--
+-- A single taller dialog with three ruled step-sections (Expert A r3 §7: not a
+-- web carousel). Reuses the DaseekiUI flow widgets via UI.CreatePane, exactly as
+-- the Help tab does. Each step shows a live done/needed status; the actions are
+-- the same Generate / Copy-Paste bundle / Enable paths the settings page exposes.
+----------------------------------------------------------------------
+
+local function buildWizardContent(flow)
+    local DS = _G.DaseekiSuite
+
+    -- Step 1 — Account ID (unique per account).
+    flow:AddSection("Step 1 — Name this account")
+    flow:Hint("Give this account a unique ID: 1-2 digits, different on every account. It is how the mesh tells your accounts apart.")
+    local s1 = flow:AddRow({ vAlign = "center" })
+    s1:Label("Account ID")
+    local s1status
+    local s1box = s1:EditBox({
+        width = 70,
+        get = function() return ns:GetAccountID() end,
+        set = function(v)
+            v = tostring(v or ""):gsub("%s", "")
+            local ok, err = ns:SetAccountID(v)
+            if s1status then
+                s1status._label:SetText(ok and "|cff66dd66saved|r" or ("|cffdd6666" .. (err or "invalid") .. "|r"))
+            end
+            refreshPage("wizard")
+        end,
+    })
+    s1box._fillWidth = false
+    s1status = s1:Label("")
+    register("wizard", function()
+        if s1box.Refresh then s1box.Refresh() end
+        local aid = ns:GetAccountID()
+        if aid ~= "" and ns:IsValidAccountID(aid) then s1status._label:SetText("|cff66dd66done|r")
+        else s1status._label:SetText("|cffddaa44needed|r") end
+    end)
+
+    -- Step 2 — credentials (Generate on account 1, Paste on the rest).
+    flow:AddSection("Step 2 — Create or join a mesh")
+    flow:Hint("On your first account, Generate credentials then Copy the setup bundle. On each other account, Paste that bundle.")
+    local s2 = flow:AddRow({ vAlign = "center" })
+    s2:Button({ text = "Generate credentials", width = 180, onClick = function()
+        local db = DB(); if not db then return end
+        db.mesh.channel = Options.GenerateChannel()
+        db.mesh.token   = Options.GenerateToken()
+        ns:Print("credentials generated. Copy the setup bundle to your other accounts.")
+        refreshPage("wizard"); refreshPage("mesh")
+    end })
+    local s2b = flow:AddRow({ vAlign = "center" })
+    s2b:Button({ text = "Copy setup bundle", width = 160, onClick = function()
+        local db = DB(); if not db then return end
+        local str = Options.EncodeBundle(db.mesh.channel or "", db.mesh.token or "")
+        if not str then ns:Print("generate or paste credentials first."); return end
+        if DS and DS.ShowTextDialog then DS.ShowTextDialog("Copy setup bundle", str, true)
+        else ns:Print("setup bundle: " .. str) end
+    end })
+    s2b:Button({ text = "Paste setup bundle", width = 160, variant = "quiet", onClick = function()
+        if not (DS and DS.ShowTextDialog) then ns:Print("paste is unavailable — update Daseeki Core."); return end
+        DS.ShowTextDialog("Paste setup bundle", "", false, function(txt)
+            local c, t = Options.DecodeBundle(txt)
+            if not c then ns:Print("that bundle could not be read. Copy the whole string and try again."); return end
+            local db = DB(); if not db then return end
+            db.mesh.channel, db.mesh.token = c, t
+            ns:Print("Channel and token accepted. Set this account's ID, then enable the mesh.")
+            refreshPage("wizard"); refreshPage("mesh")
+        end)
+    end })
+    local s2status = flow:AddRow():Label("")
+    register("wizard", function()
+        local db = DB()
+        local c = (db and db.mesh and db.mesh.channel) or ""
+        local t = (db and db.mesh and db.mesh.token) or ""
+        if validChannel(c) and validToken(t) then
+            s2status._label:SetText("|cff66dd66Channel and token set.|r")
+        else
+            s2status._label:SetText("|cffddaa44No channel or token yet — Generate or Paste.|r")
+        end
+    end)
+
+    -- Step 3 — enable + relog.
+    flow:AddSection("Step 3 — Enable the mesh")
+    flow:Hint("Turn the mesh on, then log out and back in once on this account. Characters appear across your accounts within seconds.")
+    local s3 = flow:AddRow({ vAlign = "center" })
+    register("wizard", s3:Checkbox({
+        label = "Enable mesh",
+        get = function() local db = DB(); return db and db.mesh.enabled end,
+        set = function(v)
+            local db = DB(); if not db then return end
+            local c, t = db.mesh.channel or "", db.mesh.token or ""
+            if v and not (validChannel(c) and validToken(t)) then
+                ns:Print("set a channel and token first.")
+                db.mesh.enabled = false
+                refreshPage("wizard"); return
+            end
+            db.mesh.enabled = v and true or false
+            if ns.Mesh then
+                if v and ns.Mesh.StartJoinSequence then ns:SafeCall(ns.Mesh.StartJoinSequence)
+                elseif (not v) and ns.Mesh.OnDisable then ns:SafeCall(ns.Mesh.OnDisable) end
+            end
+            ns:Print(v and "mesh enabled — joining channel. Relog to connect." or "mesh disabled.")
+            refreshPage("wizard"); refreshPage("mesh")
+        end,
+    }).Refresh)
+    flow:Hint("Coming from ShadowNetwork? /nexus import copies everything — channel, token, characters and settings.")
+end
+
+-- Build (once) and show the movable ESC-closable wizard frame.
+function Options.ShowSetupWizard()
+    local UI = DaseekiUI
+    if not (UI and UI.CreatePane and UI.FlatFrame and UI.MakeButton) then
+        ns:Print("the setup guide needs Daseeki Core — please update.")
+        return
+    end
+    local f = Options._wizardFrame
+    if not f then
+        f = CreateFrame("Frame", "DaseekiNexusSetupWizard", UIParent)
+        f:SetSize(460, 480)
+        f:SetPoint("CENTER", UIParent, "CENTER", 0, 0)
+        f:SetFrameStrata("DIALOG")
+        f:SetMovable(true); f:EnableMouse(true); f:RegisterForDrag("LeftButton")
+        f:SetScript("OnDragStart", f.StartMoving)
+        f:SetScript("OnDragStop", f.StopMovingOrSizing)
+        f:SetClampedToScreen(true)
+        if type(UISpecialFrames) == "table" then
+            table.insert(UISpecialFrames, "DaseekiNexusSetupWizard")   -- ESC closes
+        end
+
+        local bg = UI.FlatFrame(f, "panel", "accent"); bg:SetAllPoints(f)
+
+        local title = f:CreateFontString(nil, "OVERLAY")
+        title:SetFontObject(UI.fonts.accent)
+        title:SetPoint("TOP", f, "TOP", 0, -10)
+        title:SetText("Mesh Setup Guide")
+
+        local close = UI.MakeButton(f, { text = "\195\151", variant = "quiet", width = 24, height = 20,
+            onClick = function() f:Hide() end })
+        close:SetPoint("TOPRIGHT", f, "TOPRIGHT", -6, -6)
+
+        local host = CreateFrame("Frame", nil, f)
+        host:SetPoint("TOPLEFT", f, "TOPLEFT", 12, -38)
+        host:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", -12, 12)
+
+        local pane = UI.CreatePane(host)
+        f._pane = pane
+        ns:SafeCall(function() buildWizardContent(pane.flow) end)
+        Options._wizardFrame = f
+    end
+    refreshPage("wizard")
+    if f._pane and f._pane.Layout then f._pane:Layout() end
+    f:Show()
 end
 
 -- A simple token-skinned data table with a fixed column layout + live rebuild.
@@ -1564,79 +1870,9 @@ local function buildTimers(flow)
     end
     roCheck("Screen", "notify"); roCheck("Chat", "chat"); roCheck("Flash", "flash"); roCheck("Sound", "sound")
 
-    -- ── Alert matrix (EVENT-MAJOR, round-3 items 13/14/24) ────────────────────
-    -- The reference groups by event type: each event is a sub-header, under which
-    -- sit the buff rows for that event, each row = buff icon + name + inline On /
-    -- Screen / Chat / Flash checkboxes + a per-row Sound dropdown + Test.
-    -- ENGINE DEPENDENCIES (defensive fallbacks; see report):
-    --   * cell.enabled  — the "On" master flag (defaults true when absent).
-    --   * cell.sound — per-row sound tone (item 14; replaces the old event-level
-    --     ts.soundKeys). Falls back to "" (None) until the engine schema lands.
-    --   * ns.Store.ALERT_EVENT_BUFFS / ALERT_EVENT_TYPES — per-event buff sets +
-    --     order (item 24; local fallbacks encode the reference sets).
-    flow:AddSection("Alert Matrix")
-    flow:Hint("Timer alert settings — control notifications per event type.")
-
-    -- Sound channel (global; spec §8 Sound Channel dropdown).
-    local scRow = flow:AddRow({ vAlign = "center" })
-    local scLbl = scRow:Label("Sound channel"); scLbl.uiWidth = 100; scLbl._label:SetWidth(100)
-    local scDD = scRow:Dropdown({
-        width = 140, choices = SOUND_CHANNELS,
-        get = function() local ts = TS(); return ts and ts.soundChannel or "Master" end,
-        set = function(v) local ts = TS(); if ts then ts.soundChannel = v end end,
-    })
-    register("timers", function() if scDD.Refresh then scDD.Refresh() end end)
-
-    -- Hand-merge reconciliation: the engine shipped the migrated schema
-    -- EVENT-MAJOR (alerts[eventType][buffKey]) — flip the accessor to match.
-    local function alertCell(buffKey, evt)
-        local ts = TS(); if not ts then return nil end
-        ts.alerts[evt] = ts.alerts[evt] or {}
-        ts.alerts[evt][buffKey] = ts.alerts[evt][buffKey] or {}
-        return ts.alerts[evt][buffKey]
-    end
-
-    for _, evt in ipairs(alertEventOrder()) do
-        local buffs = alertEventBuffs(evt)
-        if #buffs > 0 then
-            local es = flow:AddSection(ALERT_EVENT_LABEL[evt] or evt)
-            for _, k in ipairs(buffs) do
-                local meta = ALERT_BUFF_META[k] or { name = ALERT_BUFF_LABEL[k] or k }
-                local row = es:AddRow({ vAlign = "center" })
-                -- icon
-                local ico = CreateFrame("Frame", nil, row); ico:SetSize(18, 18); ico.uiWidth, ico.uiHeight = 18, 18
-                local tex = ico:CreateTexture(nil, "ARTWORK"); tex:SetAllPoints()
-                tex:SetTexCoord(0.08, 0.92, 0.08, 0.92); tex:SetTexture(auraIcon(meta.spellID))
-                row._items[#row._items + 1] = { w = ico }
-                local nlbl = row:Label(meta.name); nlbl.uiWidth = 118; nlbl._label:SetWidth(118)
-                -- On (master enable; defaults true when the engine key is absent).
-                register("timers", row:Checkbox({
-                    label = "On",
-                    get = function() local c = alertCell(k, evt); if not c then return false end
-                        if c.enabled == nil then return true end; return c.enabled end,
-                    set = function(v) local c = alertCell(k, evt); if c then c.enabled = v and true or false end end,
-                }).Refresh)
-                local function chan(label, key)
-                    register("timers", row:Checkbox({
-                        label = label,
-                        get = function() local c = alertCell(k, evt); return c and c[key] end,
-                        set = function(v) local c = alertCell(k, evt); if c then c[key] = v and true or false end end,
-                    }).Refresh)
-                end
-                chan("Screen", "notify"); chan("Chat", "chat"); chan("Flash", "flash")
-                local dd = row:Dropdown({
-                    width = 120, choices = soundChoices(),
-                    get = function() local c = alertCell(k, evt); return (c and c.sound) or "" end,
-                    set = function(v) local c = alertCell(k, evt); if c then c.sound = v end end,
-                })
-                dd._fillWidth = false
-                register("timers", function() if dd.Refresh then dd.Refresh() end end)
-                row:Button({ text = "Test", width = 52, variant = "quiet", pin = "right", onClick = function()
-                    hudTestAlert(k, evt)
-                end })
-            end
-        end
-    end
+    -- (The event×channel Alert Matrix + Sound channel moved to their own "Alerts"
+    -- page — see buildAlerts. This page keeps raid overrides, pull-bar geometry
+    -- and Felwood pins.)
 
     -- ── Pull-timer bars ────────────────────────────────────────────────────────
     local pb = flow:AddSection("Pull Timer Bars")
@@ -1688,25 +1924,13 @@ local function buildTimers(flow)
         if pex.Refresh then pex.Refresh() end
     end)
 
-    local colRow = pb:AddRow({ vAlign = "center" })
-    colRow:Label("Fill / BG hex")
-    local fillBox = colRow:EditBox({
-        width = 80,
-        get = function() local ts = TS(); return ts and ts.pullBar.colorFill or "" end,
-        set = function(v) local ts = TS(); if ts then ts.pullBar.colorFill = sanitizeHex(v):lower() end end,
-    })
-    fillBox._fillWidth = false; fillBox.editBox:SetMaxLetters(6)
-    local bgBox = colRow:EditBox({
-        width = 80,
-        get = function() local ts = TS(); return ts and ts.pullBar.colorBG or "" end,
-        set = function(v) local ts = TS(); if ts then ts.pullBar.colorBG = sanitizeHex(v):lower() end end,
-    })
-    bgBox._fillWidth = false; bgBox.editBox:SetMaxLetters(6)
-    register("timers", function() if fillBox.Refresh then fillBox.Refresh() end; if bgBox.Refresh then bgBox.Refresh() end end)
+    -- (Raw Fill/BG hex editboxes removed — the active theme's tokens are the only
+    -- colour authority per §2/§6. The pullBar.colorFill/colorBG store keys stay
+    -- harmlessly for any legacy reader; only the controls are gone.)
 
     -- ── Felwood pins ───────────────────────────────────────────────────────────
     local fw = flow:AddSection("Felwood Pins")
-    fw:Hint("Show Songflower and tuber spawn pins on the world map and minimap.")
+    fw:Hint("Show songflower and tuber spawn pins on the world map and minimap.")
     local fwr = fw:AddRow({ vAlign = "center" })
     register("timers", fwr:Checkbox({
         label = "Show flower pins",
@@ -1726,27 +1950,36 @@ local function buildTimers(flow)
         set = function(v) local ts = TS(); if ts then ts.felwood.pickedChatAlerts = v and true or false end end,
     }).Refresh)
 
-    -- Full 5-field pin sizing (round-3 item 26). ENGINE DEPENDENCY: the split
-    -- fields (worldFlowerPinSize / worldTuberPinSize / worldTimerFontSize /
-    -- minimapFlowerPinSize / minimapTuberPinSize) are added by the engine agent;
-    -- each read falls back to the current single worldPinSize / minimapPinSize.
+    -- Pin sizing merged from five sliders to two (IA cleanup): one "World map pin
+    -- size" + one "Minimap pin size", plus the timer-font slider which stays.
+    -- Each merged slider WRITES THROUGH additively: it sets the legacy base key
+    -- (worldPinSize / minimapPinSize) AND both split keys (flower + tuber), so
+    -- every historical reader keeps working. Reads prefer the base key, then a
+    -- split key, then the default.
     local pinSliders = {}
-    local function pinSlider(label, key, fallbackKey, defVal, lo, hi)
-        local s = fw:Slider({
-            label = label, width = 300, min = lo, max = hi, step = 1,
-            get = function() local ts = TS(); if not ts then return defVal end
-                return ts.felwood[key] or ts.felwood[fallbackKey] or defVal end,
-            set = function(v) local ts = TS(); if ts then ts.felwood[key] = v end end,
-            format = function(v) return tostring(math.floor(v)) end,
-        })
-        pinSliders[#pinSliders + 1] = s
-        return s
-    end
-    pinSlider("World map songflower pin (px) — (8-24) default 14", "worldFlowerSize", "worldPinSize", 14, 8, 24)
-    pinSlider("World map tuber pin (px) — (8-24) default 14",      "worldTuberSize",  "worldPinSize", 14, 8, 24)
-    pinSlider("World map timer font (pt) — (6-20) default 10",     "worldTimerFont", "worldTimerFont", 10, 6, 20)
-    pinSlider("Minimap songflower pin (px) — (8-24) default 12",   "minimapFlowerSize", "minimapPinSize", 12, 8, 24)
-    pinSlider("Minimap tuber pin (px) — (8-24) default 12",        "minimapTuberSize",  "minimapPinSize", 12, 8, 24)
+    local worldSlider = fw:Slider({
+        label = "World map pin size (px) — (8-24) default 14", width = 300, min = 8, max = 24, step = 1,
+        get = function() local ts = TS(); if not ts then return 14 end
+            return ts.felwood.worldPinSize or ts.felwood.worldFlowerSize or ts.felwood.worldTuberSize or 14 end,
+        set = function(v) local ts = TS(); if ts then writeWorldPinSize(ts.felwood, v) end end,
+        format = function(v) return tostring(math.floor(v)) end,
+    })
+    pinSliders[#pinSliders + 1] = worldSlider
+    local fontSlider = fw:Slider({
+        label = "World map timer font (pt) — (6-20) default 10", width = 300, min = 6, max = 20, step = 1,
+        get = function() local ts = TS(); return ts and ts.felwood.worldTimerFont or 10 end,
+        set = function(v) local ts = TS(); if ts then ts.felwood.worldTimerFont = v end end,
+        format = function(v) return tostring(math.floor(v)) end,
+    })
+    pinSliders[#pinSliders + 1] = fontSlider
+    local minimapSlider = fw:Slider({
+        label = "Minimap pin size (px) — (8-24) default 12", width = 300, min = 8, max = 24, step = 1,
+        get = function() local ts = TS(); if not ts then return 12 end
+            return ts.felwood.minimapPinSize or ts.felwood.minimapFlowerSize or ts.felwood.minimapTuberSize or 12 end,
+        set = function(v) local ts = TS(); if ts then writeMinimapPinSize(ts.felwood, v) end end,
+        format = function(v) return tostring(math.floor(v)) end,
+    })
+    pinSliders[#pinSliders + 1] = minimapSlider
     register("timers", function() for _, s in ipairs(pinSliders) do if s.Refresh then s.Refresh() end end end)
 
     -- ── Songflower display ───────────────────────────────────────────────────────
@@ -1789,7 +2022,85 @@ local function buildTimers(flow)
 end
 
 ----------------------------------------------------------------------
--- 6. BLACKLIST
+-- 6. ALERTS  (event×channel matrix + sound channel — split off from Timers)
+----------------------------------------------------------------------
+
+local function buildAlerts(flow)
+    -- The matrix groups by event type: each event is a sub-header, under which sit
+    -- the buff rows for that event, each row = buff icon + name + inline On /
+    -- Screen / Chat / Flash checkboxes + a per-row Sound dropdown + Test.
+    -- ENGINE DEPENDENCIES (defensive fallbacks; see report):
+    --   * cell.enabled — the "On" master flag (defaults true when absent).
+    --   * cell.sound — per-row sound tone (item 14; replaces the old event-level
+    --     ts.soundKeys). Falls back to "" (None) until the engine schema lands.
+    --   * ns.Store.ALERT_EVENT_BUFFS / ALERT_EVENT_TYPES — per-event buff sets +
+    --     order (item 24; local fallbacks encode the reference sets).
+    flow:AddSection("Alerts")
+    flow:Hint("Choose how each timer event notifies you, per event type.")
+
+    -- Sound channel (global; spec §8 Sound Channel dropdown).
+    local scRow = flow:AddRow({ vAlign = "center" })
+    local scLbl = scRow:Label("Sound channel"); scLbl.uiWidth = 100; scLbl._label:SetWidth(100)
+    local scDD = scRow:Dropdown({
+        width = 140, choices = SOUND_CHANNELS,
+        get = function() local ts = TS(); return ts and ts.soundChannel or "Master" end,
+        set = function(v) local ts = TS(); if ts then ts.soundChannel = v end end,
+    })
+    register("alerts", function() if scDD.Refresh then scDD.Refresh() end end)
+
+    -- Event-major schema: alerts[eventType][buffKey].
+    local function alertCell(buffKey, evt)
+        local ts = TS(); if not ts then return nil end
+        ts.alerts[evt] = ts.alerts[evt] or {}
+        ts.alerts[evt][buffKey] = ts.alerts[evt][buffKey] or {}
+        return ts.alerts[evt][buffKey]
+    end
+
+    for _, evt in ipairs(alertEventOrder()) do
+        local buffs = alertEventBuffs(evt)
+        if #buffs > 0 then
+            local es = flow:AddSection(ALERT_EVENT_LABEL[evt] or evt)
+            for _, k in ipairs(buffs) do
+                local meta = ALERT_BUFF_META[k] or { name = ALERT_BUFF_LABEL[k] or k }
+                local row = es:AddRow({ vAlign = "center" })
+                -- icon
+                local ico = CreateFrame("Frame", nil, row); ico:SetSize(18, 18); ico.uiWidth, ico.uiHeight = 18, 18
+                local tex = ico:CreateTexture(nil, "ARTWORK"); tex:SetAllPoints()
+                tex:SetTexCoord(0.08, 0.92, 0.08, 0.92); tex:SetTexture(auraIcon(meta.spellID))
+                row._items[#row._items + 1] = { w = ico }
+                local nlbl = row:Label(meta.name); nlbl.uiWidth = 118; nlbl._label:SetWidth(118)
+                -- On (master enable; defaults true when the engine key is absent).
+                register("alerts", row:Checkbox({
+                    label = "On",
+                    get = function() local c = alertCell(k, evt); if not c then return false end
+                        if c.enabled == nil then return true end; return c.enabled end,
+                    set = function(v) local c = alertCell(k, evt); if c then c.enabled = v and true or false end end,
+                }).Refresh)
+                local function chan(label, key)
+                    register("alerts", row:Checkbox({
+                        label = label,
+                        get = function() local c = alertCell(k, evt); return c and c[key] end,
+                        set = function(v) local c = alertCell(k, evt); if c then c[key] = v and true or false end end,
+                    }).Refresh)
+                end
+                chan("Screen", "notify"); chan("Chat", "chat"); chan("Flash", "flash")
+                local dd = row:Dropdown({
+                    width = 120, choices = soundChoices(),
+                    get = function() local c = alertCell(k, evt); return (c and c.sound) or "" end,
+                    set = function(v) local c = alertCell(k, evt); if c then c.sound = v end end,
+                })
+                dd._fillWidth = false
+                register("alerts", function() if dd.Refresh then dd.Refresh() end end)
+                row:Button({ text = "Test", width = 52, variant = "quiet", pin = "right", onClick = function()
+                    hudTestAlert(k, evt)
+                end })
+            end
+        end
+    end
+end
+
+----------------------------------------------------------------------
+-- 7. BLACKLIST
 ----------------------------------------------------------------------
 
 local function buildBlacklist(flow)
@@ -1937,9 +2248,12 @@ function Options.Register()
             { id = "automation", title = "Automation",
               build = function(flow) once("automation", flow.pane, function() buildAutomation(flow) end) end,
               refresh = function() refreshPage("automation") end },
-            { id = "timers",     title = "Timers & Alerts",
+            { id = "timers",     title = "Timers",
               build = function(flow) once("timers", flow.pane, function() buildTimers(flow) end) end,
               refresh = function() refreshPage("timers") end },
+            { id = "alerts",     title = "Alerts",
+              build = function(flow) once("alerts", flow.pane, function() buildAlerts(flow) end) end,
+              refresh = function() refreshPage("alerts") end },
             { id = "blacklist",  title = "Blacklist",
               build = function(flow) once("blacklist", flow.pane, function() buildBlacklist(flow) end) end,
               refresh = function() refreshPage("blacklist") end },
