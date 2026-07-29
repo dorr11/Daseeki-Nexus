@@ -533,12 +533,13 @@ Dashboard.tabBuilders = {}   -- id -> build(host) -> tabObj (must expose :Refres
 -- Help sits in a right-aligned group, mirroring the reference's Help/Settings
 -- cluster). Everything else is the left group in declared order.
 local TAB_SLOTS = {
-    -- "Online" tab retired (owner task 11): folded into the 60s ("Characters")
-    -- tab as an All | Online list filter.
-    { id = "sixties",   label = "60s",       scope = "faction" },
-    { id = "summoners", label = "Summoners", scope = "faction" },
-    { id = "timers",    label = "Timers",    scope = "account" },
-    { id = "help",      label = "Help",      scope = "account", align = "right" },
+    -- Field Ledger rebuild (BRAND_SPEC §7): Characters is the ONLY roster screen.
+    -- The former 60s + Summoners + Online tabs collapse into it — scope singles
+    -- (All / 60s / Summoners) and modifier toggles now live in the chip row
+    -- (ui_roster.lua), and the open-entry register replaces the two-pane detail.
+    { id = "characters", label = "Characters", scope = "faction" },
+    { id = "timers",     label = "Timers",     scope = "account" },
+    { id = "help",       label = "Help",       scope = "account", align = "right" },
 }
 
 function Dashboard.RegisterTab(id, buildFn)
@@ -1295,8 +1296,8 @@ local function ensureWindow()
 
     -- Default tab: last used within session, else 60s.
     local st = uiState()
-    local start = st.lastTab or "sixties"
-    if not Dashboard.tabBuilders[start] and start ~= "help" then start = "sixties" end
+    local start = st.lastTab or "characters"
+    if not Dashboard.tabBuilders[start] and start ~= "help" then start = "characters" end
     Dashboard.SelectTab(start)
 
     Dashboard.window = win
