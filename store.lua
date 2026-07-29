@@ -293,6 +293,12 @@ local function defaultTimerSettings()
             flash  = true,
             sound  = false,
         },
+        -- Per-buff manual pull-window overrides (seconds). Empty by default; when
+        -- a buff key is set here (a number pins both yell stages, or a table
+        -- {[1]=,[2]=} pins per stage) the timer engine's EffectivePullWindow uses
+        -- it ahead of the observed median and the seeded default. No options UI
+        -- this pass — the engine only READS this key. ADDITIVE.
+        pullWindows = {},
     }
 end
 
@@ -340,6 +346,10 @@ local function defaultData()
             flower = {},        -- [1..10] = popEpoch
             tuber  = {},        -- [1..6]  = popEpoch
             logs   = { rend = {}, onyH = {}, onyA = {} },
+            -- Pull auto-calibration: [buffKey][yellNum] = { observedSeconds, ... }
+            -- (newest last, capped in the timer engine). ADDITIVE; the engine
+            -- also lazily creates this so it appears on pre-existing saves.
+            pullObservations  = {},
             timerVersion      = 1,
             lastWeeklyResetAt = 0,
         },

@@ -81,6 +81,163 @@ Timers.DEFAULT_PULL_WINDOW = DEFAULT_PULL_WINDOW
 local PULL_FRESH_SLACK = 5
 Timers.PULL_FRESH_SLACK = PULL_FRESH_SLACK
 
+----------------------------------------------------------------------
+-- Per-buff, per-yell-stage pull windows + auto-calibration
+--
+-- World-buff drop yells are MULTI-STAGE (the local detector already
+-- distinguishes them, classifyYell below): yell 1 = kill/announce (the head was
+-- turned in / the boss announced) and the buff actually drops MINUTES later;
+-- yell 2 = "come get buffed", the short final window before the buff lands. The
+-- old flat DEFAULT_PULL_WINDOW (40s) was only ever right for yell 2 — on a live
+-- Nef drop the owner saw reference trackers showing ~2.4 and ~3.7 MINUTES
+-- remaining while our bar ran a 40s window.
+--
+-- PULL_WINDOWS[buffKey] = { [1] = announce->drop seconds, [2] = final-yell->drop
+-- seconds }. The seeds below are PROVISIONAL, deliberately conservative first
+-- guesses; they are REPLACED per (buff, yellNum) by the rolling MEDIAN of
+-- auto-calibrated observations (Timers.pullObservations) as soon as one drop is
+-- witnessed on this client, and a manual override wins over both. Selection
+-- precedence lives in Timers.EffectivePullWindow:
+--   override (timerSettings.pullWindows[buffKey]) > observed median (>=1 sample)
+--   > seeded PROVISIONAL default > DEFAULT_PULL_WINDOW.
+local PULL_WINDOWS = {
+    rend = { [1] = 180, [2] = 40 },   -- PROVISIONAL — replace with measured median
+    onyH = { [1] = 240, [2] = 40 },   -- PROVISIONAL — replace with measured median
+    onyA = { [1] = 240, [2] = 40 },   -- PROVISIONAL — replace with measured median
+    nefH = { [1] = 240, [2] = 40 },   -- PROVISIONAL — replace with measured median
+    nefA = { [1] = 240, [2] = 40 },   -- PROVISIONAL — replace with measured median
+    zg   = { [1] = 40,  [2] = 40 },   -- PROVISIONAL — replace with measured median
+}
+Timers.PULL_WINDOWS = PULL_WINDOWS
+
+-- Keep the newest N observations per (buffKey, yellNum) pair.
+local PULL_OBS_CAP = 10
+Timers.PULL_OBS_CAP = PULL_OBS_CAP
+-- Sanity bound (seconds) on a plausible announce/yell -> land delay. Anything
+-- outside [0, PULL_OBS_MAX] is discarded (bad clock / unrelated late gain) and
+-- also bounds how long a pending pull can wait for its buff to land.
+local PULL_OBS_MAX = 900
+Timers.PULL_OBS_MAX = PULL_OBS_MAX
+
+-- Normalize yell stage to 1 or 2 (2 = the actionable "come get buffed" default).
+local function normYell(yellNum)
+    return (yellNum == 1) and 1 or 2
+end
+
+-- Median of a numeric list (pure). Even counts average the two middle values.
+local function median(list)
+    local n = list and #list or 0
+    if n == 0 then return nil end
+    local copy = {}
+    for i = 1, n do copy[i] = list[i] end
+    table.sort(copy)
+    if n % 2 == 1 then return copy[(n + 1) / 2] end
+    return (copy[n / 2] + copy[n / 2 + 1]) / 2
+end
+Timers._median = median
+
+-- Lazily-created capped observation store (ADDITIVE key on the timers store):
+--   timers.pullObservations[buffKey][yellNum] = { observedSeconds, ... }
+-- newest last, capped at PULL_OBS_CAP. Created on first write so it appears on
+-- existing SavedVariables without a migration; nil when no store is present
+-- (bare-VM path before Store loads).
+local function pullObsStore(create)
+    if not (ns.Store and ns.Store.GetTimers) then return nil end
+    local t = ns.Store.GetTimers()
+    if not t then return nil end
+    if not t.pullObservations and create then t.pullObservations = {} end
+    return t.pullObservations
+end
+
+-- Read a manual override for (buffKey, yellNum) from settings, or nil. A NUMBER
+-- pins both stages; a TABLE {[1]=,[2]=} pins per stage. Only positive values win.
+local function pullWindowOverride(buffKey, yellNum)
+    local s = ns.Store and ns.Store.GetSettings and ns.Store.GetSettings()
+    local pw = s and s.timerSettings and s.timerSettings.pullWindows
+    local ov = pw and pw[buffKey]
+    if ov == nil then return nil end
+    if type(ov) == "table" then
+        local v = tonumber(ov[normYell(yellNum)])
+        if v and v > 0 then return v end
+        return nil
+    end
+    local v = tonumber(ov)
+    if v and v > 0 then return v end
+    return nil
+end
+
+-- Effective pull window (seconds) + source label for (buffKey, yellNum).
+-- Precedence: override > observed-median (>=1 sample) > seeded default > global.
+function Timers.EffectivePullWindow(buffKey, yellNum)
+    yellNum = normYell(yellNum)
+    local override = pullWindowOverride(buffKey, yellNum)
+    if override then return override, "override" end
+    local store = pullObsStore(false)
+    local list = store and store[buffKey] and store[buffKey][yellNum]
+    if list and #list >= 1 then
+        local m = median(list)
+        if m and m > 0 then return m, "observed-median" end
+    end
+    local seed = PULL_WINDOWS[buffKey]
+    if seed and seed[yellNum] then return seed[yellNum], "default" end
+    return DEFAULT_PULL_WINDOW, "default"
+end
+
+-- Append one observed announce/yell -> land delay (seconds) for (buffKey,
+-- yellNum). Capped newest at PULL_OBS_CAP; oldest evicted. Returns true if
+-- stored. Sanity-bounded and gated to known pull buffs.
+function Timers.RecordPullObservation(buffKey, yellNum, observed)
+    if not PULL_WINDOWS[buffKey] then return false end
+    yellNum = normYell(yellNum)
+    observed = tonumber(observed)
+    if not observed or observed < 0 or observed > PULL_OBS_MAX then return false end
+    local store = pullObsStore(true)
+    if not store then return false end
+    store[buffKey] = store[buffKey] or {}
+    local list = store[buffKey][yellNum]
+    if not list then list = {}; store[buffKey][yellNum] = list end
+    list[#list + 1] = observed
+    while #list > PULL_OBS_CAP do table.remove(list, 1) end   -- evict oldest
+    return true
+end
+
+-- Pending pull per buff, seeded when a FRESH local yell raises the pull bar and
+-- consumed when the buff actually lands on the player (Timers.NotePullGain).
+-- Shape: _pendingPull[buffKey] = { [1] = yellTime, [2] = yellTime } so ONE
+-- witnessed drop can calibrate BOTH stages that preceded it.
+Timers._pendingPull = {}
+
+local function setPendingPull(buffKey, yellTime, yellNum)
+    local t = Timers._pendingPull[buffKey]
+    if not t then t = {}; Timers._pendingPull[buffKey] = t end
+    t[normYell(yellNum)] = yellTime
+end
+Timers._setPendingPull = setPendingPull
+
+-- Called when the world buff for buffKey lands on the player. For each pending
+-- yell stage still within PULL_OBS_MAX, records observed = landTime - yellTime,
+-- then clears ALL pending stages for that buff (the drop happened once). Returns
+-- the number of observations recorded (0 when no pull was active for this buff).
+function Timers.NotePullGain(buffKey, landTime)
+    local t = Timers._pendingPull[buffKey]
+    if not t then return 0 end
+    landTime = landTime or now()
+    local recorded = 0
+    for yn = 1, 2 do
+        local yt = t[yn]
+        if yt then
+            local observed = landTime - yt
+            if observed >= 0 and observed <= PULL_OBS_MAX then
+                if Timers.RecordPullObservation(buffKey, yn, observed) then
+                    recorded = recorded + 1
+                end
+            end
+        end
+    end
+    Timers._pendingPull[buffKey] = nil   -- consume all stages for this buff
+    return recorded
+end
+
 -- Which buff keys own a persisted store log, and the store log key.
 local STORE_LOG_KEY = { rend = "rend", onyH = "onyH", onyA = "onyA" }
 
@@ -201,7 +358,11 @@ end
 local scheduleWarnings
 local maybeBroadcast
 
-function Timers.Record(buffKey, epoch, trust, who, kind, zone, pullDuration)
+-- `yellNum` (optional, 1|2) is the yell stage a LOCAL detector resolved (1 =
+-- kill/announce, 2 = come-get-buffed); it selects the per-stage pull window and
+-- seeds auto-calibration. Non-local ingest paths (mesh/SN/NWB/DBM/quest) pass
+-- nil and rely on their own pullDuration or the stage-2 default.
+function Timers.Record(buffKey, epoch, trust, who, kind, zone, pullDuration, yellNum)
     if not CD[buffKey] and buffKey ~= "battleShout" then
         return false, "unknown buff " .. tostring(buffKey)
     end
@@ -269,12 +430,26 @@ function Timers.Record(buffKey, epoch, trust, who, kind, zone, pullDuration)
     -- REMAINING window (full window minus elapsed since the event) so a pull
     -- heard 20s late shows a ~20s bar, not a fresh full one.
     if isKill or kind == "pop" then
-        local window = (pullDuration and pullDuration > 0) and pullDuration or DEFAULT_PULL_WINDOW
+        -- Window precedence: an explicit trusted-source remaining (mesh/SN pull
+        -- relay carries a real countdown) always wins; otherwise the per-buff,
+        -- per-yell-stage effective window (override > observed-median > seeded).
+        local window
+        if pullDuration and pullDuration > 0 then
+            window = pullDuration
+        else
+            window = Timers.EffectivePullWindow(buffKey, yellNum)
+        end
         local elapsed = now() - epoch
         if elapsed <= window + PULL_FRESH_SLACK then
             local remaining = window - elapsed
             if remaining > window then remaining = window end   -- future/clock-skew clamp
             if remaining < 1 then remaining = 1 end              -- keep a visible sliver at the edge
+            -- Auto-calibration seed: a FRESH local yell (yellNum set) arms a
+            -- pending pull so the eventual buff-land measures announce->drop for
+            -- this (buff, stage). Non-local paths (nil yellNum) never seed.
+            if yellNum ~= nil then
+                setPendingPull(buffKey, epoch, yellNum)
+            end
             ns:Fire("PULL_DETECTED", buffKey, remaining, trust, zone)
         end
     end
@@ -357,9 +532,9 @@ local function onMonsterYell(event, text, monsterName)
     if not buffKey then return end
     local zone = GetRealZoneText and GetRealZoneText() or nil
     if yellNum == 1 then
-        Timers.Record(buffKey, now(), "local", monsterName, "killed", zone)
+        Timers.Record(buffKey, now(), "local", monsterName, "killed", zone, nil, 1)
     else
-        Timers.Record(buffKey, now(), "local", monsterName, "pop", zone)
+        Timers.Record(buffKey, now(), "local", monsterName, "pop", zone, nil, 2)
     end
 end
 
@@ -425,8 +600,10 @@ local function onCombatLog()
     local npcID = npcIDFromGUID(destGUID)
     local buffKey = announcerBuffFor(npcID, destName)
     if not buffKey then return end
-    -- Announcer death => the buff cycle just fired; treat as a kill/announce.
-    Timers.Record(buffKey, now(), "local", destName, "killed", GetRealZoneText and GetRealZoneText() or nil)
+    -- Announcer death => the buff cycle just fired; treat as a kill/announce
+    -- (yell stage 1, the minutes-scale announce->drop window).
+    Timers.Record(buffKey, now(), "local", destName, "killed",
+                  GetRealZoneText and GetRealZoneText() or nil, nil, 1)
 end
 
 ----------------------------------------------------------------------
@@ -447,6 +624,76 @@ local function onQuestTurnedIn(event, questID)
     if not buffKey then return end
     Timers.Record(buffKey, now(), "local", "handin", "quest",
                   GetRealZoneText and GetRealZoneText() or nil)
+end
+
+----------------------------------------------------------------------
+-- Buff-land detector (pull auto-calibration)
+--
+-- When the world buff that a pending pull was for actually LANDS on the player,
+-- measure the real announce/yell -> drop delay. We reuse the same aura surface
+-- tracker.lua proved in-game (C_UnitAuras.GetBuffDataByIndex on "player") rather
+-- than editing tracker. One world-buff aura can come from more than one pull buff
+-- — Onyxia AND Nefarian head turn-ins both grant "Rallying Cry of the
+-- Dragonslayer" — so an aura maps to a CANDIDATE set and we credit only the
+-- candidate that actually had a pull active (the pending gate), picking the most
+-- recent when more than one is somehow pending.
+----------------------------------------------------------------------
+
+-- Landed world-buff aura name (lowercased prefix) -> candidate pull buff keys.
+local PULL_AURA_CANDIDATES = {
+    ["rallying cry of the dragonslayer"] = { "onyH", "onyA", "nefH", "nefA" },
+    ["warchief's blessing"]              = { "rend" },
+    ["spirit of zandalar"]               = { "zg" },
+}
+
+-- Fold a typographic apostrophe (U+2019) to ASCII so "Warchief's Blessing"
+-- rendered by the live client still matches the ASCII-apostrophe prefix above.
+local function auraNorm(s)
+    s = (s or ""):lower()
+    return (s:gsub("\226\128\153", "'"))
+end
+
+-- Resolve the single best pending candidate for a landed aura prefix and, if one
+-- is pending, book the observation. Pure over its inputs (candidates + pending +
+-- landTime); the game-side scanner supplies the live aura names. Returns the
+-- credited buffKey or nil.
+local function creditPullLand(prefix, landTime)
+    local candidates = PULL_AURA_CANDIDATES[prefix]
+    if not candidates then return nil end
+    local bestKey, bestYell
+    for c = 1, #candidates do
+        local pend = Timers._pendingPull[candidates[c]]
+        if pend then
+            local yt = pend[2] or pend[1] or 0
+            if not bestYell or yt > bestYell then
+                bestYell, bestKey = yt, candidates[c]
+            end
+        end
+    end
+    if not bestKey then return nil end
+    Timers.NotePullGain(bestKey, landTime)
+    return bestKey
+end
+Timers._creditPullLand = creditPullLand
+
+-- UNIT_AURA handler: on a player aura change, if any pull is pending, scan the
+-- player's buffs for a landed pull aura and credit its calibration. Cheap no-op
+-- when nothing is pending. Uses the proven C_UnitAuras surface.
+local function onPlayerAura(event, unit)
+    if unit and unit ~= "player" then return end
+    if next(Timers._pendingPull) == nil then return end
+    if not (C_UnitAuras and C_UnitAuras.GetBuffDataByIndex) then return end
+    local landTime = now()
+    for i = 1, 40 do
+        local aura = C_UnitAuras.GetBuffDataByIndex("player", i)
+        if not aura then break end
+        local nm = auraNorm(aura.name)
+        for prefix in pairs(PULL_AURA_CANDIDATES) do
+            if nm:find(prefix, 1, true) == 1 then
+                creditPullLand(prefix, landTime)
+            end
+        end
+    end
 end
 
 ----------------------------------------------------------------------
@@ -1373,6 +1620,40 @@ function Timers.NWBDebugDump()
         .. " under a layers map (handled). Reassembly is AceComm's, shared-instance.")
 end
 
+-- /nexus debug pulls — pull-window calibration self-diagnosis. For each pull buff
+-- and yell stage: the observation log, the currently-effective window, and its
+-- source (override / observed-median / default). Also lists any pending pulls
+-- awaiting a buff-land.
+function Timers.PullsDebugDump()
+    ns:Print("pull windows (effective = override > observed-median > default):")
+    local store = pullObsStore(false)
+    for i = 1, #Timers.BUFF_KEYS do
+        local k = Timers.BUFF_KEYS[i]
+        if PULL_WINDOWS[k] then
+            for yn = 1, 2 do
+                local window, source = Timers.EffectivePullWindow(k, yn)
+                local list = store and store[k] and store[k][yn]
+                local samples = {}
+                if list then for j = 1, #list do samples[j] = tostring(math.floor(list[j] + 0.5)) end end
+                local seed = PULL_WINDOWS[k][yn]
+                ns:Print(string.format(
+                    "  %-4s yell%d  window=%ss (%s)  seed=%ss  n=%d [%s]",
+                    k, yn, tostring(math.floor(window + 0.5)), source,
+                    tostring(seed), #samples, table.concat(samples, ",")))
+            end
+        end
+    end
+    local pend = {}
+    for k, t in pairs(Timers._pendingPull) do
+        local stages = {}
+        for yn = 1, 2 do if t[yn] then stages[#stages + 1] = "y" .. yn end end
+        pend[#pend + 1] = k .. "(" .. table.concat(stages, "+") .. ")"
+    end
+    ns:Print("  pending pulls: " .. (next(Timers._pendingPull) and table.concat(pend, " ") or "(none)"))
+    ns:Print("  NOTE: seeds are PROVISIONAL; the median of witnessed drops replaces"
+        .. " them per (buff, yell). Set timerSettings.pullWindows[buff] to override.")
+end
+
 ----------------------------------------------------------------------
 -- Self-tests (pure Lua; run via /dsn debug selftest)
 ----------------------------------------------------------------------
@@ -1655,11 +1936,142 @@ local function testNWBIngest(fails)
     Timers.state = {}
 end
 
+-- Pull-window selection + auto-calibration (per-buff, per-yell-stage).
+-- Covers: (a) default vs median vs override precedence; (b) obs capping + even
+-- median; (c) yell-1 window != yell-2; (d) recency gate remaining = window -
+-- elapsed with the per-stage window; (e) observations only record when a pull
+-- was actually active for that buff.
+local function testPullWindows(fails)
+    local function resetObs()
+        local t = ns.Store and ns.Store.GetTimers and ns.Store.GetTimers()
+        if t then t.pullObservations = {} end
+    end
+    local function clearOverride()
+        local s = ns.Store and ns.Store.GetSettings and ns.Store.GetSettings()
+        if s and s.timerSettings then s.timerSettings.pullWindows = nil end
+    end
+    local function setOverride(tbl)
+        local s = ns.Store and ns.Store.GetSettings and ns.Store.GetSettings()
+        if s then
+            s.timerSettings = s.timerSettings or {}
+            s.timerSettings.pullWindows = tbl
+        end
+    end
+
+    if not (ns.Store and ns.Store.GetTimers) then
+        fails[#fails + 1] = "store absent for pull-window test"; return
+    end
+
+    resetObs(); clearOverride(); Timers._pendingPull = {}
+
+    -- (c) yell-1 window differs from yell-2 for the same buff (seed layout).
+    tcheck(Timers.PULL_WINDOWS.rend[1] ~= Timers.PULL_WINDOWS.rend[2],
+        "rend yell-1 seed != yell-2 seed", fails)
+    tcheck(Timers.PULL_WINDOWS.onyH[1] == 240 and Timers.PULL_WINDOWS.onyH[2] == 40,
+        "onyH seeds are the provisional 240/40", fails)
+
+    -- (a1) no observations -> seeded default per (buff, yellNum).
+    local w, src = Timers.EffectivePullWindow("rend", 1)
+    tcheck(w == 180 and src == "default", "no obs -> rend yell1 default 180", fails)
+    w, src = Timers.EffectivePullWindow("rend", 2)
+    tcheck(w == 40 and src == "default", "no obs -> rend yell2 default 40", fails)
+
+    -- (a2) >=1 (here 3) observations -> rolling MEDIAN wins over default.
+    Timers.RecordPullObservation("rend", 1, 100)
+    Timers.RecordPullObservation("rend", 1, 300)
+    Timers.RecordPullObservation("rend", 1, 200)
+    w, src = Timers.EffectivePullWindow("rend", 1)
+    tcheck(w == 200 and src == "observed-median", "3 obs -> median 200 wins", fails)
+    -- yell-2 for the same buff is untouched (per-stage isolation).
+    w, src = Timers.EffectivePullWindow("rend", 2)
+    tcheck(w == 40 and src == "default", "rend yell2 still default (per-stage)", fails)
+
+    -- (a3) manual override wins over BOTH median and default. Number pins both
+    -- stages; table pins per stage.
+    setOverride({ rend = 99 })
+    w, src = Timers.EffectivePullWindow("rend", 1)
+    tcheck(w == 99 and src == "override", "numeric override wins over median", fails)
+    w, src = Timers.EffectivePullWindow("rend", 2)
+    tcheck(w == 99 and src == "override", "numeric override pins both stages", fails)
+    setOverride({ onyH = { [1] = 111, [2] = 22 } })
+    w = Timers.EffectivePullWindow("onyH", 1); tcheck(w == 111, "table override yell1=111", fails)
+    w = Timers.EffectivePullWindow("onyH", 2); tcheck(w == 22, "table override yell2=22", fails)
+    clearOverride()
+
+    -- (b) observation capping at PULL_OBS_CAP + even-count median.
+    resetObs()
+    for i = 1, Timers.PULL_OBS_CAP + 2 do Timers.RecordPullObservation("zg", 2, i * 10) end
+    local list = ns.Store.GetTimers().pullObservations.zg[2]
+    tcheck(#list == Timers.PULL_OBS_CAP, "obs list capped at PULL_OBS_CAP", fails)
+    tcheck(list[1] == 30 and list[#list] == (Timers.PULL_OBS_CAP + 2) * 10,
+        "oldest evicted, newest kept (FIFO)", fails)
+    resetObs()
+    Timers.RecordPullObservation("zg", 2, 10)
+    Timers.RecordPullObservation("zg", 2, 20)
+    Timers.RecordPullObservation("zg", 2, 30)
+    Timers.RecordPullObservation("zg", 2, 40)
+    tcheck(Timers._median({ 10, 20, 30, 40 }) == 25, "even-count median averages middles", fails)
+    tcheck(Timers.EffectivePullWindow("zg", 2) == 25, "even-count obs median is effective window", fails)
+
+    -- (d) recency gate still passes remaining = window - elapsed, now using the
+    -- per-stage window (rend yell-1 seed = 180). Fresh -> ~180; 20s late -> ~160.
+    resetObs(); Timers._pendingPull = {}
+    local cap = { pull = nil }
+    ns:On("PULL_DETECTED", function(buffKey, duration) cap.pull = { buff = buffKey, duration = duration } end)
+    local t = now()
+    Timers.state = {}; cap.pull = nil
+    Timers.Record("rend", t, "local", "live", "killed", nil, nil, 1)
+    tcheck(cap.pull and cap.pull.buff == "rend" and math.abs(cap.pull.duration - 180) <= 1,
+        "fresh yell-1 pull shows ~180s window", fails)
+    Timers.state = {}; cap.pull = nil
+    Timers.Record("onyH", t - 20, "local", "late", "pop", nil, nil, 2)
+    tcheck(cap.pull and math.abs(cap.pull.duration - (40 - 20)) <= 1,
+        "late yell-2 onyH shows remaining = window - elapsed (~20)", fails)
+
+    -- (e) observation records ONLY when a pull was active for that buff.
+    resetObs(); Timers._pendingPull = {}
+    -- A fresh yell-2 pull seeds a pending for onyH; a later land books observed.
+    Timers.state = {}
+    Timers.Record("onyH", t, "local", "pull", "pop", nil, nil, 2)
+    tcheck(Timers._pendingPull.onyH ~= nil, "fresh local yell seeds a pending pull", fails)
+    local recN = Timers.NotePullGain("onyH", t + 30)
+    tcheck(recN == 1, "buff-land with active pull books one observation", fails)
+    local ol = ns.Store.GetTimers().pullObservations
+    tcheck(ol.onyH and ol.onyH[2] and ol.onyH[2][1] == 30, "observed onyH yell2 = 30s", fails)
+    tcheck(Timers._pendingPull.onyH == nil, "pending consumed after land", fails)
+    -- No pending for nefH => a buff-land books nothing (no spurious sample).
+    local recNone = Timers.NotePullGain("nefH", t + 30)
+    tcheck(recNone == 0, "buff-land with NO active pull books nothing", fails)
+    tcheck(not (ol.nefH and ol.nefH[2]), "no spurious nefH observation", fails)
+    -- Both stages of one buff resolve from a single land.
+    resetObs(); Timers._pendingPull = {}
+    Timers._setPendingPull("rend", t, 1)
+    Timers._setPendingPull("rend", t + 100, 2)
+    tcheck(Timers.NotePullGain("rend", t + 140) == 2, "one land calibrates both yell stages", fails)
+    local rl = ns.Store.GetTimers().pullObservations.rend
+    tcheck(rl[1][1] == 140 and rl[2][1] == 40, "rend yell1=140, yell2=40 booked", fails)
+    -- Shared aura (Rallying Cry) credits only the candidate with a pending pull,
+    -- most-recent yell wins (ony vs nef ambiguity).
+    resetObs(); Timers._pendingPull = {}
+    Timers._setPendingPull("nefH", t + 5, 2)   -- more recent than onyH below
+    Timers._setPendingPull("onyH", t, 2)
+    local credited = Timers._creditPullLand("rallying cry of the dragonslayer", t + 50)
+    tcheck(credited == "nefH", "rallying-cry land credits most-recent pending (nefH)", fails)
+    tcheck(Timers._pendingPull.nefH == nil and Timers._pendingPull.onyH ~= nil,
+        "only the credited candidate is consumed", fails)
+    -- Unrelated land with nothing pending records nothing and errors nothing.
+    resetObs(); Timers._pendingPull = {}
+    tcheck(Timers._creditPullLand("spirit of zandalar", t) == nil, "no pending zg -> no credit", fails)
+
+    resetObs(); clearOverride(); Timers._pendingPull = {}; Timers.state = {}
+end
+
 function Timers.RunSelfTests(verbose)
     local suites = {
         { name = "cd derivation",     fn = testCDDerivation },
         { name = "false-positive gate", fn = testFalsePositive },
         { name = "pull recency gate", fn = testPullRecencyGate },
+        { name = "pull windows + calibration", fn = testPullWindows },
         { name = "trust upgrade",     fn = testTrustUpgrade },
         { name = "trust ordering",    fn = testTrustOrdering },
         { name = "request cooldowns", fn = testRequestCooldowns },
@@ -1755,6 +2167,8 @@ function Timers.OnLogin()
     ns:RegisterEvent("COMBAT_LOG_EVENT_UNFILTERED", onCombatLog)
     ns:RegisterEvent("QUEST_TURNED_IN", onQuestTurnedIn)
     ns:RegisterEvent("UNIT_SPELLCAST_SUCCEEDED", onSpellSucceeded)
+    -- Pull auto-calibration: measure announce->drop when the buff lands on us.
+    ns:RegisterEvent("UNIT_AURA", onPlayerAura)
     ns:RegisterEvent("CHAT_MSG_ADDON", function(event, prefix, msg)
         if prefix == "D5" then
             ns:SafeCall(Timers.OnDBMMessage, msg)
@@ -1779,6 +2193,7 @@ end
 if ns.RegisterDebugCommand then
     ns:RegisterDebugCommand("timers", function() Timers.DebugDump() end)
     ns:RegisterDebugCommand("nwb", function() Timers.NWBDebugDump() end)
+    ns:RegisterDebugCommand("pulls", function() Timers.PullsDebugDump() end)
 end
 
 -- Go active at login (Core fires Tracker/Protocol OnLogin already; we hook
