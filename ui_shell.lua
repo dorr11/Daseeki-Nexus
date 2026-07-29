@@ -19,16 +19,23 @@ ns.Dashboard = Dashboard
 -- Window metrics (fixed bands — style guide: compact, stable layouts)
 ----------------------------------------------------------------------
 
-local DEFAULT_W, DEFAULT_H = 1020, 640
--- Min width must always fit the two-pane roster (card list + detail) so the
--- layout never has to fall back to a stacked mode (style rule 7). Card list is
--- 352 + SPLIT_GAP 12 + detail min 380 = 744 of content; window overhead is
--- 2*PAD(12)=24 => 768. Round up for margin.
-local MIN_W, MIN_H = 820, 480
+-- Control-panel rebuild: the window is FIXED at the mockup size (1000 x 620, no
+-- responsive reflow — pivot §10). The body is a single 576 region under a 44px
+-- titlebar (tabs live IN the titlebar; the former tab-band + status-band are gone).
+local DEFAULT_W, DEFAULT_H = 1000, 620
+local MIN_W, MIN_H = 1000, 620
 local HEADER_H = 44
-local TAB_H    = 34
-local STATUS_H = 28
+local TAB_H    = 34    -- retained constant (unused by the fixed layout)
+local STATUS_H = 28    -- retained constant (status band removed)
 local PAD      = 12
+
+-- Guarded audit-tag helper (the geometry harness ships ns.Audit.Tag in
+-- layoutaudit.lua). Tags stay no-ops when the harness/audit layer is absent.
+local function tag(frame, id)
+    if ns.Audit and ns.Audit.Tag and frame then ns.Audit.Tag(frame, id) end
+    return frame
+end
+Dashboard.Tag = tag
 
 -- Roster two-pane geometry (shared by 60s + Online).
 Dashboard.CARD_LIST_W = 352
@@ -533,16 +540,14 @@ Dashboard.tabBuilders = {}   -- id -> build(host) -> tabObj (must expose :Refres
 -- Help sits in a right-aligned group, mirroring the reference's Help/Settings
 -- cluster). Everything else is the left group in declared order.
 local TAB_SLOTS = {
-    -- Field Ledger rebuild (BRAND_SPEC §7): Characters is the ONLY roster screen.
-    -- The former 60s + Summoners + Online tabs collapse into it — scope singles
-    -- (All / 60s / Summoners) and modifier toggles now live in the chip row
-    -- (ui_roster.lua), and the open-entry register replaces the two-pane detail.
+    -- Control-panel rebuild (NEXUS PIVOT): Characters is the master/detail control
+    -- panel; scope + modifier chips live in its left chip row (ui_cards.lua). The
+    -- TIMERS TAB DISSOLVES — timer content docks in the lower-right pane region
+    -- (ui_timersdock.lua). Tabs: Characters · Instances · Help.
     { id = "characters", label = "Characters", scope = "faction" },
-    { id = "timers",     label = "Timers",     scope = "account" },
-    -- Instance-entry ledger + cap meters (NovaInstanceTracker absorption). Account-
-    -- wide (the caps are enforced per account; the tab's ALL row is cross-account).
+    -- Instance-entry ledger + cap meters. Account-wide.
     { id = "instances",  label = "Instances",  scope = "account" },
-    { id = "help",       label = "Help",       scope = "account", align = "right" },
+    { id = "help",       label = "Help",       scope = "account" },
 }
 
 function Dashboard.RegisterTab(id, buildFn)
@@ -666,7 +671,9 @@ end
 local function restoreGeom()
     local st = uiState()
     local g = st.dashGeom or {}
-    win:SetSize(math.max(MIN_W, g.w or DEFAULT_W), math.max(MIN_H, g.h or DEFAULT_H))
+    -- Fixed size (ignore any saved width/height from the old resizable layout);
+    -- only the saved POSITION is restored.
+    win:SetSize(DEFAULT_W, DEFAULT_H)
     win:ClearAllPoints()
     win:SetPoint(g.point or "CENTER", UIParent, g.relPoint or "CENTER", g.x or 0, g.y or 0)
 end
@@ -717,7 +724,14 @@ function Dashboard.SelectTab(id)
     -- Build the tab pane lazily on first selection.
     if not Dashboard._tabPanes[id] then
         local host = CreateFrame("Frame", nil, win.tabHost)
-        host:SetAllPoints(win.tabHost)
+        -- Characters is the edge-to-edge control panel (its panes own their insets);
+        -- other screens (Instances / Help) keep a PAD inset so they don't regress.
+        if id == "characters" then
+            host:SetAllPoints(win.tabHost)
+        else
+            host:SetPoint("TOPLEFT", win.tabHost, "TOPLEFT", PAD, -PAD)
+            host:SetPoint("BOTTOMRIGHT", win.tabHost, "BOTTOMRIGHT", -PAD, PAD)
+        end
         host:Hide()
         Dashboard._tabPanes[id] = host
         local builder = Dashboard.tabBuilders[id]
@@ -738,6 +752,14 @@ end
 -- Header + tab bar + status bar construction
 ----------------------------------------------------------------------
 
+-- The 44px TITLEBAR (control-panel rebuild): logo diamond · ceremonial wordmark ·
+-- tabs (Characters · Instances · Help) · faction toggle · close — one flat bar. The
+-- former separate tab-band and status-band are GONE (the mockup collapses chrome to
+-- a single 44px titlebar over a 576 body; the status bar's world-buff readouts moved
+-- into the timers dock). The wordmark keeps a ceremonial face (pivot allowance); no
+-- other serif/grain on the dashboard. This builder also creates w.tabHost (the full
+-- 576 body) and the w._updateFactionToggle / _updateTabButtons / _updateTabUnderlines
+-- closures that Dashboard.SelectTab + OnShow rely on.
 local function buildHeader(w)
     local header = CreateFrame("Frame", nil, w)
     header:SetPoint("TOPLEFT", w, "TOPLEFT", 0, 0)
@@ -747,39 +769,55 @@ local function buildHeader(w)
     header:RegisterForDrag("LeftButton")
     header:SetScript("OnDragStart", function() w:StartMoving() end)
     header:SetScript("OnDragStop",  function() w:StopMovingOrSizing(); saveGeom() end)
+    tag(header, "shell.titlebar")
 
     local bg = header:CreateTexture(nil, "BACKGROUND")
     bg:SetPoint("TOPLEFT", header, "TOPLEFT", 1, -1)
     bg:SetPoint("BOTTOMRIGHT", header, "BOTTOMRIGHT", -1, 0)
     UI.Skin(bg, function(self) self:SetColorTexture(UI.Color("panel")) end)
 
-    -- Faction toggle (owner feedback #5 — "make it look more like the SN one"):
-    -- a proper labelled segmented control, two touching halves "Alliance" /
-    -- "Horde" each with crest + text, the ACTIVE half filled with its faction
-    -- color (Alliance blue / Horde red) and the inactive half dimmed. Compact,
-    -- sized for the 44px header (style guide: clean + compact, one grid).
-    local SEG_H, SEG_W = 26, 92
-    local segTop = math.floor((HEADER_H - SEG_H) / 2)   -- vertically centered
+    -- Maker's mark: a small accent diamond at the far left (mockup logo).
+    local logo = Dashboard.MakeDiamond(header, 11, "OVERLAY")
+    logo:SetPoint("LEFT", header, "LEFT", PAD, 0)
+    Dashboard.SetDiamondColor(logo, "accent")
+
+    -- Ceremonial wordmark: DASEEKI NEXUS (NEXUS in accent). Ceremonial face is the
+    -- one serif allowance on the dashboard (pivot). Uppercase, letter-spaced by font.
+    local wordmark = header:CreateFontString(nil, "OVERLAY")
+    wordmark:SetFontObject(UI.fonts.ceremonial or UI.fonts.header)
+    wordmark:SetPoint("LEFT", logo, "RIGHT", 9, 0)
+    wordmark:SetText("DASEEKI " .. Dashboard.HexColor("accent") .. "NEXUS|r")
+
+    -- Close (far right).
+    local closeBtn = CreateFrame("Button", nil, header)
+    closeBtn:SetSize(22, 22)
+    closeBtn:SetPoint("RIGHT", header, "RIGHT", -8, 0)
+    local cx = closeBtn:CreateFontString(nil, "OVERLAY")
+    cx:SetFontObject(UI.fonts.body)
+    cx:SetPoint("CENTER", closeBtn, "CENTER", 0, 0)
+    cx:SetText("X")
+    closeBtn:SetScript("OnEnter", function() cx:SetFontObject(UI.fonts.danger) end)
+    closeBtn:SetScript("OnLeave", function() cx:SetFontObject(UI.fonts.body) end)
+    closeBtn:SetScript("OnClick", function() w:Hide() end)
+
+    -- Faction toggle (segmented Alliance/Horde), right of the tabs, left of close.
+    local SEG_H, SEG_W = 24, 74
     local factionSegs = {}
-    local function factionSeg(faction, label, x)
+    local function factionSeg(faction, label)
         local b = CreateFrame("Button", nil, header, "BackdropTemplate")
         b:SetSize(SEG_W, SEG_H)
-        b:SetPoint("TOPLEFT", header, "TOPLEFT", x, -segTop)
         b._faction = faction
-
         local crest = b:CreateTexture(nil, "ARTWORK")
-        crest:SetSize(16, 16)
-        crest:SetPoint("LEFT", b, "LEFT", 8, 0)
+        crest:SetSize(14, 14)
+        crest:SetPoint("LEFT", b, "LEFT", 7, 0)
         crest:SetTexture(Dashboard.FactionCrest(faction))
         crest:SetTexCoord(unpack(CREST_COORD))
         b._crest = crest
-
         local lbl = b:CreateFontString(nil, "OVERLAY")
-        lbl:SetFontObject(UI.fonts.body)
-        lbl:SetPoint("LEFT", crest, "RIGHT", 5, 0)
+        lbl:SetFontObject(UI.fonts.small)
+        lbl:SetPoint("LEFT", crest, "RIGHT", 4, 0)
         lbl:SetText(label)
         b._lbl = lbl
-
         b._setActive = function(self, on)
             self:SetBackdrop(UI.FLAT_BACKDROP)
             if on then
@@ -796,111 +834,41 @@ local function buildHeader(w)
             end
         end
         b:SetScript("OnClick", function() Dashboard.SetFaction(faction) end)
-        -- Re-skin on theme change (inactive side reads theme tokens; active side
-        -- reads the faction color) — both routed through the active state.
         UI.Skin(b, function(self) self:_setActive(Dashboard.GetFaction() == faction) end)
         factionSegs[#factionSegs + 1] = b
         return b
     end
-    factionSeg("Alliance", "Alliance", PAD)
-    factionSeg("Horde", "Horde", PAD + SEG_W)   -- touching halves, shared seam
-
+    local segA = factionSeg("Alliance", "Alliance")
+    local segH = factionSeg("Horde", "Horde")
+    segH:SetPoint("RIGHT", closeBtn, "LEFT", -8, 0)
+    segA:SetPoint("RIGHT", segH, "LEFT", 0, 0)   -- touching halves, shared seam
     w._updateFactionToggle = function()
         local f = Dashboard.GetFaction()
         for _, b in ipairs(factionSegs) do b:_setActive(b._faction == f) end
     end
 
-    -- Centered title (serif header font).
-    local title = header:CreateFontString(nil, "OVERLAY")
-    title:SetFontObject(UI.fonts.header)
-    title:SetPoint("CENTER", header, "CENTER", 0, 0)
-    title:SetText("Daseeki Nexus")
-
-    -- Right-side action strip: [Cancel Buffs] [Invite Online] [gear] [close].
-    local closeBtn = CreateFrame("Button", nil, header)
-    closeBtn:SetSize(24, 24)
-    closeBtn:SetPoint("RIGHT", header, "RIGHT", -6, 0)
-    local cx = closeBtn:CreateFontString(nil, "OVERLAY")
-    cx:SetFontObject(UI.fonts.body)
-    cx:SetPoint("CENTER", closeBtn, "CENTER", 0, 0)
-    cx:SetText("X")
-    closeBtn:SetScript("OnEnter", function() cx:SetFontObject(UI.fonts.danger) end)
-    closeBtn:SetScript("OnLeave", function() cx:SetFontObject(UI.fonts.body) end)
-    closeBtn:SetScript("OnClick", function() w:Hide() end)
-
-    local gearBtn = makeHeaderButton(header, "Settings", function()
-        if DaseekiSuite and DaseekiSuite.Open then
-            DaseekiSuite:Open("nexus")
-        else
-            ns:Print("Daseeki hub not available.")
-        end
-    end, 72)
-    gearBtn:SetPoint("RIGHT", closeBtn, "LEFT", -6, 0)
-
-    local inviteBtn = makeHeaderButton(header, "Invite Online", function()
-        if ns.Auto and ns.Auto.InviteOnline then
-            ns.Auto.InviteOnline(Dashboard.GetFaction())
-        end
-    end, 100)
-    inviteBtn:SetPoint("RIGHT", gearBtn, "LEFT", -6, 0)
-    -- N4 owns Auto.InviteOnline; disabled with a tooltip until then.
-    if not (ns.Auto and ns.Auto.InviteOnline) then
-        inviteBtn:SetEnabledState(false, "Arrives in a later update.")
-    end
-
-    -- The "Cancel Buffs" header button was removed (owner feedback 2b). The
-    -- Cancel-Buffs popup stays reachable via the /nexus x slash command and the
-    -- minimap button's Ctrl+Right-click. Invite Online is now the leftmost
-    -- header action, so no gap remains where the button used to sit.
-
-    w.header = header
-    w._updateFactionToggle()
-    return header
-end
-
-local function buildTabBar(w)
-    local bar = CreateFrame("Frame", nil, w)
-    bar:SetPoint("TOPLEFT", w, "TOPLEFT", 0, -HEADER_H)
-    bar:SetPoint("TOPRIGHT", w, "TOPRIGHT", 0, -HEADER_H)
-    bar:SetHeight(TAB_H)
-
-    local rule = w:CreateTexture(nil, "ARTWORK")
-    rule:SetHeight(1)
-    rule:SetPoint("TOPLEFT", w, "TOPLEFT", 1, -(HEADER_H + TAB_H))
-    rule:SetPoint("TOPRIGHT", w, "TOPRIGHT", -1, -(HEADER_H + TAB_H))
-    UI.Skin(rule, function(self) self:SetColorTexture(UI.Color("borderLite")) end)
-
+    -- Tabs, folded into the titlebar after the wordmark (left group). Each button
+    -- fills the titlebar height with an accent underline on the active tab.
     local tabs = {}
-    local leftX  = PAD   -- growing offset from the bar's LEFT edge
-    local rightX = PAD   -- growing offset from the bar's RIGHT edge (right group)
+    local prev
     for _, slot in ipairs(TAB_SLOTS) do
-        local b = CreateFrame("Button", nil, bar)
-        b:SetHeight(TAB_H)
-        b._id = slot.id
-        b._scope = slot.scope
+        local b = CreateFrame("Button", nil, header)
+        b:SetHeight(HEADER_H)
+        b._id, b._scope = slot.id, slot.scope
         local lbl = b:CreateFontString(nil, "OVERLAY")
         lbl:SetFontObject(UI.fonts.body)
         lbl:SetPoint("CENTER", b, "CENTER", 0, 0)
         lbl:SetText(slot.label)
         b._label = lbl
-        local tw = math.max(48, (lbl:GetStringWidth() or 40) + 22)
-        b:SetWidth(tw)
-        if slot.align == "right" then
-            -- Anchor to the bar's RIGHT edge so it tracks window resizes.
-            b:SetPoint("RIGHT", bar, "RIGHT", -rightX, 0)
-            rightX = rightX + tw + 4
-        else
-            b:SetPoint("LEFT", bar, "LEFT", leftX, 0)
-            leftX = leftX + tw + 4
-        end
-
+        b:SetWidth(math.max(48, (lbl:GetStringWidth() or 40) + 20))
+        if prev then b:SetPoint("LEFT", prev, "RIGHT", 2, 0)
+        else b:SetPoint("LEFT", wordmark, "RIGHT", 18, 0) end
         local under = b:CreateTexture(nil, "OVERLAY")
         under:SetHeight(2)
-        under:SetPoint("BOTTOMLEFT", b, "BOTTOMLEFT", 6, 2)
-        under:SetPoint("BOTTOMRIGHT", b, "BOTTOMRIGHT", -6, 2)
+        under:SetPoint("BOTTOMLEFT", b, "BOTTOMLEFT", 6, 0)
+        under:SetPoint("BOTTOMRIGHT", b, "BOTTOMRIGHT", -6, 0)
         under:Hide()
         b._under = under
-
         b:SetScript("OnClick", function(self) Dashboard.SelectTab(self._id) end)
         b:SetScript("OnEnter", function(self)
             if Dashboard.activeTabId ~= self._id then self._label:SetFontObject(UI.fonts.accent) end
@@ -909,8 +877,8 @@ local function buildTabBar(w)
             if Dashboard.activeTabId ~= self._id then self._label:SetFontObject(UI.fonts.body) end
         end)
         tabs[#tabs + 1] = b
+        prev = b
     end
-
     w._updateTabUnderlines = function()
         local ftok = FACTION_TOKEN[Dashboard.GetFaction()] or "accent"
         for _, b in ipairs(tabs) do
@@ -926,15 +894,23 @@ local function buildTabBar(w)
         end
     end
 
-    -- Content host below the tab bar, above the status bar.
+    -- Titlebar bottom rule (1px) — the seam between the 44px bar and the 576 body.
+    local rule = w:CreateTexture(nil, "ARTWORK")
+    rule:SetHeight(1)
+    rule:SetPoint("TOPLEFT", w, "TOPLEFT", 1, -HEADER_H)
+    rule:SetPoint("TOPRIGHT", w, "TOPRIGHT", -1, -HEADER_H)
+    UI.Skin(rule, function(self) self:SetColorTexture(UI.Color("border")) end)
+
+    -- Content host = the full 576 body (edge-to-edge; panes own their own insets).
     local host = CreateFrame("Frame", nil, w)
-    host:SetPoint("TOPLEFT", w, "TOPLEFT", PAD, -(HEADER_H + TAB_H + PAD))
-    host:SetPoint("BOTTOMRIGHT", w, "BOTTOMRIGHT", -PAD, STATUS_H + PAD)
+    host:SetPoint("TOPLEFT", w, "TOPLEFT", 0, -HEADER_H)
+    host:SetPoint("BOTTOMRIGHT", w, "BOTTOMRIGHT", 0, 0)
     w.tabHost = host
 
-    w.tabBar = bar
+    w.header = header
+    w._updateFactionToggle()
     w._updateTabUnderlines()
-    return bar
+    return header
 end
 
 ----------------------------------------------------------------------
@@ -1307,10 +1283,10 @@ local function ensureWindow()
     win:SetFrameStrata("HIGH")
     win:SetToplevel(true)
     win:SetMovable(true)
-    win:SetResizable(true)
+    win:SetResizable(false)   -- fixed-proportion mockup (pivot §10: no reflow)
     win:EnableMouse(true)
     win:SetClampedToScreen(true)
-    if win.SetResizeBounds then win:SetResizeBounds(MIN_W, MIN_H) end
+    if win.SetResizeBounds then win:SetResizeBounds(MIN_W, MIN_H, DEFAULT_W, DEFAULT_H) end
     win:Hide()
     UI.Skin(win, function(self)
         self:SetBackdrop(UI.FLAT_BACKDROP)
@@ -1320,32 +1296,20 @@ local function ensureWindow()
 
     tinsert(UISpecialFrames, "DaseekiNexusDashboard")   -- Escape closes
 
+    -- Titlebar (logo · wordmark · tabs · faction · close) + the full-body tab host.
+    -- The former separate tab-band + status-band are retired: tabs live in the 44px
+    -- titlebar and the status bar's world-buff readouts moved into the timers dock
+    -- (ui_timersdock.lua). buildStatusBar / installStatusTicker are left DEFINED (no
+    -- external callers; RefreshStatusBar self-guards on win.status being nil) but are
+    -- no longer invoked, so no status band is created.
     buildHeader(win)
-    buildTabBar(win)
-    buildStatusBar(win)
 
-    -- Corner resize grip (bottom-right, visible).
-    local grip = CreateFrame("Button", nil, win)
-    grip:SetSize(16, 16)
-    grip:SetPoint("BOTTOMRIGHT", win, "BOTTOMRIGHT", -2, 2)
-    for i = 1, 3 do
-        local ln = grip:CreateTexture(nil, "OVERLAY")
-        ln:SetSize(2, 2 + (i - 1) * 4)
-        ln:SetPoint("BOTTOMRIGHT", grip, "BOTTOMRIGHT", -(i - 1) * 4, 2)
-        UI.Skin(ln, function(self) self:SetColorTexture(UI.Color("borderLite")) end)
-    end
-    grip:SetScript("OnMouseDown", function() win:StartSizing("BOTTOMRIGHT") end)
-    grip:SetScript("OnMouseUp", function()
-        win:StopMovingOrSizing(); saveGeom(); Dashboard.RefreshActive()
-    end)
-
-    win:SetScript("OnSizeChanged", function() Dashboard.RefreshActive() end)
+    -- Fixed window: no resize grip (pivot §10 — the mockup is fixed-proportion).
     win:SetScript("OnShow", function()
         win._updateFactionToggle()
         win._updateTabUnderlines()
         Dashboard.RefreshActive()
     end)
-    installStatusTicker(win)
 
     restoreGeom()
 

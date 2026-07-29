@@ -158,10 +158,12 @@ local function toggleDashboard()
     ns:Print("dashboard arrives with the UI module.")
 end
 
+-- The Timers TAB dissolved (control-panel rebuild): world-buff timers now live in
+-- the lower-right DOCK of the Characters screen, so this opens the dashboard there.
 local function openDashboardTimers()
     local d = ns.Dashboard
-    if d and d.Show then ns:SafeCall(d.Show, "timers"); return end
-    ns:Print("dashboard Timers tab arrives with the UI module.")
+    if d and d.Show then ns:SafeCall(d.Show, "characters"); return end
+    ns:Print("dashboard arrives with the UI module.")
 end
 
 local function openFelwoodMap()
@@ -233,7 +235,7 @@ local function buildContextMenu()
 
         add(level, "Toggle dashboard", function() toggleDashboard() end)
         add(level, "Invite online",    function() inviteAll() end)
-        add(level, "Timers tab",       function() openDashboardTimers() end)
+        add(level, "Timers dock",      function() openDashboardTimers() end)
         add(level, "Cancel Buffs",     function()
             if ns.HUD and ns.HUD.ShowCancelBuffs then ns.HUD.ShowCancelBuffs() end
         end)

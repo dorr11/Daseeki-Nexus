@@ -363,7 +363,9 @@ end
 -- Map a user-typed screen token to a tab id the shell understands.
 local SCREEN_ALIASES = {
     characters = "characters", chars = "characters", roster = "characters",
-    timers     = "timers",     timer  = "timers",
+    -- The Timers tab dissolved into the Characters dock; its tokens now resolve to
+    -- the Characters screen so `/nexus debug layout timers` still dumps live frames.
+    timers     = "characters", timer  = "characters", dock = "characters",
     instances  = "instances",  inst   = "instances", lockouts = "instances",
     help       = "help",
 }

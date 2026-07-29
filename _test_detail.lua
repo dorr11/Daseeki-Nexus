@@ -1,8 +1,9 @@
--- Real-Lua 5.1 harness for ui_ledgerpage.lua (WAVE R1-B).
--- Self-contained: stubs the WoW load surface, loads the pure-logic + shared-model
--- files this page depends on (core/store/tracker/ui_shell/ui_ledgerpage), then runs
--- ONLY the "ledgerpage" self-test suite (isolated from other suites' dep needs).
--- Usage:  lua5.1 _test_ledgerpage.lua [NEXUS_DIR]   (defaults to this file's dir)
+-- Real-Lua 5.1 harness for ui_detail.lua (control-panel rebuild — replaces the
+-- retired ui_ledgerpage runner). Self-contained: stubs the WoW load surface, loads
+-- the pure-logic + shared-model files the detail pane depends on
+-- (core/store/tracker/ui_shell/ui_detail), then runs ONLY the "detail" self-test
+-- suite (isolated from other suites' dep needs).
+-- Usage:  lua5.1 _test_detail.lua [NEXUS_DIR]   (defaults to this file's dir)
 
 local DIR = arg[1] or (arg[0]:match("^(.*)[\\/][^\\/]+$")) or "."
 DIR = (DIR:gsub("\\", "/"))
@@ -71,16 +72,16 @@ ns.RegisterSelfTest = function(self, name, fn) SUITES[name] = fn; return origRST
 loadAddon("store.lua")
 loadAddon("tracker.lua")
 loadAddon("ui_shell.lua")
-loadAddon("ui_ledgerpage.lua")
+loadAddon("ui_detail.lua")
 
 if ns.Store and ns.Store.Init then pcall(ns.Store.Init) end
 
--- ── run the ledgerpage suite only ─────────────────────────────────────────────
+-- ── run the detail suite only ─────────────────────────────────────────────────
 assert(ns.Dashboard, "ns.Dashboard missing — ui_shell did not load its shared model")
-assert(ns.LedgerPage, "ns.LedgerPage missing — ui_ledgerpage did not load")
-local suite = SUITES["ledgerpage"]
-assert(suite, "ledgerpage self-test suite not registered")
-print("== ledgerpage self-test ==")
+assert(ns.Detail, "ns.Detail missing — ui_detail did not load")
+local suite = SUITES["detail"]
+assert(suite, "detail self-test suite not registered")
+print("== detail self-test ==")
 local ok = suite(true)
-print(ok and "\nLEDGERPAGE: ALL PASS" or "\nLEDGERPAGE: FAILURES ABOVE")
+print(ok and "\nDETAIL: ALL PASS" or "\nDETAIL: FAILURES ABOVE")
 os.exit(ok and 0 or 1)
