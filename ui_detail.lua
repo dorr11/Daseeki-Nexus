@@ -34,10 +34,15 @@ local PAD_H     = 14
 local HEADER_H  = 40          -- header band height (name row + border-bottom)
 local COL_R_W   = 214         -- right column fixed width (mockup dgrid 1fr / 214px)
 local COL_GAP   = 14
+-- Buff grid (owner round-2 verdict): UNIFORM SQUARE tiles, icon FILLING the frame
+-- (1px inset, cropped), duration text BENEATH, laid in even 3-column rows. Missing
+-- buffs render as DESATURATED icons with a danger/warn edge (§5a — not hollow boxes).
 local BUFF_COLS = 3           -- buff grid columns
-local BUFF_GAP  = 6
-local BUFF_TILE = 20          -- detail buff tile edge (mockup .ct-tile.big)
-local BUFF_CELL_H = 24
+local BUFF_TILE = 40          -- SQUARE tile edge (icon fills it)
+local BUFF_CAP_H = 13         -- duration caption line beneath the tile
+local BUFF_CELL_H = BUFF_TILE + 3 + BUFF_CAP_H   -- tile + gap + caption
+local BUFF_ROW_GAP = 8        -- vertical gap between tile rows
+local BUFF_TOP   = 18         -- grid top offset below the eyebrow label
 local TILE_RIM  = "controlBorder"
 
 -- Open-page raid tally order + labels (BRAND_SPEC §7 L3: MC BWL ZG AQ40 Naxx Ony AQ20;
@@ -203,38 +208,34 @@ local function microLabel(parent, text)
     return l
 end
 
--- A framed buff tile (icon inside a flat inset square) reused across the grid.
+-- A SQUARE buff tile: a bordered frame whose real spell icon FILLS it (1px inset,
+-- cropped), with the duration text on a caption line BENEATH. Uniform BUFF_TILE
+-- edge; the whole cell is BUFF_TILE wide and BUFF_CELL_H tall. Identity is carried
+-- by the icon + a hover tooltip (no inline name — the caption is the duration).
 local function makeBuffCell(parent)
     local cell = CreateFrame("Frame", nil, parent)
-    cell:SetHeight(BUFF_CELL_H)
-    -- Flat inset backing (mockup .wbcell: inset fill + border).
-    local box = CreateFrame("Frame", nil, cell, "BackdropTemplate")
-    box:SetAllPoints(cell)
-    UI.Skin(box, function(self)
-        self:SetBackdrop(UI.FLAT_BACKDROP)
-        self:SetBackdropColor(UI.Color("inset"))
-        self:SetBackdropBorderColor(UI.Color("border"))
-    end)
-    cell.box = box
-    -- The icon tile (its own bordered square so the missing edge reads).
+    cell:SetSize(BUFF_TILE, BUFF_CELL_H)
+    -- The icon tile (bordered square; the border tint carries the §5a missing edge).
     local tile = CreateFrame("Frame", nil, cell, "BackdropTemplate")
     tile:SetSize(BUFF_TILE, BUFF_TILE)
-    tile:SetPoint("LEFT", cell, "LEFT", 3, 0)
+    tile:SetPoint("TOP", cell, "TOP", 0, 0)
     local ic = tile:CreateTexture(nil, "ARTWORK")
     ic:SetPoint("TOPLEFT", tile, "TOPLEFT", 1, -1)
     ic:SetPoint("BOTTOMRIGHT", tile, "BOTTOMRIGHT", -1, 1)
-    ic:SetTexCoord(0.08, 0.92, 0.08, 0.92)
+    ic:SetTexCoord(0.06, 0.94, 0.06, 0.94)   -- crop the icon's built-in border
     tile.icon = ic
     cell.tile = tile
-    cell.name = fstr(cell, "small"); cell.name:SetPoint("LEFT", tile, "RIGHT", 6, 0)
-    cell.name:SetWordWrap(false)
-    cell.dur = fstr(cell, "numeral", "RIGHT"); cell.dur:SetPoint("RIGHT", cell, "RIGHT", -6, 0)
+    -- Duration caption, centered beneath the tile.
+    cell.dur = fstr(cell, "numeral", "CENTER")
+    cell.dur:SetPoint("TOP", tile, "BOTTOM", 0, -2)
+    cell.dur:SetPoint("LEFT", cell, "LEFT", -4, 0)
+    cell.dur:SetPoint("RIGHT", cell, "RIGHT", 4, 0)
     cell:EnableMouse(true)
     cell:SetScript("OnEnter", function(self)
-        if not self._tipFull then return end
+        if not self._tipName then return end
         GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
-        GameTooltip:AddLine(self._tipName or "", UI.Color("text"))
-        GameTooltip:AddLine(self._tipFull, UI.Color("muted"))
+        GameTooltip:AddLine(self._tipName, UI.Color("text"))
+        if self._tipFull then GameTooltip:AddLine(self._tipFull, UI.Color("muted")) end
         GameTooltip:Show()
     end)
     cell:SetScript("OnLeave", function() GameTooltip:Hide() end)
@@ -284,8 +285,16 @@ function Detail.Attach(parent)
     buffLbl:SetPoint("TOPLEFT", leftCol, "TOPLEFT", 0, 0)
     D.buffLbl = buffLbl
 
+    -- Buff-tile grid container (tagged for the geometry checker) below the label.
+    local buffGrid = CreateFrame("Frame", nil, leftCol)
+    buffGrid:SetPoint("TOPLEFT", leftCol, "TOPLEFT", 0, -BUFF_TOP)
+    buffGrid:SetPoint("BOTTOMRIGHT", leftCol, "BOTTOMRIGHT", 0, 0)
+    tag(buffGrid, "detail.bufftiles")
+    D.buffGrid = buffGrid
+
     D._cells = {}
-    for i = 1, 10 do D._cells[i] = makeBuffCell(leftCol) end
+    for i = 1, 10 do D._cells[i] = makeBuffCell(buffGrid) end
+    tag(D._cells[1].tile, "detail.bufftile1")   -- 40x40 tile — square-size assertion target
 
     -- Right column (fixed 214): tally · cooldowns · note · actions.
     local rightCol = CreateFrame("Frame", nil, parent)
@@ -301,26 +310,26 @@ function Detail.Attach(parent)
     D.tallyFS = tallyFS
 
     local cdLbl = microLabel(rightCol, "COOLDOWNS")
-    cdLbl:SetPoint("TOPLEFT", tallyFS, "BOTTOMLEFT", 0, -12)
-    -- Two telemetry columns (chrono / hearth): microLabel key + outlined numeral.
-    local function teleCol(anchorLeft, x)
+    cdLbl:SetPoint("TOPLEFT", tallyFS, "BOTTOMLEFT", 0, -14)
+    -- Two telemetry columns (CHRONO / HEARTH): a micro-label key over an outlined
+    -- numeral value. Both sit on ONE row well clear of the section header (the round-2
+    -- collision was the key sitting 6px under the label — now the row starts -20 below,
+    -- and the two columns are 100px apart within the 214-wide right column).
+    local function teleCol(keyText, xOff)
         local c = CreateFrame("Frame", nil, rightCol)
-        c:SetSize(96, 34)
-        c:SetPoint("TOPLEFT", anchorLeft, x and "TOPLEFT" or "TOPLEFT", x or 0, x and 0 or -6)
-        c.k = fstr(c, "microLabel"); c.k:SetPoint("TOPLEFT", c, "TOPLEFT", 0, 0); c.k:SetTextColor(UI.Color("faint"))
-        c.v = fstr(c, "numeral"); c.v:SetPoint("TOPLEFT", c, "TOPLEFT", 0, -13)
+        c:SetSize(100, 32)
+        c:SetPoint("TOPLEFT", cdLbl, "BOTTOMLEFT", xOff, -8)
+        c.k = fstr(c, "microLabel"); c.k:SetPoint("TOPLEFT", c, "TOPLEFT", 0, 0)
+        c.k:SetTextColor(UI.Color("faint")); c.k:SetText(keyText)
+        c.v = fstr(c, "numeral"); c.v:SetPoint("TOPLEFT", c, "TOPLEFT", 0, -14)
         return c
     end
-    local chronoCol = teleCol(cdLbl); chronoCol.k:SetText("CHRONO")
-    local hearthCol = CreateFrame("Frame", nil, rightCol); hearthCol:SetSize(96, 34)
-    hearthCol:SetPoint("TOPLEFT", chronoCol, "TOPRIGHT", 14, 0)
-    hearthCol.k = fstr(hearthCol, "microLabel"); hearthCol.k:SetPoint("TOPLEFT", hearthCol, "TOPLEFT", 0, 0)
-    hearthCol.k:SetTextColor(UI.Color("faint")); hearthCol.k:SetText("HEARTH")
-    hearthCol.v = fstr(hearthCol, "numeral"); hearthCol.v:SetPoint("TOPLEFT", hearthCol, "TOPLEFT", 0, -13)
+    local chronoCol = teleCol("CHRONO", 0)
+    local hearthCol = teleCol("HEARTH", 104)
     D.chronoCol, D.hearthCol = chronoCol, hearthCol
 
     local noteLbl = microLabel(rightCol, "NOTE")
-    noteLbl:SetPoint("TOPLEFT", chronoCol, "BOTTOMLEFT", 0, -10)
+    noteLbl:SetPoint("TOPLEFT", chronoCol, "BOTTOMLEFT", 0, -12)
     local noteBox = CreateFrame("EditBox", nil, rightCol, "BackdropTemplate")
     noteBox:SetPoint("TOPLEFT", noteLbl, "BOTTOMLEFT", 0, -5)
     noteBox:SetPoint("RIGHT", rightCol, "RIGHT", 0, 0)
@@ -397,12 +406,15 @@ function Detail.Attach(parent)
         statusFS:SetText((online and "ONLINE" or "OFFLINE") .. "  \194\183  " .. Dd.FreshnessText(rec.lastDataUpdate))
         statusFS:SetTextColor(UI.Color("muted"))
 
-        -- Buff grid (3-col flow of the SHOWN tiles; §5a lit/desat).
+        -- Buff grid: uniform SQUARE tiles, even 3-column rows. Detail keeps the §5a
+        -- lit/desat treatment (owned = full-color icon; missing = DESATURATED icon +
+        -- danger/warn edge — a visible greyed tile, never a hollow box). Duration text
+        -- sits beneath each tile. Tiles are centered within equal column thirds.
         local order = Dd.AURA_DISPLAY_ORDER or {}
         local shown, held = 0, 0
-        local colW = (leftCol:GetWidth() - (BUFF_COLS - 1) * BUFF_GAP) / BUFF_COLS
-        if colW < 1 then colW = 96 end
-        local gy = 20   -- below the eyebrow label
+        local gridW = buffGrid:GetWidth(); if gridW < 1 then gridW = leftCol:GetWidth() end
+        if gridW < 1 then gridW = 3 * (BUFF_TILE + 24) end   -- pre-layout fallback
+        local thirdW = gridW / BUFF_COLS
         local idx = 0
         for _, cell in ipairs(D._cells) do cell:Hide() end
         for _, slot in ipairs(order) do
@@ -414,18 +426,19 @@ function Detail.Attach(parent)
                 local cell = D._cells[idx]
                 local col = (idx - 1) % BUFF_COLS
                 local row = math.floor((idx - 1) / BUFF_COLS)
+                local cx = thirdW * (col + 0.5)          -- centre of this column third
                 cell:ClearAllPoints()
-                cell:SetPoint("TOPLEFT", leftCol, "TOPLEFT", col * (colW + BUFF_GAP), -(gy + row * (BUFF_CELL_H + BUFF_GAP)))
-                cell:SetWidth(colW)
+                cell:SetPoint("TOPLEFT", buffGrid, "TOPLEFT",
+                    cx - BUFF_TILE / 2, -(row * (BUFF_CELL_H + BUFF_ROW_GAP)))
                 local meta = Dd.AURA_META[slot]
                 cell.tile.icon:SetTexture(Dd.AuraIcon(slot))
                 cell.tile.icon:SetDesaturated(s.missing and true or false)
-                cell.tile.icon:SetAlpha(s.missing and 0.55 or 1)
+                cell.tile.icon:SetAlpha(s.missing and 0.85 or 1)   -- greyed but clearly visible
                 cell.tile:SetBackdrop(UI.FLAT_BACKDROP)
                 cell.tile:SetBackdropColor(UI.Color("inset"))
-                cell.tile:SetBackdropBorderColor(UI.Color(s.missing and s.tint or (s.boon and "ok" or TILE_RIM)))
-                cell.name:SetText(meta.short or "?")
-                cell.name:SetTextColor(UI.Color(s.missing and "faint" or "muted"))
+                -- Rim carries state: missing = danger/warn, boon = ok, else the buff's
+                -- threshold token (ok/warn) so an about-to-expire held tile still warns.
+                cell.tile:SetBackdropBorderColor(UI.Color(s.tint or TILE_RIM))
                 cell.dur:SetText(s.durText or (s.missing and "\226\128\148" or ""))
                 cell.dur:SetTextColor(UI.Color(s.durTok or "muted"))
                 cell._tipName = meta.name

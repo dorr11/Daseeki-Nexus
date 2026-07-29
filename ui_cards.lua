@@ -42,6 +42,7 @@ local CARD_PAD_H = 11       -- card horizontal padding
 local CARD_PAD_V = 9        -- card vertical padding
 local TILE       = 18       -- buff strip tile edge
 local TILE_GAP   = 3
+local CD_ICON    = 15       -- chrono/hearth cooldown icon edge (right-edge stack)
 local DETAIL_H   = 316      -- right-top detail pane height
 -- dock fills the remaining 260 (576 - 316).
 
@@ -212,6 +213,25 @@ function Cards.SlotState(entry, slot)
     return "missing", "danger"
 end
 
+-- COMPACT CARD-STRIP tile style (owner round-2 §5b, corrected): tiles DOUBLE-ENCODE
+-- state — the icon keeps §5a lit/desat (held = full-color, missing = desaturated)
+-- AND every tile gets a state BORDER (held = ok-green, missing = danger-red / warn
+-- for optional), matching the reference. Returns:
+--   { shown, desat (bool), border (token), state }  -- shown=false for a hidden slot.
+-- (The DETAIL pane's larger tiles use their own BuffTileState paint; this is the
+-- compact strip's dedicated, headless-tested style matrix.)
+function Cards.StripTileStyle(entry, slot)
+    local state, token = Cards.SlotState(entry, slot)
+    if state == "na" then return { shown = false, state = state } end
+    local owned = (state == "owned")
+    return {
+        shown  = true,
+        state  = state,
+        desat  = not owned,                 -- §5a: held lit, missing desaturated
+        border = owned and "ok" or token,   -- held green, missing danger/warn
+    }
+end
+
 -- Compact "updated ago" text + stale flag ("2m"/"41m"/"2h"/"1d"; ""/false if none).
 function Cards.AgoText(rec, nowE)
     local upd = (rec and rec.lastDataUpdate) or 0
@@ -276,27 +296,56 @@ local function makeCard(parent, pane)
     card.edge:SetPoint("BOTTOMLEFT", card, "BOTTOMLEFT", 0, 0)
     card.edge:SetWidth(3); card.edge:Hide()
 
-    -- Row 1: dot + name + account pill.
+    -- Right edge: chrono + hearth cooldown icons, stacked (owner round-2 item 5 —
+    -- the pre-rebuild cards + the reference cards carry these). Same data the detail
+    -- pane shows. Small (CD_ICON) so the card stays compact.
+    local function cdIcon(topAnchor, dy)
+        local f = CreateFrame("Frame", nil, card, "BackdropTemplate")
+        f:SetSize(CD_ICON, CD_ICON)
+        f:SetPoint("TOPRIGHT", topAnchor, dy and "BOTTOMRIGHT" or "TOPRIGHT",
+            dy and 0 or -CARD_PAD_H, dy or -CARD_PAD_V)
+        local ic = f:CreateTexture(nil, "ARTWORK")
+        ic:SetPoint("TOPLEFT", f, "TOPLEFT", 1, -1)
+        ic:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", -1, 1)
+        ic:SetTexCoord(0.08, 0.92, 0.08, 0.92)
+        f.icon = ic
+        f:EnableMouse(true)
+        f:SetScript("OnEnter", function(self)
+            if not self._tip then return end
+            GameTooltip:SetOwner(self, "ANCHOR_LEFT")
+            GameTooltip:AddLine(self._tip[1], UI.Color("text"))
+            GameTooltip:AddLine(self._tip[2], UI.Color(self._tip[3] or "muted"))
+            GameTooltip:Show()
+        end)
+        f:SetScript("OnLeave", function() GameTooltip:Hide() end)
+        return f
+    end
+    card.chrono = cdIcon(card)                 -- top of the stack
+    card.hearth = cdIcon(card.chrono, -2)      -- below chrono
+    local CD_COL = CARD_PAD_H + CD_ICON + 6    -- horizontal room the stack reserves
+
+    -- Row 1: dot + class-colored name + account tag + optional PvP crest (inline
+    -- cluster; owner round-2 item 6 — acct stays inline by the name).
     card.dot = card:CreateTexture(nil, "OVERLAY")
     card.dot:SetSize(8, 8); card.dot:SetPoint("TOPLEFT", card, "TOPLEFT", CARD_PAD_H, -CARD_PAD_V - 3)
-    card.acct = fstr(card, "microLabel", "RIGHT")
-    card.acct:SetPoint("TOPRIGHT", card, "TOPRIGHT", -CARD_PAD_H, -CARD_PAD_V - 2)
-    card.acct:SetTextColor(UI.Color("muted"))
     card.name = fstr(card, "body"); card.name:SetPoint("LEFT", card.dot, "RIGHT", 8, 0)
-    card.name:SetPoint("RIGHT", card.acct, "LEFT", -6, 0)
     card.name:SetJustifyH("LEFT"); card.name:SetWordWrap(false)
+    card.acct = fstr(card, "microLabel"); card.acct:SetPoint("LEFT", card.name, "RIGHT", 6, 0)
+    card.acct:SetTextColor(UI.Color("muted"))
+    card.pvp = card:CreateTexture(nil, "ARTWORK")
+    card.pvp:SetSize(13, 13); card.pvp:SetPoint("LEFT", card.acct, "RIGHT", 4, 0); card.pvp:Hide()
     -- Strike overlay for tombstoned/blacklisted names.
     card.strike = card:CreateTexture(nil, "OVERLAY")
     card.strike:SetHeight(1); card.strike:Hide()
     card.strike:SetPoint("LEFT", card.name, "LEFT", 0, 0)
 
-    -- Row 2: location + updated-ago.
+    -- Row 2: location (left) + updated-ago (right, inset clear of the CD stack).
     card.loc = fstr(card, "small"); card.loc:SetPoint("TOPLEFT", card.dot, "BOTTOMLEFT", 0, -5)
     card.loc:SetWordWrap(false)
     card.upd = fstr(card, "microLabel", "RIGHT")
-    card.upd:SetPoint("TOPRIGHT", card, "TOPRIGHT", -CARD_PAD_H, -28)
+    card.upd:SetPoint("TOPRIGHT", card, "TOPRIGHT", -CD_COL, -28)
 
-    -- Row 3: buff-icon strip (up to 10 real-icon tiles, §5a lit/desat).
+    -- Row 3: buff-icon strip (real-icon tiles; §5a lit/desat + state border).
     card.tiles = {}
     for i = 1, 10 do
         local t = CreateFrame("Frame", nil, card, "BackdropTemplate")
@@ -345,23 +394,58 @@ local function makeCard(parent, pane)
         local ago, stale = Cards.AgoText(rec, nowE)
         self.upd:SetText(ago); self.upd:SetTextColor(UI.Color(stale and "warn" or freshToken(rec, nowE)))
 
-        -- Buff strip: the applicable/present slots as real-icon tiles (§5a).
+        -- PvP-flagged crest inline in the name/acct cluster.
+        if rec.pvpFlagged and rec.faction then
+            self.pvp:Show()
+            self.pvp:SetTexture(Dashboard.FactionCrest(rec.faction))
+            self.pvp:SetTexCoord(0.02, 0.62, 0.03, 0.63)
+        else
+            self.pvp:Hide()
+        end
+
+        -- Chrono / hearth cooldown icons (right-edge stack). Chrono: booned = lit +
+        -- accent/danger rim; on use-CD = desat; else lit. Hearth: desat while on CD.
+        self.chrono.icon:SetTexture(Dashboard.ItemIcon(184937))   -- Chronoboon Displacer
+        self.hearth.icon:SetTexture(Dashboard.ItemIcon(6948))     -- Hearthstone
+        local chronoRem = Dashboard.DecayRemaining(rec.itemCooldown, rec.lastDataUpdate, nowE)
+        self.chrono:SetBackdrop(UI.FLAT_BACKDROP); self.chrono:SetBackdropColor(UI.Color("inset"))
+        if rec.chronoboonActive then
+            self.chrono:SetShown(true); self.chrono.icon:SetDesaturated(false)
+            self.chrono:SetBackdropBorderColor(UI.Color((rec.boonCount or 0) == 0 and "danger" or "accent"))
+            self.chrono._tip = { "Chronoboon Displacer", "Booned", "accent" }
+        elseif chronoRem > 0 then
+            self.chrono:SetShown(true); self.chrono.icon:SetDesaturated(true)
+            self.chrono:SetBackdropBorderColor(UI.Color("border"))
+            self.chrono._tip = { "Chronoboon Displacer", "CD " .. Dashboard.FormatDuration(chronoRem), "danger" }
+        else
+            self.chrono:SetShown(true); self.chrono.icon:SetDesaturated(false)
+            self.chrono:SetBackdropBorderColor(UI.Color("controlBorder"))
+            self.chrono._tip = { "Chronoboon Displacer", ("%d in bags"):format(rec.boonCount or 0), "muted" }
+        end
+        local hearthRem = Dashboard.DecayRemaining(rec.hearthstoneCD, rec.lastDataUpdate, nowE)
+        self.hearth:SetBackdrop(UI.FLAT_BACKDROP); self.hearth:SetBackdropColor(UI.Color("inset"))
+        self.hearth.icon:SetDesaturated(hearthRem > 0)
+        self.hearth:SetBackdropBorderColor(UI.Color(hearthRem > 0 and "border" or "controlBorder"))
+        self.hearth._tip = { "Hearthstone", hearthRem > 0 and ("CD " .. Dashboard.FormatDuration(hearthRem)) or "Ready",
+                             hearthRem > 0 and "danger" or "ok" }
+
+        -- Buff strip: real-icon tiles double-encoding state (§5b) — §5a lit/desat
+        -- icon + a state border (held ok-green / missing danger-red / warn optional).
         local order = Dashboard.AURA_DISPLAY_ORDER or {}
         local ti = 0
         for _, slot in ipairs(order) do
-            local state, token = Cards.SlotState(entry, slot)
-            if state ~= "na" then
+            local sty = Cards.StripTileStyle(entry, slot)
+            if sty.shown then
                 ti = ti + 1
                 local t = self.tiles[ti]
                 if t then
                     t:Show()
                     t.icon:SetTexture(Dashboard.AuraIcon(slot))
-                    local owned = (state == "owned")
-                    t.icon:SetDesaturated(not owned)
-                    t.icon:SetAlpha(owned and 1 or 0.6)
+                    t.icon:SetDesaturated(sty.desat)
+                    t.icon:SetAlpha(sty.desat and 0.6 or 1)
                     t:SetBackdrop(UI.FLAT_BACKDROP)
                     t:SetBackdropColor(UI.Color("inset"))
-                    t:SetBackdropBorderColor(UI.Color(owned and "controlBorder" or token))
+                    t:SetBackdropBorderColor(UI.Color(sty.border))
                 end
             end
         end
@@ -757,12 +841,53 @@ local function testSlotState(fails)
     end
 end
 
+-- Compact card-strip DOUBLE-ENCODE matrix (owner round-2 §5b): every visible tile
+-- carries BOTH a color state (lit/desat) AND a border state (ok/danger/warn).
+local function testStripStyle(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local D = Dashboard
+    if not (D and D.AURA_META) then ck(false, "Dashboard.AURA_META unavailable"); return end
+    local function slotOf(key) for s, m in pairs(D.AURA_META) do if m.key == key then return s end end end
+    local onySlot, boonSlot, rendSlot = slotOf("ony"), slotOf("boon"), slotOf("rend")
+
+    -- Held required -> lit (desat=false) + ok-green border.
+    if onySlot then
+        local ownedE = { faction = "Horde", rec = { classTag = "WARRIOR", auraStates = { [onySlot] = { duration = 3600 } } } }
+        local held = Cards.StripTileStyle(ownedE, onySlot)
+        ck(held.shown and held.desat == false and held.border == "ok",
+            "held tile -> shown + lit (desat=false) + ok border")
+        -- Missing required -> desaturated + danger border.
+        local missE = { faction = "Horde", rec = { classTag = "WARRIOR", auraStates = {} } }
+        local miss = Cards.StripTileStyle(missE, onySlot)
+        ck(miss.shown and miss.desat == true and miss.border == "danger",
+            "missing required tile -> shown + desat + danger border")
+    end
+    -- Non-applicable absent tail slot -> hidden.
+    if boonSlot then
+        local na = Cards.StripTileStyle({ faction = "Horde", rec = { classTag = "MAGE", auraStates = {} } }, boonSlot)
+        ck(na.shown == false, "non-applicable slot -> not shown in strip")
+    end
+    -- Optional missing -> desaturated + warn border.
+    if rendSlot then
+        local savedGFS = ns.Store and ns.Store.GetFactionSettings
+        ns.Store = ns.Store or {}
+        ns.Store.GetFactionSettings = function()
+            return { auraOpts = { rend = { required = {}, optional = { MAGE = true } }, thresholds = {} } }
+        end
+        local opt = Cards.StripTileStyle({ faction = "Horde", rec = { classTag = "MAGE", auraStates = {} } }, rendSlot)
+        ck(opt.shown and opt.desat == true and opt.border == "warn",
+            "optional missing tile -> shown + desat + warn border")
+        ns.Store.GetFactionSettings = savedGFS
+    end
+end
+
 if ns.RegisterSelfTest then
     ns:RegisterSelfTest("cards", function(verbose)
         local cases = {
             { name = "roster logic",      fn = testCardsLogic },
             { name = "selection machine", fn = testSelectionMachine },
             { name = "slot state",        fn = testSlotState },
+            { name = "strip tile style",  fn = testStripStyle },
         }
         local allPass = true
         for _, c in ipairs(cases) do
