@@ -388,20 +388,50 @@ function Detail.Attach(parent)
     -- lockouts 110 within the 214-wide column.
     local CD_W, LOCK_X = 92, 104
 
-    -- COOLDOWNS block (top-left). CHRONO / HEARTH are inline key→value rows.
+    -- COOLDOWNS block (top-left). Owner round-5: the CHRONO / HEARTH micro-labels are
+    -- replaced by the ITEM ICONS (chronoboon 184937 / hearthstone 6948) — same
+    -- cropped/framed treatment + item IDs the cards' right-edge stack uses — each
+    -- followed by its colored state value. The icon IS the label; the full item name
+    -- lives on the hover tooltip.
     local cdLbl = microLabel(rightCol, "COOLDOWNS")
     cdLbl:SetPoint("TOPLEFT", rightCol, "TOPLEFT", 0, 0)
     tag(cdLbl, "detail.cdlabel")
-    local function cdRow(keyText, y)
-        local kf = fstr(rightCol, "microLabel"); kf:SetTextColor(UI.Color("muted")); kf:SetText(keyText)
-        kf:SetPoint("TOPLEFT", rightCol, "TOPLEFT", 0, y)
+    local CD_ICON = 16
+    local function cdIconRow(itemID, fullName, y)
+        local f = CreateFrame("Frame", nil, rightCol, "BackdropTemplate")
+        f:SetSize(CD_ICON, CD_ICON)
+        f:SetPoint("TOPLEFT", rightCol, "TOPLEFT", 0, y)
+        UI.Skin(f, function(self)
+            self:SetBackdrop(UI.FLAT_BACKDROP)
+            self:SetBackdropColor(UI.Color("inset"))
+            self:SetBackdropBorderColor(UI.Color("borderLite"))
+        end)
+        local ic = f:CreateTexture(nil, "ARTWORK")
+        ic:SetPoint("TOPLEFT", f, "TOPLEFT", 1, -1)
+        ic:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", -1, 1)
+        ic:SetTexCoord(0.08, 0.92, 0.08, 0.92)
+        ic:SetTexture(Dashboard.ItemIcon(itemID))
+        f.icon = ic
+        f._name = fullName
+        f:EnableMouse(true)
+        f:SetScript("OnEnter", function(self)
+            GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+            GameTooltip:AddLine(self._name, UI.Color("text"))
+            if self._state then GameTooltip:AddLine(self._state, UI.Color(self._stateTok or "muted")) end
+            GameTooltip:Show()
+        end)
+        f:SetScript("OnLeave", function() GameTooltip:Hide() end)
+        -- Colored state value, right-aligned to CD_W, vertically centered on the icon.
         local vf = fstr(rightCol, "numeral", "RIGHT")
-        vf:SetPoint("TOPRIGHT", rightCol, "TOPLEFT", CD_W, y)   -- right edge at CD_W
-        return vf
+        vf:SetPoint("LEFT", f, "RIGHT", 6, 0)
+        vf:SetPoint("RIGHT", rightCol, "TOPLEFT", CD_W, y - CD_ICON / 2)
+        return f, vf
     end
-    local chronoVal = cdRow("CHRONO", -17)
-    local hearthVal = cdRow("HEARTH", -33)
+    local chronoIcon, chronoVal = cdIconRow(184937, "Chronoboon Displacer", -16)
+    local hearthIcon, hearthVal = cdIconRow(6948, "Hearthstone", -37)
+    tag(chronoIcon, "detail.cdicon1")   -- 16px item-icon square (geometry assertion)
     D.chronoVal, D.hearthVal = chronoVal, hearthVal
+    D.chronoIcon, D.hearthIcon = chronoIcon, hearthIcon
 
     -- RAID LOCKOUTS block (top-right), sharing the top rail.
     local raidLbl = microLabel(rightCol, "RAID LOCKOUTS")
@@ -524,20 +554,31 @@ function Detail.Attach(parent)
         end
         tallyFS:SetText(table.concat(parts, "  "))
 
-        -- Telemetry (chrono / hearth). Ready = green; on CD = numeral countdown.
+        -- Telemetry (chrono / hearth item icons + colored state value). The icon desats
+        -- while on cooldown (mirrors the card stack); the tooltip carries the state.
         local chronoRem = Dd.DecayRemaining(rec.itemCooldown, rec.lastDataUpdate, e)
         if rec.chronoboonActive then
             chronoVal:SetText("BOON"); chronoVal:SetTextColor(UI.Color((rec.boonCount or 0) == 0 and "danger" or "ok"))
+            D.chronoIcon.icon:SetDesaturated(false)
+            D.chronoIcon._state = ("Booned \194\183 %d in bags"):format(rec.boonCount or 0); D.chronoIcon._stateTok = "ok"
         elseif chronoRem > 0 then
             chronoVal:SetText(Dd.FormatDuration(chronoRem)); chronoVal:SetTextColor(UI.Color("warn"))
+            D.chronoIcon.icon:SetDesaturated(true)
+            D.chronoIcon._state = "Cooldown " .. Dd.FormatDuration(chronoRem); D.chronoIcon._stateTok = "warn"
         else
             chronoVal:SetText("Ready"); chronoVal:SetTextColor(UI.Color("ok"))
+            D.chronoIcon.icon:SetDesaturated(false)
+            D.chronoIcon._state = "Ready"; D.chronoIcon._stateTok = "ok"
         end
         local hearthRem = Dd.DecayRemaining(rec.hearthstoneCD, rec.lastDataUpdate, e)
         if hearthRem > 0 then
             hearthVal:SetText(Dd.FormatDuration(hearthRem)); hearthVal:SetTextColor(UI.Color("warn"))
+            D.hearthIcon.icon:SetDesaturated(true)
+            D.hearthIcon._state = "Cooldown " .. Dd.FormatDuration(hearthRem); D.hearthIcon._stateTok = "warn"
         else
             hearthVal:SetText("Ready"); hearthVal:SetTextColor(UI.Color("ok"))
+            D.hearthIcon.icon:SetDesaturated(false)
+            D.hearthIcon._state = "Ready"; D.hearthIcon._stateTok = "ok"
         end
 
         -- Note.
