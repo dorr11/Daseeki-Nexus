@@ -1124,8 +1124,8 @@ end
 
 ----------------------------------------------------------------------
 -- Status-bar refresh (world-buff states + guild + DMF). The pulse/color
--- semantics come from spec §0: steady green = can pop, steady orange = CD>20m,
--- fast-pulse red = CD<=20m or killed, grey = no data.
+-- semantics come from spec §0: steady green = Open (off-cooldown), steady orange
+-- = CD>20m, fast-pulse red = CD<=20m or killed, grey = no data.
 ----------------------------------------------------------------------
 
 local function anchorOf(state)
@@ -1144,7 +1144,9 @@ local function worldBuffCell(label, buffKey)
         return label .. ": no data", "faint", false
     end
     if info.ready then
-        return label .. ": Ready", "ok", false
+        -- Off-cooldown world buff = green "Open" (BRAND_SPEC §6 binding; the
+        -- approved status-bar live readout in §7 is "Onyxia (H): Open").
+        return label .. ": Open", "ok", false
     end
     local rem = info.remaining or 0
     if rem <= 20 * 60 then
@@ -2034,8 +2036,8 @@ Dashboard.RegisterTab("help", function(host)
     -- auto-derivation) — the pair is the mesh password.
     local g = flow:AddSection("Setup Guide")
     g:Hint("1.  Install Daseeki Nexus on every account you want connected.")
-    g:Hint("2.  On each account, open Settings \226\134\146 General and set a unique Account ID (1\226\128\1512 digits, different on each account).")
-    g:Hint("3.  In Settings \226\134\146 Mesh & Accounts, set the SAME Channel name (16+ letters/numbers, case sensitive) AND the SAME Token (6 letters/numbers) on every account.")
+    g:Hint("2.  On each account, open Settings \226\134\146 Mesh & Accounts and set a unique Account ID (1\226\128\1512 digits, different on each account).")
+    g:Hint("3.  On the same Mesh & Accounts page, set the SAME Channel name (16+ letters/numbers, case sensitive) AND the SAME Token (6 letters/numbers) on every account \226\128\148 generate the credentials there, or paste a setup bundle to copy the same Channel and Token to another account.")
     g:Hint("4.  Enable the mesh, then log out and back in once on each account \226\128\148 characters appear across your accounts within seconds.")
     g:Hint("5.  Migrating from another world-buff addon? Run /nexus import to carry over its settings, Channel, Token and data (see Troubleshooting).")
     g:Hint("Open Settings from the button at this window's top-right, or with /nexus settings.")
@@ -2068,7 +2070,7 @@ Dashboard.RegisterTab("help", function(host)
     -- ── Troubleshooting (parity item 11): Q&A adapted to our token+channel flow
     local tr = flow:AddSection("Troubleshooting")
     tr:Hint("Other accounts not showing? The Channel AND Token must match byte-for-byte on every account \226\128\148 both are case sensitive and together act as your mesh password. Correct any mismatch in Settings \226\134\146 Mesh & Accounts, then /reload.")
-    tr:Hint("Characters under the wrong account? Two accounts are sharing an Account ID. Give each account its own unique ID in Settings \226\134\146 General.")
+    tr:Hint("Characters under the wrong account? Two accounts are sharing an Account ID. Give each account its own unique ID in Settings \226\134\146 Mesh & Accounts.")
     tr:Hint("Copying settings to a new account? Set it up with the same Channel + Token, then use Send Settings to Mesh (you confirm the target account IDs first).")
     tr:Hint("Coming from ShadowNetwork? Run /nexus import \226\128\148 it carries over your settings, Channel, Token and stored data.")
 
@@ -2082,12 +2084,12 @@ Dashboard.RegisterTab("help", function(host)
 
     -- ── First-time setup (detailed) — parity item 21, at the bottom ───────────
     local ds = flow:AddSection("First-time setup (detailed)")
-    ds:Hint("1.  Account ID \226\128\148 In Settings \226\134\146 General, give this account a short unique ID (1\226\128\1512 digits). Every connected account needs a DIFFERENT ID; this is how the mesh tells your accounts apart.")
-    ds:Hint("2.  Channel \226\128\148 In Settings \226\134\146 Mesh & Accounts, set a Channel name of 16+ letters and numbers. It is case sensitive and must be identical on every account \226\128\148 think of it as the room your accounts meet in.")
-    ds:Hint("3.  Token \226\128\148 Set a 6-character Token (letters/numbers), also identical everywhere. The Channel + Token together are your mesh password; anyone with both can see your roster, so keep them private.")
+    ds:Hint("1.  Account ID \226\128\148 In Settings \226\134\146 Mesh & Accounts, give this account a short unique ID (1\226\128\1512 digits). Every connected account needs a DIFFERENT ID; this is how the mesh tells your accounts apart.")
+    ds:Hint("2.  Channel \226\128\148 On the same Mesh & Accounts page, set a Channel name of 16+ letters and numbers. It is case sensitive and must be identical on every account \226\128\148 think of it as the room your accounts meet in.")
+    ds:Hint("3.  Token \226\128\148 Set a 6-character Token (letters/numbers), also identical everywhere. Generate the credentials on the Mesh & Accounts page, or paste a setup bundle to copy the same Channel and Token to another account. The Channel + Token together are your mesh password; anyone with both can see your roster, so keep them private.")
     ds:Hint("4.  Same faction \226\128\148 The mesh rides a hidden faction chat channel, so each account must log in a character on the SAME faction to connect. Cross-faction characters simply will not mesh.")
     ds:Hint("5.  Enable + relog \226\128\148 Enable the mesh, then log out and back in once on each account. Your characters appear across accounts within seconds.")
-    ds:Hint("6.  Verify \226\128\148 Open the 60s or Online tab; you should see characters from your other accounts. If not, check Troubleshooting above.")
+    ds:Hint("6.  Verify \226\128\148 Open the Characters tab; you should see characters from your other accounts. Use the scope chips (All / 60s / Summoners) and the Card/Grid toggle to filter and compare, and open a character for its Notes and detail. If not, check Troubleshooting above.")
 
     pane:Layout()
     return { Refresh = function() pane:Layout() end }

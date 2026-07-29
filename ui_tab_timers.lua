@@ -1,14 +1,73 @@
 -- Daseeki Nexus — ui_tab_timers.lua
--- The "Timers" tab (spec §3): a World Buff Timers section (Rend, Ony-Horde,
--- Ony-Alliance) with live status + off-CD stamp + a pop-log popup per buff, a
--- Songflowers section (10 Felwood nodes with respawn/UP?/no-data states), and a
--- throttled Broadcast Timers button. Refreshes once per second while visible.
+-- The "Timers" tab — BRAND_SPEC §7 "Field Ledger" Screen 2 (WAVE R2-a).
+--
+-- Owner-locked shape (mockup Screen 2, BRAND_SPEC §6/§7/§8):
+--   * World buffs = COMPACT ledger rows (~31px): real spell-icon tile · name
+--     (+faction crest / source) · status = green "Open" (ok token) when the buff
+--     is off-cooldown OR an OUTLINED countdown numeral when on CD · absolute
+--     off-CD stamp · Log link (existing pop-log popups kept). NO large HUD bars
+--     on this page — pull bars live only in the HUD (Screen 4).
+--   * Songflowers = a fixed 2×5 grid (no scroll). Each cell: node number + label,
+--     plain state copy ("Respawn M:SS" / "UP?" / "No data"), fed by GetNodeState.
+--   * Broadcast Timers button + hint (plain copy) at the foot.
+--
+-- Ledger dress: UI.PaintLedgerGround (grain + vignette + the window's ONE bronze
+-- keyline), ceremonial section headers (MORPHEUS ≥16, §3/§7), microLabel / numeral
+-- telemetry fonts. Attention inversion (§5/§8): off-cooldown = calm green "Open";
+-- an imminent CD (≤20 min) uses danger red with a BRIGHTEN pulse (raises luminance,
+-- never alpha-dims — §8). Text/numerals live on child frames with flat fills so no
+-- glyph ever sits on the grain (§4 layering contract).
+--
+-- Clean-room build on our own DaseekiUI/Ledger stack. No third-party code.
 
 local ADDON, ns = ...
-local UI = DaseekiUI
-local Dashboard = ns.Dashboard
+local UI = DaseekiUI                 -- nil under the headless harness; only ever
+local Dashboard = ns.Dashboard       -- dereferenced inside function bodies below.
 
-local ROW_H = 26
+----------------------------------------------------------------------
+-- Metrics.
+----------------------------------------------------------------------
+
+local PAD      = 10
+local WB_ROW_H = 31     -- compact world-buff ledger row (mockup .wbrow)
+local WB_GAP   = 2
+local WB_TILE  = 20     -- real-spell-icon tile edge
+local SF_COLS  = 5      -- songflower grid = 2 rows × 5 cols = 10 nodes (no scroll)
+local SF_GAP   = 6
+local SF_CELL_H = 50
+local SF_IMMINENT = 20 * 60   -- CD ≤ 20 min = danger + brighten pulse (§8)
+
+-- Raise luminance of a color toward white (never darkens); mirrors the ledger
+-- kit's urgency-brighten so an imminent countdown BRIGHTENS instead of dimming
+-- (BRAND_SPEC §8 — "brighten, not alpha-dim").
+local function brighten(r, g, b, t)
+    t = t or 0.35
+    return r + (1 - r) * t, g + (1 - g) * t, b + (1 - b) * t
+end
+
+----------------------------------------------------------------------
+-- PURE grid-cell layout math (harness-testable; no frames touched). Returns the
+-- 0-based col/row plus the x offset, y offset (negative, top-anchored) and cell
+-- width for a 1-based `index` in a `cols`-wide grid that fills `areaW` with `gap`
+-- between cells and `cellH` tall rows. Exported so the self-test can exercise the
+-- 2×5 songflower placement without a live UI.
+----------------------------------------------------------------------
+
+function Dashboard.TimersGridCell(index, cols, areaW, gap, cellH, rowGap)
+    cols   = cols or SF_COLS
+    gap    = gap or SF_GAP
+    rowGap = rowGap or gap
+    local col = (index - 1) % cols
+    local row = math.floor((index - 1) / cols)
+    local cellW = (areaW - (cols - 1) * gap) / cols
+    return {
+        col = col,
+        row = row,
+        x   = col * (cellW + gap),
+        y   = -(row * ((cellH or SF_CELL_H) + rowGap)),
+        w   = cellW,
+    }
+end
 
 local function fstr(parent, key)
     local f = parent:CreateFontString(nil, "OVERLAY")
@@ -16,14 +75,45 @@ local function fstr(parent, key)
     return f
 end
 
+-- A ceremonial section header (MORPHEUS ≥16, §3/§7) reusing the kit header (which
+-- carries the ruled hairline under the title) with the font swapped to ceremonial.
+-- Returns header, metaFontString (right-aligned microLabel caption).
+local function sectionHeader(parent, title)
+    local h = UI.MakeSectionHeader(parent, title)
+    if h._label then h._label:SetFontObject(UI.fonts.ceremonial) end
+    local meta = fstr(h, "microLabel")
+    meta:SetJustifyH("RIGHT")
+    meta:SetPoint("TOPRIGHT", h, "TOPRIGHT", 0, -4)
+    meta:SetTextColor(UI.Color("faint"))
+    h._meta = meta
+    return h, meta
+end
+
+-- A small bordered tile holding a real spell icon (attention-inverted context is
+-- carried by the row's status, not the tile — the icon just identifies the buff).
+local function makeIconTile(parent, size)
+    local t = CreateFrame("Frame", nil, parent, "BackdropTemplate")
+    t:SetSize(size, size)
+    UI.Skin(t, function(self)
+        self:SetBackdrop(UI.FLAT_BACKDROP)
+        self:SetBackdropColor(UI.Color("inset"))
+        self:SetBackdropBorderColor(UI.Color("bronzeDim"))
+    end)
+    local ic = t:CreateTexture(nil, "ARTWORK")
+    ic:SetPoint("TOPLEFT", t, "TOPLEFT", 1, -1)
+    ic:SetPoint("BOTTOMRIGHT", t, "BOTTOMRIGHT", -1, 1)
+    ic:SetTexCoord(0.08, 0.92, 0.08, 0.92)
+    t.icon = ic
+    return t
+end
+
 local function anchorOf(state)
     if not state then return 0 end
     return math.max(state.lastPop or 0, state.lastKilled or 0)
 end
 
--- World-buff rows. Onyxia rows carry a faction `crest` (parity item 8) shown as
--- a PvP crest icon after the name instead of "— Horde"/"— Alliance" text; `title`
--- disambiguates the (otherwise identical) Onyxia pop-log headers.
+-- World-buff rows. Onyxia rows carry a faction `crest` (parity item 8) shown as a
+-- PvP crest icon after the name; `title` disambiguates the pop-log headers.
 local WB_ROWS = {
     { key = "rend", logKey = "rend", slot = 2, label = "Rend (Warchief's)", title = "Rend" },
     { key = "onyH", logKey = "onyH", slot = 1, label = "Onyxia", crest = "Horde",    title = "Onyxia (Horde)" },
@@ -31,7 +121,7 @@ local WB_ROWS = {
 }
 
 ----------------------------------------------------------------------
--- Pop-log popup (shared instance; retargeted per buff).
+-- Pop-log popup (shared instance; retargeted per buff). Unchanged from R1.
 ----------------------------------------------------------------------
 
 local function ensurePopLog()
@@ -113,39 +203,50 @@ local function showPopLog(logKey, titleText)
 end
 
 ----------------------------------------------------------------------
--- Tab registration
+-- Tab registration — Screen 2.
 ----------------------------------------------------------------------
 
 Dashboard.RegisterTab("timers", function(host)
     local obj = {}
-    local box = UI.FlatFrame(host, "inset", "border")
+
+    -- Ledger ground for the whole page (grain + vignette + the window's ONE bronze
+    -- keyline). Rows/cells carry their own flat fills so glyphs never sit on grain.
+    local box = UI.FlatFrame(host, "ground", "border")
     box:SetAllPoints(host)
+    UI.PaintLedgerGround(box, { keyline = true })
 
-    -- World Buff Timers section.
-    local wbHdr = UI.MakeSectionHeader(box, "World Buff Timers")
-    wbHdr:SetPoint("TOPLEFT", box, "TOPLEFT", 12, -10)
-    wbHdr:SetPoint("TOPRIGHT", box, "TOPRIGHT", -12, -10)
+    ------------------------------------------------------------------
+    -- World buffs section — compact ledger rows.
+    ------------------------------------------------------------------
+    local wbHdr = sectionHeader(box, "World buffs")
+    wbHdr:SetPoint("TOPLEFT", box, "TOPLEFT", PAD, -PAD)
+    wbHdr:SetPoint("TOPRIGHT", box, "TOPRIGHT", -PAD, -PAD)
+    wbHdr._meta:SetText("live board")
 
-    local wbRows = {}
-    local prev
+    local wbRows, prev = {}, nil
     for i, def in ipairs(WB_ROWS) do
         local r = CreateFrame("Frame", nil, box)
-        r:SetHeight(ROW_H)
+        r:SetHeight(WB_ROW_H)
         if prev then
-            r:SetPoint("TOPLEFT", prev, "BOTTOMLEFT", 0, -2)
-            r:SetPoint("TOPRIGHT", prev, "BOTTOMRIGHT", 0, -2)
+            r:SetPoint("TOPLEFT", prev, "BOTTOMLEFT", 0, -WB_GAP)
+            r:SetPoint("TOPRIGHT", prev, "BOTTOMRIGHT", 0, -WB_GAP)
         else
             r:SetPoint("TOPLEFT", wbHdr, "BOTTOMLEFT", 0, -4)
             r:SetPoint("TOPRIGHT", wbHdr, "BOTTOMRIGHT", 0, -4)
         end
         r._def = def
-        r.icon = r:CreateTexture(nil, "ARTWORK")
-        r.icon:SetSize(18, 18); r.icon:SetPoint("LEFT", r, "LEFT", 2, 0)
-        r.icon:SetTexCoord(0.08, 0.92, 0.08, 0.92)
-        r.icon:SetTexture(Dashboard.AuraIcon(def.slot))   -- real-spell icon (shared source)
-        r.name = fstr(r, "body"); r.name:SetPoint("LEFT", r.icon, "RIGHT", 8, 0); r.name:SetText(def.label)
-        -- Faction crest after the name for Onyxia rows (parity item 8), replacing
-        -- the "— Horde"/"— Alliance" text; status anchors after the crest.
+
+        -- Flat row fill (token "ground") so the row's text sits on flat colour, not
+        -- grain (§4 layering) — reads as the same worn ground the box paints.
+        r.bg = r:CreateTexture(nil, "BACKGROUND")
+        r.bg:SetAllPoints(r)
+        UI.Skin(r.bg, function(self) self:SetColorTexture(UI.Color("ground")) end)
+
+        r.tile = makeIconTile(r, WB_TILE)
+        r.tile:SetPoint("LEFT", r, "LEFT", 4, 0)
+        r.tile.icon:SetTexture(Dashboard.AuraIcon(def.slot))
+
+        r.name = fstr(r, "body"); r.name:SetPoint("LEFT", r.tile, "RIGHT", 9, 0); r.name:SetText(def.label)
         local afterName = r.name
         if def.crest then
             r.crest = r:CreateTexture(nil, "ARTWORK")
@@ -154,56 +255,65 @@ Dashboard.RegisterTab("timers", function(host)
             r.crest:SetTexCoord(0.02, 0.62, 0.03, 0.63)
             afterName = r.crest
         end
-        r.status = fstr(r, "body"); r.status:SetPoint("LEFT", afterName, "RIGHT", 12, 0)
+
+        -- Log link (kept — existing pop-log popup).
         r.log = UI.MakeButton(r, { text = "Log", variant = "quiet", width = 44, height = 20,
             onClick = function() showPopLog(def.logKey, (def.title or def.label) .. " — Pop Log") end })
         r.log:SetPoint("RIGHT", r, "RIGHT", 2, 0)
-        r.stamp = fstr(r, "small"); r.stamp:SetPoint("RIGHT", r.log, "LEFT", -10, 0); r.stamp:SetJustifyH("RIGHT")
+        -- Absolute off-CD stamp (microLabel), left of the Log link.
+        r.stamp = fstr(r, "microLabel"); r.stamp:SetPoint("RIGHT", r.log, "LEFT", -10, 0); r.stamp:SetJustifyH("RIGHT")
+        -- Status: green "Open" OR an outlined countdown numeral, right of the stamp.
+        r.status = fstr(r, "numeral"); r.status:SetPoint("RIGHT", r.stamp, "LEFT", -12, 0); r.status:SetJustifyH("RIGHT")
+
+        -- ONE hairline per row (§5/§6): a bottom rule.
+        r.rule = UI.Hairline(r, { token = "border" })
+        r.rule:SetPoint("BOTTOMLEFT", r, "BOTTOMLEFT", 2, 0)
+        r.rule:SetPoint("BOTTOMRIGHT", r, "BOTTOMRIGHT", -2, 0)
+
         wbRows[i] = r
         prev = r
     end
 
-    -- Songflowers section.
-    local sfHdr = UI.MakeSectionHeader(box, "Songflowers (Felwood)")
+    ------------------------------------------------------------------
+    -- Songflowers section — fixed 2×5 grid (no scroll).
+    ------------------------------------------------------------------
+    local sfHdr, sfMeta = sectionHeader(box, "Songflowers")
     sfHdr:SetPoint("TOPLEFT", prev, "BOTTOMLEFT", 0, -12)
     sfHdr:SetPoint("TOPRIGHT", prev, "BOTTOMRIGHT", 0, -12)
 
-    -- Scroll the songflower list (10 rows) so a short window still fits.
-    local sfScroll = CreateFrame("ScrollFrame", nil, box)
-    sfScroll:SetPoint("TOPLEFT", sfHdr, "BOTTOMLEFT", 0, -4)
-    sfScroll:SetPoint("BOTTOMRIGHT", box, "BOTTOMRIGHT", -12, 40)
-    sfScroll:SetClipsChildren(true)
-    sfScroll:EnableMouseWheel(true)
-    local sfChild = CreateFrame("Frame", nil, sfScroll)
-    sfChild:SetSize(1, 1); sfScroll:SetScrollChild(sfChild)
-    sfScroll:SetScript("OnMouseWheel", function(self, delta)
-        local maxs = math.max(0, sfChild:GetHeight() - self:GetHeight())
-        local cur = self:GetVerticalScroll()
-        self:SetVerticalScroll(math.max(0, math.min(maxs, cur - delta * 28)))
-    end)
-
-    local sfRows = {}
     local nodes = ns.Timers and ns.Timers.NODES and ns.Timers.NODES.flower or {}
+    local sfCells = {}
     for i = 1, #nodes do
-        local r = CreateFrame("Frame", nil, sfChild)
-        r:SetHeight(20)
-        r:SetPoint("TOPLEFT", sfChild, "TOPLEFT", 0, -((i - 1) * 20))
-        r:SetPoint("TOPRIGHT", sfChild, "TOPRIGHT", 0, -((i - 1) * 20))
-        local num = fstr(r, "small"); num:SetPoint("LEFT", r, "LEFT", 2, 0); num:SetWidth(20)
-        num:SetText(tostring(i))
-        r.name = fstr(r, "body"); r.name:SetPoint("LEFT", num, "RIGHT", 4, 0)
-        r.name:SetText(nodes[i].label or ("Node " .. i))
-        r.state = fstr(r, "body"); r.state:SetPoint("RIGHT", r, "RIGHT", 2, 0); r.state:SetJustifyH("RIGHT")
-        r._nodeKey = "flower" .. i
-        sfRows[i] = r
+        local cell = UI.FlatFrame(box, "panel", "border")
+        cell:SetHeight(SF_CELL_H)
+        cell.no = fstr(cell, "microLabel"); cell.no:SetPoint("TOPLEFT", cell, "TOPLEFT", 7, -6)
+        cell.no:SetTextColor(UI.Color("faint")); cell.no:SetText(("%02d"):format(i))
+        cell.nm = fstr(cell, "body"); cell.nm:SetPoint("TOPLEFT", cell.no, "BOTTOMLEFT", 0, -2)
+        cell.nm:SetJustifyH("LEFT"); cell.nm:SetWordWrap(true)
+        cell.nm:SetText(nodes[i].label or ("Node " .. i))
+        cell.st = fstr(cell, "microLabel"); cell.st:SetPoint("BOTTOMLEFT", cell, "BOTTOMLEFT", 7, 6)
+        cell.st:SetJustifyH("LEFT")
+        cell._nodeKey = "flower" .. i
+        sfCells[i] = cell
     end
-    sfChild:SetHeight(math.max(#nodes * 20, 1))
-    sfScroll:SetScript("OnSizeChanged", function() sfChild:SetWidth(sfScroll:GetWidth()) end)
 
-    -- Broadcast Timers button (bottom) — the tab's one primary action (parity
-    -- item 9). DaseekiUI's most prominent button style is variant "normal"
-    -- (control fill + accent border); there is no separate "primary" variant, so
-    -- "normal" IS primary here, paired with an inline muted note.
+    -- Lay the grid out from the current box width (called on every resize). Cell
+    -- width flexes; the label wraps inside. Pure math via Dashboard.TimersGridCell.
+    local function layoutGrid()
+        local areaW = box:GetWidth() - 2 * PAD
+        if areaW <= 0 then return end
+        for i, cell in ipairs(sfCells) do
+            local g = Dashboard.TimersGridCell(i, SF_COLS, areaW, SF_GAP, SF_CELL_H)
+            cell:ClearAllPoints()
+            cell:SetPoint("TOPLEFT", sfHdr, "BOTTOMLEFT", g.x, -6 + g.y)
+            cell:SetWidth(g.w)
+            cell.nm:SetWidth(g.w - 14)
+        end
+    end
+
+    ------------------------------------------------------------------
+    -- Broadcast Timers button + hint (plain copy).
+    ------------------------------------------------------------------
     local bcast = UI.MakeButton(box, {
         text = "Broadcast Timers", variant = "normal", width = 160, height = 24,
         onClick = function(self)
@@ -221,72 +331,136 @@ Dashboard.RegisterTab("timers", function(host)
             end
         end,
     })
-    bcast:SetPoint("BOTTOMLEFT", box, "BOTTOMLEFT", 12, 10)
-    local bcastHint = fstr(box, "small")
+    bcast:SetPoint("BOTTOMLEFT", box, "BOTTOMLEFT", PAD, 10)
+    local bcastHint = fstr(box, "microLabel")
     bcastHint:SetPoint("LEFT", bcast, "RIGHT", 10, 0)
     bcastHint:SetText("Sends your timer data to the mesh (throttled 60s).")
     bcastHint:SetTextColor(UI.Color("muted"))
 
+    ------------------------------------------------------------------
     -- Refresh routine.
+    ------------------------------------------------------------------
     function obj.Refresh()
         local T = ns.Timers
         local nowE = Dashboard.Now()
+
         for _, r in ipairs(wbRows) do
             local def = r._def
             local state = T and T.state and T.state[def.key]
             local anchor = anchorOf(state)
             local info = T and T.ComputeCD and T.ComputeCD(def.key, anchor, nowE)
             if not info or anchor <= 0 then
-                r.status:SetText("no data"); r.status:SetTextColor(UI.Color("faint"))
+                r.status:SetText("No data"); r.status:SetTextColor(UI.Color("faint"))
+                r.status._pulse = false
                 r.stamp:SetText("")
             elseif info.ready then
-                r.status:SetText("Can Pop"); r.status:SetTextColor(UI.Color("ok"))
+                -- Off-cooldown = green "Open" (§6 binding; ok token). Calm, not urgent.
+                r.status:SetText("Open"); r.status:SetTextColor(UI.Color("ok"))
+                r.status._pulse = false
                 r.stamp:SetText("")
             else
                 local rem = info.remaining or 0
                 local killed = state.lastKilled and state.lastKilled >= (state.lastPop or 0)
-                if rem <= 20 * 60 then
-                    r.status:SetText((killed and "Killed · " or "") .. Dashboard.FormatDuration(rem))
+                r.status:SetText((killed and "Killed · " or "") .. Dashboard.FormatDuration(rem))
+                if rem <= SF_IMMINENT then
+                    -- Imminent: danger red + brighten pulse (driven by the ticker, §8).
                     r.status:SetTextColor(UI.Color("danger"))
                     r.status._pulse = true
                 else
-                    -- Amber (warn) countdown for CD > 20min (parity item 8 /
-                    -- spec §3 "steady orange").
-                    r.status:SetText(Dashboard.FormatDuration(rem))
+                    -- Steady amber for CD > 20 min (§3 "steady orange").
                     r.status:SetTextColor(UI.Color("warn"))
                     r.status._pulse = false
                 end
-                -- Absolute off-CD stamp to the second, server time (parity item 8).
                 r.stamp:SetText("off CD " .. date("%H:%M:%S", info.nextAt))
                 r.stamp:SetTextColor(UI.Color("muted"))
             end
         end
-        for _, r in ipairs(sfRows) do
-            local ns_state = T and T.GetNodeState and T.GetNodeState(r._nodeKey)
-            if not ns_state or ns_state.state == "unknown" then
-                r.state:SetText("No data"); r.state:SetTextColor(UI.Color("faint"))
-            elseif ns_state.state == "down" then
-                r.state:SetText("Respawn " .. Dashboard.FormatDuration(ns_state.remaining))
-                r.state:SetTextColor(UI.Color("accent"))
+
+        local nUp, nDown, nUnknown = 0, 0, 0
+        for _, cell in ipairs(sfCells) do
+            local st = T and T.GetNodeState and T.GetNodeState(cell._nodeKey)
+            if not st or st.state == "unknown" then
+                cell.st:SetText("No data"); cell.st:SetTextColor(UI.Color("faint"))
+                nUnknown = nUnknown + 1
+            elseif st.state == "down" then
+                cell.st:SetText("Respawn " .. Dashboard.FormatDuration(st.remaining))
+                cell.st:SetTextColor(UI.Color("muted"))
+                nDown = nDown + 1
             else -- up
-                r.state:SetText("UP?"); r.state:SetTextColor(UI.Color("ok"))
+                cell.st:SetText("UP?"); cell.st:SetTextColor(UI.Color("ok"))
+                nUp = nUp + 1
             end
         end
+        sfMeta:SetText(("Felwood · %d up · %d respawning · %d unknown"):format(nUp, nDown, nUnknown))
     end
 
-    -- 1s ticker + red-status pulse while the tab is visible.
+    ------------------------------------------------------------------
+    -- 1s ticker + brighten pulse for imminent world-buff countdowns (§8). A hidden
+    -- frame receives no OnUpdate, so the ticker pauses when another tab is shown.
+    ------------------------------------------------------------------
     local accum = 0
     host:SetScript("OnUpdate", function(self, elapsed)
         accum = accum + elapsed
-        local a = 0.5 + 0.5 * math.abs(math.sin(GetTime() * 3))
+        local dr, dg, db = UI.Color("danger")
+        local t = 0.4 * math.abs(math.sin(GetTime() * 3))   -- 0 .. 0.4 toward white
         for _, r in ipairs(wbRows) do
-            if r.status._pulse then r.status:SetAlpha(a) else r.status:SetAlpha(1) end
+            r.status:SetAlpha(1)   -- never alpha-dim (§8)
+            if r.status._pulse then
+                r.status:SetTextColor(brighten(dr, dg, db, t))
+            end
         end
         if accum >= 1 then accum = 0; ns:SafeCall(obj.Refresh) end
     end)
-    -- A hidden frame receives no OnUpdate, so the ticker pauses automatically
-    -- when another tab is shown; no explicit teardown needed.
 
-    box:SetScript("OnSizeChanged", function() obj.Refresh() end)
+    box:SetScript("OnSizeChanged", function() layoutGrid(); obj.Refresh() end)
+    layoutGrid()
     return obj
 end)
+
+----------------------------------------------------------------------
+-- Self-test: the pure songflower-grid layout math (Dashboard.TimersGridCell).
+-- Verifies the 2×5 placement (5 per row, correct col/row/x/width) that the live
+-- layoutGrid relies on — runs headless (no frames). Registered as suite "timersui"
+-- (distinct from timers.lua's engine "timers" suite).
+----------------------------------------------------------------------
+
+local function testGridLayout(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    -- 10 nodes, 5 columns, 400px area, 6px gap. cellW = (400 - 4*6)/5 = 75.2.
+    local areaW, cols, gap, cellH = 400, 5, 6, 50
+    local expW = (areaW - (cols - 1) * gap) / cols
+    -- Row 0: indices 1..5 (col 0..4, row 0).
+    for i = 1, 5 do
+        local g = Dashboard.TimersGridCell(i, cols, areaW, gap, cellH)
+        ck(g.row == 0, "index " .. i .. " on row 0")
+        ck(g.col == i - 1, "index " .. i .. " col == " .. (i - 1))
+        ck(math.abs(g.w - expW) < 1e-9, "index " .. i .. " width == " .. expW)
+        ck(math.abs(g.x - (i - 1) * (expW + gap)) < 1e-9, "index " .. i .. " x offset")
+        ck(g.y == 0, "row-0 cells sit at y == 0")
+    end
+    -- Row 1: index 6 is the first cell of the second row (col 0, row 1).
+    local g6 = Dashboard.TimersGridCell(6, cols, areaW, gap, cellH)
+    ck(g6.col == 0 and g6.row == 1, "index 6 wraps to col 0 / row 1")
+    ck(g6.x == 0, "index 6 x resets to 0 on the new row")
+    ck(g6.y == -(cellH + gap), "index 6 drops one row (y == -(cellH+gap))")
+    -- Index 10 is the last cell (col 4, row 1).
+    local g10 = Dashboard.TimersGridCell(10, cols, areaW, gap, cellH)
+    ck(g10.col == 4 and g10.row == 1, "index 10 is col 4 / row 1 (grid corner)")
+    -- Distinct rowGap is honored when supplied.
+    local gr = Dashboard.TimersGridCell(6, cols, areaW, gap, cellH, 20)
+    ck(gr.y == -(cellH + 20), "custom rowGap applied to y")
+end
+
+if ns.RegisterSelfTest then
+    ns:RegisterSelfTest("timersui", function(verbose)
+        local fails = {}
+        local ok = pcall(testGridLayout, fails)
+        local passed = ok and #fails == 0
+        if verbose and ns and ns.Print then
+            if passed then ns:Print("  PASS timersui/songflower grid layout")
+            elseif not ok then ns:Print("  FAIL timersui/songflower grid layout :: error in test")
+            else for _, f in ipairs(fails) do ns:Print("  FAIL timersui/songflower grid layout :: " .. f) end end
+        end
+        return passed
+    end)
+end
