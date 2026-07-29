@@ -26,6 +26,7 @@ syncns.lua
 import.lua
 ui_shell.lua
 ui_roster.lua
+ui_ledgerpage.lua
 ui_tab_timers.lua
 hud.lua
 pins.lua
