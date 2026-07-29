@@ -946,7 +946,9 @@ local function buildMesh(flow)
     -- Account ID leads the credential group — the mesh keys off this identity, so it
     -- sits directly above the channel/token (relocated here from General per owner).
     local acctRow = flow:AddRow({ vAlign = "center" })
-    acctRow:Label("Account ID")
+    -- Inline-left "Account ID" label on the same 64px column as the Channel/Token
+    -- fields below (style law: no naked inputs). Owner round-1 density note.
+    local acctLbl = acctRow:Label("Account ID"); acctLbl.uiWidth = 64; acctLbl._label:SetWidth(64)
     local acctStatus
     local acctBox = acctRow:EditBox({
         width = 70,
@@ -992,26 +994,27 @@ local function buildMesh(flow)
         end
     end)
 
-    -- ── Credential actions: Generate · Copy/Paste bundle · Setup guide ─────────
-    -- These make the hardest first-run task (matching two case-sensitive secrets
-    -- byte-for-byte across accounts) one click. Generate fills the fields but does
-    -- NOT enable the mesh; the user still flips Enable above.
-    local genRow = flow:AddRow({ vAlign = "center" })
-    local genLine = flow:AddRow():Label("")
-    genRow:Button({ text = "Generate credentials", width = 180, onClick = function()
+    -- ── Credential actions: ONE compact row + ONE combined hint (owner round-1
+    -- density pass). Previously three stacked button groups each with its own hint.
+    -- The four setup actions now sit on a single row; functional wiring (generate /
+    -- bundle encode-decode / setup guide) is unchanged. Generate's success is shown
+    -- by the chat notice + the "ready to enable" status line above (cfgStatus), so
+    -- the old inline "Generated…" label is retired rather than duplicating it.
+    local actRow  = flow:AddRow({ vAlign = "center" })
+    local actLine = flow:AddRow():Label("")   -- register-owned new-here prompt (below)
+
+    actRow:Button({ text = "Generate", width = 96, onClick = function()
         local db = DB(); if not db then return end
         local c, t = Options.GenerateChannel(), Options.GenerateToken()
         db.mesh.channel, db.mesh.token = c, t
-        genLine._label:SetText("|cff66dd66Generated a 20-character channel and 6-character token. Copy the setup bundle to your other accounts, then enable the mesh.|r")
         ns:Print("credentials generated. Copy the setup bundle to your other accounts, then enable the mesh.")
         refreshPage("mesh")
     end })
 
-    local bundleRow = flow:AddRow({ vAlign = "center" })
-    bundleRow:Button({ text = "Copy setup bundle", width = 160, onClick = function()
+    actRow:Button({ text = "Copy bundle", width = 110, onClick = function()
         local str = Options.EncodeBundle(chanRaw(), tokRaw())
         if not str then
-            ns:Print("set a valid channel and token first (Generate credentials does this).")
+            ns:Print("set a valid channel and token first (Generate does this).")
             return
         end
         if DS and DS.ShowTextDialog then
@@ -1020,7 +1023,8 @@ local function buildMesh(flow)
             ns:Print("setup bundle: " .. str)
         end
     end })
-    bundleRow:Button({ text = "Paste setup bundle", width = 160, variant = "quiet", onClick = function()
+
+    actRow:Button({ text = "Paste bundle", width = 110, variant = "quiet", onClick = function()
         if not (DS and DS.ShowTextDialog) then
             ns:Print("paste is unavailable — update Daseeki Core.")
             return
@@ -1042,22 +1046,22 @@ local function buildMesh(flow)
             refreshPage("mesh")
         end)
     end })
-    flow:Hint("Generate on your first account, Copy the bundle, then Paste it on each other account. The Account ID stays unique per account and is never shared in the bundle.")
 
-    -- First-run guide entry: a Setup guide button is always available; when the
-    -- mesh is unconfigured a prompt line leads the user to it.
-    local guideRow = flow:AddRow({ vAlign = "center" })
-    guideRow:Button({ text = "Setup guide", width = 130, onClick = function()
+    actRow:Button({ text = "Setup guide", width = 104, onClick = function()
         Options.ShowSetupWizard()
     end })
-    local guideLine = guideRow:Label("")
+
+    -- New-here prompt (register-owned): shown until the mesh is configured, then
+    -- clears. Same trigger the old guideLine used, now on the shared action line.
     register("mesh", function()
         if isConfigured() then
-            guideLine._label:SetText("")
+            actLine._label:SetText("")
         else
-            guideLine._label:SetText("|cffddaa44New here? Open the setup guide to connect this account in three steps.|r")
+            actLine._label:SetText("|cffddaa44New here? Open the Setup guide to connect this account in three steps.|r")
         end
     end)
+
+    flow:Hint("Generate credentials on your first account, Copy the bundle, then Paste it on each other account (Setup guide walks you through it). The Account ID stays unique per account and is never shared in the bundle.")
 
     -- Suppress mesh-disabled alert — a notification preference. It formerly shared the
     -- Enable row; since Enable now leads the section alone, this keeps its own row

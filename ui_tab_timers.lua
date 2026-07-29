@@ -69,6 +69,39 @@ function Dashboard.TimersGridCell(index, cols, areaW, gap, cellH, rowGap)
     }
 end
 
+----------------------------------------------------------------------
+-- PURE songflower-cell CONTENT builder (harness-testable; no frames). The owner
+-- round-1 flip makes the TIMER the hero of each cell (not the location name), so
+-- the state->numeral/color mapping is factored out here and exercised by the
+-- "timersui" self-test matrix.
+--
+-- Compact hero numeral: "12s" / "18m" / "2h" while respawning, "UP?" when up, an
+-- em-dash when there's no data. Colors follow BRAND_SPEC §5a (calm must never read
+-- lifeless): a respawning numeral is warm CREAM ("text"), brightening to AMBER
+-- ("warn") under 60s; UP? is ok GREEN; no-data is FAINT.
+----------------------------------------------------------------------
+
+-- Compact single-unit duration ("12s" / "18m" / "2h"). Pure.
+function Dashboard.ShortDur(s)
+    s = math.max(0, math.floor((tonumber(s) or 0) + 0.5))
+    if s >= 3600 then return math.floor(s / 3600) .. "h" end
+    if s >= 60   then return math.floor(s / 60) .. "m" end
+    return s .. "s"
+end
+
+-- Map a node state ({ state = "up"/"down"/"unknown", remaining = n }) to the hero
+-- cell content. Returns (heroText, heroColorToken, captionColorToken). Pure.
+function Dashboard.SongflowerCellContent(st)
+    if not st or st.state == "unknown" then
+        return "\226\128\148", "faint", "faint"   -- em-dash, no data
+    elseif st.state == "down" then
+        local rem = st.remaining or 0
+        return Dashboard.ShortDur(rem), (rem < 60) and "warn" or "text", "muted"
+    else
+        return "UP?", "ok", "muted"
+    end
+end
+
 local function fstr(parent, key)
     local f = parent:CreateFontString(nil, "OVERLAY")
     f:SetFontObject(UI.fonts[key] or UI.fonts.body)
@@ -286,13 +319,24 @@ Dashboard.RegisterTab("timers", function(host)
     for i = 1, #nodes do
         local cell = UI.FlatFrame(box, "panel", "border")
         cell:SetHeight(SF_CELL_H)
-        cell.no = fstr(cell, "microLabel"); cell.no:SetPoint("TOPLEFT", cell, "TOPLEFT", 7, -6)
+        -- Cell number stays a small corner microlabel (top-left).
+        cell.no = fstr(cell, "microLabel"); cell.no:SetPoint("TOPLEFT", cell, "TOPLEFT", 7, -5)
         cell.no:SetTextColor(UI.Color("faint")); cell.no:SetText(("%02d"):format(i))
-        cell.nm = fstr(cell, "body"); cell.nm:SetPoint("TOPLEFT", cell.no, "BOTTOMLEFT", 0, -2)
-        cell.nm:SetJustifyH("LEFT"); cell.nm:SetWordWrap(true)
+        -- HERO: the timer is the focal point — a large outlined countdown numeral
+        -- centered in the cell (owner round-1 flip). Enlarge the telemetry numeral
+        -- face to hero size, keeping its OUTLINE.
+        cell.timer = fstr(cell, "numeral")
+        do
+            local fp, _, ff = cell.timer:GetFont()
+            if fp then cell.timer:SetFont(fp, 22, (ff and ff ~= "" and ff) or "OUTLINE") end
+        end
+        cell.timer:SetPoint("CENTER", cell, "CENTER", 0, 6)
+        cell.timer:SetJustifyH("CENTER")
+        -- Location name demoted to a small caption beneath the numeral.
+        cell.nm = fstr(cell, "microLabel"); cell.nm:SetPoint("BOTTOM", cell, "BOTTOM", 0, 5)
+        cell.nm:SetJustifyH("CENTER"); cell.nm:SetWordWrap(false)
         cell.nm:SetText(nodes[i].label or ("Node " .. i))
-        cell.st = fstr(cell, "microLabel"); cell.st:SetPoint("BOTTOMLEFT", cell, "BOTTOMLEFT", 7, 6)
-        cell.st:SetJustifyH("LEFT")
+        cell.nm:SetTextColor(UI.Color("muted"))
         cell._nodeKey = "flower" .. i
         sfCells[i] = cell
     end
@@ -307,7 +351,8 @@ Dashboard.RegisterTab("timers", function(host)
             cell:ClearAllPoints()
             cell:SetPoint("TOPLEFT", sfHdr, "BOTTOMLEFT", g.x, -6 + g.y)
             cell:SetWidth(g.w)
-            cell.nm:SetWidth(g.w - 14)
+            cell.nm:SetWidth(g.w - 10)
+            cell.timer:SetWidth(g.w - 8)
         end
     end
 
@@ -379,15 +424,16 @@ Dashboard.RegisterTab("timers", function(host)
         local nUp, nDown, nUnknown = 0, 0, 0
         for _, cell in ipairs(sfCells) do
             local st = T and T.GetNodeState and T.GetNodeState(cell._nodeKey)
+            -- Hero numeral + caption color from the PURE content mapper (flip: the
+            -- timer leads, the name is the caption).
+            local heroText, heroTok, capTok = Dashboard.SongflowerCellContent(st)
+            cell.timer:SetText(heroText); cell.timer:SetTextColor(UI.Color(heroTok))
+            cell.nm:SetTextColor(UI.Color(capTok))
             if not st or st.state == "unknown" then
-                cell.st:SetText("No data"); cell.st:SetTextColor(UI.Color("faint"))
                 nUnknown = nUnknown + 1
             elseif st.state == "down" then
-                cell.st:SetText("Respawn " .. Dashboard.FormatDuration(st.remaining))
-                cell.st:SetTextColor(UI.Color("muted"))
                 nDown = nDown + 1
             else -- up
-                cell.st:SetText("UP?"); cell.st:SetTextColor(UI.Color("ok"))
                 nUp = nUp + 1
             end
         end
@@ -451,15 +497,52 @@ local function testGridLayout(fails)
     ck(gr.y == -(cellH + 20), "custom rowGap applied to y")
 end
 
+-- Cell CONTENT matrix (owner round-1 flip): the hero numeral text + color token
+-- and the caption color token for every node state. Verifies compact numerals,
+-- the <60s amber brighten, UP? green, and the no-data em-dash faint.
+local function testCellContent(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local EMDASH = "\226\128\148"
+
+    -- Compact single-unit durations.
+    ck(Dashboard.ShortDur(12) == "12s", "ShortDur seconds -> '12s'")
+    ck(Dashboard.ShortDur(0)  == "0s",  "ShortDur zero -> '0s'")
+    ck(Dashboard.ShortDur(59) == "59s", "ShortDur 59 -> '59s'")
+    ck(Dashboard.ShortDur(60) == "1m",  "ShortDur 60 -> '1m'")
+    ck(Dashboard.ShortDur(18 * 60) == "18m", "ShortDur 1080 -> '18m'")
+    ck(Dashboard.ShortDur(2 * 3600) == "2h", "ShortDur 7200 -> '2h'")
+
+    -- No data -> em-dash, faint numeral + faint caption.
+    local t, c, cap = Dashboard.SongflowerCellContent(nil)
+    ck(t == EMDASH and c == "faint" and cap == "faint", "no state -> em-dash / faint / faint")
+    t, c, cap = Dashboard.SongflowerCellContent({ state = "unknown" })
+    ck(t == EMDASH and c == "faint", "unknown -> em-dash / faint")
+
+    -- Respawning -> compact numeral, warm CREAM ('text'); caption muted.
+    t, c, cap = Dashboard.SongflowerCellContent({ state = "down", remaining = 18 * 60 })
+    ck(t == "18m" and c == "text" and cap == "muted", "down >60s -> '18m' / cream / muted")
+
+    -- Respawning under 60s -> AMBER ('warn') brighten.
+    t, c = Dashboard.SongflowerCellContent({ state = "down", remaining = 45 })
+    ck(t == "45s" and c == "warn", "down <60s -> '45s' / warn (amber)")
+    -- Boundary: exactly 60s is still cream, 59s is amber.
+    ck(select(2, Dashboard.SongflowerCellContent({ state = "down", remaining = 60 })) == "text", "60s boundary is cream")
+    ck(select(2, Dashboard.SongflowerCellContent({ state = "down", remaining = 59 })) == "warn", "59s is amber")
+
+    -- Up -> 'UP?' in ok green.
+    t, c = Dashboard.SongflowerCellContent({ state = "up" })
+    ck(t == "UP?" and c == "ok", "up -> 'UP?' / ok green")
+end
+
 if ns.RegisterSelfTest then
     ns:RegisterSelfTest("timersui", function(verbose)
         local fails = {}
-        local ok = pcall(testGridLayout, fails)
+        local ok = pcall(function() testGridLayout(fails); testCellContent(fails) end)
         local passed = ok and #fails == 0
         if verbose and ns and ns.Print then
-            if passed then ns:Print("  PASS timersui/songflower grid layout")
-            elseif not ok then ns:Print("  FAIL timersui/songflower grid layout :: error in test")
-            else for _, f in ipairs(fails) do ns:Print("  FAIL timersui/songflower grid layout :: " .. f) end end
+            if passed then ns:Print("  PASS timersui/songflower grid layout + cell content")
+            elseif not ok then ns:Print("  FAIL timersui/songflower :: error in test")
+            else for _, f in ipairs(fails) do ns:Print("  FAIL timersui/songflower :: " .. f) end end
         end
         return passed
     end)

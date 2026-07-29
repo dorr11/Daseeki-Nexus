@@ -648,6 +648,175 @@ function Import._MapData(sn)
 end
 
 ----------------------------------------------------------------------
+-- NovaInstanceTracker (NIT) instance-run import
+-- --------------------------------------------------------------------
+-- The owner's own NovaInstanceTracker SavedVariables DATA (global `NITdatabase`)
+-- — interop like the ShadowNetwork importer above. The NIT ADDON SOURCE is NEVER
+-- read (firewall); this mapping was derived solely from the SHAPE of the owner's
+-- own SavedVariables data files.
+--
+-- OBSERVED NIT SHAPE (from the owner's real SV):
+--   NITdatabase.global[<realm>].instances = { <run>, ... }   (array, newest…oldest)
+--   <run> = {
+--     playerName    = "Artaeum",             -- character (no realm; realm is the key)
+--     instanceName  = "Blackwing Lair",      -- display name
+--     instanceID    = 469,                    -- stable numeric id  (our mapID)
+--     enteredTime   = 1660972435,             -- entry epoch        (our t)
+--     leftTime      = 1660983242,             -- exit epoch         (dur = left-entered)
+--     enteredMoney  = 20301778, leftMoney = 137816,   -- copper (gold = left-entered)
+--     enteredXP     = 0,        leftXP    = 0,         -- (xp = left-entered)
+--     zoneID, difficultyID, class, mobCount, group, rep, ...   -- carried, unused
+--   }
+--
+-- Each run -> our instances entry { t, name, mapID, dur, gold, xp, merged=false },
+-- keyed under Name-Realm (realm whitespace stripped, matching tracker.lua's
+-- selfNameRealm). Characters the store already knows are attributed to their
+-- account; unknown characters (orphans) go under the local account id. Idempotent
+-- via Instances.MergeEntryList ((nameRealm,t) dedup + the existing 60-ring cap).
+----------------------------------------------------------------------
+
+-- Build our canonical Name-Realm from a NIT playerName + its realm bucket key.
+-- Realm whitespace is stripped to match tracker.lua's selfNameRealm().
+function Import._NITNameRealm(playerName, realm)
+    if type(playerName) ~= "string" or playerName == "" then return nil end
+    local r = (type(realm) == "string" and (realm:gsub("%s+", ""))) or ""
+    return playerName .. "-" .. r
+end
+
+-- Map ONE NIT run record -> our instances entry, or nil if unusable (no entry
+-- time or no instance name). Gold/XP are stored raw deltas (gold may be negative
+-- when the run spent more than it earned), mirroring instances.lua's live capture.
+function Import._MapInstanceEntry(run)
+    if type(run) ~= "table" then return nil end
+    local t = tonumber(run.enteredTime)
+    local name = run.instanceName
+    if not t or t <= 0 or type(name) ~= "string" or name == "" then return nil end
+    local left = tonumber(run.leftTime)
+    local dur = (left and left > t) and (left - t) or 0
+    local gold = 0
+    local em, lm = tonumber(run.enteredMoney), tonumber(run.leftMoney)
+    if em and lm then gold = lm - em end
+    local xp = 0
+    local ex, lx = tonumber(run.enteredXP), tonumber(run.leftXP)
+    if ex and lx then xp = lx - ex end
+    return { t = t, name = name, mapID = tonumber(run.instanceID), dur = dur, gold = gold, xp = xp, merged = false }
+end
+
+-- PURE core: NITdatabase -> our per-account/per-character instances partial + counts.
+--   ownerIndex = { [nameRealm] = aid }  (accounts the store already knows a char under)
+--   selfAID    = local account id (orphans land here)
+-- Returns (mapped, counts):
+--   mapped = { [aid] = { [nameRealm] = { entries = { entry, ... } } } }
+--   counts = { runs, skipped, chars, attributed, orphaned, perAccount = {[aid]=n} }
+function Import._MapNITData(nitDB, ownerIndex, selfAID)
+    ownerIndex = ownerIndex or {}
+    selfAID = selfAID or ""
+    local mapped, charSet = {}, {}
+    local counts = { runs = 0, skipped = 0, chars = 0, attributed = 0, orphaned = 0, perAccount = {} }
+    local g = (type(nitDB) == "table") and nitDB.global
+    if type(g) ~= "table" then return mapped, counts end
+    for realm, realmData in pairs(g) do
+        local runs = (type(realmData) == "table") and realmData.instances
+        if type(runs) == "table" then
+            for i = 1, #runs do
+                local run = runs[i]
+                local entry = Import._MapInstanceEntry(run)
+                local nameRealm = entry and Import._NITNameRealm(run.playerName, realm)
+                if entry and nameRealm then
+                    local known = ownerIndex[nameRealm]
+                    local aid = known or selfAID
+                    local acct = mapped[aid]; if not acct then acct = {}; mapped[aid] = acct end
+                    local crec = acct[nameRealm]; if not crec then crec = { entries = {} }; acct[nameRealm] = crec end
+                    crec.entries[#crec.entries + 1] = entry
+                    counts.runs = counts.runs + 1
+                    counts.perAccount[aid] = (counts.perAccount[aid] or 0) + 1
+                    if known then counts.attributed = counts.attributed + 1
+                    else counts.orphaned = counts.orphaned + 1 end
+                    if not charSet[nameRealm] then charSet[nameRealm] = true; counts.chars = counts.chars + 1 end
+                elseif run ~= nil then
+                    counts.skipped = counts.skipped + 1
+                end
+            end
+        end
+    end
+    return mapped, counts
+end
+
+-- Reverse index of every character the store already knows -> its account id
+-- (the characters bucket wins over homeless). Used to attribute NIT runs.
+local function buildOwnerIndex()
+    local idx = {}
+    local Store = ns.Store
+    local data = Store and Store.GetData and Store.GetData()
+    local accounts = data and data.accounts
+    if type(accounts) == "table" then
+        for aid, bucket in pairs(accounts) do
+            if type(bucket) == "table" then
+                if type(bucket.characters) == "table" then
+                    for nameRealm in pairs(bucket.characters) do idx[nameRealm] = aid end
+                end
+                if type(bucket.homeless) == "table" then
+                    for nameRealm in pairs(bucket.homeless) do if idx[nameRealm] == nil then idx[nameRealm] = aid end end
+                end
+            end
+        end
+    end
+    return idx
+end
+
+-- Merge the mapped NIT partial into the live Store.data.instances, idempotently
+-- (Instances.MergeEntryList dedups by t and caps to the 60-ring). Returns added.
+function Import._ApplyInstances(mapped)
+    local Store = ns.Store
+    if not (Store and Store.GetData) then return 0 end
+    local data = Store.GetData()
+    if not data then return 0 end
+    if type(data.instances) ~= "table" then data.instances = {} end
+    local Instances = ns.Instances
+    local added = 0
+    for aid, chars in pairs(mapped) do
+        local dest = data.instances[aid]
+        if type(dest) ~= "table" then dest = {}; data.instances[aid] = dest end
+        for nameRealm, crec in pairs(chars) do
+            local drec = dest[nameRealm]
+            if type(drec) ~= "table" then drec = { entries = {} }; dest[nameRealm] = drec end
+            if Instances and Instances.MergeEntryList then
+                local mergedList, n = Instances.MergeEntryList(drec.entries, crec.entries)
+                drec.entries = mergedList
+                added = added + n
+            else
+                for _, e in ipairs(crec.entries) do drec.entries[#drec.entries + 1] = e end
+                added = added + #crec.entries
+            end
+        end
+    end
+    if added > 0 and ns.Fire then
+        ns:Fire("INSTANCES_CHANGED")
+        ns:Fire("STORE_REFRESHED")
+    end
+    return added
+end
+
+-- Ordered summary lines for the NIT counts table (mirrors summaryLines' style).
+local function instanceSummaryLines(counts, selfAID)
+    local lines = {
+        string.format("instances: runs=%d mapped, characters=%d, skipped=%d",
+            counts.runs or 0, counts.chars or 0, counts.skipped or 0),
+        string.format("attribution: %d to known accounts, %d orphaned to local account \"%s\"",
+            counts.attributed or 0, counts.orphaned or 0, (selfAID ~= "" and selfAID) or "(unset)"),
+    }
+    local aids = {}
+    for aid in pairs(counts.perAccount or {}) do aids[#aids + 1] = aid end
+    table.sort(aids)
+    for _, aid in ipairs(aids) do
+        lines[#lines + 1] = string.format("  acct %s: %d runs",
+            (aid ~= "" and aid) or "(unset)", counts.perAccount[aid])
+    end
+    return lines
+end
+Import._InstanceSummaryLines = instanceSummaryLines
+
+----------------------------------------------------------------------
 -- WoW-facing wrappers
 ----------------------------------------------------------------------
 
@@ -663,6 +832,44 @@ end
 function Import.IsAvailable()
     local db, data = snGlobals()
     return (type(db) == "table") or (type(data) == "table")
+end
+
+-- The NovaInstanceTracker SavedVariables global (or nil). Behind _G indexing so
+-- the firewall grep sees the name only as a data string (mirrors snGlobals).
+local function nitGlobal()
+    local G = _G or getfenv(0)
+    return G["NITdatabase"]
+end
+
+-- True when the NovaInstanceTracker SavedVariable is loaded in memory.
+function Import.InstancesAvailable()
+    return type(nitGlobal()) == "table"
+end
+
+-- Import NovaInstanceTracker instance runs into Store.data.instances. `dryRun`
+-- truthy => compute + print counts, apply nothing. Idempotent when applied.
+-- Returns (ok, counts).
+function Import.RunInstances(dryRun)
+    local nitDB = nitGlobal()
+    if type(nitDB) ~= "table" then
+        if ns.Print then ns:Print("import instances: no NovaInstanceTracker SavedVariables found (is it still installed + enabled?).") end
+        return false, nil
+    end
+    local selfAID = (ns.GetAccountID and ns:GetAccountID()) or ""
+    local ownerIndex = buildOwnerIndex()
+    local mapped, counts = Import._MapNITData(nitDB, ownerIndex, selfAID)
+
+    if ns.Print then
+        ns:Print(dryRun and "import instances DRY-RUN (nothing applied):" or "import instances applied:")
+        local lines = instanceSummaryLines(counts, selfAID)
+        for i = 1, #lines do ns:Print("  " .. lines[i]) end
+    end
+
+    if not dryRun then
+        local added = Import._ApplyInstances(mapped)
+        if ns.Print then ns:Print(string.format("  merged %d new entries into the store (idempotent — re-import adds 0).", added)) end
+    end
+    return true, counts
 end
 
 -- Format the count table into ordered summary lines for chat / harness.
@@ -749,13 +956,28 @@ end
 if ns.RegisterSubcommand then
     ns:RegisterSubcommand("import", function(rest)
         rest = (rest and rest:match("^%s*(.-)%s*$")) or ""
+        local first, remainder = rest:match("^(%S*)%s*(.-)%s*$")
+        first, remainder = first or "", remainder or ""
+
+        -- `/nexus import instances [dry]` — NovaInstanceTracker instance runs.
+        if first == "instances" then
+            if not Import.InstancesAvailable() then
+                ns:Print("import: NovaInstanceTracker is not loaded — nothing to import.")
+                return
+            end
+            local dry = (remainder == "dry" or remainder == "dryrun" or remainder == "preview")
+            Import.RunInstances(dry)
+            return
+        end
+
+        -- `/nexus import [dry]` — ShadowNetwork settings + data (default).
         if not Import.IsAvailable() then
             ns:Print("import: ShadowNetwork is not loaded — nothing to import.")
             return
         end
         local dry = (rest == "dry" or rest == "dryrun" or rest == "preview")
         Import.Run(dry)
-    end, "import settings + data from ShadowNetwork ('dry' to preview)")
+    end, "import from ShadowNetwork; 'import instances' pulls NovaInstanceTracker runs ('dry' previews either)")
 end
 
 ----------------------------------------------------------------------
@@ -894,6 +1116,64 @@ local function selfTest(verbose)
     check("merge overwrite scalar", dst.a == 9)
     check("merge keeps untouched", dst.nested.y == 2)
     check("merge overwrote nested", dst.nested.x == 7)
+
+    ------------------------------------------------------------------
+    -- NIT instance-run import: shape mapping, attribution, idempotency.
+    ------------------------------------------------------------------
+    local nitFixture = {
+        global = {
+            ["Jom Gabbar"] = { instances = {
+                { playerName = "Artaeum", instanceName = "Blackwing Lair", instanceID = 469,
+                  enteredTime = 1000, leftTime = 4600, enteredMoney = 500, leftMoney = 1500,
+                  enteredXP = 0, leftXP = 0, mobCount = 900 },
+                { playerName = "Artaeum", instanceName = "Molten Core", instanceID = 409,
+                  enteredTime = 5000, leftTime = 8600, enteredMoney = 2000, leftMoney = 1000 }, -- spent gold
+                { playerName = "", instanceName = "Bad", enteredTime = 9000 },  -- no player -> skip
+                { instanceName = "NoTime", enteredTime = 0 },                   -- no entry time -> skip
+            } },
+            ["Whitemane"] = { instances = {
+                { playerName = "Stranger", instanceName = "Scholomance", instanceID = 289,
+                  enteredTime = 2000, leftTime = 3000, enteredMoney = 10, leftMoney = 60,
+                  enteredXP = 100, leftXP = 900 },  -- xp gain 800
+            } },
+        },
+    }
+    -- Artaeum-JomGabbar is a KNOWN char on account "2"; Stranger-Whitemane is unknown.
+    local mapped, counts = Import._MapNITData(nitFixture, { ["Artaeum-JomGabbar"] = "2" }, "1")
+    check("nit runs mapped (2 JG + 1 WM)", counts.runs == 3)
+    check("nit skipped invalid runs", counts.skipped == 2)
+    check("nit distinct characters", counts.chars == 2)
+    check("nit attributed to known acct", counts.attributed == 2)
+    check("nit orphaned to self", counts.orphaned == 1)
+    check("nit per-account: acct 2 = 2 runs", counts.perAccount["2"] == 2)
+    check("nit per-account: self 1 = 1 run", counts.perAccount["1"] == 1)
+
+    local jg = mapped["2"] and mapped["2"]["Artaeum-JomGabbar"]
+    check("nit known char under acct 2", jg and #jg.entries == 2)
+    local wm = mapped["1"] and mapped["1"]["Stranger-Whitemane"]
+    check("nit orphan under self acct 1", wm and #wm.entries == 1)
+
+    local bwl = jg and jg.entries[1]
+    check("nit t<-enteredTime", bwl and bwl.t == 1000)
+    check("nit name<-instanceName", bwl and bwl.name == "Blackwing Lair")
+    check("nit mapID<-instanceID", bwl and bwl.mapID == 469)
+    check("nit dur = left-entered", bwl and bwl.dur == 3600)
+    check("nit gold = left-entered (copper)", bwl and bwl.gold == 1000)
+    check("nit merged=false", bwl and bwl.merged == false)
+    local mc = jg and jg.entries[2]
+    check("nit negative gold (spent in-run)", mc and mc.gold == -1000)
+    check("nit xp = left-entered", wm and wm.entries[1].xp == 800)
+    check("nit nameRealm strips realm spaces", Import._NITNameRealm("Artaeum", "Jom Gabbar") == "Artaeum-JomGabbar")
+    check("nit nameRealm nil on empty player", Import._NITNameRealm("", "Jom Gabbar") == nil)
+
+    -- Idempotency via the apply path's dedup+cap (Instances.MergeEntryList): a
+    -- re-import of the same mapped list adds ZERO on the second pass.
+    if ns.Instances and ns.Instances.MergeEntryList then
+        local listA, addedA = ns.Instances.MergeEntryList({}, jg.entries)
+        check("nit merge first pass adds all", addedA == 2)
+        local _, addedB = ns.Instances.MergeEntryList(listA, jg.entries)
+        check("nit merge re-import idempotent (adds 0)", addedB == 0)
+    end
 
     if verbose and ns.Print then
         ns:Print(pass and "  import selftest: PASS" or "  import selftest: FAIL")
