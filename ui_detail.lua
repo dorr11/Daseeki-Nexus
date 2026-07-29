@@ -34,16 +34,34 @@ local PAD_H     = 14
 local HEADER_H  = 40          -- header band height (name row + border-bottom)
 local COL_R_W   = 214         -- right column fixed width (mockup dgrid 1fr / 214px)
 local COL_GAP   = 14
--- Buff grid (owner round-2 verdict): UNIFORM SQUARE tiles, icon FILLING the frame
--- (1px inset, cropped), duration text BENEATH, laid in even 3-column rows. Missing
--- buffs render as DESATURATED icons with a danger/warn edge (§5a — not hollow boxes).
-local BUFF_COLS = 3           -- buff grid columns
-local BUFF_TILE = 40          -- SQUARE tile edge (icon fills it)
-local BUFF_CAP_H = 13         -- duration caption line beneath the tile
-local BUFF_CELL_H = BUFF_TILE + 3 + BUFF_CAP_H   -- tile + gap + caption
-local BUFF_ROW_GAP = 8        -- vertical gap between tile rows
-local BUFF_TOP   = 18         -- grid top offset below the eyebrow label
+-- Buff display (owner round-3 verdict): a LABELED ROW LIST (return to the pre-rebuild
+-- detail panel's row pattern) — one row per tracked buff: small cropped/framed icon ·
+-- buff name (tinted by its family hue) · right-aligned STATE status. NOT a tile grid
+-- (that's the compact CARD strip, §5b). The name carries buff IDENTITY; the status
+-- column carries STATE color (Missing / duration / Boon / DMF parenthetical).
+local BUFF_ICON   = 16        -- row icon edge (cropped/framed)
+local BUFF_ROW_H  = 20        -- buff row height
+local BUFF_ROW_GAP = 2        -- gap between rows (pitch = BUFF_ROW_H + gap = 22)
+local BUFF_TOP    = 18        -- list top offset below the eyebrow label
 local TILE_RIM  = "controlBorder"
+
+-- Per-buff FAMILY HUE (echoes each spell icon's dominant color, reference-style) —
+-- these are buff IDENTITY colors (like class/faction colors), deliberately NOT theme
+-- chrome tokens: the spell art is theme-invariant, so the identity hue is too. Keys
+-- match Dashboard.AURA_META[slot].key. Names fall back to the cream "text" token when
+-- the hue's contrast against the active theme's ground is too low (see nameColor).
+local BUFF_HUE = {
+    ony        = { 0.753, 0.529, 0.227 },   -- Rallying Cry — dragon gold
+    rend       = { 0.769, 0.192, 0.275 },   -- Warchief's — warchief red
+    zg         = { 0.310, 0.620, 0.525 },   -- Zandalar — jungle teal
+    songflower = { 0.525, 0.831, 0.169 },   -- Songflower — spring green
+    dmf        = { 0.612, 0.420, 0.984 },   -- Sayge's fortune — arcane violet
+    dmtap      = { 0.851, 0.541, 0.227 },   -- Fengus — ember orange
+    dmtstam    = { 0.431, 0.561, 0.839 },   -- Mol'dar — steel blue
+    dmtsp      = { 0.780, 0.471, 0.690 },   -- Slip'kik — savvy magenta
+    silithyst  = { 0.788, 0.702, 0.478 },   -- Silithyst — desert tan
+    boon       = { 0.247, 0.663, 0.722 },   -- Blackfathom — deep teal
+}
 
 -- Open-page raid tally order + labels (BRAND_SPEC §7 L3: MC BWL ZG AQ40 Naxx Ony AQ20;
 -- keys match Store.RAID_KEYS). Locked = cream ("text"), open = faint. No raid diamonds.
@@ -172,6 +190,22 @@ function Detail.RaidTally(rec, e)
     return out, locked, open
 end
 
+-- Row-list STATUS text + token from a BuffTileState result (pure/testable). The
+-- status column carries the STATE color; the name column carries buff identity.
+--   missing (non-DMF) -> "Missing", danger (required) / warn (optional)
+--   missing DMF        -> its re-acquire state ("READY"/"on CD"/dur) + token
+--   present            -> the duration text (FormatDuration, or "..(Boon)" green)
+-- The DMF row's PRESENT-case parenthetical is appended by the renderer (it embeds an
+-- inline color escape, which would make the pure return string awkward to assert).
+function Detail.RowStatus(s, isDMF)
+    if not s or not s.shown then return "", "faint" end
+    if s.missing then
+        if isDMF then return (s.durText or "READY"), (s.durTok or "ok") end
+        return "Missing", (s.tint or "danger")
+    end
+    return (s.fullText or s.durText or ""), (s.boon and "ok" or (s.durTok or "ok"))
+end
+
 -- Resolve a character record by nameRealm across all account buckets.
 function Detail.Resolve(nameRealm)
     local data = ns.Store and ns.Store.GetData and ns.Store.GetData()
@@ -208,38 +242,54 @@ local function microLabel(parent, text)
     return l
 end
 
--- A SQUARE buff tile: a bordered frame whose real spell icon FILLS it (1px inset,
--- cropped), with the duration text on a caption line BENEATH. Uniform BUFF_TILE
--- edge; the whole cell is BUFF_TILE wide and BUFF_CELL_H tall. Identity is carried
--- by the icon + a hover tooltip (no inline name — the caption is the duration).
-local function makeBuffCell(parent)
-    local cell = CreateFrame("Frame", nil, parent)
-    cell:SetSize(BUFF_TILE, BUFF_CELL_H)
-    -- The icon tile (bordered square; the border tint carries the §5a missing edge).
-    local tile = CreateFrame("Frame", nil, cell, "BackdropTemplate")
-    tile:SetSize(BUFF_TILE, BUFF_TILE)
-    tile:SetPoint("TOP", cell, "TOP", 0, 0)
+-- Resolve a buff name's tint: its family hue, unless that hue's contrast against the
+-- active theme's ground is too weak (light themes), in which case fall back to the
+-- cream "text" token. Returns r,g,b (0..1) for SetTextColor.
+local function relLum(r, g, b) return 0.2126 * r + 0.7152 * g + 0.0722 * b end
+local function nameColor(slot)
+    local D = ns.Dashboard
+    local meta = D and D.AURA_META and D.AURA_META[slot]
+    local hue = meta and BUFF_HUE[meta.key]
+    if not hue then return UI.Color("text") end
+    local gr, gg, gb = UI.Color("ground")
+    if math.abs(relLum(hue[1], hue[2], hue[3]) - relLum(gr, gg, gb)) < 0.20 then
+        return UI.Color("text")   -- insufficient contrast on this theme -> cream
+    end
+    return hue[1], hue[2], hue[3]
+end
+
+-- A LABELED BUFF ROW: cropped/framed ~16px icon · buff name (family-hue tinted) ·
+-- right-aligned status. Full BUFF_ROW_H tall; spans the left column's width.
+local function makeBuffRow(parent)
+    local row = CreateFrame("Frame", nil, parent)
+    row:SetHeight(BUFF_ROW_H)
+    -- Framed icon (thin inset border; §5a desat is applied to the icon in Show).
+    local tile = CreateFrame("Frame", nil, row, "BackdropTemplate")
+    tile:SetSize(BUFF_ICON, BUFF_ICON)
+    tile:SetPoint("LEFT", row, "LEFT", 0, 0)
     local ic = tile:CreateTexture(nil, "ARTWORK")
     ic:SetPoint("TOPLEFT", tile, "TOPLEFT", 1, -1)
     ic:SetPoint("BOTTOMRIGHT", tile, "BOTTOMRIGHT", -1, 1)
     ic:SetTexCoord(0.06, 0.94, 0.06, 0.94)   -- crop the icon's built-in border
     tile.icon = ic
-    cell.tile = tile
-    -- Duration caption, centered beneath the tile.
-    cell.dur = fstr(cell, "numeral", "CENTER")
-    cell.dur:SetPoint("TOP", tile, "BOTTOM", 0, -2)
-    cell.dur:SetPoint("LEFT", cell, "LEFT", -4, 0)
-    cell.dur:SetPoint("RIGHT", cell, "RIGHT", 4, 0)
-    cell:EnableMouse(true)
-    cell:SetScript("OnEnter", function(self)
+    row.tile = tile
+    -- Right-aligned status (STATE color) — anchored first so the name can bound to it.
+    row.status = fstr(row, "body", "RIGHT")
+    row.status:SetPoint("RIGHT", row, "RIGHT", 0, 0)
+    -- Buff name (family-hue tinted), between the icon and the status column.
+    row.name = fstr(row, "body"); row.name:SetJustifyH("LEFT"); row.name:SetWordWrap(false)
+    row.name:SetPoint("LEFT", tile, "RIGHT", 8, 0)
+    row.name:SetPoint("RIGHT", row.status, "LEFT", -8, 0)
+    row:EnableMouse(true)
+    row:SetScript("OnEnter", function(self)
         if not self._tipName then return end
         GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
         GameTooltip:AddLine(self._tipName, UI.Color("text"))
         if self._tipFull then GameTooltip:AddLine(self._tipFull, UI.Color("muted")) end
         GameTooltip:Show()
     end)
-    cell:SetScript("OnLeave", function() GameTooltip:Hide() end)
-    return cell
+    row:SetScript("OnLeave", function() GameTooltip:Hide() end)
+    return row
 end
 
 -- Build the detail pane into `parent` (the tagged detail.pane host from ui_cards).
@@ -285,16 +335,20 @@ function Detail.Attach(parent)
     buffLbl:SetPoint("TOPLEFT", leftCol, "TOPLEFT", 0, 0)
     D.buffLbl = buffLbl
 
-    -- Buff-tile grid container (tagged for the geometry checker) below the label.
-    local buffGrid = CreateFrame("Frame", nil, leftCol)
-    buffGrid:SetPoint("TOPLEFT", leftCol, "TOPLEFT", 0, -BUFF_TOP)
-    buffGrid:SetPoint("BOTTOMRIGHT", leftCol, "BOTTOMRIGHT", 0, 0)
-    tag(buffGrid, "detail.bufftiles")
-    D.buffGrid = buffGrid
+    -- Buff ROW-LIST container (tagged for the geometry checker) below the eyebrow.
+    local buffRows = CreateFrame("Frame", nil, leftCol)
+    buffRows:SetPoint("TOPLEFT", leftCol, "TOPLEFT", 0, -BUFF_TOP)
+    buffRows:SetPoint("BOTTOMRIGHT", leftCol, "BOTTOMRIGHT", 0, 0)
+    tag(buffRows, "detail.buffrows")
+    D.buffRows = buffRows
 
-    D._cells = {}
-    for i = 1, 10 do D._cells[i] = makeBuffCell(buffGrid) end
-    tag(D._cells[1].tile, "detail.bufftile1")   -- 40x40 tile — square-size assertion target
+    D._rows = {}
+    for i = 1, 10 do D._rows[i] = makeBuffRow(buffRows) end
+    -- Stable ids for the row-list geometry assertions (height/pitch, icon size,
+    -- shared left rail, right-aligned status column).
+    tag(D._rows[1], "detail.buffrow1"); tag(D._rows[2], "detail.buffrow2")
+    tag(D._rows[1].tile, "detail.bufficon1")
+    tag(D._rows[1].status, "detail.buffstatus1"); tag(D._rows[2].status, "detail.buffstatus2")
 
     -- Right column (fixed 214): tally · cooldowns · note · actions.
     local rightCol = CreateFrame("Frame", nil, parent)
@@ -303,33 +357,41 @@ function Detail.Attach(parent)
     rightCol:SetWidth(COL_R_W)
     D.rightCol = rightCol
 
+    -- Right column layout (owner round-3): the top rail is a SIDE-BY-SIDE pair —
+    -- COOLDOWNS on the LEFT, RAID LOCKOUTS on the RIGHT (both labels share the
+    -- rightCol top edge). NOTE moves to the BOTTOM where the buttons used to be.
+    -- The Invite + Cancel-buffs buttons are DELETED (owner crossed them out; those
+    -- actions stay on the minimap right-click menu). Split: cooldowns 92 · gap 12 ·
+    -- lockouts 110 within the 214-wide column.
+    local CD_W, LOCK_X = 92, 104
+
+    -- COOLDOWNS block (top-left). CHRONO / HEARTH are inline key→value rows.
+    local cdLbl = microLabel(rightCol, "COOLDOWNS")
+    cdLbl:SetPoint("TOPLEFT", rightCol, "TOPLEFT", 0, 0)
+    tag(cdLbl, "detail.cdlabel")
+    local function cdRow(keyText, y)
+        local kf = fstr(rightCol, "microLabel"); kf:SetTextColor(UI.Color("faint")); kf:SetText(keyText)
+        kf:SetPoint("TOPLEFT", rightCol, "TOPLEFT", 0, y)
+        local vf = fstr(rightCol, "numeral", "RIGHT")
+        vf:SetPoint("TOPRIGHT", rightCol, "TOPLEFT", CD_W, y)   -- right edge at CD_W
+        return vf
+    end
+    local chronoVal = cdRow("CHRONO", -17)
+    local hearthVal = cdRow("HEARTH", -33)
+    D.chronoVal, D.hearthVal = chronoVal, hearthVal
+
+    -- RAID LOCKOUTS block (top-right), sharing the top rail.
     local raidLbl = microLabel(rightCol, "RAID LOCKOUTS")
-    raidLbl:SetPoint("TOPLEFT", rightCol, "TOPLEFT", 0, 0)
+    raidLbl:SetPoint("TOPLEFT", rightCol, "TOPLEFT", LOCK_X, 0)
+    tag(raidLbl, "detail.raidlabel")
     local tallyFS = fstr(rightCol, "numeral"); tallyFS:SetPoint("TOPLEFT", raidLbl, "BOTTOMLEFT", 0, -6)
     tallyFS:SetPoint("RIGHT", rightCol, "RIGHT", 0, 0); tallyFS:SetJustifyH("LEFT"); tallyFS:SetWordWrap(true)
     D.tallyFS = tallyFS
 
-    local cdLbl = microLabel(rightCol, "COOLDOWNS")
-    cdLbl:SetPoint("TOPLEFT", tallyFS, "BOTTOMLEFT", 0, -14)
-    -- Two telemetry columns (CHRONO / HEARTH): a micro-label key over an outlined
-    -- numeral value. Both sit on ONE row well clear of the section header (the round-2
-    -- collision was the key sitting 6px under the label — now the row starts -20 below,
-    -- and the two columns are 100px apart within the 214-wide right column).
-    local function teleCol(keyText, xOff)
-        local c = CreateFrame("Frame", nil, rightCol)
-        c:SetSize(100, 32)
-        c:SetPoint("TOPLEFT", cdLbl, "BOTTOMLEFT", xOff, -8)
-        c.k = fstr(c, "microLabel"); c.k:SetPoint("TOPLEFT", c, "TOPLEFT", 0, 0)
-        c.k:SetTextColor(UI.Color("faint")); c.k:SetText(keyText)
-        c.v = fstr(c, "numeral"); c.v:SetPoint("TOPLEFT", c, "TOPLEFT", 0, -14)
-        return c
-    end
-    local chronoCol = teleCol("CHRONO", 0)
-    local hearthCol = teleCol("HEARTH", 104)
-    D.chronoCol, D.hearthCol = chronoCol, hearthCol
-
+    -- NOTE block (bottom) — label + editbox, full column width, where the buttons were.
     local noteLbl = microLabel(rightCol, "NOTE")
-    noteLbl:SetPoint("TOPLEFT", chronoCol, "BOTTOMLEFT", 0, -12)
+    noteLbl:SetPoint("TOPLEFT", rightCol, "TOPLEFT", 0, -66)
+    tag(noteLbl, "detail.notelabel")
     local noteBox = CreateFrame("EditBox", nil, rightCol, "BackdropTemplate")
     noteBox:SetPoint("TOPLEFT", noteLbl, "BOTTOMLEFT", 0, -5)
     noteBox:SetPoint("RIGHT", rightCol, "RIGHT", 0, 0)
@@ -348,27 +410,6 @@ function Detail.Attach(parent)
         if D._current then local t = self:GetText(); noteSet(D._current, (t ~= "" and t) or nil) end
     end)
     D.noteBox = noteBox
-
-    -- Action chips (Invite + Cancel buffs), pinned to the column bottom. (Invite is
-    -- the mockup's accent chip; the kit exposes normal/quiet/danger variants, so we
-    -- use "normal" and let the button's own accent-on-hover carry emphasis.)
-    local function chip(text, accent, onClick)
-        local b = UI.MakeButton(rightCol, {
-            text = text, variant = "normal",
-            width = accent and 84 or 96, height = 24, onClick = onClick,
-        })
-        return b
-    end
-    local inviteBtn = chip("Invite", true, function()
-        if D._current and C_PartyInfo and C_PartyInfo.InviteUnit then C_PartyInfo.InviteUnit(D._current) end
-    end)
-    inviteBtn:SetPoint("BOTTOMLEFT", rightCol, "BOTTOMLEFT", 0, 0)
-    local cancelBtn = chip("Cancel buffs", false, function()
-        if ns.HUD and ns.HUD.ShowCancelBuffs then ns.HUD.ShowCancelBuffs()
-        else ns:Print("Cancel-Buffs popup arrives in a later update.") end
-    end)
-    cancelBtn:SetPoint("BOTTOMLEFT", inviteBtn, "BOTTOMRIGHT", 8, 0)
-    D.inviteBtn, D.cancelBtn = inviteBtn, cancelBtn
 
     -- Empty-state label (no selection).
     local emptyFS = fstr(parent, "muted"); emptyFS:SetPoint("CENTER", parent, "CENTER", 0, 0)
@@ -406,44 +447,45 @@ function Detail.Attach(parent)
         statusFS:SetText((online and "ONLINE" or "OFFLINE") .. "  \194\183  " .. Dd.FreshnessText(rec.lastDataUpdate))
         statusFS:SetTextColor(UI.Color("muted"))
 
-        -- Buff grid: uniform SQUARE tiles, even 3-column rows. Detail keeps the §5a
-        -- lit/desat treatment (owned = full-color icon; missing = DESATURATED icon +
-        -- danger/warn edge — a visible greyed tile, never a hollow box). Duration text
-        -- sits beneath each tile. Tiles are centered within equal column thirds.
+        -- Buff ROW LIST: one row per shown buff — framed icon (§5a lit/desat) ·
+        -- family-hue buff name · right-aligned STATE status (the status column carries
+        -- the state color; the name carries buff identity). Rows stack at a fixed pitch.
         local order = Dd.AURA_DISPLAY_ORDER or {}
         local shown, held = 0, 0
-        local gridW = buffGrid:GetWidth(); if gridW < 1 then gridW = leftCol:GetWidth() end
-        if gridW < 1 then gridW = 3 * (BUFF_TILE + 24) end   -- pre-layout fallback
-        local thirdW = gridW / BUFF_COLS
         local idx = 0
-        for _, cell in ipairs(D._cells) do cell:Hide() end
+        for _, r in ipairs(D._rows) do r:Hide() end
         for _, slot in ipairs(order) do
             local s = Detail.BuffTileState(slot, rec, faction, e)
             if s.shown then
                 idx = idx + 1
                 shown = shown + 1
                 if not s.missing then held = held + 1 end
-                local cell = D._cells[idx]
-                local col = (idx - 1) % BUFF_COLS
-                local row = math.floor((idx - 1) / BUFF_COLS)
-                local cx = thirdW * (col + 0.5)          -- centre of this column third
-                cell:ClearAllPoints()
-                cell:SetPoint("TOPLEFT", buffGrid, "TOPLEFT",
-                    cx - BUFF_TILE / 2, -(row * (BUFF_CELL_H + BUFF_ROW_GAP)))
+                local row = D._rows[idx]
                 local meta = Dd.AURA_META[slot]
-                cell.tile.icon:SetTexture(Dd.AuraIcon(slot))
-                cell.tile.icon:SetDesaturated(s.missing and true or false)
-                cell.tile.icon:SetAlpha(s.missing and 0.85 or 1)   -- greyed but clearly visible
-                cell.tile:SetBackdrop(UI.FLAT_BACKDROP)
-                cell.tile:SetBackdropColor(UI.Color("inset"))
-                -- Rim carries state: missing = danger/warn, boon = ok, else the buff's
-                -- threshold token (ok/warn) so an about-to-expire held tile still warns.
-                cell.tile:SetBackdropBorderColor(UI.Color(s.tint or TILE_RIM))
-                cell.dur:SetText(s.durText or (s.missing and "\226\128\148" or ""))
-                cell.dur:SetTextColor(UI.Color(s.durTok or "muted"))
-                cell._tipName = meta.name
-                cell._tipFull = s.fullText or (s.missing and "Missing" or nil)
-                cell:Show()
+                row:ClearAllPoints()
+                row:SetPoint("TOPLEFT", buffRows, "TOPLEFT", 0, -((idx - 1) * (BUFF_ROW_H + BUFF_ROW_GAP)))
+                row:SetPoint("RIGHT", buffRows, "RIGHT", 0, 0)
+                -- Icon (§5a): held lit; missing desaturated + danger/warn edge.
+                row.tile.icon:SetTexture(Dd.AuraIcon(slot))
+                row.tile.icon:SetDesaturated(s.missing and true or false)
+                row.tile.icon:SetAlpha(s.missing and 0.85 or 1)
+                row.tile:SetBackdrop(UI.FLAT_BACKDROP)
+                row.tile:SetBackdropColor(UI.Color("inset"))
+                row.tile:SetBackdropBorderColor(UI.Color(s.missing and (s.tint or "danger") or (s.boon and "ok" or TILE_RIM)))
+                -- Name in its family hue (falls back to cream on low-contrast themes).
+                row.name:SetText(meta.name)
+                row.name:SetTextColor(nameColor(slot))
+                -- Status (state color). The DMF PRESENT case appends its re-acquire paren.
+                local statusText, statusTok = Detail.RowStatus(s, meta.key == "dmf")
+                if meta.key == "dmf" and not s.missing then
+                    local par, ptok = Detail.DMFParenthetical(rec, e)
+                    statusText = statusText .. "  " .. Dd.Colored("(" .. par .. ")", ptok)
+                end
+                row.status:SetText(statusText)
+                row.status:SetTextColor(UI.Color(statusTok))
+                row._tipName = meta.name
+                row._tipFull = s.fullText or (s.missing and "Missing" or nil)
+                row:Show()
             end
         end
         buffLbl:SetText(("WORLD BUFFS  \194\183  %d/%d HELD"):format(held, shown))
@@ -459,25 +501,21 @@ function Detail.Attach(parent)
         -- Telemetry (chrono / hearth). Ready = green; on CD = numeral countdown.
         local chronoRem = Dd.DecayRemaining(rec.itemCooldown, rec.lastDataUpdate, e)
         if rec.chronoboonActive then
-            chronoCol.v:SetText("BOON"); chronoCol.v:SetTextColor(UI.Color((rec.boonCount or 0) == 0 and "danger" or "ok"))
+            chronoVal:SetText("BOON"); chronoVal:SetTextColor(UI.Color((rec.boonCount or 0) == 0 and "danger" or "ok"))
         elseif chronoRem > 0 then
-            chronoCol.v:SetText(Dd.FormatDuration(chronoRem)); chronoCol.v:SetTextColor(UI.Color("warn"))
+            chronoVal:SetText(Dd.FormatDuration(chronoRem)); chronoVal:SetTextColor(UI.Color("warn"))
         else
-            chronoCol.v:SetText("Ready"); chronoCol.v:SetTextColor(UI.Color("ok"))
+            chronoVal:SetText("Ready"); chronoVal:SetTextColor(UI.Color("ok"))
         end
         local hearthRem = Dd.DecayRemaining(rec.hearthstoneCD, rec.lastDataUpdate, e)
         if hearthRem > 0 then
-            hearthCol.v:SetText(Dd.FormatDuration(hearthRem)); hearthCol.v:SetTextColor(UI.Color("warn"))
+            hearthVal:SetText(Dd.FormatDuration(hearthRem)); hearthVal:SetTextColor(UI.Color("warn"))
         else
-            hearthCol.v:SetText("Ready"); hearthCol.v:SetTextColor(UI.Color("ok"))
+            hearthVal:SetText("Ready"); hearthVal:SetTextColor(UI.Color("ok"))
         end
 
         -- Note.
         if not noteBox:HasFocus() then noteBox:SetText(noteGet(entry.nameRealm) or "") end
-
-        -- Invite only enabled for a different, online character (self-invite is inert).
-        local canInvite = online and not (entry.isSelf)
-        if inviteBtn.SetEnabledState then inviteBtn:SetEnabledState(canInvite) end
     end
 
     D:Show(nil)   -- start on the empty state until the first selection
@@ -562,6 +600,29 @@ local function testRaidTally(fails)
     if open ~= 5 then fails[#fails + 1] = "expected 5 open, got " .. open end
 end
 
+-- Row-list STATUS matrix (owner round-3): map a BuffTileState result -> (text, tok).
+local function testRowStatus(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    -- missing required -> "Missing" / danger
+    local t, tok = Detail.RowStatus({ shown = true, missing = true, tint = "danger" }, false)
+    ck(t == "Missing" and tok == "danger", "missing required -> Missing/danger")
+    -- missing optional -> "Missing" / warn
+    t, tok = Detail.RowStatus({ shown = true, missing = true, tint = "warn" }, false)
+    ck(t == "Missing" and tok == "warn", "missing optional -> Missing/warn")
+    -- present healthy -> duration / durTok
+    t, tok = Detail.RowStatus({ shown = true, missing = false, fullText = "1h 2m", durTok = "ok" }, false)
+    ck(t == "1h 2m" and tok == "ok", "present -> duration/ok")
+    -- booned -> full "..(Boon)" / ok
+    t, tok = Detail.RowStatus({ shown = true, missing = false, boon = true, fullText = "1h 59m (Boon)", durTok = "ok" }, false)
+    ck(t == "1h 59m (Boon)" and tok == "ok", "boon -> frozen dur (Boon)/ok")
+    -- missing DMF keeps its re-acquire state (durText/durTok), NOT "Missing"
+    t, tok = Detail.RowStatus({ shown = true, missing = true, durText = "READY", durTok = "ok", tint = "danger" }, true)
+    ck(t == "READY" and tok == "ok", "missing DMF -> READY/ok (re-acquire, not 'Missing')")
+    -- hidden slot -> empty
+    t = Detail.RowStatus({ shown = false }, false)
+    ck(t == "", "hidden slot -> empty status")
+end
+
 if ns.RegisterSelfTest then
     ns:RegisterSelfTest("detail", function(verbose)
         local cases = {
@@ -569,6 +630,7 @@ if ns.RegisterSelfTest then
             { name = "buff display matrix", fn = testBuffMatrix },
             { name = "caption compact",     fn = testCaptionCompact },
             { name = "raid tally",          fn = testRaidTally },
+            { name = "row status",          fn = testRowStatus },
         }
         local allPass = true
         for _, c in ipairs(cases) do
