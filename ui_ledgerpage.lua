@@ -14,8 +14,12 @@
 --     UI.Hairline(parent,opts)                       — 1px pixel-snapped rule
 --     UI.PaintLedgerGround(frame,opts)               — grain+vignette+keyline (bg layers)
 --   DaseekiUI framework (Daseeki-Core/daseekiui.lua + theme.lua):
---     UI.FlatFrame / UI.Skin / UI.Color / UI.Token / UI.MakeButton / UI.FLAT_BACKDROP
+--     UI.FlatFrame / UI.Skin / UI.Color / UI.Token / UI.FLAT_BACKDROP
 --     UI.fonts.{body,muted,small,microLabel,numeral}
+--     (action chips are built inline here, NOT via UI.MakeButton — the primary needs a
+--      brand-TINTED fill the framework button doesn't offer; see chipButton in Build)
+--   Blizzard fonts: CreateFont — two page-local faces (enlarged FRIZQT name line +
+--     ARIALN+OUTLINE ~16px telemetry values) the shared UI.fonts set doesn't provide
 --   Nexus shared model (ui_shell.lua ns.Dashboard — loads BEFORE this file):
 --     Dashboard.AURA_META / AURA_DISPLAY_ORDER / AuraIcon(slot)
 --     Dashboard.AuraRequirement / ClassRuleState / GetThreshold / AuraColorToken
@@ -35,12 +39,16 @@
 --   Cancel-buffs secure popup launcher (hud.lua):  ns.HUD.ShowCancelBuffs()
 --
 -- ── BRAND_SPEC SELF-AUDIT ───────────────────────────────────────────────────────
---   §3 fonts: names/values = FRIZQT (body) class-colored, never MORPHEUS; eyebrows =
---     ARIALN microLabel (uppercased by caller); numerals = ARIALN+OUTLINE. No <16 MORPHEUS.
+--   §3 fonts: the name line = ENLARGED FRIZQT (16px), class-colored, NEVER MORPHEUS —
+--     the mockup renders the name in serif, but §3 reserves MORPHEUS for ceremonial
+--     titles, so name-parity is bought with a larger FRIZQT instead. Subhead/freshness =
+--     ARIALN condensed; eyebrows = ARIALN microLabel; telemetry values = ARIALN+OUTLINE.
 --   §4/§5 diamond budget: exactly ONE diamond on the page — the wax seal (online=lit
 --     brand / offline=idle). Buff tiles are plain SQUARE icon tiles (never masked-diamond,
 --     never repeated diamonds). Raid tally = ruled text initials, NO raid diamonds (§7 L3).
---   §5 attention inversion: owned+healthy buff = calm idle tile; only missing/expiring tints.
+--   §5/§5a lit-icon reading: owned = full-color lit tile w/ quiet cborder rim; missing =
+--     desaturated + danger/warn edge; booned = frozen duration in GREEN + thin ok rim
+--     ("Boon" no longer stamped per-tile — it's one eyebrow word + the hover tooltip).
 --   §6 copy: plain + concise ("4 held · 5 missing", "Updated 2m ago", "Invite", "Cancel buffs").
 --   §8 interaction: reveal ≤120ms (page frame only); WoW-native top-right ✕ + ESC(UISpecialFrames)
 --     + GameTooltip; single-character Invite is a plain click (NOT mass-invite). ONE hairline (header rule).
@@ -141,10 +149,13 @@ function LedgerPage.BuffTileState(slot, rec, faction, e)
         local booned = (st.source == BOON or st.source == "boon")
         local full = D.FormatDuration(st.duration)
         if booned then
-            -- item E: (Boon) REPLACES the duration on the tile caption (green
-            -- "Boon"); the full duration + "(Boon)" live on the hover tooltip.
+            -- Card-parity + §5a de-dull: a booned tile shows its FROZEN duration in
+            -- GREEN (the ok color itself carries the "boon" meaning) + a thin ok-green
+            -- rim. The word "Boon" is no longer stamped on every tile — it surfaces
+            -- ONCE in the eyebrow ("· booned") and on the tile's hover tooltip.
             return { shown = true, slot = slot, missing = false, boon = true,
-                     calm = true, tint = "ok", durText = "Boon", durTok = "ok",
+                     calm = true, tint = "ok",
+                     durText = LedgerPage.CompactDuration(st.duration), durTok = "ok",
                      fullText = full .. " (Boon)", spellID = meta.spellID }
         end
         local th  = D.GetThreshold(faction, meta.thresholdKey)
@@ -289,6 +300,35 @@ local function numFS(parent)
     return t
 end
 
+-- Bespoke faces the shared UI.fonts set does not provide (both BRAND_SPEC §3-legal):
+--   NAME  = FRIZQT enlarged to the mockup name presence (.en). §3 forbids MORPHEUS for
+--           NAMES, so parity is bought with a LARGER FRIZQT, never a serif face.
+--   VALUE = ARIALN + OUTLINE at the mockup's telemetry-value size (.cd .num 16px) for
+--           the CHRONO/HEARTH column numerals (UI.fonts.numeral is only 13px).
+-- Class color rides in the name string itself (ColoredName's |c..|r), so neither font
+-- needs a ThemeChanged re-tint — every value's color is set explicitly at Populate.
+local NAME_SIZE, VALUE_SIZE = 16, 15
+local _nameFont, _valueFont
+local function nameFontObj()
+    if not _nameFont then
+        _nameFont = CreateFont("DaseekiNexusLedgerNameFont")
+        _nameFont:SetFont("Fonts\\FRIZQT__.TTF", NAME_SIZE, "")
+    end
+    return _nameFont
+end
+local function valueFontObj()
+    if not _valueFont then
+        _valueFont = CreateFont("DaseekiNexusLedgerValueFont")
+        _valueFont:SetFont("Fonts\\ARIALN.TTF", VALUE_SIZE, "OUTLINE")
+    end
+    return _valueFont
+end
+
+-- Framed-tile treatment (card-parity gap 1): a spell-icon tile is a flat RAISED-token
+-- backing with a quiet 1px cborder rim, the cropped icon inset inside it — a crisp
+-- framed tile, not a naked icon. Missing/boon states override the rim with their tint.
+local TILE_BG, TILE_RIM = "raised", "controlBorder"
+
 -- Build the singleton page frame + its pooled children. No per-open allocation.
 function LedgerPage.Build()
     local f = UI.FlatFrame(UIParent, "raised", "border")
@@ -335,25 +375,25 @@ function LedgerPage.Build()
     f.crest = crest
 
     local nameFS = f:CreateFontString(nil, "OVERLAY")
-    nameFS:SetFontObject(UI.fonts.body)                 -- FRIZQT class-colored, never MORPHEUS (§3)
+    nameFS:SetFontObject(nameFontObj())                 -- enlarged FRIZQT, class-colored, never MORPHEUS (§3)
     nameFS:SetPoint("LEFT", crest, "RIGHT", 7, 0)
     f.nameFS = nameFS
 
-    local freshFS = numFS(f)
+    local freshFS = microFS(f)                          -- ARIALN faint readout (mockup .efresh), not an outlined numeral
     freshFS:SetPoint("RIGHT", closeX, "LEFT", -8, 0)
     freshFS:SetJustifyH("RIGHT")
     f.freshFS = freshFS
 
     local subFS = f:CreateFontString(nil, "OVERLAY")
-    subFS:SetFontObject(UI.fonts.small)                 -- "Level 60 Warlock · account A1 · online"
-    subFS:SetPoint("TOPLEFT", seal, "BOTTOMLEFT", 0, -5)
+    subFS:SetFontObject(UI.fonts.microLabel)            -- ARIALN condensed subhead (mockup .esub)
+    subFS:SetPoint("TOPLEFT", seal, "BOTTOMLEFT", 0, -6)
     subFS:SetPoint("RIGHT", f, "RIGHT", -PAD, 0)
     subFS:SetJustifyH("LEFT")
     f.subFS = subFS
 
     -- ONE hairline: the header rule (§8 one-per-section).
     local rule = UI.Hairline(f, { token = "border" })
-    rule:SetPoint("TOPLEFT", subFS, "BOTTOMLEFT", 0, -6)
+    rule:SetPoint("TOPLEFT", subFS, "BOTTOMLEFT", 0, -8)
     rule:SetPoint("TOPRIGHT", f, "TOPRIGHT", -PAD, 0)
     f.rule = rule
 
@@ -432,9 +472,11 @@ function LedgerPage.Build()
     f.rSay = rSay
 
     local tallyFS = f:CreateFontString(nil, "OVERLAY")
-    tallyFS:SetFontObject(UI.fonts.small)                 -- one step down so all 7 initials fit ONE ruled line (item H)
+    tallyFS:SetFontObject(UI.fonts.body)                  -- mockup .tally.big presence; full-width so it NEVER ellipsizes (gap 4)
     tallyFS:SetPoint("TOPLEFT", rEyebrow, "BOTTOMLEFT", 0, -6)
-    tallyFS:SetWidth(SIDE_W); tallyFS:SetJustifyH("LEFT")
+    -- RIGHT edge is pinned to the page in Populate (the hosted page is full-width), so
+    -- the tally gets the whole remaining row and all 7 initials fit at readable size.
+    tallyFS:SetJustifyH("LEFT")
     tallyFS:SetWordWrap(false)
     tallyFS:EnableMouse(true)
     tallyFS:SetScript("OnEnter", function(self)
@@ -446,31 +488,72 @@ function LedgerPage.Build()
     tallyFS:SetScript("OnLeave", function() GameTooltip:Hide() end)
     f.tallyFS = tallyFS
 
-    -- Cooldown telemetry: chrono + hearth real item icons + red remaining numerals.
-    local function cdRow()
-        local r = CreateFrame("Frame", nil, f)
-        r:SetSize(SIDE_W, 18)
-        r.icon = r:CreateTexture(nil, "ARTWORK")
-        r.icon:SetSize(16, 16); r.icon:SetPoint("LEFT", r, "LEFT", 0, 0)
-        r.icon:SetTexCoord(0.08, 0.92, 0.08, 0.92)
-        r.lbl = microFS(r); r.lbl:SetPoint("LEFT", r.icon, "RIGHT", 6, 0)
-        r.val = numFS(r); r.val:SetPoint("RIGHT", r, "RIGHT", 0, 0); r.val:SetJustifyH("RIGHT")
-        return r
+    -- Cooldown telemetry as the mockup's TELEMETRY COLUMN PAIR (gap 5): a micro-label
+    -- header ("CHRONO" / "HEARTH") over a LARGE colored numeral, with the real item icon
+    -- kept small + subordinate beside the value. Replaces the old label→right-value rows.
+    local CD_COL_W = 100
+    local function cdCol(label)
+        local c = CreateFrame("Frame", nil, f)
+        c:SetSize(CD_COL_W, 34)
+        c.lbl = microFS(c)
+        c.lbl:SetPoint("TOPLEFT", c, "TOPLEFT", 0, 0)
+        c.lbl:SetText(label)
+        c.icon = c:CreateTexture(nil, "ARTWORK")
+        c.icon:SetSize(14, 14)
+        c.icon:SetPoint("TOPLEFT", c.lbl, "BOTTOMLEFT", 0, -5)
+        c.icon:SetTexCoord(0.08, 0.92, 0.08, 0.92)
+        c.val = c:CreateFontString(nil, "OVERLAY")
+        c.val:SetFontObject(valueFontObj())              -- ARIALN+OUTLINE ~16px (mockup .cd .num)
+        c.val:SetPoint("LEFT", c.icon, "RIGHT", 6, 0)
+        c.val:SetJustifyH("LEFT")
+        return c
     end
-    f.chronoRow = cdRow(); f.chronoRow.lbl:SetText("Chrono")
-    f.hearthRow = cdRow(); f.hearthRow.lbl:SetText("Hearth")
+    f.chronoCol = cdCol("CHRONO")
+    f.hearthCol = cdCol("HEARTH")
     f.shardFS   = numFS(f)                                -- warlock soul-shard parity line
 
-    -- Actions: single-character Invite (plain click, §8) + Cancel-buffs launcher.
-    f.inviteBtn = UI.MakeButton(f, { text = "Invite", variant = "normal", width = 80, height = 22,
-        onClick = function()
-            local key = LedgerPage.openKey
-            if key and C_PartyInfo and C_PartyInfo.InviteUnit then C_PartyInfo.InviteUnit(key) end
-        end })
-    f.cancelBtn = UI.MakeButton(f, { text = "Cancel buffs", variant = "quiet", width = 96, height = 22,
-        onClick = function()
-            if ns.HUD and ns.HUD.ShowCancelBuffs then ns.HUD.ShowCancelBuffs() end
-        end })
+    -- Actions: mockup chips (gap 6). Built inline (NOT UI.MakeButton) so the PRIMARY can
+    -- carry a brand-TINTED fill + brand rim + brandBright label — the mockup .btn look —
+    -- instead of the framework button's control fill + hard bronze/accent border. The
+    -- secondary is the quiet variant (control fill, cborder rim, cream label).
+    local function chipButton(text, primary, onClick)
+        local b = CreateFrame("Button", nil, f, "BackdropTemplate")
+        b:SetHeight(24)
+        local lbl = b:CreateFontString(nil, "OVERLAY")
+        lbl:SetFontObject(UI.fonts.body)
+        lbl:SetPoint("CENTER", b, "CENTER", 0, 0)
+        lbl:SetText(text)
+        b._lbl = lbl
+        local hover = b:CreateTexture(nil, "HIGHLIGHT")
+        hover:SetAllPoints(b)
+        b:SetHighlightTexture(hover)
+        UI.Skin(b, function(self)
+            self:SetBackdrop(UI.FLAT_BACKDROP)
+            if primary then
+                self:SetBackdropColor(UI.Color("brand", 0.18))     -- brand-tinted FILL, not a hard border
+                self:SetBackdropBorderColor(UI.Color("brand"))
+                lbl:SetTextColor(UI.Color("brandBright"))
+                hover:SetColorTexture(UI.Color("brand", 0.16))
+            else
+                self:SetBackdropColor(UI.Color("control"))         -- quiet bordered secondary
+                self:SetBackdropBorderColor(UI.Color("controlBorder"))
+                lbl:SetTextColor(UI.Color("text"))
+                hover:SetColorTexture(UI.Color("brand", 0.10))
+            end
+        end)
+        local w = math.max(80, (lbl:GetStringWidth() or 40) + 26)
+        b:SetWidth(w); b.uiWidth, b.uiHeight = w, 24
+        if onClick then b:SetScript("OnClick", onClick) end
+        return b
+    end
+    -- single-character Invite (plain click, §8) + Cancel-buffs launcher.
+    f.inviteBtn = chipButton("Invite", true, function()
+        local key = LedgerPage.openKey
+        if key and C_PartyInfo and C_PartyInfo.InviteUnit then C_PartyInfo.InviteUnit(key) end
+    end)
+    f.cancelBtn = chipButton("Cancel buffs", false, function()
+        if ns.HUD and ns.HUD.ShowCancelBuffs then ns.HUD.ShowCancelBuffs() end
+    end)
 
     return f
 end
@@ -514,9 +597,18 @@ function LedgerPage.Populate(nameRealm)
         local s = LedgerPage.BuffTileState(slot, rec, faction, e)
         if s.shown then states[#states + 1] = s end
     end
-    local held, missing = 0, 0
-    for _, s in ipairs(states) do if s.missing then missing = missing + 1 else held = held + 1 end end
-    f.bSay:SetText(("%d held \194\183 %d missing"):format(held, missing))
+    local held, missing, booned = 0, 0, 0
+    for _, s in ipairs(states) do
+        if s.missing then missing = missing + 1
+        else held = held + 1; if s.boon then booned = booned + 1 end end
+    end
+    -- Eyebrow companion (mockup .say, faint). "booned" surfaces ONCE here when every
+    -- HELD tile is booned (the per-tile green duration carries it otherwise) — replacing
+    -- the old seven-times-repeated "Boon" caption clutter (gap 2).
+    local say = ("%d held \194\183 %d missing"):format(held, missing)
+    if booned > 0 and booned == held then say = say .. "  \194\183  booned" end
+    f.bSay:SetText(say)
+    f.bSay:SetTextColor(UI.Color("faint"))
 
     -- Centered wrapping tile flow within MAIN_W.
     local perRow = math.max(1, math.floor((MAIN_W + TILE_GAP) / (TILE + TILE_GAP)))
@@ -547,9 +639,9 @@ function LedgerPage.Populate(nameRealm)
             t._name = meta and meta.name
             t._tipLine = s.fullText or (s.missing and "missing") or nil
             t:SetBackdrop(UI.FLAT_BACKDROP)
-            t:SetBackdropColor(UI.Color("inset"))
-            -- Edge: missing pops its tint; owned stays quiet (boon gets a soft green).
-            t:SetBackdropBorderColor(UI.Color(s.missing and s.tint or (s.boon and "ok" or "border")))
+            t:SetBackdropColor(UI.Color(TILE_BG))         -- flat RAISED backing (framed tile, gap 1)
+            -- Rim: missing pops its tint; booned = thin ok-green; owned = quiet cborder.
+            t:SetBackdropBorderColor(UI.Color(s.missing and s.tint or (s.boon and "ok" or TILE_RIM)))
             -- Caption (§5a de-dull): green Boon / cream healthy / amber low / red critical.
             if s.durText and s.durText ~= "" then
                 local capTok = s.boon and "ok"
@@ -581,8 +673,11 @@ function LedgerPage.Populate(nameRealm)
     -- RIGHT: raid tally + counts + cooldowns + actions --------------------------
     local rowsList, locked, open = LedgerPage.RaidTally(rec, e)
     f.rSay:SetText(("%d locked \194\183 %d open"):format(locked, open))
+    f.rSay:SetTextColor(UI.Color("faint"))
     local parts, tip = {}, {}
     for _, r in ipairs(rowsList) do
+        -- Locked = bold cream (§5a "never lifeless"), open = faint — the mockup weight
+        -- contrast. Two spaces give the mockup's per-initial air (.tally.big margin).
         parts[#parts + 1] = D.Colored(r.key, r.locked and "text" or "faint")
         if r.locked then
             tip[#tip + 1] = { r.full .. ": locked \194\183 " .. D.FormatDuration(r.remaining), 0.9, 0.9, 0.85 }
@@ -590,39 +685,45 @@ function LedgerPage.Populate(nameRealm)
             tip[#tip + 1] = { r.full .. ": open", 0.66, 0.61, 0.52 }
         end
     end
-    f.tallyFS:SetText(table.concat(parts, " "))   -- single space: 7 initials on ONE line (item H)
+    f.tallyFS:SetText(table.concat(parts, "  "))
     f.tallyFS._tip = tip
 
     -- anchor the right column's y to the buff eyebrow's y so both columns align at top
     f.rEyebrow:ClearAllPoints()
     f.rEyebrow:SetPoint("TOPLEFT", f.bEyebrow, "TOPLEFT", MAIN_W + COL_GAP, 0)
+    -- Full-width tally row: pin its RIGHT to the page edge so all 7 raids fit at readable
+    -- size and NEVER ellipsize (gap 4). The page is hosted full-width, so this is wide.
+    f.tallyFS:ClearAllPoints()
+    f.tallyFS:SetPoint("TOPLEFT", f.rEyebrow, "BOTTOMLEFT", 0, -6)
+    f.tallyFS:SetPoint("RIGHT", f, "RIGHT", -PAD, 0)
 
+    -- Telemetry column pair (gap 5): CHRONO | HEARTH, header over a large colored value.
     local chronoRem = D.DecayRemaining(rec.itemCooldown, rec.lastDataUpdate, e)
     local hearthRem = D.DecayRemaining(rec.hearthstoneCD, rec.lastDataUpdate, e)
-    f.chronoRow:ClearAllPoints()
-    f.chronoRow:SetPoint("TOPLEFT", f.tallyFS, "BOTTOMLEFT", 0, -10)
-    f.chronoRow.icon:SetTexture(D.ItemIcon(184937))
+    f.chronoCol:ClearAllPoints()
+    f.chronoCol:SetPoint("TOPLEFT", f.tallyFS, "BOTTOMLEFT", 0, -12)
+    f.chronoCol.icon:SetTexture(D.ItemIcon(184937))
     if chronoRem > 0 then
-        f.chronoRow.val:SetText(D.FormatDuration(chronoRem)); f.chronoRow.val:SetTextColor(UI.Color("danger"))
+        f.chronoCol.val:SetText(D.FormatDuration(chronoRem)); f.chronoCol.val:SetTextColor(UI.Color("danger"))
     elseif (rec.boonCount or 0) > 0 or rec.chronoboonActive then
-        f.chronoRow.val:SetText(rec.chronoboonActive and "Active" or "Ready")
-        f.chronoRow.val:SetTextColor(UI.Color("ok"))
+        f.chronoCol.val:SetText(rec.chronoboonActive and "Active" or "Ready")
+        f.chronoCol.val:SetTextColor(UI.Color("ok"))
     else
-        f.chronoRow.val:SetText("\226\128\148"); f.chronoRow.val:SetTextColor(UI.Color("faint"))
+        f.chronoCol.val:SetText("\226\128\148"); f.chronoCol.val:SetTextColor(UI.Color("faint"))
     end
-    f.hearthRow:ClearAllPoints()
-    f.hearthRow:SetPoint("TOPLEFT", f.chronoRow, "BOTTOMLEFT", 0, -4)
-    f.hearthRow.icon:SetTexture(D.ItemIcon(6948))
+    f.hearthCol:ClearAllPoints()
+    f.hearthCol:SetPoint("TOPLEFT", f.chronoCol, "TOPRIGHT", 18, 0)
+    f.hearthCol.icon:SetTexture(D.ItemIcon(6948))
     if hearthRem > 0 then
-        f.hearthRow.val:SetText(D.FormatDuration(hearthRem)); f.hearthRow.val:SetTextColor(UI.Color("danger"))
+        f.hearthCol.val:SetText(D.FormatDuration(hearthRem)); f.hearthCol.val:SetTextColor(UI.Color("danger"))
     else
-        f.hearthRow.val:SetText("Ready"); f.hearthRow.val:SetTextColor(UI.Color("ok"))
+        f.hearthCol.val:SetText("Ready"); f.hearthCol.val:SetTextColor(UI.Color("ok"))
     end
 
-    local sideCursor = f.hearthRow
+    local sideCursor = f.chronoCol
     if rec.classTag == "WARLOCK" then
         f.shardFS:ClearAllPoints()
-        f.shardFS:SetPoint("TOPLEFT", f.hearthRow, "BOTTOMLEFT", 0, -4)
+        f.shardFS:SetPoint("TOPLEFT", f.chronoCol, "BOTTOMLEFT", 0, -6)
         f.shardFS:SetText("Soul shards: " .. (rec.shardCount or 0))
         f.shardFS:SetTextColor(UI.Color("muted"))
         f.shardFS:Show()
@@ -632,17 +733,16 @@ function LedgerPage.Populate(nameRealm)
     end
 
     f.inviteBtn:ClearAllPoints()
-    f.inviteBtn:SetPoint("TOPLEFT", sideCursor, "BOTTOMLEFT", 0, -10)
+    f.inviteBtn:SetPoint("TOPLEFT", sideCursor, "BOTTOMLEFT", 0, -12)
     f.cancelBtn:ClearAllPoints()
     f.cancelBtn:SetPoint("LEFT", f.inviteBtn, "RIGHT", 8, 0)
 
-    -- Height = header + max(left block, right block) + pad.
-    local headerH = PAD + 12 + 5 + 14 + 6 + 1 + 8   -- pad + seal + gap + subhead + gap + rule + gap
-    local rightBlockH = 14 + 6 + (rows > 0 and 0 or 0)  -- eyebrow + gap
-    -- right block: eyebrow(14)+gap(6)+tally(~2 lines 32)+gap(10)+chrono(18)+hearth(18)+[shard 20]+gap(10)+actions(22)
-    local tallyLines = 1   -- forced onto one ruled line (item H)
-    local rightH = 14 + 6 + tallyLines * 16 + 10 + 18 + 4 + 18
-        + (rec.classTag == "WARLOCK" and 24 or 0) + 10 + 22
+    -- Height = header + max(left block, right block) + pad. Header now carries the
+    -- enlarged (16px) name line + condensed subhead; body starts at the two eyebrows.
+    local headerH = (PAD + 1) + 16 + 6 + 14 + 8 + 1 + 8   -- pad + seal/name + gap + subhead + gap + rule + gap
+    -- right block: eyebrow(14)+gap(6)+tally(16)+gap(12)+telemetry cols(34)+[gap+shard 26]+gap(12)+actions(24)
+    local rightH = 14 + 6 + 16 + 12 + 34
+        + (rec.classTag == "WARLOCK" and (6 + 20) or 0) + 12 + 24
     local leftH = 14 + mainBlockH
     local body = math.max(leftH, rightH)
     local H = headerH + body + PAD
@@ -797,13 +897,16 @@ local function testBuffMatrix(fails)
     local st = LedgerPage.BuffTileState(onySlot, rec, "Horde", e)
     if not (st.shown and st.calm and not st.missing) then fails[#fails + 1] = "owned healthy buff should be shown+calm" end
 
-    -- (Boon) source -> ok/green + boon flag + caption "Boon" REPLACES the duration
-    -- (item E); the full duration + "(Boon)" move to the hover tooltip (fullText).
+    -- (Boon) source -> ok/green + boon flag + caption = the FROZEN DURATION rendered in
+    -- green (the ok color itself carries "boon"); the full dur + "(Boon)" move to the
+    -- hover tooltip. "Boon" is NO LONGER stamped on the tile caption (card-parity gap 2).
     rec.auraStates[onySlot] = { duration = 1200, source = BOON }
     st = LedgerPage.BuffTileState(onySlot, rec, "Horde", e)
-    if not (st.boon and st.tint == "ok" and st.durText == "Boon"
+    if not (st.boon and st.tint == "ok" and st.durTok == "ok"
+            and st.durText == LedgerPage.CompactDuration(1200)
+            and st.durText ~= "Boon"
             and st.fullText and st.fullText:find("%(Boon%)")) then
-        fails[#fails + 1] = "boon buff caption should be 'Boon' (green) with full dur+(Boon) on tooltip"
+        fails[#fails + 1] = "boon tile caption should be the frozen duration (green), (Boon) only on tooltip"
     end
 
     -- required class-rule slot MISSING (rend on WARRIOR) -> shown + danger

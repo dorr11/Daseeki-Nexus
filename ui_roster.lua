@@ -446,9 +446,11 @@ local function makeRosterRow(parent, pane)
                     t:SetBackdrop(UI.FLAT_BACKDROP)
                     if state == "owned" then
                         -- §5a: real spell icon = OWNED reads WoW-native full-color LIT.
+                        -- Card-parity framed tile: flat RAISED backing + quiet cborder rim
+                        -- (matches the open-page tiles), icon inset + cropped.
                         t.icon:SetDesaturated(false); t.icon:SetVertexColor(1, 1, 1); t.icon:SetAlpha(1)
-                        t:SetBackdropColor(UI.Color("inset"))
-                        t:SetBackdropBorderColor(UI.Color("border"))
+                        t:SetBackdropColor(UI.Color("raised"))
+                        t:SetBackdropBorderColor(UI.Color("controlBorder"))
                     else
                         -- §5a: MISSING = desaturated (unlit) icon + danger/warn EDGE.
                         t.icon:SetDesaturated(true); t.icon:SetVertexColor(1, 1, 1); t.icon:SetAlpha(0.85)
@@ -833,8 +835,8 @@ Dashboard.RegisterTab("characters", function(host)
             if dkey == "grid" and col then
                 t.icon:SetTexture(Dashboard.AuraIcon(Dashboard.AURA_DISPLAY_ORDER[i]))
                 t:SetBackdrop(UI.FLAT_BACKDROP)
-                t:SetBackdropColor(UI.Color("inset"))
-                t:SetBackdropBorderColor(UI.Color("border"))
+                t:SetBackdropColor(UI.Color("raised"))            -- framed-tile parity with the rows
+                t:SetBackdropBorderColor(UI.Color("controlBorder"))
                 t:ClearAllPoints()
                 t:SetPoint("LEFT", hdr, "LEFT", col.x + (col.w - HDR_TILE) / 2, 0)
                 t:Show()
