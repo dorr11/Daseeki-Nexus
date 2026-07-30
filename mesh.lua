@@ -58,8 +58,9 @@ Mesh.BUCKET_REFILL = 1
 Mesh.OP_COST = {
     timer = 1, state = 1, heartbeat = 1, discovery = 1,
     relay = 1, sync = 1, settings = 1, ack = 1,
+    nspayload = 1, nsreq = 1,
 }
-Mesh.OP_MAX_BURST = { relay = 3, sync = 6, settings = 6 }
+Mesh.OP_MAX_BURST = { relay = 3, sync = 6, settings = 6, nspayload = 6 }
 
 -- Frame operation codes (single chars keep the header tiny).
 local OP = {
@@ -77,6 +78,8 @@ local OP = {
     TIMER      = "z",   -- timer / pull event (payload from N2b handoff)
     TIMER_SNAP = "n",   -- Nexus merged timer snapshot (request reply / broadcast)
     INSTANCES  = "i",   -- account instance-ledger sync (additive; see §Instances sync)
+    NSPAYLOAD  = "y",   -- suite-namespace payload push (Daseeki.Sync v2, wave N5)
+    NSREQ      = "u",   -- suite-namespace pull request (heartbeat rev-hash mismatch)
 }
 Mesh.OP = OP
 
@@ -85,8 +88,8 @@ Mesh.OP = OP
 local PRIO = {
     timer = 1, discovery = 2, ack = 2,
     state = 3, heartbeat = 3,
-    relay = 4, sync = 4,
-    settings = 6,
+    relay = 4, sync = 4, nsreq = 4,
+    settings = 6, nspayload = 6,
 }
 
 ----------------------------------------------------------------------
@@ -299,6 +302,12 @@ Mesh._ackWait = {}       -- [syncId] = { [target]=true } pending ACKs
 Mesh._sessionId = 0      -- randomised at login to prefix message ids
 Mesh._timerCodec = nil   -- N2b handoff codec (see §Timer handoff)
 Mesh._timerHandler = nil -- N2b handoff receive callback
+Mesh._nsPushPending = {} -- [nsKey.."\1"..ownerKey] = true while a debounced push is queued
+Mesh._nsReqSeen = {}     -- [sender.."\1"..nsKey] = expiry (pull-request dedup)
+
+-- Suite-namespace transport tunables (wave N5).
+Mesh.NS_PUSH_DEBOUNCE = 3    -- seconds to coalesce rapid MarkDirty pushes
+Mesh.NS_REQ_DEDUP     = 15   -- seconds to suppress repeated pull answers to a peer
 
 -- Channel-join retry state machine + discovery telemetry (see §Channel join).
 Mesh._joinState = nil    -- { chanName, attempts, index, joined, gaveUp, pingedOnJoin }
@@ -516,6 +525,9 @@ function Mesh.PruneDedup(t)
     end
     for k, exp in pairs(Mesh._timerSeen) do
         if exp <= t then Mesh._timerSeen[k] = nil end
+    end
+    for k, exp in pairs(Mesh._nsReqSeen) do
+        if exp <= t then Mesh._nsReqSeen[k] = nil end
     end
 end
 
@@ -1025,6 +1037,15 @@ local function handleHeartbeat(f, sender)
     if hb.instancesHash and hb.instancesHash ~= localInstHash then
         Mesh.RequestSync(sender, hb.aid, "instances")
     end
+    -- Suite-namespace divergence (wave N5) -> pull the differing namespaces from
+    -- this peer (store-and-forward: whoever advertises the newest serves it).
+    local Sync = _G and _G.Daseeki and _G.Daseeki.Sync
+    if Sync and Sync.AllNamespaceHashes and type(hb.nsRev) == "table" then
+        local nsDiffs = Mesh.DiffNamespaceHashes(Sync.AllNamespaceHashes(), hb.nsRev)
+        for i = 1, #nsDiffs do
+            Mesh.RequestNamespace(sender, nsDiffs[i])
+        end
+    end
 end
 
 local function handleDiscovery(f, sender, isPing)
@@ -1170,6 +1191,8 @@ function Mesh.Dispatch(prefix, frame, sender)
         -- Defined later in the chunk (snapshot handoff section); reach it via
         -- the Mesh table so this early closure resolves it at call time.
         if Mesh._handleTimerSnap then Mesh._handleTimerSnap(f, sender) end
+    elseif op == OP.NSPAYLOAD then  Mesh.HandleNSPayload(f, sender)
+    elseif op == OP.NSREQ then      Mesh.HandleNSReq(f, sender)
     end
 end
 
@@ -1182,6 +1205,7 @@ function Mesh.SendHeartbeat()
     if not Mesh.IsEnabled() then return end
     local aid = ns:GetAccountID()
     local bucket = Store.GetAccount(aid, false)
+    local Sync = _G and _G.Daseeki and _G.Daseeki.Sync
     local hb = {
         aid       = aid,
         hashes    = bucket and Mesh.AccountHashes(bucket) or {},
@@ -1190,6 +1214,8 @@ function Mesh.SendHeartbeat()
         -- ignore it, so no protocol version bump). Follows the timerHash pattern.
         instancesHash = Mesh.HashInstances(
             Store.GetInstancesForAID and Store.GetInstancesForAID(aid)),
+        -- Per-namespace rev hash (wave N5): peers whose hash differs pull.
+        nsRev     = (Sync and Sync.AllNamespaceHashes) and Sync.AllNamespaceHashes() or nil,
         online    = {},   -- online-character hint (Name-Realm list)
     }
     if bucket then
@@ -1426,6 +1452,131 @@ function Mesh.SendTimers(target)
     Mesh.Enqueue(Protocol.PREFIX.SYNC, frame, {
         op = "sync", chatType = "WHISPER", target = target, seq = seq,
     })
+end
+
+----------------------------------------------------------------------
+-- Suite-namespace transport (DSKN3 SYNC prefix, wave N5)
+--
+-- Carries the payloads other suite addons publish through Daseeki.Sync v2
+-- (Bags today). Each frame is one owner's payload for one namespace:
+--   NSPAYLOAD blob = { ns=<nsKey>, o=<ownerKey>, r=<rev>, d=<payload table> }
+-- The payload is LibSerialize+LibDeflate-packed and chunked like every other
+-- SYNC frame (these are KBs). Propagation is revision-gated and store-and-
+-- forward: MarkDirty pushes to online peers; heartbeats advertise a per-
+-- namespace rev hash, and a peer whose hash differs pulls (NSREQ) so whoever
+-- holds the newest rev serves it when a peer appears. Owner-wins-by-rev + the
+-- frame dedup guards keep it from looping.
+--
+-- Op-letter note (re-land deviation): the original branch used "n" for
+-- NSPAYLOAD, but current main reassigned "n" to TIMER_SNAP, so NSPAYLOAD is "y"
+-- here (NSREQ stays "u"). Purely a wire-code assignment; additive op, older
+-- clients ignore the unknown op, so no protocol version bump -- same discipline
+-- the INSTANCES op followed.
+----------------------------------------------------------------------
+
+local function suiteSync()
+    return _G and _G.Daseeki and _G.Daseeki.Sync or nil
+end
+
+-- Build + enqueue one owner's namespace payload to a single target.
+local function sendNSPayloadTo(target, nsKey, ownerKey)
+    if not target then return false end
+    local Sync = suiteSync()
+    local S = Store
+    if not (Sync and S and S.SyncNSGet) then return false end
+    local entry = S.SyncNSGet(nsKey, ownerKey)
+    if not entry then return false end
+    local payload = Mesh.Pack({ ns = nsKey, o = ownerKey, r = entry.rev, d = entry.data })
+    if not payload then return false end
+    local seq = Mesh._outSeq + 1
+    local frame = Mesh.BuildFrame(OP.NSPAYLOAD, payload, { seq = seq })
+    Mesh.Enqueue(Protocol.PREFIX.SYNC, frame, {
+        op = "nspayload", chatType = "WHISPER", target = target, seq = seq,
+    })
+    return true
+end
+
+-- Push one owner's namespace payload to every online peer, debounced so a burst
+-- of MarkDirty calls coalesces into one propagation.
+function Mesh.PushNamespace(nsKey, ownerKey)
+    if not Mesh.IsEnabled() then return end
+    local pendKey = tostring(nsKey) .. "\1" .. tostring(ownerKey)
+    if Mesh._nsPushPending[pendKey] then return end
+    Mesh._nsPushPending[pendKey] = true
+    local function flush()
+        Mesh._nsPushPending[pendKey] = nil
+        if not Mesh.IsEnabled() then return end
+        for _, p in pairs(Mesh.peers) do
+            if p.online and p.name then
+                sendNSPayloadTo(p.name, nsKey, ownerKey)
+            end
+        end
+    end
+    if C_Timer and C_Timer.After then
+        C_Timer.After(Mesh.NS_PUSH_DEBOUNCE, function() ns:SafeCall(flush) end)
+    else
+        flush()   -- headless / no timer: push immediately
+    end
+end
+
+-- Answer a peer's pull for a namespace: send every owner entry we hold for it
+-- (the receiver rev-gates + dedups). Guarded by a short per-(sender,ns) window
+-- so repeated heartbeat mismatches don't re-blast the whole namespace.
+function Mesh.SendNamespace(target, nsKey)
+    if not Mesh.IsEnabled() or not target then return end
+    local S = Store
+    if not (S and S.SyncNSAll) then return end
+    for ownerKey in pairs(S.SyncNSAll(nsKey)) do
+        sendNSPayloadTo(target, nsKey, ownerKey)
+    end
+end
+
+-- Request a namespace from a peer whose advertised rev hash diverged from ours.
+function Mesh.RequestNamespace(target, nsKey)
+    if not Mesh.IsEnabled() or not target then return end
+    local payload = Mesh.Pack({ ns = nsKey })
+    if not payload then return end
+    local frame = Mesh.BuildFrame(OP.NSREQ, payload, {})
+    Mesh.Enqueue(Protocol.PREFIX.SYNC, frame, {
+        op = "nsreq", chatType = "WHISPER", target = target,
+    })
+end
+
+-- PURE: given our namespace hashes and a peer's advertised hashes, return the
+-- namespace keys whose hashes differ (so we should pull them from that peer).
+function Mesh.DiffNamespaceHashes(localH, remoteH)
+    local diffs = {}
+    if type(remoteH) ~= "table" then return diffs end
+    for nsKey, rhash in pairs(remoteH) do
+        if (localH and localH[nsKey] or "0") ~= rhash then
+            diffs[#diffs + 1] = nsKey
+        end
+    end
+    return diffs
+end
+
+-- Table methods (not file-locals) so the earlier Dispatch can reach them
+-- regardless of definition order.
+function Mesh.HandleNSPayload(f, sender)
+    local blob = Mesh.Unpack(f.payload)
+    if not blob or type(blob.ns) ~= "string" or type(blob.o) ~= "string" then return end
+    local Sync = suiteSync()
+    if not (Sync and Sync.ApplyInbound) then return end
+    Sync.ApplyInbound(blob.ns, blob.o, blob.r, blob.d, now())
+    -- No re-broadcast on receive: the next heartbeat advertises our updated rev
+    -- hash and any still-stale peer pulls from us (store-and-forward), which
+    -- avoids the fan-out storm a naive relay would cause.
+end
+
+function Mesh.HandleNSReq(f, sender)
+    local req = Mesh.Unpack(f.payload)
+    if not req or type(req.ns) ~= "string" then return end
+    local dkey = sender .. "\1" .. req.ns
+    local t = now()
+    local exp = Mesh._nsReqSeen[dkey]
+    if exp and exp > t then return end   -- already answered this peer recently
+    Mesh._nsReqSeen[dkey] = t + Mesh.NS_REQ_DEDUP
+    Mesh.SendNamespace(sender, req.ns)
 end
 
 ----------------------------------------------------------------------
@@ -2733,6 +2884,30 @@ local function testAccountConflict()
     return true
 end
 
+-- Suite-namespace hash diff (wave N5): pull exactly the namespaces whose
+-- advertised hash differs from ours; ignore matches and missing-local keys.
+local function testNamespaceDiff()
+    local localH  = { bags = "aaa", cfg = "bbb" }
+    local remoteH = { bags = "aaa", cfg = "ZZZ", extra = "qqq" }
+    local diffs = Mesh.DiffNamespaceHashes(localH, remoteH)
+    -- cfg differs, extra is remote-only (local "0" != "qqq"), bags matches.
+    local set = {}
+    for _, k in ipairs(diffs) do set[k] = true end
+    if set.bags then return false, "bags matched but flagged" end
+    if not set.cfg then return false, "cfg divergence missed" end
+    if not set.extra then return false, "remote-only namespace missed" end
+    if #diffs ~= 2 then return false, "unexpected diff count " .. #diffs end
+    -- identical bundles -> no diffs
+    if #Mesh.DiffNamespaceHashes(localH, localH) ~= 0 then
+        return false, "identical bundles produced diffs"
+    end
+    -- non-table remote -> empty
+    if #Mesh.DiffNamespaceHashes(localH, nil) ~= 0 then
+        return false, "nil remote produced diffs"
+    end
+    return true
+end
+
 function Mesh.RunSelfTests(verbose)
     local suite = {
         { name = "transmit safety",  fn = testTransmitSafety },
@@ -2740,6 +2915,7 @@ function Mesh.RunSelfTests(verbose)
         { name = "state-changed guard", fn = testStateChangedGuard },
         { name = "relay assignment", fn = testRelayPlan },
         { name = "hash diff",        fn = testHashDiff },
+        { name = "namespace hash diff", fn = testNamespaceDiff },
         { name = "instances hash",   fn = testInstancesHash },
         { name = "dedup window",     fn = testDedupWindow },
         { name = "frame round-trip", fn = testFrameRoundTrip },

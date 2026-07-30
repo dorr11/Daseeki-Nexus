@@ -36,93 +36,279 @@ Daseeki = Daseeki or {}
 local Daseeki = Daseeki
 
 ----------------------------------------------------------------------
--- Daseeki.Sync — DaseekiWoWHelperRemote contract owner
+-- Daseeki.Sync v2 — mesh-transported namespace store (wave N5)
 --
--- CURRENT STATE (pre-N5): the `DaseekiWoWHelperRemote` SavedVariable is still
--- DECLARED by Daseeki-Bags' .toc and written by the offline helper
--- (DaseekiWoWHelper.ps1) file mirror. Network does NOT declare it yet. These
--- accessors therefore PROXY whatever global exists at runtime.
+-- REDEFINITION (2026-07-28, helper retired): Daseeki.Sync is no longer a proxy
+-- over a file-mirrored SavedVariable. It is a real store, backed by
+-- DaseekiNexusData.syncNamespaces and transported over the Nexus mesh:
 --
--- N5 MIGRATION (declaration swap — do these together, Bags + Network release):
---   1. Remove `DaseekiWoWHelperRemote` from Daseeki-Bags.toc SavedVariables.
---   2. Add `DaseekiWoWHelperRemote` to Daseeki-Nexus.toc SavedVariables.
---   3. One-time data migration honoring the SV-safety gate: with Network's SV
---      now authoritative, the first Network load inherits the existing on-disk
---      table (WoW loads it into the same global name), so NO copy step is
---      needed — but test on COPIES of all 4 accounts' WTF first (design D2).
---   4. Update DaseekiWoWHelper.ps1's target path/addon for the file mirror
---      (ops, hand-merged by the orchestrator — not this agent).
---   NONE of the API below changes across the swap: consumers keep calling
---   Daseeki.Sync.Get/Set/RegisterNamespace exactly as they do now.
+--   * A consumer registers a PROVIDER namespace:
+--       Daseeki.Sync.RegisterNamespace(key, {
+--           provide  = function() return <table> end,   -- our current payload
+--           rev      = function() return <number> end,  -- OPTIONAL monotonic rev
+--                                                        --   (auto-incremented if
+--                                                        --    omitted)
+--           onRemote = function(ownerKey, data) ... end, -- a peer's payload
+--           ownerKey = "<string>" | function() return "<string>" end,
+--                        -- OPTIONAL: identifies OUR data owner (a character,
+--                        --   for "bags"); defaults to this Nexus account id.
+--       })
+--   * Daseeki.Sync.Get(key) returns the MERGED local+remote view keyed by
+--     ownerKey: { [ownerKey] = data, ... }.
+--   * Daseeki.Sync.MarkDirty(key) snapshots our provide() into the store under
+--     our ownerKey (bumping rev) and hands it to the mesh for debounced,
+--     chunked, revision-gated propagation (store-and-forward to peers that
+--     appear later).
+--   * The mesh calls Daseeki.Sync.ApplyInbound(...) for received payloads
+--     (owner-wins-by-rev; delivers winners to onRemote) and reads
+--     Daseeki.Sync.AllNamespaceHashes() for its heartbeat rev-diffing.
+--
+-- LEGACY key-value API (Get/Set/GetRemote/NotifyRemoteUpdated) is retained for
+-- non-provider namespaces — Daseeki.Config's offline catch-up still calls
+-- Get/Set(key). Its backing moved from the vanished DaseekiWoWHelperRemote
+-- global to DaseekiNexusData.syncKV.
 ----------------------------------------------------------------------
-
-local SYNC_GLOBAL = "DaseekiWoWHelperRemote"
 
 local Sync = {}
 Daseeki.Sync = Daseeki.Sync or Sync
 Sync = Daseeki.Sync
 
-Sync._namespaces = Sync._namespaces or {}   -- key -> { onRemote = fn }
+Sync.VERSION = 2
+Sync._namespaces = Sync._namespaces or {}   -- key -> { provide, rev, onRemote, ownerKey }
 
--- Resolve (and, on write, lazily create) the proxied remote table. Reading
--- never creates it, so a missing helper mirror simply reads as nil/empty.
-local function remoteTable(createIfMissing)
-    local G = _G or getfenv(0)
-    local t = G[SYNC_GLOBAL]
-    if type(t) ~= "table" and createIfMissing then
-        t = {}
-        G[SYNC_GLOBAL] = t
+local function store()
+    return ns.Store
+end
+
+-- The legacy key-value table (backed by the SV; lazily created on write).
+local function kv(create)
+    local S = store()
+    if not (S and S.data) then return nil end
+    if create then S.data.syncKV = S.data.syncKV or {} end
+    return S.data.syncKV
+end
+
+-- Resolve OUR local owner key for a namespace. Providers may pin it via
+-- spec.ownerKey (string or fn); default is this account's Nexus id.
+function Sync.LocalOwnerKey(key)
+    local spec = Sync._namespaces[key]
+    local ok = spec and spec.ownerKey
+    if type(ok) == "function" then
+        local good, res = pcall(ok)
+        if good and type(res) == "string" and res ~= "" then return res end
+    elseif type(ok) == "string" and ok ~= "" then
+        return ok
     end
-    return (type(t) == "table") and t or nil
+    return (ns.GetAccountID and ns:GetAccountID()) or ""
 end
 
--- The whole remote table (or nil if the mirror isn't present this session).
+function Sync.IsProviderNamespace(key)
+    local spec = Sync._namespaces[key]
+    return spec ~= nil and spec.provide ~= nil
+end
+
+-- Safe-call a namespace provider. Returns ok, payload.
+function Sync._Provide(key)
+    local spec = Sync._namespaces[key]
+    if not spec or not spec.provide then return false, nil end
+    local ok, res = pcall(spec.provide)
+    if not ok then geterrorhandler()(res); return false, nil end
+    return true, res
+end
+
+-- The whole legacy key-value table (back-compat accessor).
 function Sync.GetRemote()
-    return remoteTable(false)
+    return kv(false)
 end
 
--- Read one per-addon namespace key from the remote mirror.
+-- Read a namespace. For a PROVIDER namespace this is the merged local+remote
+-- view keyed by ownerKey; for a legacy key-value namespace it is the stored
+-- value for `key`.
 function Sync.Get(key)
-    local t = remoteTable(false)
+    if Sync.IsProviderNamespace(key) then
+        local view = {}
+        local S = store()
+        if S and S.SyncNSAll then
+            for ownerKey, entry in pairs(S.SyncNSAll(key)) do
+                view[ownerKey] = entry.data
+            end
+        end
+        local ok, data = Sync._Provide(key)
+        if ok and data ~= nil then
+            view[Sync.LocalOwnerKey(key)] = data
+        end
+        return view
+    end
+    local t = kv(false)
     return t and t[key] or nil
 end
 
--- Write one per-addon namespace key into the remote mirror (lazily creating
--- the global if the mirror wasn't declared/loaded). This is the in-game write
--- path; the offline helper writes the same global from the file mirror.
+-- Write a legacy key-value namespace value (Config offline catch-up).
 function Sync.Set(key, value)
-    local t = remoteTable(true)
+    local t = kv(true)
     if not t then return false end
     t[key] = value
     return true
 end
 
--- Register a consumer namespace. `spec.onRemote(key, data)` is invoked when the
--- remote mirror for `key` is (re)loaded — apply-at-login for file transport, or
--- on an explicit NotifyRemoteUpdated. Registration is idempotent.
+-- Register a namespace. A `provide` field makes it a v2 provider namespace;
+-- without one it is a legacy key-value namespace (onRemote receives the stored
+-- value at login). Registration is idempotent; re-registering updates the spec.
 function Sync.RegisterNamespace(key, spec)
     if type(key) ~= "string" or key == "" then return false end
-    Sync._namespaces[key] = { onRemote = spec and spec.onRemote }
+    spec = spec or {}
+    Sync._namespaces[key] = {
+        provide  = spec.provide,
+        rev      = spec.rev,
+        onRemote = spec.onRemote,
+        ownerKey = spec.ownerKey,
+    }
     return true
 end
 
--- Fire a namespace's onRemote with its current remote data. Used at login and
--- whenever the mirror is known to have changed.
-function Sync.NotifyRemoteUpdated(key)
-    local reg = Sync._namespaces[key]
-    if not reg or not reg.onRemote then return end
-    local data = Sync.Get(key)
-    if ns.SafeCall then ns:SafeCall(reg.onRemote, key, data)
-    else reg.onRemote(key, data) end
+-- The next local revision for our payload in a provider namespace. Providers
+-- may supply their own monotonic rev(); otherwise auto-increment past whatever
+-- we last stored under our own owner key.
+function Sync.NextLocalRev(key)
+    local spec = Sync._namespaces[key]
+    if spec and spec.rev then
+        local ok, r = pcall(spec.rev)
+        if ok and type(r) == "number" then return r end
+    end
+    local S = store()
+    local existing = S and S.SyncNSGet and S.SyncNSGet(key, Sync.LocalOwnerKey(key))
+    return (existing and existing.rev or 0) + 1
 end
 
--- Login pass: file-mirror transport applies at login (never mid-session — the
--- running client rewrites its SVs on logout, so a mid-session file write would
--- be clobbered; design constraint). Notify every registered namespace once.
-function Sync.OnLogin()
-    for key in pairs(Sync._namespaces) do
-        Sync.NotifyRemoteUpdated(key)
+-- Snapshot our provider payload into the store (bumping rev) and hand it to the
+-- mesh for debounced propagation. Safe with the mesh absent/disabled — the
+-- store is still seeded so Get() and store-and-forward see the change.
+function Sync.MarkDirty(key)
+    local spec = Sync._namespaces[key]
+    if not spec or not spec.provide then return false end
+    local ok, data = Sync._Provide(key)
+    if not ok or data == nil then return false end
+    local S = store()
+    if not (S and S.SyncNSPut) then return false end
+    local ownerKey = Sync.LocalOwnerKey(key)
+    local rev = Sync.NextLocalRev(key)
+    S.SyncNSPut(key, ownerKey, rev, data, S.Now and S.Now() or nil)
+    if ns.Mesh and ns.Mesh.PushNamespace then
+        ns.Mesh.PushNamespace(key, ownerKey)
     end
+    return true
+end
+
+-- Deliver one owner's payload to a namespace's onRemote (guarded).
+function Sync._DeliverOne(key, ownerKey, data)
+    local spec = Sync._namespaces[key]
+    if not spec or not spec.onRemote then return end
+    local okc, err = pcall(spec.onRemote, ownerKey, data)
+    if not okc then geterrorhandler()(err) end
+end
+
+-- Apply a payload received from the mesh: owner-wins-by-rev into the store,
+-- and on a winning apply deliver it to onRemote. Never overwrites OUR own live
+-- owner key (self-immunity). Returns "applied"/"stale".
+function Sync.ApplyInbound(key, ownerKey, rev, data, now)
+    local S = store()
+    if not (S and S.SyncNSPut) then return "stale" end
+    if Sync.IsProviderNamespace(key) and ownerKey == Sync.LocalOwnerKey(key) then
+        return "stale"   -- a peer must never clobber our own live payload
+    end
+    local result = S.SyncNSPut(key, ownerKey, rev, data, now)
+    if result == "applied" then
+        Sync._DeliverOne(key, ownerKey, data)
+    end
+    return result
+end
+
+-- Deliver every stored remote owner (excluding our own live owner) to a
+-- provider namespace's onRemote. Used at login so consumers see all cached
+-- cross-account data immediately, before any live mesh frame arrives.
+function Sync.DeliverRemote(key)
+    local spec = Sync._namespaces[key]
+    if not spec or not spec.onRemote then return end
+    local S = store()
+    if not (S and S.SyncNSAll) then return end
+    local mine = Sync.LocalOwnerKey(key)
+    for ownerKey, entry in pairs(S.SyncNSAll(key)) do
+        if ownerKey ~= mine then
+            Sync._DeliverOne(key, ownerKey, entry.data)
+        end
+    end
+end
+
+-- A deterministic hash of a provider namespace's owner->rev map, advertised in
+-- heartbeats so a peer with a differing hash pulls the divergent namespace.
+function Sync.NamespaceRevHash(key)
+    local S = store()
+    local parts = {}
+    if S and S.SyncNSAll then
+        for ownerKey, entry in pairs(S.SyncNSAll(key)) do
+            parts[#parts + 1] = ownerKey .. "=" .. tostring(entry.rev or 0)
+        end
+    end
+    table.sort(parts)
+    local joined = table.concat(parts, "\30")
+    if ns.Mesh and ns.Mesh.Fnv1a then return ns.Mesh.Fnv1a(joined) end
+    local h = 5381
+    for i = 1, #joined do h = (h * 33 + joined:byte(i)) % 2147483647 end
+    return tostring(h)
+end
+
+-- All provider namespaces' rev hashes, for the heartbeat bundle.
+function Sync.AllNamespaceHashes()
+    local out = {}
+    for key, spec in pairs(Sync._namespaces) do
+        if spec.provide then out[key] = Sync.NamespaceRevHash(key) end
+    end
+    return out
+end
+
+-- Provider namespace keys (mesh iterates these when answering a pull).
+function Sync.ProviderKeys()
+    local out = {}
+    for key, spec in pairs(Sync._namespaces) do
+        if spec.provide then out[#out + 1] = key end
+    end
+    return out
+end
+
+-- Snapshot + queue every local provider payload for the mesh (login + on
+-- account-id change).
+function Sync.PublishAll()
+    for _, key in ipairs(Sync.ProviderKeys()) do
+        Sync.MarkDirty(key)
+    end
+end
+
+-- Legacy compat: fire a namespace's onRemote with its current data. Provider
+-- namespaces deliver all cached remote owners; legacy namespaces deliver the
+-- stored key-value (Config offline catch-up).
+function Sync.NotifyRemoteUpdated(key)
+    local spec = Sync._namespaces[key]
+    if not spec or not spec.onRemote then return end
+    if spec.provide then
+        Sync.DeliverRemote(key)
+        return
+    end
+    local data = Sync.Get(key)
+    if ns.SafeCall then ns:SafeCall(spec.onRemote, key, data)
+    else spec.onRemote(key, data) end
+end
+
+-- Login pass: deliver cached cross-account data to every consumer, then
+-- advertise our own payloads to the mesh.
+function Sync.OnLogin()
+    for key, spec in pairs(Sync._namespaces) do
+        if spec.provide then
+            Sync.DeliverRemote(key)
+        elseif spec.onRemote then
+            Sync.NotifyRemoteUpdated(key)
+        end
+    end
+    Sync.PublishAll()
 end
 
 ----------------------------------------------------------------------
@@ -390,7 +576,187 @@ local function selfTest(verbose)
     return pass
 end
 
+----------------------------------------------------------------------
+-- Self-test: Daseeki.Sync v2 store (rev-gating, inbound apply + delivery,
+-- merged Get, MarkDirty). Uses the real Store on a disposable namespace.
+----------------------------------------------------------------------
+
+local function syncSelfTest(verbose)
+    local pass = true
+    local function check(name, cond)
+        if not cond then
+            pass = false
+            if verbose and ns.Print then ns:Print("  sync selftest FAIL: " .. name) end
+        end
+    end
+    local S = ns.Store
+    if not (S and S.SyncNSApply) then
+        if verbose and ns.Print then ns:Print("  sync selftest SKIP (store unavailable)") end
+        return true
+    end
+
+    -- Pure rev-gating matrix on Store.SyncNSApply (owner-wins-by-rev).
+    local nsp = {}
+    check("rev0 applies over empty", S.SyncNSApply(nsp, "A", 0, { v = 1 }, 100) == "applied")
+    check("stored rev0/data", nsp.A and nsp.A.rev == 0 and nsp.A.data.v == 1)
+    check("rev0 again stale", S.SyncNSApply(nsp, "A", 0, { v = 2 }, 101) == "stale")
+    check("data unchanged after stale", nsp.A.data.v == 1)
+    check("rev1 applies", S.SyncNSApply(nsp, "A", 1, { v = 3 }, 102) == "applied" and nsp.A.data.v == 3)
+    check("rev3 skips 2", S.SyncNSApply(nsp, "A", 3, { v = 4 }, 103) == "applied")
+    check("rev2 now stale", S.SyncNSApply(nsp, "A", 2, { v = 5 }, 104) == "stale")
+    check("second owner independent", S.SyncNSApply(nsp, "B", 0, { v = 9 }, 105) == "applied" and nsp.B.data.v == 9)
+    check("empty ownerKey stale", S.SyncNSApply(nsp, "", 5, {}, 106) == "stale")
+
+    -- Round-trip through ApplyInbound + onRemote delivery + merged Get on a
+    -- disposable provider namespace.
+    local delivered = {}
+    Sync.RegisterNamespace("__synctest", {
+        ownerKey = function() return "self" end,
+        provide  = function() return { mine = true } end,
+        onRemote = function(ownerKey, data) delivered[ownerKey] = data end,
+    })
+    local temp = S.SyncNSNamespace("__synctest", true)
+    for k in pairs(temp) do temp[k] = nil end
+
+    check("inbound applies", Sync.ApplyInbound("__synctest", "peer1", 1, { hello = 1 }, 200) == "applied")
+    check("onRemote delivered", delivered.peer1 and delivered.peer1.hello == 1)
+    check("inbound stale rejected", Sync.ApplyInbound("__synctest", "peer1", 1, { hello = 2 }, 201) == "stale")
+    check("self-owner inbound rejected", Sync.ApplyInbound("__synctest", "self", 9, { evil = 1 }, 202) == "stale")
+
+    local view = Sync.Get("__synctest")
+    check("merged has remote peer", view.peer1 and view.peer1.hello == 1)
+    check("merged has local live", view.self and view.self.mine == true)
+
+    check("markdirty ok", Sync.MarkDirty("__synctest") == true)
+    local mine = S.SyncNSGet("__synctest", "self")
+    check("markdirty stored our payload", mine and mine.data.mine == true)
+
+    -- Namespace rev hash diverges after a change.
+    local h1 = Sync.NamespaceRevHash("__synctest")
+    Sync.ApplyInbound("__synctest", "peer2", 1, { x = 1 }, 203)
+    local h2 = Sync.NamespaceRevHash("__synctest")
+    check("rev hash changes on new owner", h1 ~= h2)
+
+    -- Cleanup disposable namespace + registration.
+    S.SyncNS()["__synctest"] = nil
+    Sync._namespaces["__synctest"] = nil
+
+    if verbose and ns.Print then
+        ns:Print(pass and "  sync selftest: PASS" or "  sync selftest: FAIL")
+    end
+    return pass
+end
+
+----------------------------------------------------------------------
+-- Self-test: Bags syncBridge API-shape compatibility (wave N5)
+--
+-- The Daseeki-Bags core/features/syncBridge.lua module is the FIRST consumer of
+-- Daseeki.Sync v2. This asserts the EXACT surface it depends on, so a future
+-- refactor of this file can't silently break the cutover:
+--   * SuiteSync() capability probe: RegisterNamespace + MarkDirty + Get all
+--     present as functions (MarkDirty is the v2-only marker).
+--   * RegisterNamespace(key, { ownerKey=fn, provide=fn, onRemote=fn }) accepted.
+--   * Get(key) returns a merged { [ownerKey] = data } view including our own
+--     provide() payload under our ownerKey.
+--   * onRemote fires for an inbound peer owner; last-writer-wins (a lower rev is
+--     rejected, a strictly-higher rev applied) exactly as the mesh will drive it.
+--   * The mesh NS transport surface the bridge relies on indirectly exists.
+----------------------------------------------------------------------
+
+local function bridgeCompatTest(verbose)
+    local pass = true
+    local function check(name, cond)
+        if not cond then
+            pass = false
+            if verbose and ns.Print then ns:Print("  syncbridge selftest FAIL: " .. name) end
+        end
+    end
+
+    -- 1) The literal SuiteSync() probe from syncBridge.lua.
+    local S = _G and _G.Daseeki and _G.Daseeki.Sync
+    check("Daseeki.Sync present", type(S) == "table")
+    check("RegisterNamespace is fn", S and type(S.RegisterNamespace) == "function")
+    check("MarkDirty is fn (v2 marker)", S and type(S.MarkDirty) == "function")
+    check("Get is fn", S and type(S.Get) == "function")
+    local probe = (S and S.RegisterNamespace and S.MarkDirty and S.Get) and S or nil
+    check("SuiteSync() probe passes", probe ~= nil)
+
+    local store = ns.Store
+    if not (probe and store and store.SyncNSApply) then
+        if verbose and ns.Print then ns:Print("  syncbridge selftest SKIP (sync/store unavailable)") end
+        return pass
+    end
+
+    -- 2) Register a "bags"-shaped provider EXACTLY as syncBridge:OnLoad does.
+    local ownerKey = "Tester-TestRealm"
+    local delivered = {}
+    local ok = probe.RegisterNamespace("__bridgetest", {
+        ownerKey = function() return ownerKey end,
+        provide  = function() return { itemCounts = { [1] = 3 }, money = 42, ts = 100 } end,
+        onRemote = function(who, data) delivered[who] = data end,
+    })
+    check("RegisterNamespace accepts bridge spec", ok == true)
+
+    -- Clear any residue in the disposable namespace.
+    local temp = store.SyncNSNamespace("__bridgetest", true)
+    for k in pairs(temp) do temp[k] = nil end
+
+    -- 3) MarkDirty snapshots our provide() under our ownerKey.
+    check("MarkDirty returns true", probe.MarkDirty("__bridgetest") == true)
+    local mine = store.SyncNSGet("__bridgetest", ownerKey)
+    check("MarkDirty stored our snapshot", mine and mine.data and mine.data.money == 42)
+
+    -- 4) Get() returns the merged { [ownerKey] = data } view syncBridge iterates.
+    local view = probe.Get("__bridgetest")
+    check("Get returns table", type(view) == "table")
+    check("Get merges our own owner", view[ownerKey] and view[ownerKey].money == 42)
+
+    -- 5) Inbound peer -> onRemote fires; last-writer-wins on rev.
+    check("peer rev1 applies", probe.ApplyInbound("__bridgetest", "Peer-TestRealm", 1,
+        { itemCounts = { [2] = 9 }, money = 7, ts = 101 }, 101) == "applied")
+    check("onRemote delivered peer", delivered["Peer-TestRealm"] and delivered["Peer-TestRealm"].money == 7)
+    check("peer stale rev rejected (LWW)", probe.ApplyInbound("__bridgetest", "Peer-TestRealm", 1,
+        { money = 999 }, 102) == "stale")
+    check("peer higher rev applies (LWW)", probe.ApplyInbound("__bridgetest", "Peer-TestRealm", 2,
+        { money = 55, ts = 103 }, 103) == "applied")
+    check("onRemote got the winner", delivered["Peer-TestRealm"] and delivered["Peer-TestRealm"].money == 55)
+    local merged = probe.Get("__bridgetest")
+    check("Get merges peer + self", merged[ownerKey] and merged["Peer-TestRealm"]
+        and merged["Peer-TestRealm"].money == 55 and merged[ownerKey].money == 42)
+
+    -- 6) The mesh NS transport surface the bridge relies on indirectly.
+    local M = ns.Mesh
+    if M then
+        check("Mesh.PushNamespace is fn", type(M.PushNamespace) == "function")
+        check("Mesh.RequestNamespace is fn", type(M.RequestNamespace) == "function")
+        check("Mesh.SendNamespace is fn", type(M.SendNamespace) == "function")
+        check("Mesh.DiffNamespaceHashes is fn", type(M.DiffNamespaceHashes) == "function")
+        check("Mesh.HandleNSPayload is fn", type(M.HandleNSPayload) == "function")
+        check("Mesh.HandleNSReq is fn", type(M.HandleNSReq) == "function")
+        -- hash-diff advertises the changed namespace so a diverging peer pulls it.
+        local h1 = Sync.NamespaceRevHash("__bridgetest")
+        probe.ApplyInbound("__bridgetest", "Peer2-TestRealm", 1, { money = 1 }, 104)
+        local h2 = Sync.NamespaceRevHash("__bridgetest")
+        check("rev hash shifts on change", h1 ~= h2)
+        local diffs = M.DiffNamespaceHashes({ ["__bridgetest"] = h1 }, { ["__bridgetest"] = h2 })
+        check("hash-diff flags the changed namespace", diffs[1] == "__bridgetest")
+    end
+
+    -- Cleanup disposable namespace + registration.
+    store.SyncNS()["__bridgetest"] = nil
+    Sync._namespaces["__bridgetest"] = nil
+
+    if verbose and ns.Print then
+        ns:Print(pass and "  syncbridge selftest: PASS" or "  syncbridge selftest: FAIL")
+    end
+    return pass
+end
+
 if ns.RegisterSelfTest then
     ns:RegisterSelfTest("syncns", selfTest)
+    ns:RegisterSelfTest("sync", syncSelfTest)
+    ns:RegisterSelfTest("syncbridge", bridgeCompatTest)
 end
 Config._SelfTest = selfTest
+Sync._SelfTest = syncSelfTest
+Sync._BridgeCompatTest = bridgeCompatTest

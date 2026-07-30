@@ -35,6 +35,10 @@ local MESH_CAP           = 8             -- accounts
 local TOMBSTONE_TTL      = 14 * 86400    -- 14 days
 local DMF_OFFLINE_CLEAR  = 8 * 3600      -- ~8h resting-offline clears sibling DMF CD
 local WEEK_SECONDS       = 7 * 86400
+-- Suite-namespace store (Daseeki.Sync v2, wave N5): retention for the
+-- cross-account payloads other suite addons publish through Nexus (e.g. Bags).
+local SYNCNS_STALE       = 30 * 86400   -- drop an owner entry not refreshed in 30 days
+local SYNCNS_SIZE_WARN   = 64           -- per-namespace owner-count sanity threshold (log only)
 -- Wednesday 04:00 as an offset into the server-local week.
 -- Calendar weekday: 1=Sunday .. 4=Wednesday. secondsOfWeek uses
 -- (weekday-1) full days + hours/minutes/seconds.
@@ -371,6 +375,19 @@ local function defaultData()
             friends = {},       -- ["Name-Realm"] = true
         },
         deletedAIDs = {},       -- [aid] = tombstoneEpoch (local-only, never broadcast)
+        -- Suite-namespace store (Daseeki.Sync v2, wave N5). Each consuming
+        -- addon owns a namespace key; every data owner (a character or account,
+        -- depending on the namespace) has one revision-stamped payload here.
+        --   syncNamespaces[nsKey][ownerKey] = { rev, updatedAt, data }
+        -- Mesh-transported, revision-gated, store-and-forward; persists so a
+        -- peer's data survives relogs and can be served to newly-appearing peers.
+        syncNamespaces = {},
+        -- Legacy key-value lane retained for Daseeki.Config's offline catch-up
+        -- (the helper file-mirror is retired; this now lives in the SV instead
+        -- of the vanished DaseekiWoWHelperRemote global).
+        syncKV = {},
+        -- One-time idempotent guard for the wave-N5 Bags import (see MigrateBags).
+        bagsImported = false,
     }
 end
 
@@ -547,6 +564,13 @@ function Store.Init()
         -- Instance ledger is account-scoped state the wipe must PRESERVE (like
         -- notes/manualLocations): the caps math is only useful across sessions.
         local preservedInstances = DaseekiNexusData.instances
+        -- The suite-namespace payloads are cross-account caches (like accounts,
+        -- reconstructible from the mesh) but expensive to re-pull -- KBs per
+        -- owner -- so preserve them across a character-graph wipe rather than
+        -- forcing every peer to resend. Not schema-coupled to the char graph.
+        local preservedSyncNS  = DaseekiNexusData.syncNamespaces
+        local preservedSyncKV  = DaseekiNexusData.syncKV
+        local preservedImported = DaseekiNexusData.bagsImported
 
         DaseekiNexusData = defaultData()
         DaseekiNexusData.version = Store.STORAGE_VERSION
@@ -557,6 +581,9 @@ function Store.Init()
         if preservedNotesMig ~= nil then DaseekiNexusData.notesMigrated = preservedNotesMig end
         if preservedDeleted then DaseekiNexusData.deletedAIDs = preservedDeleted end
         if preservedInstances then DaseekiNexusData.instances = preservedInstances end
+        if preservedSyncNS  then DaseekiNexusData.syncNamespaces = preservedSyncNS end
+        if preservedSyncKV  then DaseekiNexusData.syncKV = preservedSyncKV end
+        if preservedImported ~= nil then DaseekiNexusData.bagsImported = preservedImported end
     end
 
     -- Backfill any structure a partial/older DB is missing.
@@ -578,6 +605,10 @@ function Store.OnLogin()
     Store.WeeklyResetSweep()
     Store.SweepOrphanBucket()
     Store.SweepOfflineDMF()
+    -- Wave N5: one-time import of legacy Bags cross-account data, then a
+    -- retention sweep over the suite-namespace store.
+    Store.MigrateBags()
+    Store.SweepSyncNamespaces()
 end
 
 function Store.OnLogout()
@@ -961,6 +992,234 @@ function Store.SweepOfflineDMF()
             end
         end
     end
+end
+
+----------------------------------------------------------------------
+-- Suite-namespace store (Daseeki.Sync v2, wave N5)
+--
+-- The persistent backing for the mesh-transported namespace payloads other
+-- suite addons publish through Nexus. Shape:
+--   syncNamespaces[nsKey][ownerKey] = { rev = <number>, updatedAt = <epoch>,
+--                                       data = <table> }
+-- `rev` is a per-owner monotonic revision (owner-wins-by-rev on merge); a
+-- strictly-greater rev replaces the stored payload, an equal/lower rev is
+-- rejected as stale. This is the same last-writer-wins discipline the mesh
+-- character graph uses, applied per namespace owner.
+----------------------------------------------------------------------
+
+-- The whole namespace table (lazily created).
+function Store.SyncNS()
+    local d = Store.data
+    d.syncNamespaces = d.syncNamespaces or {}
+    return d.syncNamespaces
+end
+
+-- The owner->entry map for one namespace (lazily created when `create`).
+function Store.SyncNSNamespace(nsKey, create)
+    if type(nsKey) ~= "string" or nsKey == "" then return nil end
+    local all = Store.SyncNS()
+    local nsp = all[nsKey]
+    if not nsp and create then
+        nsp = {}
+        all[nsKey] = nsp
+    end
+    return nsp
+end
+
+-- Read one owner's stored entry (or nil).
+function Store.SyncNSGet(nsKey, ownerKey)
+    local nsp = Store.SyncNSNamespace(nsKey, false)
+    return nsp and nsp[ownerKey] or nil
+end
+
+-- Read one owner's payload data (or nil).
+function Store.SyncNSGetData(nsKey, ownerKey)
+    local e = Store.SyncNSGet(nsKey, ownerKey)
+    return e and e.data or nil
+end
+
+-- The owner->entry map (never nil; empty table if absent).
+function Store.SyncNSAll(nsKey)
+    return Store.SyncNSNamespace(nsKey, false) or {}
+end
+
+-- PURE core: owner-wins-by-rev merge into a namespace table. `nsp` is the
+-- owner->entry map. Returns "applied" if the incoming rev strictly beats the
+-- stored one (or the owner is new), else "stale". Mutates `nsp` on apply.
+function Store.SyncNSApply(nsp, ownerKey, rev, data, now)
+    if type(ownerKey) ~= "string" or ownerKey == "" then return "stale" end
+    rev = tonumber(rev) or 0
+    local existing = nsp[ownerKey]
+    local curRev = existing and existing.rev or -1
+    if rev <= curRev then
+        return "stale"
+    end
+    nsp[ownerKey] = { rev = rev, updatedAt = now or serverNow(), data = data }
+    return "applied"
+end
+
+-- Live wrapper: put/merge one owner's payload into a namespace with owner-wins
+-- rev gating. Returns "applied"/"stale".
+function Store.SyncNSPut(nsKey, ownerKey, rev, data, now)
+    local nsp = Store.SyncNSNamespace(nsKey, true)
+    if not nsp then return "stale" end
+    return Store.SyncNSApply(nsp, ownerKey, rev, data, now)
+end
+
+-- Remove one owner from a namespace (tombstone / eviction).
+function Store.SyncNSDrop(nsKey, ownerKey)
+    local nsp = Store.SyncNSNamespace(nsKey, false)
+    if nsp then nsp[ownerKey] = nil end
+end
+
+-- Retention: drop stale entries (not refreshed within SYNCNS_STALE) and any
+-- entry whose ownerKey names a tombstoned account (account-granular
+-- namespaces). Char-granular namespaces like "bags" simply age out by
+-- staleness. Emits a one-line size-sanity note if a namespace grows past
+-- SYNCNS_SIZE_WARN owners. Returns the number of entries dropped.
+function Store.SweepSyncNamespaces(now)
+    now = now or serverNow()
+    local all = Store.SyncNS()
+    local dropped = 0
+    for nsKey, nsp in pairs(all) do
+        local count = 0
+        for ownerKey, entry in pairs(nsp) do
+            local stale = (now - (entry.updatedAt or 0)) > SYNCNS_STALE
+            local tombstoned = Store.IsTombstoned and Store.IsTombstoned(ownerKey)
+            if stale or tombstoned then
+                nsp[ownerKey] = nil
+                dropped = dropped + 1
+            else
+                count = count + 1
+            end
+        end
+        if count > SYNCNS_SIZE_WARN and ns and ns.Print then
+            ns:Print(string.format(
+                "sync: namespace '%s' holds %d owners (over sanity threshold %d).",
+                nsKey, count, SYNCNS_SIZE_WARN))
+        end
+    end
+    return dropped
+end
+
+----------------------------------------------------------------------
+-- Wave N5 migration: seed syncNamespaces["bags"] from the legacy Bags
+-- cross-account cache.
+--
+-- Redefinition note (2026-07-28): the retired DaseekiWoWHelper never actually
+-- populated a `DaseekiWoWHelperRemote` global inside Daseeki-Bags -- Bags used
+-- an in-game DBAG mesh whose received cross-account snapshots live in the
+-- `DaseekiBagsMesh` SavedVariable (shape per owner:
+--   { ts, rev, class, race, sex, level, faction, itemCounts, currency, money }).
+-- We import BOTH sources for forward-compatibility: any legacy
+-- DaseekiWoWHelperRemote table if one is ever present (spec-literal path,
+-- a no-op on today's data) AND DaseekiBagsMesh (the real legacy store). The
+-- import is one-time (bagsImported guard), idempotent, and NON-DESTRUCTIVE --
+-- the legacy globals are only read, never written.
+----------------------------------------------------------------------
+
+-- PURE core: build a { ownerKey -> { rev, updatedAt, data } } seed from the
+-- legacy sources. `sources.mesh` is a DaseekiBagsMesh-shaped table
+-- ({ [realm] = { [charName] = snapshot } }); `sources.helper` is an optional
+-- DaseekiWoWHelperRemote-shaped table whose ["bags"] key (if a table) is
+-- treated as an already-keyed { ownerKey -> snapshot|entry } map. Returns the
+-- seed table plus a small stats table for validation/reporting.
+function Store.BuildBagsNamespaceSeed(sources, now)
+    now = now or serverNow()
+    sources = sources or {}
+    local seed = {}
+    local stats = { fromMesh = 0, fromHelper = 0, realms = 0, bagsWithItems = 0 }
+
+    local function put(ownerKey, snapshot, rev, ts)
+        if type(ownerKey) ~= "string" or ownerKey == "" then return false end
+        if type(snapshot) ~= "table" then return false end
+        seed[ownerKey] = {
+            rev = tonumber(rev) or tonumber(snapshot.rev) or 1,
+            updatedAt = tonumber(ts) or tonumber(snapshot.ts) or now,
+            data = snapshot,
+        }
+        if type(snapshot.itemCounts) == "table" and next(snapshot.itemCounts) then
+            stats.bagsWithItems = stats.bagsWithItems + 1
+        end
+        return true
+    end
+
+    -- DaseekiBagsMesh: { [realm] = { [charName] = snapshot } } -> "Char-Realm".
+    local mesh = sources.mesh
+    if type(mesh) == "table" then
+        for realm, byChar in pairs(mesh) do
+            if type(realm) == "string" and type(byChar) == "table" then
+                stats.realms = stats.realms + 1
+                for charName, snap in pairs(byChar) do
+                    if type(charName) == "string" and type(snap) == "table" then
+                        if put(charName .. "-" .. realm, snap, snap.rev, snap.ts) then
+                            stats.fromMesh = stats.fromMesh + 1
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    -- DaseekiWoWHelperRemote.bags: already an ownerKey-keyed map (spec-literal
+    -- path; absent on today's data). Each value is either a raw snapshot or a
+    -- { rev, updatedAt/ts, data } entry. Mesh entries win on an ownerKey tie
+    -- only when strictly newer by rev.
+    local helper = sources.helper
+    local helperBags = type(helper) == "table" and helper.bags or nil
+    if type(helperBags) == "table" then
+        for ownerKey, val in pairs(helperBags) do
+            if type(ownerKey) == "string" and type(val) == "table" then
+                local snap = val.data or val
+                local rev  = val.rev or (snap and snap.rev)
+                local ts   = val.updatedAt or val.ts or (snap and snap.ts)
+                local existing = seed[ownerKey]
+                if not existing or (tonumber(rev) or 1) > existing.rev then
+                    if put(ownerKey, snap, rev, ts) then
+                        stats.fromHelper = stats.fromHelper + 1
+                    end
+                end
+            end
+        end
+    end
+
+    stats.total = 0
+    for _ in pairs(seed) do stats.total = stats.total + 1 end
+    return seed, stats
+end
+
+-- Run the one-time import into DaseekiNexusData.syncNamespaces["bags"]. Reads
+-- the legacy globals at runtime (present because Bags loads alongside Nexus
+-- until its own cutover branch merges). Guarded + non-destructive. Returns the
+-- stats table (or nil if already imported / nothing to import).
+function Store.MigrateBags(now)
+    if Store.data.bagsImported then return nil end
+    now = now or serverNow()
+    local G = _G or getfenv(0)
+    local sources = {
+        mesh   = (type(G.DaseekiBagsMesh) == "table") and G.DaseekiBagsMesh or nil,
+        helper = (type(G.DaseekiWoWHelperRemote) == "table") and G.DaseekiWoWHelperRemote or nil,
+    }
+    -- Nothing to import: still set the guard so we don't re-scan every login.
+    if not sources.mesh and not sources.helper then
+        Store.data.bagsImported = true
+        return nil
+    end
+
+    local seed, stats = Store.BuildBagsNamespaceSeed(sources, now)
+    local nsp = Store.SyncNSNamespace("bags", true)
+    -- Merge with owner-wins-by-rev so a re-run (or already-live mesh data)
+    -- never clobbers a newer payload we already hold.
+    for ownerKey, entry in pairs(seed) do
+        Store.SyncNSApply(nsp, ownerKey, entry.rev, entry.data, entry.updatedAt)
+    end
+    Store.data.bagsImported = true
+    if ns and ns.Print then
+        ns:Print(string.format(
+            "sync: imported %d cross-account Bags owner(s) into the 'bags' namespace.",
+            stats.total))
+    end
+    return stats
 end
 
 ----------------------------------------------------------------------
