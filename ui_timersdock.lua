@@ -319,26 +319,51 @@ function TimersDock.Attach(parent)
     end
     D._layoutGrid = layoutGrid
 
-    -- ── Broadcast button ─────────────────────────────────────────────────────
-    local bcast = UI.MakeButton(parent, {
-        text = "Broadcast", variant = "normal", width = 110, height = 22,
-        onClick = function(self)
-            local t = GetTime()
-            if D._lastBcast and (t - D._lastBcast) < 60 then ns:Print("broadcast throttled (60s)."); return end
-            if ns.Mesh and ns.Mesh.BroadcastTimers and ns.Timers then
-                ns:SafeCall(ns.Mesh.BroadcastTimers, ns.Timers.GetSnapshot())
-                D._lastBcast = t; ns:Print("timers broadcast to guild/mesh.")
-            else
-                ns:Print("mesh broadcast arrives in a later update.")
-            end
-        end,
-    })
-    -- Flow the Broadcast button directly below the songflower grid (round-4) rather
-    -- than pinning it to the dock bottom — with the taller rows/cells the content now
-    -- fills top-down and the small remaining margin sits below the button, not as a
-    -- dead mid-pane gap.
-    bcast:SetPoint("TOPLEFT", sfGrid, "BOTTOMLEFT", 0, -12)
-    D.bcast = bcast
+    -- ── Bottom-right ICON PAIR (owner round-10 item 1): Broadcast + Refresh ──────
+    -- Icon buttons (glyph + tooltip) in the dock's bottom-right corner. Refresh (right)
+    -- pulls fresh timer data via the existing request path; Broadcast (left) pushes our
+    -- snapshot to the mesh (60s throttle). The old text Broadcast button is removed.
+    local function iconButton(iconTex, tip, onClick)
+        local b = CreateFrame("Button", nil, parent, "BackdropTemplate")
+        b:SetSize(22, 22)
+        UI.Skin(b, function(self)
+            self:SetBackdrop(UI.FLAT_BACKDROP)
+            self:SetBackdropColor(UI.Color("inset"))
+            self:SetBackdropBorderColor(UI.Color("borderLite"))
+        end)
+        local ic = b:CreateTexture(nil, "ARTWORK")
+        ic:SetPoint("TOPLEFT", b, "TOPLEFT", 2, -2); ic:SetPoint("BOTTOMRIGHT", b, "BOTTOMRIGHT", -2, 2)
+        ic:SetTexCoord(0.1, 0.9, 0.1, 0.9); ic:SetTexture(iconTex)
+        b.icon = ic
+        b:SetScript("OnEnter", function(self)
+            GameTooltip:SetOwner(self, "ANCHOR_LEFT"); GameTooltip:AddLine(tip, UI.Color("text")); GameTooltip:Show()
+        end)
+        b:SetScript("OnLeave", function() GameTooltip:Hide() end)
+        b:SetScript("OnClick", onClick)
+        return b
+    end
+    -- Refresh (circular-arrows / time glyph) — pull fresh timer data.
+    local refreshBtn = iconButton("Interface\\Icons\\Spell_Nature_TimeStop", "Refresh timer data", function()
+        if ns.Timers and ns.Timers.RequestTimerData then
+            ns:SafeCall(ns.Timers.RequestTimerData); ns:Print("requesting timer data from the mesh...")
+        else
+            ns:Print("timer-data request arrives in a later update.")
+        end
+    end)
+    refreshBtn:SetPoint("BOTTOMRIGHT", parent, "BOTTOMRIGHT", -PAD_H, PAD_V)
+    -- Broadcast (signal/horn glyph) — push our snapshot to the mesh (60s throttle).
+    local bcast = iconButton("Interface\\Icons\\INV_Misc_Horn_02", "Broadcast timers to the mesh (60s)", function()
+        local t = GetTime()
+        if D._lastBcast and (t - D._lastBcast) < 60 then ns:Print("broadcast throttled (60s)."); return end
+        if ns.Mesh and ns.Mesh.BroadcastTimers and ns.Timers then
+            ns:SafeCall(ns.Mesh.BroadcastTimers, ns.Timers.GetSnapshot())
+            D._lastBcast = t; ns:Print("timers broadcast to guild/mesh.")
+        else
+            ns:Print("mesh broadcast arrives in a later update.")
+        end
+    end)
+    bcast:SetPoint("RIGHT", refreshBtn, "LEFT", -6, 0)
+    D.bcast, D.refresh = bcast, refreshBtn
 
     -- ── Refresh ──────────────────────────────────────────────────────────────
     function D.Refresh()

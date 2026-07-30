@@ -240,37 +240,57 @@ end
 -- HALO behind it that glows against the panel. Falls back to a rotated-square diamond
 -- if the mask primitive is unavailable (headless / no Core). Returns (pip, halo); the
 -- pip is the anchor target. Paint with Dashboard.PaintStatusPip(pip, halo, online).
+local function maskOrRotate(t)
+    if UI and UI.MaskTexture then UI.MaskTexture(t)   -- clip to the faceted diamond stencil
+    else t:SetRotation(0.7853981633974483) end        -- fallback: rotated square (math.rad 45)
+end
 function Dashboard.MakeStatusPip(parent, size)
     size = size or 9
-    local function diamond(sz, layer)
-        local t = parent:CreateTexture(nil, layer)
-        t:SetTexture("Interface\\Buttons\\WHITE8X8")
-        t:SetSize(sz, sz)
-        if UI and UI.MaskTexture then
-            UI.MaskTexture(t)                      -- clip to the faceted diamond stencil
-        else
-            t:SetRotation(0.7853981633974483)      -- fallback: rotated square (math.rad 45)
-        end
-        return t
-    end
-    local halo = diamond(size + 5, "ARTWORK")      -- behind (glow)
-    local pip  = diamond(size, "OVERLAY")          -- solid front
-    halo:SetPoint("CENTER", pip, "CENTER", 0, 0)
+    local pip = parent:CreateTexture(nil, "OVERLAY")
+    pip:SetTexture("Interface\\Buttons\\WHITE8X8"); pip:SetSize(size, size); maskOrRotate(pip)
+    -- Halo lives in its OWN small child frame so it can be ANIMATED (owner round-10
+    -- item 5: an outward-expanding glow). It sits over/around the pip; low alpha.
+    local halo = CreateFrame("Frame", nil, parent)
+    halo:SetSize(size + 5, size + 5); halo:SetPoint("CENTER", pip, "CENTER", 0, 0)
+    local htex = halo:CreateTexture(nil, "ARTWORK")
+    htex:SetTexture("Interface\\Buttons\\WHITE8X8"); htex:SetAllPoints(halo); maskOrRotate(htex)
+    halo.tex = htex
     halo:Hide()
+    -- Glow: one looping scale+alpha AnimationGroup (~2s) — the halo expands outward from
+    -- the pip centre and fades, then repeats. Guarded for animation-API variance across
+    -- clients (SetScaleTo/SetScale, SetToAlpha/SetChange). Engine-driven, so it is cheap
+    -- and pauses automatically when the frame is hidden (offline / other tab).
+    pcall(function()
+        local ag = halo:CreateAnimationGroup(); ag:SetLooping("REPEAT")
+        local sc = ag:CreateAnimation("Scale"); sc:SetOrigin("CENTER", 0, 0); sc:SetDuration(2)
+        if sc.SetScaleTo then sc:SetScaleFrom(0.45, 0.45); sc:SetScaleTo(2.0, 2.0)
+        elseif sc.SetScale then sc:SetScale(2.0, 2.0) end
+        local al = ag:CreateAnimation("Alpha"); al:SetDuration(2)
+        if al.SetFromAlpha then al:SetFromAlpha(1); al:SetToAlpha(0)
+        elseif al.SetChange then al:SetChange(-1) end
+        halo.glow = ag
+    end)
     return pip, halo
 end
 
--- Online = FULL ok-green (no muting) + a soft ok halo glow. Offline = a dim faint
--- diamond, no halo. `pip`/`halo` from Dashboard.MakeStatusPip.
+-- Online = FULL ok-green (no muting) + a soft ANIMATED ok halo glow. Offline = a dim
+-- faint diamond, no halo. `pip` is a texture; `halo` is the glow frame from MakeStatusPip.
 function Dashboard.PaintStatusPip(pip, halo, online)
     if online then
         local r, g, b = UI.Color("ok")
         pip:SetVertexColor(r, g, b, 1)
-        if halo then halo:SetVertexColor(r, g, b, 0.4); halo:Show() end
+        if halo then
+            halo.tex:SetVertexColor(r, g, b, 0.5)
+            halo:Show()
+            if halo.glow and not halo.glow:IsPlaying() then halo.glow:Play() end
+        end
     else
         local r, g, b = UI.Color("faint")
         pip:SetVertexColor(r, g, b, 0.8)
-        if halo then halo:Hide() end
+        if halo then
+            if halo.glow then halo.glow:Stop() end
+            halo:Hide()
+        end
     end
 end
 

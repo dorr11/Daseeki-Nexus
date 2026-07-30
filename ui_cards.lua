@@ -368,7 +368,7 @@ local function makeCard(parent, pane)
         self:SetBackdropBorderColor(UI.Color(self._sel and "accent" or "borderLite"))
     end)
     -- Rounded corners against the cards panel's raised fill (round-8 item 3, radius ~4).
-    Dashboard.RoundCorners(card, 4, "raised")
+    Dashboard.RoundCorners(card, 6, "raised")
     -- Accent wash over the selected card (clearly distinct from a resting card).
     card.wash = card:CreateTexture(nil, "BACKGROUND")
     card.wash:SetPoint("TOPLEFT", card, "TOPLEFT", 1, -1)
@@ -574,9 +574,10 @@ end
 -- transparent + text label; a housing border + 1px dividers give the segmented look.
 -- Returns the housing frame with :Apply(filter) (repaints + sizes to content).
 ----------------------------------------------------------------------
+local SEG_H = 28   -- round-10 item 6: taller segments fill the 44px chip bar
 local function makeFilterSegmented(parent, pane)
     local housing = CreateFrame("Frame", nil, parent, "BackdropTemplate")
-    housing:SetHeight(22)
+    housing:SetHeight(SEG_H)
     UI.Skin(housing, function(self)
         self:SetBackdrop(UI.FLAT_BACKDROP)
         self:SetBackdropColor(0, 0, 0, 0)
@@ -586,17 +587,20 @@ local function makeFilterSegmented(parent, pane)
     local prev
     for i, def in ipairs(FILTER_DEFS) do
         local b = CreateFrame("Button", nil, housing, "BackdropTemplate")
-        b:SetHeight(22)
+        b:SetHeight(SEG_H)
         b._key = def.key
+        -- "60S" -> "60s" (owner round-10 item 6); ONLINE/SUMMONERS stay uppercase.
+        local disp = (def.key == "60s") and "60s" or def.label:upper()
         local lbl = fstr(b, "microLabel"); lbl:SetPoint("CENTER", b, "CENTER", 0, 0)
-        lbl:SetText(def.label:upper())
+        lbl:SetText(disp)
+        do local f, sz = lbl:GetFont(); if f then lbl:SetFont(f, (sz or 10) + 1, "OUTLINE") end end  -- +1 + bold
         b._lbl = lbl
-        b:SetWidth((lbl:GetStringWidth() or 30) + 16)
+        b:SetWidth((lbl:GetStringWidth() or 30) + 20)
         if prev then b:SetPoint("LEFT", prev, "RIGHT", 0, 0) else b:SetPoint("LEFT", housing, "LEFT", 0, 0) end
         -- 1px divider before each segment after the first (segmented look).
         if i > 1 then
             local div = housing:CreateTexture(nil, "OVERLAY")
-            div:SetSize(1, 14); div:SetPoint("RIGHT", b, "LEFT", 0, 0)
+            div:SetSize(1, SEG_H - 8); div:SetPoint("RIGHT", b, "LEFT", 0, 0)
             UI.Skin(div, function(self) self:SetColorTexture(UI.Color("borderLite")) end)
         end
         b:SetScript("OnEnter", function(self)
@@ -635,10 +639,10 @@ end
 -- filled faction color; inactive = borderLite outline + desaturated crest.
 local function makeFactionSeg(parent, faction)
     local b = CreateFrame("Button", nil, parent, "BackdropTemplate")
-    b:SetSize(26, 22)
+    b:SetSize(30, SEG_H)   -- round-10 item 6: taller/wider to match the filter segments
     b._faction = faction
     local crest = b:CreateTexture(nil, "ARTWORK")
-    crest:SetSize(14, 14); crest:SetPoint("CENTER", b, "CENTER", 0, 0)
+    crest:SetSize(16, 16); crest:SetPoint("CENTER", b, "CENTER", 0, 0)
     crest:SetTexture(Dashboard.FactionCrest(faction))
     crest:SetTexCoord(0.02, 0.62, 0.03, 0.63)
     b._crest = crest
@@ -681,7 +685,7 @@ Dashboard.RegisterTab("characters", function(host)
             self:SetBackdropBorderColor(UI.Color("borderLite"))
         end)
         -- Rounded corners against the base ground (round-8 item 3, mockup radius ~5).
-        Dashboard.RoundCorners(p, 5, "ground")
+        Dashboard.RoundCorners(p, 7, "ground")
         tag(p, id)
         return p
     end
@@ -706,13 +710,13 @@ Dashboard.RegisterTab("characters", function(host)
 
     -- Filter SEGMENTED control (one housing, 60S | ONLINE | SUMMONERS), left side.
     local filterSeg = makeFilterSegmented(chipbar, pane)
-    filterSeg:SetPoint("LEFT", chipbar, "LEFT", LIST_PAD, 0)
+    filterSeg:SetPoint("LEFT", chipbar, "LEFT", 6, 0)
     pane._filterSeg = filterSeg
     tag(filterSeg, "cards.filter")
     -- Faction A|H segment at the RIGHT end of the chip bar (item B).
     local segA = makeFactionSeg(chipbar, "Alliance")
     local segH = makeFactionSeg(chipbar, "Horde")
-    segH:SetPoint("RIGHT", chipbar, "RIGHT", -LIST_PAD, 0)
+    segH:SetPoint("RIGHT", chipbar, "RIGHT", -6, 0)
     segA:SetPoint("RIGHT", segH, "LEFT", 0, 0)   -- touching halves
     pane._factionSegs = { segA, segH }
     tag(segA, "cards.faction")

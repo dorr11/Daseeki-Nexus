@@ -193,6 +193,62 @@ function InstancesUI.ClassLookup(data)
     return map
 end
 
+-- Per-character EXPERIENCE / REST row (owner round-10 item 2). Consumes the record
+-- fields the engine agent is adding concurrently (rec.xp / rec.xpMax / rec.restedXP)
+-- GUARDEDLY — an absent field renders "—" so this is safe before the engine lands.
+-- A level-60 character shows just "Level 60" (no xp / rested). Rested% is restedXP as a
+-- percent of xpMax, "N% (Max)" at >= 150%. Pure/headless-tested.
+local EMDASH = "\226\128\148"
+function InstancesUI.ExpRow(rec, nameRealm, classTag)
+    rec = rec or {}
+    local D = ns.Dashboard
+    local name = (D and D.ShortName and D.ShortName(nameRealm))
+                 or (nameRealm and nameRealm:match("^([^%-]+)")) or nameRealm
+    local level = rec.level or 0
+    local maxed = level >= 60
+    local xpText, restedText
+    if not maxed then
+        local xp, xpMax, rested = rec.xp, rec.xpMax, rec.restedXP
+        if xp and xpMax and xpMax > 0 then xpText = ("%d/%d"):format(xp, xpMax) else xpText = EMDASH end
+        if rested and xpMax and xpMax > 0 then
+            local pct = math.floor(rested / xpMax * 100 + 0.5)
+            restedText = (pct >= 150) and (pct .. "% (Max)") or (pct .. "%")
+        else
+            restedText = EMDASH
+        end
+    end
+    return { nameRealm = nameRealm, classTag = classTag, name = name, level = level,
+             maxed = maxed, levelText = "Level " .. level, xpText = xpText, restedText = restedText }
+end
+
+-- All characters { nameRealm, classTag, level } ordered by LEVEL desc then name asc,
+-- with an "All" sentinel { all = true } prepended (owner round-10 item 3 dropdown).
+-- Pure over a Store.GetData() shape.
+function InstancesUI.CharList(data)
+    local out = {}
+    local accounts = data and data.accounts
+    if type(accounts) == "table" then
+        local function scan(t)
+            if type(t) ~= "table" then return end
+            for nameRealm, rec in pairs(t) do
+                if type(rec) == "table" then
+                    out[#out + 1] = { nameRealm = nameRealm, classTag = rec.classTag, level = rec.level or 0 }
+                end
+            end
+        end
+        for _, bucket in pairs(accounts) do
+            scan(bucket.characters)
+            scan(bucket.homeless)
+        end
+    end
+    table.sort(out, function(a, b)
+        if a.level ~= b.level then return a.level > b.level end
+        return tostring(a.nameRealm) < tostring(b.nameRealm)
+    end)
+    table.insert(out, 1, { all = true, label = "All" })
+    return out
+end
+
 -- ════════════════════════════════════════════════════════════════════════════
 --  COMPACT PANEL (in-game only; UI is non-nil there)
 -- ════════════════════════════════════════════════════════════════════════════
@@ -228,21 +284,111 @@ function InstancesPanel.Attach(host)
     local P = { _meters = {}, _rows = {} }
     P.frame = host
 
-    local hdr = microLabel(host, "INSTANCES")
-    hdr:SetPoint("TOPLEFT", host, "TOPLEFT", PAD, -PAD)
-    tag(hdr, "instances.header")
+    P.view = "instances"       -- "instances" | "exp"  (owner round-10 item 2)
+    P.selectedChar = nil       -- nil = All  (owner round-10 item 3)
+
+    -- Header: INSTANCES | EXP toggle (left) + caps meta (right).
+    local toggle = CreateFrame("Frame", nil, host)
+    toggle:SetPoint("TOPLEFT", host, "TOPLEFT", PAD, -PAD); toggle:SetHeight(14)
+    tag(toggle, "instances.header")
+    P._tSegs = {}
+    local function makeTSeg(key, text)
+        local b = CreateFrame("Button", nil, toggle)
+        local l = fstr(b, "microLabel"); l:SetPoint("LEFT", b, "LEFT", 0, 0); l:SetText(text)
+        b:SetSize((l:GetStringWidth() or 40) + 2, 14); b._lbl = l; b._key = key
+        b:SetScript("OnClick", function() P.view = key; P.Refresh() end)
+        function b:Apply(active) self._lbl:SetTextColor(UI.Color(active and "accent" or "muted")) end
+        P._tSegs[#P._tSegs + 1] = b
+        return b
+    end
+    local segI = makeTSeg("instances", "INSTANCES"); segI:SetPoint("LEFT", toggle, "LEFT", 0, 0)
+    local sep = fstr(toggle, "microLabel"); sep:SetText("|"); sep:SetTextColor(UI.Color("faint"))
+    sep:SetPoint("LEFT", segI, "RIGHT", 6, 0)
+    local segE = makeTSeg("exp", "EXP"); segE:SetPoint("LEFT", sep, "RIGHT", 6, 0)
+
     local meta = fstr(host, "microLabel", "RIGHT")
     meta:SetPoint("TOPRIGHT", host, "TOPRIGHT", -PAD, -PAD)
     meta:SetTextColor(UI.Color("muted"))
     P.meta = meta
 
-    -- Meters container (per-account rows + ALL row), anchored below the header.
+    -- Character DROPDOWN (round-10 item 3): filters BOTH views to a selected character
+    -- ("All" default). Below the toggle. Clicking opens a scrollable popup of all chars
+    -- (level desc, name asc) + "All" at top; the cap meters below stay global.
+    local dd = CreateFrame("Button", nil, host, "BackdropTemplate")
+    dd:SetHeight(17)
+    dd:SetPoint("TOPLEFT", host, "TOPLEFT", PAD, -(PAD + 18))
+    dd:SetPoint("RIGHT", host, "RIGHT", -PAD, 0)
+    UI.Skin(dd, function(self)
+        self:SetBackdrop(UI.FLAT_BACKDROP); self:SetBackdropColor(UI.Color("inset")); self:SetBackdropBorderColor(UI.Color("borderLite"))
+    end)
+    dd.label = fstr(dd, "small"); dd.label:SetPoint("LEFT", dd, "LEFT", 7, 0); dd.label:SetText("All")
+    local ddArrow = fstr(dd, "small"); ddArrow:SetPoint("RIGHT", dd, "RIGHT", -6, 0); ddArrow:SetText("\226\150\190")
+    ddArrow:SetTextColor(UI.Color("muted"))
+    tag(dd, "instances.charselect")
+    P.dd = dd
+    -- Popup list (own frame, DIALOG strata; 10 rows visible, scroll for the rest).
+    local DD_ROW_H, DD_VIS = 16, 10
+    local pop = CreateFrame("Frame", nil, dd, "BackdropTemplate")
+    pop:SetFrameStrata("DIALOG"); pop:SetPoint("TOPLEFT", dd, "BOTTOMLEFT", 0, -1); pop:SetPoint("TOPRIGHT", dd, "BOTTOMRIGHT", 0, -1)
+    pop:SetHeight(DD_VIS * DD_ROW_H + 4)
+    UI.Skin(pop, function(self)
+        self:SetBackdrop(UI.FLAT_BACKDROP); self:SetBackdropColor(UI.Color("ground")); self:SetBackdropBorderColor(UI.Color("accent"))
+    end)
+    pop:Hide()
+    local popScroll = CreateFrame("ScrollFrame", nil, pop); popScroll:SetPoint("TOPLEFT", 2, -2); popScroll:SetPoint("BOTTOMRIGHT", -2, 2)
+    popScroll:SetClipsChildren(true); popScroll:EnableMouseWheel(true)
+    local popChild = CreateFrame("Frame", nil, popScroll); popChild:SetSize(1, 1); popScroll:SetScrollChild(popChild)
+    popScroll:SetScript("OnMouseWheel", function(self, delta)
+        local maxs = math.max(0, popChild:GetHeight() - self:GetHeight())
+        self:SetVerticalScroll(math.max(0, math.min(maxs, self:GetVerticalScroll() - delta * DD_ROW_H * 2)))
+    end)
+    P._ddRows = {}
+    local function ddRebuild()
+        local data = ns.Store and ns.Store.GetData and ns.Store.GetData()
+        local list = InstancesUI.CharList(data)
+        local W = popScroll:GetWidth(); if W < 1 then W = dd:GetWidth() - 4 end
+        popChild:SetWidth(W)
+        for _, r in ipairs(P._ddRows) do r:Hide() end
+        local y = 0
+        for i, item in ipairs(list) do
+            local r = P._ddRows[i]
+            if not r then
+                r = CreateFrame("Button", nil, popChild)
+                r:SetHeight(DD_ROW_H)
+                r.txt = fstr(r, "small"); r.txt:SetPoint("LEFT", r, "LEFT", 6, 0); r.txt:SetWordWrap(false)
+                r.txt:SetPoint("RIGHT", r, "RIGHT", -6, 0); r.txt:SetJustifyH("LEFT")
+                r:SetScript("OnEnter", function(self) self.txt:SetTextColor(UI.Color("accent")) end)
+                P._ddRows[i] = r
+            end
+            r:ClearAllPoints(); r:SetPoint("TOPLEFT", popChild, "TOPLEFT", 0, -y); r:SetPoint("TOPRIGHT", popChild, "TOPRIGHT", 0, -y)
+            if item.all then
+                r.txt:SetText("All"); r.txt:SetTextColor(UI.Color("text"))
+                r._sel = nil
+                r:SetScript("OnLeave", function(self) self.txt:SetTextColor(UI.Color("text")) end)
+            else
+                local cr, cg, cb = Dashboard.ClassColor(item.classTag)
+                r.txt:SetText(("%s  \194\183 %d"):format((item.nameRealm:match("^([^%-]+)") or item.nameRealm), item.level))
+                if cr then r.txt:SetTextColor(cr, cg, cb) else r.txt:SetTextColor(UI.Color("text")) end
+                r._sel = item.nameRealm
+                r:SetScript("OnLeave", function(self) if cr then self.txt:SetTextColor(cr, cg, cb) else self.txt:SetTextColor(UI.Color("text")) end end)
+            end
+            r:SetScript("OnClick", function(self) P.selectedChar = self._sel; pop:Hide(); P.Refresh() end)
+            r:Show()
+            y = y + DD_ROW_H
+        end
+        popChild:SetHeight(math.max(y, 1))
+    end
+    dd:SetScript("OnClick", function() if pop:IsShown() then pop:Hide() else ddRebuild(); pop:Show() end end)
+    P._ddRebuild = ddRebuild
+
+    -- Meters container (per-account rows + ALL row) — GLOBAL, below the dropdown.
+    local METERS_TOP = PAD + 40
     local metersTop = CreateFrame("Frame", nil, host)
-    metersTop:SetPoint("TOPLEFT", host, "TOPLEFT", PAD, -(PAD + 15))
+    metersTop:SetPoint("TOPLEFT", host, "TOPLEFT", PAD, -METERS_TOP)
     metersTop:SetPoint("RIGHT", host, "RIGHT", -PAD, 0)
     metersTop:SetHeight(1)
     tag(metersTop, "instances.meters")
-    P.metersTop = metersTop
+    P.metersTop, P._metersTop = metersTop, METERS_TOP
 
     local function makeMeterRow()
         local r = CreateFrame("Frame", nil, host)
@@ -288,6 +434,31 @@ function InstancesPanel.Attach(host)
         local r = P._rows[i]; if not r then r = makeRecRow(); P._rows[i] = r end; return r
     end
 
+    -- EXP rows (round-10 item 2): class-colored name · level · xp cur/total · rested%.
+    P._expRows = {}
+    local function makeExpRow()
+        local r = CreateFrame("Frame", nil, child)
+        r:SetHeight(REC_H)
+        r.name = fstr(r, "small"); r.name:SetPoint("LEFT", r, "LEFT", 0, 0); r.name:SetWordWrap(false)
+        r.rested = fstr(r, "numeral", "RIGHT"); r.rested:SetPoint("RIGHT", r, "RIGHT", 0, 0)
+        r.xp = fstr(r, "numeral", "RIGHT"); r.xp:SetPoint("RIGHT", r.rested, "LEFT", -12, 0)
+        r.lvl = fstr(r, "microLabel"); r.lvl:SetPoint("LEFT", r.name, "RIGHT", 8, 0); r.lvl:SetTextColor(UI.Color("muted"))
+        return r
+    end
+    local function getExp(i)
+        local r = P._expRows[i]; if not r then r = makeExpRow(); P._expRows[i] = r end; return r
+    end
+
+    -- Resolve a character record (for xp/rested fields) across all account buckets.
+    local function resolveRec(data, nameRealm)
+        local accounts = data and data.accounts
+        if type(accounts) ~= "table" then return nil end
+        for _, b in pairs(accounts) do
+            local rec = (b.characters and b.characters[nameRealm]) or (b.homeless and b.homeless[nameRealm])
+            if rec then return rec end
+        end
+    end
+
     function P.Refresh()
         local nowE = (Dashboard and Dashboard.Now and Dashboard.Now()) or (GetServerTime and GetServerTime()) or 0
         local Inst = ns.Instances
@@ -324,37 +495,70 @@ function InstancesPanel.Attach(host)
         placeMeter("All", view.total)
         for j = n + 1, #P._meters do P._meters[j]:Hide() end
 
-        -- Recent label + scroll region, positioned below the meters.
+        -- Toggle + dropdown repaint.
+        for _, seg in ipairs(P._tSegs) do seg:Apply(P.view == seg._key) end
+        dd.label:SetText(P.selectedChar and (P.selectedChar:match("^([^%-]+)") or P.selectedChar) or "All")
+
+        -- List label + scroll region, positioned below the (global) meters.
         local metersH = n * METER_H + math.max(0, n - 1) * METER_GAP
-        local recTop = PAD + 15 + metersH + 8
-        recLbl:ClearAllPoints(); recLbl:SetPoint("TOPLEFT", host, "TOPLEFT", PAD, -recTop)
+        local listTop = P._metersTop + metersH + 8
+        local isExp = (P.view == "exp")
+        recLbl:SetText(isExp and "EXPERIENCE" or "RECENT")
+        recLbl:ClearAllPoints(); recLbl:SetPoint("TOPLEFT", host, "TOPLEFT", PAD, -listTop)
         scroll:ClearAllPoints()
-        scroll:SetPoint("TOPLEFT", host, "TOPLEFT", PAD, -(recTop + 15))
+        scroll:SetPoint("TOPLEFT", host, "TOPLEFT", PAD, -(listTop + 15))
         scroll:SetPoint("BOTTOMRIGHT", host, "BOTTOMRIGHT", -PAD, PAD)
 
-        -- Recent list (newest first, capped).
-        local all = InstancesUI.GatherEntries((data and data.instances) or {})
         local classMap = InstancesUI.ClassLookup(data or {})
         local W = scroll:GetWidth(); if W < 1 then W = host:GetWidth() - 2 * PAD end
         child:SetWidth(W)
         for _, r in ipairs(P._rows) do r:Hide() end
+        for _, r in ipairs(P._expRows) do r:Hide() end
         local y, shown = 0, 0
-        for i = 1, math.min(#all, MAX_REC) do
-            local item = all[i]
-            local model = InstancesUI.RowModel(item.entry, item.nameRealm, classMap[item.nameRealm], nowE)
-            shown = shown + 1
-            local r = getRec(shown)
-            r:ClearAllPoints(); r:SetPoint("TOPLEFT", child, "TOPLEFT", 0, -y); r:SetPoint("TOPRIGHT", child, "TOPRIGHT", 0, -y)
-            local cr, cg, cb = Dashboard.ClassColor(model.classTag)
-            r.name:SetText(model.name or "?")
-            if cr then r.name:SetTextColor(cr, cg, cb) else r.name:SetTextColor(UI.Color("text")) end
-            r.inst:SetText(model.instance)
-            r.ago:SetText(model.agoText)
-            r:Show()
-            y = y + REC_H + REC_GAP
+
+        if isExp then
+            -- EXP view: per-character xp / rested rows, filtered by the dropdown.
+            local list = InstancesUI.CharList(data)
+            for _, item in ipairs(list) do
+                if not item.all and (not P.selectedChar or item.nameRealm == P.selectedChar) then
+                    local m = InstancesUI.ExpRow(resolveRec(data, item.nameRealm), item.nameRealm, item.classTag)
+                    shown = shown + 1
+                    local r = getExp(shown)
+                    r:ClearAllPoints(); r:SetPoint("TOPLEFT", child, "TOPLEFT", 0, -y); r:SetPoint("TOPRIGHT", child, "TOPRIGHT", 0, -y)
+                    local cr, cg, cb = Dashboard.ClassColor(m.classTag)
+                    r.name:SetText(m.name or "?")
+                    if cr then r.name:SetTextColor(cr, cg, cb) else r.name:SetTextColor(UI.Color("text")) end
+                    r.lvl:SetText(m.levelText)
+                    r.xp:SetText(m.xpText or ""); r.xp:SetTextColor(UI.Color("muted"))
+                    r.rested:SetText(m.restedText or ""); r.rested:SetTextColor(UI.Color("muted"))
+                    r:Show()
+                    y = y + REC_H + REC_GAP
+                end
+            end
+            P._empty:SetText("No characters."); P._empty:SetShown(shown == 0)
+        else
+            -- INSTANCES view: recent entries (newest first), filtered by the dropdown.
+            local all = InstancesUI.GatherEntries((data and data.instances) or {})
+            for i = 1, #all do
+                local item = all[i]
+                if shown >= MAX_REC then break end
+                if (not P.selectedChar) or (item.nameRealm == P.selectedChar) then
+                    local model = InstancesUI.RowModel(item.entry, item.nameRealm, classMap[item.nameRealm], nowE)
+                    shown = shown + 1
+                    local r = getRec(shown)
+                    r:ClearAllPoints(); r:SetPoint("TOPLEFT", child, "TOPLEFT", 0, -y); r:SetPoint("TOPRIGHT", child, "TOPRIGHT", 0, -y)
+                    local cr, cg, cb = Dashboard.ClassColor(model.classTag)
+                    r.name:SetText(model.name or "?")
+                    if cr then r.name:SetTextColor(cr, cg, cb) else r.name:SetTextColor(UI.Color("text")) end
+                    r.inst:SetText(model.instance)
+                    r.ago:SetText(model.agoText)
+                    r:Show()
+                    y = y + REC_H + REC_GAP
+                end
+            end
+            P._empty:SetText("No instance entries recorded."); P._empty:SetShown(shown == 0)
         end
         child:SetHeight(math.max(y, 1))
-        P._empty:SetShown(shown == 0)
     end
 
     P.Refresh()
@@ -436,6 +640,32 @@ local function testInstancesUI(fails)
     ck(ids[1] == "1" and ids[2] == "2" and ids[3] == "10", "account ids sorted numerically")
     local cl = IU.ClassLookup(data)
     ck(cl["A-R"] == "ROGUE" and cl["H-R"] == "PRIEST", "class lookup maps nameRealm -> class")
+
+    -- ExpRow (round-10 item 2): guards absent engine fields; level-60 = just Level 60.
+    local EM = "\226\128\148"
+    local r60 = IU.ExpRow({ level = 60, xp = 1, xpMax = 2, restedXP = 3 }, "Max-R", "WARRIOR")
+    ck(r60.maxed == true and r60.levelText == "Level 60", "exp: level 60 -> maxed / Level 60")
+    ck(r60.xpText == nil and r60.restedText == nil, "exp: level 60 has no xp/rested")
+    local rMid = IU.ExpRow({ level = 40, xp = 8000, xpMax = 16000, restedXP = 24000 }, "Mid-R", "MAGE")
+    ck(rMid.levelText == "Level 40", "exp: level text")
+    ck(rMid.xpText == "8000/16000", "exp: xp cur/total")
+    ck(rMid.restedText == "150% (Max)", "exp: rested 24000/16000 = 150% (Max)")
+    local rLow = IU.ExpRow({ level = 20, xp = 500, xpMax = 4000, restedXP = 800 }, "Low-R", "ROGUE")
+    ck(rLow.restedText == "20%", "exp: rested 800/4000 = 20%")
+    local rNone = IU.ExpRow({ level = 30 }, "None-R", "PRIEST")   -- engine fields absent
+    ck(rNone.xpText == EM and rNone.restedText == EM, "exp: absent engine fields -> em-dash")
+
+    -- CharList (round-10 item 3): level desc, then name asc, "All" sentinel at top.
+    local cdata = { accounts = {
+        ["1"] = { characters = { ["Bee-R"] = { classTag = "MAGE", level = 60 },
+                                 ["Ann-R"] = { classTag = "ROGUE", level = 60 },
+                                 ["Cee-R"] = { classTag = "PRIEST", level = 42 } } },
+    } }
+    local list = IU.CharList(cdata)
+    ck(list[1].all == true and list[1].label == "All", "charlist: All sentinel at top")
+    ck(list[2].nameRealm == "Ann-R" and list[3].nameRealm == "Bee-R",
+        "charlist: level 60 block ordered by name asc (Ann before Bee)")
+    ck(list[4].nameRealm == "Cee-R" and list[4].level == 42, "charlist: lower level last")
 end
 
 if ns.RegisterSelfTest then
