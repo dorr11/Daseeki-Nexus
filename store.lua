@@ -637,6 +637,9 @@ function Store.NewCharacterRecord(nameRealm)
         className       = nil,     -- localized
         faction         = nil,     -- "Alliance" / "Horde" / nil
         level           = 0,
+        xp              = 0,       -- current XP into the level (0 at max level)
+        xpMax           = 0,       -- total XP for the level    (0 at max level)
+        restedXP        = 0,       -- rested (double-XP) pool    (0 when unrested)
         location        = nil,     -- resolved label / zone
         inInstance      = false,
         isResting       = false,
@@ -659,6 +662,32 @@ function Store.NewCharacterRecord(nameRealm)
         lastDataUpdate  = 0,
         ownerEpoch      = 0,       -- sync tiebreaker
     }
+end
+
+-- Rested pool as a PERCENTAGE OF THE CURRENT LEVEL: restedXP / xpMax * 100.
+--
+-- Semantics (Classic Era): the rested "bubble" pool grants +100% XP (double XP)
+-- while it lasts and accrues up to a hard cap of 1.5 levels of XP. Expressed as a
+-- percentage of ONE level that cap is 150%, so the DISPLAY value is clamped to
+-- 150 (the raw ratio can momentarily read higher mid-tick, but the game caps
+-- accrual at 1.5 levels). The value is computed honestly from the record's own
+-- xpMax — it is NOT pre-capped in the stored data, only at display time here.
+--
+-- Returns nil (no rested line — the UI shows "Level 60" only) when:
+--   * rec is not a table, or xp/rested fields are absent/non-numeric, or
+--   * xpMax <= 0  (max level, or level data not yet captured — divide-by-zero guard).
+-- Returns 0 for a rested pool of 0 on a sub-60 character (distinct from nil).
+-- Pure; harness-tested (see testRestedPercent).
+function Store.RestedPercent(rec)
+    if type(rec) ~= "table" then return nil end
+    local xpMax  = rec.xpMax
+    local rested = rec.restedXP
+    if type(xpMax) ~= "number" or type(rested) ~= "number" then return nil end
+    if xpMax <= 0 then return nil end          -- max level / no level data captured
+    local pct = rested / xpMax * 100
+    if pct < 0   then pct = 0   end
+    if pct > 150 then pct = 150 end            -- classic rest cap = 1.5 levels
+    return pct
 end
 
 -- Read a character record from any account bucket. Searches the given
@@ -1005,6 +1034,9 @@ local function testDefaults(fails)
     -- Character record has the soulstone field.
     local rec = Store.NewCharacterRecord("X-Y")
     ck(rec.soulstoneReady == false, "record has soulstoneReady field")
+    -- v2 experience/rest fields default to 0 (additive; applyDefaults/decode-safe).
+    ck(rec.xp == 0 and rec.xpMax == 0 and rec.restedXP == 0,
+        "record has xp/xpMax/restedXP fields defaulting to 0")
     -- Instances tab additive keys.
     ck(s.instancesWarnOnEntry == true, "instancesWarnOnEntry default ON")
     local d = defaultData()
@@ -1113,6 +1145,36 @@ local function testInboundNameGuard(fails)
     Store._droppedNamelessInbound = savedCount
 end
 
+-- Rested% derivation matrix: 0, partial, exactly-capped, over-cap, level-60,
+-- and missing/malformed fields. Pure — asserts Store.RestedPercent semantics.
+local function testRestedPercent(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local function rec(xpMax, rested) return { xpMax = xpMax, restedXP = rested } end
+
+    -- 0 rested on a sub-60 character -> 0% (NOT nil; xpMax is valid).
+    ck(Store.RestedPercent(rec(1000, 0)) == 0, "0 rested -> 0%")
+    -- Partial: 250/1000 -> 25%.
+    ck(Store.RestedPercent(rec(1000, 250)) == 25, "250/1000 -> 25%")
+    -- Half a level: 500/1000 -> 50%.
+    ck(Store.RestedPercent(rec(1000, 500)) == 50, "500/1000 -> 50%")
+    -- Exactly at the 1.5-level cap: 1500/1000 -> 150 (not clamped below).
+    ck(Store.RestedPercent(rec(1000, 1500)) == 150, "1500/1000 -> 150% (cap)")
+    -- Over the cap: 3000/1000 raw 300 -> clamped to 150.
+    ck(Store.RestedPercent(rec(1000, 3000)) == 150, "over-cap clamps to 150%")
+    -- Level 60 / no XP data: xpMax 0 -> nil (UI shows "Level 60" only).
+    ck(Store.RestedPercent(rec(0, 0)) == nil, "xpMax 0 (level 60) -> nil")
+    ck(Store.RestedPercent(rec(0, 123)) == nil, "xpMax 0 with stray rested -> nil")
+    -- Missing / malformed fields -> nil.
+    ck(Store.RestedPercent({ xpMax = 1000 }) == nil, "missing restedXP -> nil")
+    ck(Store.RestedPercent({ restedXP = 100 }) == nil, "missing xpMax -> nil")
+    ck(Store.RestedPercent({ xpMax = "x", restedXP = 1 }) == nil, "non-numeric xpMax -> nil")
+    ck(Store.RestedPercent(nil) == nil, "nil rec -> nil")
+    ck(Store.RestedPercent("nope") == nil, "non-table rec -> nil")
+    -- A freshly-defaulted record (all zero) reads as level-60-style nil.
+    ck(Store.RestedPercent(Store.NewCharacterRecord("X-Y")) == nil,
+        "default record (0/0/0) -> nil")
+end
+
 function Store.RunSelfTests(verbose)
     local suites = {
         { name = "defaults",        fn = testDefaults },
@@ -1120,6 +1182,7 @@ function Store.RunSelfTests(verbose)
         { name = "songflower migration", fn = testSongflowerMigration },
         { name = "notes",           fn = testNotes },
         { name = "inbound name guard", fn = testInboundNameGuard },
+        { name = "rested percent",  fn = testRestedPercent },
     }
     local allPass = true
     for _, suite in ipairs(suites) do

@@ -386,6 +386,29 @@ local function captureIdentity(rec)
     end
 end
 
+-- Experience + rested pool (self only). A sub-60 character carries live XP into
+-- the current level plus its rested (double-XP) pool; a max-level (>=60) character
+-- earns no XP, so all three fields are stored as 0/0/0 (the UI shows "Level 60"
+-- only — no XP/rested line). The >=60 gate matches instances.lua sampleXP() so the
+-- two capture paths agree on what "max level" means. restedXP is 0 when unrested
+-- (GetXPExhaustion() returns nil off-rest). All three are Classic Era 1.15.9
+-- globals — UnitXP / UnitXPMax are already used live in instances.lua on 11509,
+-- GetXPExhaustion is the stock rested-pool global. Values ride the u32 wire fields
+-- (see protocol.lua EncodeCharacter) which clamp to the u32 range.
+local function captureXP(rec)
+    local level = rec.level or (UnitLevel and UnitLevel("player")) or 0
+    if level >= 60 or not (UnitXP and UnitXPMax) then
+        rec.xp, rec.xpMax, rec.restedXP = 0, 0, 0
+        return
+    end
+    rec.xp       = UnitXP("player") or 0
+    rec.xpMax    = UnitXPMax("player") or 0
+    rec.restedXP = (GetXPExhaustion and GetXPExhaustion()) or 0
+    -- Defensive: if xpMax reads 0 below 60 (API not yet warm on a fresh login),
+    -- zero the trio so Store.RestedPercent yields nil rather than dividing by 0.
+    if rec.xpMax == 0 then rec.xp, rec.restedXP = 0, 0 end
+end
+
 -- Resting / PvP / instance flags.
 local function captureFlags(rec)
     rec.isResting = IsResting() and true or false
@@ -640,6 +663,7 @@ function Tracker.Capture()
     if not rec then return end
 
     captureIdentity(rec)
+    captureXP(rec)
     captureFlags(rec)
     captureLocation(rec)
     captureShards(rec)
@@ -694,6 +718,8 @@ function Tracker.OnLogin()
         "PLAYER_LEVEL_UP",
         "PLAYER_CONTROL_LOST",
         "PLAYER_CONTROL_GAINED",
+        "PLAYER_XP_UPDATE",       -- XP earned -> refresh xp/xpMax (debounced)
+        "UPDATE_EXHAUSTION",      -- rested pool changed -> refresh restedXP
     }
     for _, evt in ipairs(capEvents) do
         ns:RegisterEvent(evt, function(event, unit)

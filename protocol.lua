@@ -33,7 +33,15 @@ Protocol.PREFIX_LIST = {
     Protocol.PREFIX.SYNC,
 }
 
-Protocol.SCHEMA_VERSION = 1     -- our binary state-schema version
+-- Binary state-schema version. BUMP HISTORY:
+--   v1 — original character record.
+--   v2 — appended xp (u32), xpMax (u32), restedXP (u32) at the END of the
+--        pack/unpack order (Experience/Rest view). DecodeCharacter version-gates
+--        and cleanly REJECTS any mismatched version (returns nil, "unsupported
+--        schema version N"), so a v1<->v2 mesh split simply holds last-known data
+--        with no crash. After this ships, BOTH accounts must /reload before
+--        records flow again (see the report's both-accounts note).
+Protocol.SCHEMA_VERSION = 2     -- our binary state-schema version
 
 -- Register every prefix so inbound messages reach CHAT_MSG_ADDON. Safe to
 -- call once logged in; the mesh dispatcher attaches in wave N2.
@@ -255,6 +263,9 @@ end
 --   str nameRealm
 --   str className
 --   str location
+--   u32 xp                  (current XP into the level; 0 at max level)   [v2]
+--   u32 xpMax               (total XP for the level;    0 at max level)   [v2]
+--   u32 restedXP            (rested/double-XP pool;      0 when unrested)  [v2]
 ----------------------------------------------------------------------
 
 local FACTION_TO_CODE = { Alliance = 1, Horde = 2 }
@@ -337,6 +348,11 @@ function Protocol.EncodeCharacter(rec)
     w.str(rec.className or "")
     w.str(rec.location or "")
 
+    -- v2 tail: experience + rested pool (u32 clamps to the u32 range in w.u32).
+    w.u32(rec.xp or 0)
+    w.u32(rec.xpMax or 0)
+    w.u32(rec.restedXP or 0)
+
     return w.result()
 end
 
@@ -399,6 +415,11 @@ function Protocol.DecodeCharacter(bytes)
     if rec.className == "" then rec.className = nil end
     if rec.location == ""  then rec.location = nil end
 
+    -- v2 tail: experience + rested pool (read in the same appended order).
+    rec.xp       = r.u32()
+    rec.xpMax    = r.u32()
+    rec.restedXP = r.u32()
+
     return rec
 end
 
@@ -417,6 +438,7 @@ local function recordsMatch(a, b)
         "itemCooldown", "hearthstoneCD", "pvpExpiry", "chronoboonLastSeen",
         "lastSeen", "lastDataUpdate", "ownerEpoch", "nameRealm",
         "className", "location",
+        "xp", "xpMax", "restedXP",           -- v2 experience/rest tail
     }
     for _, k in ipairs(scalars) do
         if a[k] ~= b[k] then
@@ -469,8 +491,13 @@ local function testRoundTrip()
     rec.classTag = "WARLOCK"
     rec.className = "Warlock"
     rec.faction = "Horde"
-    rec.level = 60
+    rec.level = 58
     rec.location = "Rend Staging (S)"
+    -- v2 experience/rest tail — non-zero values so the three u32 fields are proven
+    -- to round-trip byte-exactly (sub-60 record carries live XP + a rested pool).
+    rec.xp = 734512
+    rec.xpMax = 1526400
+    rec.restedXP = 381600
     rec.inInstance = false
     rec.isResting = true
     rec.pvpFlagged = true
