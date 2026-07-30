@@ -285,12 +285,14 @@ local function refreshWorldPins()
                     local sz = worldPinSize()
                     pin:SetSize(sz, sz)
                     stylePin(pin, kind, sz)
-                    -- Apply the configured world-map timer font size (restore 3a); cached
-                    -- so SetFont only runs when the slider value actually changes.
+                    -- Apply the configured world-map timer font size on Core's PICKED face
+                    -- (round-12 restore 3a; round-14: read the face from UI.fonts.small so a
+                    -- live font-picker change reaches the pin — cached by face+size).
+                    local base = UI and UI.fonts and UI.fonts.small
+                    local face, _, fl = base and base:GetFont()
                     local fsz = worldTimerFont()
-                    if pin._timerSz ~= fsz then
-                        local face, _, fl = pin._timer:GetFont()
-                        if face then pin._timer:SetFont(face, fsz, fl); pin._timerSz = fsz end
+                    if face and (pin._timerSz ~= fsz or pin._timerFace ~= face) then
+                        pin._timer:SetFont(face, fsz, fl); pin._timerSz = fsz; pin._timerFace = face
                     end
                     pin:ClearAllPoints()
                     pin:SetPoint("CENTER", canvas, "TOPLEFT", node.x * cw, -node.y * ch)

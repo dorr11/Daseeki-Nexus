@@ -351,46 +351,43 @@ function Dashboard.SetCornerStroke(frame, token)
     for _, st in ipairs(frame._rrStroke) do st:SetVertexColor(UI.Color(frame._rrStrokeToken)) end
 end
 
--- ── Dashboard body/card TYPE (round-11 item 2) ────────────────────────────────
--- The dashboard's body/card/row/label text moves off FRIZQT onto ARIALN (condensed —
--- cleaner and denser at the small sizes the cards use). Numerals/micro-labels were
--- already ARIALN; titles (header) and the wordmark (ceremonial) keep FRIZQT/MORPHEUS.
--- These are NEXUS-LOCAL FontObjects, so Core's shared UI.fonts (and the rest of the
--- suite) stay FRIZQT. Colours re-tint on ThemeChanged exactly like the Core fonts.
--- (UI is nil in the headless harness; the CreateFont calls are stubbed there and the
--- UI-touching apply/subscribe only runs in-game where UI is present.)
-local NX_FACE = "Fonts\\ARIALN.TTF"
-local NX_SPEC = {
-    body   = { size = "bodySize",  color = "text"   },
-    small  = { size = "smallSize", color = "muted"  },
-    muted  = { size = "bodySize",  color = "muted"  },
-    accent = { size = "bodySize",  color = "accent" },
-    danger = { size = "bodySize",  color = "danger" },
-}
-local nxFonts = {}
-for key in pairs(NX_SPEC) do
-    nxFonts[key] = _G["DaseekiNexusFont_" .. key] or (CreateFont and CreateFont("DaseekiNexusFont_" .. key))
-end
-local function applyNexusFonts()
-    for key, spec in pairs(NX_SPEC) do
-        local fo = nxFonts[key]
-        if fo and fo.SetFont then
-            fo:SetFont(NX_FACE, UI.Token(spec.size) or 12, "")
-            fo:SetTextColor(UI.Color(spec.color))
-            fo:SetJustifyH("LEFT")
-        end
-    end
-end
-if UI and UI.Token and UI.OnThemeChanged then
-    applyNexusFonts()
-    UI.OnThemeChanged(applyNexusFonts)
-end
--- Resolve a dashboard text FontObject: the ARIALN variant for the re-faced keys, else
--- the shared Core font (header/ceremonial/numeral/microLabel keep their faces).
+-- ── Dashboard body/card TYPE (round-11; REWIRED round-14 to Core's font picker) ──
+-- Core now OWNS font selection. Its shared UI.fonts.* (body/muted/small/accent/danger/
+-- header + microLabel/numeral) already resolve to the PICKED face (UI.FontFile(), default
+-- the vendored "Fira Sans Condensed Medium") at the scale-adjusted size, and Core re-skins
+-- them live on font AND theme change (applyFonts + fireFontChanged / fireThemeChanged). So
+-- the dashboard simply CONSUMES Core's objects — the round-11 ARIALN-forced Nexus-LOCAL
+-- font objects are RETIRED (they fought the picker and caused drift). numeral keeps its
+-- OUTLINE telemetry intent (Core sets it); ceremonial stays MORPHEUS (brand-locked).
+-- No Nexus-local font objects remain. (UI is nil under the headless harness — guarded.)
 function Dashboard.Font(key)
-    local fo = nxFonts[key]
-    if fo then return fo end
     return (UI and UI.fonts and (UI.fonts[key] or UI.fonts.body)) or nil
+end
+
+-- A few dashboard FontStrings need the picked face at a size OFFSET from a base role
+-- (bolded, +1/+2) — the card name and the filter-segment labels. Rather than mint a
+-- Nexus-local FontObject, SizedFont reads the CURRENT picked face+size straight off the
+-- base role's Core object (so scale is already baked in) and applies base+delta with the
+-- given flags to the FontString, then re-applies on OnFontChanged / OnThemeChanged so the
+-- offset tracks the picker/theme live. The FACE stays Core-owned; only size+flags are ours.
+local sizedFonts = {}   -- { fs, baseKey, delta, flags }
+local function applySizedFont(rec)
+    local base = UI and UI.fonts and UI.fonts[rec.baseKey]
+    if not (base and base.GetFont) then return end
+    local face, sz = base:GetFont()
+    if face and rec.fs and rec.fs.SetFont then rec.fs:SetFont(face, (sz or 12) + rec.delta, rec.flags) end
+end
+function Dashboard.SizedFont(fs, baseKey, delta, flags)
+    if not fs then return fs end
+    local rec = { fs = fs, baseKey = baseKey or "body", delta = delta or 0, flags = flags }
+    sizedFonts[#sizedFonts + 1] = rec
+    applySizedFont(rec)
+    return fs
+end
+if UI then
+    local function reapply() for _, r in ipairs(sizedFonts) do applySizedFont(r) end end
+    if UI.OnFontChanged  then UI.OnFontChanged(reapply)  end
+    if UI.OnThemeChanged then UI.OnThemeChanged(reapply) end   -- a theme may change base sizes
 end
 
 -- Class color (r,g,b) from the user override table, falling back to Blizzard's.

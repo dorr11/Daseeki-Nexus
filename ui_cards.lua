@@ -521,9 +521,9 @@ local function makeCard(parent, pane)
     -- hugs the name.
     card.name = fstr(card, "body"); card.name:SetPoint("LEFT", card.dot, "RIGHT", 8, 0)
     card.name:SetJustifyH("LEFT"); card.name:SetWordWrap(false)
-    -- Round-11 item 3: name +2 steps and BOLD (OUTLINE) so it reads clear on the ARIALN
-    -- (condensed) face the cards now use — the card's identity anchor.
-    do local f, sz = card.name:GetFont(); if f then card.name:SetFont(f, (sz or 13) + 2, "OUTLINE") end end
+    -- Round-11 item 3 / round-14: name +2 steps and BOLD (OUTLINE) so it reads clear on
+    -- the picked face — the card's identity anchor. Face tracks Core's picker via SizedFont.
+    Dashboard.SizedFont(card.name, "body", 2, "OUTLINE")
     card.pvp = card:CreateTexture(nil, "ARTWORK")
     card.pvp:SetSize(13, 13); card.pvp:SetPoint("LEFT", card.name, "RIGHT", 4, 0); card.pvp:Hide()
     -- Strike overlay for tombstoned/blacklisted names.
@@ -721,7 +721,7 @@ local function makeFilterSegmented(parent, pane)
         local disp = (def.key == "60s") and "60s" or def.label:upper()
         local lbl = fstr(b, "microLabel"); lbl:SetPoint("CENTER", b, "CENTER", 0, 0)
         lbl:SetText(disp)
-        do local f, sz = lbl:GetFont(); if f then lbl:SetFont(f, (sz or 10) + 1, "OUTLINE") end end  -- +1 + bold
+        Dashboard.SizedFont(lbl, "microLabel", 1, "OUTLINE")   -- +1 + bold; face tracks the picker
         b._lbl = lbl
         b:SetWidth((lbl:GetStringWidth() or 30) + 20)
         if prev then b:SetPoint("LEFT", prev, "RIGHT", 0, 0) else b:SetPoint("LEFT", housing, "LEFT", 0, 0) end
