@@ -778,17 +778,22 @@ local function buildHeader(w)
     bg:SetPoint("BOTTOMRIGHT", header, "BOTTOMRIGHT", -1, 0)
     UI.Skin(bg, function(self) self:SetColorTexture(UI.Color("panel")) end)
 
-    -- Maker's mark: a small accent diamond at the far left (mockup logo).
-    local logo = Dashboard.MakeDiamond(header, 11, "OVERLAY")
+    -- Suite EMBLEM (owner round-7 item 4): the diamond sigil is now the brand mark in
+    -- the header — the "DASEEKI" word is removed and the header reads [emblem] NEXUS.
+    -- Uses the existing titlebar mark art (the token-drawn accent diamond), bumped for
+    -- prominence. (Kept the token-drawn diamond rather than a masked .tga so the emblem
+    -- never depends on a Core texture path that could be absent; a masked-asset emblem
+    -- is a trivial follow-up if the owner wants the exact sigil art.)
+    local logo = Dashboard.MakeDiamond(header, 14, "OVERLAY")
     logo:SetPoint("LEFT", header, "LEFT", PAD, 0)
     Dashboard.SetDiamondColor(logo, "accent")
 
-    -- Ceremonial wordmark: DASEEKI NEXUS (NEXUS in accent). Ceremonial face is the
-    -- one serif allowance on the dashboard (pivot). Uppercase, letter-spaced by font.
+    -- Wordmark: just NEXUS (accent), in the ceremonial face — the emblem carries the
+    -- suite brand now.
     local wordmark = header:CreateFontString(nil, "OVERLAY")
     wordmark:SetFontObject(UI.fonts.ceremonial or UI.fonts.header)
-    wordmark:SetPoint("LEFT", logo, "RIGHT", 9, 0)
-    wordmark:SetText("DASEEKI " .. Dashboard.HexColor("accent") .. "NEXUS|r")
+    wordmark:SetPoint("LEFT", logo, "RIGHT", 10, 0)
+    wordmark:SetText(Dashboard.HexColor("accent") .. "NEXUS|r")
 
     -- Close (far right).
     local closeBtn = CreateFrame("Button", nil, header)

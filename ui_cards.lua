@@ -213,6 +213,19 @@ function Cards.FilterView(entries, filter)
     return Cards.SortEntries(out)
 end
 
+-- The filter TOGGLE transition (pure/headless-tested). Clicking the ACTIVE segment
+-- CLEARS the filter (nil = ALL); clicking another selects it exclusively.
+-- ROUND-7 BUGFIX: the click handler used `(cur == clicked) and nil or clicked`, but
+-- `X and nil or Y` ALWAYS yields Y in Lua (nil short-circuits the `or`), so the active
+-- segment could never be un-clicked. This explicit form is now the single source of
+-- the transition, and the "cards/exclusive filter" suite asserts the clear step —
+-- the round-6 matrix only tested the pure FilterMatch/FilterView MODEL (nil = all),
+-- never the click STATE MACHINE, so it couldn't catch the and/or pitfall.
+function Cards.NextFilter(current, clicked)
+    if current == clicked then return nil end
+    return clicked
+end
+
 -- The SELECTION state machine (pure): given the currently-visible sorted list and
 -- the current selection, return the nameRealm that SHOULD be selected.
 --   * current selection still visible -> keep it.
@@ -353,14 +366,13 @@ local function makeCard(parent, pane)
     card.edge:SetPoint("BOTTOMLEFT", card, "BOTTOMLEFT", 0, 0)
     card.edge:SetWidth(3); card.edge:Hide()
 
-    -- Right edge: chrono + hearth cooldown icons, stacked (owner round-2 item 5 —
-    -- the pre-rebuild cards + the reference cards carry these). Same data the detail
-    -- pane shows. Small (CD_ICON) so the card stays compact.
-    local function cdIcon(topAnchor, dy)
+    -- Right-edge FLUSH ICON COLUMN (owner round-7 item 3). One column at the card's
+    -- right edge: SOUL SHARD at the TOP (warlocks only, count to its LEFT) and the
+    -- chrono + hearth cooldown icons STACKED at the BOTTOM (chrono above hearth, keeping
+    -- the round-6 20px + clear spacing). Non-warlocks show just the bottom pair.
+    local function cdIcon(size)
         local f = CreateFrame("Frame", nil, card, "BackdropTemplate")
-        f:SetSize(CD_ICON, CD_ICON)
-        f:SetPoint("TOPRIGHT", topAnchor, dy and "BOTTOMRIGHT" or "TOPRIGHT",
-            dy and 0 or -CARD_PAD_H, dy or -CARD_PAD_V)
+        f:SetSize(size, size)
         local ic = f:CreateTexture(nil, "ARTWORK")
         ic:SetPoint("TOPLEFT", f, "TOPLEFT", 1, -1)
         ic:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", -1, 1)
@@ -377,25 +389,30 @@ local function makeCard(parent, pane)
         f:SetScript("OnLeave", function() GameTooltip:Hide() end)
         return f
     end
-    -- Round-6 C: bigger padded icons (CD_ICON 15 -> 20) with a clear 6px gap between
-    -- them so chrono + hearth read as two separate indicators.
-    card.chrono = cdIcon(card)                 -- top of the stack
-    card.hearth = cdIcon(card.chrono, -6)      -- below chrono, clear spacing
-    local CD_COL = CARD_PAD_H + CD_ICON + 8    -- horizontal room the stack reserves
+    card.hearth = cdIcon(CD_ICON)              -- bottom of the column
+    card.hearth:SetPoint("BOTTOMRIGHT", card, "BOTTOMRIGHT", -CARD_PAD_H, CARD_PAD_V)
+    card.chrono = cdIcon(CD_ICON)              -- above hearth, clear 6px gap
+    card.chrono:SetPoint("BOTTOMRIGHT", card.hearth, "TOPRIGHT", 0, 6)
+    -- Soul shard (warlocks) at the TOP of the same flush column; count to its LEFT.
+    card.shard = card:CreateTexture(nil, "ARTWORK")
+    card.shard:SetSize(CD_ICON, CD_ICON); card.shard:SetTexCoord(0.08, 0.92, 0.08, 0.92)
+    card.shard:SetPoint("TOPRIGHT", card, "TOPRIGHT", -CARD_PAD_H, -CARD_PAD_V)
+    card.shardCount = fstr(card, "numeral", "RIGHT")
+    card.shardCount:SetPoint("RIGHT", card.shard, "LEFT", -4, 0)
+    card.shard:Hide(); card.shardCount:Hide()
 
-    -- Row 1: dot + class-colored name + account tag + optional PvP crest (inline
-    -- cluster; owner round-2 item 6 — acct stays inline by the name).
+    -- Row 1: status dot + class-colored name + optional PvP crest. The account "#N"
+    -- tag was REMOVED (owner round-7 item 2 — it lives in the detail header).
     card.dot = card:CreateTexture(nil, "OVERLAY")
     card.dot:SetSize(8, 8); card.dot:SetPoint("TOPLEFT", card, "TOPLEFT", CARD_PAD_H, -CARD_PAD_V - 3)
-    -- Name: brightened class color + one font step up (pop pass). No right bound; the
-    -- acct tag hugs the name (compact cards, short names).
+    -- Name: brightened class color + one font step up (pop pass). Left-anchored auto
+    -- width (short character names never reach the top-right icon column); PvP crest
+    -- hugs the name.
     card.name = fstr(card, "body"); card.name:SetPoint("LEFT", card.dot, "RIGHT", 8, 0)
     card.name:SetJustifyH("LEFT"); card.name:SetWordWrap(false)
     do local f, sz, fl = card.name:GetFont(); if f then card.name:SetFont(f, (sz or 13) + 1, fl) end end
-    card.acct = fstr(card, "microLabel"); card.acct:SetPoint("LEFT", card.name, "RIGHT", 6, 0)
-    card.acct:SetTextColor(UI.Color("muted"))
     card.pvp = card:CreateTexture(nil, "ARTWORK")
-    card.pvp:SetSize(13, 13); card.pvp:SetPoint("LEFT", card.acct, "RIGHT", 4, 0); card.pvp:Hide()
+    card.pvp:SetSize(13, 13); card.pvp:SetPoint("LEFT", card.name, "RIGHT", 4, 0); card.pvp:Hide()
     -- Strike overlay for tombstoned/blacklisted names.
     card.strike = card:CreateTexture(nil, "OVERLAY")
     card.strike:SetHeight(1); card.strike:Hide()
@@ -422,15 +439,6 @@ local function makeCard(parent, pane)
         card.tiles[i] = t
     end
 
-    -- Warlock SOUL-SHARD corner (owner round-6 D): a small shard icon + count in the
-    -- card's bottom-right corner, warlock cards only (right of the buff strip).
-    card.shardCount = fstr(card, "numeral", "RIGHT")
-    card.shardCount:SetPoint("BOTTOMRIGHT", card, "BOTTOMRIGHT", -CARD_PAD_H, CARD_PAD_V + 1)
-    card.shard = card:CreateTexture(nil, "ARTWORK")
-    card.shard:SetSize(14, 14); card.shard:SetTexCoord(0.08, 0.92, 0.08, 0.92)
-    card.shard:SetPoint("RIGHT", card.shardCount, "LEFT", -3, 0)
-    card.shard:Hide(); card.shardCount:Hide()
-
     card:SetScript("OnClick", function(self) if self._entry then pane._select(self._entry) end end)
 
     function card:Populate(entry, selected)
@@ -450,7 +458,6 @@ local function makeCard(parent, pane)
         -- Name: short (realm stripped) in the brightened class hue (pop pass).
         self.name:SetText(Dashboard.ShortName(entry.nameRealm))
         self.name:SetTextColor(brightName(rec.classTag))
-        self.acct:SetText((entry.aid and entry.aid ~= "" and ("#" .. entry.aid)) or "")
 
         local struck = Cards.IsStruck(entry.nameRealm)
         if struck then
@@ -545,39 +552,67 @@ local function makeCard(parent, pane)
 end
 
 ----------------------------------------------------------------------
--- A FILTER chip (round-6): part of the mutually-exclusive 60S/ONLINE/SUMMONERS trio.
--- No count. Active = accent fill + ground label; inactive = borderLite outline + text
--- label. Click toggles: active -> deselect (nil = ALL); else set exclusively.
+-- FILTER SEGMENTED control (round-7 item 1): ONE housing, three touching segments
+-- (60S | ONLINE | SUMMONERS), styled like the faction A|H selector. Mutually
+-- exclusive; clicking the ACTIVE segment CLEARS the filter (nil = ALL) via the pure
+-- Cards.NextFilter transition. Active segment = accent fill + ground label; inactive =
+-- transparent + text label; a housing border + 1px dividers give the segmented look.
+-- Returns the housing frame with :Apply(filter) (repaints + sizes to content).
 ----------------------------------------------------------------------
-local function makeFilterChip(parent, def, pane)
-    local b = CreateFrame("Button", nil, parent, "BackdropTemplate")
-    b:SetHeight(22)
-    b._key = def.key
-    local lbl = fstr(b, "microLabel"); lbl:SetPoint("CENTER", b, "CENTER", 0, 0)
-    lbl:SetText(def.label:upper())
-    b._lbl = lbl
-    b:SetWidth((lbl:GetStringWidth() or 30) + 18)
-    b:SetScript("OnEnter", function(self)
-        if not def.tip then return end
-        GameTooltip:SetOwner(self, "ANCHOR_BOTTOM")
-        GameTooltip:AddLine(def.tip, UI.Color("muted")); GameTooltip:Show()
-    end)
-    b:SetScript("OnLeave", function() GameTooltip:Hide() end)
-    b:SetScript("OnClick", function()
-        pane.filter = (pane.filter == def.key) and nil or def.key   -- exclusive; re-click clears
-        pane.obj.Refresh()
-    end)
-    function b:Apply(active)
+local function makeFilterSegmented(parent, pane)
+    local housing = CreateFrame("Frame", nil, parent, "BackdropTemplate")
+    housing:SetHeight(22)
+    UI.Skin(housing, function(self)
         self:SetBackdrop(UI.FLAT_BACKDROP)
-        if active then
-            self:SetBackdropColor(UI.Color("accent")); self:SetBackdropBorderColor(UI.Color("accent"))
-            self._lbl:SetTextColor(UI.Color("ground"))
-        else
-            self:SetBackdropColor(0, 0, 0, 0); self:SetBackdropBorderColor(UI.Color("borderLite"))
-            self._lbl:SetTextColor(UI.Color("text"))
+        self:SetBackdropColor(0, 0, 0, 0)
+        self:SetBackdropBorderColor(UI.Color("borderLite"))
+    end)
+    housing._segs = {}
+    local prev
+    for i, def in ipairs(FILTER_DEFS) do
+        local b = CreateFrame("Button", nil, housing, "BackdropTemplate")
+        b:SetHeight(22)
+        b._key = def.key
+        local lbl = fstr(b, "microLabel"); lbl:SetPoint("CENTER", b, "CENTER", 0, 0)
+        lbl:SetText(def.label:upper())
+        b._lbl = lbl
+        b:SetWidth((lbl:GetStringWidth() or 30) + 16)
+        if prev then b:SetPoint("LEFT", prev, "RIGHT", 0, 0) else b:SetPoint("LEFT", housing, "LEFT", 0, 0) end
+        -- 1px divider before each segment after the first (segmented look).
+        if i > 1 then
+            local div = housing:CreateTexture(nil, "OVERLAY")
+            div:SetSize(1, 14); div:SetPoint("RIGHT", b, "LEFT", 0, 0)
+            UI.Skin(div, function(self) self:SetColorTexture(UI.Color("borderLite")) end)
         end
+        b:SetScript("OnEnter", function(self)
+            if not def.tip then return end
+            GameTooltip:SetOwner(self, "ANCHOR_BOTTOM")
+            GameTooltip:AddLine(def.tip, UI.Color("muted")); GameTooltip:Show()
+        end)
+        b:SetScript("OnLeave", function() GameTooltip:Hide() end)
+        b:SetScript("OnClick", function()
+            pane.filter = Cards.NextFilter(pane.filter, def.key)   -- pure toggle (clears active)
+            pane.obj.Refresh()
+        end)
+        function b:Apply(active)
+            self:SetBackdrop(UI.FLAT_BACKDROP)
+            if active then
+                self:SetBackdropColor(UI.Color("accent")); self:SetBackdropBorderColor(UI.Color("accent"))
+                self._lbl:SetTextColor(UI.Color("ground"))
+            else
+                self:SetBackdropColor(0, 0, 0, 0); self:SetBackdropBorderColor(0, 0, 0, 0)
+                self._lbl:SetTextColor(UI.Color("text"))
+            end
+        end
+        housing._segs[#housing._segs + 1] = b
+        prev = b
     end
-    return b
+    function housing:Apply(filter)
+        local total = 0
+        for _, b in ipairs(self._segs) do b:Apply(filter == b._key); total = total + b:GetWidth() end
+        self:SetWidth(math.max(1, total))
+    end
+    return housing
 end
 
 -- Compact faction A|H segment (round-6 item B: moved off the titlebar into the chip
@@ -652,11 +687,11 @@ Dashboard.RegisterTab("characters", function(host)
     chipRule:SetPoint("BOTTOMLEFT", chipbar, "BOTTOMLEFT", 0, 0)
     chipRule:SetPoint("BOTTOMRIGHT", chipbar, "BOTTOMRIGHT", 0, 0)
 
-    -- Filter trio (mutually exclusive; laid out left-to-right in Refresh).
-    pane._filterChips = {}
-    for _, def in ipairs(FILTER_DEFS) do
-        pane._filterChips[#pane._filterChips + 1] = makeFilterChip(chipbar, def, pane)
-    end
+    -- Filter SEGMENTED control (one housing, 60S | ONLINE | SUMMONERS), left side.
+    local filterSeg = makeFilterSegmented(chipbar, pane)
+    filterSeg:SetPoint("LEFT", chipbar, "LEFT", LIST_PAD, 0)
+    pane._filterSeg = filterSeg
+    tag(filterSeg, "cards.filter")
     -- Faction A|H segment at the RIGHT end of the chip bar (item B).
     local segA = makeFactionSeg(chipbar, "Alliance")
     local segH = makeFactionSeg(chipbar, "Horde")
@@ -740,12 +775,8 @@ Dashboard.RegisterTab("characters", function(host)
         end
         local list = Cards.FilterView(entries, pane.filter)
 
-        -- Filter chips: exactly the active one is filled; lay them left-to-right.
-        local cx = LIST_PAD
-        for _, c in ipairs(pane._filterChips) do
-            c:Apply(pane.filter == c._key)
-            c:ClearAllPoints(); c:SetPoint("LEFT", chipbar, "LEFT", cx, 0); cx = cx + c:GetWidth() + 5
-        end
+        -- Filter segmented control: at most one segment filled (none = ALL).
+        pane._filterSeg:Apply(pane.filter)
         -- Faction segment repaint (it moved into the chip bar).
         local f = Dashboard.GetFaction()
         for _, s in ipairs(pane._factionSegs) do s:Apply(s._faction == f) end
@@ -922,6 +953,14 @@ local function testFilter(fails)
     ck(#Cards.FilterView(entries, "60s") == 2, "60s -> 2 level-60s")
     local sorted = Cards.FilterView(entries, nil)
     ck(sorted[1].nameRealm == "Aaa-R", "FilterView returns SortEntries order (online acct1 first)")
+
+    -- Round-7: the CLICK TOGGLE state machine (Cards.NextFilter). This is what the
+    -- round-6 matrix missed — it tested the pure MODEL (nil=all) but never the click
+    -- transition, so the `X and nil or Y` deselect bug slipped through.
+    ck(Cards.NextFilter(nil, "60s") == "60s", "click a segment from ALL -> select it")
+    ck(Cards.NextFilter("60s", "60s") == nil, "click the ACTIVE segment -> CLEAR (nil = all)")
+    ck(Cards.NextFilter("60s", "online") == "online", "click another segment -> switch exclusively")
+    ck(Cards.NextFilter("online", "online") == nil, "re-click online -> clear")
 end
 
 local function testSlotState(fails)
