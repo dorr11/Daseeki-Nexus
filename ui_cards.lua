@@ -130,6 +130,29 @@ function Cards.NeedsBuffs(entry)
     return Cards.MissingCount(entry) > 0
 end
 
+-- Hover-peek (round-12 restore #2; BRAND_SPEC §8 ~200ms GameTooltip). Pure helpers so
+-- the derivation + edge-flip are headless-testable; the reveal itself lives on the card.
+-- PeekAnchor: which side of the cursor the tip opens on — flips LEFT when the cursor is
+-- past `frac` of the screen width so the tip never clips the right edge.
+function Cards.PeekAnchor(cursorX, screenW, frac)
+    frac = frac or 0.6
+    if screenW and screenW > 0 and cursorX and cursorX > screenW * frac then return "left" end
+    return "right"
+end
+-- PeekLines: the peek's data payload for an entry — name is rendered class-colored by
+-- the caller; here we return the raw fields (online, location|nil=>missing, missing-buff
+-- count, updated-ago text). nowE = current epoch.
+function Cards.PeekLines(entry, nowE)
+    local rec = (entry and entry.rec) or {}
+    local hasLoc = rec.location and rec.location ~= ""
+    return {
+        online   = entry and entry.online and true or false,
+        location = hasLoc and rec.location or nil,
+        missing  = Cards.MissingCount(entry),
+        ago      = Cards.AgoText(rec, nowE),
+    }
+end
+
 function Cards.InScope(entry, scope)
     local rec = entry and entry.rec
     if scope == "60s" then return ((rec and rec.level) or 0) >= 60 end
@@ -377,6 +400,45 @@ local function brightName(classTag)
     return r + (1 - r) * t, g + (1 - g) * t, b + (1 - b) * t
 end
 
+-- Hover-peek reveal (round-12 restore #2). Cursor-anchored GameTooltip, side-flipped
+-- via Cards.PeekAnchor so it never clips the right edge. Four lines: class-colored name
+-- (+ online tag), location (or "Missing"), missing-buff count, updated-ago.
+local HOVER_DELAY = 0.2
+local function showCardPeek(card, entry)
+    if not (GameTooltip and entry and entry.rec) then return end
+    local nowE = (Dashboard and Dashboard.Now and Dashboard.Now()) or now()
+    local L = Cards.PeekLines(entry, nowE)
+    local screenW = (UIParent and UIParent.GetRight and UIParent:GetRight())
+        or (GetScreenWidth and GetScreenWidth()) or 0
+    local cx, cy = 0, 0
+    if GetCursorPosition then
+        local scale = (UIParent and UIParent.GetEffectiveScale and UIParent:GetEffectiveScale()) or 1
+        if not scale or scale == 0 then scale = 1 end
+        cx, cy = GetCursorPosition(); cx, cy = cx / scale, cy / scale
+    end
+    GameTooltip:SetOwner(card, "ANCHOR_NONE")
+    GameTooltip:ClearAllPoints()
+    if Cards.PeekAnchor(cx, screenW) == "left" then
+        GameTooltip:SetPoint("TOPRIGHT", UIParent, "BOTTOMLEFT", cx - 12, cy)
+    else
+        GameTooltip:SetPoint("TOPLEFT", UIParent, "BOTTOMLEFT", cx + 12, cy)
+    end
+    local nameLine = Dashboard.ColoredName(entry.nameRealm, entry.rec.classTag)
+    if L.online then nameLine = nameLine .. "  " .. Dashboard.Colored("online", "ok") end
+    GameTooltip:AddLine(nameLine)
+    local lr, lg, lb = UI.Color("muted")
+    if L.location then
+        GameTooltip:AddDoubleLine("Location", L.location, lr, lg, lb, 1, 1, 1)
+    else
+        local dr, dg, db = UI.Color("danger")
+        GameTooltip:AddDoubleLine("Location", "Missing", lr, lg, lb, dr, dg, db)
+    end
+    local mr, mg, mb = UI.Color(L.missing > 0 and "danger" or "ok")
+    GameTooltip:AddDoubleLine("Buffs missing", tostring(L.missing), lr, lg, lb, mr, mg, mb)
+    GameTooltip:AddDoubleLine("Updated", L.ago, lr, lg, lb, 1, 1, 1)
+    GameTooltip:Show()
+end
+
 ----------------------------------------------------------------------
 -- A compact card (mockup .card anatomy). Pooled; :Populate(entry, selected).
 ----------------------------------------------------------------------
@@ -489,6 +551,21 @@ local function makeCard(parent, pane)
     end
 
     card:SetScript("OnClick", function(self) if self._entry then pane._select(self._entry) end end)
+    -- Hover-peek (restore #2): reveal after ~200ms, cancelled if the mouse leaves first.
+    card:SetScript("OnEnter", function(self)
+        self._peekPending = true
+        if C_Timer and C_Timer.After then
+            C_Timer.After(HOVER_DELAY, function()
+                if self._peekPending and self:IsMouseOver() and self._entry then
+                    showCardPeek(self, self._entry)
+                end
+            end)
+        end
+    end)
+    card:SetScript("OnLeave", function(self)
+        self._peekPending = false
+        if GameTooltip then GameTooltip:Hide() end
+    end)
 
     function card:Populate(entry, selected)
         self._entry = entry
@@ -1142,6 +1219,25 @@ local function testOnAccentTextColor(fails)
     ck(Cards.OnAccentTextColor(1, 1, 1) == "ground", "white accent -> ground label")
 end
 
+-- Round-12 restore #2: hover-peek anchor flip + data derivation.
+local function testPeek(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    ck(Cards.PeekAnchor(100, 1000) == "right", "cursor left of 60% -> right anchor")
+    ck(Cards.PeekAnchor(950, 1000) == "left", "cursor past 60% -> left anchor")
+    ck(Cards.PeekAnchor(600, 1000) == "right", "cursor at exactly 60% -> right (not past)")
+    ck(Cards.PeekAnchor(nil, nil) == "right", "no cursor/screen -> right default")
+    local NOW = 1000000
+    local e = mkEntry("Zoe-R", "1", { online = true, loc = "Orgrimmar", level = 60, class = "MAGE", upd = NOW - 120 })
+    local L = Cards.PeekLines(e, NOW)
+    ck(L.online == true, "peek: online flag")
+    ck(L.location == "Orgrimmar", "peek: location surfaced")
+    ck(L.ago == "2m", "peek: updated-ago compact")
+    ck(type(L.missing) == "number", "peek: missing-buff count is a number")
+    local L2 = Cards.PeekLines(mkEntry("Amy-R", "1", { online = false, loc = "" }), NOW)
+    ck(L2.location == nil, "peek: empty location -> nil (renders Missing)")
+    ck(L2.online == false, "peek: offline flag")
+end
+
 if ns.RegisterSelfTest then
     ns:RegisterSelfTest("cards", function(verbose)
         local cases = {
@@ -1152,6 +1248,7 @@ if ns.RegisterSelfTest then
             { name = "strip tile style",  fn = testStripStyle },
             { name = "cd icon state",     fn = testCdIconState },
             { name = "on-accent label",   fn = testOnAccentTextColor },
+            { name = "hover peek",        fn = testPeek },
         }
         local allPass = true
         for _, c in ipairs(cases) do

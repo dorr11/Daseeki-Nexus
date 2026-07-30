@@ -129,6 +129,14 @@ end
 
 local function worldPinSize()   return felwoodCfg().worldPinSize   or 14 end
 local function minimapPinSize() return felwoodCfg().minimapPinSize or 12 end
+-- World-map pin countdown font size, pt (round-12 restore 3a: the options slider
+-- writes felwood.worldTimerFont but nothing read it — the pin timer used a fixed
+-- font object). Clamped to the slider's 6-20 range; default 10.
+local function worldTimerFont()
+    local v = felwoodCfg().worldTimerFont
+    if type(v) == "number" and v >= 6 and v <= 20 then return v end
+    return 10
+end
 
 ----------------------------------------------------------------------
 -- Node state colouring (via Timers)
@@ -277,6 +285,13 @@ local function refreshWorldPins()
                     local sz = worldPinSize()
                     pin:SetSize(sz, sz)
                     stylePin(pin, kind, sz)
+                    -- Apply the configured world-map timer font size (restore 3a); cached
+                    -- so SetFont only runs when the slider value actually changes.
+                    local fsz = worldTimerFont()
+                    if pin._timerSz ~= fsz then
+                        local face, _, fl = pin._timer:GetFont()
+                        if face then pin._timer:SetFont(face, fsz, fl); pin._timerSz = fsz end
+                    end
                     pin:ClearAllPoints()
                     pin:SetPoint("CENTER", canvas, "TOPLEFT", node.x * cw, -node.y * ch)
                     local st = nodeState(kind, index)

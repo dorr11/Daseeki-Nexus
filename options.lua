@@ -1987,12 +1987,11 @@ local function buildTimers(flow)
     register("timers", function() for _, s in ipairs(pinSliders) do if s.Refresh then s.Refresh() end end end)
 
     -- ── Songflower display ───────────────────────────────────────────────────────
-    -- Drives the Timers-tab UP?/minus state machine (timers.lua NodeState).
+    -- Drives the songflower UP?/minus display state machine (timers.lua NodeState).
     local sf = flow:AddSection("Songflower Display")
     sf:Hint("Minus-timer counts the respawn; UP? window shows after respawn (0 = always).")
-    -- NOTE: range/default hints per round-3 item 25. Item 27 (ENGINE) will revise
-    -- these ranges/defaults (UP? 1-30s default 5; minus 30-600s default 120) and
-    -- drop the 0="always" sentinel — reconcile min/max + labels at merge.
+    -- Ranges/defaults are final (minus 5:00-50:00 default 25:00; UP? 0-60:00 default
+    -- "always"). The 0="always" sentinel is intentional. Labels below carry the range.
     local sfMinus = sf:Slider({
         label = "Minus-timer duration — (5:00-50:00) default 25:00", width = 300, min = 300, max = 3000, step = 30,
         get = function() local ts = TS(); return ts and ts.felwood.flowerMinusDuration or 1500 end,
@@ -2113,7 +2112,7 @@ local function buildBlacklist(flow)
 
     -- ── Character Blacklist (inline textareas, round-3 item 33) ────────────────
     local sec = flow:AddSection("Character Blacklist")
-    sec:Hint("Hide characters from the 60s and Summoners tabs. They still function normally in-game.")
+    sec:Hint("Blacklisted characters show struck-through on the dashboard (not hidden). They still function normally in-game.")
     buildTextArea(sec, {
         height = 110, register = "blacklist",
         get = function() local db = DB(); return db and mapToLines(db.ui.blacklist) or "" end,
@@ -2201,7 +2200,7 @@ end
 
 local function buildInstances(flow)
     local sec = flow:AddSection("Instances")
-    sec:Hint("The Instances tab tracks dungeon/raid entries against the server's rolling "
+    sec:Hint("The Instances panel tracks dungeon/raid entries against the server's rolling "
         .. "caps (5 per hour, 30 per day, per account).")
 
     -- Warn-on-entry chat notice. Wires the existing DaseekiNexusDB.instancesWarnOnEntry

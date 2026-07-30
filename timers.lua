@@ -1129,6 +1129,18 @@ function Timers.MarkNode(kind, index, epoch, trust)
     pops[index] = epoch
     ns:Fire("NODE_UPDATED", kind .. index)
     if maybeBroadcast then maybeBroadcast() end
+    -- Songflower picked chat alert (round-12 restore 3b — item 28). The options toggle
+    -- felwood.pickedChatAlerts wrote a key nothing consumed; emit one chat line when a
+    -- LOCAL flower pick is recorded (proximity detection / manual mark). Local-only so
+    -- mesh-relayed and bulk-import picks don't spam. Off by default (nil reads as off).
+    if kind == "flower" and trust == "local" then
+        local s = ns.Store and ns.Store.GetSettings and ns.Store.GetSettings()
+        local fw = s and s.timerSettings and s.timerSettings.felwood
+        if fw and fw.pickedChatAlerts then
+            local node = Timers.NODES and Timers.NODES.flower and Timers.NODES.flower[index]
+            ns:Print(("songflower picked: %s"):format((node and node.label) or ("Songflower " .. index)))
+        end
+    end
     return true
 end
 

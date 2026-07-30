@@ -365,6 +365,32 @@ function TimersDock.Attach(parent)
     bcast:SetPoint("RIGHT", refreshBtn, "LEFT", -6, 0)
     D.bcast, D.refresh = bcast, refreshBtn
 
+    -- ── Darkmoon Faire schedule readout (round-12 restore #1) ───────────────────
+    -- The computed DMF estimate (Dashboard.GetDMFSchedule) had lived only in the now-
+    -- removed status bar. Home it bottom-left of the dock, sharing the footer baseline
+    -- with the Broadcast/Refresh icons. Hover reveals zone + start/end. Estimate only
+    -- (Classic Era exposes no faire-schedule API).
+    local dmfHost = CreateFrame("Frame", nil, parent)
+    dmfHost:SetHeight(20)
+    dmfHost:SetPoint("BOTTOMLEFT", parent, "BOTTOMLEFT", PAD_H, PAD_V + 1)
+    dmfHost:SetPoint("RIGHT", bcast, "LEFT", -10, 0)
+    dmfHost:EnableMouse(true)
+    local dmfFS = fstr(dmfHost, "small"); dmfFS:SetPoint("LEFT", dmfHost, "LEFT", 0, 0)
+    dmfFS:SetJustifyH("LEFT"); dmfFS:SetWordWrap(false); dmfFS:SetTextColor(UI.Color("muted"))
+    dmfHost:SetScript("OnEnter", function(self)
+        local sc = Dashboard.GetDMFSchedule and Dashboard.GetDMFSchedule()
+        if not sc then return end
+        GameTooltip:SetOwner(self, "ANCHOR_TOP")
+        GameTooltip:AddLine("Darkmoon Faire" .. (sc.estimated and " (estimated)" or ""), UI.Color("text"))
+        GameTooltip:AddLine("Zone: " .. (sc.zone or "?"), UI.Color("muted"))
+        if sc.startEpoch then GameTooltip:AddDoubleLine("Start", date("%b %d %H:%M", sc.startEpoch), UI.Color("muted"), 1, 1, 1) end
+        if sc.endEpoch then GameTooltip:AddDoubleLine("End", date("%b %d %H:%M", sc.endEpoch), UI.Color("muted"), 1, 1, 1) end
+        GameTooltip:Show()
+    end)
+    dmfHost:SetScript("OnLeave", function() GameTooltip:Hide() end)
+    tag(dmfHost, "dock.dmf")
+    D.dmf = dmfFS
+
     -- ── Refresh ──────────────────────────────────────────────────────────────
     function D.Refresh()
         local T = ns.Timers
@@ -372,6 +398,10 @@ function TimersDock.Attach(parent)
         -- WB meta: realm · faction · live.
         local realm = (GetRealmName and GetRealmName()) or "?"
         wbMeta:SetText(("%s \194\183 %s \194\183 live"):format(realm, Dashboard.GetFaction()))
+        -- Darkmoon Faire schedule readout (restore #1).
+        if D.dmf and Dashboard.GetDMFSchedule and Dashboard.FormatDMFCaption then
+            D.dmf:SetText(Dashboard.FormatDMFCaption(Dashboard.GetDMFSchedule(), now))
+        end
 
         for _, r in ipairs(D._wbRows) do
             local def = r._def
