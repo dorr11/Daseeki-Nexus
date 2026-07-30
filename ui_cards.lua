@@ -146,20 +146,32 @@ function Cards.MatchesMods(entry, mods, nowE)
     return true
 end
 
--- Deterministic sort: self first, then online-first, then account (numeric asc),
--- then name asc. Strict total order → stable/deterministic. `isSelf` stamped in gather.
+-- Deterministic sort (owner round-9): ONLINE characters first — self first, then
+-- account (numeric asc), then name asc (the existing online tiebreak) — followed by
+-- OFFLINE characters sorted by LAST-UPDATED DESCENDING (most recently updated first,
+-- the same rec.lastDataUpdate the "Updated X ago" line renders), name asc as the final
+-- stability tiebreak. Strict total order → stable/deterministic. `isSelf` stamped in gather.
 local function acctNum(e) return tonumber(e.aid) or math.huge end
+local function lastUpdate(e) return (e.rec and e.rec.lastDataUpdate) or 0 end
 function Cards.SortEntries(entries)
     local out = {}
     for i = 1, #entries do out[i] = entries[i] end
     table.sort(out, function(a, b)
-        local as, bs = a.isSelf and true or false, b.isSelf and true or false
-        if as ~= bs then return as end
         local ao, bo = a.online and true or false, b.online and true or false
-        if ao ~= bo then return ao end
-        local aa, ba = acctNum(a), acctNum(b)
-        if aa ~= ba then return aa < ba end
-        return (a.nameRealm or "") < (b.nameRealm or "")
+        if ao ~= bo then return ao end            -- online block before offline block
+        if ao then
+            -- both ONLINE: self first, then account asc, then name asc.
+            local as, bs = a.isSelf and true or false, b.isSelf and true or false
+            if as ~= bs then return as end
+            local aa, ba = acctNum(a), acctNum(b)
+            if aa ~= ba then return aa < ba end
+            return (a.nameRealm or "") < (b.nameRealm or "")
+        else
+            -- both OFFLINE: most-recently-updated first, then name asc (stability).
+            local au, bu = lastUpdate(a), lastUpdate(b)
+            if au ~= bu then return au > bu end
+            return (a.nameRealm or "") < (b.nameRealm or "")
+        end
     end)
     return out
 end
@@ -885,18 +897,23 @@ local function testCardsLogic(fails)
     local _, c3 = Cards.ComputeView(entries, "summoners", {}, NOW)
     ck(c3.mod.online == 1, "within summoners scope, online count 1 (Aaa)")
 
-    -- Sort determinism: self first, then online, then account asc, then name.
+    -- Sort determinism (round-9): ONLINE first (self, then acct asc, then name asc);
+    -- then OFFLINE by last-updated DESC (newest first), name asc as the tiebreak.
     local se = {
         mkEntry("Zed-R", "1", { online = true }),
         mkEntry("Ann-R", "2", { online = true, isSelf = true }),
         mkEntry("Bob-R", "1", { online = true }),
-        mkEntry("Cal-R", "1", { online = false }),
+        mkEntry("Old-R", "1", { online = false, upd = NOW - 3600 }),   -- offline, older
+        mkEntry("New-R", "3", { online = false, upd = NOW - 60 }),     -- offline, newer
     }
     local sorted = Cards.SortEntries(se)
-    ck(sorted[1].nameRealm == "Ann-R", "self sorts first")
+    ck(sorted[1].nameRealm == "Ann-R", "self sorts first (online)")
     ck(sorted[2].nameRealm == "Bob-R", "then online acct1 name asc (Bob before Zed)")
     ck(sorted[3].nameRealm == "Zed-R", "online acct1 Zed second")
-    ck(sorted[4].nameRealm == "Cal-R", "offline last")
+    -- Offline block: most-recently-updated first, regardless of account (New acct3
+    -- before Old acct1 because it is newer) — this is the round-9 change.
+    ck(sorted[4].nameRealm == "New-R", "offline sorted by last-updated DESC (newer first)")
+    ck(sorted[5].nameRealm == "Old-R", "older offline follows the newer offline")
     local sorted2 = Cards.SortEntries(sorted)
     for i = 1, #sorted do ck(sorted2[i].nameRealm == sorted[i].nameRealm, "sort idempotent @" .. i) end
 
