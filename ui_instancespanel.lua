@@ -267,7 +267,7 @@ local function tag(frame, id)
 end
 local function fstr(parent, key, justify)
     local f = parent:CreateFontString(nil, "OVERLAY")
-    f:SetFontObject(UI.fonts[key] or UI.fonts.body)
+    f:SetFontObject(Dashboard.Font(key))   -- round-11 item 2: ARIALN dashboard type
     if justify then f:SetJustifyH(justify) end
     return f
 end

@@ -294,33 +294,99 @@ function Dashboard.PaintStatusPip(pip, halo, online)
     end
 end
 
--- ROUNDED CORNERS (owner round-8 item 3). WoW frames have no corner radius, so we
--- overlay 4 corner-MASK textures (one own .tga in Nexus textures/, reused via
--- SetTexCoord flips) tinted to the color BEHIND the frame — they cover the sharp
--- fill+border corner with the base color, leaving a subtle ~radius-px rounded corner.
--- Hairlines/dividers INSIDE panels stay square (untouched). NOTE: a clean 9-slice
--- edgeFile backdrop is a Core-kit follow-up (UI.FLAT_BACKDROP is a flat 1px square
--- border today); this ships the rounded LOOK locally.
+-- ROUNDED CORNERS (round-8 item 3; REBUILT round-11 item 1 — the REAL fix). The old
+-- approach covered each corner with a single behind-tinted mask, which also erased the
+-- 1px border STROKE at the corner ("pixels in the very corner disappear" — owner). Now
+-- each corner draws TWO own textures (authored TOP-LEFT, reused via SetTexCoord flips):
+--   * COVER (round-corner.tga) tinted to the color BEHIND the frame — carves the smooth
+--     rounded FILL silhouette by painting the outside-arc region with the base color.
+--   * STROKE (round-stroke.tga) tinted to the BORDER token — a ~1px arc laid ALONG the
+--     curve so the border stroke CONTINUES around the corner, meeting the straight
+--     backdrop edges at the arc tangents. This is the piece the old mask erased.
+-- Border color stays token-tinted (SetVertexColor); selected cards re-tint the stroke to
+-- accent via Dashboard.SetCornerStroke. Hairlines/dividers INSIDE panels stay square.
 local ROUND_CORNER_TEX = "Interface\\AddOns\\Daseeki-Nexus\\textures\\round-corner"
-function Dashboard.RoundCorners(frame, radius, behindToken)
+local ROUND_STROKE_TEX = "Interface\\AddOns\\Daseeki-Nexus\\textures\\round-stroke"
+local ROUND_CORNER_SPEC = {
+    -- anchor + texcoord (L,R,T,B) flips of the TOP-LEFT base texture.
+    { "TOPLEFT",     0, 1, 0, 1 },
+    { "TOPRIGHT",    1, 0, 0, 1 },
+    { "BOTTOMLEFT",  0, 1, 1, 0 },
+    { "BOTTOMRIGHT", 1, 0, 1, 0 },
+}
+function Dashboard.RoundCorners(frame, radius, behindToken, borderToken)
     radius = radius or 5
     behindToken = behindToken or "ground"
-    -- point + texcoord (L,R,T,B) flips of the TOP-LEFT base corner texture.
-    local corners = {
-        { "TOPLEFT",     0, 1, 0, 1 },
-        { "TOPRIGHT",    1, 0, 0, 1 },
-        { "BOTTOMLEFT",  0, 1, 1, 0 },
-        { "BOTTOMRIGHT", 1, 0, 1, 0 },
-    }
-    for _, c in ipairs(corners) do
-        local t = frame:CreateTexture(nil, "OVERLAY", nil, 7)   -- above the fill+border
-        t:SetTexture(ROUND_CORNER_TEX)
-        t:SetSize(radius, radius)
-        t:SetTexCoord(c[2], c[3], c[4], c[5])
-        t:SetPoint(c[1], frame, c[1], 0, 0)
-        UI.Skin(t, function(self) self:SetVertexColor(UI.Color(behindToken)) end)
+    borderToken = borderToken or "borderLite"
+    frame._rrStroke = {}          -- stroke textures, for later re-tint (selection)
+    frame._rrStrokeToken = borderToken
+    for _, c in ipairs(ROUND_CORNER_SPEC) do
+        -- COVER: behind color, carves the rounded fill silhouette.
+        local cov = frame:CreateTexture(nil, "OVERLAY", nil, 6)
+        cov:SetTexture(ROUND_CORNER_TEX)
+        cov:SetSize(radius, radius)
+        cov:SetTexCoord(c[2], c[3], c[4], c[5])
+        cov:SetPoint(c[1], frame, c[1], 0, 0)
+        UI.Skin(cov, function(self) self:SetVertexColor(UI.Color(behindToken)) end)
+        -- STROKE: border color, continues the 1px edge around the arc (above cover).
+        local st = frame:CreateTexture(nil, "OVERLAY", nil, 7)
+        st:SetTexture(ROUND_STROKE_TEX)
+        st:SetSize(radius, radius)
+        st:SetTexCoord(c[2], c[3], c[4], c[5])
+        st:SetPoint(c[1], frame, c[1], 0, 0)
+        UI.Skin(st, function(self) self:SetVertexColor(UI.Color(frame._rrStrokeToken or borderToken)) end)
+        frame._rrStroke[#frame._rrStroke + 1] = st
     end
     return frame
+end
+
+-- Re-tint the corner stroke (e.g. a selected card whose straight border went accent).
+function Dashboard.SetCornerStroke(frame, token)
+    if not (frame and frame._rrStroke) then return end
+    frame._rrStrokeToken = token or "borderLite"
+    for _, st in ipairs(frame._rrStroke) do st:SetVertexColor(UI.Color(frame._rrStrokeToken)) end
+end
+
+-- ── Dashboard body/card TYPE (round-11 item 2) ────────────────────────────────
+-- The dashboard's body/card/row/label text moves off FRIZQT onto ARIALN (condensed —
+-- cleaner and denser at the small sizes the cards use). Numerals/micro-labels were
+-- already ARIALN; titles (header) and the wordmark (ceremonial) keep FRIZQT/MORPHEUS.
+-- These are NEXUS-LOCAL FontObjects, so Core's shared UI.fonts (and the rest of the
+-- suite) stay FRIZQT. Colours re-tint on ThemeChanged exactly like the Core fonts.
+-- (UI is nil in the headless harness; the CreateFont calls are stubbed there and the
+-- UI-touching apply/subscribe only runs in-game where UI is present.)
+local NX_FACE = "Fonts\\ARIALN.TTF"
+local NX_SPEC = {
+    body   = { size = "bodySize",  color = "text"   },
+    small  = { size = "smallSize", color = "muted"  },
+    muted  = { size = "bodySize",  color = "muted"  },
+    accent = { size = "bodySize",  color = "accent" },
+    danger = { size = "bodySize",  color = "danger" },
+}
+local nxFonts = {}
+for key in pairs(NX_SPEC) do
+    nxFonts[key] = _G["DaseekiNexusFont_" .. key] or (CreateFont and CreateFont("DaseekiNexusFont_" .. key))
+end
+local function applyNexusFonts()
+    for key, spec in pairs(NX_SPEC) do
+        local fo = nxFonts[key]
+        if fo and fo.SetFont then
+            fo:SetFont(NX_FACE, UI.Token(spec.size) or 12, "")
+            fo:SetTextColor(UI.Color(spec.color))
+            fo:SetJustifyH("LEFT")
+        end
+    end
+end
+if UI and UI.Token and UI.OnThemeChanged then
+    applyNexusFonts()
+    UI.OnThemeChanged(applyNexusFonts)
+end
+-- Resolve a dashboard text FontObject: the ARIALN variant for the re-faced keys, else
+-- the shared Core font (header/ceremonial/numeral/microLabel keep their faces).
+function Dashboard.Font(key)
+    local fo = nxFonts[key]
+    if fo then return fo end
+    return (UI and UI.fonts and (UI.fonts[key] or UI.fonts.body)) or nil
 end
 
 -- Class color (r,g,b) from the user override table, falling back to Blizzard's.
@@ -728,7 +794,7 @@ local function makeHeaderButton(parent, text, onClick, width)
     btn._disabled = false
     function btn:SetEnabledState(on, tip)
         self._disabled = not on
-        self._label:SetFontObject(on and UI.fonts.body or UI.fonts.muted)
+        self._label:SetFontObject(on and Dashboard.Font("body") or Dashboard.Font("muted"))
         self._tip = tip
     end
     btn:SetScript("OnEnter", function(self)
@@ -893,11 +959,11 @@ local function buildHeader(w)
     closeBtn:SetSize(22, 22)
     closeBtn:SetPoint("RIGHT", header, "RIGHT", -8, 0)
     local cx = closeBtn:CreateFontString(nil, "OVERLAY")
-    cx:SetFontObject(UI.fonts.body)
+    cx:SetFontObject(Dashboard.Font("body"))
     cx:SetPoint("CENTER", closeBtn, "CENTER", 0, 0)
     cx:SetText("X")
-    closeBtn:SetScript("OnEnter", function() cx:SetFontObject(UI.fonts.danger) end)
-    closeBtn:SetScript("OnLeave", function() cx:SetFontObject(UI.fonts.body) end)
+    closeBtn:SetScript("OnEnter", function() cx:SetFontObject(Dashboard.Font("danger")) end)
+    closeBtn:SetScript("OnLeave", function() cx:SetFontObject(Dashboard.Font("body")) end)
     closeBtn:SetScript("OnClick", function() w:Hide() end)
 
     -- Round-6 (item B): the faction toggle MOVED OFF the titlebar into the chip bar
@@ -912,13 +978,13 @@ local function buildHeader(w)
     local settingsBtn = CreateFrame("Button", nil, header)
     settingsBtn:SetHeight(HEADER_H)
     local sLbl = settingsBtn:CreateFontString(nil, "OVERLAY")
-    sLbl:SetFontObject(UI.fonts.body)
+    sLbl:SetFontObject(Dashboard.Font("body"))
     sLbl:SetPoint("CENTER", settingsBtn, "CENTER", 0, 0)
     sLbl:SetText("Settings")
     settingsBtn:SetWidth((sLbl:GetStringWidth() or 52) + 16)
     settingsBtn:SetPoint("RIGHT", closeBtn, "LEFT", -8, 0)
-    settingsBtn:SetScript("OnEnter", function() sLbl:SetFontObject(UI.fonts.accent) end)
-    settingsBtn:SetScript("OnLeave", function() sLbl:SetFontObject(UI.fonts.body) end)
+    settingsBtn:SetScript("OnEnter", function() sLbl:SetFontObject(Dashboard.Font("accent")) end)
+    settingsBtn:SetScript("OnLeave", function() sLbl:SetFontObject(Dashboard.Font("body")) end)
     settingsBtn:SetScript("OnClick", function()
         if DaseekiSuite and DaseekiSuite.Open then DaseekiSuite:Open("nexus")
         else ns:Print("the Daseeki hub (Daseeki Core) is not available.") end
@@ -934,7 +1000,7 @@ local function buildHeader(w)
         b:SetHeight(HEADER_H)
         b._id, b._scope = slot.id, slot.scope
         local lbl = b:CreateFontString(nil, "OVERLAY")
-        lbl:SetFontObject(UI.fonts.body)
+        lbl:SetFontObject(Dashboard.Font("body"))
         lbl:SetPoint("CENTER", b, "CENTER", 0, 0)
         lbl:SetText(slot.label)
         b._label = lbl
@@ -949,10 +1015,10 @@ local function buildHeader(w)
         b._under = under
         b:SetScript("OnClick", function(self) Dashboard.SelectTab(self._id) end)
         b:SetScript("OnEnter", function(self)
-            if Dashboard.activeTabId ~= self._id then self._label:SetFontObject(UI.fonts.accent) end
+            if Dashboard.activeTabId ~= self._id then self._label:SetFontObject(Dashboard.Font("accent")) end
         end)
         b:SetScript("OnLeave", function(self)
-            if Dashboard.activeTabId ~= self._id then self._label:SetFontObject(UI.fonts.body) end
+            if Dashboard.activeTabId ~= self._id then self._label:SetFontObject(Dashboard.Font("body")) end
         end)
         tabs[#tabs + 1] = b
         prev = b
@@ -968,7 +1034,7 @@ local function buildHeader(w)
         for _, b in ipairs(tabs) do
             local active = (Dashboard.activeTabId == b._id)
             b._under:SetShown(active)
-            b._label:SetFontObject(active and UI.fonts.accent or UI.fonts.body)
+            b._label:SetFontObject(active and Dashboard.Font("accent") or Dashboard.Font("body"))
         end
     end
 
@@ -1092,7 +1158,7 @@ local function buildStatusBar(w)
 
     local function seg(anchorTo, x)
         local fs = bar:CreateFontString(nil, "OVERLAY")
-        fs:SetFontObject(UI.fonts.small)
+        fs:SetFontObject(Dashboard.Font("small"))
         if anchorTo then
             fs:SetPoint("LEFT", anchorTo, "RIGHT", x, 0)
         else
@@ -1152,7 +1218,7 @@ local function buildStatusBar(w)
         dot:SetAllPoints()
         b._dot = dot
         local lbl = b:CreateFontString(nil, "OVERLAY")
-        lbl:SetFontObject(UI.fonts.small)
+        lbl:SetFontObject(Dashboard.Font("small"))
         lbl:SetPoint("CENTER", b, "CENTER", 0, 0)
         lbl:SetText(letter)
         b._lbl = lbl
@@ -1171,7 +1237,7 @@ local function buildStatusBar(w)
 
     -- Guild-online count (green), hover list.
     local guildFS = bar:CreateFontString(nil, "OVERLAY")
-    guildFS:SetFontObject(UI.fonts.small)
+    guildFS:SetFontObject(Dashboard.Font("small"))
     guildFS:SetPoint("LEFT", reqNWB, "RIGHT", 16, 0)
     local guildHover = CreateFrame("Frame", nil, bar)
     guildHover:SetPoint("TOPLEFT", guildFS, "TOPLEFT", -2, 4)
@@ -1195,7 +1261,7 @@ local function buildStatusBar(w)
 
     -- DMF schedule (right-aligned), hover for start/end.
     local dmfFS = bar:CreateFontString(nil, "OVERLAY")
-    dmfFS:SetFontObject(UI.fonts.small)
+    dmfFS:SetFontObject(Dashboard.Font("small"))
     dmfFS:SetPoint("RIGHT", bar, "RIGHT", -10, 0)
     local dmfHover = CreateFrame("Frame", nil, bar)
     dmfHover:SetPoint("TOPLEFT", dmfFS, "TOPLEFT", -2, 4)
@@ -1458,7 +1524,7 @@ ns:On("STORE_REFRESHED", onEngineChange)
 
 local function fs(parent, fontKey)
     local f = parent:CreateFontString(nil, "OVERLAY")
-    f:SetFontObject(UI.fonts[fontKey] or UI.fonts.body)
+    f:SetFontObject(Dashboard.Font(fontKey))
     return f
 end
 
@@ -1550,7 +1616,7 @@ function Dashboard.BuildDetailPanel(parent)
     end
     local locBox = CreateFrame("EditBox", nil, child, "BackdropTemplate")
     locBox:SetHeight(22); locBox:SetAutoFocus(false)
-    locBox:SetFontObject(UI.fonts.body); locBox:SetTextInsets(8, 8, 0, 0)
+    locBox:SetFontObject(Dashboard.Font("body")); locBox:SetTextInsets(8, 8, 0, 0)
     UI.Skin(locBox, function(self)
         self:SetBackdrop(UI.FLAT_BACKDROP)
         self:SetBackdropColor(UI.Color("inset"))
@@ -1637,7 +1703,7 @@ function Dashboard.BuildDetailPanel(parent)
         local function line(text, fontKey, tokenOverride, rightReserve)
             li = li + 1
             local l = getLine(li)
-            l:SetFontObject(UI.fonts[fontKey or "body"])
+            l:SetFontObject(Dashboard.Font(fontKey or "body"))
             if tokenOverride then l:SetTextColor(UI.Color(tokenOverride)) end
             l:ClearAllPoints()
             l:SetPoint("TOPLEFT", child, "TOPLEFT", 0, -y)
@@ -1730,7 +1796,7 @@ function Dashboard.BuildDetailPanel(parent)
         line("Current: " .. (rec.location or Dashboard.Colored("Missing location","danger")), "body")
         li = li + 1
         local lblNotes = getLine(li)
-        lblNotes:SetFontObject(UI.fonts.small)
+        lblNotes:SetFontObject(Dashboard.Font("small"))
         lblNotes:ClearAllPoints()
         lblNotes:SetPoint("TOPLEFT", child, "TOPLEFT", 0, -y)
         lblNotes:SetWidth(W); lblNotes:SetText("Notes:")
@@ -1914,12 +1980,12 @@ function Dashboard.BuildRosterPane(host, opts)
         bar:SetPoint("TOPRIGHT", left, "TOPRIGHT", -10, -8)
         bar:SetSize(96, 16)
         local onBtn = CreateFrame("Button", nil, bar)
-        local onT = onBtn:CreateFontString(nil, "OVERLAY"); onT:SetFontObject(UI.fonts.small)
+        local onT = onBtn:CreateFontString(nil, "OVERLAY"); onT:SetFontObject(Dashboard.Font("small"))
         onT:SetText("Online"); onT:SetPoint("RIGHT", bar, "RIGHT", 0, 0)
         onBtn:SetAllPoints(onT)
         local sep = fs(bar, "small"); sep:SetText("|"); sep:SetPoint("RIGHT", onT, "LEFT", -4, 0)
         local allBtn = CreateFrame("Button", nil, bar)
-        local allT = allBtn:CreateFontString(nil, "OVERLAY"); allT:SetFontObject(UI.fonts.small)
+        local allT = allBtn:CreateFontString(nil, "OVERLAY"); allT:SetFontObject(Dashboard.Font("small"))
         allT:SetText("All"); allT:SetPoint("RIGHT", sep, "LEFT", -4, 0)
         allBtn:SetAllPoints(allT)
         local function paint()

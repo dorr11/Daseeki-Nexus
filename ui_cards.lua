@@ -50,8 +50,8 @@ local CHIP_H     = 44       -- chip bar height (top of the cards panel)
 local LIST_PAD   = 12       -- card list padding
 local CARD_H     = 84       -- card height
 local CARD_GAP   = 6        -- gap between cards
-local CARD_PAD_H = 11       -- card horizontal padding
-local CARD_PAD_V = 9        -- card vertical padding
+local CARD_PAD_H = 9        -- card horizontal padding (round-11 item 4: 11 -> 9, one step tighter)
+local CARD_PAD_V = 7        -- card vertical padding   (round-11 item 4: 9 -> 7, one step tighter)
 local TILE       = 18       -- buff strip tile edge
 local TILE_GAP   = 3
 local CD_ICON    = 20       -- chrono/hearth cooldown icon edge (round-6 C: 15 -> 20, padded)
@@ -320,6 +320,30 @@ local function freshToken(rec, nowE)
     return "idle"
 end
 
+-- Round-11 item 5: pure cd-icon state from remaining seconds.
+--   ready (rem <= 0) -> { border = "ok",     cd = nil }              (green border)
+--   on CD (rem > 0)  -> { border = "danger", cd = "<compact>" }      (red border + text)
+-- The caller overrides chrono's special BOONED state (accent border, no countdown). The
+-- compact countdown reuses the shared decayed-remaining formatter (e.g. "12m", "1h05m").
+function Cards.CdIconState(rem)
+    if rem and rem > 0 then
+        return { border = "danger", cd = Dashboard.FormatDuration(rem, "compact") }
+    end
+    return { border = "ok", cd = nil }
+end
+
+-- Round-11 addendum: contrast-by-construction for a SELECTED segmented-control label
+-- sitting on an accent FILL. The old code always drew the label in "ground" (dark),
+-- which on a low-luminance accent (blood-red Daseeki) rendered dark-on-red and drowned
+-- (owner: SUMMONERS unreadable). Branch on the accent's Rec.601 relative luminance:
+--   dark accent  (lum < threshold) -> label = "text"   (cream/white; caller keeps BOLD)
+--   light accent (lum >= threshold)-> label = "ground"  (near-black)
+-- Returns a THEME TOKEN name so it re-tints with the theme. Threshold 0.5.
+function Cards.OnAccentTextColor(r, g, b)
+    local lum = 0.299 * (r or 0) + 0.587 * (g or 0) + 0.114 * (b or 0)
+    if lum < 0.5 then return "text" else return "ground" end
+end
+
 -- Struck = blacklisted / tombstoned name (rendered with a strike overlay).
 function Cards.IsStruck(nameRealm)
     local st = Dashboard and Dashboard.UIState and Dashboard.UIState()
@@ -337,7 +361,7 @@ local function tag(frame, id)
 end
 local function fstr(parent, key, justify)
     local f = parent:CreateFontString(nil, "OVERLAY")
-    f:SetFontObject(UI.fonts[key] or UI.fonts.body)
+    f:SetFontObject(Dashboard.Font(key))   -- round-11 item 2: ARIALN-based dashboard type
     if justify then f:SetJustifyH(justify) end
     return f
 end
@@ -367,8 +391,10 @@ local function makeCard(parent, pane)
         self:SetBackdropColor(UI.Color(self._sel and "raised" or "panel"))
         self:SetBackdropBorderColor(UI.Color(self._sel and "accent" or "borderLite"))
     end)
-    -- Rounded corners against the cards panel's raised fill (round-8 item 3, radius ~4).
-    Dashboard.RoundCorners(card, 6, "raised")
+    -- Rounded corners against the cards panel's raised fill (round-8; round-11 item 1:
+    -- the stroke now CURVES around the corner — borderLite here, re-tinted to accent when
+    -- the card is selected, matching its straight border).
+    Dashboard.RoundCorners(card, 6, "raised", "borderLite")
     -- Accent wash over the selected card (clearly distinct from a resting card).
     card.wash = card:CreateTexture(nil, "BACKGROUND")
     card.wash:SetPoint("TOPLEFT", card, "TOPLEFT", 1, -1)
@@ -380,10 +406,13 @@ local function makeCard(parent, pane)
     card.edge:SetPoint("BOTTOMLEFT", card, "BOTTOMLEFT", 0, 0)
     card.edge:SetWidth(3); card.edge:Hide()
 
-    -- Right-edge FLUSH ICON COLUMN (owner round-7 item 3). One column at the card's
-    -- right edge: SOUL SHARD at the TOP (warlocks only, count to its LEFT) and the
-    -- chrono + hearth cooldown icons STACKED at the BOTTOM (chrono above hearth, keeping
-    -- the round-6 20px + clear spacing). Non-warlocks show just the bottom pair.
+    -- Right-edge ICON COLUMN (round-7 item 3; round-11 item 4: EVENLY DISTRIBUTED —
+    -- owner's icons-cramped fix). With reduced padding, the three icons space out along
+    -- the full right edge with clear gaps and never touch: SOUL SHARD at the TOP
+    -- (warlocks only, count to its LEFT), the chrono in the VERTICAL CENTRE, the hearth at
+    -- the BOTTOM. Non-warlocks show two icons — chrono TOP + hearth BOTTOM (wide gap). The
+    -- chrono anchor is (re)set per class in :Populate. Each cd icon carries a countdown
+    -- FontString to its LEFT, shown only while on cooldown (round-11 item 5).
     local function cdIcon(size)
         local f = CreateFrame("Frame", nil, card, "BackdropTemplate")
         f:SetSize(size, size)
@@ -392,6 +421,10 @@ local function makeCard(parent, pane)
         ic:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", -1, 1)
         ic:SetTexCoord(0.08, 0.92, 0.08, 0.92)
         f.icon = ic
+        -- Countdown numeral to the LEFT of the icon (compact, e.g. "12m"); hidden off-CD.
+        f.cd = fstr(card, "numeral", "RIGHT")
+        f.cd:SetPoint("RIGHT", f, "LEFT", -4, 0)
+        f.cd:Hide()
         f:EnableMouse(true)
         f:SetScript("OnEnter", function(self)
             if not self._tip then return end
@@ -403,11 +436,10 @@ local function makeCard(parent, pane)
         f:SetScript("OnLeave", function() GameTooltip:Hide() end)
         return f
     end
-    card.hearth = cdIcon(CD_ICON)              -- bottom of the column
+    card.hearth = cdIcon(CD_ICON)              -- BOTTOM of the column
     card.hearth:SetPoint("BOTTOMRIGHT", card, "BOTTOMRIGHT", -CARD_PAD_H, CARD_PAD_V)
-    card.chrono = cdIcon(CD_ICON)              -- above hearth, clear 6px gap
-    card.chrono:SetPoint("BOTTOMRIGHT", card.hearth, "TOPRIGHT", 0, 6)
-    -- Soul shard (warlocks) at the TOP of the same flush column; count to its LEFT.
+    card.chrono = cdIcon(CD_ICON)              -- CENTRE (warlock) / TOP (non-warlock); set in Populate
+    -- Soul shard (warlocks) at the TOP of the same distributed column; count to its LEFT.
     card.shard = card:CreateTexture(nil, "ARTWORK")
     card.shard:SetSize(CD_ICON, CD_ICON); card.shard:SetTexCoord(0.08, 0.92, 0.08, 0.92)
     card.shard:SetPoint("TOPRIGHT", card, "TOPRIGHT", -CARD_PAD_H, -CARD_PAD_V)
@@ -425,7 +457,9 @@ local function makeCard(parent, pane)
     -- hugs the name.
     card.name = fstr(card, "body"); card.name:SetPoint("LEFT", card.dot, "RIGHT", 8, 0)
     card.name:SetJustifyH("LEFT"); card.name:SetWordWrap(false)
-    do local f, sz, fl = card.name:GetFont(); if f then card.name:SetFont(f, (sz or 13) + 1, fl) end end
+    -- Round-11 item 3: name +2 steps and BOLD (OUTLINE) so it reads clear on the ARIALN
+    -- (condensed) face the cards now use — the card's identity anchor.
+    do local f, sz = card.name:GetFont(); if f then card.name:SetFont(f, (sz or 13) + 2, "OUTLINE") end end
     card.pvp = card:CreateTexture(nil, "ARTWORK")
     card.pvp:SetSize(13, 13); card.pvp:SetPoint("LEFT", card.name, "RIGHT", 4, 0); card.pvp:Hide()
     -- Strike overlay for tombstoned/blacklisted names.
@@ -433,11 +467,11 @@ local function makeCard(parent, pane)
     card.strike:SetHeight(1); card.strike:Hide()
     card.strike:SetPoint("LEFT", card.name, "LEFT", 0, 0)
 
-    -- Row 2: location (left). Row 3: "Updated X ago" in the BODY, under the location
-    -- (owner round-4 item 4 — off the right edge, which belongs to the CD stack).
-    card.loc = fstr(card, "small"); card.loc:SetPoint("TOPLEFT", card.dot, "BOTTOMLEFT", 0, -6)
+    -- Row 2: LOCATION. Round-11 item 3: the "Updated X ago" line is REMOVED entirely, and
+    -- the location moves DOWN into its slot (centred in the body between the name and the
+    -- buff strip) — the card's freshness now lives only in the status pip + detail pane.
+    card.loc = fstr(card, "small"); card.loc:SetPoint("TOPLEFT", card.dot, "BOTTOMLEFT", 0, -11)
     card.loc:SetWordWrap(false)
-    card.upd = fstr(card, "microLabel"); card.upd:SetPoint("TOPLEFT", card.loc, "BOTTOMLEFT", 0, -3)
 
     -- Row 3: buff-icon strip (real-icon tiles; §5a lit/desat + state border).
     card.tiles = {}
@@ -463,6 +497,7 @@ local function makeCard(parent, pane)
         local nowE = now()
         self:SetBackdropColor(UI.Color(selected and "raised" or "panel"))
         self:SetBackdropBorderColor(UI.Color(selected and "accent" or "borderLite"))
+        Dashboard.SetCornerStroke(self, selected and "accent" or "borderLite")  -- curve the stroke to match
         self.edge:SetShown(selected)
         if selected then self.edge:SetColorTexture(UI.Color("accent")) end
         -- Selected accent wash (clearly distinct from a resting card).
@@ -490,11 +525,6 @@ local function makeCard(parent, pane)
         else
             self.loc:SetText("Unknown"); self.loc:SetTextColor(UI.Color("danger"))
         end
-        -- "Updated X ago" in the body under the location (tertiary -> muted; warn stale).
-        local ago, stale = Cards.AgoText(rec, nowE)
-        self.upd:SetText("Updated " .. ago .. " ago")
-        self.upd:SetTextColor(UI.Color(stale and "warn" or "muted"))
-
         -- PvP-flagged crest inline in the name/acct cluster.
         if rec.pvpFlagged and rec.faction then
             self.pvp:Show()
@@ -504,29 +534,48 @@ local function makeCard(parent, pane)
             self.pvp:Hide()
         end
 
-        -- Chrono / hearth cooldown icons (right-edge stack). Chrono: booned = lit +
-        -- accent/danger rim; on use-CD = desat; else lit. Hearth: desat while on CD.
+        -- Chrono / hearth cd icons (round-11 item 5): GREEN border when ready, RED border
+        -- + a compact countdown to the icon's LEFT when on cooldown. Chrono's BOONED state
+        -- overrides to an accent border (active/held, not merely ready).
         self.chrono.icon:SetTexture(Dashboard.ItemIcon(184937))   -- Chronoboon Displacer
         self.hearth.icon:SetTexture(Dashboard.ItemIcon(6948))     -- Hearthstone
-        local chronoRem = Dashboard.DecayRemaining(rec.itemCooldown, rec.lastDataUpdate, nowE)
+        -- Distribute the icon column by class (round-11 item 4): warlock -> chrono in the
+        -- vertical CENTRE (shard top, hearth bottom); non-warlock -> chrono at the TOP.
+        self.chrono:ClearAllPoints()
+        if rec.classTag == "WARLOCK" then
+            self.chrono:SetPoint("RIGHT", self, "RIGHT", -CARD_PAD_H, 0)
+        else
+            self.chrono:SetPoint("TOPRIGHT", self, "TOPRIGHT", -CARD_PAD_H, -CARD_PAD_V)
+        end
         self.chrono:SetBackdrop(UI.FLAT_BACKDROP); self.chrono:SetBackdropColor(UI.Color("inset"))
+        local chronoRem = Dashboard.DecayRemaining(rec.itemCooldown, rec.lastDataUpdate, nowE)
+        local cSt = Cards.CdIconState(chronoRem)
         if rec.chronoboonActive then
-            self.chrono:SetShown(true); self.chrono.icon:SetDesaturated(false)
-            self.chrono:SetBackdropBorderColor(UI.Color((rec.boonCount or 0) == 0 and "danger" or "accent"))
+            self.chrono.icon:SetDesaturated(false)
+            self.chrono:SetBackdropBorderColor(UI.Color("accent"))
+            self.chrono.cd:Hide()
             self.chrono._tip = { "Chronoboon Displacer", "Booned", "accent" }
         elseif chronoRem > 0 then
-            self.chrono:SetShown(true); self.chrono.icon:SetDesaturated(true)
-            self.chrono:SetBackdropBorderColor(UI.Color("border"))
+            self.chrono.icon:SetDesaturated(true)
+            self.chrono:SetBackdropBorderColor(UI.Color(cSt.border))       -- danger
+            self.chrono.cd:SetText(cSt.cd); self.chrono.cd:SetTextColor(UI.Color("danger")); self.chrono.cd:Show()
             self.chrono._tip = { "Chronoboon Displacer", "CD " .. Dashboard.FormatDuration(chronoRem), "danger" }
         else
-            self.chrono:SetShown(true); self.chrono.icon:SetDesaturated(false)
-            self.chrono:SetBackdropBorderColor(UI.Color("controlBorder"))
+            self.chrono.icon:SetDesaturated(false)
+            self.chrono:SetBackdropBorderColor(UI.Color(cSt.border))       -- ok (green, ready)
+            self.chrono.cd:Hide()
             self.chrono._tip = { "Chronoboon Displacer", ("%d in bags"):format(rec.boonCount or 0), "muted" }
         end
         local hearthRem = Dashboard.DecayRemaining(rec.hearthstoneCD, rec.lastDataUpdate, nowE)
+        local hSt = Cards.CdIconState(hearthRem)
         self.hearth:SetBackdrop(UI.FLAT_BACKDROP); self.hearth:SetBackdropColor(UI.Color("inset"))
         self.hearth.icon:SetDesaturated(hearthRem > 0)
-        self.hearth:SetBackdropBorderColor(UI.Color(hearthRem > 0 and "border" or "controlBorder"))
+        self.hearth:SetBackdropBorderColor(UI.Color(hSt.border))           -- green ready / red CD
+        if hSt.cd then
+            self.hearth.cd:SetText(hSt.cd); self.hearth.cd:SetTextColor(UI.Color("danger")); self.hearth.cd:Show()
+        else
+            self.hearth.cd:Hide()
+        end
         self.hearth._tip = { "Hearthstone", hearthRem > 0 and ("CD " .. Dashboard.FormatDuration(hearthRem)) or "Ready",
                              hearthRem > 0 and "danger" or "ok" }
 
@@ -616,8 +665,11 @@ local function makeFilterSegmented(parent, pane)
         function b:Apply(active)
             self:SetBackdrop(UI.FLAT_BACKDROP)
             if active then
-                self:SetBackdropColor(UI.Color("accent")); self:SetBackdropBorderColor(UI.Color("accent"))
-                self._lbl:SetTextColor(UI.Color("ground"))
+                -- Selected: accent FILL (controlled full alpha) + a label colour chosen for
+                -- contrast against THIS theme's accent (round-11 addendum — fixes red-on-red).
+                local ar, ag, ab = UI.Color("accent")
+                self:SetBackdropColor(ar, ag, ab, 1); self:SetBackdropBorderColor(ar, ag, ab, 1)
+                self._lbl:SetTextColor(UI.Color(Cards.OnAccentTextColor(ar, ag, ab)))
             else
                 self:SetBackdropColor(0, 0, 0, 0); self:SetBackdropBorderColor(0, 0, 0, 0)
                 self._lbl:SetTextColor(UI.Color("text"))
@@ -1063,6 +1115,33 @@ local function testStripStyle(fails)
     end
 end
 
+-- Round-11 item 5: cd-icon state derivation (green ready / red + countdown on CD).
+local function testCdIconState(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local ready = Cards.CdIconState(0)
+    ck(ready.border == "ok" and ready.cd == nil, "ready (0) -> ok border, no countdown")
+    local readyNil = Cards.CdIconState(nil)
+    ck(readyNil.border == "ok" and readyNil.cd == nil, "nil rem -> ok border, no countdown")
+    local onCd = Cards.CdIconState(720)   -- 12 minutes
+    ck(onCd.border == "danger", "on CD -> danger border")
+    ck(onCd.cd == Dashboard.FormatDuration(720, "compact"), "on CD -> compact countdown text")
+    ck(onCd.cd == "12m", "720s -> '12m' compact")
+end
+
+-- Round-11 addendum: on-accent label contrast branch (fixes red-on-red selected chip).
+local function testOnAccentTextColor(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    -- Daseeki blood-red accent (#CF5D4A) is LOW luminance -> light (text) label.
+    ck(Cards.OnAccentTextColor(0.8118, 0.3647, 0.2902) == "text", "blood-red accent -> text (light) label")
+    -- Winterspring ice-blue accent is HIGH luminance -> dark (ground) label.
+    ck(Cards.OnAccentTextColor(0.60, 0.80, 0.95) == "ground", "ice-blue accent -> ground (dark) label")
+    -- Legacy Ashenvale gold (#C9A24D) is high-ish -> dark (ground), preserving its look.
+    ck(Cards.OnAccentTextColor(0.7882, 0.6353, 0.3020) == "ground", "gold accent -> ground (dark) label")
+    -- Extremes.
+    ck(Cards.OnAccentTextColor(0, 0, 0) == "text", "black accent -> text label")
+    ck(Cards.OnAccentTextColor(1, 1, 1) == "ground", "white accent -> ground label")
+end
+
 if ns.RegisterSelfTest then
     ns:RegisterSelfTest("cards", function(verbose)
         local cases = {
@@ -1071,6 +1150,8 @@ if ns.RegisterSelfTest then
             { name = "selection machine", fn = testSelectionMachine },
             { name = "slot state",        fn = testSlotState },
             { name = "strip tile style",  fn = testStripStyle },
+            { name = "cd icon state",     fn = testCdIconState },
+            { name = "on-accent label",   fn = testOnAccentTextColor },
         }
         local allPass = true
         for _, c in ipairs(cases) do
