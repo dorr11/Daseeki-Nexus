@@ -355,6 +355,8 @@ local function makeCard(parent, pane)
         self:SetBackdropColor(UI.Color(self._sel and "raised" or "panel"))
         self:SetBackdropBorderColor(UI.Color(self._sel and "accent" or "borderLite"))
     end)
+    -- Rounded corners against the cards panel's raised fill (round-8 item 3, radius ~4).
+    Dashboard.RoundCorners(card, 4, "raised")
     -- Accent wash over the selected card (clearly distinct from a resting card).
     card.wash = card:CreateTexture(nil, "BACKGROUND")
     card.wash:SetPoint("TOPLEFT", card, "TOPLEFT", 1, -1)
@@ -403,8 +405,9 @@ local function makeCard(parent, pane)
 
     -- Row 1: status dot + class-colored name + optional PvP crest. The account "#N"
     -- tag was REMOVED (owner round-7 item 2 — it lives in the detail header).
-    card.dot = card:CreateTexture(nil, "OVERLAY")
-    card.dot:SetSize(8, 8); card.dot:SetPoint("TOPLEFT", card, "TOPLEFT", CARD_PAD_H, -CARD_PAD_V - 3)
+    -- Status pip: a DIAMOND with pop (round-8 item 2) — online = full ok-green + glow.
+    card.dot, card.dotHalo = Dashboard.MakeStatusPip(card, 9)
+    card.dot:SetPoint("TOPLEFT", card, "TOPLEFT", CARD_PAD_H, -CARD_PAD_V - 3)
     -- Name: brightened class color + one font step up (pop pass). Left-anchored auto
     -- width (short character names never reach the top-right icon column); PvP crest
     -- hugs the name.
@@ -454,7 +457,7 @@ local function makeCard(parent, pane)
         self.wash:SetShown(selected)
         if selected then local ar, ag, ab = UI.Color("accent"); self.wash:SetColorTexture(ar, ag, ab, 0.10) end
 
-        self.dot:SetColorTexture(UI.Color(entry.online and "ok" or "faint"))
+        Dashboard.PaintStatusPip(self.dot, self.dotHalo, entry.online)
         -- Name: short (realm stripped) in the brightened class hue (pop pass).
         self.name:SetText(Dashboard.ShortName(entry.nameRealm))
         self.name:SetTextColor(brightName(rec.classTag))
@@ -665,6 +668,8 @@ Dashboard.RegisterTab("characters", function(host)
             self:SetBackdropColor(UI.Color("raised"))
             self:SetBackdropBorderColor(UI.Color("borderLite"))
         end)
+        -- Rounded corners against the base ground (round-8 item 3, mockup radius ~5).
+        Dashboard.RoundCorners(p, 5, "ground")
         tag(p, id)
         return p
     end

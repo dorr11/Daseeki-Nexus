@@ -350,9 +350,10 @@ function Detail.Attach(parent)
     -- Status cluster (right): dot + Online/Offline · freshness.
     local statusFS = fstr(header, "microLabel", "RIGHT")
     statusFS:SetPoint("BOTTOMRIGHT", header, "BOTTOMRIGHT", 0, 3)
-    local statusDot = header:CreateTexture(nil, "OVERLAY")
-    statusDot:SetSize(8, 8); statusDot:SetPoint("RIGHT", statusFS, "LEFT", -6, 0)
-    D.nameFS, D.subFS, D.statusFS, D.statusDot = nameFS, subFS, statusFS, statusDot
+    -- Status pip: a DIAMOND with pop (round-8 item 2), matching the card pips.
+    local statusDot, statusHalo = Dash().MakeStatusPip(header, 9)
+    statusDot:SetPoint("RIGHT", statusFS, "LEFT", -8, 0)
+    D.nameFS, D.subFS, D.statusFS, D.statusDot, D.statusHalo = nameFS, subFS, statusFS, statusDot, statusHalo
 
     -- Header bottom hairline (one sharp rule, §9 UI.Hairline). Pop pass: borderLite.
     local hrule = UI.Hairline(parent, { token = "borderLite" })
@@ -512,7 +513,7 @@ function Detail.Attach(parent)
         local acct = (entry.aid and entry.aid ~= "" and ("#" .. entry.aid)) or ""
         subFS:SetText(("Level %s %s  %s"):format(rec.level or 60, rec.className or rec.classTag or "?", acct))
         local online = entry.online
-        statusDot:SetColorTexture(UI.Color(online and "ok" or "faint"))
+        Dd.PaintStatusPip(statusDot, D.statusHalo, online)
         statusFS:SetText((online and "ONLINE" or "OFFLINE") .. "  \194\183  " .. Dd.FreshnessText(rec.lastDataUpdate))
         statusFS:SetTextColor(UI.Color("muted"))
 

@@ -234,6 +234,75 @@ function Dashboard.SetDiamondColor(tex, token, alpha)
     tex:SetVertexColor(r, g, b, alpha or 1)
 end
 
+-- Diamond STATUS PIP (owner round-8 item 2): the online indicator is a smooth diamond
+-- with POP — a WHITE8X8 fill clipped to a diamond via the §9 mask primitive
+-- (UI.MaskTexture + UI.TEX_DIAMOND), >= 8px so the shape reads, plus a larger low-alpha
+-- HALO behind it that glows against the panel. Falls back to a rotated-square diamond
+-- if the mask primitive is unavailable (headless / no Core). Returns (pip, halo); the
+-- pip is the anchor target. Paint with Dashboard.PaintStatusPip(pip, halo, online).
+function Dashboard.MakeStatusPip(parent, size)
+    size = size or 9
+    local function diamond(sz, layer)
+        local t = parent:CreateTexture(nil, layer)
+        t:SetTexture("Interface\\Buttons\\WHITE8X8")
+        t:SetSize(sz, sz)
+        if UI and UI.MaskTexture then
+            UI.MaskTexture(t)                      -- clip to the faceted diamond stencil
+        else
+            t:SetRotation(0.7853981633974483)      -- fallback: rotated square (math.rad 45)
+        end
+        return t
+    end
+    local halo = diamond(size + 5, "ARTWORK")      -- behind (glow)
+    local pip  = diamond(size, "OVERLAY")          -- solid front
+    halo:SetPoint("CENTER", pip, "CENTER", 0, 0)
+    halo:Hide()
+    return pip, halo
+end
+
+-- Online = FULL ok-green (no muting) + a soft ok halo glow. Offline = a dim faint
+-- diamond, no halo. `pip`/`halo` from Dashboard.MakeStatusPip.
+function Dashboard.PaintStatusPip(pip, halo, online)
+    if online then
+        local r, g, b = UI.Color("ok")
+        pip:SetVertexColor(r, g, b, 1)
+        if halo then halo:SetVertexColor(r, g, b, 0.4); halo:Show() end
+    else
+        local r, g, b = UI.Color("faint")
+        pip:SetVertexColor(r, g, b, 0.8)
+        if halo then halo:Hide() end
+    end
+end
+
+-- ROUNDED CORNERS (owner round-8 item 3). WoW frames have no corner radius, so we
+-- overlay 4 corner-MASK textures (one own .tga in Nexus textures/, reused via
+-- SetTexCoord flips) tinted to the color BEHIND the frame — they cover the sharp
+-- fill+border corner with the base color, leaving a subtle ~radius-px rounded corner.
+-- Hairlines/dividers INSIDE panels stay square (untouched). NOTE: a clean 9-slice
+-- edgeFile backdrop is a Core-kit follow-up (UI.FLAT_BACKDROP is a flat 1px square
+-- border today); this ships the rounded LOOK locally.
+local ROUND_CORNER_TEX = "Interface\\AddOns\\Daseeki-Nexus\\textures\\round-corner"
+function Dashboard.RoundCorners(frame, radius, behindToken)
+    radius = radius or 5
+    behindToken = behindToken or "ground"
+    -- point + texcoord (L,R,T,B) flips of the TOP-LEFT base corner texture.
+    local corners = {
+        { "TOPLEFT",     0, 1, 0, 1 },
+        { "TOPRIGHT",    1, 0, 0, 1 },
+        { "BOTTOMLEFT",  0, 1, 1, 0 },
+        { "BOTTOMRIGHT", 1, 0, 1, 0 },
+    }
+    for _, c in ipairs(corners) do
+        local t = frame:CreateTexture(nil, "OVERLAY", nil, 7)   -- above the fill+border
+        t:SetTexture(ROUND_CORNER_TEX)
+        t:SetSize(radius, radius)
+        t:SetTexCoord(c[2], c[3], c[4], c[5])
+        t:SetPoint(c[1], frame, c[1], 0, 0)
+        UI.Skin(t, function(self) self:SetVertexColor(UI.Color(behindToken)) end)
+    end
+    return frame
+end
+
 -- Class color (r,g,b) from the user override table, falling back to Blizzard's.
 function Dashboard.ClassColor(classTag)
     if classTag and ns.Store and ns.Store.GetSettings then
@@ -778,15 +847,19 @@ local function buildHeader(w)
     bg:SetPoint("BOTTOMRIGHT", header, "BOTTOMRIGHT", -1, 0)
     UI.Skin(bg, function(self) self:SetColorTexture(UI.Color("panel")) end)
 
-    -- Suite EMBLEM (owner round-7 item 4): the diamond sigil is now the brand mark in
-    -- the header — the "DASEEKI" word is removed and the header reads [emblem] NEXUS.
-    -- Uses the existing titlebar mark art (the token-drawn accent diamond), bumped for
-    -- prominence. (Kept the token-drawn diamond rather than a masked .tga so the emblem
-    -- never depends on a Core texture path that could be absent; a masked-asset emblem
-    -- is a trivial follow-up if the owner wants the exact sigil art.)
-    local logo = Dashboard.MakeDiamond(header, 14, "OVERLAY")
+    -- Suite EMBLEM (owner round-8 item 1: the token-drawn diamond "wasn't rendering
+    -- correctly"). Use the REAL suite sigil — Core's UI.MakerMark, the same faceted
+    -- diamond brandmark the Daseeki hub titlebar draws (outer diamond ring + crimson
+    -- MORPHEUS "D"), so Nexus shows the identical, correct emblem. Falls back to the
+    -- token-drawn accent diamond only if the Core primitive is somehow absent.
+    local logo
+    if UI.MakerMark then
+        logo = UI.MakerMark(header, { size = 18 })
+    else
+        logo = Dashboard.MakeDiamond(header, 14, "OVERLAY")
+        Dashboard.SetDiamondColor(logo, "accent")
+    end
     logo:SetPoint("LEFT", header, "LEFT", PAD, 0)
-    Dashboard.SetDiamondColor(logo, "accent")
 
     -- Wordmark: just NEXUS (accent), in the ceremonial face — the emblem carries the
     -- suite brand now.
