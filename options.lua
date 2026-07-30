@@ -271,7 +271,7 @@ local function FS() return ns.Store and ns.Store.GetFactionSettings and ns.Store
 -- `alerts` is the split-off event matrix page (was folded into `timers`); `wizard`
 -- serves the first-run setup dialog's live get/set widgets.
 local refreshers = { auras = {}, automation = {}, mesh = {}, general = {}, timers = {},
-                     alerts = {}, blacklist = {}, wizard = {}, instances = {} }
+                     alerts = {}, blacklist = {}, wizard = {}, instances = {}, help = {} }
 local function register(page, fn) local l = refreshers[page]; l[#l + 1] = fn end
 local function refreshPage(page)
     local l = refreshers[page]
@@ -2234,6 +2234,72 @@ local function ensureLiveTicker()
 end
 
 ----------------------------------------------------------------------
+-- Help (round-13: moved verbatim from the old in-dashboard Help tab into the hub —
+-- the dashboard is now single-page, so Help lives at Settings -> Nexus -> Help).
+----------------------------------------------------------------------
+local function buildHelp(flow)
+    local s = flow:AddSection("Daseeki Nexus")
+    s:Hint("Cross-account world-buff dashboard and timers for the Daseeki suite. "
+        .. "Every account that shares your mesh Channel and Token sees the same roster.")
+
+    local g = flow:AddSection("Setup Guide")
+    g:Hint("1.  Install Daseeki Nexus on every account you want connected.")
+    g:Hint("2.  On each account, open Settings \226\134\146 Mesh & Accounts and set a unique Account ID (1\226\128\1512 digits, different on each account).")
+    g:Hint("3.  On the same Mesh & Accounts page, set the SAME Channel name (16+ letters/numbers, case sensitive) AND the SAME Token (6 letters/numbers) on every account \226\128\148 generate the credentials there, or paste a setup bundle to copy the same Channel and Token to another account.")
+    g:Hint("4.  Enable the mesh, then log out and back in once on each account \226\128\148 characters appear across your accounts within seconds.")
+    g:Hint("5.  Migrating from another world-buff addon? Run /nexus import to carry over its settings, Channel, Token and data (see Troubleshooting).")
+    g:Hint("Open this hub any time from the dashboard's Settings button, or with /nexus settings.")
+
+    local c = flow:AddSection("Slash commands")
+    c:Hint("Primary /nexus  \194\183  short /dnx  \194\183  aliases /dsn, /daseekinetwork")
+    c:Hint("/nexus toggle \226\128\148 show or hide the dashboard")
+    c:Hint("/nexus x \226\128\148 open the Cancel Buffs popup")
+    c:Hint("/nexus invite \226\128\148 invite all online characters")
+    c:Hint("/nexus resetui \226\128\148 reset the dashboard window position")
+    c:Hint("/nexus account <id> \226\128\148 show or set this account's mesh ID")
+    c:Hint("/nexus settings \226\128\148 open the Daseeki hub to Nexus settings")
+    c:Hint("/nexus import \226\128\148 import ShadowNetwork settings & data ('dry' to preview)")
+    c:Hint("/nexus help \226\128\148 full command list in chat")
+
+    local db = flow:AddSection("Dashboard")
+    db:Hint("The dashboard is one panel screen. On the left is the character card list; on the right is the selected character's detail, with the Instances panel and the Timers dock beneath it.")
+    db:Hint("Filter the cards with the 60s / Online / Summoners toggles above the list; click the active toggle again to clear it (with none active, all characters show). The Alliance / Horde toggle beside them switches faction.")
+    db:Hint("Hover a card for a quick peek (location, missing buffs, last update); click it to open that character on the right.")
+    db:Hint("The Instances panel has an Instances | Exp switch: Instances shows recent lockouts and the per-account cap meters; Exp shows each character's level, XP and rested. The character dropdown filters both.")
+    db:Hint("The Timers dock (bottom-right) shows world-buff cooldowns, the Felwood songflower grid, the Darkmoon Faire estimate, and the Broadcast / Refresh buttons.")
+    db:Hint("Blacklisted characters appear struck-through on the dashboard (they are not hidden). Manage the list in Settings \226\134\146 Blacklist.")
+
+    local mm = flow:AddSection("Minimap button")
+    mm:Hint("Left-click \226\128\148 open or close the dashboard.")
+    mm:Hint("Right-click \226\128\148 open or close the dashboard.")
+    mm:Hint("Shift + Left-click \226\128\148 invite all online characters.")
+    mm:Hint("Shift + Right-click \226\128\148 open the button menu: Toggle dashboard, Invite online, Timers dock, Cancel Buffs, Felwood map, Lock button, Settings.")
+    mm:Hint("Hover \226\128\148 live Rend / Onyxia (A/H) cooldowns.")
+    mm:Hint("Drag it around the minimap ring to reposition (unless locked in Settings \226\134\146 General).")
+
+    local tr = flow:AddSection("Troubleshooting")
+    tr:Hint("Other accounts not showing? The Channel AND Token must match byte-for-byte on every account \226\128\148 both are case sensitive and together act as your mesh password. Correct any mismatch in Settings \226\134\146 Mesh & Accounts, then /reload.")
+    tr:Hint("Characters under the wrong account? Two accounts are sharing an Account ID. Give each account its own unique ID in Settings \226\134\146 Mesh & Accounts.")
+    tr:Hint("Copying settings to a new account? Set it up with the same Channel + Token, then use Send Settings to Mesh (you confirm the target account IDs first).")
+    tr:Hint("Coming from ShadowNetwork? Run /nexus import \226\128\148 it carries over your settings, Channel, Token and stored data.")
+
+    local ac = flow:AddSection("Accounts & Tombstones")
+    ac:Hint("Deleting an account is local only \226\128\148 it hides that account on THIS client and leaves a 14-day tombstone that blocks it from re-appearing.")
+    ac:Hint("Remove a tombstone early and the account re-adds itself on its next heartbeat (while it is still meshing).")
+    ac:Hint("Changing your Account ID migrates your data locally; other accounts keep showing your OLD ID until they delete it.")
+    ac:Hint("If two accounts use the same ID you'll see an \"Account ID conflict\" warning \226\128\148 change one of them to a unique ID.")
+    ac:Hint("You can't delete your OWN account \226\128\148 change your Account ID instead.")
+
+    local ds = flow:AddSection("First-time setup (detailed)")
+    ds:Hint("1.  Account ID \226\128\148 In Settings \226\134\146 Mesh & Accounts, give this account a short unique ID (1\226\128\1512 digits). Every connected account needs a DIFFERENT ID; this is how the mesh tells your accounts apart.")
+    ds:Hint("2.  Channel \226\128\148 On the same Mesh & Accounts page, set a Channel name of 16+ letters and numbers. It is case sensitive and must be identical on every account \226\128\148 think of it as the room your accounts meet in.")
+    ds:Hint("3.  Token \226\128\148 Set a 6-character Token (letters/numbers), also identical everywhere. Generate the credentials on the Mesh & Accounts page, or paste a setup bundle to copy the same Channel and Token to another account. The Channel + Token together are your mesh password; anyone with both can see your roster, so keep them private.")
+    ds:Hint("4.  Same faction \226\128\148 The mesh rides a hidden faction chat channel, so each account must log in a character on the SAME faction to connect. Cross-faction characters simply will not mesh.")
+    ds:Hint("5.  Enable + relog \226\128\148 Enable the mesh, then log out and back in once on each account. Your characters appear across accounts within seconds.")
+    ds:Hint("6.  Verify \226\128\148 Open the dashboard; you should see characters from your other accounts. Use the 60s / Online / Summoners filter toggles and the Alliance / Horde toggle to narrow the list, and click a character to open its detail and Notes. If not, check Troubleshooting above.")
+end
+
+----------------------------------------------------------------------
 -- Section builders wrapper (guarded so a build error surfaces, not hides)
 ----------------------------------------------------------------------
 
@@ -2286,6 +2352,10 @@ function Options.Register()
             { id = "blacklist",  title = "Blacklist",
               build = function(flow) once("blacklist", flow.pane, function() buildBlacklist(flow) end) end,
               refresh = function() refreshPage("blacklist") end },
+            -- Round-13: Help moved out of the dashboard into the hub (single-page dashboard).
+            { id = "help",       title = "Help",
+              build = function(flow) once("help", flow.pane, function() buildHelp(flow) end) end,
+              refresh = function() refreshPage("help") end },
         },
     })
 end

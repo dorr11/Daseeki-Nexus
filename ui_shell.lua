@@ -26,7 +26,8 @@ ns.Dashboard = Dashboard
 -- the two-panel instances/timers bottom row need the extra room to stay legible).
 local DEFAULT_W, DEFAULT_H = 1120, 620
 local MIN_W, MIN_H = 1120, 620
-local HEADER_H = 44
+local HEADER_H = 34    -- round-13: tab strip removed, so the titlebar tightens (was 44);
+                       -- the reclaimed 10px goes to the body (DETAIL_H grows to match)
 local TAB_H    = 34    -- retained constant (unused by the fixed layout)
 local PAD      = 12
 
@@ -312,13 +313,17 @@ local ROUND_CORNER_SPEC = {
     { "BOTTOMLEFT",  0, 1, 1, 0 },
     { "BOTTOMRIGHT", 1, 0, 1, 0 },
 }
-function Dashboard.RoundCorners(frame, radius, behindToken, borderToken)
+-- `only` (optional): a set keyed by corner name ("TOPLEFT"/"TOPRIGHT"/"BOTTOMLEFT"/
+-- "BOTTOMRIGHT") — render just those corners. Used to round only the OUTER corners of a
+-- touching segment pair (the faction A|H chips) so their shared inner edge stays square.
+function Dashboard.RoundCorners(frame, radius, behindToken, borderToken, only)
     radius = radius or 5
     behindToken = behindToken or "ground"
     borderToken = borderToken or "borderLite"
     frame._rrStroke = {}          -- stroke textures, for later re-tint (selection)
     frame._rrStrokeToken = borderToken
     for _, c in ipairs(ROUND_CORNER_SPEC) do
+      if not only or only[c[1]] then
         -- COVER: behind color, carves the rounded fill silhouette.
         local cov = frame:CreateTexture(nil, "OVERLAY", nil, 6)
         cov:SetTexture(ROUND_CORNER_TEX)
@@ -334,6 +339,7 @@ function Dashboard.RoundCorners(frame, radius, behindToken, borderToken)
         st:SetPoint(c[1], frame, c[1], 0, 0)
         UI.Skin(st, function(self) self:SetVertexColor(UI.Color(frame._rrStrokeToken or borderToken)) end)
         frame._rrStroke[#frame._rrStroke + 1] = st
+      end
     end
     return frame
 end
@@ -660,22 +666,8 @@ Dashboard.UIState = uiState
 
 Dashboard.tabBuilders = {}   -- id -> build(host) -> tabObj (must expose :Refresh())
 
--- scope "faction" = faction-scoped (underline in faction color);
--- scope "account" = account-wide (split underline).
--- align "right" pins a tab to the RIGHT end of the bar (owner feedback 2b:
--- Help sits in a right-aligned group, mirroring the reference's Help/Settings
--- cluster). Everything else is the left group in declared order.
-local TAB_SLOTS = {
-    -- Control-panel rebuild (NEXUS PIVOT): Characters is the master/detail control
-    -- panel; scope + modifier chips live in its left chip row (ui_cards.lua). The
-    -- TIMERS TAB DISSOLVES — timer content docks in the lower-right pane region
-    -- (ui_timersdock.lua). Tabs: Characters · Instances · Help.
-    { id = "characters", label = "Characters", scope = "faction" },
-    -- Round-6: the Instances TAB dissolved into a panel on the Characters screen
-    -- (ui_instancespanel.lua) alongside the timers panel. Tabs: Characters · Help.
-    { id = "help",       label = "Help",       scope = "account" },
-}
-
+-- Round-13: the tab strip is gone (single-page dashboard); "characters" is the only
+-- registered pane and is auto-selected. RegisterTab remains the pane-builder hook.
 function Dashboard.RegisterTab(id, buildFn)
     Dashboard.tabBuilders[id] = buildFn
 end
@@ -850,22 +842,17 @@ function Dashboard.SetFaction(f)
     Dashboard.RefreshActive()
 end
 
--- Faction underline color token: faction-scoped tabs use the faction color;
--- account-wide tabs split, but we approximate with the neutral accent since the
--- flat underline is one texture (documented — a split gradient would need art).
-local FACTION_TOKEN = { Alliance = "accent", Horde = "danger" }
-
 ----------------------------------------------------------------------
--- Tab selection
+-- Pane selection (round-13: single pane — only "characters" is ever selected).
 ----------------------------------------------------------------------
 
 function Dashboard.SelectTab(id)
     if not win then return end
-    -- Build the tab pane lazily on first selection.
+    -- Build the pane lazily on first selection.
     if not Dashboard._tabPanes[id] then
         local host = CreateFrame("Frame", nil, win.tabHost)
-        -- Characters is the edge-to-edge control panel (its panes own their insets);
-        -- other screens (Instances / Help) keep a PAD inset so they don't regress.
+        -- Characters is the edge-to-edge control panel (its panes own their insets); any
+        -- future non-characters pane would keep a PAD inset so it doesn't regress.
         if id == "characters" then
             host:SetAllPoints(win.tabHost)
         else
@@ -974,54 +961,14 @@ local function buildHeader(w)
     end)
     w.settingsBtn = settingsBtn
 
-    -- Tabs, folded into the titlebar after the wordmark (left group). Each button
-    -- fills the titlebar height with an accent underline on the active tab.
-    local tabs = {}
-    local prev
-    for _, slot in ipairs(TAB_SLOTS) do
-        local b = CreateFrame("Button", nil, header)
-        b:SetHeight(HEADER_H)
-        b._id, b._scope = slot.id, slot.scope
-        local lbl = b:CreateFontString(nil, "OVERLAY")
-        lbl:SetFontObject(Dashboard.Font("body"))
-        lbl:SetPoint("CENTER", b, "CENTER", 0, 0)
-        lbl:SetText(slot.label)
-        b._label = lbl
-        b:SetWidth(math.max(48, (lbl:GetStringWidth() or 40) + 20))
-        if prev then b:SetPoint("LEFT", prev, "RIGHT", 2, 0)
-        else b:SetPoint("LEFT", wordmark, "RIGHT", 18, 0) end
-        local under = b:CreateTexture(nil, "OVERLAY")
-        under:SetHeight(2)
-        under:SetPoint("BOTTOMLEFT", b, "BOTTOMLEFT", 6, 0)
-        under:SetPoint("BOTTOMRIGHT", b, "BOTTOMRIGHT", -6, 0)
-        under:Hide()
-        b._under = under
-        b:SetScript("OnClick", function(self) Dashboard.SelectTab(self._id) end)
-        b:SetScript("OnEnter", function(self)
-            if Dashboard.activeTabId ~= self._id then self._label:SetFontObject(Dashboard.Font("accent")) end
-        end)
-        b:SetScript("OnLeave", function(self)
-            if Dashboard.activeTabId ~= self._id then self._label:SetFontObject(Dashboard.Font("body")) end
-        end)
-        tabs[#tabs + 1] = b
-        prev = b
-    end
-    w._updateTabUnderlines = function()
-        local ftok = FACTION_TOKEN[Dashboard.GetFaction()] or "accent"
-        for _, b in ipairs(tabs) do
-            local tok = (b._scope == "faction") and ftok or "accent"
-            b._under:SetColorTexture(UI.Color(tok))
-        end
-    end
-    w._updateTabButtons = function()
-        for _, b in ipairs(tabs) do
-            local active = (Dashboard.activeTabId == b._id)
-            b._under:SetShown(active)
-            b._label:SetFontObject(active and Dashboard.Font("accent") or Dashboard.Font("body"))
-        end
-    end
+    -- Round-13 (owner: single-page control panel): the Characters/Help TAB STRIP is
+    -- REMOVED. The dashboard IS the Characters page and Help moved into the Settings hub
+    -- (Settings -> Nexus -> Help), so the titlebar is just [emblem] NEXUS ... Settings ✕.
+    -- The two tab-update hooks stay as no-ops (OnShow / SelectTab / SetFaction call them).
+    w._updateTabUnderlines = function() end
+    w._updateTabButtons    = function() end
 
-    -- Titlebar bottom rule (1px) — the seam between the 44px bar and the 576 body.
+    -- Titlebar bottom rule (1px) — the seam between the titlebar and the body.
     -- Pop pass (round-4): borderLite so the seam reads like the reference's edges.
     local rule = w:CreateTexture(nil, "ARTWORK")
     rule:SetHeight(1)
@@ -1081,11 +1028,9 @@ local function ensureWindow()
 
     restoreGeom()
 
-    -- Default tab: last used within session, else 60s.
-    local st = uiState()
-    local start = st.lastTab or "characters"
-    if not Dashboard.tabBuilders[start] and start ~= "help" then start = "characters" end
-    Dashboard.SelectTab(start)
+    -- Round-13: single-page dashboard — Characters is the only pane (Help moved to the
+    -- Settings hub). Always select it.
+    Dashboard.SelectTab("characters")
 
     Dashboard.window = win
     return win
@@ -1150,95 +1095,6 @@ end, "cancel-buffs popup")
 ns:RegisterSubcommand("resetui", function() Dashboard.ResetUI() end, "reset dashboard layout")
 ns:RegisterSubcommand("reset",   function() Dashboard.ResetUI() end, "reset dashboard layout")
 
-----------------------------------------------------------------------
--- Help tab (static, our brand + our commands). Shell-owned.
-----------------------------------------------------------------------
-
--- Content uses the :Hint block path (not :Label rows). :Hint's AddBlock arrange
--- explicitly sets BOTH the block width and the label width and computes wrapped
--- height, so every line renders deterministically. The prior "Tabs" section used
--- :Label rows, whose container frame width is left unset (0) — the same
--- zero-size class the framework guards for height but not for a lone label's
--- width — which is the most likely cause of that section rendering blank. It is
--- removed here per owner feedback 2b; the remaining content stays on the robust
--- :Hint path so the blank-section class can't recur.
-Dashboard.RegisterTab("help", function(host)
-    local pane = UI.CreatePane(host)
-    local flow = pane.flow
-
-    local s = flow:AddSection("Daseeki Nexus")
-    s:Hint("Cross-account world-buff dashboard and timers for the Daseeki suite. "
-        .. "Every account that shares your mesh Channel and Token sees the same roster.")
-
-    -- ── Setup Guide (numbered, like the reference's Quick Start) ──────────────
-    -- Mesh joins on a Channel + Token PAIR (both user-set, case sensitive, no
-    -- auto-derivation) — the pair is the mesh password.
-    local g = flow:AddSection("Setup Guide")
-    g:Hint("1.  Install Daseeki Nexus on every account you want connected.")
-    g:Hint("2.  On each account, open Settings \226\134\146 Mesh & Accounts and set a unique Account ID (1\226\128\1512 digits, different on each account).")
-    g:Hint("3.  On the same Mesh & Accounts page, set the SAME Channel name (16+ letters/numbers, case sensitive) AND the SAME Token (6 letters/numbers) on every account \226\128\148 generate the credentials there, or paste a setup bundle to copy the same Channel and Token to another account.")
-    g:Hint("4.  Enable the mesh, then log out and back in once on each account \226\128\148 characters appear across your accounts within seconds.")
-    g:Hint("5.  Migrating from another world-buff addon? Run /nexus import to carry over its settings, Channel, Token and data (see Troubleshooting).")
-    g:Hint("Open Settings from the button at this window's top-right, or with /nexus settings.")
-
-    -- ── Slash commands (one per line, every user-facing subcommand) ───────────
-    local c = flow:AddSection("Slash commands")
-    c:Hint("Primary /nexus  \194\183  short /dnx  \194\183  aliases /dsn, /daseekinetwork")
-    c:Hint("/nexus toggle \226\128\148 show or hide the dashboard")
-    c:Hint("/nexus x \226\128\148 open the Cancel Buffs popup")
-    c:Hint("/nexus invite \226\128\148 invite all online characters")
-    c:Hint("/nexus resetui \226\128\148 reset the dashboard window position")
-    c:Hint("/nexus account <id> \226\128\148 show or set this account's mesh ID")
-    c:Hint("/nexus settings \226\128\148 open the Daseeki hub to Nexus settings")
-    c:Hint("/nexus import \226\128\148 import ShadowNetwork settings & data ('dry' to preview)")
-    c:Hint("/nexus help \226\128\148 full command list in chat")
-
-    -- ── Dashboard (round-12: describes TODAY'S panel UI — no Timers/Instances tabs,
-    -- no All chip, no Card/Grid toggle) ──────────────────────────────────────────
-    local db = flow:AddSection("Dashboard")
-    db:Hint("The dashboard is one panel screen. On the left is the character card list; on the right is the selected character's detail, with the Instances panel and the Timers dock beneath it.")
-    db:Hint("Filter the cards with the 60s / Online / Summoners toggles above the list; click the active toggle again to clear it (with none active, all characters show). The Alliance / Horde toggle beside them switches faction.")
-    db:Hint("Hover a card for a quick peek (location, missing buffs, last update); click it to open that character on the right.")
-    db:Hint("The Instances panel has an Instances | Exp switch: Instances shows recent lockouts and the per-account cap meters; Exp shows each character's level, XP and rested. The character dropdown filters both.")
-    db:Hint("The Timers dock (bottom-right) shows world-buff cooldowns, the Felwood songflower grid, the Darkmoon Faire estimate, and the Broadcast / Refresh buttons.")
-    db:Hint("Blacklisted characters appear struck-through on the dashboard (they are not hidden). Manage the list in Settings \226\134\146 Blacklist.")
-
-    -- ── Minimap button (round-12: corrected to minimap.lua's real bindings) ──────
-    local mm = flow:AddSection("Minimap button")
-    mm:Hint("Left-click \226\128\148 open or close the dashboard.")
-    mm:Hint("Right-click \226\128\148 open or close the dashboard.")
-    mm:Hint("Shift + Left-click \226\128\148 invite all online characters.")
-    mm:Hint("Shift + Right-click \226\128\148 open the button menu: Toggle dashboard, Invite online, Timers dock, Cancel Buffs, Felwood map, Lock button, Settings.")
-    mm:Hint("Hover \226\128\148 live Rend / Onyxia (A/H) cooldowns.")
-    mm:Hint("Drag it around the minimap ring to reposition (unless locked in Settings \226\134\146 General).")
-
-    -- ── Troubleshooting (parity item 11): Q&A adapted to our token+channel flow
-    local tr = flow:AddSection("Troubleshooting")
-    tr:Hint("Other accounts not showing? The Channel AND Token must match byte-for-byte on every account \226\128\148 both are case sensitive and together act as your mesh password. Correct any mismatch in Settings \226\134\146 Mesh & Accounts, then /reload.")
-    tr:Hint("Characters under the wrong account? Two accounts are sharing an Account ID. Give each account its own unique ID in Settings \226\134\146 Mesh & Accounts.")
-    tr:Hint("Copying settings to a new account? Set it up with the same Channel + Token, then use Send Settings to Mesh (you confirm the target account IDs first).")
-    tr:Hint("Coming from ShadowNetwork? Run /nexus import \226\128\148 it carries over your settings, Channel, Token and stored data.")
-
-    -- ── Accounts & Tombstones (parity item 19) ────────────────────────────────
-    local ac = flow:AddSection("Accounts & Tombstones")
-    ac:Hint("Deleting an account is local only \226\128\148 it hides that account on THIS client and leaves a 14-day tombstone that blocks it from re-appearing.")
-    ac:Hint("Remove a tombstone early and the account re-adds itself on its next heartbeat (while it is still meshing).")
-    ac:Hint("Changing your Account ID migrates your data locally; other accounts keep showing your OLD ID until they delete it.")
-    ac:Hint("If two accounts use the same ID you'll see an \"Account ID conflict\" warning \226\128\148 change one of them to a unique ID.")
-    ac:Hint("You can't delete your OWN account \226\128\148 change your Account ID instead.")
-
-    -- ── First-time setup (detailed) — parity item 21, at the bottom ───────────
-    local ds = flow:AddSection("First-time setup (detailed)")
-    ds:Hint("1.  Account ID \226\128\148 In Settings \226\134\146 Mesh & Accounts, give this account a short unique ID (1\226\128\1512 digits). Every connected account needs a DIFFERENT ID; this is how the mesh tells your accounts apart.")
-    ds:Hint("2.  Channel \226\128\148 On the same Mesh & Accounts page, set a Channel name of 16+ letters and numbers. It is case sensitive and must be identical on every account \226\128\148 think of it as the room your accounts meet in.")
-    ds:Hint("3.  Token \226\128\148 Set a 6-character Token (letters/numbers), also identical everywhere. Generate the credentials on the Mesh & Accounts page, or paste a setup bundle to copy the same Channel and Token to another account. The Channel + Token together are your mesh password; anyone with both can see your roster, so keep them private.")
-    ds:Hint("4.  Same faction \226\128\148 The mesh rides a hidden faction chat channel, so each account must log in a character on the SAME faction to connect. Cross-faction characters simply will not mesh.")
-    ds:Hint("5.  Enable + relog \226\128\148 Enable the mesh, then log out and back in once on each account. Your characters appear across accounts within seconds.")
-    ds:Hint("6.  Verify \226\128\148 Open the dashboard; you should see characters from your other accounts. Use the 60s / Online / Summoners filter toggles and the Alliance / Horde toggle to narrow the list, and click a character to open its detail and Notes. If not, check Troubleshooting above.")
-
-    pane:Layout()
-    return { Refresh = function() pane:Layout() end }
-end)
 
 ----------------------------------------------------------------------
 -- Self-test: class-rule aura applicability matrix (spec §5). Verifies the

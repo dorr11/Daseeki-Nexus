@@ -42,7 +42,9 @@ local MARGIN     = 8        -- window edge -> outer panels (tight left margin, i
 local GUTTER     = 10       -- base-colored gap between panels
 local CARDS_W    = 352      -- cards panel width (shifted left; right side gains room)
 local RIGHT_X    = MARGIN + CARDS_W + GUTTER   -- 370: left edge of the right cluster
-local DETAIL_H   = 282      -- detail panel height (upper right)
+local DETAIL_H   = 292      -- detail panel height (upper right); round-13: +10 to absorb
+                            -- the reclaimed header space (HEADER_H 44->34) so the right
+                            -- cluster still fills to the cards panel's bottom edge
 local BOTTOM_H   = 268      -- bottom-row panel height (instances + timers)
 local INST_W     = 364      -- instances panel width (bottom-left of the right cluster)
 
@@ -760,6 +762,15 @@ local function makeFilterSegmented(parent, pane)
         for _, b in ipairs(self._segs) do b:Apply(filter == b._key); total = total + b:GetWidth() end
         self:SetWidth(math.max(1, total))
     end
+    -- Round-13 item 1: subtle rounded corners matching the panels/cards. The segment
+    -- buttons are child frames that draw over the housing's own textures, so the corner
+    -- cover+stroke live on a CAP overlay tracking the housing at a higher frame level.
+    -- The cover (behind = "raised", the chip bar) rounds inactive AND active (accent-
+    -- filled) end segments correctly; the cap is not mouse-enabled so clicks pass through.
+    local cap = CreateFrame("Frame", nil, housing)
+    cap:SetAllPoints(housing)
+    cap:SetFrameLevel(housing:GetFrameLevel() + 10)
+    Dashboard.RoundCorners(cap, 5, "raised", "borderLite")
     return housing
 end
 
@@ -791,6 +802,14 @@ local function makeFactionSeg(parent, faction)
             self._crest:SetDesaturated(true); self._crest:SetAlpha(0.55)
         end
     end
+    -- Round-13 item 1: round only this chip's OUTER corners so the touching A|H pair
+    -- reads as one rounded pill (their shared inner edge stays square). Alliance sits on
+    -- the LEFT, Horde on the RIGHT. No child frames cover these buttons, so the corner
+    -- textures sit directly on the button (above its backdrop + crest).
+    local only = (faction == "Alliance")
+        and { TOPLEFT = true, BOTTOMLEFT = true }
+        or  { TOPRIGHT = true, BOTTOMRIGHT = true }
+    Dashboard.RoundCorners(b, 5, "raised", "borderLite", only)
     return b
 end
 

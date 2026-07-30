@@ -42,7 +42,8 @@ local COL_GAP   = 14
 local BUFF_ICON   = 16        -- row icon edge (cropped/framed)
 local BUFF_ROW_H  = 18        -- buff row height (round-4: 18 so all 10 slots fit the
 local BUFF_ROW_GAP = 2        -- shorter 284 pane — pitch 20, 10 rows = 200px)
-local BUFF_TOP    = 18        -- list top offset below the eyebrow label
+local BUFF_TOP    = 24        -- list top offset below the eyebrow label (round-13: 18->24,
+                             -- +6 breathing room under the WORLD BUFFS header, even w/ CD/RAID)
 local TILE_RIM  = "borderLite"   -- neutral held/boon icon rim (pop pass — visible edge)
 
 -- Per-buff FAMILY HUE (echoes each spell icon's dominant color, reference-style) —
@@ -441,8 +442,9 @@ function Detail.Attach(parent)
         vf:SetPoint("RIGHT", rightCol, "TOPLEFT", CD_W, y - CD_ICON / 2)
         return f, vf
     end
-    local chronoIcon, chronoVal = cdIconRow(184937, "Chronoboon Displacer", -16)
-    local hearthIcon, hearthVal = cdIconRow(6948, "Hearthstone", -37)
+    -- Round-13: +6 gap below the COOLDOWNS header (first icon -16 -> -22; pitch 21 kept).
+    local chronoIcon, chronoVal = cdIconRow(184937, "Chronoboon Displacer", -22)
+    local hearthIcon, hearthVal = cdIconRow(6948, "Hearthstone", -43)
     tag(chronoIcon, "detail.cdicon1")   -- 16px item-icon square (geometry assertion)
     D.chronoVal, D.hearthVal = chronoVal, hearthVal
     D.chronoIcon, D.hearthIcon = chronoIcon, hearthIcon
@@ -451,7 +453,8 @@ function Detail.Attach(parent)
     local raidLbl = microLabel(rightCol, "RAID LOCKOUTS")
     raidLbl:SetPoint("TOPLEFT", rightCol, "TOPLEFT", LOCK_X, 0)
     tag(raidLbl, "detail.raidlabel")
-    local tallyFS = fstr(rightCol, "numeral"); tallyFS:SetPoint("TOPLEFT", raidLbl, "BOTTOMLEFT", 0, -6)
+    -- Round-13: +6 gap below the RAID LOCKOUTS header (-6 -> -12), matching the others.
+    local tallyFS = fstr(rightCol, "numeral"); tallyFS:SetPoint("TOPLEFT", raidLbl, "BOTTOMLEFT", 0, -12)
     tallyFS:SetPoint("RIGHT", rightCol, "RIGHT", 0, 0); tallyFS:SetJustifyH("LEFT"); tallyFS:SetWordWrap(true)
     D.tallyFS = tallyFS
 
