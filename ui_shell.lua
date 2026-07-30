@@ -22,8 +22,10 @@ ns.Dashboard = Dashboard
 -- Control-panel rebuild: the window is FIXED at the mockup size (1000 x 620, no
 -- responsive reflow — pivot §10). The body is a single 576 region under a 44px
 -- titlebar (tabs live IN the titlebar; the former tab-band + status-band are gone).
-local DEFAULT_W, DEFAULT_H = 1000, 620
-local MIN_W, MIN_H = 1000, 620
+-- Round-6: grew to 1120 wide for the panel-layer layout (cards panel + detail panel +
+-- the two-panel instances/timers bottom row need the extra room to stay legible).
+local DEFAULT_W, DEFAULT_H = 1120, 620
+local MIN_W, MIN_H = 1120, 620
 local HEADER_H = 44
 local TAB_H    = 34    -- retained constant (unused by the fixed layout)
 local STATUS_H = 28    -- retained constant (status band removed)
@@ -545,8 +547,8 @@ local TAB_SLOTS = {
     -- TIMERS TAB DISSOLVES — timer content docks in the lower-right pane region
     -- (ui_timersdock.lua). Tabs: Characters · Instances · Help.
     { id = "characters", label = "Characters", scope = "faction" },
-    -- Instance-entry ledger + cap meters. Account-wide.
-    { id = "instances",  label = "Instances",  scope = "account" },
+    -- Round-6: the Instances TAB dissolved into a panel on the Characters screen
+    -- (ui_instancespanel.lua) alongside the timers panel. Tabs: Characters · Help.
     { id = "help",       label = "Help",       scope = "account" },
 }
 
@@ -800,59 +802,15 @@ local function buildHeader(w)
     closeBtn:SetScript("OnLeave", function() cx:SetFontObject(UI.fonts.body) end)
     closeBtn:SetScript("OnClick", function() w:Hide() end)
 
-    -- Faction toggle (segmented Alliance/Horde), right of the tabs, left of close.
-    local SEG_H, SEG_W = 24, 74
-    local factionSegs = {}
-    local function factionSeg(faction, label)
-        local b = CreateFrame("Button", nil, header, "BackdropTemplate")
-        b:SetSize(SEG_W, SEG_H)
-        b._faction = faction
-        local crest = b:CreateTexture(nil, "ARTWORK")
-        crest:SetSize(14, 14)
-        crest:SetPoint("LEFT", b, "LEFT", 7, 0)
-        crest:SetTexture(Dashboard.FactionCrest(faction))
-        crest:SetTexCoord(unpack(CREST_COORD))
-        b._crest = crest
-        local lbl = b:CreateFontString(nil, "OVERLAY")
-        lbl:SetFontObject(UI.fonts.small)
-        lbl:SetPoint("LEFT", crest, "RIGHT", 4, 0)
-        lbl:SetText(label)
-        b._lbl = lbl
-        b._setActive = function(self, on)
-            self:SetBackdrop(UI.FLAT_BACKDROP)
-            if on then
-                local r, g, bl = Dashboard.FactionColor(faction)
-                self:SetBackdropColor(r, g, bl, 0.85)
-                self:SetBackdropBorderColor(r, g, bl, 1)
-                self._crest:SetDesaturated(false); self._crest:SetAlpha(1)
-                self._lbl:SetTextColor(UI.Color("text"))
-            else
-                self:SetBackdropColor(UI.Color("control"))
-                self:SetBackdropBorderColor(UI.Color("controlBorder"))
-                self._crest:SetDesaturated(true); self._crest:SetAlpha(0.5)
-                self._lbl:SetTextColor(UI.Color("faint"))
-            end
-        end
-        b:SetScript("OnClick", function() Dashboard.SetFaction(faction) end)
-        UI.Skin(b, function(self) self:_setActive(Dashboard.GetFaction() == faction) end)
-        factionSegs[#factionSegs + 1] = b
-        return b
-    end
-    local segA = factionSeg("Alliance", "Alliance")
-    local segH = factionSeg("Horde", "Horde")
-    segH:SetPoint("RIGHT", closeBtn, "LEFT", -8, 0)
-    segA:SetPoint("RIGHT", segH, "LEFT", 0, 0)   -- touching halves, shared seam
-    w._updateFactionToggle = function()
-        local f = Dashboard.GetFaction()
-        for _, b in ipairs(factionSegs) do b:_setActive(b._faction == f) end
-    end
+    -- Round-6 (item B): the faction toggle MOVED OFF the titlebar into the chip bar
+    -- (it filters characters, so it lives with the filters — see ui_cards). The
+    -- titlebar right cluster is now just Settings · ✕. A no-op _updateFactionToggle is
+    -- kept so OnShow (which calls it) stays safe; the chip-bar segment repaints on
+    -- Dashboard.RefreshActive instead.
+    w._updateFactionToggle = function() end
 
-    -- Settings launcher (owner round-4: the shell rebuild dropped it — a regression).
-    -- CHOICE: a right-cluster TEXT BUTTON left of the faction toggle, NOT a tab. Settings
-    -- is an ACTION (opens the Core hub), not a dashboard pane, so a tab would be
-    -- semantically wrong and would need one built lazily; the right-cluster text button
-    -- reads as the reference's right-side Help/Settings pairing while Help stays a real
-    -- tab. Opens the Daseeki hub to the Nexus section (the old header wiring).
+    -- Settings launcher (right-cluster text button, left of ✕). Opens the Core hub to
+    -- the Nexus section. (Settings is an action, not a pane — a text button, not a tab.)
     local settingsBtn = CreateFrame("Button", nil, header)
     settingsBtn:SetHeight(HEADER_H)
     local sLbl = settingsBtn:CreateFontString(nil, "OVERLAY")
@@ -860,7 +818,7 @@ local function buildHeader(w)
     sLbl:SetPoint("CENTER", settingsBtn, "CENTER", 0, 0)
     sLbl:SetText("Settings")
     settingsBtn:SetWidth((sLbl:GetStringWidth() or 52) + 16)
-    settingsBtn:SetPoint("RIGHT", segA, "LEFT", -12, 0)
+    settingsBtn:SetPoint("RIGHT", closeBtn, "LEFT", -8, 0)
     settingsBtn:SetScript("OnEnter", function() sLbl:SetFontObject(UI.fonts.accent) end)
     settingsBtn:SetScript("OnLeave", function() sLbl:SetFontObject(UI.fonts.body) end)
     settingsBtn:SetScript("OnClick", function()

@@ -33,20 +33,28 @@ ns.Cards = Cards
 ----------------------------------------------------------------------
 -- Geometry (mockup nexus-controlpanel-notes.md — every value is law).
 ----------------------------------------------------------------------
-local COL_W      = 380      -- left column width
-local CHIP_H     = 44       -- chip bar height
+-- PANEL-LAYER geometry (owner round-6). The body is a darker BASE (window ground);
+-- each widget is a distinct RAISED panel (raised fill + borderLite edge + own padding)
+-- floating on the base with base-colored GUTTERS between panels. Window body = 1120 x
+-- 576. Layout: cards panel (left, full height) · detail panel (upper right) · the
+-- bottom row = instances panel (left) + timers panel (right).
+local MARGIN     = 8        -- window edge -> outer panels (tight left margin, item A.1)
+local GUTTER     = 10       -- base-colored gap between panels
+local CARDS_W    = 352      -- cards panel width (shifted left; right side gains room)
+local RIGHT_X    = MARGIN + CARDS_W + GUTTER   -- 370: left edge of the right cluster
+local DETAIL_H   = 282      -- detail panel height (upper right)
+local BOTTOM_H   = 268      -- bottom-row panel height (instances + timers)
+local INST_W     = 364      -- instances panel width (bottom-left of the right cluster)
+
+local CHIP_H     = 44       -- chip bar height (top of the cards panel)
 local LIST_PAD   = 12       -- card list padding
-local CARD_H     = 84       -- card height (round-4: +10 for the "Updated X ago" body line)
+local CARD_H     = 84       -- card height
 local CARD_GAP   = 6        -- gap between cards
 local CARD_PAD_H = 11       -- card horizontal padding
 local CARD_PAD_V = 9        -- card vertical padding
 local TILE       = 18       -- buff strip tile edge
 local TILE_GAP   = 3
-local CD_ICON    = 15       -- chrono/hearth cooldown icon edge (right-edge stack)
-local DETAIL_H   = 284      -- right-top detail pane height (round-4: was 316 — the
-                            -- detail reserved a hollow band; shrink it and let the
-                            -- dock take the reclaimed space so WORLD BUFF TIMERS rises).
--- dock fills the remaining 292 (576 - 284).
+local CD_ICON    = 20       -- chrono/hearth cooldown icon edge (round-6 C: 15 -> 20, padded)
 
 local STALE_AGE = 30 * 60
 
@@ -64,7 +72,18 @@ local MOD_DEFS = {
     { key = "stale",  label = "Stale",       tip = "Data older than 30 min." },
     { key = "locked", label = "Locked",      tip = "Holding at least one raid lockout." },
 }
-local MOD_CHIPS = { "online", "needs" }   -- the modifiers rendered as chips (mockup)
+local MOD_CHIPS = { "online", "needs" }   -- (round-6: retained-but-unused; see FILTER_DEFS)
+
+-- Round-6 chip model (owner teal-box): the scope/modifier chips are REPLACED by a
+-- SINGLE mutually-exclusive filter trio. Zero-or-one active; none active -> show ALL
+-- (there is no "All" chip). No counts. "Needs buffs"/"All" are gone. The ComputeView
+-- scope/modifier machinery above is retained-but-unused (kept for its headless tests
+-- and the shared predicates FilterMatch reuses).
+local FILTER_DEFS = {
+    { key = "60s",       label = "60s",       tip = "Level 60 characters." },
+    { key = "online",    label = "Online",    tip = "Currently online." },
+    { key = "summoners", label = "Summoners", tip = "Warlocks." },
+}
 
 ----------------------------------------------------------------------
 -- PURE roster logic (no UI — exercised headless by the "cards" self-test).
@@ -173,6 +192,25 @@ function Cards.ComputeView(entries, scope, mods, nowE)
         counts.mod[def.key] = n
     end
     return list, counts
+end
+
+-- Round-6 EXCLUSIVE filter (single active key, or nil = ALL). Reuses the retained
+-- scope/online predicates. Pure/headless-tested.
+--   nil         -> all characters
+--   "60s"       -> level 60+
+--   "online"    -> currently online
+--   "summoners" -> warlocks
+function Cards.FilterMatch(entry, filter)
+    if not filter then return true end
+    if filter == "online" then return entry.online and true or false end
+    if filter == "60s" then return Cards.InScope(entry, "60s") end
+    if filter == "summoners" then return Cards.InScope(entry, "summoners") end
+    return true
+end
+function Cards.FilterView(entries, filter)
+    local out = {}
+    for _, e in ipairs(entries or {}) do if Cards.FilterMatch(e, filter) then out[#out + 1] = e end end
+    return Cards.SortEntries(out)
 end
 
 -- The SELECTION state machine (pure): given the currently-visible sorted list and
@@ -339,9 +377,11 @@ local function makeCard(parent, pane)
         f:SetScript("OnLeave", function() GameTooltip:Hide() end)
         return f
     end
+    -- Round-6 C: bigger padded icons (CD_ICON 15 -> 20) with a clear 6px gap between
+    -- them so chrono + hearth read as two separate indicators.
     card.chrono = cdIcon(card)                 -- top of the stack
-    card.hearth = cdIcon(card.chrono, -2)      -- below chrono
-    local CD_COL = CARD_PAD_H + CD_ICON + 6    -- horizontal room the stack reserves
+    card.hearth = cdIcon(card.chrono, -6)      -- below chrono, clear spacing
+    local CD_COL = CARD_PAD_H + CD_ICON + 8    -- horizontal room the stack reserves
 
     -- Row 1: dot + class-colored name + account tag + optional PvP crest (inline
     -- cluster; owner round-2 item 6 — acct stays inline by the name).
@@ -381,6 +421,15 @@ local function makeCard(parent, pane)
         t.icon = ic
         card.tiles[i] = t
     end
+
+    -- Warlock SOUL-SHARD corner (owner round-6 D): a small shard icon + count in the
+    -- card's bottom-right corner, warlock cards only (right of the buff strip).
+    card.shardCount = fstr(card, "numeral", "RIGHT")
+    card.shardCount:SetPoint("BOTTOMRIGHT", card, "BOTTOMRIGHT", -CARD_PAD_H, CARD_PAD_V + 1)
+    card.shard = card:CreateTexture(nil, "ARTWORK")
+    card.shard:SetSize(14, 14); card.shard:SetTexCoord(0.08, 0.92, 0.08, 0.92)
+    card.shard:SetPoint("RIGHT", card.shardCount, "LEFT", -3, 0)
+    card.shard:Hide(); card.shardCount:Hide()
 
     card:SetScript("OnClick", function(self) if self._entry then pane._select(self._entry) end end)
 
@@ -480,23 +529,34 @@ local function makeCard(parent, pane)
             end
         end
         for i = ti + 1, #self.tiles do self.tiles[i]:Hide() end
+
+        -- Warlock soul-shard corner (round-6 D): shard icon + count, warlocks only.
+        if rec.classTag == "WARLOCK" then
+            self.shard:SetTexture(Dashboard.ItemIcon(6265, "Interface\\Icons\\INV_Misc_Gem_Amethyst_02"))
+            self.shardCount:SetText(tostring(rec.shardCount or 0))
+            self.shardCount:SetTextColor(UI.Color("muted"))
+            self.shard:Show(); self.shardCount:Show()
+        else
+            self.shard:Hide(); self.shardCount:Hide()
+        end
     end
 
     return card
 end
 
 ----------------------------------------------------------------------
--- A chip (mockup .chip). scope = single-select filled accent; modifier = accent
--- outline. Shows a live count. :Apply(active, count).
+-- A FILTER chip (round-6): part of the mutually-exclusive 60S/ONLINE/SUMMONERS trio.
+-- No count. Active = accent fill + ground label; inactive = borderLite outline + text
+-- label. Click toggles: active -> deselect (nil = ALL); else set exclusively.
 ----------------------------------------------------------------------
-local function makeChip(parent, def, kind, pane)
+local function makeFilterChip(parent, def, pane)
     local b = CreateFrame("Button", nil, parent, "BackdropTemplate")
     b:SetHeight(22)
-    b._key, b._kind = def.key, kind
-    local lbl = fstr(b, "microLabel"); lbl:SetPoint("LEFT", b, "LEFT", 9, 0)
+    b._key = def.key
+    local lbl = fstr(b, "microLabel"); lbl:SetPoint("CENTER", b, "CENTER", 0, 0)
+    lbl:SetText(def.label:upper())
     b._lbl = lbl
-    local cnt = fstr(b, "microLabel"); cnt:SetPoint("LEFT", lbl, "RIGHT", 5, 0)
-    b._cnt = cnt
+    b:SetWidth((lbl:GetStringWidth() or 30) + 18)
     b:SetScript("OnEnter", function(self)
         if not def.tip then return end
         GameTooltip:SetOwner(self, "ANCHOR_BOTTOM")
@@ -504,37 +564,49 @@ local function makeChip(parent, def, kind, pane)
     end)
     b:SetScript("OnLeave", function() GameTooltip:Hide() end)
     b:SetScript("OnClick", function()
-        if kind == "scope" then pane.scope = def.key
-        else pane.mods[def.key] = not pane.mods[def.key] end
+        pane.filter = (pane.filter == def.key) and nil or def.key   -- exclusive; re-click clears
         pane.obj.Refresh()
     end)
-    function b:Apply(active, count)
+    function b:Apply(active)
         self:SetBackdrop(UI.FLAT_BACKDROP)
-        self._lbl:SetText(def.label:upper())
-        self._cnt:SetText(count and tostring(count) or "")
-        -- Pop pass (round-4): inactive chip LABELS read at `text` (not muted); the
-        -- outline is borderLite; the count stays a tertiary `muted`.
-        if kind == "scope" then
-            if active then
-                self:SetBackdropColor(UI.Color("accent")); self:SetBackdropBorderColor(UI.Color("accent"))
-                self._lbl:SetTextColor(UI.Color("ground")); self._cnt:SetTextColor(UI.Color("ground"))
-            else
-                self:SetBackdropColor(0, 0, 0, 0); self:SetBackdropBorderColor(UI.Color("borderLite"))
-                self._lbl:SetTextColor(UI.Color("text")); self._cnt:SetTextColor(UI.Color("muted"))
-            end
+        if active then
+            self:SetBackdropColor(UI.Color("accent")); self:SetBackdropBorderColor(UI.Color("accent"))
+            self._lbl:SetTextColor(UI.Color("ground"))
         else
-            if active then
-                local ar, ag, ab = UI.Color("accent")
-                self:SetBackdropColor(ar, ag, ab, 0.18); self:SetBackdropBorderColor(UI.Color("accent"))
-                self._lbl:SetTextColor(UI.Color("accent")); self._cnt:SetTextColor(UI.Color("accent"))
-            else
-                self:SetBackdropColor(0, 0, 0, 0); self:SetBackdropBorderColor(UI.Color("borderLite"))
-                self._lbl:SetTextColor(UI.Color("text")); self._cnt:SetTextColor(UI.Color("muted"))
-            end
+            self:SetBackdropColor(0, 0, 0, 0); self:SetBackdropBorderColor(UI.Color("borderLite"))
+            self._lbl:SetTextColor(UI.Color("text"))
         end
-        -- Size to content (label + count + padding).
-        local w = (self._lbl:GetStringWidth() or 20) + (count and ((self._cnt:GetStringWidth() or 0) + 5) or 0) + 18
-        self:SetWidth(math.max(34, w))
+    end
+    return b
+end
+
+-- Compact faction A|H segment (round-6 item B: moved off the titlebar into the chip
+-- bar — it filters characters, so it lives with the filters). Crest only; active =
+-- filled faction color; inactive = borderLite outline + desaturated crest.
+local function makeFactionSeg(parent, faction)
+    local b = CreateFrame("Button", nil, parent, "BackdropTemplate")
+    b:SetSize(26, 22)
+    b._faction = faction
+    local crest = b:CreateTexture(nil, "ARTWORK")
+    crest:SetSize(14, 14); crest:SetPoint("CENTER", b, "CENTER", 0, 0)
+    crest:SetTexture(Dashboard.FactionCrest(faction))
+    crest:SetTexCoord(0.02, 0.62, 0.03, 0.63)
+    b._crest = crest
+    b:SetScript("OnClick", function() Dashboard.SetFaction(faction) end)
+    b:SetScript("OnEnter", function(self)
+        GameTooltip:SetOwner(self, "ANCHOR_BOTTOM"); GameTooltip:AddLine(faction, UI.Color("muted")); GameTooltip:Show()
+    end)
+    b:SetScript("OnLeave", function() GameTooltip:Hide() end)
+    function b:Apply(active)
+        self:SetBackdrop(UI.FLAT_BACKDROP)
+        if active then
+            local r, g, bl = Dashboard.FactionColor(faction)
+            self:SetBackdropColor(r, g, bl, 0.85); self:SetBackdropBorderColor(r, g, bl, 1)
+            self._crest:SetDesaturated(false); self._crest:SetAlpha(1)
+        else
+            self:SetBackdropColor(0, 0, 0, 0); self:SetBackdropBorderColor(UI.Color("borderLite"))
+            self._crest:SetDesaturated(true); self._crest:SetAlpha(0.55)
+        end
     end
     return b
 end
@@ -543,62 +615,60 @@ end
 -- The "characters" screen — the whole control-panel body.
 ----------------------------------------------------------------------
 Dashboard.RegisterTab("characters", function(host)
-    local pane = { scope = "all", mods = {}, _cards = {}, selected = nil, obj = {} }
+    local pane = { filter = nil, _cards = {}, selected = nil, obj = {} }
     Cards._pane = pane
 
     -- Restore persisted selection (additive, optional).
     local persisted = Dashboard.UIState and Dashboard.UIState().selectedCharacter
     if persisted and persisted ~= "" then pane.selected = persisted end
 
-    -- ── LEFT column (380) ────────────────────────────────────────────────────
-    local col = CreateFrame("Frame", nil, host)
-    col:SetPoint("TOPLEFT", host, "TOPLEFT", 0, 0)
-    col:SetPoint("BOTTOMLEFT", host, "BOTTOMLEFT", 0, 0)
-    col:SetWidth(COL_W)
-    tag(col, "cards.col")
-    pane.col = col
+    -- PANEL FACTORY: a raised, borderLite-outlined panel floating on the darker base.
+    local function makePanel(id)
+        local p = CreateFrame("Frame", nil, host, "BackdropTemplate")
+        UI.Skin(p, function(self)
+            self:SetBackdrop(UI.FLAT_BACKDROP)
+            self:SetBackdropColor(UI.Color("raised"))
+            self:SetBackdropBorderColor(UI.Color("borderLite"))
+        end)
+        tag(p, id)
+        return p
+    end
 
-    -- Vertical divider at the column's right edge (shared 1px seam @ x=380).
-    local vdiv = host:CreateTexture(nil, "OVERLAY")
-    vdiv:SetWidth(1)
-    vdiv:SetPoint("TOPLEFT", col, "TOPRIGHT", 0, 0)
-    vdiv:SetPoint("BOTTOMLEFT", col, "BOTTOMRIGHT", 0, 0)
-    UI.Skin(vdiv, function(self) self:SetColorTexture(UI.Color("borderLite")) end)
+    -- ── CARDS panel (left, full body height) ─────────────────────────────────
+    local cardsP = makePanel("cards.panel")
+    cardsP:SetPoint("TOPLEFT", host, "TOPLEFT", MARGIN, -MARGIN)
+    cardsP:SetPoint("BOTTOMLEFT", host, "BOTTOMLEFT", MARGIN, MARGIN)
+    cardsP:SetWidth(CARDS_W)
+    pane.cardsP = cardsP
 
-    -- Chip bar (44) at the top of the left column.
-    local chipbar = CreateFrame("Frame", nil, col)
-    chipbar:SetPoint("TOPLEFT", col, "TOPLEFT", 0, 0)
-    chipbar:SetPoint("TOPRIGHT", col, "TOPRIGHT", 0, 0)
+    -- Chip bar (top of the cards panel): filter trio (left) + faction A|H (right).
+    local chipbar = CreateFrame("Frame", nil, cardsP)
+    chipbar:SetPoint("TOPLEFT", cardsP, "TOPLEFT", 1, -1)
+    chipbar:SetPoint("TOPRIGHT", cardsP, "TOPRIGHT", -1, -1)
     chipbar:SetHeight(CHIP_H)
     tag(chipbar, "cards.chipbar")
     pane.chipbar = chipbar
-    local chipRule = UI.Hairline(col, { token = "borderLite" })
+    local chipRule = UI.Hairline(cardsP, { token = "borderLite" })
     chipRule:SetPoint("BOTTOMLEFT", chipbar, "BOTTOMLEFT", 0, 0)
     chipRule:SetPoint("BOTTOMRIGHT", chipbar, "BOTTOMRIGHT", 0, 0)
 
-    -- Build chips: scope singles, a divider, then modifier toggles.
-    pane._scopeChips, pane._modChips = {}, {}
-    local x = LIST_PAD
-    for _, def in ipairs(SCOPE_DEFS) do
-        local c = makeChip(chipbar, def, "scope", pane)
-        c._x = x; pane._scopeChips[def.key] = c; pane._scopeChips[#pane._scopeChips + 1] = c
+    -- Filter trio (mutually exclusive; laid out left-to-right in Refresh).
+    pane._filterChips = {}
+    for _, def in ipairs(FILTER_DEFS) do
+        pane._filterChips[#pane._filterChips + 1] = makeFilterChip(chipbar, def, pane)
     end
-    for _, key in ipairs(MOD_CHIPS) do
-        local def
-        for _, d in ipairs(MOD_DEFS) do if d.key == key then def = d end end
-        local c = makeChip(chipbar, def, "mod", pane)
-        pane._modChips[key] = c; pane._modChips[#pane._modChips + 1] = c
-    end
-    -- A small vertical divider texture between scope and modifier groups.
-    local chipSep = chipbar:CreateTexture(nil, "OVERLAY")
-    chipSep:SetSize(1, 18)
-    UI.Skin(chipSep, function(self) self:SetColorTexture(UI.Color("borderLite")) end)
-    pane._chipSep = chipSep
+    -- Faction A|H segment at the RIGHT end of the chip bar (item B).
+    local segA = makeFactionSeg(chipbar, "Alliance")
+    local segH = makeFactionSeg(chipbar, "Horde")
+    segH:SetPoint("RIGHT", chipbar, "RIGHT", -LIST_PAD, 0)
+    segA:SetPoint("RIGHT", segH, "LEFT", 0, 0)   -- touching halves
+    pane._factionSegs = { segA, segH }
+    tag(segA, "cards.faction")
 
-    -- ── Card list (scroll) ───────────────────────────────────────────────────
-    local listScroll = CreateFrame("ScrollFrame", nil, col)
-    listScroll:SetPoint("TOPLEFT", col, "TOPLEFT", LIST_PAD, -(CHIP_H + LIST_PAD))
-    listScroll:SetPoint("BOTTOMRIGHT", col, "BOTTOMRIGHT", -LIST_PAD, LIST_PAD)
+    -- Card list scroll (below the chip bar).
+    local listScroll = CreateFrame("ScrollFrame", nil, cardsP)
+    listScroll:SetPoint("TOPLEFT", cardsP, "TOPLEFT", LIST_PAD, -(CHIP_H + LIST_PAD))
+    listScroll:SetPoint("BOTTOMRIGHT", cardsP, "BOTTOMRIGHT", -LIST_PAD, LIST_PAD)
     listScroll:SetClipsChildren(true)
     listScroll:EnableMouseWheel(true)
     tag(listScroll, "cards.list")
@@ -614,30 +684,32 @@ Dashboard.RegisterTab("characters", function(host)
     emptyFS:SetText("No characters tracked."); emptyFS:Hide()
     pane._emptyFS = emptyFS
 
-    -- ── RIGHT column: detail (316, top) + dock (260, bottom) ─────────────────
-    local detailHost = CreateFrame("Frame", nil, host)
-    detailHost:SetPoint("TOPLEFT", col, "TOPRIGHT", 1, 0)
-    detailHost:SetPoint("TOPRIGHT", host, "TOPRIGHT", 0, 0)
-    detailHost:SetHeight(DETAIL_H)
-    tag(detailHost, "detail.pane")
-    pane.detailHost = detailHost
+    -- ── DETAIL panel (upper right, spans the right cluster width) ─────────────
+    local detailP = makePanel("detail.pane")
+    detailP:SetPoint("TOPLEFT", host, "TOPLEFT", RIGHT_X, -MARGIN)
+    detailP:SetPoint("TOPRIGHT", host, "TOPRIGHT", -MARGIN, -MARGIN)
+    detailP:SetHeight(DETAIL_H)
+    pane.detailHost = detailP
 
-    local dockHost = CreateFrame("Frame", nil, host)
-    dockHost:SetPoint("TOPLEFT", detailHost, "BOTTOMLEFT", 0, 0)
-    dockHost:SetPoint("BOTTOMRIGHT", host, "BOTTOMRIGHT", 0, 0)
-    tag(dockHost, "dock.pane")
-    pane.dockHost = dockHost
+    -- ── INSTANCES panel (bottom-left of the right cluster) ───────────────────
+    local instP = makePanel("instances.pane")
+    instP:SetPoint("TOPLEFT", detailP, "BOTTOMLEFT", 0, -GUTTER)
+    instP:SetWidth(INST_W)
+    instP:SetHeight(BOTTOM_H)
+    pane.instHost = instP
 
-    -- Seam hairline between detail and dock (the 1px divider).
-    local seam = UI.Hairline(host, { token = "borderLite" })
-    seam:SetPoint("TOPLEFT", detailHost, "BOTTOMLEFT", 0, 0)
-    seam:SetPoint("TOPRIGHT", detailHost, "BOTTOMRIGHT", 0, 0)
+    -- ── TIMERS panel (bottom-right of the right cluster) ─────────────────────
+    local timersP = makePanel("dock.pane")
+    timersP:SetPoint("TOPLEFT", instP, "TOPRIGHT", GUTTER, 0)
+    timersP:SetPoint("TOPRIGHT", detailP, "BOTTOMRIGHT", 0, -GUTTER)
+    timersP:SetHeight(BOTTOM_H)
+    pane.dockHost = timersP
 
-    pane.detail = ns.Detail and ns.Detail.Attach and ns.Detail.Attach(detailHost) or nil
-    pane.dock   = ns.TimersDock and ns.TimersDock.Attach and ns.TimersDock.Attach(dockHost) or nil
+    pane.detail    = ns.Detail          and ns.Detail.Attach          and ns.Detail.Attach(detailP)          or nil
+    pane.instances = ns.InstancesPanel  and ns.InstancesPanel.Attach  and ns.InstancesPanel.Attach(instP)    or nil
+    pane.dock      = ns.TimersDock       and ns.TimersDock.Attach       and ns.TimersDock.Attach(timersP)     or nil
 
     -- ── Selection ────────────────────────────────────────────────────────────
-    -- Apply a selection: persist, fire the selection event, swap the detail.
     function pane._applySelection(entry)
         pane.selected = entry and entry.nameRealm or nil
         local st = Dashboard.UIState and Dashboard.UIState()
@@ -645,7 +717,6 @@ Dashboard.RegisterTab("characters", function(host)
         ns:Fire("NEXUS_SELECT", pane.selected)
         if pane.detail then pane.detail:Show(entry) end
     end
-    -- Click handler: select + re-highlight the cards (no full regather needed).
     function pane._select(entry)
         pane._applySelection(entry)
         for _, c in ipairs(pane._cards) do
@@ -659,7 +730,7 @@ Dashboard.RegisterTab("characters", function(host)
         return c
     end
 
-    -- ── Refresh: gather → view → resolve selection → render ──────────────────
+    -- ── Refresh: gather → filter → resolve selection → render ────────────────
     function pane.obj.Refresh()
         local faction = Dashboard.GetFaction()
         local entries = Dashboard.GatherRoster(faction, { includeHomeless = true }) or {}
@@ -667,25 +738,17 @@ Dashboard.RegisterTab("characters", function(host)
             e.faction = faction
             e.isSelf = Cards.IsSelf(e.nameRealm)
         end
-        local nowE = now()
-        local list, counts = Cards.ComputeView(entries, pane.scope, pane.mods, nowE)
+        local list = Cards.FilterView(entries, pane.filter)
 
-        -- Chip states + counts.
-        for _, def in ipairs(SCOPE_DEFS) do
-            pane._scopeChips[def.key]:Apply(pane.scope == def.key, counts.scope[def.key])
-        end
-        for _, key in ipairs(MOD_CHIPS) do
-            pane._modChips[key]:Apply(pane.mods[key] and true or false, counts.mod[key])
-        end
-        -- Lay chips left-to-right (widths are content-sized in :Apply).
+        -- Filter chips: exactly the active one is filled; lay them left-to-right.
         local cx = LIST_PAD
-        for _, c in ipairs(pane._scopeChips) do
+        for _, c in ipairs(pane._filterChips) do
+            c:Apply(pane.filter == c._key)
             c:ClearAllPoints(); c:SetPoint("LEFT", chipbar, "LEFT", cx, 0); cx = cx + c:GetWidth() + 5
         end
-        pane._chipSep:ClearAllPoints(); pane._chipSep:SetPoint("LEFT", chipbar, "LEFT", cx + 1, 0); cx = cx + 8
-        for _, c in ipairs(pane._modChips) do
-            c:ClearAllPoints(); c:SetPoint("LEFT", chipbar, "LEFT", cx, 0); cx = cx + c:GetWidth() + 5
-        end
+        -- Faction segment repaint (it moved into the chip bar).
+        local f = Dashboard.GetFaction()
+        for _, s in ipairs(pane._factionSegs) do s:Apply(s._faction == f) end
 
         -- Selection follows the filter (auto-select highest / next visible).
         local resolved = Cards.ResolveSelection(list, pane.selected)
@@ -694,7 +757,6 @@ Dashboard.RegisterTab("characters", function(host)
             for _, e in ipairs(list) do if e.nameRealm == resolved then entry = e end end
             pane._applySelection(entry)
         else
-            -- Keep the detail current for the (unchanged) selection's data.
             if pane.detail and resolved then
                 for _, e in ipairs(list) do if e.nameRealm == resolved then pane.detail:Show(e); break end end
             elseif pane.detail and not resolved then
@@ -703,7 +765,7 @@ Dashboard.RegisterTab("characters", function(host)
         end
 
         -- Render the card list.
-        local W = listScroll:GetWidth(); if W < 1 then W = COL_W - 2 * LIST_PAD end
+        local W = listScroll:GetWidth(); if W < 1 then W = CARDS_W - 2 * LIST_PAD end
         listChild:SetWidth(W)
         for _, c in ipairs(pane._cards) do c:Hide() end
         local y = 0
@@ -717,8 +779,8 @@ Dashboard.RegisterTab("characters", function(host)
         listChild:SetHeight(math.max(y, 1))
         pane._emptyFS:SetShown(#list == 0)
 
-        -- Keep the dock's live world-buff readouts current on engine events too
-        -- (its own 1s ticker also drives it; this makes timer events immediate).
+        -- Keep the sibling panels current on engine events (each also self-ticks).
+        if pane.instances and pane.instances.Refresh then pane.instances.Refresh() end
         if pane.dock and pane.dock.Refresh then pane.dock.Refresh() end
     end
 
@@ -834,9 +896,32 @@ local function testSelectionMachine(fails)
     ck(Cards.ResolveSelection({}, "Bob-R") == nil, "empty view -> no selection")
     -- Filter-follows end-to-end: select Cal, then apply Online mod (Cal drops) ->
     -- ResolveSelection over the online-only view moves selection to a visible online.
-    local NOW = 1000000
-    local onlineOnly = Cards.ComputeView(list, "all", { online = true }, NOW)
+    local onlineOnly = Cards.FilterView(list, "online")
     ck(Cards.ResolveSelection(onlineOnly, "Cal-R") == "Ann-R", "Online filter drops Cal -> selection follows to Ann")
+end
+
+-- Round-6 EXCLUSIVE filter matrix (60s/online/summoners; none = all).
+local function testFilter(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local entries = {
+        mkEntry("Aaa-R", "1", { class = "WARLOCK", online = true,  level = 60 }),
+        mkEntry("Bbb-R", "1", { class = "MAGE",    online = false, level = 60 }),
+        mkEntry("Ccc-R", "2", { class = "WARLOCK", online = false, level = 50 }),
+    }
+    ck(Cards.FilterMatch(entries[1], nil) == true, "nil filter -> all match")
+    ck(Cards.FilterMatch(entries[1], "online") == true, "online: online char matches")
+    ck(Cards.FilterMatch(entries[2], "online") == false, "online: offline char excluded")
+    ck(Cards.FilterMatch(entries[3], "60s") == false, "60s: level 50 excluded")
+    ck(Cards.FilterMatch(entries[1], "60s") == true, "60s: level 60 matches")
+    ck(Cards.FilterMatch(entries[1], "summoners") == true, "summoners: warlock matches")
+    ck(Cards.FilterMatch(entries[2], "summoners") == false, "summoners: mage excluded")
+    -- FilterView: none active -> ALL; each key filters exclusively; result is sorted.
+    ck(#Cards.FilterView(entries, nil) == 3, "no filter -> all 3 (deselect-to-all)")
+    ck(#Cards.FilterView(entries, "online") == 1, "online -> 1")
+    ck(#Cards.FilterView(entries, "summoners") == 2, "summoners -> 2 warlocks")
+    ck(#Cards.FilterView(entries, "60s") == 2, "60s -> 2 level-60s")
+    local sorted = Cards.FilterView(entries, nil)
+    ck(sorted[1].nameRealm == "Aaa-R", "FilterView returns SortEntries order (online acct1 first)")
 end
 
 local function testSlotState(fails)
@@ -917,6 +1002,7 @@ if ns.RegisterSelfTest then
     ns:RegisterSelfTest("cards", function(verbose)
         local cases = {
             { name = "roster logic",      fn = testCardsLogic },
+            { name = "exclusive filter",  fn = testFilter },
             { name = "selection machine", fn = testSelectionMachine },
             { name = "slot state",        fn = testSlotState },
             { name = "strip tile style",  fn = testStripStyle },

@@ -28,8 +28,8 @@ import.lua
 ui_shell.lua
 ui_detail.lua
 ui_timersdock.lua
+ui_instancespanel.lua
 ui_cards.lua
-ui_tab_instances.lua
 hud.lua
 pins.lua
 minimap.lua
