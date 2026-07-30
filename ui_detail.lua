@@ -218,6 +218,19 @@ function Detail.Resolve(nameRealm)
     return nil
 end
 
+-- Resolve an item's inventory-icon texture through the shared ns.Dashboard.ItemIcon
+-- path. ROUND-5 HOTFIX: the COOLDOWNS icon paint used a BARE `Dashboard` global, which
+-- is nil in this file (the convention is ns.Dashboard / Dash()); it parsed clean but
+-- crashed at first render. This wrapper is ns-guarded and returns a question-mark
+-- fallback if the engine is somehow absent, so the icon paint can never crash. Exposed
+-- so the headless suite can exercise the path (a bare global would fail the assertion).
+local QUESTION_ICON = "Interface\\Icons\\INV_Misc_QuestionMark"
+function Detail.ItemIconTex(itemID)
+    local D = ns.Dashboard
+    if D and D.ItemIcon then return D.ItemIcon(itemID) or QUESTION_ICON end
+    return QUESTION_ICON
+end
+
 -- ════════════════════════════════════════════════════════════════════════════
 --  FRAME BUILD + INSTANT SWAP  (in-game only; UI is non-nil there)
 -- ════════════════════════════════════════════════════════════════════════════
@@ -410,7 +423,7 @@ function Detail.Attach(parent)
         ic:SetPoint("TOPLEFT", f, "TOPLEFT", 1, -1)
         ic:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", -1, 1)
         ic:SetTexCoord(0.08, 0.92, 0.08, 0.92)
-        ic:SetTexture(Dashboard.ItemIcon(itemID))
+        ic:SetTexture(Detail.ItemIconTex(itemID))
         f.icon = ic
         f._name = fullName
         f:EnableMouse(true)
@@ -711,6 +724,21 @@ local function testColorFns(fails)
     ns.Store.GetSettings = savedGS
 end
 
+-- The COOLDOWNS item-icon path must route through ns.Dashboard (round-5 hotfix guard).
+-- A BARE `Dashboard` global would ignore this stub and crash on the nil global — exactly
+-- the render bug (ui_detail:413). Exercising the wrapper headless catches that class.
+local function testItemIconTex(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local savedD = ns.Dashboard
+    ns.Dashboard = { ItemIcon = function(id) return "TEX:" .. tostring(id) end }
+    local t = Detail.ItemIconTex(184937)
+    ck(t == "TEX:184937", "ItemIconTex must route through ns.Dashboard.ItemIcon (got " .. tostring(t) .. ")")
+    ns.Dashboard = {}   -- engine absent -> non-empty fallback texture, never nil/crash
+    local f = Detail.ItemIconTex(6948)
+    ck(type(f) == "string" and f ~= "", "ItemIconTex must return a fallback texture when ItemIcon absent")
+    ns.Dashboard = savedD
+end
+
 if ns.RegisterSelfTest then
     ns:RegisterSelfTest("detail", function(verbose)
         local cases = {
@@ -720,6 +748,7 @@ if ns.RegisterSelfTest then
             { name = "raid tally",          fn = testRaidTally },
             { name = "row status",          fn = testRowStatus },
             { name = "color fns (rgb)",     fn = testColorFns },
+            { name = "item icon path",      fn = testItemIconTex },
         }
         local allPass = true
         for _, c in ipairs(cases) do
