@@ -122,11 +122,23 @@ local function defaultFactionBlock()
             defaultsApplied   = false,       -- one-time seeding guard
         },
         autoSummon = {
+            -- Master toggle. The spec defaults this ON; the OWNER chose to ship
+            -- it OFF ("seed the triggers, but don't auto-accept until I say so").
+            -- The trigger set below is still seeded so that flipping this one
+            -- checkbox gives the full spec'd behaviour with no further setup.
             enabled        = false,
             alwaysAccept   = false,
             freshBuffWindow = 19,            -- seconds; accept if a buff is <19s old
-            triggers       = {},             -- ["buffKey"] = true
+            -- Left EMPTY here on purpose, exactly like auraOpts.thresholds: the
+            -- seven spec'd ON triggers are installed once by
+            -- Store.SeedAutoSummonDefaults under the `defaultsApplied` guard
+            -- below. If they lived in this tree, applyDefaults would resurrect
+            -- every trigger the owner unchecked on the next login (the options
+            -- UI writes an unchecked box as nil, so "off" IS absence here).
+            triggers       = {},             -- ["triggerKey"] = true
             dropOnTaxiPvp  = true,
+            -- Sticky one-time seeding guard, mirroring auraOpts.defaultsApplied.
+            defaultsApplied = false,
         },
         autoGossip = {
             dmt = false,                     -- Dire Maul tribute guard
@@ -182,9 +194,14 @@ end
 local function buildFactionSettings()
     local alliance = defaultFactionBlock()
     local horde    = defaultFactionBlock()
-    -- Horde threshold overrides: Rend/Warchief's is a Horde-native buff,
-    -- so the default fresh-buff window is tightened for summon gating.
-    horde.autoSummon.freshBuffWindow = 15
+    -- NOTE: a previous build tightened the Horde fresh-buff window to 15 s with
+    -- the rationale "Rend/Warchief's is a Horde-native buff". That override has
+    -- no basis in the spec -- SN §13 quotes a flat "fresh-buff window: 19
+    -- seconds" for both factions, and the Horde/Alliance split covers aura
+    -- THRESHOLDS only (see AURA_THRESHOLD_SEEDS). The override is removed so a
+    -- fresh install matches the spec on both sides. This is fresh-install only:
+    -- applyDefaults never overwrites a key that already exists, so an existing
+    -- Horde SavedVariables file keeps whatever window it already stored.
     return { Alliance = alliance, Horde = horde }
 end
 
@@ -337,6 +354,91 @@ function Store.SeedAuraDefaults(db)
                 end
             end
             ao.defaultsApplied = true
+        end
+    end
+end
+
+----------------------------------------------------------------------
+-- Auto-summon TRIGGER seeds (spec §13)
+--
+-- Spec §13: "Per-slot buff triggers decide what counts as a fresh buff.
+--   Defaults ON:  DMF, Ony, Songflower, ZG, Rend, Battle Shout, FFF.
+--   Defaults OFF: DMT AP, DMT SP, DMT STAM."
+--
+-- KEY NAMESPACE WARNING: the trigger keys are NOT the aura/threshold keys used
+-- by AURA_THRESHOLD_SEEDS. The authoritative catalog is
+-- Auto.SUMMON_TRIGGER_BUFFS (auto.lua), which names them after the buff's aura
+-- rather than its source, and import.lua maps the SN positional slots onto the
+-- same names. The mapping is:
+--     DMF          -> "dmf"
+--     Ony          -> "dragonslayer"   (Rallying Cry of the Dragonslayer)
+--     ZG           -> "zandalar"       (Spirit of Zandalar)
+--     Songflower   -> "songflower"
+--     Rend         -> "warchief"       (Warchief's Blessing)
+--     Battle Shout -> "battleShout"
+--     FFF          -> "fff"            (seasonal)
+--     DMT AP/STAM/SP -> "fengus" / "moldar" / "slipkik"   <- deliberately NOT seeded
+--
+-- Only the seven ON triggers are listed. The three DMT triggers are seeded by
+-- OMISSION, not by an explicit `false`, because absence IS "off" throughout this
+-- feature: options.lua writes an unchecked box as `triggers[key] = nil`, and
+-- auto.lua tests `triggers[key]` for truthiness. Writing `false` would produce a
+-- row the UI can never reproduce, so the seeded table is byte-identical to what
+-- an owner would get by ticking those seven boxes by hand.
+----------------------------------------------------------------------
+
+Store.SUMMON_TRIGGER_SEEDS = {
+    "dmf", "dragonslayer", "zandalar", "songflower",
+    "warchief", "battleShout", "fff",
+}
+
+-- Spec §13 fresh-buff window, in seconds. Seeded only when the key is ABSENT;
+-- the defaults tree already carries it for both factions, so in practice this
+-- only rescues a hand-edited or partially-migrated SavedVariables file.
+Store.SUMMON_FRESH_WINDOW_SEED = 19
+
+----------------------------------------------------------------------
+-- One-time seeding of the auto-summon trigger set.
+--
+-- Same contract as Store.SeedAuraDefaults -- ADDITIVE ONLY, and sticky. Per
+-- faction:
+--   * `autoSummon.defaultsApplied` already true -> do nothing at all. This is
+--     what keeps an unchecked trigger unchecked forever.
+--   * triggers table completely empty -> install the seven spec'd ON triggers.
+--     Non-empty (the owner has already ticked or unticked something) -> left
+--     EXACTLY as-is; we never merge into a table the owner has touched.
+--   * freshBuffWindow absent -> install 19. An existing value is never touched.
+--   * Then stamp defaultsApplied = true so this never runs again.
+--
+-- DELIBERATELY DOES NOT TOUCH `enabled`. The owner's decision for this batch is
+-- "seeds without enable": the trigger set ships pre-checked so the feature is
+-- one click away, but auto-accept itself stays OFF until the owner turns it on.
+-- A fresh install must therefore show seven ticked Buff Triggers AND an unticked
+-- "Auto-accept summon".
+--
+-- Nothing is ever deleted or rewritten, so this satisfies the release-safety
+-- rule against destructive SavedVariables migrations. Safe to call repeatedly.
+----------------------------------------------------------------------
+
+function Store.SeedAutoSummonDefaults(db)
+    if type(db) ~= "table" then return end
+    local fsAll = db.factionSettings
+    if type(fsAll) ~= "table" then return end
+
+    for _, faction in ipairs({ "Alliance", "Horde" }) do
+        local fs = fsAll[faction]
+        local as = type(fs) == "table" and fs.autoSummon or nil
+        if type(as) == "table" and not as.defaultsApplied then
+            if type(as.triggers) ~= "table" then as.triggers = {} end
+            if next(as.triggers) == nil then
+                for _, key in ipairs(Store.SUMMON_TRIGGER_SEEDS) do
+                    as.triggers[key] = true
+                end
+            end
+            if as.freshBuffWindow == nil then
+                as.freshBuffWindow = Store.SUMMON_FRESH_WINDOW_SEED
+            end
+            as.defaultsApplied = true
         end
     end
 end
@@ -733,6 +835,12 @@ function Store.Init()
     -- applyDefaults so factionSettings/auraOpts is guaranteed to exist, and
     -- self-disables via auraOpts.defaultsApplied (never re-seeds).
     Store.SeedAuraDefaults(DaseekiNexusDB)
+
+    -- One-time, additive install of the seven spec'd auto-summon buff triggers
+    -- (spec §13). Same ordering constraint as SeedAuraDefaults -- must run AFTER
+    -- applyDefaults so factionSettings/autoSummon exists -- and self-disables via
+    -- autoSummon.defaultsApplied. Does NOT enable auto-accept (owner decision).
+    Store.SeedAutoSummonDefaults(DaseekiNexusDB)
 
     -- Data SV
     if type(DaseekiNexusData) ~= "table" then
@@ -1889,6 +1997,107 @@ local function testAuraSeeds(fails)
     end
 end
 
+-- Auto-summon trigger seeds (spec §13). Mirrors testAuraSeeds: the sticky-flag
+-- contract is what keeps an unchecked trigger unchecked, so it is tested the
+-- same five ways (fresh / sticky / pre-flagged / legacy-edited / robustness).
+local function testAutoSummonSeeds(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+
+    local ON  = { "dmf", "dragonslayer", "zandalar", "songflower",
+                  "warchief", "battleShout", "fff" }
+    local OFF = { "fengus", "moldar", "slipkik" }
+
+    ------------------------------------------------------------------
+    -- 1. Fresh store: the seven ON triggers land, the three DMT stay absent.
+    ------------------------------------------------------------------
+    local db = { factionSettings = buildFactionSettings() }
+    local A0 = db.factionSettings.Alliance.autoSummon
+    ck(next(A0.triggers) == nil, "pre-seed: triggers ship empty")
+    ck(A0.defaultsApplied == false, "pre-seed: autoSummon.defaultsApplied is false")
+    ck(A0.enabled == false, "pre-seed: auto-accept ships OFF")
+
+    Store.SeedAutoSummonDefaults(db)
+    local A = db.factionSettings.Alliance.autoSummon
+    local H = db.factionSettings.Horde.autoSummon
+
+    for _, f in ipairs({ { "Alliance", A }, { "Horde", H } }) do
+        local name, as = f[1], f[2]
+        local n = 0
+        for _ in pairs(as.triggers) do n = n + 1 end
+        ck(n == 7, name .. ": exactly 7 triggers seeded (got " .. n .. ")")
+        for _, k in ipairs(ON) do
+            ck(as.triggers[k] == true, name .. ": trigger " .. k .. " seeded ON")
+        end
+        -- OFF is ABSENCE, not an explicit false -- the options UI writes nil for
+        -- an unchecked box, so a `false` here would be a row it can never make.
+        for _, k in ipairs(OFF) do
+            ck(as.triggers[k] == nil, name .. ": DMT trigger " .. k .. " absent (off)")
+        end
+        ck(as.freshBuffWindow == 19, name .. ": freshBuffWindow is the spec's 19s")
+        ck(as.defaultsApplied == true, name .. ": defaultsApplied stamped")
+        -- OWNER DECISION: seeds without enable.
+        ck(as.enabled == false, name .. ": auto-accept still OFF after seeding")
+    end
+
+    ------------------------------------------------------------------
+    -- 2. Sticky flag: an unchecked trigger is NOT resurrected by a re-seed.
+    ------------------------------------------------------------------
+    A.triggers.dmf = nil                      -- owner unticks DMF
+    Store.SeedAutoSummonDefaults(db)
+    ck(A.triggers.dmf == nil, "unticked trigger stays unticked across a re-seed")
+    ck(A.triggers.ony == nil, "re-seed did not invent a non-catalog key")
+    A.freshBuffWindow = 30                    -- owner retunes the window
+    Store.SeedAutoSummonDefaults(db)
+    ck(A.freshBuffWindow == 30, "owner's freshBuffWindow survives a re-seed")
+
+    ------------------------------------------------------------------
+    -- 3. Pre-populated DB with the flag already set -> seeding skipped whole.
+    ------------------------------------------------------------------
+    local db2 = { factionSettings = buildFactionSettings() }
+    local A2 = db2.factionSettings.Alliance.autoSummon
+    A2.defaultsApplied = true
+    Store.SeedAutoSummonDefaults(db2)
+    ck(next(A2.triggers) == nil, "flag already set -> triggers left empty")
+
+    ------------------------------------------------------------------
+    -- 4. Legacy DB (no flag) the owner already configured -> left EXACTLY as-is.
+    ------------------------------------------------------------------
+    local db3 = { factionSettings = buildFactionSettings() }
+    local A3 = db3.factionSettings.Alliance.autoSummon
+    A3.triggers = { slipkik = true }          -- an owner-built set, DMT-only
+    Store.SeedAutoSummonDefaults(db3)
+    ck(A3.triggers.slipkik == true, "legacy edited: owner's trigger kept")
+    ck(A3.triggers.dmf == nil, "legacy edited: no merge into a touched table")
+    ck(A3.defaultsApplied == true, "legacy edited: flag stamped so it never re-runs")
+    ck(db3.factionSettings.Horde.autoSummon.triggers.dmf == true,
+        "legacy edited: the untouched faction still seeds normally")
+
+    ------------------------------------------------------------------
+    -- 5. Robustness: bad input must not throw.
+    ------------------------------------------------------------------
+    Store.SeedAutoSummonDefaults(nil)
+    Store.SeedAutoSummonDefaults({})
+    Store.SeedAutoSummonDefaults({ factionSettings = "nope" })
+    Store.SeedAutoSummonDefaults({ factionSettings = { Alliance = {} } })
+    ck(true, "SeedAutoSummonDefaults survives malformed input")
+
+    ------------------------------------------------------------------
+    -- 6. Trigger keys must exist in auto.lua's authoritative catalog. This is
+    --    the guard that would have caught seeding the AURA keys (ony/zg/rend)
+    --    instead of the trigger keys (dragonslayer/zandalar/warchief).
+    ------------------------------------------------------------------
+    if ns.Auto and type(ns.Auto.SUMMON_TRIGGER_BUFFS) == "table" then
+        local known = {}
+        for _, d in ipairs(ns.Auto.SUMMON_TRIGGER_BUFFS) do known[d.key] = true end
+        for _, k in ipairs(Store.SUMMON_TRIGGER_SEEDS) do
+            ck(known[k] == true, "seed key '" .. k .. "' exists in Auto.SUMMON_TRIGGER_BUFFS")
+        end
+        local nCat = 0
+        for _ in pairs(known) do nCat = nCat + 1 end
+        ck(nCat == 10, "catalog still has 10 triggers (7 seeded on + 3 DMT off)")
+    end
+end
+
 local function testSongflowerMigration(fails)
     local function ck(c, m) if not c then fails[#fails + 1] = m end end
     -- Stored old defaults are rewritten to the accurate values.
@@ -2093,6 +2302,7 @@ function Store.RunSelfTests(verbose)
         { name = "defaults",        fn = testDefaults },
         { name = "alert migration", fn = testAlertMigration },
         { name = "aura seeds",      fn = testAuraSeeds },
+        { name = "autosummon seeds", fn = testAutoSummonSeeds },
         { name = "songflower migration", fn = testSongflowerMigration },
         { name = "notes",           fn = testNotes },
         { name = "inbound name guard", fn = testInboundNameGuard },

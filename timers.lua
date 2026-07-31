@@ -1035,12 +1035,38 @@ local function creditPullLand(prefix, landTime)
 end
 Timers._creditPullLand = creditPullLand
 
+-- Is a boonable buff appearing right now a chronoboon RESTORE rather than a
+-- genuine fresh pickup? Spec §13: "a booned -> live transition is NEVER fresh,
+-- and boonable slots gaining during the 3 s unboon window are excluded."
+--
+-- tracker.lua owns the window (it stamps Tracker._unboonUntil on the unboon
+-- cast and exposes Tracker.InUnboonWindow). Called with NO argument on purpose:
+-- the window is stamped in FRAME time (GetTime), whereas timers' now() is the
+-- server epoch, so we let the tracker read its own clock.
+--
+-- Fully guarded: tracker.lua loads before timers.lua in the .toc, but headless
+-- and partial loads may not have it, and a missing tracker must read as "not in
+-- an unboon window" (i.e. behave exactly as before this gate existed).
+local function inUnboonWindow()
+    local T = ns.Tracker
+    if not (T and T.InUnboonWindow) then return false end
+    local ok, res = pcall(T.InUnboonWindow)
+    return (ok and res) and true or false
+end
+Timers._inUnboonWindow = inUnboonWindow
+
 -- UNIT_AURA handler: on a player aura change, if any pull is pending, scan the
 -- player's buffs for a landed pull aura and credit its calibration. Cheap no-op
 -- when nothing is pending. Uses the proven C_UnitAuras surface.
 local function onPlayerAura(event, unit)
     if unit and unit ~= "player" then return end
     if next(Timers._pendingPull) == nil then return end
+    -- Unboon restore: the aura reappears looking exactly like a real drop, so
+    -- crediting it would poison the observed pull-window median with a ~0 s
+    -- sample (and, once the BUFF_GAIN seam is fed, fire a bogus "gained" alert).
+    -- We return WITHOUT consuming _pendingPull, so a genuine landing that
+    -- follows the window still calibrates normally.
+    if inUnboonWindow() then return end
     if not (C_UnitAuras and C_UnitAuras.GetBuffDataByIndex) then return end
     local landTime = now()
     for i = 1, 40 do
@@ -1054,6 +1080,7 @@ local function onPlayerAura(event, unit)
         end
     end
 end
+Timers._onPlayerAura = onPlayerAura   -- exposed so the unboon gate is testable
 
 ----------------------------------------------------------------------
 -- NWB type-string mapping (shared by the NWB ingest opcodes)
@@ -3947,6 +3974,77 @@ local function testPullWindows(fails)
     resetObs(); clearOverride(); Timers._pendingPull = {}; Timers.state = {}
 end
 
+-- Chronoboon unboon gate (spec §13): a buff RESTORED by an unboon reappears on
+-- the player looking exactly like a genuine drop. Crediting it would book a
+-- garbage yell->land sample and (once the BUFF_GAIN seam is fed) fire a false
+-- "gained" alert. tracker.lua owns the 3 s window; timers.lua only consumes it,
+-- and must behave exactly as before whenever the tracker is missing or broken.
+local function testUnboonGate(fails)
+    local savedTracker = ns.Tracker
+    local savedAuras   = C_UnitAuras
+    local savedPending = Timers._pendingPull
+
+    -- Minimal aura scanner: the player is showing Warchief's Blessing (-> rend).
+    _G.C_UnitAuras = { GetBuffDataByIndex = function(unit, i)
+        if unit == "player" and i == 1 then return { name = "Warchief's Blessing" } end
+        return nil
+    end }
+
+    local function armPending()
+        Timers._pendingPull = {}
+        Timers._setPendingPull("rend", 1000, 2)
+    end
+
+    -- (a) Headless / partial load: no Tracker at all must read as "not in a
+    --     window" and leave the pre-existing crediting behaviour untouched.
+    ns.Tracker = nil
+    tcheck(Timers._inUnboonWindow() == false,
+        "unboon gate: an absent Tracker reads as not-in-window", fails)
+    armPending()
+    Timers._onPlayerAura("UNIT_AURA", "player")
+    tcheck(Timers._pendingPull.rend == nil,
+        "unboon gate: without a Tracker a land still credits", fails)
+
+    -- (b) Window OPEN: the gain is a restore, so nothing is credited...
+    ns.Tracker = { InUnboonWindow = function() return true end }
+    tcheck(Timers._inUnboonWindow() == true, "unboon gate: an open window reads true", fails)
+    armPending()
+    Timers._onPlayerAura("UNIT_AURA", "player")
+    tcheck(Timers._pendingPull.rend ~= nil,
+        "an unboon restore does not credit a pull observation", fails)
+
+    -- ...and crucially the pending is NOT consumed, so the genuine land that
+    -- follows the window still calibrates normally.
+    ns.Tracker = { InUnboonWindow = function() return false end }
+    Timers._onPlayerAura("UNIT_AURA", "player")
+    tcheck(Timers._pendingPull.rend == nil,
+        "the pending survives the window and credits on the real land", fails)
+
+    -- (c) Window CLOSED: ordinary crediting.
+    armPending()
+    Timers._onPlayerAura("UNIT_AURA", "player")
+    tcheck(Timers._pendingPull.rend == nil,
+        "outside the window a land credits normally", fails)
+
+    -- (d) A throwing Tracker must not take the aura handler down with it.
+    ns.Tracker = { InUnboonWindow = function() error("boom") end }
+    tcheck(Timers._inUnboonWindow() == false,
+        "unboon gate: a throwing Tracker reads as not-in-window", fails)
+    armPending()
+    tcheck(pcall(Timers._onPlayerAura, "UNIT_AURA", "player"),
+        "a throwing Tracker does not break the aura handler", fails)
+
+    -- (e) The gate did not disturb the existing non-player short-circuit.
+    ns.Tracker = { InUnboonWindow = function() return false end }
+    armPending()
+    Timers._onPlayerAura("UNIT_AURA", "target")
+    tcheck(Timers._pendingPull.rend ~= nil, "a non-player UNIT_AURA is still ignored", fails)
+
+    ns.Tracker          = savedTracker
+    _G.C_UnitAuras      = savedAuras
+    Timers._pendingPull = savedPending or {}
+end
+
 function Timers.RunSelfTests(verbose)
     local suites = {
         { name = "cd derivation",     fn = testCDDerivation },
@@ -3959,6 +4057,7 @@ function Timers.RunSelfTests(verbose)
         { name = "other-player songflower", fn = testOtherSongflower },
         { name = "pull recency gate", fn = testPullRecencyGate },
         { name = "pull windows + drift", fn = testPullWindows },
+        { name = "unboon gate",       fn = testUnboonGate },
         { name = "trust upgrade",     fn = testTrustUpgrade },
         { name = "trust ordering",    fn = testTrustOrdering },
         { name = "request cooldowns", fn = testRequestCooldowns },

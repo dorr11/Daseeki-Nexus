@@ -1493,6 +1493,29 @@ local function buildAuras(flow)
         register("auras", function() if nBox.Refresh then nBox.Refresh() end; if mBox.Refresh then mBox.Refresh() end end)
     end
 
+    -- ── Darkmoon Faire cooldown announcement ─────────────────────────────────
+    -- Sits directly under the threshold table so it reads with the DMF row at
+    -- the top of it. Wires the existing DaseekiNexusDB.dmfPushAnnounce, which
+    -- tracker.lua reads through Tracker.DMFPushAnnounceEnabled when the debuff
+    -- bar pushes the hidden DMF cooldown aura off (spec §5 / A8.4).
+    --
+    -- DEFAULT ON, and ABSENT counts as ON -- so the getter must test `~= false`,
+    -- NOT plain truthiness, or an older SavedVariables file with no key would
+    -- render an unticked box while the engine happily announced. The setter
+    -- writes a real boolean, which also settles the key for good.
+    --
+    -- Account-wide, unlike everything else on this page; the hint says so.
+    local dmfSec = flow:AddSection("Darkmoon Faire")
+    local dmfRow = dmfSec:AddRow({ vAlign = "center" })
+    register("auras", dmfRow:Checkbox({
+        label = "Announce DMF cooldown clear in chat",
+        get = function() local db = DB(); return db and db.dmfPushAnnounce ~= false end,
+        set = function(v) local db = DB(); if db then db.dmfPushAnnounce = v and true or false end end,
+    }).Refresh)
+    dmfSec:Hint("When the debuff bar pushes the hidden DMF cooldown off, say so in SAY, "
+        .. "and in RAID or PARTY when grouped, so everyone knows their fortune is back up. "
+        .. "This setting is account-wide.")
+
     -- ── Rend / Battle Shout class rules (cycling buttons) ─────────────────────
     buildClassRuleGrid(flow, "Rend — Required Classes", "rend", REND_CLASSES)
     buildClassRuleGrid(flow, "Battle Shout — Required Classes", "battleShout", BS_CLASSES)
