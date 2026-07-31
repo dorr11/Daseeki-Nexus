@@ -1256,9 +1256,22 @@ end
 -- is repeated at the transport edge. It is deliberately keyed on
 -- (content hash, target set) so it can never withhold state from a peer that
 -- was not in the previous send.
+-- A9.1 ENCODE BOUNDARY. protocol.lua carries two u16 REMAINING-SECONDS fields
+-- and is frozen; the record carries START EPOCHS. Convert here, on a SHALLOW
+-- COPY, so the number on the wire is the remaining as of the moment of
+-- transmission — not as of the last capture — and the live Store record is never
+-- mutated by the act of sending. See the drift analysis in store.lua.
+function Mesh.WireRecord(rec, t)
+    if type(rec) ~= "table" then return rec end
+    local out = {}
+    for k, v in pairs(rec) do out[k] = v end
+    if Store and Store.WireItemCd then Store.WireItemCd(out, t or now()) end
+    return out
+end
+
 function Mesh.PushState(nameRealm, record, force)
     if not Mesh.IsEnabled() then return end
-    local payload = Protocol.EncodeCharacter(record)
+    local payload = Protocol.EncodeCharacter(Mesh.WireRecord(record, now()))
     if not payload then return end   -- nothing encodable (nil/foreign record)
     local ids = onlinePeerIDs()
     -- A10.9: adapt the direct-send budget to the live token count.
@@ -1496,12 +1509,22 @@ local function handleSyncReq(f, sender)
     end
 end
 
+-- B4 — manifest adoption + GHOST CLEANUP (spec §9.7).
+--
+-- Manifests used to be purely advisory here: we noted the peer and threw the
+-- list away, so the only way a character ever left our roster was the norole
+-- eviction cap. An alt deleted or renamed on another account therefore lingered
+-- FOREVER — nothing on the wire says "this character is gone" except its absence
+-- from a newer manifest.
+--
+-- All of the "is this allowed" logic (self-immunity, tombstones, unknown
+-- account, unsynced segment, strictly-newer epoch, per-record out-of-order
+-- protection) lives in Store.AdoptManifest so it is testable without a mesh.
 local function handleManifest(f, sender)
-    -- Manifests are advisory here: the authoritative merge happens as segment
-    -- character records arrive (owner-wins + epoch gate in the store). We keep
-    -- the hook so a future wave can pre-diff before pulling full segments.
     local man = Mesh.Unpack(f.payload)
-    if man and man.aid then Mesh.NotePeer(man.aid, sender, now()) end
+    if not man or not man.aid then return end
+    Mesh.NotePeer(man.aid, sender, now())
+    Store.AdoptManifest(man.aid, man.area, man.list, man.epoch, man.hash)
 end
 
 local function handleSegment(f, sender)
@@ -2518,7 +2541,9 @@ function Mesh.LogoutFlush()
     local rec = Store.GetCharacter and Store.GetCharacter(nameRealm)
     if not rec then return end
     local t = now()
-    local payload = Protocol.EncodeCharacter(Mesh.LogoutRecord(rec, t))
+    -- A9.1: LogoutRecord already shallow-copies; WireRecord copies again and
+    -- stamps the send-time remaining onto the frozen u16 fields.
+    local payload = Protocol.EncodeCharacter(Mesh.WireRecord(Mesh.LogoutRecord(rec, t), t))
     if not payload then return end
 
     -- Order peers by most-recently-seen first.
@@ -3562,6 +3587,142 @@ local function testChannelGating()
     return true
 end
 
+----------------------------------------------------------------------
+-- A9.1 — the wire boundary, end to end through the REAL binary codec.
+--
+-- protocol.lua is frozen: two u16 REMAINING-SECONDS fields, SCHEMA_VERSION
+-- untouched. This proves the epoch model survives that round trip, that the
+-- drift is exactly the transit delay, and that nothing about the frame changed.
+----------------------------------------------------------------------
+local function testItemCdWireBoundary()
+    local T = 1785000500
+
+    local live = Store.NewCharacterRecord("Daseeki-Faerlina")
+    live.level, live.faction = 60, "Horde"
+    live.lastSeen, live.lastDataUpdate, live.ownerEpoch = T, T, T
+    live.hearthstoneCDStart = T - 1200          -- 40 min in: 2400 left
+    live.chronoboonCDStart  = T - 3000          -- 50 min in:  600 left
+    live.hearthstoneCD, live.itemCooldown = 0, 0   -- mirrors deliberately stale
+
+    -- ENCODE at T+300, i.e. 5 minutes after the last capture.
+    local SEND = T + 300
+    local wire = Mesh.WireRecord(live, SEND)
+    if live.hearthstoneCD ~= 0 or live.itemCooldown ~= 0 then
+        return false, "WireRecord mutated the live Store record"
+    end
+    if wire.hearthstoneCD ~= 2100 then
+        return false, "encode: hearth remaining not computed at SEND time (" .. tostring(wire.hearthstoneCD) .. ")"
+    end
+    if wire.itemCooldown ~= 300 then
+        return false, "encode: chrono remaining not computed at SEND time (" .. tostring(wire.itemCooldown) .. ")"
+    end
+
+    local bytes = Protocol.EncodeCharacter(wire)
+    if not bytes then return false, "wire record failed to encode" end
+    local dec = Protocol.DecodeCharacter(bytes)
+    if not dec then return false, "wire record failed to decode" end
+    if dec.hearthstoneCD ~= 2100 or dec.itemCooldown ~= 300 then
+        return false, "the u16 remaining fields did not survive the real codec"
+    end
+
+    -- DECODE with 4 s of transit. Store.WriteInboundCharacter is the real entry
+    -- point; call the conversion it performs directly at a controlled clock.
+    local RECV = SEND + 4
+    Store.AdoptWireCooldowns(dec, RECV)
+    if dec.hearthstoneCDStart ~= (T - 1200) + 4 then
+        return false, "decode: reconstructed epoch is not late by exactly the transit delay"
+    end
+    -- The reconstructed countdown reads HIGH by the transit delay, and by
+    -- nothing else — no clock skew can enter, because neither side trusts the
+    -- other's epoch, only the duration arithmetic.
+    local drift = Store.ItemCdRemaining(dec, "hearthstone", SEND) - 2100
+    if drift ~= 4 then
+        return false, "drift is not bounded by transit (" .. tostring(drift) .. "s)"
+    end
+    -- And it does not accumulate: the next push re-anchors from the owner again.
+    local wire2 = Mesh.WireRecord(live, SEND + 600)
+    local dec2 = Protocol.DecodeCharacter(Protocol.EncodeCharacter(wire2))
+    Store.AdoptWireCooldowns(dec2, SEND + 600 + 4)
+    if dec2.hearthstoneCDStart ~= (T - 1200) + 4 then
+        return false, "drift accumulated across pushes"
+    end
+
+    -- A peer running the OLD build sends only the mirrors (no epoch fields at
+    -- all) — it must still land as a usable local epoch.
+    local oldPeer = { nameRealm = "Old-Realm", hearthstoneCD = 1800, itemCooldown = 0,
+                      lastSeen = T, lastDataUpdate = T, ownerEpoch = T, level = 60 }
+    local decOld = Protocol.DecodeCharacter(Protocol.EncodeCharacter(oldPeer))
+    Store.AdoptWireCooldowns(decOld, T)
+    if decOld.hearthstoneCDStart ~= T - 1800 then
+        return false, "an old-build peer's remaining did not convert to an epoch"
+    end
+
+    -- A record with no cooldown at all round-trips as no cooldown.
+    local idle = Store.NewCharacterRecord("Idle-Realm")
+    idle.level, idle.lastSeen, idle.lastDataUpdate, idle.ownerEpoch = 60, T, T, T
+    local decIdle = Protocol.DecodeCharacter(Protocol.EncodeCharacter(Mesh.WireRecord(idle, T)))
+    Store.AdoptWireCooldowns(decIdle, T)
+    if decIdle.hearthstoneCDStart ~= 0 or decIdle.hearthstoneCD ~= 0 then
+        return false, "an idle record invented a cooldown at the boundary"
+    end
+
+    -- The SCHEMA is untouched: same version byte, same field order, same length
+    -- for the same content.
+    if Protocol.SCHEMA_VERSION ~= string.byte(bytes, 1) then
+        return false, "encoded schema version byte does not match Protocol.SCHEMA_VERSION"
+    end
+    return true
+end
+
+----------------------------------------------------------------------
+-- B4 — the manifest actually reaches the store's ghost cleanup.
+-- (The rule matrix itself is tested in store.lua; this is the wiring.)
+----------------------------------------------------------------------
+local function testManifestWiring()
+    local T = 1785000500
+    local savedAccounts = Store.data.accounts
+    local savedDeleted  = Store.data.deletedAIDs
+    local savedPeers    = Store.data and Mesh.peers
+    local savedLog      = Store._ghostLog
+    Store._ghostLog = {}
+    Mesh.peers = {}
+    Store.data.deletedAIDs = {}
+    Store.data.accounts = {
+        ["9"] = { isSelf = false,
+                  characters = { ["Keeper-R"] = { level = 60, ownerEpoch = T - 100 },
+                                 ["Ghost-R"]  = { level = 60, ownerEpoch = T - 100 } },
+                  segments = { sixties = {}, summoners = {}, norole = {} },
+                  segmentHashes = { sixties = { epoch = T - 1000 } },
+                  homeless = {} },
+    }
+
+    local payload = Mesh.Pack({ aid = "9", area = "sixties", list = { "Keeper-R" },
+                                hash = "deadbeef", epoch = T })
+    if not payload then
+        Store.data.accounts, Store.data.deletedAIDs = savedAccounts, savedDeleted
+        Mesh.peers, Store._ghostLog = savedPeers, savedLog
+        return false, "manifest payload failed to pack"
+    end
+    local frame = Mesh.BuildFrame(Mesh.OP.MANIFEST, payload, {})
+    local okCall, err = pcall(Mesh.Dispatch, Protocol.PREFIX.SYNC, frame, "Peer-Realm")
+
+    local chars = Store.data.accounts["9"].characters
+    local gone  = (chars["Ghost-R"] == nil)
+    local kept  = (chars["Keeper-R"] ~= nil)
+    local epoch = Store.data.accounts["9"].segmentHashes.sixties.epoch
+    local logged = #Store._ghostLog
+
+    Store.data.accounts, Store.data.deletedAIDs = savedAccounts, savedDeleted
+    Mesh.peers, Store._ghostLog = savedPeers, savedLog
+
+    if not okCall then return false, "manifest dispatch errored: " .. tostring(err) end
+    if not gone then return false, "a received manifest did not ghost-clean the absent character" end
+    if not kept then return false, "a received manifest deleted a character it names" end
+    if epoch ~= T then return false, "the received manifest epoch was not stored" end
+    if logged ~= 1 then return false, "the deletion was not written to the debug log" end
+    return true
+end
+
 -- Account-ID conflict detection (item 18).
 local function testAccountConflict()
     local savedAID, savedSelf = ns.GetAccountID, Mesh.IsSelfSender
@@ -4255,6 +4416,8 @@ function Mesh.RunSelfTests(verbose)
         { name = "join notice throttle", fn = testJoinNoticeThrottle },
         { name = "channel gating",   fn = testChannelGating },
         { name = "account conflict", fn = testAccountConflict },
+        { name = "item cd wire boundary (A9.1)", fn = testItemCdWireBoundary },
+        { name = "manifest ghost cleanup wiring (B4)", fn = testManifestWiring },
     }
     local allPass, results = true, {}
     for _, t in ipairs(suite) do

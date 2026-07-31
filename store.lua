@@ -65,6 +65,64 @@ Store.CLASS_ORDER = {
 }
 
 ----------------------------------------------------------------------
+-- A9.1 — ITEM COOLDOWNS ARE START EPOCHS
+--
+-- Spec §6: "Remaining is always derived as 3600 - (now - stored start epoch)".
+-- We used to store REMAINING SECONDS, which is only as good as the last capture:
+-- Store.WriteSelfCharacter re-stamps lastDataUpdate on EVERY capture, and the UI
+-- decays the stored remaining against that stamp — so on the live character the
+-- elapsed term is always ~0 and the countdown never moves, while a capture that
+-- failed to read C_Container wrote 0 and the cooldown vanished. Both failure
+-- modes disappear once the record carries WHEN the cooldown started.
+--
+-- Field model (ADDITIVE — see the SavedVariables note below):
+--     hearthstone  epoch rec.hearthstoneCDStart   legacy mirror rec.hearthstoneCD
+--     chronoboon   epoch rec.chronoboonCDStart    legacy mirror rec.itemCooldown
+-- chronoboonCDStart already existed (A7.2 stamped it on a successful boon cast);
+-- this unifies BOTH items onto that one model.
+--
+-- SAVEDVARIABLES / CHANGELOG NOTE ------------------------------------------
+-- The two legacy remaining-seconds fields are STILL WRITTEN on every capture and
+-- still carried on the wire. They are the compatibility surface for
+--   (a) the u16 wire fields (protocol.lua is frozen — no SCHEMA_VERSION bump),
+--   (b) any record written by an older client that has not been re-captured yet,
+--   (c) Mesh.StateHashInput, which coarsens them by 300s.
+-- Keep them for ONE RELEASE CYCLE, then delete the mirrors, drop the legacy
+-- branch of Store.ItemCdRemaining, and convert the wire fields at the boundary
+-- only (Store.WireItemCd / Store.AdoptWireCooldowns already isolate that).
+----------------------------------------------------------------------
+
+-- Both tracked item cooldowns are 60 minutes in Classic Era.
+local ITEM_CD_HEARTHSTONE = 3600
+local ITEM_CD_CHRONOBOON  = 3600
+
+-- Spec §6 sanity gates on any API-derived cooldown, shared by every writer.
+Store.ITEM_CD_GCD_MAX   = 1.5    -- duration <= this is the global cooldown, not an item CD
+Store.ITEM_CD_ABSURD    = 7200   -- duration > this is loading-screen garbage
+Store.ITEM_CD_SKEW      = 5      -- epoch acceptance window: [now - duration - 5, now + 5]
+-- An API-derived start epoch only DISPLACES a stored one when it is newer by
+-- more than this. Re-reading a live cooldown reproduces the same start ±1s of
+-- rounding; without the margin that jitter would creep the stamp forward and
+-- silently extend the cooldown. A real re-use (or the instance-kick reset the
+-- spec calls out) moves the start by minutes, so it always clears the bar.
+Store.ITEM_CD_RESET_SLACK = 2
+
+-- which -> { epoch field, legacy remaining-seconds field, duration }
+local ITEM_CD = {
+    hearthstone = { epoch = "hearthstoneCDStart", legacy = "hearthstoneCD", duration = ITEM_CD_HEARTHSTONE },
+    chronoboon  = { epoch = "chronoboonCDStart",  legacy = "itemCooldown",  duration = ITEM_CD_CHRONOBOON },
+}
+Store.ITEM_CD_KEYS = { "hearthstone", "chronoboon" }
+Store.ITEM_CD_DURATION = {
+    hearthstone = ITEM_CD_HEARTHSTONE,
+    chronoboon  = ITEM_CD_CHRONOBOON,
+}
+
+local U16_MAX = 65535
+
+function Store.ItemCdSpec(which) return ITEM_CD[which] end
+
+----------------------------------------------------------------------
 -- Time helpers
 ----------------------------------------------------------------------
 
@@ -933,6 +991,13 @@ function Store.OnLogin()
     Store.WeeklyResetSweep()
     Store.SweepOrphanBucket()
     Store.SweepOfflineDMF()
+    -- A9.1: one-time, additive synthesis of item-cooldown START EPOCHS from the
+    -- legacy remaining-seconds fields already in SavedVariables. Runs before the
+    -- first capture so an alt parked mid-hearthstone keeps a truthful countdown
+    -- across the relog instead of freezing at its last captured value.
+    Store.MigrateItemCdEpochsAll()
+    -- B4 (sender side): publishable manifest membership for our own account.
+    Store.RebuildSelfSegments()
     -- Wave N5: one-time import of legacy Bags cross-account data, then a
     -- retention sweep over the suite-namespace store.
     Store.MigrateBags()
@@ -1006,15 +1071,22 @@ function Store.NewCharacterRecord(nameRealm)
         pvpExpiry       = 0,       -- epoch when the flag drops (0 = none)
         chronoboonActive = false,
         chronoboonLastSeen = 0,
-        chronoboonCDStart = 0,     -- A7.2: epoch of the last successful BOON CAST.
-                                   -- Authoritative source for the chronoboon item
-                                   -- cooldown; the bag API is only a fallback.
+        chronoboonCDStart = 0,     -- A9.1/A7.2: START EPOCH of the chronoboon item
+                                   -- cooldown. Written by the successful BOON CAST
+                                   -- (authoritative) or derived from the bag API
+                                   -- (fallback). 0 = no cooldown.
         boonCount       = 0,
         shardCount      = 0,       -- warlock soul shards
         soulstoneReady  = false,   -- warlock: a soulstone is available (item in bags
                                    -- and/or Create Soulstone off cooldown) — item 6
-        itemCooldown    = 0,       -- remaining seconds on the tracked trinket/item
-        hearthstoneCD   = 0,       -- remaining seconds
+        hearthstoneCDStart = 0,    -- A9.1: START EPOCH of the hearthstone cooldown
+                                   -- (0 = none). Remaining is always DERIVED.
+        -- A9.1 LEGACY MIRRORS — remaining seconds, recomputed from the epochs on
+        -- every capture and at the wire boundary. Kept for one release cycle so
+        -- the frozen u16 wire fields and older records keep working; see the
+        -- SavedVariables/CHANGELOG note at the top of this file.
+        itemCooldown    = 0,       -- chronoboon item CD, remaining seconds (mirror)
+        hearthstoneCD   = 0,       -- hearthstone CD, remaining seconds  (mirror)
         dmfInBoon       = false,   -- the Darkmoon fortune is stashed IN the boon.
                                    -- A8: this is now literally "in boon" (it used
                                    -- to mean "holds a fortune, live or booned"),
@@ -1085,6 +1157,9 @@ function Store.WriteSelfCharacter(nameRealm, record)
     record.lastDataUpdate = serverNow()
     if record.lastSeen == 0 then record.lastSeen = record.lastDataUpdate end
     bucket.characters[nameRealm] = record
+    -- B4 (sender side): keep our own manifest membership honest. Cheap — it only
+    -- rewrites (and only bumps the segment epoch) when membership really moved.
+    Store.RebuildSelfSegments(record.lastDataUpdate)
     return record
 end
 
@@ -1128,6 +1203,12 @@ function Store.WriteInboundCharacter(aid, nameRealm, record, senderAID)
     if Store.IsSelfAccount(aid) then
         return false   -- never overwrite our own data from the wire
     end
+    -- A9.1 DECODE BOUNDARY. Every inbound record — binary STATE frames (u16
+    -- remaining) and whole-table SEGMENT records alike — funnels through here, so
+    -- this is the single place the wire's remaining-seconds become a LOCAL epoch.
+    -- Done before the epoch guard on purpose: `record` is a decoded temporary,
+    -- and converting a record we then reject costs nothing.
+    Store.AdoptWireCooldowns(record, serverNow())
     local bucket = Store.GetAccount(aid, true)
     if not bucket then return false end
     local existing = bucket.characters[nameRealm]
@@ -1156,6 +1237,461 @@ function Store.WriteInboundCharacter(aid, nameRealm, record, senderAID)
     record._srcAID = senderAID
     bucket.characters[nameRealm] = record
     return true
+end
+
+----------------------------------------------------------------------
+-- A9.1 — the shared item-cooldown epoch helpers
+--
+-- EVERY writer and EVERY reader goes through this block: the tracker's capture,
+-- the boon-cast stamp, the mesh wire boundary in both directions, the SV
+-- migration, the cards, the detail pane. There is exactly one place that knows
+-- how a stored epoch becomes a countdown.
+----------------------------------------------------------------------
+
+-- PURE. Is `epoch` a believable START for a cooldown of `duration` at `nowE`?
+-- Spec §6: "a converted epoch is only accepted if it falls in [now-3605, now+5]"
+-- — i.e. no further back than one full cooldown (plus the skew allowance) and no
+-- more than the skew allowance into the future.
+function Store.ItemCdEpochSane(epoch, nowE, duration)
+    epoch = tonumber(epoch) or 0
+    if epoch <= 0 then return false end
+    nowE = tonumber(nowE) or serverNow()
+    duration = tonumber(duration) or ITEM_CD_HEARTHSTONE
+    local slack = Store.ITEM_CD_SKEW
+    return epoch >= (nowE - duration - slack) and epoch <= (nowE + slack)
+end
+
+-- PURE. Turn a REMAINING-SECONDS reading taken at `atE` into a start epoch.
+-- Returns 0 when the remaining is not a usable cooldown (<=0, or larger than the
+-- cooldown itself / the absurd-duration gate — both are garbage readings).
+function Store.ItemCdEpochFromRemaining(remaining, atE, duration)
+    remaining = tonumber(remaining) or 0
+    duration  = tonumber(duration) or ITEM_CD_HEARTHSTONE
+    if remaining <= 0 then return 0 end
+    if remaining > duration or remaining > Store.ITEM_CD_ABSURD then return 0 end
+    return (tonumber(atE) or serverNow()) - (duration - remaining)
+end
+
+-- PURE. Seconds remaining on `which` cooldown for `rec`, at `nowE`.
+--
+-- WHO OWNS THE RECORD is decided by whether the epoch FIELD EXISTS, not by
+-- whether it is non-zero. Any record this release has touched carries a number
+-- there (Store.NewCharacterRecord seeds 0, every writer stamps one), and for
+-- those the epoch is the ONLY truth — a zero means "no cooldown", full stop.
+-- Only a record from before this release, which has no such field at all, falls
+-- back to the legacy mirror. Without that rule an expired epoch healed to 0
+-- would fall through and let a stale mirror resurrect the countdown.
+--
+--   epoch field, sane value -> duration - (now - epoch)         [the model]
+--   epoch field, 0/insane   -> 0                                [self-healing]
+--   NO epoch field          -> legacy remaining decayed against rec.lastDataUpdate
+--                              (and a legacy value above the cooldown with no
+--                              usable reference heals to 0 — spec §6)
+-- The legacy branch exists only for records written before this release (and for
+-- records produced by import.lua, which carry the remainings and no epochs); it
+-- is deleted along with the mirrors one cycle from now.
+function Store.ItemCdRemaining(rec, which, nowE)
+    local spec = ITEM_CD[which]
+    if type(rec) ~= "table" or not spec then return 0 end
+    nowE = tonumber(nowE) or serverNow()
+
+    if rec[spec.epoch] ~= nil then
+        local epoch = tonumber(rec[spec.epoch]) or 0
+        if epoch <= 0 then return 0 end
+        if not Store.ItemCdEpochSane(epoch, nowE, spec.duration) then return 0 end
+        local rem = spec.duration - (nowE - epoch)
+        if rem <= 0 then return 0 end
+        if rem > spec.duration then rem = spec.duration end
+        return math.floor(rem)
+    end
+
+    local legacy = tonumber(rec[spec.legacy]) or 0
+    if legacy <= 0 then return 0 end
+    local ref = tonumber(rec.lastDataUpdate) or 0
+    if ref <= 0 then
+        -- No reference epoch at all: a value above the cooldown is unhealable
+        -- garbage (the "9000-minute" shape), anything else freezes as-is.
+        if legacy > spec.duration then return 0 end
+        return math.floor(legacy)
+    end
+    local elapsed = nowE - ref
+    if elapsed < 0 then elapsed = 0 end
+    local rem = legacy - elapsed
+    if rem <= 0 then return 0 end
+    return math.floor(rem)
+end
+
+-- Recompute the legacy remaining-seconds mirror for one cooldown from its epoch.
+-- Clamped to the u16 range the wire uses. Returns the value written.
+function Store.RefreshItemCdMirror(rec, which, nowE)
+    local spec = ITEM_CD[which]
+    if type(rec) ~= "table" or not spec then return 0 end
+    local rem = Store.ItemCdRemaining(rec, which, nowE)
+    if rem > U16_MAX then rem = U16_MAX end
+    rec[spec.legacy] = rem
+    return rem
+end
+
+-- Recompute BOTH mirrors. Called at the end of every capture and at the encode
+-- boundary, so the legacy fields (and therefore the wire, and the state hash)
+-- always agree with the epochs.
+function Store.RefreshItemCdMirrors(rec, nowE)
+    if type(rec) ~= "table" then return rec end
+    nowE = tonumber(nowE) or serverNow()
+    for i = 1, #Store.ITEM_CD_KEYS do
+        Store.RefreshItemCdMirror(rec, Store.ITEM_CD_KEYS[i], nowE)
+    end
+    return rec
+end
+
+-- Write a start epoch, subject to the acceptance window. Returns true on write.
+-- `force` skips the "must be newer than what we hold" rule; the boon cast and
+-- the migration use it, the bag-API fallback does not (spec §6: the API is
+-- accepted "when no cooldown is stored, or when the API's derived start epoch is
+-- newer than the stored one — the instance-kick reset case").
+function Store.ItemCdSetStart(rec, which, epoch, nowE, force)
+    local spec = ITEM_CD[which]
+    if type(rec) ~= "table" or not spec then return false end
+    nowE = tonumber(nowE) or serverNow()
+    epoch = tonumber(epoch) or 0
+    if epoch <= 0 then return false end
+    if not Store.ItemCdEpochSane(epoch, nowE, spec.duration) then return false end
+    if not force then
+        local held = tonumber(rec[spec.epoch]) or 0
+        if held > 0 and Store.ItemCdEpochSane(held, nowE, spec.duration) then
+            if epoch <= held + Store.ITEM_CD_RESET_SLACK then return false end
+        end
+    end
+    rec[spec.epoch] = epoch
+    Store.RefreshItemCdMirror(rec, which, nowE)
+    return true
+end
+
+-- Clear a cooldown (both the epoch and its mirror).
+function Store.ItemCdClear(rec, which)
+    local spec = ITEM_CD[which]
+    if type(rec) ~= "table" or not spec then return end
+    rec[spec.epoch] = 0
+    rec[spec.legacy] = 0
+end
+
+-- Drop an epoch that has fully elapsed or fallen outside the sane window, so a
+-- stale stamp cannot linger in SavedVariables forever. Returns true if it healed
+-- something. (The READER is pure and already reads 0 for these; this is the
+-- write-side sweep the tracker runs on capture.)
+function Store.HealItemCdEpochs(rec, nowE)
+    if type(rec) ~= "table" then return false end
+    nowE = tonumber(nowE) or serverNow()
+    local healed = false
+    for i = 1, #Store.ITEM_CD_KEYS do
+        local which = Store.ITEM_CD_KEYS[i]
+        local spec  = ITEM_CD[which]
+        local epoch = tonumber(rec[spec.epoch]) or 0
+        if epoch > 0 and not Store.ItemCdEpochSane(epoch, nowE, spec.duration) then
+            -- Clear the mirror alongside the epoch: leaving a stale remaining
+            -- behind is exactly how a healed cooldown came back from the dead.
+            Store.ItemCdClear(rec, which)
+            healed = true
+        end
+    end
+    return healed
+end
+
+-- MIGRATION (spec: additive, on first capture). A record written by an older
+-- client carries only the remaining-seconds mirrors. Synthesize the epoch once:
+--     start = reference - (duration - remaining)
+-- where the reference is rec.lastDataUpdate (the epoch the remaining was read
+-- at) or, when that is missing, `nowE` — which FREEZES the countdown at its
+-- stored value rather than back-dating it by an unknown offline stretch.
+-- Never touches a record that already carries an epoch. Returns true if it wrote.
+function Store.MigrateItemCdEpochs(rec, nowE)
+    if type(rec) ~= "table" then return false end
+    nowE = tonumber(nowE) or serverNow()
+    local wrote = false
+    for i = 1, #Store.ITEM_CD_KEYS do
+        local which = Store.ITEM_CD_KEYS[i]
+        local spec  = ITEM_CD[which]
+        local epoch = tonumber(rec[spec.epoch]) or 0
+        if epoch <= 0 then
+            local legacy = tonumber(rec[spec.legacy]) or 0
+            local synth = 0
+            if legacy > 0 then
+                local ref = tonumber(rec.lastDataUpdate) or 0
+                if ref <= 0 or ref > nowE then ref = nowE end
+                synth = Store.ItemCdEpochFromRemaining(legacy, ref, spec.duration)
+                if not Store.ItemCdEpochSane(synth, nowE, spec.duration) then
+                    -- Unhealable legacy garbage (the >3600-with-no-reference case).
+                    synth = 0
+                    rec[spec.legacy] = 0
+                end
+            end
+            -- Always STAMP the field, even with 0: that is what promotes the
+            -- record to the epoch model so the legacy branch stops being used.
+            rec[spec.epoch] = synth
+            if synth > 0 then wrote = true end
+        end
+    end
+    if wrote then Store.RefreshItemCdMirrors(rec, nowE) end
+    return wrote
+end
+
+----------------------------------------------------------------------
+-- A9.1 — THE WIRE BOUNDARY
+--
+-- protocol.lua is FROZEN: it carries two u16 REMAINING-SECONDS fields and no
+-- SCHEMA_VERSION bump is permitted. So the epoch model is converted at the edge.
+--
+-- ENCODE (Store.WireItemCd, via Mesh.WireRecord): recompute the mirrors from the
+-- epochs at SEND time, so the number that goes out is the remaining as of the
+-- moment of transmission rather than the moment of the last capture.
+--
+-- DECODE (Store.AdoptWireCooldowns, called from Store.WriteInboundCharacter):
+-- convert the received remaining straight back into a LOCAL epoch,
+--     epoch = receiveTime - (duration - remaining)
+-- and from then on the countdown ticks locally against OUR clock forever.
+--
+-- DRIFT CHARACTERISTICS
+--   * The only error introduced is the send->receive transit: the remaining was
+--     true at send time and is re-anchored at receive time, so the reconstructed
+--     epoch is LATE by exactly that delay and the countdown reads HIGH by it.
+--     That is bounded by the scheduler's whisper latency (token bucket: capacity
+--     8, refill 1/s) plus network — seconds, not minutes — and it never
+--     accumulates: each subsequent push re-anchors from the owner's own epoch.
+--   * NO cross-machine clock skew enters the value. Both sides do pure duration
+--     arithmetic; the sender's epoch is never trusted. This is the strict
+--     improvement over today, where the receiver decayed the stored remaining
+--     against rec.lastDataUpdate — the SENDER's clock — so any skew between the
+--     two machines landed directly in the displayed countdown, unbounded.
+--   * A record that stops being refreshed now keeps counting down correctly
+--     instead of freezing (self) or decaying off a stale stamp (remote).
+--   * u16 clamp: both cooldowns are 3600s, far inside 65535, so the clamp never
+--     bites in practice and is kept only as a wire-safety net.
+----------------------------------------------------------------------
+
+-- ENCODE side. Refreshes the mirrors on the record handed to the encoder.
+function Store.WireItemCd(rec, nowE)
+    return Store.RefreshItemCdMirrors(rec, nowE)
+end
+
+-- DECODE side. Re-anchor the received remaining-seconds onto our own clock.
+-- A record that already carries a sane epoch (a peer running this release that
+-- sent a full record over the SEGMENT path, where tables travel whole) keeps it.
+function Store.AdoptWireCooldowns(rec, nowE)
+    if type(rec) ~= "table" then return rec end
+    nowE = tonumber(nowE) or serverNow()
+    for i = 1, #Store.ITEM_CD_KEYS do
+        local which = Store.ITEM_CD_KEYS[i]
+        local spec  = ITEM_CD[which]
+        local held  = tonumber(rec[spec.epoch]) or 0
+        if held > 0 and Store.ItemCdEpochSane(held, nowE, spec.duration) then
+            -- keep the owner's own epoch (segment path)
+        else
+            local rem = tonumber(rec[spec.legacy]) or 0
+            local synth = Store.ItemCdEpochFromRemaining(rem, nowE, spec.duration)
+            rec[spec.epoch] = Store.ItemCdEpochSane(synth, nowE, spec.duration) and synth or 0
+        end
+    end
+    Store.RefreshItemCdMirrors(rec, nowE)
+    return rec
+end
+
+-- One-time SavedVariables sweep: synthesize epochs for every character record we
+-- already hold (our own alts and every cached peer character), so a relog does
+-- not have to wait for each of them to be re-captured or re-pushed. Sticky —
+-- `Store.data.itemCdEpochsMigrated` stops it re-running. Returns the count.
+function Store.MigrateItemCdEpochsAll(nowE)
+    local data = Store.data
+    if type(data) ~= "table" then return 0 end
+    if data.itemCdEpochsMigrated then return 0 end
+    nowE = tonumber(nowE) or serverNow()
+    local n = 0
+    for _, bucket in pairs(data.accounts or {}) do
+        for _, tbl in pairs({ bucket.characters, bucket.homeless }) do
+            for _, rec in pairs(tbl or {}) do
+                if Store.MigrateItemCdEpochs(rec, nowE) then n = n + 1 end
+            end
+        end
+    end
+    data.itemCdEpochsMigrated = true
+    return n
+end
+
+----------------------------------------------------------------------
+-- B4 — MANIFEST ADOPTION + GHOST CLEANUP
+--
+-- Spec §9.7: "a remote manifest is applied only when its epoch is strictly newer
+-- than the locally stored one for that segment. On adoption the addon performs
+-- ghost cleanup — any local character classified into that segment but absent
+-- from the new manifest is deleted, PROVIDED ITS OWN DATA EPOCH IS <= THE
+-- MANIFEST EPOCH. Homeless characters named by the new manifest are adopted."
+--
+-- Without this, an alt you delete or rename on one account lingers on every
+-- other account's roster forever — there is no other delete signal on the wire.
+--
+-- The guards, all of which are tested:
+--   * NEVER our own account (self-immunity; our roster is authoritative locally)
+--   * NEVER a tombstoned account (spec §1.3: silently rejected on EVERY inbound
+--     path, manifest included)
+--   * NEVER an account we hold no bucket for (nothing to clean, and creating one
+--     from a manifest would resurrect a purged account)
+--   * only the SYNCED segments (spec §3.1: norole is local + opportunistic and
+--     is never manifest-driven, so it must never be ghost-cleaned)
+--   * stale/equal manifest epoch -> no adoption at all
+--   * a record whose own ownerEpoch is NEWER than the manifest survives: it is
+--     out-of-order delivery (the character was re-created / re-classified after
+--     that manifest was cut), not a ghost.
+----------------------------------------------------------------------
+
+local SYNCED_SEGMENTS = { sixties = true, summoners = true }
+Store.SYNCED_SEGMENTS = SYNCED_SEGMENTS
+
+-- PURE. Which segment a record belongs to (spec §3.1).
+function Store.SegmentFor(rec)
+    if type(rec) ~= "table" then return "norole" end
+    local lvl = tonumber(rec.level) or 0
+    if lvl == 60 then return "sixties" end
+    if rec.classTag == "WARLOCK" and lvl >= 20 then return "summoners" end
+    return "norole"
+end
+
+Store.GHOST_LOG_CAP = 20
+Store._ghostLog = {}          -- newest-first ring, surfaced by /dsn debug mesh
+
+local function ghostLog(msg)
+    local ring = Store._ghostLog
+    table.insert(ring, 1, { at = serverNow(), text = msg })
+    while #ring > Store.GHOST_LOG_CAP do table.remove(ring) end
+    if ns and ns.Print then ns:Print("|cffffc020" .. msg .. "|r") end
+end
+Store._ghostLogWrite = ghostLog
+
+-- Adopt a remote manifest for (aid, area) and ghost-clean the segment.
+-- `list` is the ordered Name-Realm list ("X" = tombstone slot), `epoch` the
+-- manifest epoch, `hash` the sender's advertised segment hash (stored as-is;
+-- the local hash is always recomputed live from characters at send time).
+--
+-- Returns applied(boolean), info(table) where info is
+--   { reason = <why not applied>, deleted = {names}, adopted = {names} }.
+function Store.AdoptManifest(aid, area, list, epoch, hash)
+    local info = { deleted = {}, adopted = {} }
+    if aid == nil or aid == "" then info.reason = "no-aid"; return false, info end
+    if type(area) ~= "string" or not SYNCED_SEGMENTS[area] then
+        info.reason = "unsynced-area"; return false, info
+    end
+    if type(list) ~= "table" then info.reason = "no-list"; return false, info end
+    if Store.IsSelfAccount(aid) then info.reason = "self"; return false, info end
+    if Store.IsTombstoned(aid) then info.reason = "tombstoned"; return false, info end
+
+    local bucket = Store.GetAccount(aid, false)
+    if not bucket then info.reason = "unknown-account"; return false, info end
+
+    epoch = tonumber(epoch) or 0
+    local held = bucket.segmentHashes[area]
+    local heldEpoch = (held and tonumber(held.epoch)) or 0
+    if epoch <= 0 or epoch <= heldEpoch then
+        info.reason = "stale-epoch"; return false, info
+    end
+
+    -- Named set from the manifest ("X" slots are tombstones, not names).
+    local named = {}
+    for i = 1, #list do
+        local nameRealm = list[i]
+        if type(nameRealm) == "string" and nameRealm ~= "" and nameRealm ~= "X" then
+            named[nameRealm] = true
+        end
+    end
+
+    -- (1) GHOST CLEANUP.
+    local doomed = {}
+    for nameRealm, rec in pairs(bucket.characters) do
+        if not named[nameRealm] and Store.SegmentFor(rec) == area then
+            local recEpoch = tonumber(rec.ownerEpoch) or 0
+            if recEpoch <= epoch then
+                doomed[#doomed + 1] = nameRealm
+            end
+        end
+    end
+    table.sort(doomed)
+    for i = 1, #doomed do
+        bucket.characters[doomed[i]] = nil
+        info.deleted[#info.deleted + 1] = doomed[i]
+    end
+
+    -- (2) HOMELESS ADOPTION: a character parked without a manifest slot that this
+    -- manifest now names moves into the real table (spec §3.2).
+    local adopted = {}
+    for nameRealm in pairs(named) do
+        if bucket.homeless[nameRealm] and not bucket.characters[nameRealm] then
+            adopted[#adopted + 1] = nameRealm
+        end
+    end
+    table.sort(adopted)
+    for i = 1, #adopted do
+        local nameRealm = adopted[i]
+        bucket.characters[nameRealm] = bucket.homeless[nameRealm]
+        bucket.homeless[nameRealm] = nil
+        info.adopted[#info.adopted + 1] = nameRealm
+    end
+
+    -- (3) Store the manifest itself.
+    local seg = {}
+    for i = 1, #list do seg[i] = list[i] end
+    bucket.segments[area] = seg
+    bucket.segmentHashes[area] = { hash = hash, epoch = epoch }
+
+    if #info.deleted > 0 then
+        ghostLog(("mesh: manifest %s/%s (epoch %d) removed %d ghost character(s): %s")
+            :format(tostring(aid), area, epoch, #info.deleted,
+                    table.concat(info.deleted, ", ")))
+    end
+    return true, info
+end
+
+-- SENDER SIDE of B4. Ghost cleanup only works if the account that DELETED the
+-- alt publishes a manifest that no longer names it, with a NEWER epoch — so our
+-- own segments have to be maintained and the epoch bumped when membership
+-- actually changes. Nothing built them before (they were only ever populated by
+-- the legacy importer in import.lua), which would have left the receive side
+-- dead code.
+--
+-- Membership-only: the epoch moves when a character joins, leaves or changes
+-- segment (a level-60 ding, a deleted alt), and NOT on a data refresh — so this
+-- cannot churn manifests on every capture. Returns true if anything changed.
+function Store.RebuildSelfSegments(nowE)
+    local bucket = Store.GetSelfAccount(false)
+    if not bucket then return false end
+    nowE = tonumber(nowE) or serverNow()
+
+    local built = { sixties = {}, summoners = {}, norole = {} }
+    for nameRealm, rec in pairs(bucket.characters) do
+        local seg = built[Store.SegmentFor(rec)]
+        seg[#seg + 1] = nameRealm
+    end
+
+    local changed = false
+    for area in pairs(built) do
+        local nextList = built[area]
+        table.sort(nextList)
+        local prev = bucket.segments[area] or {}
+        local same = (#prev == #nextList)
+        if same then
+            for i = 1, #nextList do
+                if prev[i] ~= nextList[i] then same = false; break end
+            end
+        end
+        if not same then
+            bucket.segments[area] = nextList
+            local h = bucket.segmentHashes[area] or {}
+            -- Monotonic: a same-second rebuild still has to advance the epoch or
+            -- the peer's strictly-newer gate would drop it.
+            local prevEpoch = tonumber(h.epoch) or 0
+            h.epoch = (nowE > prevEpoch) and nowE or (prevEpoch + 1)
+            h.hash = nil                      -- recomputed live at send time
+            bucket.segmentHashes[area] = h
+            changed = true
+        end
+    end
+    return changed
 end
 
 ----------------------------------------------------------------------
@@ -2386,6 +2922,275 @@ local function testDMFCooldown(fails)
     ck(Store.DMFOfflineClearable(nil) == false, "nil rec is not clearable")
 end
 
+----------------------------------------------------------------------
+-- A9.1 — item cooldowns as start epochs
+----------------------------------------------------------------------
+local function testItemCdEpochs(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local T = 1700000000
+
+    -- ---- the acceptance window (spec §6: [now-3605, now+5]) ----------------
+    ck(Store.ItemCdEpochSane(T - 3605, T, 3600) == true,  "epoch at now-3605 accepted (edge)")
+    ck(Store.ItemCdEpochSane(T - 3606, T, 3600) == false, "epoch at now-3606 rejected")
+    ck(Store.ItemCdEpochSane(T + 5, T, 3600) == true,     "epoch at now+5 accepted (edge)")
+    ck(Store.ItemCdEpochSane(T + 6, T, 3600) == false,    "epoch at now+6 rejected (clock skew)")
+    ck(Store.ItemCdEpochSane(0, T, 3600) == false,        "epoch 0 is not a cooldown")
+
+    -- ---- remaining is DERIVED ----------------------------------------------
+    local rec = { hearthstoneCDStart = T - 1200, chronoboonCDStart = 0 }
+    ck(Store.ItemCdRemaining(rec, "hearthstone", T) == 2400, "hearth: 3600-(now-epoch) = 2400")
+    ck(Store.ItemCdRemaining(rec, "hearthstone", T + 600) == 1800, "hearth: 10 min later = 1800")
+    ck(Store.ItemCdRemaining(rec, "hearthstone", T + 2400) == 0, "hearth: exactly elapsed -> 0")
+    ck(Store.ItemCdRemaining(rec, "hearthstone", T + 99999) == 0, "hearth: long past -> 0, never negative")
+    ck(Store.ItemCdRemaining(rec, "chronoboon", T) == 0, "a zero epoch reads ready")
+    ck(Store.ItemCdRemaining(nil, "hearthstone", T) == 0, "nil record -> 0")
+    ck(Store.ItemCdRemaining(rec, "nonsense", T) == 0, "unknown cooldown key -> 0")
+
+    -- An epoch-native record NEVER falls back to the mirror, even at 0. This is
+    -- the regression that let a healed cooldown come back from the dead.
+    local healed = { hearthstoneCDStart = 0, hearthstoneCD = 1200, lastDataUpdate = T }
+    ck(Store.ItemCdRemaining(healed, "hearthstone", T) == 0,
+       "epoch-native record ignores a stale legacy mirror")
+
+    -- ---- the legacy fallback (records with NO epoch field at all) ----------
+    local legacy = { hearthstoneCD = 1200, lastDataUpdate = T }
+    ck(Store.ItemCdRemaining(legacy, "hearthstone", T) == 1200, "legacy record still reads")
+    ck(Store.ItemCdRemaining(legacy, "hearthstone", T + 200) == 1000, "legacy record decays vs lastDataUpdate")
+    local unref = { hearthstoneCD = 540000 }      -- the "9000 minute" shape, no reference
+    ck(Store.ItemCdRemaining(unref, "hearthstone", T) == 0,
+       "legacy value above the cooldown with no reference heals to 0 (spec §6)")
+
+    -- ---- MIGRATION: legacy remaining + lastDataUpdate -> start epoch --------
+    local m1 = { hearthstoneCD = 1200, itemCooldown = 600, lastDataUpdate = T - 300 }
+    ck(Store.MigrateItemCdEpochs(m1, T) == true, "migration reports it wrote")
+    ck(m1.hearthstoneCDStart == T - 300 - 2400, "hearth epoch synthesized from lastDataUpdate")
+    ck(m1.chronoboonCDStart  == T - 300 - 3000, "chrono epoch synthesized from lastDataUpdate")
+    ck(m1.hearthstoneCD == 900, "mirror refreshed: 1200 captured 300s ago = 900 now")
+    ck(m1.itemCooldown  == 300, "chrono mirror refreshed the same way")
+    ck(Store.MigrateItemCdEpochs(m1, T) == false, "migration is idempotent — never re-runs on a record")
+
+    -- No reference epoch: FREEZE at the stored value rather than invent an
+    -- offline stretch (a fresh login must not wipe the record).
+    local m2 = { hearthstoneCD = 1200 }
+    Store.MigrateItemCdEpochs(m2, T)
+    ck(m2.hearthstoneCDStart == T - 2400, "no lastDataUpdate -> epoch anchored at now (frozen)")
+    ck(Store.ItemCdRemaining(m2, "hearthstone", T) == 1200, "...so the remaining is unchanged")
+
+    -- Unhealable garbage is dropped, and the record is still PROMOTED to the
+    -- epoch model so it can never fall back to the mirror again.
+    local m3 = { hearthstoneCD = 540000 }
+    Store.MigrateItemCdEpochs(m3, T)
+    ck(m3.hearthstoneCDStart == 0 and m3.hearthstoneCD == 0, "9000-minute legacy garbage migrates to 0/0")
+
+    -- ---- THE RELOG / "9000-MINUTE" REGRESSION ------------------------------
+    -- The old model: WriteSelfCharacter re-stamps lastDataUpdate on EVERY
+    -- capture, so the UI's elapsed term was always ~0 and a stored remaining
+    -- never moved. Reproduce that shape, then prove the epoch model fixes it.
+    local stuck = { hearthstoneCD = 1200, lastDataUpdate = T }
+    ck(Store.ItemCdRemaining(stuck, "hearthstone", T + 900) == 300, "legacy: honest while the stamp is old")
+    stuck.lastDataUpdate = T + 900                       -- a capture re-stamps it
+    ck(Store.ItemCdRemaining(stuck, "hearthstone", T + 900) == 1200,
+       "legacy BUG reproduced: a re-stamped capture freezes the countdown at 1200")
+    local fixed = { hearthstoneCDStart = T - 2400, hearthstoneCD = 1200, lastDataUpdate = T }
+    fixed.lastDataUpdate = T + 900                       -- same re-stamp
+    ck(Store.ItemCdRemaining(fixed, "hearthstone", T + 900) == 300,
+       "A9.1: the epoch model is immune to the re-stamp — 300s left, correctly")
+    -- ...and it survives the relog: same stored epoch, a session later.
+    ck(Store.ItemCdRemaining(fixed, "hearthstone", T + 1200) == 0, "and it reaches ready on its own")
+
+    -- ---- ItemCdSetStart acceptance rules -----------------------------------
+    local s = { hearthstoneCDStart = T - 1200 }
+    ck(Store.ItemCdSetStart(s, "hearthstone", T - 1201, T) == false, "an OLDER derived start is ignored")
+    ck(Store.ItemCdSetStart(s, "hearthstone", T - 1199, T) == false, "a start inside the reset slack is ignored")
+    ck(Store.ItemCdSetStart(s, "hearthstone", T - 10, T) == true, "a genuinely newer start displaces (re-use / kick reset)")
+    ck(s.hearthstoneCDStart == T - 10 and s.hearthstoneCD == 3590, "...and the mirror follows")
+    ck(Store.ItemCdSetStart(s, "hearthstone", T + 600, T) == false, "an out-of-window start is refused")
+    ck(Store.ItemCdSetStart(s, "hearthstone", T - 3000, T, true) == true, "force (a CAST) displaces regardless")
+
+    -- ---- self-heal ----------------------------------------------------------
+    local h = { hearthstoneCDStart = T - 5000, hearthstoneCD = 1200 }
+    ck(Store.HealItemCdEpochs(h, T) == true, "an out-of-window epoch is healed")
+    ck(h.hearthstoneCDStart == 0 and h.hearthstoneCD == 0, "heal clears the mirror too")
+
+    -- ---- THE WIRE BOUNDARY --------------------------------------------------
+    -- ENCODE: the mirror is recomputed at SEND time, not capture time.
+    local out = { hearthstoneCDStart = T - 1200, chronoboonCDStart = T - 3000, hearthstoneCD = 0, itemCooldown = 0 }
+    Store.WireItemCd(out, T + 300)
+    ck(out.hearthstoneCD == 2100, "encode: hearth remaining computed at send time")
+    ck(out.itemCooldown  == 300,  "encode: chrono remaining computed at send time")
+
+    -- DECODE: remaining -> a LOCAL epoch. Zero transit = exact.
+    local inb = Store.NewCharacterRecord("Peer-Realm")
+    inb.hearthstoneCD, inb.itemCooldown = 2100, 300
+    Store.AdoptWireCooldowns(inb, T + 300)
+    ck(inb.hearthstoneCDStart == T - 1200, "decode: remaining re-anchored to the identical epoch")
+    ck(Store.ItemCdRemaining(inb, "hearthstone", T + 300) == 2100, "decode: round-trips exactly with no transit")
+
+    -- DRIFT: the reconstructed epoch is LATE by exactly the transit delay, so the
+    -- countdown reads HIGH by it — bounded, and it does not accumulate.
+    local drifted = Store.NewCharacterRecord("Peer-Realm")
+    drifted.hearthstoneCD = 2100
+    Store.AdoptWireCooldowns(drifted, T + 300 + 4)          -- 4s in flight
+    ck(drifted.hearthstoneCDStart == T - 1200 + 4, "decode: epoch is late by exactly the transit time")
+    ck(Store.ItemCdRemaining(drifted, "hearthstone", T + 300) - 2100 == 4,
+       "drift == transit delay, and nothing else (no clock skew enters the value)")
+
+    -- A record that already carries a sane epoch (SEGMENT path, whole tables)
+    -- keeps the OWNER's epoch instead of re-deriving it.
+    local seg = Store.NewCharacterRecord("Peer-Realm")
+    seg.hearthstoneCDStart, seg.hearthstoneCD = T - 1200, 2100
+    Store.AdoptWireCooldowns(seg, T + 300 + 4)
+    ck(seg.hearthstoneCDStart == T - 1200, "segment path: the owner's own epoch is preserved")
+
+    -- Garbage on the wire (remaining above the cooldown) converts to no cooldown.
+    local junk = Store.NewCharacterRecord("Peer-Realm")
+    junk.hearthstoneCD = 60000
+    Store.AdoptWireCooldowns(junk, T)
+    ck(junk.hearthstoneCDStart == 0 and junk.hearthstoneCD == 0, "wire garbage -> no cooldown")
+
+    -- ---- the one-time SavedVariables sweep ---------------------------------
+    local savedAccounts = Store.data.accounts
+    local savedFlag     = Store.data.itemCdEpochsMigrated
+    Store.data.accounts = {
+        ["77"] = { isSelf = false, characters = { ["A-R"] = { hearthstoneCD = 1200, lastDataUpdate = T } },
+                   segments = {}, segmentHashes = {},
+                   homeless = { ["B-R"] = { itemCooldown = 600, lastDataUpdate = T } } },
+    }
+    Store.data.itemCdEpochsMigrated = nil
+    ck(Store.MigrateItemCdEpochsAll(T) == 2, "SV sweep migrates characters AND homeless records")
+    ck(Store.data.accounts["77"].characters["A-R"].hearthstoneCDStart == T - 2400, "swept character got its epoch")
+    ck(Store.data.accounts["77"].homeless["B-R"].chronoboonCDStart == T - 3000, "swept homeless record got its epoch")
+    ck(Store.MigrateItemCdEpochsAll(T) == 0, "the sweep is sticky — never runs twice")
+    Store.data.accounts = savedAccounts
+    Store.data.itemCdEpochsMigrated = savedFlag
+end
+
+----------------------------------------------------------------------
+-- B4 — manifest adoption + ghost cleanup
+----------------------------------------------------------------------
+local function testManifestGhostCleanup(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local T = 1700000000
+
+    -- ---- segment classification (spec §3.1) --------------------------------
+    ck(Store.SegmentFor({ level = 60 }) == "sixties", "level 60 -> sixties")
+    ck(Store.SegmentFor({ level = 60, classTag = "WARLOCK" }) == "sixties", "a 60 warlock is a SIXTY, not a summoner")
+    ck(Store.SegmentFor({ level = 34, classTag = "WARLOCK" }) == "summoners", "warlock >=20 and not 60 -> summoners")
+    ck(Store.SegmentFor({ level = 19, classTag = "WARLOCK" }) == "norole", "warlock below 20 -> norole")
+    ck(Store.SegmentFor({ level = 45, classTag = "MAGE" }) == "norole", "everything else -> norole")
+    ck(Store.SegmentFor(nil) == "norole", "nil record -> norole")
+
+    local savedAccounts = Store.data.accounts
+    local savedDeleted  = Store.data.deletedAIDs
+    local savedLog      = Store._ghostLog
+    Store._ghostLog = {}
+
+    local function sixty(ownerEpoch) return { level = 60, ownerEpoch = ownerEpoch } end
+    local function bucket(chars, homeless, segEpoch)
+        return { isSelf = false, characters = chars or {}, homeless = homeless or {},
+                 segments = { sixties = {}, summoners = {}, norole = {} },
+                 segmentHashes = segEpoch and { sixties = { epoch = segEpoch } } or {} }
+    end
+
+    -- ---- THE MATRIX --------------------------------------------------------
+    Store.data.deletedAIDs = {}
+    Store.data.accounts = {
+        ["9"] = bucket({
+            ["Keeper-R"]  = sixty(T - 100),          -- named by the manifest
+            ["Ghost-R"]   = sixty(T - 100),          -- absent, OLDER  -> deleted
+            ["Fresh-R"]   = sixty(T + 500),          -- absent, NEWER  -> kept
+            ["Equal-R"]   = sixty(T),                -- absent, EQUAL  -> deleted (<=)
+            ["Lock-R"]    = { level = 40, classTag = "WARLOCK", ownerEpoch = T - 100 },
+        }, { ["Homeless-R"] = sixty(T - 50) }, T - 1000),
+    }
+    local applied, info = Store.AdoptManifest("9", "sixties", { "Keeper-R", "Homeless-R", "X" }, T, "abc")
+    local chars = Store.data.accounts["9"].characters
+    ck(applied == true, "a strictly newer manifest is adopted")
+    ck(chars["Keeper-R"] ~= nil, "named in the manifest -> kept")
+    ck(chars["Ghost-R"] == nil, "absent + older record epoch -> DELETED")
+    ck(chars["Fresh-R"] ~= nil, "absent + NEWER record epoch -> kept (out-of-order protection)")
+    ck(chars["Equal-R"] == nil, "absent + equal epoch -> deleted (the rule is <=)")
+    ck(chars["Lock-R"] ~= nil, "a SUMMONER is untouched by the sixties manifest")
+    ck(chars["Homeless-R"] ~= nil, "a homeless character named by the manifest is ADOPTED")
+    ck(Store.data.accounts["9"].homeless["Homeless-R"] == nil, "...and leaves the homeless table")
+    ck(#info.deleted == 2 and #info.adopted == 1, "info reports 2 deletions + 1 adoption")
+    ck(Store.data.accounts["9"].segmentHashes.sixties.epoch == T, "the manifest epoch is stored")
+    ck(Store.data.accounts["9"].segments.sixties[1] == "Keeper-R", "the manifest list is stored verbatim")
+    ck(#Store._ghostLog == 1, "the deletion is written to the debug log")
+
+    -- ---- stale / equal epoch: no adoption, NOTHING deleted ------------------
+    Store.data.accounts = { ["9"] = bucket({ ["Ghost-R"] = sixty(T - 100) }, nil, T) }
+    local ok2, i2 = Store.AdoptManifest("9", "sixties", {}, T, "abc")
+    ck(ok2 == false and i2.reason == "stale-epoch", "an EQUAL manifest epoch is refused")
+    ck(Store.data.accounts["9"].characters["Ghost-R"] ~= nil, "...and deletes nothing")
+    local ok3 = Store.AdoptManifest("9", "sixties", {}, T - 1, "abc")
+    ck(ok3 == false, "an OLDER manifest epoch is refused")
+    ck(Store.data.accounts["9"].characters["Ghost-R"] ~= nil, "...and still deletes nothing")
+
+    -- ---- SELF: never, under any epoch --------------------------------------
+    Store.data.accounts = { ["9"] = bucket({ ["Mine-R"] = sixty(T - 100) }, nil, T - 1000) }
+    Store.data.accounts["9"].isSelf = true
+    local ok4, i4 = Store.AdoptManifest("9", "sixties", {}, T + 9999, "abc")
+    ck(ok4 == false and i4.reason == "self", "our OWN account is never manifest-cleaned")
+    ck(Store.data.accounts["9"].characters["Mine-R"] ~= nil, "...our character survives")
+
+    -- ---- TOMBSTONED: silently rejected on every inbound path (spec §1.3) ----
+    Store.data.accounts = { ["9"] = bucket({ ["Ghost-R"] = sixty(T - 100) }, nil, T - 1000) }
+    Store.data.deletedAIDs = { ["9"] = serverNow() }
+    local ok5, i5 = Store.AdoptManifest("9", "sixties", {}, T, "abc")
+    ck(ok5 == false and i5.reason == "tombstoned", "a tombstoned account's manifest is rejected")
+    ck(Store.data.accounts["9"].characters["Ghost-R"] ~= nil, "...and deletes nothing")
+    Store.data.deletedAIDs = {}
+
+    -- ---- unsynced segment: norole is local + opportunistic (spec §3.1) -----
+    Store.data.accounts = { ["9"] = bucket({ ["Alt-R"] = { level = 30, ownerEpoch = T - 100 } }, nil, T - 1000) }
+    local ok6, i6 = Store.AdoptManifest("9", "norole", {}, T, "abc")
+    ck(ok6 == false and i6.reason == "unsynced-area", "a norole manifest is refused outright")
+    ck(Store.data.accounts["9"].characters["Alt-R"] ~= nil, "...norole characters are never ghost-cleaned")
+
+    -- ---- an account we hold no bucket for is never created from a manifest --
+    Store.data.accounts = {}
+    local ok7, i7 = Store.AdoptManifest("9", "sixties", {}, T, "abc")
+    ck(ok7 == false and i7.reason == "unknown-account", "an unknown account is not resurrected by a manifest")
+    ck(Store.data.accounts["9"] == nil, "...no bucket is created")
+
+    -- ---- malformed input ----------------------------------------------------
+    Store.data.accounts = { ["9"] = bucket({}, nil, 0) }
+    ck(select(1, Store.AdoptManifest(nil, "sixties", {}, T)) == false, "nil aid refused")
+    ck(select(1, Store.AdoptManifest("9", "sixties", nil, T)) == false, "nil list refused")
+    ck(select(1, Store.AdoptManifest("9", nil, {}, T)) == false, "nil area refused")
+
+    -- ---- SENDER SIDE: our own segments, epoch bumped only on membership -----
+    Store.data.accounts = { ["1"] = bucket({
+        ["Sixty-R"] = { level = 60 },
+        ["Lock-R"]  = { level = 40, classTag = "WARLOCK" },
+        ["Alt-R"]   = { level = 12 },
+    }, nil, nil) }
+    Store.data.accounts["1"].isSelf = true
+    local savedGetAID = ns.GetAccountID
+    ns.GetAccountID = function() return "1" end
+    ck(Store.RebuildSelfSegments(T) == true, "first rebuild publishes our segments")
+    local me = Store.data.accounts["1"]
+    ck(me.segments.sixties[1] == "Sixty-R", "our 60 lands in sixties")
+    ck(me.segments.summoners[1] == "Lock-R", "our warlock lands in summoners")
+    ck(me.segments.norole[1] == "Alt-R", "our low alt lands in norole")
+    ck(me.segmentHashes.sixties.epoch == T, "the segment epoch is stamped")
+    ck(Store.RebuildSelfSegments(T + 60) == false, "an unchanged roster does NOT bump the epoch")
+    ck(me.segmentHashes.sixties.epoch == T, "...so peers see no spurious manifest")
+    me.characters["Sixty-R"] = nil                       -- delete the alt
+    ck(Store.RebuildSelfSegments(T + 120) == true, "deleting a character DOES bump the epoch")
+    ck(me.segmentHashes.sixties.epoch == T + 120, "...to the new time")
+    ck(#me.segments.sixties == 0, "...and the manifest no longer names it — which is what deletes it on peers")
+    me.characters["Alt-R"].level = 60                    -- a ding re-segments
+    ck(Store.RebuildSelfSegments(T + 180) == true, "a level-60 ding bumps both affected segments")
+    ck(me.segments.sixties[1] == "Alt-R" and #me.segments.norole == 0, "...and moves the character")
+    ns.GetAccountID = savedGetAID
+
+    Store.data.accounts   = savedAccounts
+    Store.data.deletedAIDs = savedDeleted
+    Store._ghostLog        = savedLog
+end
+
 function Store.RunSelfTests(verbose)
     local suites = {
         { name = "defaults",        fn = testDefaults },
@@ -2397,6 +3202,8 @@ function Store.RunSelfTests(verbose)
         { name = "inbound name guard", fn = testInboundNameGuard },
         { name = "rested percent",  fn = testRestedPercent },
         { name = "dmf cooldown",    fn = testDMFCooldown },
+        { name = "item cd epochs (A9.1)",   fn = testItemCdEpochs },
+        { name = "manifest ghost cleanup (B4)", fn = testManifestGhostCleanup },
     }
     local allPass = true
     for _, suite in ipairs(suites) do

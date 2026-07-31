@@ -471,6 +471,30 @@ function Dashboard.DecayRemaining(stored, lastUpdate, nowE)
     return math.floor(rem)
 end
 
+----------------------------------------------------------------------
+-- A9.1 — DISPLAYED item-cooldown remaining. THE single choke point.
+--
+-- Every reader of the hearthstone / chronoboon cooldowns (card icons, detail
+-- rows) comes through here so they can never disagree. The record now carries a
+-- START EPOCH per cooldown and the remaining is always DERIVED, which is what
+-- makes a mid-cooldown relog show a countdown that simply continues instead of
+-- freezing at whatever the last capture happened to read.
+--
+-- `which` is "hearthstone" or "chronoboon". Delegates to Store.ItemCdRemaining
+-- (pure, harness-tested there), including its legacy fallback for records that
+-- predate the epoch fields. Returns 0 when the store layer is absent.
+--
+-- NOTE this deliberately does NOT go through Dashboard.DecayRemaining: that
+-- helper decays a stored remaining against rec.lastDataUpdate, which is exactly
+-- the model A9.1 replaces. It stays for the aura path (§4.5), which really does
+-- store a captured remaining.
+function Dashboard.ItemCdRemaining(rec, which, nowE)
+    if ns.Store and ns.Store.ItemCdRemaining then
+        return ns.Store.ItemCdRemaining(rec, which, nowE or Dashboard.Now()) or 0
+    end
+    return 0
+end
+
 -- DMF cooldown remaining (owner task 4 — the "DMFable" tracker, folded onto the
 -- DMF buff row). A8 landed the real model in store.lua: a 14,400 s ONLINE-TIME
 -- cooldown carried on rec.dmfCooldown.remainingOnlineSecs, ticked down by the

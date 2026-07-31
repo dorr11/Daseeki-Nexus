@@ -34,8 +34,9 @@ local CHRONOBOON_ITEMS = { 184937, 184938 }
 local SPELL_BOON_CAST   = 349858
 local SPELL_UNBOON_CAST = 349863
 
--- Item USE cooldown for both the hearthstone and the chronoboon (spec §4.4/§6).
-local CHRONOBOON_ITEM_CD = 3600
+-- Item USE cooldown for both the hearthstone and the chronoboon (spec §4.4/§6)
+-- now lives in ONE place, store.lua's Store.ITEM_CD_DURATION, alongside the
+-- shared start-epoch helpers every reader and writer goes through (A9.1).
 
 -- A removal seen within this many seconds BEFORE the boon cast succeeded is the
 -- chronoboon stripping the aura (restore it as booned). Anything earlier is a
@@ -754,10 +755,10 @@ function Tracker.FinishBoonCast(rec, atFrame, atEpoch)
     if Tracker._noteBoonCount then
         Tracker._noteBoonCount(rec, math.max(0, (tonumber(rec.boonCount) or 0) - 1))
     end
-    -- A7.2: the cast is authoritative for the item cooldown; the bag API is a
-    -- fallback from here on (see captureCooldowns).
-    rec.chronoboonCDStart  = atEpoch
-    rec.itemCooldown       = CHRONOBOON_ITEM_CD
+    -- A7.2/A9.1: the cast is authoritative for the item cooldown; the bag API is
+    -- a fallback from here on (see captureCooldowns). `force` because a cast is
+    -- ground truth — it displaces whatever epoch we were holding, newer or not.
+    ns.Store.ItemCdSetStart(rec, "chronoboon", atEpoch, atEpoch, true)
 
     -- A8.5: entering a boon CARRYING DMF re-stamps a full 4 h. Safety net for a
     -- missed unboon edge — the cooldown then freezes until the buffs come out.
@@ -1001,30 +1002,32 @@ local function captureSoulstone(rec)
     end
 end
 
--- Hearthstone + Chronoboon Displacer remaining cooldowns (seconds).
--- rec.itemCooldown now carries the Chronoboon Displacer USE cooldown remaining
--- (max across the two Era item IDs) — it was previously a hardcoded-0 placeholder
--- but is already an existing u16 wire field, so repurposing it needs no schema
--- bump. Both values are clamped to the u16 range (<=65535s) before the wire.
-local function itemCooldownRemaining(itemID)
+-- A9.1 — the bag API reduced to a START EPOCH, with the spec §6 sanity gates.
+--
+-- C_Container.GetItemCooldown reports (start, duration, enable) where `start` is
+-- in GetTime()'s monotonic frame; converting it to a server epoch is
+--     epoch = now - (GetTime() - start)
+-- Everything the spec calls garbage is rejected HERE, before any of it can reach
+-- a record:
+--   * duration <= 1.5s  -> that is the global cooldown, not an item cooldown
+--   * duration > 7200s  -> loading-screen garbage (this is the shape behind the
+--                          documented "9000-minute stuck cooldown")
+--   * negative elapsed  -> a start time in the future; discard
+--   * enable == 0       -> the item reports no usable cooldown
+-- Returns the derived START EPOCH, or 0 for "nothing believable to read".
+local function itemCooldownStartEpoch(itemID, nowE)
+    if not (C_Container and C_Container.GetItemCooldown) then return 0 end
     local start, duration, enable = C_Container.GetItemCooldown(itemID)
-    if start and duration and duration > 0 and (enable == nil or enable == 1) then
-        local rem = (start + duration) - GetTime()
-        if rem > 0 then return rem end
-    end
-    return 0
-end
-
--- Carry a stored remaining-seconds cooldown forward across a suppressed capture,
--- decaying it by the time that has passed since it was last actually read. The
--- storage model is unchanged (remaining seconds, not a start epoch — that is a
--- later designed change); this only keeps the preserved value honest, because
--- Store.WriteSelfCharacter re-stamps lastDataUpdate on every capture and the UI
--- decays against that stamp.
-local function carryCooldown(v, elapsed)
-    v = (tonumber(v) or 0) - elapsed
-    if v < 0 then v = 0 end
-    return math.floor(v)
+    if not (start and duration) then return 0 end
+    if enable ~= nil and enable ~= 1 then return 0 end
+    if duration <= (ns.Store.ITEM_CD_GCD_MAX or 1.5) then return 0 end
+    if duration > (ns.Store.ITEM_CD_ABSURD or 7200) then return 0 end
+    if start <= 0 then return 0 end
+    local elapsed = GetTime() - start
+    if elapsed < 0 then return 0 end                 -- start in the future
+    local rem = duration - elapsed
+    if rem <= 0 then return 0 end                    -- already expired
+    return math.floor(nowE - elapsed)
 end
 
 -- Seconds since the last trusted read of a given piece, or 0 when we have no
@@ -1040,72 +1043,81 @@ end
 Tracker._cdCapturedAt   = nil   -- Store.Now() of the last trusted cooldown read
 Tracker._auraCapturedAt = nil   -- Store.Now() of the last aura slot write
 
--- A7.2 — remaining on the chronoboon item, derived from the CAST STAMP.
+-- A7.2/A9.1 — remaining on the chronoboon item, from its START EPOCH.
 --
--- The bag API was our only source, which meant a boon cast while C_Container was
--- cold, or any relog, lost the "when can I re-boon" countdown entirely. The
--- successful cast now writes rec.chronoboonCDStart (a server epoch) and that is
--- authoritative; the API drops to a fallback consulted only when no live stamp
--- exists (spec §6: "the API is only consulted when nothing is stored").
+-- The bag API was once our only source, which meant a boon cast while
+-- C_Container was cold, or any relog, lost the "when can I re-boon" countdown
+-- entirely. The cast writes rec.chronoboonCDStart and that is authoritative; the
+-- API is a fallback consulted only when no stamp exists (spec §6: "the API is
+-- only consulted when nothing is stored").
 --
--- Self-healing: a stamp in the future (clock skew) or older than the cooldown is
--- cleared and reads 0. Returns seconds remaining, 0 when there is no live stamp.
+-- The arithmetic now lives in Store.ItemCdRemaining (one helper for both items);
+-- this wrapper keeps the WRITE-side self-heal — a stamp in the future (clock
+-- skew) or older than the cooldown is cleared, not merely read as zero.
 local function chronoboonStampRemaining(rec, now)
-    local at = tonumber(rec.chronoboonCDStart) or 0
-    if at <= 0 then return 0 end
-    local since = now - at
-    if since < 0 or since >= CHRONOBOON_ITEM_CD then
+    local rem = ns.Store.ItemCdRemaining(rec, "chronoboon", now)
+    if rem <= 0 and (tonumber(rec.chronoboonCDStart) or 0) > 0 then
         rec.chronoboonCDStart = 0
-        return 0
     end
-    return CHRONOBOON_ITEM_CD - since
+    return rem
 end
 Tracker._chronoboonStampRemaining = chronoboonStampRemaining
 
+-- A9.1 — capture BOTH item cooldowns as START EPOCHS.
+--
+-- What actually gets written is rec.hearthstoneCDStart / rec.chronoboonCDStart;
+-- rec.hearthstoneCD / rec.itemCooldown are recomputed from them as the legacy
+-- mirrors the frozen wire schema still carries (see the CHANGELOG note in
+-- store.lua). Nothing here decays or carries a remaining value any more — an
+-- epoch is exact through a loading screen, a suppressed capture and a relog,
+-- which is the entire point of the model.
 local function captureCooldowns(rec)
+    local now = ns.Store.Now()
+
+    -- MIGRATION: a record written by an older client carries only the mirrors.
+    -- Synthesize its epochs on this first capture, then heal anything stale.
+    ns.Store.MigrateItemCdEpochs(rec, now)
+    ns.Store.HealItemCdEpochs(rec, now)
+
     -- A9.2: BAG_UPDATE_COOLDOWN and the login capture both hit C_Container while
-    -- it is cold right after a loading screen, which is the documented race that
-    -- produces stuck multi-thousand-minute cooldowns. Suppress the read during
-    -- teardown and for COOLDOWN_GRACE seconds after entering the world; carry the
-    -- previous values forward instead of writing the API's garbage (or its 0).
+    -- it is cold right after a loading screen — the documented race that produces
+    -- stuck multi-thousand-minute cooldowns. Suppress the READ during teardown
+    -- and for COOLDOWN_GRACE seconds after entering the world. The stored epochs
+    -- are untouched and simply keep counting down.
     if Tracker.IsTeardown() or Tracker.InEnteringWorldGrace(COOLDOWN_GRACE) then
-        local now = ns.Store.Now()
-        local elapsed = sinceCapture(Tracker._cdCapturedAt, now)
-        rec.hearthstoneCD = carryCooldown(rec.hearthstoneCD, elapsed)
-        -- A7.2: an epoch stamp needs no carrying — it is exact through a loading
-        -- screen and through a relog, which is the whole point of having it.
-        local stamped = chronoboonStampRemaining(rec, now)
-        if stamped > 0 then
-            rec.itemCooldown = math.min(65535, math.floor(stamped))
-        else
-            rec.itemCooldown = carryCooldown(rec.itemCooldown, elapsed)
-        end
+        chronoboonStampRemaining(rec, now)          -- write-side self-heal
+        ns.Store.RefreshItemCdMirrors(rec, now)
         Tracker._cdCapturedAt = now
         return
     end
 
-    local now = ns.Store.Now()
-    rec.itemCooldown = 0
-    rec.hearthstoneCD = 0
-
-    -- A7.2: cast stamp first, bag API only as the fallback.
-    local stamped = chronoboonStampRemaining(rec, now)
-    if stamped > 0 then
-        rec.itemCooldown = math.min(65535, math.floor(stamped))
+    -- HEARTHSTONE: the bag API is the only source we have (there is no cast hook
+    -- for 8690 in this batch), and it is accepted per spec §6 — when nothing is
+    -- stored, or when its derived start is NEWER than the stored one (a genuine
+    -- re-use, or the instance-kick reset). It can never CLEAR a stored cooldown:
+    -- a cold or empty API read must not delete a live countdown, which is exactly
+    -- how a failed capture used to write 0 and make the cooldown disappear.
+    local hearthStart = itemCooldownStartEpoch(ITEM_HEARTHSTONE, now)
+    if hearthStart > 0 then
+        ns.Store.ItemCdSetStart(rec, "hearthstone", hearthStart, now)
     end
 
-    if C_Container and C_Container.GetItemCooldown then
-        rec.hearthstoneCD = math.min(65535, math.floor(itemCooldownRemaining(ITEM_HEARTHSTONE)))
-        if stamped <= 0 then
-            -- Chronoboon Displacer: max remaining across base + super-charged IDs.
-            local best = 0
-            for i = 1, #CHRONOBOON_ITEMS do
-                local rem = itemCooldownRemaining(CHRONOBOON_ITEMS[i])
-                if rem > best then best = rem end
-            end
-            rec.itemCooldown = math.min(65535, math.floor(best))
+    -- CHRONOBOON: cast stamp first, bag API only when nothing is stored. Both Era
+    -- item IDs are probed and the EARLIEST believable start wins (= the longest
+    -- remaining), which is the epoch-space equivalent of the old max-remaining.
+    local stamped = chronoboonStampRemaining(rec, now)
+    if stamped <= 0 then
+        local best = 0
+        for i = 1, #CHRONOBOON_ITEMS do
+            local e = itemCooldownStartEpoch(CHRONOBOON_ITEMS[i], now)
+            if e > 0 and (best == 0 or e < best) then best = e end
+        end
+        if best > 0 then
+            ns.Store.ItemCdSetStart(rec, "chronoboon", best, now)
         end
     end
+
+    ns.Store.RefreshItemCdMirrors(rec, now)
     Tracker._cdCapturedAt = now
 end
 
@@ -2258,6 +2270,11 @@ local function testCaptureGuards(fails)
     Tracker._captureCooldowns(rec)
     ck(rec.hearthstoneCD == 1200, "EW +1s: hearthstone CD preserved, garbage ignored")
     ck(rec.itemCooldown == 600, "EW +1s: item CD preserved, garbage ignored")
+    -- A9.1: the same suppressed capture MIGRATED both legacy remainings into
+    -- start epochs (no lastDataUpdate on this record, so `now` is the reference
+    -- and the countdown freezes at its stored value rather than back-dating).
+    ck(rec.hearthstoneCDStart == epochNow - 2400, "A9.1: legacy hearth remaining -> start epoch")
+    ck(rec.chronoboonCDStart  == epochNow - 3000, "A9.1: legacy chrono remaining -> start epoch")
 
     settle()
     Tracker._enteredWorldAt = frameNow - 2.9      -- still inside the 3s window
@@ -2273,14 +2290,23 @@ local function testCaptureGuards(fails)
     Tracker._captureCooldowns(rec)
     ck(rec.hearthstoneCD == 1200 and rec.itemCooldown == 600, "logout: cooldowns frozen")
 
-    -- Preserved cooldowns decay by in-session elapsed (lastDataUpdate re-stamps).
+    -- ---- A9.1 the epoch model replaces carry-forward -----------------------
+    -- There is no "carry a remaining value forward" step any more: the stored
+    -- epoch is exact, so a suppressed capture derives from it and _cdCapturedAt
+    -- (which used to drive the decay) no longer affects the value at all.
     settle()
     Tracker._loggingOut = true
-    rec = { hearthstoneCD = 1200, itemCooldown = 30 }
+    rec = { hearthstoneCDStart = epochNow - 2400, chronoboonCDStart = epochNow - 3570 }
     Tracker._cdCapturedAt = epochNow - 60
     Tracker._captureCooldowns(rec)
-    ck(rec.hearthstoneCD == 1140, "preserved hearthstone CD decays 60s -> 1140")
-    ck(rec.itemCooldown == 0, "preserved item CD floors at 0, never negative")
+    ck(rec.hearthstoneCD == 1200, "suppressed: remaining derives from the epoch, not _cdCapturedAt")
+    ck(rec.itemCooldown == 30, "suppressed: the chronoboon epoch derives the same way")
+    epochNow = epochNow + 60
+    Tracker._captureCooldowns(rec)
+    ck(rec.hearthstoneCD == 1140, "60s of real time later the SAME epoch reads 1140")
+    ck(rec.itemCooldown == 0, "an elapsed cooldown floors at 0, never negative")
+    ck(rec.chronoboonCDStart == 0, "an elapsed chronoboon stamp is self-healed away")
+    epochNow = EPOCH
 
     -- Outside the window the API is trusted again.
     settle()
@@ -2289,7 +2315,52 @@ local function testCaptureGuards(fails)
     rec = { hearthstoneCD = 0, itemCooldown = 0 }
     Tracker._captureCooldowns(rec)
     ck(rec.hearthstoneCD == 3500, "EW +3.1s: API trusted again -> 3500s")
+    ck(rec.hearthstoneCDStart == epochNow - 100, "A9.1: the API read is stored as a START EPOCH")
     ck(Tracker._cdCapturedAt == epochNow, "a trusted read stamps _cdCapturedAt")
+
+    -- ---- A9.5 sanity gates on the API read ---------------------------------
+    settle()
+    cdStart, cdDuration = frameNow - 0.2, 1.5
+    rec = {}
+    Tracker._captureCooldowns(rec)
+    ck((rec.hearthstoneCDStart or 0) == 0, "A9.5: duration <=1.5s is the GCD -> rejected")
+
+    settle()
+    cdStart, cdDuration = frameNow, 7201
+    rec = {}
+    Tracker._captureCooldowns(rec)
+    ck((rec.hearthstoneCDStart or 0) == 0, "A9.5: duration >7200s is garbage -> rejected")
+
+    settle()
+    cdStart, cdDuration = frameNow + 50, 3600
+    rec = {}
+    Tracker._captureCooldowns(rec)
+    ck((rec.hearthstoneCDStart or 0) == 0, "A9.1: a start time in the future is discarded")
+
+    -- ---- A9.1 the API can never DELETE a stored cooldown -------------------
+    -- This is the failure the gap analysis called BROKEN: "any capture that
+    -- failed to read the API writes 0 and the cooldown disappears."
+    settle()
+    cdStart, cdDuration = 0, 0
+    rec = { hearthstoneCDStart = epochNow - 1200 }
+    Tracker._captureCooldowns(rec)
+    ck(rec.hearthstoneCDStart == epochNow - 1200, "an empty API read leaves the stored epoch alone")
+    ck(rec.hearthstoneCD == 2400, "...and the countdown keeps running")
+
+    -- ...but a NEWER derived start (a real re-use, or the instance-kick reset
+    -- the spec calls out) does displace it.
+    settle()
+    cdStart, cdDuration = frameNow - 10, 3600
+    rec = { hearthstoneCDStart = epochNow - 1200 }
+    Tracker._captureCooldowns(rec)
+    ck(rec.hearthstoneCDStart == epochNow - 10, "a newer derived start displaces the stored one")
+
+    -- Re-reading the SAME live cooldown must not creep the stamp forward.
+    settle()
+    cdStart, cdDuration = frameNow - 1200, 3600
+    rec = { hearthstoneCDStart = epochNow - 1201 }
+    Tracker._captureCooldowns(rec)
+    ck(rec.hearthstoneCDStart == epochNow - 1201, "a same-cooldown re-read inside the slack is ignored")
 
     end)
 

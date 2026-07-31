@@ -698,7 +698,8 @@ local function makeCard(parent, pane)
         local slotY = self._slotY[(rec.classTag == "WARLOCK") and 2 or 1]
         self.chrono:SetPoint("TOPRIGHT", self, "TOPRIGHT", -CARD_PAD_H, slotY)
         self.chrono:SetBackdrop(UI.FLAT_BACKDROP); self.chrono:SetBackdropColor(UI.Color("inset"))
-        local chronoRem = Dashboard.DecayRemaining(rec.itemCooldown, rec.lastDataUpdate, nowE)
+        -- A9.1: derived from the stored START EPOCH, via the one shared helper.
+        local chronoRem = Dashboard.ItemCdRemaining(rec, "chronoboon", nowE)
         local cSt = Cards.CdIconState(chronoRem)
         if rec.chronoboonActive then
             self.chrono.icon:SetDesaturated(false)
@@ -716,7 +717,7 @@ local function makeCard(parent, pane)
             self.chrono.cd:Hide()
             self.chrono._tip = { "Chronoboon Displacer", ("%d in bags"):format(rec.boonCount or 0), "muted" }
         end
-        local hearthRem = Dashboard.DecayRemaining(rec.hearthstoneCD, rec.lastDataUpdate, nowE)
+        local hearthRem = Dashboard.ItemCdRemaining(rec, "hearthstone", nowE)
         local hSt = Cards.CdIconState(hearthRem)
         self.hearth:SetBackdrop(UI.FLAT_BACKDROP); self.hearth:SetBackdropColor(UI.Color("inset"))
         self.hearth.icon:SetDesaturated(hearthRem > 0)

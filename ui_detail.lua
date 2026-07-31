@@ -578,7 +578,8 @@ function Detail.Attach(parent)
 
         -- Telemetry (chrono / hearth item icons + colored state value). The icon desats
         -- while on cooldown (mirrors the card stack); the tooltip carries the state.
-        local chronoRem = Dd.DecayRemaining(rec.itemCooldown, rec.lastDataUpdate, e)
+        -- A9.1: derived from the stored START EPOCH, via the one shared helper.
+        local chronoRem = Dd.ItemCdRemaining(rec, "chronoboon", e)
         if rec.chronoboonActive then
             chronoVal:SetText("BOON"); chronoVal:SetTextColor(UI.Color((rec.boonCount or 0) == 0 and "danger" or "ok"))
             D.chronoIcon.icon:SetDesaturated(false)
@@ -592,7 +593,7 @@ function Detail.Attach(parent)
             D.chronoIcon.icon:SetDesaturated(false)
             D.chronoIcon._state = "Ready"; D.chronoIcon._stateTok = "ok"
         end
-        local hearthRem = Dd.DecayRemaining(rec.hearthstoneCD, rec.lastDataUpdate, e)
+        local hearthRem = Dd.ItemCdRemaining(rec, "hearthstone", e)
         if hearthRem > 0 then
             hearthVal:SetText(Dd.FormatDuration(hearthRem)); hearthVal:SetTextColor(UI.Color("warn"))
             D.hearthIcon.icon:SetDesaturated(true)
