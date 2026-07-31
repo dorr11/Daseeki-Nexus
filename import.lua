@@ -676,8 +676,17 @@ end
 --                                             --   level-up safe; preferred.
 --     GUID, GUIDSource,                       -- serial provenance:
 --                                             --   "combatLog" | "mouseover" | "target"
---     zoneID, difficultyID, class, mobCount, group, rep, ...   -- carried, unused
+--     mobCount        = 312,                  -- XP-derived kill count  (our mobXP)
+--     mobCountFromKill= 318,                  -- combat-log kill count  (our mobKill)
+--     enteredLevel    = 58,                   -- level walked in at
+--     group           = { ... },              -- per-member level/class/guild
+--     groupAverage    = 57.4,                 -- average group level incl. the player
+--     zoneID, difficultyID, class, rep, ...   -- carried, unused
 --   }
+--   plus, on the REALM bucket alongside `instances`, a trade log whose records
+--   carry { time, where, tradeWho, playerMoney, targetMoney } — `where` is the
+--   instance name when the trade happened inside one. The container's key name is
+--   not guessed; the log is located structurally (Import._NITTradeLog).
 --
 -- Each run -> our instances entry { t, name, mapID, dur, gold, xp, merged=false },
 -- keyed under Name-Realm (realm whitespace stripped, matching tracker.lua's
@@ -812,6 +821,128 @@ local function firstNumericField(run, keys)
     return nil
 end
 
+----------------------------------------------------------------------
+-- PER-RUN DETAIL (the fields the register's row hover needs)
+--
+-- CONFIRMED key names in the owner's own SavedVariables, exactly as for
+-- `xpFromChat` / `rawMoneyCount` above: `mobCount` (XP-derived kills),
+-- `mobCountFromKill` (combat-log kills), `enteredLevel`, `group`, `groupAverage`,
+-- and — on the realm bucket's own trade log, not on the run — `time`, `where`,
+-- `tradeWho`, `playerMoney`, `targetMoney`.
+--
+-- Every mapping is best-effort and SKIPS GRACEFULLY: a record that predates a
+-- field simply imports without it, exactly as the live capture leaves the field
+-- nil on a run where nothing was observed. Nothing here can fail an import.
+----------------------------------------------------------------------
+
+-- The stored group is per-member level/class/guild (behaviour spec §8.2) but the
+-- concrete container shape is not something we can know without reading the
+-- source, so this accepts every plausible one: an array of member tables, an
+-- array of bare names, a name->table map, or a name->level map. Returns our
+-- normalized { {name=, level=}, ... } or nil. Pure.
+function Import._NormalizeNITGroup(g, selfName)
+    if type(g) ~= "table" then return nil end
+    local out = {}
+    for i = 1, #g do                      -- array form first (deterministic order)
+        local v = g[i]
+        if type(v) == "table" then
+            local nm = v.name or v.playerName or v.unitName or v[1]
+            if type(nm) == "string" and nm ~= "" then
+                out[#out + 1] = { name = nm, level = tonumber(v.level) or 0 }
+            end
+        elseif type(v) == "string" and v ~= "" then
+            out[#out + 1] = { name = v, level = 0 }
+        end
+    end
+    if #out == 0 then                     -- map form: name -> table | level
+        for k, v in pairs(g) do
+            if type(k) == "string" and k ~= "" then
+                if type(v) == "table" then
+                    out[#out + 1] = { name = k, level = tonumber(v.level) or 0 }
+                elseif type(v) == "number" then
+                    out[#out + 1] = { name = k, level = v }
+                elseif v ~= nil then
+                    out[#out + 1] = { name = k, level = 0 }
+                end
+            end
+        end
+        table.sort(out, function(a, b) return a.name < b.name end)
+    end
+    if #out == 0 then return nil end
+    if type(selfName) == "string" and selfName ~= "" then
+        for i = 1, #out do
+            if out[i].name == selfName then out[i].isSelf = true end
+        end
+    end
+    return out
+end
+
+-- One source trade record -> our { t, who, gave, got, where } or nil. Money-only,
+-- matching the live capture and the hover's own content. Pure.
+local function normalizeNITTrade(rec)
+    if type(rec) ~= "table" then return nil end
+    local t = tonumber(rec.time)
+    if not t or t <= 0 then return nil end
+    local gave = math.floor(tonumber(rec.playerMoney) or 0)
+    local got  = math.floor(tonumber(rec.targetMoney) or 0)
+    if gave < 0 then gave = 0 end
+    if got  < 0 then got  = 0 end
+    if gave == 0 and got == 0 then return nil end
+    local who = rec.tradeWho
+    if type(who) ~= "string" or who == "" then who = "?" end
+    local where = (type(rec.where) == "string" and rec.where ~= "" and rec.where) or nil
+    return { t = t, who = who, gave = gave, got = got, where = where }
+end
+
+-- The realm bucket's trade log, found STRUCTURALLY. The behaviour spec says the
+-- bucket holds one (§8.1) and the record keys are confirmed, but the container's
+-- own key name is not something we are willing to guess: a wrong guess that
+-- happens to hit another array is worse than finding nothing. So we look for an
+-- array whose records carry BOTH `tradeWho` and `time`, which no other bucket
+-- member does. Returns a time-ascending array (possibly empty). Pure.
+function Import._NITTradeLog(realmData)
+    local out = {}
+    if type(realmData) ~= "table" then return out end
+    for key, v in pairs(realmData) do
+        if key ~= "instances" and type(v) == "table" and #v > 0 then
+            local probe = v[1]
+            if type(probe) == "table" and probe.tradeWho ~= nil and probe.time ~= nil then
+                for i = 1, #v do
+                    local tr = normalizeNITTrade(v[i])
+                    if tr then out[#out + 1] = tr end
+                end
+            end
+        end
+    end
+    table.sort(out, function(a, b)
+        if a.t ~= b.t then return a.t < b.t end
+        return tostring(a.who) < tostring(b.who)
+    end)
+    return out
+end
+
+-- Select the trades that happened INSIDE one run: inside its [entry, exit]
+-- window, and — when the record carries a location at all — located to this
+-- instance (the reference stamps the instance name on a trade taken inside one).
+-- A run that never recorded an exit has no window and gets none. Pure.
+function Import._TradesForRun(trades, entry)
+    if type(trades) ~= "table" or #trades == 0 or type(entry) ~= "table" then return nil end
+    local from = tonumber(entry.t)
+    local to   = tonumber(entry.exitT)
+    if not from or not to or to <= from then return nil end
+    local cap = (ns.Instances and ns.Instances.MAX_TRADES) or 20
+    local out
+    for i = 1, #trades do
+        local tr = trades[i]
+        if tr.t >= from and tr.t <= to and ((not tr.where) or tr.where == entry.name) then
+            out = out or {}
+            if #out >= cap then break end
+            out[#out + 1] = { t = tr.t, who = tr.who, gave = tr.gave, got = tr.got }
+        end
+    end
+    return out
+end
+
 -- Map ONE source run record -> our instances entry, or nil if unusable.
 -- Returns (entry, usedLootField, usedXPField) so the caller can report how often
 -- the preferred accumulators were found.
@@ -845,11 +976,43 @@ function Import._MapInstanceEntry(run)
         t = t, name = name, mapID = tonumber(run.instanceID),
         dur = dur, gold = gold, xp = xp, merged = false,
         goldLoot = goldLoot or 0,
+        -- Provenance. The register's display grouping reads this: an imported
+        -- ledger contains NO merged runs (spec §8.3 — a merged record is deleted
+        -- at the source and its totals folded into the survivor), so every row
+        -- here is already a distinct instance entry and must never be folded
+        -- together by the serial-less legacy heuristic.
+        src = "nit",
     }
     -- Historical exit epoch, so the register can recompute a duration on demand
     -- exactly as it does for live runs. Zero means the run was never closed.
     if left and left > t then entry.exitT = left end
-    return entry, (lootKey ~= nil), (xpKey ~= nil)
+
+    -- ── ADDITIVE per-run detail (all optional; absent keys simply stay nil) ──
+    local detail = {}
+    -- Mob counts: the same two-counter model the live capture keeps — the
+    -- XP-derived count and the kill-derived one that carries boosted grey runs.
+    local mobXP = tonumber(run.mobCount)
+    if mobXP and mobXP >= 0 then entry.mobXP = math.floor(mobXP); detail.mob = true end
+    local mobKill = tonumber(run.mobCountFromKill)
+    if mobKill and mobKill >= 0 then entry.mobKill = math.floor(mobKill); detail.mob = true end
+    -- Level the character entered at.
+    local lvl = tonumber(run.enteredLevel)
+    if lvl and lvl > 0 then entry.enteredLevel = math.floor(lvl); detail.level = true end
+    -- Group snapshot + average, encoded into our compact stored form.
+    local members = Import._NormalizeNITGroup(run.group, run.playerName)
+    if members and ns.Instances and ns.Instances.EncodeGroup then
+        local gstr = ns.Instances.EncodeGroup(members)
+        if gstr then
+            entry.group = gstr
+            entry.groupAvg = tonumber(run.groupAverage)
+                             or (ns.Instances.AverageGroupLevel and ns.Instances.AverageGroupLevel(members))
+            if entry.groupAvg then
+                entry.groupAvg = math.floor(entry.groupAvg * 10 + 0.5) / 10
+            end
+            detail.group = true
+        end
+    end
+    return entry, (lootKey ~= nil), (xpKey ~= nil), detail
 end
 
 -- PURE core: NITdatabase -> our per-account/per-character instances partial + counts.
@@ -874,12 +1037,16 @@ function Import._MapNITData(nitDB, ownerIndex, selfAID)
         runs = 0, skipped = 0, pvpSkipped = 0, chars = 0,
         attributed = 0, orphaned = 0, lootFieldHits = 0, xpFieldHits = 0,
         pvpBy = { id = 0, type = 0, flag = 0, stripped = 0 },
+        detail = { level = 0, group = 0, mob = 0, trades = 0, tradeRecords = 0 },
         perAccount = {}, orphanAID = orphanAID,
     }
     local g = (type(nitDB) == "table") and nitDB.global
     if type(g) ~= "table" then return mapped, counts end
     for realm, realmData in pairs(g) do
         local runs = (type(realmData) == "table") and realmData.instances
+        -- The realm bucket's trade log, located structurally (see _NITTradeLog).
+        local tradeLog = Import._NITTradeLog(realmData)
+        counts.detail.tradeRecords = counts.detail.tradeRecords + #tradeLog
         if type(runs) == "table" then
             for i = 1, #runs do
                 local run = runs[i]
@@ -888,9 +1055,20 @@ function Import._MapNITData(nitDB, ownerIndex, selfAID)
                     counts.pvpSkipped = counts.pvpSkipped + 1
                     counts.pvpBy[why] = (counts.pvpBy[why] or 0) + 1
                 else
-                    local entry, lootHit, xpHit = Import._MapInstanceEntry(run)
+                    local entry, lootHit, xpHit, detail = Import._MapInstanceEntry(run)
                     local nameRealm = entry and Import._NITNameRealm(run.playerName, realm)
                     if entry and nameRealm then
+                        -- Trades taken while inside THIS run.
+                        local trades = Import._TradesForRun(tradeLog, entry)
+                        if trades then
+                            entry.trades = trades
+                            counts.detail.trades = counts.detail.trades + 1
+                        end
+                        if detail then
+                            for k in pairs(detail) do
+                                counts.detail[k] = (counts.detail[k] or 0) + 1
+                            end
+                        end
                         local known = ownerIndex[nameRealm]
                         local aid = known or orphanAID
                         local acct = mapped[aid]; if not acct then acct = {}; mapped[aid] = acct end
@@ -981,6 +1159,12 @@ local function instanceSummaryLines(counts, selfAID)
             counts.attributed or 0, counts.orphaned or 0, orphanAID),
         string.format("field preference: %d runs had a loot-coin total, %d had a chat-XP total (0 means those keys are absent -- snapshot fallback used)",
             counts.lootFieldHits or 0, counts.xpFieldHits or 0),
+        string.format("run detail: %d with an entry level, %d with a group snapshot, %d with mob counts, %d with trades (from %d trade records)",
+            (counts.detail and counts.detail.level) or 0,
+            (counts.detail and counts.detail.group) or 0,
+            (counts.detail and counts.detail.mob) or 0,
+            (counts.detail and counts.detail.trades) or 0,
+            (counts.detail and counts.detail.tradeRecords) or 0),
     }
     if (counts.orphaned or 0) > 0 then
         lines[#lines + 1] = "NOTE: populate the account index for those characters and re-run to attribute them."
@@ -1312,7 +1496,10 @@ local function selfTest(verbose)
                 { playerName = "Artaeum", instanceName = "Blackwing Lair", instanceID = 469,
                   type = "raid", difficultyID = 1, enteredTime = 1000, leftTime = 4600,
                   enteredMoney = 500, leftMoney = 1500,
-                  enteredXP = 0, leftXP = 0, mobCount = 900,
+                  enteredXP = 0, leftXP = 0, mobCount = 900, mobCountFromKill = 912,
+                  enteredLevel = 60, groupAverage = 59.5,
+                  group = { Artaeum = { level = 60, class = "MAGE" },
+                            Bramble = { level = 59, class = "ROGUE" } },
                   rawMoneyCount = 41250, xpFromChat = 0,
                   GUID = "Creature-0-3151-469-4821-11583-000082EA3F", GUIDSource = "mouseover" },
                 { playerName = "Artaeum", instanceName = "Molten Core", instanceID = 409,
@@ -1329,7 +1516,25 @@ local function selfTest(verbose)
                   enteredTime = 6200, leftTime = 7200 },
                 { playerName = "", instanceName = "Bad", enteredTime = 9000 },  -- no player -> unusable
                 { instanceName = "NoTime", enteredTime = 0 },                   -- no entry time -> unusable
-            } },
+            },
+            -- The realm bucket's TRADE LOG, alongside `instances`. The container
+            -- key is deliberately not the one the mapper looks for by name -- it
+            -- is found structurally, by the confirmed record keys.
+            tradeLog = {
+                { time = 2000, where = "Blackwing Lair", tradeWho = "Bramble",
+                  playerMoney = 500000, targetMoney = 0 },
+                { time = 3000, where = "Blackwing Lair", tradeWho = "Cera",
+                  playerMoney = 0, targetMoney = 120000 },
+                { time = 3500, where = "Orgrimmar", tradeWho = "Dorn",     -- outside
+                  playerMoney = 700000, targetMoney = 0 },
+                { time = 99000, where = "Blackwing Lair", tradeWho = "Late", -- after the run
+                  playerMoney = 100, targetMoney = 0 },
+                { time = 2500, where = "Blackwing Lair", tradeWho = "Items", -- item-only
+                  playerMoney = 0, targetMoney = 0 },
+            },
+            -- A same-shaped array that is NOT a trade log must be ignored.
+            somethingElse = { { time = 2100, note = "not a trade" } },
+        },
             ["Whitemane"] = { instances = {
                 { playerName = "Stranger", instanceName = "Scholomance", instanceID = 289,
                   type = "party", difficultyID = 1, enteredTime = 2000, leftTime = 3000,
@@ -1380,6 +1585,58 @@ local function selfTest(verbose)
     local mc = jg and jg.entries[2]
     check("nit negative wallet gold survives (repaired in-run)", mc and mc.gold == -1000)
     check("nit loot total is positive on that same run", mc and mc.goldLoot == 63000)
+
+    ------------------------------------------------------------------
+    -- PER-RUN DETAIL: the fields the row hover needs, from the confirmed keys.
+    ------------------------------------------------------------------
+    check("nit mobXP <- mobCount", bwl and bwl.mobXP == 900)
+    check("nit mobKill <- mobCountFromKill", bwl and bwl.mobKill == 912)
+    check("nit enteredLevel imported", bwl and bwl.enteredLevel == 60)
+    check("nit group encoded, self marked, name-sorted",
+        bwl and bwl.group == "*Artaeum:60|Bramble:59")
+    check("nit groupAvg <- groupAverage", bwl and bwl.groupAvg == 59.5)
+    check("nit stamps import provenance", bwl and bwl.src == "nit")
+    -- Trades: inside the window AND located to this instance.
+    check("nit trades attached to the run they happened in", bwl and bwl.trades and #bwl.trades == 2)
+    check("nit trade partner + coin given", bwl and bwl.trades[1].who == "Bramble"
+        and bwl.trades[1].gave == 500000)
+    check("nit trade coin received", bwl and bwl.trades[2].who == "Cera" and bwl.trades[2].got == 120000)
+    check("nit a trade taken OUTSIDE is not attached", mc == nil or mc.trades == nil)
+    check("nit trade-log records counted (item-only dropped)",
+        counts.detail and counts.detail.tradeRecords == 4)
+    check("nit runs-with-trades counted", counts.detail and counts.detail.trades == 1)
+    check("nit detail counters", counts.detail and counts.detail.level == 1
+        and counts.detail.group == 1 and counts.detail.mob == 1)
+    -- A record that predates every one of these keys imports cleanly without them.
+    local bare = Import._MapInstanceEntry({
+        instanceName = "Uldaman", instanceID = 70, type = "party", difficultyID = 1,
+        enteredTime = 10, leftTime = 20, enteredMoney = 0, leftMoney = 0 })
+    check("nit record without detail keys imports with none of them",
+        bare and bare.enteredLevel == nil and bare.group == nil and bare.trades == nil)
+    check("nit that record still maps its core fields", bare and bare.t == 10 and bare.dur == 10)
+
+    -- Group normalizer: every plausible container shape.
+    local arr = Import._NormalizeNITGroup({ { name = "Ann", level = 60 }, { name = "Bob", level = 58 } }, "Ann")
+    check("group array-of-tables", arr and #arr == 2 and arr[1].name == "Ann" and arr[1].isSelf == true)
+    local names = Import._NormalizeNITGroup({ "Ann", "Bob" })
+    check("group array-of-names", names and #names == 2 and names[2].level == 0)
+    local lvlMap = Import._NormalizeNITGroup({ Ann = 60, Bob = 58 })
+    check("group name->level map", lvlMap and #lvlMap == 2 and lvlMap[1].name == "Ann" and lvlMap[1].level == 60)
+    check("group nil/garbage -> nil", Import._NormalizeNITGroup(nil) == nil
+        and Import._NormalizeNITGroup({}) == nil and Import._NormalizeNITGroup("x") == nil)
+
+    -- Trade-log location + windowing, in isolation.
+    local log = Import._NITTradeLog({ instances = {}, whatever = {
+        { time = 50, tradeWho = "A", playerMoney = 10, targetMoney = 0 },
+        { time = 10, tradeWho = "B", playerMoney = 0, targetMoney = 20 },
+    } })
+    check("trade log found structurally and time-sorted", #log == 2 and log[1].who == "B")
+    check("trade log ignores a non-trade array",
+        #Import._NITTradeLog({ notes = { { time = 1, text = "x" } } }) == 0)
+    local win = Import._TradesForRun(log, { t = 5, exitT = 20, name = "Anywhere" })
+    check("trades windowed to the run", win and #win == 1 and win[1].who == "B")
+    check("an unclosed run gets no trades",
+        Import._TradesForRun(log, { t = 5, name = "Anywhere" }) == nil)
 
     -- A5.3 -- the XP snapshot delta goes negative across a ding (900 -> 100).
     -- xpFromChat is the level-up-safe figure and must win outright.

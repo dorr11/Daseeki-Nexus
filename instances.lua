@@ -21,13 +21,23 @@
 --                                the stable identifier is instanceID, stored as
 --                                entry.mapID per the design schema)
 --   GetMoney()                -> copper:number         (global; capability-guarded)
---   CombatLogGetCurrentEventInfo() -> timestamp, subEvent, hideCaster, sourceGUID, ...
+--   CombatLogGetCurrentEventInfo() -> timestamp, subEvent, hideCaster, sourceGUID,
+--                                sourceName, sourceFlags, sourceRaidFlags, destGUID, ...
 --   UnitGUID(unit)            -> guid:WOWGUID          (global; capability-guarded)
+--   UnitLevel(unit)           -> level:number          (global)
+--   UnitIsUnit(unit1, unit2)  -> result:bool
+--   GetNumGroupMembers()      -> count:number          (global)
+--   IsInRaid()                -> inRaid:bool           (global)
+--   GetPlayerTradeMoney() / GetTargetTradeMoney() -> copper:number   (globals)
 -- Events (all catalog-verified under Event.* in wow-api-catalog/latest):
 --   PLAYER_ENTERING_WORLD, PLAYER_LEAVING_WORLD, PLAYER_LOGOUT,
 --   UNIT_SPELLCAST_START / UNIT_SPELLCAST_SUCCEEDED (unitTarget, castGUID, spellID),
 --   COMBAT_LOG_EVENT_UNFILTERED, UPDATE_MOUSEOVER_UNIT, PLAYER_TARGET_CHANGED,
---   CHAT_MSG_COMBAT_XP_GAIN, CHAT_MSG_MONEY, CHAT_MSG_SYSTEM.
+--   CHAT_MSG_COMBAT_XP_GAIN, CHAT_MSG_MONEY, CHAT_MSG_SYSTEM,
+--   GROUP_ROSTER_UPDATE            (Event.PartyInfo.GroupRosterUpdate),
+--   TRADE_SHOW / TRADE_MONEY_CHANGED / PLAYER_TRADE_MONEY /
+--   TRADE_ACCEPT_UPDATE (playerAccepted, targetAccepted) / TRADE_REQUEST_CANCEL /
+--   TRADE_CLOSED                   (Event.TradeInfo.*).
 -- Every live call is guarded with a presence check so the module loads and its
 -- pure self-tests run headless with none of these globals present.
 
@@ -220,8 +230,10 @@ end
 -- Append a new entry to a character's entries list, ring-capping to RING_CAP
 -- (drops the oldest). Every entry is born NON-merged and counted; the serial
 -- watcher may retroactively merge it (Instances.ApplySerial).
+-- `extra` (optional) seeds the ADDITIVE detail fields captured at entry time
+-- (enteredLevel, group, groupAvg) without widening the positional signature.
 -- Returns (entry, count).
-function Instances.RecordInto(entries, name, mapID, t)
+function Instances.RecordInto(entries, name, mapID, t, extra)
     entries = entries or {}
     local entry = {
         t = t, name = name, mapID = mapID,
@@ -230,9 +242,142 @@ function Instances.RecordInto(entries, name, mapID, t)
         mobXP = 0,         -- kills that yielded XP
         mobKill = 0,       -- kills seen in the combat log (boosted grey runs)
     }
+    if type(extra) == "table" then
+        for k, v in pairs(extra) do
+            if entry[k] == nil and v ~= nil then entry[k] = v end
+        end
+    end
     entries[#entries + 1] = entry
     while #entries > RING_CAP do table.remove(entries, 1) end   -- evict oldest (front)
     return entry, #entries
+end
+
+----------------------------------------------------------------------
+-- PER-ENTRY DETAIL: group snapshot, entry level, trades (spec §3.4 / §8.2 / §9)
+--
+-- These are the fields the reference's per-run hover carries that our ledger did
+-- not: the level the character walked in at, who was in the group and at what
+-- levels (plus the running average), the kill-derived mob count, and any money
+-- that changed hands in a trade completed while inside.
+--
+-- WIRE / STORAGE SHAPE. The group is stored as ONE compact string —
+-- "*Artaeum:60|Bramble:58|Cera:57" (a leading "*" marks the character's own row)
+-- — not as an array of tables. A 40-man raid snapshot as 40 nested tables, on 60
+-- ring entries, on a payload that is LibSerialize'd and chunked at 230 bytes a
+-- chunk, is a materially larger mesh frame for no added meaning; the string form
+-- deflates almost to nothing across entries that share a roster. Decode is a
+-- pure function (Instances.DecodeGroup) and everything downstream reads that.
+--
+-- All of these fields are OPTIONAL and ADDITIVE: absent on every pre-existing
+-- entry, ignored by old peers, and invisible to Mesh.HashInstances (which hashes
+-- only t / name / merged), so an old peer and a new peer still agree.
+----------------------------------------------------------------------
+
+local MAX_GROUP  = 40           -- a raid is the natural bound
+local MAX_TRADES = 20           -- per entry; the reference trims its own log too
+Instances.MAX_GROUP  = MAX_GROUP
+Instances.MAX_TRADES = MAX_TRADES
+
+-- members: { { name = "Cera", level = 57, isSelf = bool }, ... } -> compact string
+-- (or nil when there is nothing worth storing). Pure.
+function Instances.EncodeGroup(members)
+    if type(members) ~= "table" then return nil end
+    local parts = {}
+    for i = 1, #members do
+        local m = members[i]
+        local nm = m and m.name
+        if type(nm) == "string" and nm ~= "" and #parts < MAX_GROUP then
+            nm = nm:gsub("[|:*]", "")                      -- separators are ours
+            if nm ~= "" then
+                local lvl = math.floor(tonumber(m.level) or 0)
+                if lvl < 0 then lvl = 0 end
+                parts[#parts + 1] = (m.isSelf and "*" or "") .. nm .. ":" .. lvl
+            end
+        end
+    end
+    if #parts == 0 then return nil end
+    return table.concat(parts, "|")
+end
+
+-- The inverse. Always returns an array (empty for nil/garbage). Pure.
+function Instances.DecodeGroup(str)
+    local out = {}
+    if type(str) ~= "string" or str == "" then return out end
+    for part in string.gmatch(str, "([^|]+)") do
+        local nm, lvl = part:match("^(.-):(%d+)$")
+        if not nm then nm, lvl = part, "0" end
+        local isSelf = false
+        if nm:sub(1, 1) == "*" then isSelf, nm = true, nm:sub(2) end
+        if nm ~= "" then
+            out[#out + 1] = { name = nm, level = tonumber(lvl) or 0, isSelf = isSelf }
+        end
+    end
+    return out
+end
+
+-- Average group level INCLUDING the player (spec §3.4), to one decimal. Members
+-- with no usable level are skipped rather than dragging the mean to zero. Pure.
+function Instances.AverageGroupLevel(members)
+    local sum, n = 0, 0
+    for i = 1, #(members or {}) do
+        local lvl = tonumber(members[i] and members[i].level) or 0
+        if lvl > 0 then sum = sum + lvl; n = n + 1 end
+    end
+    if n == 0 then return nil end
+    return math.floor((sum / n) * 10 + 0.5) / 10
+end
+
+-- UNION a fresh roster reading into the stored snapshot (spec §3.4: the roster is
+-- re-read on GROUP_ROSTER_UPDATE, and "fields are only overwritten when the new
+-- value is valid" — a member who has walked out of range must not blank the
+-- level we already recorded). First-seen order is preserved; new names append.
+-- Returns (encodedString, averageLevel, memberCount). Pure.
+function Instances.UnionGroup(prevStr, members)
+    local list = Instances.DecodeGroup(prevStr)
+    local idx = {}
+    for i = 1, #list do idx[list[i].name] = list[i] end
+    for i = 1, #(members or {}) do
+        local m = members[i]
+        local nm = m and m.name
+        if type(nm) == "string" and nm ~= "" then
+            nm = nm:gsub("[|:*]", "")
+            if nm ~= "" then
+                local have = idx[nm]
+                if have then
+                    local lvl = math.floor(tonumber(m.level) or 0)
+                    if lvl > 0 then have.level = lvl end      -- valid values only
+                    if m.isSelf then have.isSelf = true end
+                elseif #list < MAX_GROUP then
+                    local rec = { name = nm, level = math.floor(tonumber(m.level) or 0),
+                                  isSelf = m.isSelf and true or false }
+                    list[#list + 1] = rec
+                    idx[nm] = rec
+                end
+            end
+        end
+    end
+    return Instances.EncodeGroup(list), Instances.AverageGroupLevel(list), #list
+end
+
+-- Append a MONEY trade to an entry's trade log (spec §9: gold given and received
+-- per partner, located to the instance when it happened inside one). Item-only
+-- trades carry no money and are deliberately not logged — the reference's own
+-- hover reports coin. Returns the record, or nil when there was nothing to log.
+-- Pure over the entry table.
+function Instances.AppendTrade(entry, t, who, gave, got)
+    if type(entry) ~= "table" then return nil end
+    gave = math.floor(tonumber(gave) or 0)
+    got  = math.floor(tonumber(got)  or 0)
+    if gave < 0 then gave = 0 end
+    if got  < 0 then got  = 0 end
+    if gave == 0 and got == 0 then return nil end
+    if type(who) ~= "string" or who == "" then who = "?" end
+    local list = entry.trades
+    if type(list) ~= "table" then list = {}; entry.trades = list end
+    if #list >= MAX_TRADES then return nil end
+    local rec = { t = t, who = who, gave = gave, got = got }
+    list[#list + 1] = rec
+    return rec
 end
 
 -- Apply an observed instance serial to a character's ledger. THE merge decision.
@@ -251,8 +396,24 @@ function Instances.ApplySerial(entries, serial, guid, source)
     -- the watcher is one-shot, this is the belt to that braces).
     if (newest.serial or 0) > 0 then return "noop" end
 
-    local prev = entries[#entries - 1]
-    if type(prev) == "table" and not prev.merged and (prev.serial or 0) == serial then
+    -- THE PREVIOUS RECORD = the nearest preceding NON-merged entry.
+    --
+    -- The reference DELETES a merged record, so its "second-newest" is always a
+    -- live record. We keep merged records (flagged) so the mesh ledger hash input
+    -- stays stable, which means the equivalent lookup has to step back over them.
+    -- Taking entries[#entries-1] blindly broke the SECOND corpse run of a single
+    -- instance: the slot in front of the new record was the FIRST corpse run's
+    -- merged entry, `not prev.merged` failed, and the third visit committed its
+    -- own serial as a brand-new record — a phantom slot on the meter and a third
+    -- row in the register for one physical instance. Merged records only ever sit
+    -- immediately behind their own survivor, so walking back over them lands on
+    -- exactly the record the reference would have compared.
+    local prev
+    for i = #entries - 1, 1, -1 do
+        local cand = entries[i]
+        if type(cand) == "table" and not cand.merged then prev = cand; break end
+    end
+    if type(prev) == "table" and (prev.serial or 0) == serial then
         -- SAME LIVE INSTANCE: fold the new record's takings into the survivor.
         prev.goldLoot = (prev.goldLoot or 0) + (newest.goldLoot or 0)
         prev.xp       = (prev.xp or 0)       + (newest.xp or 0)
@@ -260,6 +421,21 @@ function Instances.ApplySerial(entries, serial, guid, source)
         prev.mobKill  = (prev.mobKill or 0)  + (newest.mobKill or 0)
         -- Entry level / entry XP / entry money on the survivor are deliberately
         -- NOT overwritten (spec §2.4 — overwriting them was a bug there too).
+        -- The GROUP is unioned rather than kept, though: someone who joined during
+        -- the corpse run is genuinely part of this run's roster.
+        if newest.group then
+            local gstr, gavg = Instances.UnionGroup(prev.group, Instances.DecodeGroup(newest.group))
+            if gstr then prev.group, prev.groupAvg = gstr, gavg end
+        end
+        -- Trades completed in either visit belong to the same physical run.
+        if type(newest.trades) == "table" and #newest.trades > 0 then
+            local dest = prev.trades
+            if type(dest) ~= "table" then dest = {}; prev.trades = dest end
+            for i = 1, #newest.trades do
+                if #dest >= MAX_TRADES then break end
+                dest[#dest + 1] = newest.trades[i]
+            end
+        end
         prev.prevSerial  = serial
         prev.mergeGUID   = guid
         prev.mergeSource = source
@@ -446,7 +622,8 @@ function Instances.MergeEntryList(existing, incoming)
         if e and e.t ~= nil then byT[e.t] = e end
     end
     local added = 0
-    local FILL = { "serial", "prevSerial", "exitT", "goldLoot", "mobXP", "mobKill", "mapID" }
+    local FILL = { "serial", "prevSerial", "exitT", "goldLoot", "mobXP", "mobKill", "mapID",
+                   "enteredLevel", "group", "groupAvg", "trades", "src" }
     for i = 1, #incoming do
         local e = incoming[i]
         if e and e.t ~= nil then
@@ -561,10 +738,68 @@ Instances._openKey    = nil     -- { aid, nameRealm } of the currently-open run
 Instances._openSample = nil     -- { gold, entry, entries } captured at entry
 Instances._serialArmed = false  -- one-shot serial watcher armed for this entry?
 Instances._entryAt    = nil     -- server time of entry (combat-log suppression)
+Instances._lastGroupSnap = nil  -- throttle stamp for the roster re-snapshot
+Instances._trade      = nil     -- the trade window currently open, if any
+
+-- Roster re-snapshots are throttled to once per 2 s (spec §3.4). The union means
+-- a reading skipped by the throttle costs nothing: the next one still lands.
+local GROUP_SNAP_THROTTLE = 2
+Instances.GROUP_SNAP_THROTTLE = GROUP_SNAP_THROTTLE
 
 local function sampleGold()
     if GetMoney then return GetMoney() or 0 end
     return nil
+end
+
+local function sampleLevel()
+    if not UnitLevel then return nil end
+    local l = tonumber(UnitLevel("player"))
+    if l and l > 0 then return l end
+    return nil
+end
+
+-- Read the live group roster as { name, level, isSelf }. The player is always
+-- member 1 (the average includes them, spec §3.4). Party tokens are party1..N-1
+-- (the player is not among them); raid tokens are raid1..N and DO include the
+-- player, so that one is filtered by identity. Returns nil headless.
+local function readGroupMembers()
+    if not UnitName then return nil end
+    local selfName = UnitName("player")
+    if type(selfName) ~= "string" or selfName == "" then return nil end
+    local members = { { name = selfName, level = sampleLevel() or 0, isSelf = true } }
+    local n = (GetNumGroupMembers and tonumber(GetNumGroupMembers())) or 0
+    if n > 1 then
+        local inRaid = (IsInRaid and IsInRaid()) and true or false
+        local prefix = inRaid and "raid" or "party"
+        local last = inRaid and n or (n - 1)
+        if last > MAX_GROUP then last = MAX_GROUP end
+        for i = 1, last do
+            local unit = prefix .. i
+            local nm = UnitName(unit)
+            local isMe = inRaid and UnitIsUnit and UnitIsUnit(unit, "player")
+            if type(nm) == "string" and nm ~= "" and not isMe then
+                members[#members + 1] = { name = nm, level = (UnitLevel and tonumber(UnitLevel(unit))) or 0 }
+            end
+        end
+    end
+    return members
+end
+
+-- Snapshot (and union into) the open run's group. Called once at entry (forced)
+-- and on every GROUP_ROSTER_UPDATE while inside (throttled).
+function Instances._snapshotGroup(force)
+    local sample = Instances._openSample
+    local e = sample and sample.entry
+    if not e then return end
+    local nowE = now()
+    if not force and Instances._lastGroupSnap
+        and (nowE - Instances._lastGroupSnap) < GROUP_SNAP_THROTTLE then return end
+    Instances._lastGroupSnap = nowE
+    local members = readGroupMembers()
+    if not members then return end
+    local gstr, gavg = Instances.UnionGroup(e.group, members)
+    if gstr then e.group, e.groupAvg = gstr, gavg end
+    return gstr
 end
 
 -- Read the current instance identity from the live client. Returns
@@ -586,12 +821,18 @@ function Instances._recordEntry()
     local nameRealm = selfNameRealm()
     local t = now()
     local entries = charEntries(aid, nameRealm, true)
-    local entry = Instances.RecordInto(entries, name, instanceID, t)
+    -- ADDITIVE detail sampled at the moment of entry: the level the character
+    -- walked in at (never overwritten later, spec §2.4 / §8.2).
+    local entry = Instances.RecordInto(entries, name, instanceID, t,
+        { enteredLevel = sampleLevel() })
     -- Open a run so exit can stamp duration + the wallet delta.
     Instances._openKey     = { aid = aid, nameRealm = nameRealm }
     Instances._openSample  = { gold = sampleGold(), entry = entry, entries = entries }
     Instances._entryAt     = t
     Instances._serialArmed = true   -- one-shot serial watcher (spec §2.1)
+    -- Group snapshot at entry; GROUP_ROSTER_UPDATE keeps it current while inside.
+    Instances._lastGroupSnap = nil
+    Instances._snapshotGroup(true)
     -- The entry is COUNTED immediately; the serial watcher may retroactively
     -- un-count it (spec §2.7).
     Instances._maybeWarn(aid, t)
@@ -622,6 +863,7 @@ function Instances._closeRun()
     local sample = Instances._openSample
     Instances._openKey, Instances._openSample = nil, nil
     Instances._serialArmed, Instances._entryAt = false, nil
+    Instances._lastGroupSnap, Instances._trade = nil, nil
     if not (sample and sample.entry) then return end
     Instances._stampExit(sample, now())
     if ns.Fire then ns:Fire("INSTANCES_CHANGED") end
@@ -693,13 +935,38 @@ local function pastSuppression()
 end
 
 -- COMBAT_LOG_EVENT_UNFILTERED -> read via CombatLogGetCurrentEventInfo().
+-- Two consumers now share the one read: the serial watcher (one-shot, suppressed
+-- for 2 s after entry) and the KILL-DERIVED mob counter (spec §3.4 secondary).
 function Instances._onCombatLog()
-    if not Instances._serialArmed then return end
     if not CombatLogGetCurrentEventInfo then return end
-    if not pastSuppression() then return end
-    local _, subEvent, _, sourceGUID = CombatLogGetCurrentEventInfo()
+    local _, subEvent, _, sourceGUID, _, _, _, destGUID = CombatLogGetCurrentEventInfo()
+    if subEvent == "UNIT_DIED" then
+        Instances._onUnitDied(destGUID)
+        return
+    end
+    if not Instances._serialArmed then return end
     if not CL_SERIAL_EVENTS[subEvent or ""] then return end
+    if not pastSuppression() then return end
     Instances._observeSerial(sourceGUID, "combatlog")
+end
+
+-- The SECONDARY mob counter (spec §3.4): a kill seen in the combat log, whether
+-- or not it yielded XP. It exists precisely for the boosted run where every mob
+-- is grey and the XP-derived count stays at zero; the display prefers the
+-- XP-derived count whenever that is above zero.
+--
+-- SIMPLIFICATION (documented): the reference excludes a maintained list of
+-- companion/critter NPC ids. We have no such list and will not invent one, so a
+-- rat killed inside an instance counts here. It cannot skew the displayed number
+-- on any run that yielded XP (the primary count wins), and on a boosted run the
+-- error is a handful of critters against hundreds of kills.
+function Instances._onUnitDied(destGUID)
+    local sample = Instances._openSample
+    local e = sample and sample.entry
+    if not e then return end
+    if type(destGUID) ~= "string" then return end
+    if destGUID:sub(1, 9) ~= "Creature-" then return end   -- players/pets are not mobs
+    e.mobKill = (e.mobKill or 0) + 1
 end
 
 -- UPDATE_MOUSEOVER_UNIT / PLAYER_TARGET_CHANGED -> UnitGUID("mouseover"/"target").
@@ -746,6 +1013,74 @@ function Instances._onMoney(text)
     local copper = Instances.ParseMoneyCopper(text)
     if not copper or copper <= 0 then return end
     e.goldLoot = (e.goldLoot or 0) + copper
+end
+
+----------------------------------------------------------------------
+-- Trades completed while inside (spec §9 — coin given/received per partner,
+-- located to the instance when the trade happened inside one)
+--
+-- THE MECHANISM. The trade window's money getters are only valid while the
+-- window is open, and no event says "that trade went through". What the client
+-- does give us is: TRADE_SHOW (window opened, partner is unit "NPC"),
+-- TRADE_MONEY_CHANGED / PLAYER_TRADE_MONEY (either side moved coin),
+-- TRADE_ACCEPT_UPDATE(playerAccepted, targetAccepted) and TRADE_CLOSED. So we
+-- sample the coin on every money event, latch "both sides accepted" from
+-- TRADE_ACCEPT_UPDATE — the last moment the getters are guaranteed readable —
+-- and commit the record on TRADE_CLOSED. TRADE_REQUEST_CANCEL drops the window.
+--
+-- SIMPLIFICATIONS (deliberate, and the only ones):
+--   * a both-accepted trade that the SERVER then refuses (a full bag on either
+--     side is the realistic case) is still logged. There is no client-side event
+--     that distinguishes it, and over-logging a trade the owner did attempt is
+--     the benign direction of that error.
+--   * ITEM-only trades are not logged at all. The hover reports coin, so an
+--     item-for-item trade has nothing to show; AppendTrade drops a 0/0 record.
+--   * only trades completed while a run is OPEN are logged, which is exactly the
+--     "trades while inside" scoping the panel needs.
+----------------------------------------------------------------------
+
+local function tradePartner()
+    if not UnitName then return nil end
+    local nm = UnitName("NPC")
+    if type(nm) == "string" and nm ~= "" then return nm end
+    return nil
+end
+
+function Instances._onTradeShow()
+    Instances._trade = { who = tradePartner(), gave = 0, got = 0, accepted = false }
+end
+
+function Instances._onTradeMoney()
+    local tr = Instances._trade
+    if not tr then return end
+    if GetPlayerTradeMoney then tr.gave = tonumber(GetPlayerTradeMoney()) or tr.gave end
+    if GetTargetTradeMoney then tr.got  = tonumber(GetTargetTradeMoney()) or tr.got end
+    if not tr.who then tr.who = tradePartner() end
+end
+
+function Instances._onTradeAccept(playerAccepted, targetAccepted)
+    local tr = Instances._trade
+    if not tr then return end
+    Instances._onTradeMoney()      -- resample: the getters are still valid here
+    if tonumber(playerAccepted) == 1 and tonumber(targetAccepted) == 1 then
+        tr.accepted = true
+    end
+end
+
+function Instances._onTradeCancel()
+    Instances._trade = nil
+end
+
+function Instances._onTradeClosed()
+    local tr = Instances._trade
+    Instances._trade = nil
+    if not (tr and tr.accepted) then return end
+    local sample = Instances._openSample
+    local e = sample and sample.entry
+    if not e then return end       -- not inside a run: nothing to attach it to
+    local rec = Instances.AppendTrade(e, now(), tr.who, tr.gave, tr.got)
+    if rec and ns.Fire then ns:Fire("INSTANCES_CHANGED") end
+    return rec
 end
 
 ----------------------------------------------------------------------
@@ -839,6 +1174,14 @@ Instances._Handlers = {
     CHAT_MSG_COMBAT_XP_GAIN  = function(text) Instances._onXPGain(text) end,
     CHAT_MSG_MONEY           = function(text) Instances._onMoney(text) end,
     CHAT_MSG_SYSTEM          = function(text) Instances._onSystemMessage(text) end,
+    -- Per-entry detail (catalog: Event.PartyInfo.GroupRosterUpdate, Event.TradeInfo.*)
+    GROUP_ROSTER_UPDATE      = function() Instances._snapshotGroup() end,
+    TRADE_SHOW               = function() Instances._onTradeShow() end,
+    TRADE_MONEY_CHANGED      = function() Instances._onTradeMoney() end,
+    PLAYER_TRADE_MONEY       = function() Instances._onTradeMoney() end,
+    TRADE_ACCEPT_UPDATE      = function(p, t) Instances._onTradeAccept(p, t) end,
+    TRADE_REQUEST_CANCEL     = function() Instances._onTradeCancel() end,
+    TRADE_CLOSED             = function() Instances._onTradeClosed() end,
 }
 
 function Instances.OnLogin()
@@ -927,14 +1270,24 @@ local function newSimClient()
         GetMoney = G.GetMoney, UnitName = G.UnitName, GetRealmName = G.GetRealmName,
         CombatLogGetCurrentEventInfo = G.CombatLogGetCurrentEventInfo,
         UnitGUID = G.UnitGUID, C_Timer = G.C_Timer,
+        UnitLevel = G.UnitLevel, UnitIsUnit = G.UnitIsUnit,
+        GetNumGroupMembers = G.GetNumGroupMembers, IsInRaid = G.IsInRaid,
+        GetPlayerTradeMoney = G.GetPlayerTradeMoney, GetTargetTradeMoney = G.GetTargetTradeMoney,
     }
     local savedNow, savedData, savedGet = Store.Now, Store.data, ns.GetAccountID
     local savedDB = Store.db
     local savedState = {
         Instances._inside, Instances._curKey, Instances._openKey,
         Instances._openSample, Instances._serialArmed, Instances._entryAt,
-        Instances._serverCapAt,
+        Instances._serverCapAt, Instances._lastGroupSnap, Instances._trade,
     }
+
+    -- Group roster the sim reports: { unitToken -> {name, level} } plus the player.
+    sim.playerLevel = 58
+    sim.party = {}         -- array of { name = , level = }
+    sim.inRaid = false
+    sim.tradeMoney = { player = 0, target = 0 }
+    sim.tradePartner = "Bramble"
 
     G.IsInInstance = function() return sim.inside, sim.itype end
     G.GetInstanceInfo = function()
@@ -942,7 +1295,32 @@ local function newSimClient()
     end
     G.GetMoney = function() return sim.money end
     G.UnitGUID = function(unit) return sim.unitGUID and sim.unitGUID[unit] or nil end
-    G.UnitName = function() return "Tester" end
+    G.UnitName = function(unit)
+        if unit == "player" or unit == nil then return "Tester" end
+        if unit == "NPC" then return sim.tradePartner end
+        local i = tonumber(tostring(unit):match("(%d+)$"))
+        local m = i and sim.party[i]
+        return m and m.name or nil
+    end
+    G.UnitLevel = function(unit)
+        if unit == "player" then return sim.playerLevel end
+        local i = tonumber(tostring(unit):match("(%d+)$"))
+        local m = i and sim.party[i]
+        return m and m.level or 0
+    end
+    G.UnitIsUnit = function(a, b)
+        if b ~= "player" then return false end
+        local i = tonumber(tostring(a):match("(%d+)$"))
+        local m = i and sim.party[i]
+        return (m and m.name == "Tester") and true or false
+    end
+    G.GetNumGroupMembers = function()
+        if #sim.party == 0 then return 0 end
+        return sim.inRaid and #sim.party or (#sim.party + 1)
+    end
+    G.IsInRaid = function() return sim.inRaid end
+    G.GetPlayerTradeMoney = function() return sim.tradeMoney.player end
+    G.GetTargetTradeMoney = function() return sim.tradeMoney.target end
     G.GetRealmName = function() return "Sim Realm" end
     G.C_Timer = nil   -- print immediately in tests rather than deferring 0.2 s
     Store.Now = function() return sim.clock end
@@ -956,6 +1334,7 @@ local function newSimClient()
     Instances._openKey, Instances._openSample = nil, nil
     Instances._serialArmed, Instances._entryAt = false, nil
     Instances._serverCapAt = nil
+    Instances._lastGroupSnap, Instances._trade = nil, nil
 
     -- Fire an event exactly as core.lua's event frame would.
     function sim.fire(event, ...)
@@ -1001,6 +1380,29 @@ local function newSimClient()
         end
         sim.fire("COMBAT_LOG_EVENT_UNFILTERED")
     end
+    -- A mob (or, with a Player GUID, a group member) dies in the combat log.
+    function sim.unitDied(guid)
+        G.CombatLogGetCurrentEventInfo = function()
+            return sim.clock, "UNIT_DIED", false, nil, nil, 0, 0,
+                   guid or creatureGUID(4242, 11583)
+        end
+        sim.fire("COMBAT_LOG_EVENT_UNFILTERED")
+    end
+    -- Set the group roster (array of { name, level }) and fire the roster event.
+    function sim.setGroup(members, inRaid)
+        sim.party = members or {}
+        sim.inRaid = inRaid and true or false
+        sim.fire("GROUP_ROSTER_UPDATE")
+    end
+    -- A complete money trade: open, move coin, both accept, close.
+    function sim.trade(who, gave, got, accept)
+        sim.tradePartner = who
+        sim.fire("TRADE_SHOW")
+        sim.tradeMoney.player, sim.tradeMoney.target = gave or 0, got or 0
+        sim.fire("TRADE_MONEY_CHANGED")
+        sim.fire("TRADE_ACCEPT_UPDATE", accept == false and 0 or 1, accept == false and 0 or 1)
+        sim.fire("TRADE_CLOSED")
+    end
     function sim.entries()
         local acct = Store.data.instances["1"] or {}
         local crec = acct["Tester-SimRealm"]
@@ -1015,6 +1417,7 @@ local function newSimClient()
         Instances._openKey, Instances._openSample = savedState[3], savedState[4]
         Instances._serialArmed, Instances._entryAt = savedState[5], savedState[6]
         Instances._serverCapAt = savedState[7]
+        Instances._lastGroupSnap, Instances._trade = savedState[8], savedState[9]
     end
     return sim
 end
@@ -1535,7 +1938,9 @@ local function testSegmentRoundTrip(fails)
             -- Carries the NEW optional fields: old peers ignore what they do not
             -- know, new peers get the richer record. Additive by construction.
             { t = 1500, name = "Zul'Gurub", mapID = 309, dur = 3600, gold = 500, xp = 0,
-              merged = false, serial = 8181, exitT = 5100, goldLoot = 4200, mobXP = 40, mobKill = 44 },
+              merged = false, serial = 8181, exitT = 5100, goldLoot = 4200, mobXP = 40, mobKill = 44,
+              enteredLevel = 60, group = "*Tester:60|Bramble:60", groupAvg = 60,
+              trades = { { t = 4000, who = "Bramble", gave = 500000, got = 0 } } },
             { t = 1600, name = "Zul'Gurub", mapID = 309, dur = 60, gold = 0, xp = 0,
               merged = true, serial = 8181 },
         } },
@@ -1553,8 +1958,218 @@ local function testSegmentRoundTrip(fails)
     ck(e[1].name == "Zul'Gurub" and e[2].merged == true, "round-trip: fields + merged flag intact")
     ck(e[1].serial == 8181 and e[1].exitT == 5100 and e[1].goldLoot == 4200,
         "round-trip: the new optional fields survive the wire")
+    ck(e[1].enteredLevel == 60 and e[1].group == "*Tester:60|Bramble:60" and e[1].groupAvg == 60,
+        "round-trip: entry level + group snapshot survive the wire")
+    ck(type(e[1].trades) == "table" and e[1].trades[1].who == "Bramble" and e[1].trades[1].gave == 500000,
+        "round-trip: the nested trade log survives the wire")
     ns.GetAccountID = savedGet
     Store.data = saved
+end
+
+-- The PURE per-entry detail primitives: group codec, average, union, trade log.
+local function testDetailPrimitives(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+
+    -- Codec round-trip, including the "you" marker.
+    local members = { { name = "Tester", level = 58, isSelf = true },
+                      { name = "Bramble", level = 57 }, { name = "Cera", level = 60 } }
+    local str = Instances.EncodeGroup(members)
+    ck(str == "*Tester:58|Bramble:57|Cera:60", "group encodes compactly (got " .. tostring(str) .. ")")
+    local back = Instances.DecodeGroup(str)
+    ck(#back == 3, "group decodes 3 members (got " .. #back .. ")")
+    ck(back[1].name == "Tester" and back[1].level == 58 and back[1].isSelf == true,
+        "group decode: self member with its level")
+    ck(back[3].name == "Cera" and back[3].isSelf == false, "group decode: non-self member")
+    ck(Instances.EncodeGroup({}) == nil, "empty roster encodes to nil, not an empty string")
+    ck(Instances.EncodeGroup(nil) == nil, "nil roster -> nil")
+    ck(#Instances.DecodeGroup(nil) == 0, "decoding nil yields an empty list")
+    ck(#Instances.DecodeGroup("") == 0, "decoding an empty string yields an empty list")
+    ck(#Instances.DecodeGroup("garbage") == 1 and Instances.DecodeGroup("garbage")[1].level == 0,
+        "a level-less token still decodes with level 0")
+    -- Separators can never be smuggled in via a name.
+    local sep = Instances.DecodeGroup(Instances.EncodeGroup({ { name = "A|B:C*D", level = 5 } }))
+    ck(#sep == 1 and sep[1].name == "ABCD" and sep[1].level == 5, "separators stripped from names")
+
+    -- Average INCLUDING the player; unknown levels are skipped, not counted as 0.
+    ck(Instances.AverageGroupLevel(members) == 58.3,
+        "avg group level to 1dp (got " .. tostring(Instances.AverageGroupLevel(members)) .. ")")
+    ck(Instances.AverageGroupLevel({ { name = "A", level = 60 }, { name = "B", level = 0 } }) == 60,
+        "a member with no level does not drag the average down")
+    ck(Instances.AverageGroupLevel({}) == nil, "no members -> no average")
+
+    -- UNION: new names append, valid levels update, invalid levels never blank.
+    local u1, avg1, n1 = Instances.UnionGroup(str, { { name = "Bramble", level = 58 },
+                                                     { name = "Dorn", level = 55 } })
+    local ul = Instances.DecodeGroup(u1)
+    ck(n1 == 4 and #ul == 4, "union appends the newcomer (got " .. tostring(n1) .. ")")
+    ck(ul[2].name == "Bramble" and ul[2].level == 58, "union updates a member who dinged")
+    ck(ul[1].name == "Tester" and ul[1].isSelf == true, "union preserves first-seen order + self")
+    ck(ul[4].name == "Dorn", "the newcomer lands last")
+    ck(avg1 == 57.8, "union recomputes the average (got " .. tostring(avg1) .. ")")
+    local u2 = Instances.DecodeGroup(Instances.UnionGroup(u1, { { name = "Bramble", level = 0 } }))
+    ck(u2[2].level == 58, "an out-of-range reading (level 0) does NOT blank a known level")
+    local u3, _, n3 = Instances.UnionGroup(nil, { { name = "Solo", level = 41, isSelf = true } })
+    ck(n3 == 1 and u3 == "*Solo:41", "union from nothing seeds the snapshot")
+    -- The roster cap holds at a full raid.
+    local big = {}
+    for i = 1, Instances.MAX_GROUP + 10 do big[i] = { name = "M" .. i, level = 60 } end
+    local _, _, nBig = Instances.UnionGroup(nil, big)
+    ck(nBig == Instances.MAX_GROUP, "group capped at MAX_GROUP (got " .. tostring(nBig) .. ")")
+
+    -- Trade log.
+    local e = {}
+    ck(Instances.AppendTrade(e, 100, "Bramble", 500000, 0) ~= nil, "a money trade is logged")
+    ck(#e.trades == 1 and e.trades[1].who == "Bramble" and e.trades[1].gave == 500000,
+        "trade record carries partner + coin given")
+    ck(Instances.AppendTrade(e, 110, "Cera", 0, 120000) ~= nil, "a received-coin trade is logged")
+    ck(e.trades[2].got == 120000, "coin received recorded")
+    ck(Instances.AppendTrade(e, 120, "Dorn", 0, 0) == nil, "an item-only (0/0) trade is NOT logged")
+    ck(#e.trades == 2, "…and adds no record")
+    ck(Instances.AppendTrade(e, 130, nil, 100, 0) ~= nil, "an unnamed partner still logs")
+    ck(e.trades[3].who == "?", "…as an explicit unknown")
+    ck(Instances.AppendTrade(nil, 1, "X", 1, 0) == nil, "nil entry -> no record, no error")
+    for i = 1, Instances.MAX_TRADES + 5 do Instances.AppendTrade(e, 200 + i, "Spam", 1, 0) end
+    ck(#e.trades == Instances.MAX_TRADES, "trade log capped at MAX_TRADES (got " .. #e.trades .. ")")
+end
+
+-- LIVE per-entry detail through the real handlers: entry level, roster union,
+-- the kill-derived mob counter, and trades scoped to the run.
+local function testLiveDetailCapture(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local sim = newSimClient()
+    local ok, err = pcall(function()
+        sim.playerLevel = 58
+        sim.party = { { name = "Bramble", level = 57 }, { name = "Cera", level = 60 } }
+        sim.enter("Scholomance", 289)
+        local e = sim.entries()[1]
+        ck(e.enteredLevel == 58, "entry level captured at zone-in (got " .. tostring(e.enteredLevel) .. ")")
+        local g = Instances.DecodeGroup(e.group)
+        ck(#g == 3, "group snapshotted at entry: player + 2 (got " .. #g .. ")")
+        ck(g[1].name == "Tester" and g[1].isSelf == true, "the player leads the roster")
+        ck(e.groupAvg == 58.3, "average group level includes the player (got " .. tostring(e.groupAvg) .. ")")
+
+        -- A fourth member joins mid-run: the roster UNIONS, it does not replace.
+        sim.clock = sim.clock + 60
+        sim.setGroup({ { name = "Bramble", level = 57 }, { name = "Cera", level = 60 },
+                       { name = "Dorn", level = 55 } })
+        local g2 = Instances.DecodeGroup(sim.entries()[1].group)
+        ck(#g2 == 4, "roster update unions the newcomer in (got " .. #g2 .. ")")
+        -- Someone drops group entirely: the people who WERE here stay recorded.
+        sim.clock = sim.clock + 60
+        sim.setGroup({ { name = "Bramble", level = 57 } })
+        local g3 = Instances.DecodeGroup(sim.entries()[1].group)
+        ck(#g3 == 4, "a member leaving does not erase them from the run's roster (got " .. #g3 .. ")")
+
+        -- Throttle: two roster events inside 2 s only sample once.
+        sim.setGroup({ { name = "Zed", level = 60 } })
+        ck(#Instances.DecodeGroup(sim.entries()[1].group) == 4, "roster re-read throttled to 2 s")
+        sim.clock = sim.clock + 3
+        sim.setGroup({ { name = "Zed", level = 60 } })
+        ck(#Instances.DecodeGroup(sim.entries()[1].group) == 5, "…and lands once the throttle lapses")
+
+        -- Kill-derived mob count (the boosted-run counter).
+        sim.unitDied()
+        sim.unitDied()
+        ck(sim.entries()[1].mobKill == 2, "UNIT_DIED on a creature counts a kill (got "
+            .. tostring(sim.entries()[1].mobKill) .. ")")
+        ck((sim.entries()[1].mobXP or 0) == 0, "…without touching the XP-derived count")
+        sim.unitDied("Player-3299-0AB4C1D2")
+        ck(sim.entries()[1].mobKill == 2, "a player death is not a mob kill")
+        sim.fire("CHAT_MSG_COMBAT_XP_GAIN", "Risen Guard dies, you gain 300 experience.")
+        ck(sim.entries()[1].mobXP == 1, "the XP-derived counter still works alongside")
+
+        -- A trade completed INSIDE lands on the run.
+        sim.clock = sim.clock + 30
+        sim.trade("Bramble", 500000, 0)
+        local tr = sim.entries()[1].trades
+        ck(tr and #tr == 1, "a completed trade inside is logged (got " .. tostring(tr and #tr) .. ")")
+        ck(tr[1].who == "Bramble" and tr[1].gave == 500000, "trade partner + coin given recorded")
+        ck(tr[1].t == sim.clock, "trade stamped with the time it completed")
+        -- A cancelled trade is not.
+        sim.trade("Cera", 999, 0, false)
+        ck(#sim.entries()[1].trades == 1, "a trade neither side accepted is NOT logged")
+        -- Nor is one that opens and is cancelled outright.
+        sim.fire("TRADE_SHOW"); sim.fire("TRADE_REQUEST_CANCEL"); sim.fire("TRADE_CLOSED")
+        ck(#sim.entries()[1].trades == 1, "a cancelled trade window logs nothing")
+
+        -- Outside the instance nothing is captured at all.
+        sim.clock = sim.clock + 30
+        sim.leave()
+        sim.unitDied()
+        sim.trade("Cera", 700000, 0)
+        ck(sim.entries()[1].mobKill == 2, "no kills counted once the run is closed")
+        ck(#sim.entries()[1].trades == 1, "no trades logged once the run is closed")
+    end)
+    sim.restore()
+    if not ok then fails[#fails + 1] = "live detail sim errored: " .. tostring(err) end
+end
+
+-- The SECOND corpse run into the same live instance. The reference deletes a
+-- merged record, so its "previous record" is always live; we keep merged records
+-- flagged, so the lookup has to step back over them or the third visit bills a
+-- phantom slot and shows as its own row.
+local function testDoubleCorpseRun(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local sim = newSimClient()
+    local ok, err = pcall(function()
+        sim.enter("Stratholme", 329)
+        sim.clock = sim.clock + 10
+        sim.cast(9100)
+        sim.fire("CHAT_MSG_MONEY", "You loot 1 Gold, 0 Silver, 0 Copper")
+
+        -- Wipe 1 -> corpse run back into the SAME instance.
+        sim.clock = sim.clock + 300; sim.leave()
+        sim.clock = sim.clock + 200; sim.enter("Stratholme", 329)
+        sim.clock = sim.clock + 5;   sim.cast(9100)
+        ck(sim.counts().hour == 1, "first corpse run consumes no slot")
+
+        -- Wipe 2 -> corpse run back AGAIN. The record in front of the new one is
+        -- now the first corpse run's MERGED entry.
+        sim.clock = sim.clock + 300; sim.leave()
+        sim.clock = sim.clock + 200; sim.enter("Stratholme", 329)
+        sim.clock = sim.clock + 5;   sim.cast(9100)
+        local e = sim.entries()
+        ck(#e == 3, "three physical visits recorded")
+        ck(e[3].merged == true, "the SECOND corpse run merges too (got merged="
+            .. tostring(e[3].merged) .. ")")
+        ck(sim.counts().hour == 1, "one live instance = one slot, however many corpse runs (got "
+            .. sim.counts().hour .. ")")
+        ck(e[1].merged == false and e[1].serial == 9100, "the original survivor holds the serial")
+
+        -- A genuine reset after all that still bills its own slot.
+        sim.clock = sim.clock + 300; sim.leave()
+        sim.clock = sim.clock + 60;  sim.enter("Stratholme", 329)
+        sim.clock = sim.clock + 5;   sim.cast(9101)
+        ck(sim.entries()[4].merged == false, "a reset+rerun after corpse runs is NOT merged")
+        ck(sim.counts().hour == 2, "…and burns its own slot (got " .. sim.counts().hour .. ")")
+    end)
+    sim.restore()
+    if not ok then fails[#fails + 1] = "double corpse-run sim errored: " .. tostring(err) end
+end
+
+-- A merge must fold the DETAIL fields too: the corpse-run roster and any trades
+-- taken during it belong to the same physical run.
+local function testMergeFoldsDetail(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local entries = {}
+    local a = select(1, Instances.RecordInto(entries, "Molten Core", 409, 1000,
+        { enteredLevel = 58, group = "*Tester:58|Bramble:57", groupAvg = 57.5 }))
+    a.serial = 4242
+    Instances.AppendTrade(a, 1100, "Bramble", 100000, 0)
+    local b = select(1, Instances.RecordInto(entries, "Molten Core", 409, 1400,
+        { enteredLevel = 59, group = "*Tester:59|Dorn:60", groupAvg = 59.5 }))
+    Instances.AppendTrade(b, 1450, "Dorn", 0, 250000)
+    b.mobKill = 7
+    local res, survivor = Instances.ApplySerial(entries, 4242, "g", "cast")
+    ck(res == "merged" and survivor == a, "same serial merges into the survivor")
+    ck(a.enteredLevel == 58, "entry level on the survivor is NOT overwritten (spec §2.4)")
+    local g = Instances.DecodeGroup(a.group)
+    ck(#g == 3, "the corpse-run roster is unioned into the survivor (got " .. #g .. ")")
+    ck(g[1].level == 59, "a member who dinged during the re-entry updates")
+    ck(a.groupAvg == 58.7, "average recomputed over the union (got " .. tostring(a.groupAvg) .. ")")
+    ck(#a.trades == 2, "trades from both visits land on the survivor (got " .. #a.trades .. ")")
+    ck(a.trades[2].who == "Dorn", "…in order")
+    ck(a.mobKill == 7, "kill-derived count folded")
 end
 
 -- The mesh instance-ledger hash must be BLIND to the new optional fields, or an
@@ -1568,7 +2183,10 @@ local function testHashCompat(fails)
     } } }
     local new = { ["A-R"] = { entries = {
         { t = 100, name = "MC", merged = false, serial = 77, exitT = 180, goldLoot = 9,
-          mobXP = 3, mobKill = 4, prevSerial = 77, mergeGUID = "g", mergeSource = "cast" },
+          mobXP = 3, mobKill = 4, prevSerial = 77, mergeGUID = "g", mergeSource = "cast",
+          -- the per-entry DETAIL fields must be invisible to the hash too
+          enteredLevel = 58, group = "*Tester:58|Bramble:57", groupAvg = 57.5,
+          trades = { { t = 150, who = "Bramble", gave = 500000, got = 0 } }, src = "nit" },
         { t = 200, name = "MC", merged = true, serial = 77 },
     } } }
     ck(ns.Mesh.HashInstances(old) == ns.Mesh.HashInstances(new),
@@ -1595,6 +2213,10 @@ function Instances.RunSelfTests(verbose)
         { name = "rolling-window counts",         fn = testWindowCounts },
         { name = "ring capping",                  fn = testRingCap },
         { name = "cross-account + orphan bucket", fn = testCrossAccount },
+        { name = "per-entry detail primitives",   fn = testDetailPrimitives },
+        { name = "live detail capture",           fn = testLiveDetailCapture },
+        { name = "double corpse run",             fn = testDoubleCorpseRun },
+        { name = "merge folds detail fields",     fn = testMergeFoldsDetail },
         { name = "inbound merge dedup",           fn = testMergeInbound },
         { name = "segment round-trip (codec)",    fn = testSegmentRoundTrip },
         { name = "mesh hash compatibility",       fn = testHashCompat },

@@ -112,6 +112,64 @@ function InstancesUI.FormatMoney(copper)
     return string.format("%s%dc", sign, c)
 end
 
+-- Signed copper -> the FULL coin form "4g 82s 10c", dropping only the leading
+-- units that are zero. The compact FormatMoney above stops at two units because
+-- it feeds a 42px register cell; the row hover has the room for the real figure,
+-- and "raw gold from mobs" is one of the numbers the owner reads off it. Pure.
+function InstancesUI.FormatMoneyFull(copper)
+    copper = math.floor(tonumber(copper) or 0)
+    local sign = ""
+    if copper < 0 then sign = "-"; copper = -copper end
+    local g = math.floor(copper / 10000)
+    local s = math.floor((copper % 10000) / 100)
+    local c = copper % 100
+    if g > 0 then return string.format("%s%dg %ds %dc", sign, g, s, c) end
+    if s > 0 then return string.format("%s%ds %dc", sign, s, c) end
+    return string.format("%s%dc", sign, c)
+end
+
+-- An epoch -> a wall-clock time the owner can match against their evening:
+-- "8:42 PM" for today, "12 Aug 8:42 PM" for anything older. 12-hour, matching
+-- the reference's own default.
+--
+-- SIMPLIFICATION: entry epochs are SERVER time and this renders them through the
+-- local clock, so a player whose realm sits in another timezone reads a shifted
+-- clock. Differencing GetGameTime() against the local clock to correct that is a
+-- whole feature of its own; every OTHER figure in the block (durations, "ago")
+-- is a difference of epochs and is timezone-proof either way. Pure given a clock.
+function InstancesUI.ClockText(epoch, nowE)
+    epoch = tonumber(epoch)
+    if not epoch or epoch <= 0 then return nil end
+    local D = date or (os and os.date)
+    if not D then return nil end
+    local ok, hm = pcall(D, "%I:%M %p", epoch)
+    if not ok or type(hm) ~= "string" or hm == "" then return nil end
+    hm = hm:gsub("^0", "")
+    if nowE then
+        local ok2, dayA = pcall(D, "%Y%m%d", epoch)
+        local ok3, dayB = pcall(D, "%Y%m%d", nowE)
+        if ok2 and ok3 and dayA ~= dayB then
+            local ok4, dm = pcall(D, "%d %b", epoch)
+            if ok4 and type(dm) == "string" then
+                return (dm:gsub("^0", "")) .. " " .. hm
+            end
+        end
+    end
+    return hm
+end
+
+-- Mobs killed on a run: the XP-derived count when it has anything to say, else
+-- the combat-log count (spec §3.4 — the second exists so a boosted run of grey
+-- mobs, which yields no XP at all, still reports a kill count). Pure.
+function InstancesUI.MobCount(entry)
+    entry = entry or {}
+    local byXP = math.floor(tonumber(entry.mobXP) or 0)
+    if byXP > 0 then return byXP, "xp" end
+    local byKill = math.floor(tonumber(entry.mobKill) or 0)
+    if byKill > 0 then return byKill, "kill" end
+    return 0, nil
+end
+
 -- "just now" under a minute, else "<duration> ago". Pure.
 function InstancesUI.AgoText(sec)
     sec = math.max(0, math.floor(sec or 0))
@@ -119,6 +177,151 @@ function InstancesUI.AgoText(sec)
     local D = ns.Dashboard
     local dur = (D and D.FormatDuration and D.FormatDuration(sec)) or (math.floor(sec / 60) .. "m")
     return dur .. " ago"
+end
+
+-- ── ONE ROW PER PHYSICAL INSTANCE (owner: "if i leave and re-enter the same
+--    instance, without resetting it, then that should show as a single line,
+--    rather than 2") ───────────────────────────────────────────────────────────
+--
+-- The grouping key is the SERVER INSTANCE SERIAL, and nothing weaker. Two visits
+-- collapse into one row iff the server says they were the same live instance —
+-- exactly the rule the cap math already runs on. A reset-and-rerun of the same
+-- dungeon gets a new serial, bills its own slot, and KEEPS ITS OWN ROW: those
+-- rows are the owner's evidence of where the five went.
+--
+-- CAP MATH IS UNTOUCHED. This is a presentation fold over the same entries; each
+-- visit still carries its own `merged` flag and still counts (or doesn't) exactly
+-- as it did. Nothing here writes to the ledger.
+--
+-- SERIAL-LESS LEGACY ROWS. An entry that never observed a serial (an old Nexus
+-- build, or a run where nothing was moused over, targeted, cast or swung before
+-- the player left) cannot be joined on identity. For those, and ONLY those, a
+-- deliberately narrow continuation heuristic applies — same account, same
+-- character, same instance, the earlier visit actually recorded an exit, and the
+-- re-entry happened within LEGACY_JOIN_GAP of it. When any of that is missing the
+-- rows stay separate: a wrongly-folded row HIDES a run the owner paid a slot for,
+-- which is much worse than showing a corpse run twice.
+--
+-- IMPORTED ROWS ARE NEVER FOLDED. Per the behaviour spec §8.3 a merged run does
+-- not physically exist in the source file — the source deletes it and folds its
+-- totals into the survivor — so every imported record is ALREADY a distinct
+-- instance entry. Import stamps `src`, and any entry carrying it is excluded from
+-- the legacy heuristic outright. (Imported entries that carry a serial still
+-- group on it, which is the correct and lossless path.)
+InstancesUI.LEGACY_JOIN_GAP = 600      -- 10 min: a corpse run, not a farm loop
+
+-- May a serial-less entry continue the serial-less run before it? Pure.
+function InstancesUI.LegacyContinues(prevEntry, entry, gap)
+    if type(prevEntry) ~= "table" or type(entry) ~= "table" then return false end
+    if prevEntry.src or entry.src then return false end            -- imported: never
+    if (tonumber(prevEntry.serial) or 0) > 0 then return false end
+    if (tonumber(entry.serial) or 0) > 0 then return false end
+    local exitT = tonumber(prevEntry.exitT) or 0
+    if exitT <= 0 then return false end                            -- no closing sample
+    local t = tonumber(entry.t) or 0
+    if t < exitT then return false end
+    return (t - exitT) <= (gap or InstancesUI.LEGACY_JOIN_GAP)
+end
+
+-- Fold a GatherEntries list (newest-first) into display groups, newest-first.
+-- Each group: { aid, nameRealm, key, t (newest), primary, visits (OLDEST first),
+--               legacy = true when it was built by the heuristic }.
+-- `primary` is the surviving entry — the one the engine folded totals into.
+-- Pure.
+function InstancesUI.GroupVisits(list, opts)
+    local gap = (opts and opts.legacyGap) or InstancesUI.LEGACY_JOIN_GAP
+    local asc = {}
+    for i = #(list or {}), 1, -1 do asc[#asc + 1] = list[i] end
+    local groups, bySerial, lastLegacy = {}, {}, {}
+    for _, item in ipairs(asc) do
+        local e = item.entry or {}
+        local who = tostring(item.aid) .. "\1" .. tostring(item.nameRealm)
+        local place = tostring(e.mapID or e.name or "?")
+        local serial = tonumber(e.serial) or 0
+        local g
+        if serial > 0 then
+            local key = who .. "\1" .. place .. "\1s" .. serial
+            g = bySerial[key]
+            if not g then
+                g = { aid = item.aid, nameRealm = item.nameRealm, key = key, visits = {} }
+                bySerial[key] = g
+                groups[#groups + 1] = g
+            end
+        else
+            local lkey = who .. "\1" .. place
+            local last = lastLegacy[lkey]
+            if last and InstancesUI.LegacyContinues(last.entry, e, gap) then g = last.group end
+            if not g then
+                g = { aid = item.aid, nameRealm = item.nameRealm, legacy = true, visits = {},
+                      key = lkey .. "\1L" .. tostring(e.t or 0) }
+                groups[#groups + 1] = g
+            end
+            lastLegacy[lkey] = { group = g, entry = e }
+        end
+        g.visits[#g.visits + 1] = item
+        -- The survivor: the first NON-merged visit (the engine folds into it).
+        if not g.primary then g.primary = e
+        elseif g.primary.merged and not e.merged then g.primary = e end
+        if (g.t or -math.huge) < (e.t or 0) then g.t = e.t or 0 end
+    end
+    for i = 1, #groups do
+        local g = groups[i]
+        g.primary = g.primary or (g.visits[1] and g.visits[1].entry) or {}
+        g.count = #g.visits
+    end
+    table.sort(groups, function(a, b)
+        if (a.t or 0) ~= (b.t or 0) then return (a.t or 0) > (b.t or 0) end
+        return tostring(a.key) < tostring(b.key)
+    end)
+    return groups
+end
+
+-- The numbers a grouped row shows. Pure.
+--
+-- THE ONE SUBTLETY: when the ENGINE merged the visits (any visit flagged
+-- `merged`), the survivor ALREADY carries the folded coin / XP / mob totals —
+-- Instances.ApplySerial added them in at merge time — so summing across visits
+-- would count them twice. Its exit epoch is likewise restamped at the true end of
+-- the whole run, so its duration already spans the corpse run and the gap. For
+-- an engine-folded group every total therefore comes from the survivor alone.
+-- Only a LEGACY (heuristic) group, whose entries were never folded by anything,
+-- is summed.
+-- `isOpen` marks the LIVE run: it applies to the survivor on an engine-folded
+-- group (the open run continues on it) and to the newest visit otherwise, so a
+-- grouped row still reports live elapsed while the character is still inside.
+function InstancesUI.AggregateVisits(visits, nowE, isOpen)
+    local E = ns.Instances
+    local folded, primary = false, nil
+    for i = 1, #(visits or {}) do
+        local e = visits[i].entry or {}
+        if e.merged then folded = true elseif not primary then primary = e end
+    end
+    primary = primary or (visits and visits[1] and visits[1].entry) or {}
+    local function dur(e, isOpen)
+        return (E and E.EntryDuration and E.EntryDuration(e, nowE, isOpen)) or (e.dur or 0)
+    end
+    local agg = { count = #(visits or {}), folded = folded, primary = primary }
+    if folded then
+        agg.dur      = dur(primary, isOpen)
+        agg.goldLoot = primary.goldLoot or 0
+        agg.gold     = primary.gold or 0
+        agg.xp       = math.max(0, primary.xp or 0)
+        agg.mobXP    = primary.mobXP or 0
+        agg.mobKill  = primary.mobKill or 0
+    else
+        agg.dur, agg.goldLoot, agg.gold, agg.xp, agg.mobXP, agg.mobKill = 0, 0, 0, 0, 0, 0
+        local n = #(visits or {})
+        for i = 1, n do
+            local e = visits[i].entry or {}
+            agg.dur      = agg.dur      + dur(e, isOpen and i == n)
+            agg.goldLoot = agg.goldLoot + (e.goldLoot or 0)
+            agg.gold     = agg.gold     + (e.gold or 0)
+            agg.xp       = agg.xp       + math.max(0, e.xp or 0)
+            agg.mobXP    = agg.mobXP    + (e.mobXP or 0)
+            agg.mobKill  = agg.mobKill  + (e.mobKill or 0)
+        end
+    end
+    return agg
 end
 
 -- Assemble one register-row model from an entry + resolved class. Pure.
@@ -129,16 +332,66 @@ end
 -- repairs, vendor sales, reagents and mail, so a profitable Blackrock Depths run
 -- reads negative); the delta remains the fallback for entries that predate the
 -- accumulator. XP is the level-up-safe chat total and is never negative.
-function InstancesUI.RowModel(entry, nameRealm, classTag, nowE, isOpen)
+-- `visits` (optional) is a display group's OLDEST-first visit list; when given,
+-- the row reports the whole physical instance rather than the single entry, and
+-- the model carries the per-visit detail the hover renders.
+function InstancesUI.RowModel(entry, nameRealm, classTag, nowE, isOpen, visits)
     entry = entry or {}
     local D = ns.Dashboard
     local E = ns.Instances
     local ago = (nowE or 0) - (entry.t or 0)
     if ago < 0 then ago = 0 end
-    local loot = entry.goldLoot or 0
-    local gold = (loot ~= 0) and loot or (entry.gold or 0)
-    local xp = math.max(0, entry.xp or 0)
-    local dur = (E and E.EntryDuration and E.EntryDuration(entry, nowE, isOpen)) or (entry.dur or 0)
+    local agg = (visits and #visits > 0) and InstancesUI.AggregateVisits(visits, nowE, isOpen) or nil
+    -- The newest visit's age is what the AGO column should read for a folded row.
+    if agg then
+        local newest = entry.t or 0
+        for i = 1, #visits do
+            local vt = (visits[i].entry and visits[i].entry.t) or 0
+            if vt > newest then newest = vt end
+        end
+        ago = math.max(0, (nowE or 0) - newest)
+    end
+    local loot = agg and agg.goldLoot or (entry.goldLoot or 0)
+    local wallet = agg and agg.gold or (entry.gold or 0)
+    local gold = (loot ~= 0) and loot or wallet
+    local xp = math.max(0, agg and agg.xp or entry.xp or 0)
+    local dur = agg and agg.dur
+                or (E and E.EntryDuration and E.EntryDuration(entry, nowE, isOpen))
+                or (entry.dur or 0)
+    local mobCount = InstancesUI.MobCount(agg or entry)
+
+    -- Per-entry detail (all optional; a run that never captured it renders none).
+    -- On a LEGACY multi-visit group the roster and trades are unioned across the
+    -- visits, because no engine merge folded them together.
+    local groupStr, groupAvg, trades = entry.group, entry.groupAvg, entry.trades
+    if agg and not agg.folded and visits and #visits > 1 and E and E.UnionGroup then
+        groupStr, trades = nil, nil
+        for i = 1, #visits do
+            local e = visits[i].entry or {}
+            if e.group then
+                local gs, ga = E.UnionGroup(groupStr, E.DecodeGroup(e.group))
+                if gs then groupStr, groupAvg = gs, ga end
+            end
+            if type(e.trades) == "table" then
+                trades = trades or {}
+                for j = 1, #e.trades do trades[#trades + 1] = e.trades[j] end
+            end
+        end
+    end
+    local members = (E and E.DecodeGroup and E.DecodeGroup(groupStr)) or {}
+
+    local visitList
+    if visits and #visits > 1 then
+        visitList = {}
+        for i = 1, #visits do
+            local e = visits[i].entry or {}
+            visitList[i] = {
+                t = e.t, merged = e.merged and true or false,
+                clock = InstancesUI.ClockText(e.t, nowE),
+            }
+        end
+    end
+
     return {
         ago       = ago,                       -- raw seconds (the compact cell layer reads this)
         agoText   = InstancesUI.AgoText(ago),
@@ -147,15 +400,34 @@ function InstancesUI.RowModel(entry, nameRealm, classTag, nowE, isOpen)
         name      = (D and D.ShortName and D.ShortName(nameRealm))
                     or (nameRealm and nameRealm:match("^([^%-]+)")) or nameRealm,
         instance  = entry.name or "?",
+        -- The register cell: a folded row carries "×2" so the fold is visible
+        -- without hovering. One visit renders exactly the bare name it always did.
+        instanceText = (entry.name or "?")
+                       .. ((agg and agg.count > 1) and (" \195\151" .. agg.count) or ""),
         dur       = dur,
         durText   = (D and D.FormatDuration and D.FormatDuration(dur)) or (math.floor(dur) .. "s"),
         gold      = gold,
         goldFromLoot = (loot ~= 0),
         goldText  = InstancesUI.FormatMoney(gold),
+        goldFullText = InstancesUI.FormatMoneyFull(gold),
         goldToken = (gold < 0) and "danger" or "muted",
         xp        = xp,
         xpText    = (xp ~= 0) and ("+" .. xp .. " xp") or nil,
-        merged    = entry.merged and true or false,
+        merged    = (entry.merged or (visitList ~= nil)) and true or false,
+        -- ── the hover block ──
+        serial       = entry.serial,
+        entered      = entry.t,
+        enteredText  = InstancesUI.ClockText(entry.t, nowE),
+        left         = entry.exitT,
+        leftText     = InstancesUI.ClockText(entry.exitT, nowE),
+        mobCount     = mobCount,
+        enteredLevel = entry.enteredLevel,
+        groupAvg     = groupAvg,
+        group        = members,
+        trades       = trades,
+        visits       = visitList,
+        visitCount   = (agg and agg.count) or 1,
+        folded       = (agg and agg.folded) or false,
     }
 end
 
@@ -236,19 +508,101 @@ function InstancesUI.InstanceFlexWidth(C)
     return C.content - fixed
 end
 
--- The row tooltip: the EXACT figures the compact cells abbreviate, so nothing
--- the rebuild made honest is lost to the column budget. Returns a title plus
--- label/value pairs (frame-free). Pure.
-function InstancesUI.RowTooltip(model)
+-- The group roster as a TWO-COLUMN name list: { {left, right}, ... }, each cell
+-- "Bramble 57" and the character's own row annotated. Capped, with a "+N more"
+-- tail so a 40-man raid cannot grow a tooltip past the screen. Pure.
+function InstancesUI.GroupPairs(members, cap)
+    cap = cap or 20
+    members = members or {}
+    local cells, over = {}, 0
+    for i = 1, #members do
+        local m = members[i] or {}
+        if #cells >= cap then over = over + 1
+        else
+            local lvl = tonumber(m.level) or 0
+            local txt = (lvl > 0) and (tostring(m.name) .. " " .. lvl) or tostring(m.name)
+            if m.isSelf then txt = txt .. " (you)" end
+            cells[#cells + 1] = txt
+        end
+    end
+    local rows = {}
+    for i = 1, #cells, 2 do rows[#rows + 1] = { cells[i], cells[i + 1] or "" } end
+    if over > 0 then rows[#rows + 1] = { "+" .. over .. " more", "" } end
+    return rows
+end
+
+-- One trade -> the hover line, in the reference's own phrasing. Pure.
+function InstancesUI.TradeLine(tr, nowE)
+    tr = tr or {}
+    local who = tr.who or "?"
+    local gave, got = math.floor(tonumber(tr.gave) or 0), math.floor(tonumber(tr.got) or 0)
+    local F = InstancesUI.FormatMoneyFull
+    local body
+    if gave > 0 and got > 0 then
+        body = ("Gave %s to %s, received %s"):format(F(gave), who, F(got))
+    elseif gave > 0 then
+        body = ("Gave %s to %s"):format(F(gave), who)
+    else
+        body = ("Received %s from %s"):format(F(got), who)
+    end
+    local when = tr.t and InstancesUI.AgoText((nowE or 0) - tr.t) or nil
+    if when then body = body .. " \194\183 " .. when end
+    return body
+end
+
+-- The row hover: the full per-instance block. Everything the compact register
+-- cells abbreviate, plus the detail that never had anywhere to go — the serial
+-- the row is grouped on, wall-clock entered/left, time inside, mobs killed, raw
+-- mob coin, the level walked in at, the average group level, the roster, the
+-- trades taken inside, and (when a physical instance was visited more than once)
+-- the constituent visits. Frame-free; the panel walks these fields. Pure.
+--
+-- Every section is OMITTED when the run has no data for it, so a pre-detail
+-- entry renders exactly the block it always did plus the clock lines.
+function InstancesUI.RowTooltip(model, nowE)
     model = model or {}
-    local lines = {
-        { "Duration", model.durText or "" },
-        { "Gold", (model.goldText or "") .. (model.goldFromLoot and " (loot)" or " (wallet)") },
-        { "XP", model.xpText or "none" },
-        { "When", model.agoText or "" },
-    }
-    if model.merged then lines[#lines + 1] = { "Merged", "re-entry folded into this run" } end
-    return { title = model.instance or "?", character = model.name, lines = lines }
+    local lines = {}
+    local function add(label, value) lines[#lines + 1] = { label, value } end
+
+    if model.serial then add("Instance ID", tostring(model.serial)) end
+    if model.enteredText then add("Entered", model.enteredText) end
+    add("Left", model.leftText or "still inside")
+    add("Time inside", model.durText or "")
+    if (model.mobCount or 0) > 0 then add("Mobs killed", tostring(model.mobCount)) end
+    add("Gold from mobs", (model.goldFullText or "")
+        .. (model.goldFromLoot and " (looted)" or " (wallet delta)"))
+    if model.xpText then add("XP", model.xpText) end
+    if model.enteredLevel then add("Entered level", tostring(model.enteredLevel)) end
+    if model.groupAvg then add("Average group level", string.format("%.1f", model.groupAvg)) end
+    add("When", model.agoText or "")
+
+    local tip = { title = model.instance or "?", character = model.name, lines = lines }
+
+    local roster = InstancesUI.GroupPairs(model.group, 20)
+    if #roster > 0 then
+        tip.groupHeader = "Group (" .. #(model.group or {}) .. ")"
+        tip.groupPairs = roster
+    end
+
+    if model.trades and #model.trades > 0 then
+        tip.tradeHeader = "Trades while inside"
+        tip.tradeLines = {}
+        for i = 1, #model.trades do
+            tip.tradeLines[i] = InstancesUI.TradeLine(model.trades[i], nowE)
+        end
+    end
+
+    if model.visits and #model.visits > 1 then
+        tip.visitHeader = "Visits (" .. #model.visits .. ")"
+        tip.visitLines = {}
+        for i = 1, #model.visits do
+            local v = model.visits[i]
+            tip.visitLines[i] = "Entered " .. (v.clock or "?")
+                .. (v.merged and " (re-entry)" or "")
+        end
+    end
+
+    return tip
 end
 
 -- ── CAP-COUNTDOWN TICKER GATE (owner round-15 item 2) ───────────────────────
@@ -674,8 +1028,31 @@ function InstancesPanel.Attach(host)
             if tip.character then GameTooltip:AddLine(tip.character, UI.Color("muted")) end
             local tr, tg, tb = UI.Color("muted")
             local vr, vg, vb = UI.Color("text")
+            local hr, hg, hb = UI.Color("accent")
             for _, ln in ipairs(tip.lines) do
                 GameTooltip:AddDoubleLine(ln[1], ln[2], tr, tg, tb, vr, vg, vb)
+            end
+            -- Roster: a two-column name list, one AddDoubleLine per pair.
+            if tip.groupPairs then
+                GameTooltip:AddLine(" ")
+                GameTooltip:AddLine(tip.groupHeader, hr, hg, hb)
+                for _, pr in ipairs(tip.groupPairs) do
+                    GameTooltip:AddDoubleLine(pr[1], pr[2], vr, vg, vb, vr, vg, vb)
+                end
+            end
+            if tip.tradeLines then
+                GameTooltip:AddLine(" ")
+                GameTooltip:AddLine(tip.tradeHeader, hr, hg, hb)
+                for _, ln in ipairs(tip.tradeLines) do
+                    GameTooltip:AddLine(ln, vr, vg, vb)
+                end
+            end
+            if tip.visitLines then
+                GameTooltip:AddLine(" ")
+                GameTooltip:AddLine(tip.visitHeader, hr, hg, hb)
+                for _, ln in ipairs(tip.visitLines) do
+                    GameTooltip:AddLine(ln, tr, tg, tb)
+                end
             end
             GameTooltip:Show()
         end)
@@ -816,27 +1193,32 @@ function InstancesPanel.Attach(host)
             end
             P._empty:SetText("No characters."); P._empty:SetShown(shown == 0)
         else
-            -- INSTANCES view: recent entries (newest first), filtered by the dropdown.
+            -- INSTANCES view: recent runs (newest first), filtered by the dropdown.
+            -- ONE ROW PER PHYSICAL INSTANCE: re-entries into the same live
+            -- instance (corpse run, summon back, relog inside) fold into the row
+            -- of the run they belong to; a reset-and-rerun keeps its own row.
             local all = InstancesUI.GatherEntries((data and data.instances) or {})
-            for i = 1, #all do
-                local item = all[i]
+            local groups = InstancesUI.GroupVisits(all)
+            for i = 1, #groups do
+                local item = groups[i]
                 if shown >= MAX_REC then break end
                 if (not P.selectedChar) or (item.nameRealm == P.selectedChar) then
-                    local model = InstancesUI.RowModel(item.entry, item.nameRealm, classMap[item.nameRealm], nowE)
+                    local model = InstancesUI.RowModel(item.primary, item.nameRealm,
+                        classMap[item.nameRealm], nowE, false, item.visits)
                     shown = shown + 1
                     local r = getRec(shown)
                     r:ClearAllPoints(); r:SetPoint("TOPLEFT", child, "TOPLEFT", 0, -y); r:SetPoint("TOPRIGHT", child, "TOPRIGHT", 0, -y)
                     local cr, cg, cb = Dashboard.ClassColor(model.classTag)
                     r.name:SetText(model.name or "?")
                     if cr then r.name:SetTextColor(cr, cg, cb) else r.name:SetTextColor(UI.Color("text")) end
-                    r.inst:SetText(model.instance)
+                    r.inst:SetText(model.instanceText or model.instance)
                     -- Computed columns (owner round-15 item 1), compact form.
                     local cells = InstancesUI.RecentCells(model)
                     r.dur:SetText(cells.dur);  r.dur:SetTextColor(UI.Color("muted"))
                     r.gold:SetText(cells.gold); r.gold:SetTextColor(UI.Color(cells.goldToken))
                     r.xp:SetText(cells.xp or ""); r.xp:SetTextColor(UI.Color("muted"))
                     r.ago:SetText(cells.ago)
-                    r._tip = InstancesUI.RowTooltip(model)
+                    r._tip = InstancesUI.RowTooltip(model, nowE)
                     r:Show()
                     y = y + REC_H + REC_GAP
                 end
@@ -1008,19 +1390,220 @@ local function testInstancesUI(fails)
                      + 3 * RCOL.gap + IU.InstanceFlexWidth()
     ck(fixedSum == RCOL.content, "cols: the columns exactly consume the content width")
 
-    -- The tooltip carries the EXACT figures the cells abbreviate.
-    local tip = IU.RowTooltip(rCells)
+    -- ── The NIT-parity row hover ────────────────────────────────────────────
+    -- A label lookup keeps these assertions independent of line ORDER, which is
+    -- presentation and will keep moving.
+    local function tipVal(tip, label)
+        for _, ln in ipairs((tip and tip.lines) or {}) do
+            if ln[1] == label then return ln[2] end
+        end
+        return nil
+    end
+
+    local tip = IU.RowTooltip(rCells, T)
     ck(tip.title == "Blackrock Depths", "tooltip: titled with the instance")
-    ck(tip.lines[1][2] == rCells.durText, "tooltip: full duration text")
-    ck(tip.lines[2][2] == "4g 80s (loot)", "tooltip: exact gold + source (got " ..
-        tostring(tip.lines[2][2]) .. ")")
-    ck(tip.lines[3][2] == "+12400 xp", "tooltip: exact xp")
-    ck(tip.lines[4][2] == rCells.agoText, "tooltip: full ago text")
-    ck(#tip.lines == 4, "tooltip: no merged line on a non-merged run")
-    local tipM = IU.RowTooltip(IU.RowModel({ t = T - 60, name = "Zul'Gurub", merged = true,
-                                             gold = 7000 }, "Alt-Realm", "ROGUE", T))
-    ck(#tipM.lines == 5 and tipM.lines[5][1] == "Merged", "tooltip: merged runs get a line")
-    ck(tipM.lines[2][2]:find("wallet") ~= nil, "tooltip: wallet-sourced gold is labelled")
+    ck(tipVal(tip, "Time inside") == rCells.durText, "tooltip: full duration text")
+    ck(tipVal(tip, "Gold from mobs") == "4g 80s 0c (looted)",
+        "tooltip: exact coin + source (got " .. tostring(tipVal(tip, "Gold from mobs")) .. ")")
+    ck(tipVal(tip, "XP") == "+12400 xp", "tooltip: exact xp")
+    ck(tipVal(tip, "When") == rCells.agoText, "tooltip: full ago text")
+    ck(tipVal(tip, "Left") == "still inside", "tooltip: an unclosed run says so")
+    ck(tipVal(tip, "Entered") ~= nil, "tooltip: entered clock time present")
+    ck(tipVal(tip, "Instance ID") == nil, "tooltip: no serial line when there is no serial")
+    ck(tipVal(tip, "Mobs killed") == nil, "tooltip: no mob line on a run that killed nothing")
+    ck(tip.groupPairs == nil and tip.tradeLines == nil and tip.visitLines == nil,
+        "tooltip: a detail-less run renders no detail sections")
+
+    local rFull = IU.RowModel({
+        t = T - 7200, exitT = T - 3600, name = "Stratholme", mapID = 329, serial = 5501,
+        goldLoot = 482310, xp = 9400, mobXP = 312, mobKill = 318, enteredLevel = 58,
+        group = "*Tester:58|Bramble:57|Cera:60", groupAvg = 58.3,
+        trades = { { t = T - 5000, who = "Bramble", gave = 500000, got = 0 },
+                   { t = T - 4000, who = "Cera", gave = 0, got = 120000 } },
+    }, "Tester-Realm", "MAGE", T)
+    ck(rFull.mobCount == 312, "row: mob count prefers the XP-derived counter")
+    ck(#rFull.group == 3, "row: group decoded from the stored snapshot")
+    local tipF = IU.RowTooltip(rFull, T)
+    ck(tipVal(tipF, "Instance ID") == "5501", "tooltip: the serial the row is grouped on")
+    ck(tipVal(tipF, "Mobs killed") == "312", "tooltip: mob count")
+    ck(tipVal(tipF, "Gold from mobs") == "48g 23s 10c (looted)",
+        "tooltip: raw mob coin in full (got " .. tostring(tipVal(tipF, "Gold from mobs")) .. ")")
+    ck(tipVal(tipF, "Entered level") == "58", "tooltip: level walked in at")
+    ck(tipVal(tipF, "Average group level") == "58.3", "tooltip: average group level")
+    ck(tipVal(tipF, "Left") ~= "still inside", "tooltip: a closed run reports its exit clock")
+    ck(tipF.groupHeader == "Group (3)", "tooltip: roster header carries the count")
+    ck(#tipF.groupPairs == 2, "tooltip: 3 members -> 2 two-column rows")
+    ck(tipF.groupPairs[1][1] == "Tester 58 (you)", "tooltip: the character's own row is annotated")
+    ck(tipF.groupPairs[1][2] == "Bramble 57", "tooltip: second column filled")
+    ck(tipF.groupPairs[2][2] == "", "tooltip: an odd member count leaves the last cell empty")
+    ck(#tipF.tradeLines == 2, "tooltip: both trades listed")
+    ck(tipF.tradeLines[1]:find("Gave 50g 0s 0c to Bramble", 1, true) ~= nil,
+        "tooltip: trade phrasing (got " .. tostring(tipF.tradeLines[1]) .. ")")
+    ck(tipF.tradeLines[2]:find("Received 12g 0s 0c from Cera", 1, true) ~= nil,
+        "tooltip: a received trade reads the other way")
+    ck(tipF.tradeLines[1]:find("ago") ~= nil, "tooltip: trades carry when they happened")
+
+    -- A boosted run: every mob grey, no XP at all, so the kill counter carries it.
+    local rBoost = IU.RowModel({ t = T - 600, name = "Scholomance", mobXP = 0, mobKill = 210 },
+                               "Alt-Realm", "PRIEST", T)
+    ck(rBoost.mobCount == 210, "row: the kill counter carries a boosted grey run")
+    ck(IU.MobCount({ mobXP = 5, mobKill = 99 }) == 5, "mob count: XP-derived wins when non-zero")
+    ck(IU.MobCount({}) == 0, "mob count: nothing recorded -> 0")
+
+    -- Full coin form + the wallet-source label.
+    ck(IU.FormatMoneyFull(482310) == "48g 23s 10c", "full coin: g/s/c")
+    ck(IU.FormatMoneyFull(9905) == "99s 5c", "full coin: sub-gold")
+    ck(IU.FormatMoneyFull(7) == "7c", "full coin: copper only")
+    ck(IU.FormatMoneyFull(-12000) == "-1g 20s 0c", "full coin: keeps the sign")
+    ck(IU.FormatMoneyFull(0) == "0c", "full coin: zero")
+    local tipW = IU.RowTooltip(IU.RowModel({ t = T - 60, name = "Zul'Gurub", gold = 7000 },
+                                            "Alt-Realm", "ROGUE", T), T)
+    ck(tipW.lines and tipVal(tipW, "Gold from mobs"):find("wallet delta") ~= nil,
+        "tooltip: wallet-sourced coin is labelled as such")
+
+    -- Clock text: shape only (the value is the harness machine's timezone).
+    ck(IU.ClockText(1660972435, 1660972435):match("^%d+:%d%d") ~= nil,
+        "clock: renders as H:MM (got " .. tostring(IU.ClockText(1660972435, 1660972435)) .. ")")
+    ck(IU.ClockText(nil) == nil, "clock: nil epoch -> nil")
+    ck(IU.ClockText(0) == nil, "clock: a zero exit epoch is not a time")
+    local older = IU.ClockText(1660972435, 1660972435 + 3 * 86400)
+    ck(older and #older > #(IU.ClockText(1660972435, 1660972435) or ""),
+        "clock: an entry from another day carries its date")
+
+    -- Roster capping: a 40-man raid must not grow an unbounded tooltip.
+    local raid = {}
+    for i = 1, 40 do raid[i] = { name = "Raider" .. i, level = 60 } end
+    local capped = IU.GroupPairs(raid, 20)
+    ck(#capped == 11, "roster: 20 shown as 10 pair-rows + a '+20 more' tail (got " .. #capped .. ")")
+    ck(capped[11][1] == "+20 more", "roster: overflow tail")
+    ck(#IU.GroupPairs({}, 20) == 0, "roster: no members -> no rows")
+    ck(IU.GroupPairs({ { name = "Solo" } }, 20)[1][1] == "Solo",
+        "roster: a member with no level renders bare")
+
+    -- ── ONE ROW PER PHYSICAL INSTANCE: the display-grouping matrix ──────────
+    -- Owner: "if i leave and re-enter the same instance, without resetting it,
+    -- then that should show as a single line, rather than 2."
+    local function gitem(aid, nr, e) return { aid = aid, nameRealm = nr, entry = e, t = e.t } end
+    local function newestFirst(...)
+        local l = { ... }
+        table.sort(l, function(a, b) return a.t > b.t end)
+        return l
+    end
+
+    -- 1. Corpse run: two visits, ONE serial -> ONE row. This is the headline.
+    local surv  = { t = T - 3000, exitT = T - 2400, name = "Stratholme", mapID = 329,
+                    serial = 5501, goldLoot = 90000, xp = 900, mobXP = 40, merged = false }
+    local corpse = { t = T - 2100, name = "Stratholme", mapID = 329, serial = 5501,
+                     goldLoot = 30000, xp = 300, mobXP = 12, merged = true }
+    local gA = IU.GroupVisits(newestFirst(gitem("1", "A-R", surv), gitem("1", "A-R", corpse)))
+    ck(#gA == 1, "grouping: a corpse run folds into ONE row (got " .. #gA .. ")")
+    ck(gA[1].count == 2, "grouping: …that knows it holds 2 visits")
+    ck(gA[1].primary == surv, "grouping: the survivor is the row's primary entry")
+    ck(gA[1].visits[1].entry == surv and gA[1].visits[2].entry == corpse,
+        "grouping: visits listed oldest-first")
+
+    -- 2. Reset + rerun: same dungeon, DIFFERENT serial -> two rows, as the owner
+    --    wants (they billed two slots and must stay visible as two).
+    local rerun = { t = T - 1200, exitT = T - 600, name = "Stratholme", mapID = 329,
+                    serial = 5502, goldLoot = 50000, merged = false }
+    local gB = IU.GroupVisits(newestFirst(gitem("1", "A-R", surv), gitem("1", "A-R", corpse),
+                                          gitem("1", "A-R", rerun)))
+    ck(#gB == 2, "grouping: a reset+rerun keeps its OWN row (got " .. #gB .. ")")
+    ck(gB[1].primary == rerun, "grouping: rows are newest-first")
+
+    -- 3. Same serial, DIFFERENT character -> never the same row.
+    local other = { t = T - 2900, name = "Stratholme", mapID = 329, serial = 5501, merged = false }
+    local gC = IU.GroupVisits(newestFirst(gitem("1", "A-R", surv), gitem("1", "B-R", other)))
+    ck(#gC == 2, "grouping: one row per CHARACTER, even on a shared serial")
+    local gD = IU.GroupVisits(newestFirst(gitem("1", "A-R", surv), gitem("2", "A-R", other)))
+    ck(#gD == 2, "grouping: one row per ACCOUNT too")
+
+    -- 4. Aggregates. The engine ALREADY folded the corpse run's takings into the
+    --    survivor, so the row must not add them a second time.
+    local mA = IU.RowModel(gA[1].primary, "A-R", "ROGUE", T, false, gA[1].visits)
+    ck(mA.gold == 90000, "grouped row: engine-folded totals are NOT double-counted (got "
+        .. mA.gold .. ")")
+    ck(mA.xp == 900, "grouped row: xp likewise taken from the survivor")
+    ck(mA.mobCount == 40, "grouped row: mob count likewise")
+    ck(mA.visitCount == 2 and mA.folded == true, "grouped row: flagged as an engine fold")
+    ck(mA.ago == T - corpse.t, "grouped row: AGO reads from the NEWEST visit")
+    ck(mA.instanceText == "Stratholme \195\1512",
+        "grouped row: the cell marks the fold (got " .. tostring(mA.instanceText) .. ")")
+    local tipA = IU.RowTooltip(mA, T)
+    ck(tipA.visitHeader == "Visits (2)", "grouped tooltip: a visits section appears")
+    ck(#tipA.visitLines == 2, "grouped tooltip: one line per constituent visit")
+    ck(tipA.visitLines[1]:find("Entered") ~= nil, "grouped tooltip: visits list entry times")
+    ck(tipA.visitLines[2]:find("(re-entry)", 1, true) ~= nil,
+        "grouped tooltip: the re-entry is marked (got " .. tostring(tipA.visitLines[2]) .. ")")
+
+    -- 5. A single-visit row carries no visits section and reports its own numbers.
+    local gSolo = IU.GroupVisits(newestFirst(gitem("1", "A-R", rerun)))
+    local mSolo = IU.RowModel(gSolo[1].primary, "A-R", "ROGUE", T, false, gSolo[1].visits)
+    ck(mSolo.visitCount == 1 and mSolo.visits == nil, "single-visit row: no visits section")
+    ck(mSolo.instanceText == "Stratholme", "single-visit row: bare instance name, no fold marker")
+    ck(IU.RowTooltip(mSolo, T).visitLines == nil, "single-visit tooltip: no visits block")
+    ck(mSolo.dur == 600, "single-visit row: its own duration (got " .. mSolo.dur .. ")")
+    -- The LIVE run still reports live elapsed through the grouped path.
+    local live = { t = T - 420, name = "Dire Maul", mapID = 429, serial = 8800 }
+    local gLive = IU.GroupVisits(newestFirst(gitem("1", "A-R", live)))
+    local mLive = IU.RowModel(gLive[1].primary, "A-R", "ROGUE", T, true, gLive[1].visits)
+    ck(mLive.dur == 420, "grouped row: an open run reports live elapsed (got " .. mLive.dur .. ")")
+    local gLiveFold = IU.GroupVisits(newestFirst(gitem("1", "A-R", surv), gitem("1", "A-R", corpse)))
+    local mLiveFold = IU.RowModel(gLiveFold[1].primary, "A-R", "ROGUE", T, true, gLiveFold[1].visits)
+    ck(mLiveFold.dur == 3000, "grouped row: a still-open folded run measures from the survivor's entry")
+
+    -- 6. SERIAL-LESS LEGACY rows. Conservative by construction: same character,
+    --    same instance, the earlier visit recorded an exit, and the re-entry
+    --    inside the join gap. Anything else stays two rows.
+    local lg1 = { t = T - 5000, exitT = T - 4700, name = "Uldaman", mapID = 70 }
+    local lg2 = { t = T - 4500, name = "Uldaman", mapID = 70 }              -- 200s later
+    ck(#IU.GroupVisits(newestFirst(gitem("1", "A-R", lg1), gitem("1", "A-R", lg2))) == 1,
+        "legacy: a prompt re-entry into the same instance folds")
+    local far = { t = T - 4700 + IU.LEGACY_JOIN_GAP + 1, name = "Uldaman", mapID = 70 }
+    ck(#IU.GroupVisits(newestFirst(gitem("1", "A-R", lg1), gitem("1", "A-R", far))) == 2,
+        "legacy: beyond the join gap they stay separate")
+    local noExit = { t = T - 5000, name = "Uldaman", mapID = 70 }           -- never closed
+    ck(#IU.GroupVisits(newestFirst(gitem("1", "A-R", noExit), gitem("1", "A-R", lg2))) == 2,
+        "legacy: no exit epoch on the earlier run -> do NOT fold")
+    local elsewhere = { t = T - 4500, name = "Maraudon", mapID = 349 }
+    ck(#IU.GroupVisits(newestFirst(gitem("1", "A-R", lg1), gitem("1", "A-R", elsewhere))) == 2,
+        "legacy: a different instance never folds")
+    local serialled = { t = T - 4500, name = "Uldaman", mapID = 70, serial = 77 }
+    ck(#IU.GroupVisits(newestFirst(gitem("1", "A-R", lg1), gitem("1", "A-R", serialled))) == 2,
+        "legacy: a run that DID observe a serial is judged on identity, not the gap")
+    -- Imported rows are never folded: the source deleted its merged runs already.
+    local imp1 = { t = T - 5000, exitT = T - 4700, name = "Uldaman", mapID = 70, src = "nit" }
+    local imp2 = { t = T - 4500, name = "Uldaman", mapID = 70, src = "nit" }
+    ck(#IU.GroupVisits(newestFirst(gitem("1", "A-R", imp1), gitem("1", "A-R", imp2))) == 2,
+        "legacy: imported runs are already distinct entries and never fold")
+    -- A chain of three legacy visits collapses into one row.
+    local ch1 = { t = T - 9000, exitT = T - 8800, name = "Maraudon", mapID = 349, goldLoot = 100 }
+    local ch2 = { t = T - 8700, exitT = T - 8500, name = "Maraudon", mapID = 349, goldLoot = 200 }
+    local ch3 = { t = T - 8400, exitT = T - 8000, name = "Maraudon", mapID = 349, goldLoot = 300 }
+    local gChain = IU.GroupVisits(newestFirst(gitem("1", "A-R", ch1), gitem("1", "A-R", ch2),
+                                              gitem("1", "A-R", ch3)))
+    ck(#gChain == 1 and gChain[1].count == 3, "legacy: a 3-visit chain is one row")
+    local mChain = IU.RowModel(gChain[1].primary, "A-R", "ROGUE", T, false, gChain[1].visits)
+    ck(mChain.gold == 600, "legacy row: takings ARE summed (nothing folded them) (got "
+        .. mChain.gold .. ")")
+    ck(mChain.dur == 800, "legacy row: durations summed across the visits (got " .. mChain.dur .. ")")
+
+    -- 7. Legacy rows union their roster + trades across the visits.
+    local lr1 = { t = T - 9000, exitT = T - 8800, name = "Maraudon", mapID = 349,
+                  group = "*Tester:40|Bramble:41", groupAvg = 40.5,
+                  trades = { { t = T - 8900, who = "Bramble", gave = 100, got = 0 } } }
+    local lr2 = { t = T - 8700, name = "Maraudon", mapID = 349,
+                  group = "*Tester:41|Cera:42",
+                  trades = { { t = T - 8600, who = "Cera", gave = 0, got = 200 } } }
+    local gR = IU.GroupVisits(newestFirst(gitem("1", "A-R", lr1), gitem("1", "A-R", lr2)))
+    local mR = IU.RowModel(gR[1].primary, "A-R", "ROGUE", T, false, gR[1].visits)
+    ck(#mR.group == 3, "legacy row: rosters unioned across visits (got " .. #mR.group .. ")")
+    ck(mR.group[1].level == 41, "legacy row: a level that changed between visits updates")
+    ck(mR.trades and #mR.trades == 2, "legacy row: trades gathered from every visit")
+
+    -- 8. Empty / degenerate input never errors.
+    ck(#IU.GroupVisits({}) == 0, "grouping: an empty list yields no rows")
+    ck(#IU.GroupVisits(nil) == 0, "grouping: nil yields no rows")
 
     -- ── round-15 item 2: the cap-countdown ticker gate ──────────────────────
     local mOK  = IU.MeterModel({ hour = 2, day = 10 }, T, caps)
