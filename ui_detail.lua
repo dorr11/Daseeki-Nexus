@@ -40,6 +40,10 @@ local COL_GAP   = 14
 -- (that's the compact CARD strip, §5b). The name carries buff IDENTITY; the status
 -- column carries STATE color (Missing / duration / Boon / DMF parenthetical).
 local BUFF_ICON   = 16        -- row icon edge (cropped/framed)
+local STATUS_X    = 210       -- round-18: buff-row STATUS left rail, measured from the row's
+                              -- left edge — just past the longest buff name ("Rallying Cry of
+                              -- the Dragonslayer") at the default font scale. Was effectively
+                              -- ~486 (the left column's far edge) before the owner's fix.
 local BUFF_ROW_H  = 18        -- buff row height (round-4: 18 so all 10 slots fit the pane)
 local BUFF_ROW_GAP = 1        -- round-17: 2 -> 1 (pitch 20 -> 19). The 10-row list needs
                               -- 10*18+9*1 = 189px; this is the 6px reclaimed to pay for
@@ -49,7 +53,15 @@ local BUFF_ROW_GAP = 1        -- round-17: 2 -> 1 (pitch 20 -> 19). The 10-row l
 -- header's bottom edge (gridTop = -(PAD_V+HEADER_H)), i.e. 6px ABOVE the rule — so the
 -- 1px line drew straight through "WORLD BUFFS · N/N HELD". The grid now starts BELOW the
 -- rule with GRID_GAP of clear air, matching round-13's +6 feel under each column header.
-local HRULE_GAP  = 6          -- header band bottom -> the 1px hairline
+-- ROUND-18 item 3 (owner): the header's bottom hairline must land on the SAME screen Y as
+-- the TOP OF THE FIRST CARD in the left panel. Both panels share the body top rail
+-- (MARGIN), so it is pure arithmetic across the two files:
+--     first card top = MARGIN + CHIP_H(44) + LIST_PAD(12)          = MARGIN + 56
+--     detail rule    = MARGIN + PAD_V(12) + HEADER_H(40) + HRULE_GAP
+-- so PAD_V + HEADER_H + HRULE_GAP must equal 56. It was 58 (rule 2px low); HRULE_GAP goes
+-- 6 -> 4 to close it, which keeps HEADER_H at 40 for the enlarged name. LAYOUT_SPEC pins
+-- this with a cross-panel align assertion (detail.hrule vs cards.list).
+local HRULE_GAP  = 4          -- header band bottom -> the 1px hairline (round-18: 6 -> 4)
 local GRID_GAP   = 6          -- hairline -> the column eyebrow labels (round-17)
 local BUFF_TOP    = 24        -- list top offset below the eyebrow label (round-13: 18->24,
                              -- +6 breathing room under the WORLD BUFFS header, even w/ CD/RAID)
@@ -188,6 +200,14 @@ end
 -- band, below the hairline, plus GRID_GAP of clear air.
 function Detail.GridTop()
     return -(PAD_V + HEADER_H + HRULE_GAP + GRID_GAP)
+end
+
+-- ROUND-18 item 3: how far BELOW the detail panel's top edge the header hairline sits.
+-- The cards panel puts the first card's top at CHIP_H + LIST_PAD below ITS panel top, and
+-- both panels share the body top rail — so these two numbers must be equal for the owner's
+-- alignment to hold. Pure, and asserted both here and cross-panel in LAYOUT_SPEC.
+function Detail.HeaderRuleOffset()
+    return PAD_V + HEADER_H + HRULE_GAP
 end
 
 -- PURE fit check for the left column's 10-row buff list inside a `paneH`-tall pane. The
@@ -388,12 +408,18 @@ local function makeBuffRow(parent)
     tile.icon = ic
     row.tile = tile
     -- Right-aligned status (STATE color) — anchored first so the name can bound to it.
-    row.status = fstr(row, "body", "RIGHT")
-    row.status:SetPoint("RIGHT", row, "RIGHT", 0, 0)
+    -- ROUND-18 item 1 (owner ORANGE arrow): the status used to right-align at the LEFT
+    -- COLUMN'S far edge (~486px out), leaving a huge gulf between a ~150px buff name and
+    -- its status. It now LEFT-anchors at a fixed rail just past the longest buff name, so
+    -- name -> status reads as one line instead of two eye-stops.
+    row.status = fstr(row, "body", "LEFT")
+    row.status:SetPoint("LEFT", row, "LEFT", STATUS_X, 0)
     -- Buff name (family-hue tinted), between the icon and the status column.
     row.name = fstr(row, "body"); row.name:SetJustifyH("LEFT"); row.name:SetWordWrap(false)
     row.name:SetPoint("LEFT", tile, "RIGHT", 8, 0)
-    row.name:SetPoint("RIGHT", row.status, "LEFT", -8, 0)
+    -- Name is capped just short of the status rail (it already has SetWordWrap(false), so
+    -- an over-long name ellipsizes instead of colliding with the status).
+    row.name:SetPoint("RIGHT", row, "LEFT", STATUS_X - 8, 0)
     row:EnableMouse(true)
     row:SetScript("OnEnter", function(self)
         if not self._tipName then return end
@@ -422,6 +448,11 @@ function Detail.Attach(parent)
     D.header = header
 
     local nameFS = fstr(header, "header"); nameFS:SetPoint("BOTTOMLEFT", header, "BOTTOMLEFT", 0, 2)
+    -- ROUND-18 item 3 (owner): the character name is this pane's anchor and should read
+    -- clearly bigger than a card name. +4 on the `header` base, tracking the font picker
+    -- via SizedFont. No OUTLINE: the wordmark (MORPHEUS ceremonial) stays the loudest mark
+    -- in the window, and an outlined 19px name would out-shout it.
+    if Dash() and Dash().SizedFont then Dash().SizedFont(nameFS, "header", 4) end
     nameFS:SetWordWrap(false)
     local subFS = fstr(header, "small"); subFS:SetPoint("LEFT", nameFS, "RIGHT", 10, 0)
     subFS:SetTextColor(UI.Color("muted"))
@@ -435,6 +466,7 @@ function Detail.Attach(parent)
 
     -- Header bottom hairline (one sharp rule, §9 UI.Hairline). Pop pass: borderLite.
     local hrule = UI.Hairline(parent, { token = "borderLite" })
+    tag(hrule, "detail.hrule")   -- round-18: pinned to the cards list top by LAYOUT_SPEC
     hrule:SetPoint("TOPLEFT", header, "BOTTOMLEFT", 0, -HRULE_GAP)
     hrule:SetPoint("TOPRIGHT", header, "BOTTOMRIGHT", 0, -HRULE_GAP)
 
@@ -875,23 +907,33 @@ end
 -- Round-17: the header-rule padding must not push the 10-row buff list out of the pane.
 local function testDetailGeometry(fails)
     local function ck(c, m) if not c then fails[#fails + 1] = m end end
-    -- Grid now starts BELOW the hairline: PAD_V 12 + HEADER_H 40 + HRULE_GAP 6 + GRID_GAP 6.
-    ck(Detail.GridTop() == -64, "grid top -64 (below the hairline, +6 clear air)")
-    -- The hairline itself sits at -(PAD_V + HEADER_H + HRULE_GAP) = -58, so the eyebrow
-    -- labels now begin a clear GRID_GAP below it instead of being crossed by it.
-    local ruleY = -(12 + 40 + 6)
+    -- ROUND-18: the hairline was raised 2px to line up with the first card's top rail, so
+    -- the grid follows: PAD_V 12 + HEADER_H 40 + HRULE_GAP 4 + GRID_GAP 6.
+    ck(Detail.GridTop() == -62, "grid top -62 (below the hairline, +6 clear air)")
+    local ruleY = -(12 + 40 + 4)
     ck(Detail.GridTop() < ruleY, "eyebrows start BELOW the rule (the round-17 bug)")
     ck(ruleY - Detail.GridTop() == 6, "exactly 6px of air between rule and eyebrow")
 
+    -- CROSS-PANEL ALIGNMENT (round-18 item 3): the detail hairline and the cards list top
+    -- must share a screen Y. Both panels hang off the same body top rail (MARGIN), so the
+    -- two offsets have to match exactly. cards side = CHIP_H(44) + LIST_PAD(12).
+    ck(Detail.HeaderRuleOffset() == 56,
+        "detail rule sits 56 below the panel top (got " .. tostring(Detail.HeaderRuleOffset()) .. ")")
+    ck(Detail.HeaderRuleOffset() == 44 + 12,
+        "...which is exactly CHIP_H + LIST_PAD, i.e. the first card's top rail")
+
     local f = Detail.BuffListFit(292, 10)
     ck(f.listH == 189, "10 rows at pitch 19 = 189px (got " .. tostring(f.listH) .. ")")
-    ck(f.listTop == 88, "list starts at 88 (64 grid + 24 eyebrow offset)")
+    ck(f.listTop == 86, "list starts at 86 (62 grid + 24 eyebrow offset)")
     ck(f.limit == 280, "usable bottom is 280 (292 pane - 12 pad)")
     ck(f.fits == true, "the 10-row list still fits the 292px pane")
-    ck(f.slack == 3, "3px slack remains (got " .. tostring(f.slack) .. ")")
-    -- Proves the reclaim was REQUIRED: at the old 2px row gap the list would overflow.
+    ck(f.slack == 5, "5px slack remains (got " .. tostring(f.slack) .. ")")
+    -- The 2px reclaimed by the alignment is still NOT enough to restore the 2px row gap
+    -- (round-17 took it under protest): 198 > 194 available. Pinned so the next attempt
+    -- to relax it fails loudly rather than silently clipping the 10th buff row.
     local wide = 10 * 18 + 9 * 2                    -- 198 = the pre-round-17 list height
-    ck(f.listTop + wide > f.limit, "at the OLD 2px gap the list would overflow the pane")
+    ck(f.listTop + wide > f.limit, "a 2px row gap would STILL overflow (short by "
+        .. tostring(f.listTop + wide - f.limit) .. "px)")
 end
 
 -- Row-list STATUS matrix (owner round-3): map a BuffTileState result -> (text, tok).

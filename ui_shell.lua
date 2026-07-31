@@ -1313,22 +1313,41 @@ local function buildHeader(w)
     -- Dashboard.RefreshActive instead.
     w._updateFactionToggle = function() end
 
-    -- Settings launcher (right-cluster text button, left of ✕). Opens the Core hub to
-    -- the Nexus section. (Settings is an action, not a pane — a text button, not a tab.)
-    local settingsBtn = CreateFrame("Button", nil, header)
-    settingsBtn:SetHeight(HEADER_H)
-    local sLbl = settingsBtn:CreateFontString(nil, "OVERLAY")
-    sLbl:SetFontObject(Dashboard.Font("body"))
-    sLbl:SetPoint("CENTER", settingsBtn, "CENTER", 0, 0)
-    sLbl:SetText("Settings")
-    settingsBtn:SetWidth((sLbl:GetStringWidth() or 52) + 16)
+    -- Settings launcher, left of ✕. Opens the Core hub to the Nexus section.
+    -- ROUND-18 item 4 (owner): the "Settings" TEXT button becomes a 22x22 GEAR ICON button
+    -- skinned exactly like the timers dock's Refresh/Broadcast pair — our own white glyph
+    -- mask (textures/icon-gear.tga), tinted `muted` at rest and `accent` on hover, both
+    -- re-applied on ThemeChanged. The label is not lost: it moves to a GameTooltip.
+    local settingsBtn = CreateFrame("Button", nil, header, "BackdropTemplate")
+    settingsBtn:SetSize(22, 22)
+    local sIcon = settingsBtn:CreateTexture(nil, "ARTWORK")
+    sIcon:SetPoint("TOPLEFT", settingsBtn, "TOPLEFT", 2, -2)
+    sIcon:SetPoint("BOTTOMRIGHT", settingsBtn, "BOTTOMRIGHT", -2, 2)
+    sIcon:SetTexture("Interface\\AddOns\\Daseeki-Nexus\\textures\\icon-gear")
+    settingsBtn.icon = sIcon
+    UI.Skin(settingsBtn, function(self)
+        self:SetBackdrop(UI.FLAT_BACKDROP)
+        self:SetBackdropColor(UI.Color("inset"))
+        self:SetBackdropBorderColor(UI.Color("borderLite"))
+        self.icon:SetVertexColor(UI.Color(self._hot and "accent" or "muted"))
+    end)
     settingsBtn:SetPoint("RIGHT", closeBtn, "LEFT", -8, 0)
-    settingsBtn:SetScript("OnEnter", function() sLbl:SetFontObject(Dashboard.Font("accent")) end)
-    settingsBtn:SetScript("OnLeave", function() sLbl:SetFontObject(Dashboard.Font("body")) end)
+    settingsBtn:SetScript("OnEnter", function(self)
+        self._hot = true
+        self.icon:SetVertexColor(UI.Color("accent"))
+        GameTooltip:SetOwner(self, "ANCHOR_BOTTOM")
+        GameTooltip:AddLine("Settings", UI.Color("text")); GameTooltip:Show()
+    end)
+    settingsBtn:SetScript("OnLeave", function(self)
+        self._hot = nil
+        self.icon:SetVertexColor(UI.Color("muted"))
+        GameTooltip:Hide()
+    end)
     settingsBtn:SetScript("OnClick", function()
         if DaseekiSuite and DaseekiSuite.Open then DaseekiSuite:Open("nexus")
         else ns:Print("the Daseeki hub (Daseeki Core) is not available.") end
     end)
+    tag(settingsBtn, "shell.settings")
     w.settingsBtn = settingsBtn
 
     -- Round-13 (owner: single-page control panel): the Characters/Help TAB STRIP is
