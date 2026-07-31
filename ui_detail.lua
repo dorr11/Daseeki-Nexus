@@ -494,8 +494,11 @@ function Detail.Attach(parent)
     function D:Show(entry)
         if type(entry) == "string" then
             local rec, aid = Detail.Resolve(entry)
+            -- Pass the resolved aid so same-account online exclusivity can be
+            -- applied even when a bare Name-Realm string was handed in (two
+            -- accounts may hold the same Name-Realm; the aid disambiguates).
             entry = rec and { nameRealm = entry, rec = rec, aid = aid,
-                              online = Dash().IsOnline(rec, entry) } or nil
+                              online = Dash().IsOnline(rec, entry, aid) } or nil
         end
         if not entry or not entry.rec then
             D._current, D._entry = nil, nil

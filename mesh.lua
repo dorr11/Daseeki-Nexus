@@ -1218,11 +1218,16 @@ function Mesh.SendHeartbeat()
         nsRev     = (Sync and Sync.AllNamespaceHashes) and Sync.AllNamespaceHashes() or nil,
         online    = {},   -- online-character hint (Name-Realm list)
     }
-    if bucket then
-        for nameRealm, rec in pairs(bucket.characters) do
-            if rec and rec.lastSeen then hb.online[#hb.online + 1] = nameRealm end
-        end
-    end
+    -- A WoW account has exactly ONE character logged in at a time, so the hint
+    -- is the character we ARE — not every character in the bucket that carries
+    -- a lastSeen (which advertised the entire roster as "online" and matched
+    -- the same-account double-green-pip bug the dashboard just fixed).
+    -- Wire shape is unchanged (Name-Realm string array), so no SCHEMA_VERSION
+    -- bump. NOTE: no receiver reads hb.online today — handleHeartbeat ignores
+    -- the field entirely — this only keeps the advertised value honest for a
+    -- future presence consumer.
+    local me = selfNameRealm()
+    if me and me ~= "" then hb.online[1] = me end
     local payload = Mesh.Pack(hb)
     if not payload then return end
     -- Whisper the heartbeat to every KNOWN peer (the channel is presence-only:

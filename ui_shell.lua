@@ -496,15 +496,143 @@ function Dashboard.FreshnessText(epoch)
     return "Updated " .. Dashboard.FormatDuration(d) .. " ago"
 end
 
--- Online heuristic (records carry no live-online flag; mesh presence is a later
--- wave). The current player character is always online; others count online if
--- seen within ONLINE_WINDOW.
-function Dashboard.IsOnline(rec, nameRealm)
-    if not rec then return false end
-    if ns.Tracker and nameRealm then
-        local self = UnitName and UnitName("player")
-        if self and nameRealm:match("^([^%-]+)") == self then return true end
+----------------------------------------------------------------------
+-- Same-account online exclusivity
+--
+-- A WoW ACCOUNT can only ever have ONE character logged in at a time, but the
+-- records carry no live-online flag — `lastSeen` recency is all we have, and a
+-- character you just logged OUT of stays "fresh" for the whole ONLINE_WINDOW.
+-- So the roster used to paint a green pip on BOTH the character you left and
+-- the one you just entered (owner bug: Daseeki -> Shalk, both on account #1).
+--
+-- Rule: at most ONE character per account id may read online.
+--   * LOCAL account  -> the character we are logged in as wins outright; every
+--     local sibling is offline no matter how fresh its lastSeen looks.
+--   * REMOTE account -> the sibling with the newest lastSeen wins, and only if
+--     that lastSeen is itself inside ONLINE_WINDOW (else nobody on it is on).
+--   * ORPHAN bucket (aid == "", and not ours) is EXEMPT: it is a grab-bag of
+--     synced-but-unattributed characters from potentially MANY accounts, so
+--     "one per account" is not a claim we can make there. Recency still rules.
+--
+-- Exclusivity is strictly PER-AID — two characters on two DIFFERENT accounts
+-- are both legitimately online (the owner runs four accounts).
+--
+-- Computed ONCE per roster refresh over ALL stored records, never over the
+-- faction/level-filtered subset: the sibling that wins an account is very often
+-- filtered out of the view you are looking at (a Horde main vs the Alliance alt
+-- you just logged into), and computing over the subset would let each faction
+-- roster elect its own "winner" and reproduce the bug.
+----------------------------------------------------------------------
+
+-- Short (realm-stripped) name of the character we are logged in as, or nil.
+local function selfShortName()
+    local n = UnitName and UnitName("player")
+    if n and n ~= "" then return n end
+    return nil
+end
+Dashboard.SelfShortName = selfShortName
+
+local function shortOf(nameRealm)
+    return nameRealm:match("^([^%-]+)") or nameRealm
+end
+
+-- PURE exclusivity pass. `records` is an array of
+--   { nameRealm = , aid = , rec = , selfAcct = bool }
+-- `selfName` is the short name of the logged-in character (nil when unknown).
+-- Returns
+--   { winner  = { [aid] = nameRealm | false },   -- false = nobody online here
+--     charAID = { [nameRealm] = aid | false } }  -- false = name spans >1 aid
+-- An aid absent from `winner` is exempt (no exclusivity claim).
+function Dashboard.ComputeOnlineWinners(records, nowE, selfName)
+    local groups, charAID = {}, {}
+    for _, r in ipairs(records or {}) do
+        local aid = r.aid or ""
+        -- The orphan bucket only earns a claim when it is OUR bucket (which it
+        -- is when no account id has been chosen yet — see Store.GetSelfAccount).
+        if aid ~= "" or r.selfAcct then
+            local g = groups[aid]
+            if not g then g = { selfAcct = false }; groups[aid] = g end
+            if r.selfAcct then g.selfAcct = true end
+            g[#g + 1] = r
+            local seen = charAID[r.nameRealm]
+            if seen == nil then charAID[r.nameRealm] = aid
+            elseif seen ~= aid then charAID[r.nameRealm] = false end
+        end
     end
+
+    local winner = {}
+    for aid, g in pairs(groups) do
+        local pick
+        if g.selfAcct and selfName then
+            for _, r in ipairs(g) do
+                if shortOf(r.nameRealm) == selfName then pick = r.nameRealm; break end
+            end
+        end
+        if not pick then
+            -- Remote account (or a bucket flagged self that we are not actually
+            -- standing in — a stale isSelf after an account-id change): newest
+            -- lastSeen wins, and only while it is inside the window.
+            local best, bestSeen
+            for _, r in ipairs(g) do
+                local ls = (r.rec and r.rec.lastSeen) or 0
+                if not bestSeen or ls > bestSeen
+                   or (ls == bestSeen and r.nameRealm < best) then
+                    best, bestSeen = r.nameRealm, ls
+                end
+            end
+            if best and (nowE - bestSeen) <= ONLINE_WINDOW then pick = best end
+        end
+        winner[aid] = pick or false
+    end
+    return { winner = winner, charAID = charAID }
+end
+
+-- Rebuild the exclusivity table from the WHOLE store. Cheap (a few dozen
+-- records) and idempotent; run at the top of every roster gather.
+function Dashboard.RefreshOnlineWinners()
+    local records = {}
+    local data = ns.Store and ns.Store.GetData and ns.Store.GetData()
+    local accounts = data and data.accounts
+    if accounts then
+        local selfAID = (ns.GetAccountID and ns:GetAccountID()) or ""
+        for aid, bucket in pairs(accounts) do
+            local selfAcct = (bucket.isSelf == true)
+                             or (selfAID ~= "" and aid == selfAID)
+            local function add(nameRealm, rec)
+                records[#records + 1] = {
+                    nameRealm = nameRealm, aid = aid, rec = rec, selfAcct = selfAcct,
+                }
+            end
+            for nameRealm, rec in pairs(bucket.characters or {}) do add(nameRealm, rec) end
+            for nameRealm, rec in pairs(bucket.homeless or {}) do add(nameRealm, rec) end
+        end
+    end
+    Dashboard._onlineWinners =
+        Dashboard.ComputeOnlineWinners(records, now(), selfShortName())
+    return Dashboard._onlineWinners
+end
+
+-- Online test. Recency gates who is a CANDIDATE; the per-account exclusivity
+-- table decides which single candidate actually wins. `aid` is optional — pass
+-- it when the caller already knows the account (it disambiguates a Name-Realm
+-- that exists under more than one account); otherwise it is looked up.
+function Dashboard.IsOnline(rec, nameRealm, aid)
+    if not rec then return false end
+    local w = Dashboard._onlineWinners
+    if not w then w = Dashboard.RefreshOnlineWinners() end
+    if w and nameRealm then
+        local own = aid
+        if own == nil then own = w.charAID[nameRealm] end
+        -- `own == false` means the same Name-Realm sits under several accounts
+        -- and cannot be attributed; fall through to plain recency for it.
+        if own then
+            local win = w.winner[own]
+            if win ~= nil then return win == nameRealm end
+        end
+    end
+    -- Exempt / unattributable character: the original recency heuristic.
+    local selfName = selfShortName()
+    if selfName and nameRealm and shortOf(nameRealm) == selfName then return true end
     return (now() - (rec.lastSeen or 0)) <= ONLINE_WINDOW
 end
 
@@ -621,6 +749,9 @@ function Dashboard.GatherRoster(faction, opts)
     local out = {}
     local data = ns.Store and ns.Store.GetData and ns.Store.GetData()
     if not data or not data.accounts then return out end
+    -- Per-account online exclusivity is recomputed over the WHOLE store BEFORE
+    -- the faction/level filters run (see the block above IsOnline for why).
+    Dashboard.RefreshOnlineWinners()
     for aid, bucket in pairs(data.accounts) do
         local function consider(nameRealm, rec)
             if not rec then return end
@@ -633,7 +764,7 @@ function Dashboard.GatherRoster(faction, opts)
                 nameRealm = nameRealm,
                 aid       = aid,
                 rec       = rec,
-                online    = Dashboard.IsOnline(rec, nameRealm),
+                online    = Dashboard.IsOnline(rec, nameRealm, aid),
             }
         end
         for nameRealm, rec in pairs(bucket.characters or {}) do consider(nameRealm, rec) end
@@ -1179,12 +1310,84 @@ local function testDMFSchedule(fails)
     ck(Dashboard.FormatDMFCaption(nil, 0) == "Darkmoon: \226\128\148", "DMF caption: nil schedule -> em-dash")
 end
 
+-- Same-account online exclusivity (owner bug: logging Daseeki -> Shalk on ONE
+-- account left both showing a green pip). Exercises the pure winners pass and
+-- the IsOnline lookup that consults it.
+local function testOnlineExclusivity(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local T = 1000000
+    local function r(nameRealm, aid, lastSeen, selfAcct)
+        return { nameRealm = nameRealm, aid = aid, selfAcct = selfAcct or false,
+                 rec = { lastSeen = lastSeen } }
+    end
+
+    -- 1) REMOTE account, two fresh siblings -> only the newest lastSeen is on.
+    local w = Dashboard.ComputeOnlineWinners(
+        { r("Daseeki-R", "2", T - 40), r("Shalk-R", "2", T - 5) }, T, "Tester")
+    ck(w.winner["2"] == "Shalk-R", "same aid, two fresh -> newest (Shalk) wins")
+
+    -- 2) LOCAL account -> the character we are logged in as wins outright, even
+    --    though the sibling we just left has the FRESHER lastSeen. This is the
+    --    reported bug: recency alone kept Daseeki green.
+    w = Dashboard.ComputeOnlineWinners(
+        { r("Daseeki-R", "1", T, true), r("Shalk-R", "1", T - 90, true) }, T, "Shalk")
+    ck(w.winner["1"] == "Shalk-R", "local account -> current player wins over fresher sibling")
+
+    -- 3) DIFFERENT accounts, both fresh -> both online (owner runs 4 accounts;
+    --    exclusivity is strictly per-aid and must never span accounts).
+    w = Dashboard.ComputeOnlineWinners(
+        { r("Aaa-R", "1", T - 5, true), r("Bbb-R", "3", T - 5) }, T, "Aaa")
+    ck(w.winner["1"] == "Aaa-R" and w.winner["3"] == "Bbb-R", "different aids -> both online")
+
+    -- 4) Remote account whose freshest record is outside ONLINE_WINDOW -> nobody.
+    w = Dashboard.ComputeOnlineWinners(
+        { r("Old-R", "4", T - (ONLINE_WINDOW + 1)), r("Older-R", "4", T - 9999) }, T, "Tester")
+    ck(w.winner["4"] == false, "remote aid, all stale -> no winner")
+
+    -- 5) Orphan bucket that is not ours is EXEMPT (unattributed characters may
+    --    come from many accounts, so one-per-account is not a valid claim).
+    w = Dashboard.ComputeOnlineWinners(
+        { r("Un-R", "", T), r("Deux-R", "", T - 1) }, T, "Tester")
+    ck(w.winner[""] == nil, "non-self orphan bucket -> exempt from exclusivity")
+    --    ...but our OWN orphan bucket (no account id chosen yet) still claims.
+    w = Dashboard.ComputeOnlineWinners(
+        { r("Un-R", "", T, true), r("Tester-R", "", T - 99, true) }, T, "Tester")
+    ck(w.winner[""] == "Tester-R", "self orphan bucket -> current player wins")
+
+    -- 6) A Name-Realm held under TWO accounts is unattributable -> charAID false.
+    w = Dashboard.ComputeOnlineWinners(
+        { r("Dup-R", "1", T, true), r("Dup-R", "5", T) }, T, "Tester")
+    ck(w.charAID["Dup-R"] == false, "duplicate Name-Realm across aids -> unattributable")
+
+    -- 7) IsOnline consults the table: the LOSER reads offline even though its
+    --    lastSeen is bang-fresh, and an explicit aid overrides the lookup.
+    local saved = Dashboard._onlineWinners
+    Dashboard._onlineWinners = {
+        winner  = { ["1"] = "Shalk-R", ["3"] = "Bbb-R" },
+        charAID = { ["Shalk-R"] = "1", ["Daseeki-R"] = "1", ["Bbb-R"] = "3" },
+    }
+    local fresh = { lastSeen = now() }
+    ck(Dashboard.IsOnline(fresh, "Shalk-R", "1") == true, "IsOnline: winner -> online")
+    ck(Dashboard.IsOnline(fresh, "Daseeki-R", "1") == false,
+        "IsOnline: fresh same-account loser -> OFFLINE (the bug)")
+    ck(Dashboard.IsOnline(fresh, "Daseeki-R") == false,
+        "IsOnline: aid resolved via charAID -> loser still offline")
+    ck(Dashboard.IsOnline(fresh, "Bbb-R", "3") == true, "IsOnline: other account unaffected")
+    ck(Dashboard.IsOnline(fresh, "Nobody-R") == true,
+        "IsOnline: untracked character falls back to recency")
+    ck(Dashboard.IsOnline({ lastSeen = now() - (ONLINE_WINDOW + 5) }, "Nobody-R") == false,
+        "IsOnline: untracked + stale -> offline")
+    ck(Dashboard.IsOnline(nil, "Shalk-R", "1") == false, "IsOnline: nil record -> offline")
+    Dashboard._onlineWinners = saved
+end
+
 if ns.RegisterSelfTest then
     ns:RegisterSelfTest("dashboard", function(verbose)
         local cases = {
             { name = "aura class rules", fn = testAuraClassRules },
             { name = "cooldown decay", fn = testDecayRemaining },
             { name = "dmf schedule", fn = testDMFSchedule },
+            { name = "online exclusivity", fn = testOnlineExclusivity },
         }
         local allPass = true
         for _, c in ipairs(cases) do
