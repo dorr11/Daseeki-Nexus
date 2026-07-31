@@ -5,7 +5,8 @@
 -- content docks here, in the lower-right pane region of the Characters screen. This
 -- file re-houses the proven timer logic from the retired ui_tab_timers.lua: the
 -- world-buff cooldown rows (icon tile · name+crest · green "Open" / outlined
--- countdown · off-CD stamp · Log link + pop-log popup), the songflower strip (a
+-- countdown, whose HOVER names the off-CD clock time · Log link + pop-log popup —
+-- round-16b retired the inline off-CD stamp), the songflower strip (a
 -- compact 2×5 mini grid), and the Broadcast button. It ALSO subsumes the former
 -- status bar's live world-buff readouts (that band is removed from the window).
 --
@@ -102,13 +103,19 @@ local WB_ROWS = {
 }
 
 -- Map a Timers.BuffStatus readout ({ state, remaining, nextAt }) to world-buff row
--- content. Returns (statusText, statusToken, pulse, stampText). Pure, so the
+-- content. Returns (statusText, statusToken, pulse, tipText). Pure, so the
 -- "timersui" suite drives the whole four-state matrix headless.
 --   nodata : nothing observed yet
 --   canpop : off cooldown / respawn elapsed — BRAND_SPEC §6 green "Open"
 --   killed : the announcer died and is respawning. INFORMATIONAL, not a closing
 --            window, so it reads warn and never pulses.
 --   cd     : on cooldown — danger + brighten pulse once inside SF_IMMINENT.
+-- ROUND-16b (owner): the 4th return was the INLINE "off CD 14:58" stamp micro-label that
+-- sat between the countdown and the Log button. The stamp is deleted from the row; this
+-- string is now the HOVER TOOLTIP line for the countdown numeral, so the clock time is
+-- on demand instead of permanently occupying a column. Plain copy ("Off cooldown at
+-- 14:58"). The two states that show no countdown (Open / No data) return "" — the numeral
+-- already says everything, so a tooltip there would only repeat it.
 function Dashboard.WBRowContent(st, imminent)
     imminent = imminent or SF_IMMINENT
     local state = st and st.state
@@ -116,14 +123,46 @@ function Dashboard.WBRowContent(st, imminent)
         return "Open", "ok", false, ""
     elseif state == "killed" then
         return "Killed \194\183 " .. Dashboard.FormatMSS(st.remaining), "warn", false,
-               "respawns " .. date("%H:%M", st.nextAt)
+               "Respawns at " .. date("%H:%M", st.nextAt)
     elseif state == "cd" then
         local rem = st.remaining or 0
         local imm = (rem <= imminent)
         return Dashboard.FormatDuration(rem), imm and "danger" or "warn", imm,
-               "off CD " .. date("%H:%M", st.nextAt)
+               "Off cooldown at " .. date("%H:%M", st.nextAt)
     end
     return "No data", "faint", false, ""
+end
+
+-- ── DMF readout ink + copy (round-16b addendum) ──────────────────────────────
+-- The bottom-left Darkmoon readout drops its "Darkmoon:" word prefix in favour of the
+-- DMF BUFF ICON, and the remaining caption reads in the buff's own family hue (arcane
+-- violet) so it matches the detail pane's buff-name language.
+--
+-- TECH DEBT: the caption string is built by ui_shell's Dashboard.FormatDMFCaption, which
+-- still bakes in the "Darkmoon: " prefix. ui_shell is owned by the roster-dedup sibling
+-- this round, so the prefix is stripped DOCK-SIDE here. Fold this into FormatDMFCaption
+-- as a style option (e.g. `prefix=false`) when ui_shell is free again.
+local DMF_PREFIX = "Darkmoon: "
+function Dashboard.StripDMFPrefix(s)
+    if type(s) ~= "string" then return "" end
+    if s:sub(1, #DMF_PREFIX) == DMF_PREFIX then return s:sub(#DMF_PREFIX + 1) end
+    return s
+end
+
+-- Mirrors ui_detail's BUFF_HUE.dmf + its lift/contrast-guard treatment (that table is a
+-- file-local there, so the constant is duplicated rather than reached into).
+local DMF_HUE = { 0.612, 0.420, 0.984 }   -- Sayge's fortune — arcane violet
+local DMF_LIFT, DMF_MIN_CONTRAST = 0.14, 0.20
+local function relLum(r, g, b) return 0.2126 * r + 0.7152 * g + 0.0722 * b end
+-- Returns r, g, b, fellBack — the lifted violet, or the supplied fallback (the theme's
+-- text colour) when the hue is too close to this theme's ground to stay readable.
+function Dashboard.DMFInk(groundR, groundG, groundB, fbR, fbG, fbB)
+    local hr = DMF_HUE[1] + (1 - DMF_HUE[1]) * DMF_LIFT
+    local hg = DMF_HUE[2] + (1 - DMF_HUE[2]) * DMF_LIFT
+    local hb = DMF_HUE[3] + (1 - DMF_HUE[3]) * DMF_LIFT
+    local dl = math.abs(relLum(hr, hg, hb) - relLum(groundR or 0, groundG or 0, groundB or 0))
+    if dl < DMF_MIN_CONTRAST then return fbR, fbG, fbB, true end
+    return hr, hg, hb, false
 end
 
 ----------------------------------------------------------------------
@@ -288,9 +327,28 @@ function TimersDock.Attach(parent)
         r.log = UI.MakeButton(r, { text = "Log", variant = "quiet", width = 40, height = 18,
             onClick = function() showPopLog(def.logKey, (def.title or def.label) .. " — Pop Log") end })
         r.log:SetPoint("RIGHT", r, "RIGHT", 0, 0)
-        r.stamp = fstr(r, "microLabel", "RIGHT"); r.stamp:SetPoint("RIGHT", r.log, "LEFT", -8, 0)
-        r.stamp:SetTextColor(UI.Color("muted"))   -- pop pass (off-CD stamp is secondary)
-        r.status = fstr(r, "numeral", "RIGHT"); r.status:SetPoint("RIGHT", r.stamp, "LEFT", -10, 0)
+        -- ROUND-16b (owner): the inline "off CD 14:58" stamp is GONE. The countdown now
+        -- sits directly beside the Log button — the whole stamp column is reclaimed, so
+        -- the name/status side of the row gains that width — and the clock time moved to
+        -- a hover tooltip on the countdown itself.
+        r.status = fstr(r, "numeral", "RIGHT"); r.status:SetPoint("RIGHT", r.log, "LEFT", -8, 0)
+        -- A FontString cannot take mouse input, so a thin hit frame tracks the numeral's
+        -- text extents (it re-anchors automatically as the countdown's width changes).
+        -- It sits left of the Log button and never overlaps it, so the Log click and any
+        -- row-level hover are untouched.
+        local hit = CreateFrame("Frame", nil, r)
+        hit:SetPoint("TOPLEFT", r.status, "TOPLEFT", -4, 2)
+        hit:SetPoint("BOTTOMRIGHT", r.status, "BOTTOMRIGHT", 4, -2)
+        hit:EnableMouse(true)
+        hit:SetScript("OnEnter", function()
+            if not r._tipText or r._tipText == "" then return end   -- Open / No data: nothing to add
+            GameTooltip:SetOwner(hit, "ANCHOR_RIGHT")
+            GameTooltip:AddLine(def.title or def.label, UI.Color("text"))
+            GameTooltip:AddLine(r._tipText, UI.Color("muted"))
+            GameTooltip:Show()
+        end)
+        hit:SetScript("OnLeave", function() GameTooltip:Hide() end)
+        r.statusHit = hit
         -- One hairline per row (sharp control-panel rule). Pop pass: borderLite.
         r.rule = UI.Hairline(r, { token = "borderLite" })
         r.rule:SetPoint("BOTTOMLEFT", r, "BOTTOMLEFT", 0, 0)
@@ -325,10 +383,13 @@ function TimersDock.Attach(parent)
             self:SetBackdropColor(UI.Color("inset"))
             self:SetBackdropBorderColor(UI.Color("borderLite"))   -- pop pass
         end)
-        -- Two-line cell (fills the taller round-4 cell): "N Label" on top, status below.
+        -- Two-line cell (fills the taller round-4 cell): node name on top, status below.
         cell.nm = fstr(cell, "microLabel"); cell.nm:SetPoint("TOPLEFT", cell, "TOPLEFT", 6, -5)
         cell.nm:SetWordWrap(false); cell.nm:SetTextColor(UI.Color("muted"))   -- pop pass
-        cell.nm:SetText(("%d %s"):format(i, nodes[i].label or ("Node " .. i)))
+        -- Round-16b addendum 2 (owner: "the names are getting cut off"): the numeric
+        -- prefix is dropped so the full node name gets the cell width. Node indices are
+        -- unaffected everywhere else (pop log / slash output still name them by number).
+        cell.nm:SetText(nodes[i].label or ("Node " .. i))
         cell.st = fstr(cell, "numeral"); cell.st:SetPoint("BOTTOMLEFT", cell, "BOTTOMLEFT", 6, 6)
         cell._nodeKey = "flower" .. i
         D._sfCells[i] = cell
@@ -403,8 +464,15 @@ function TimersDock.Attach(parent)
     dmfHost:SetPoint("BOTTOMLEFT", parent, "BOTTOMLEFT", PAD_H, PAD_V + 1)
     dmfHost:SetPoint("RIGHT", bcast, "LEFT", -10, 0)
     dmfHost:EnableMouse(true)
-    local dmfFS = fstr(dmfHost, "small"); dmfFS:SetPoint("LEFT", dmfHost, "LEFT", 0, 0)
-    dmfFS:SetJustifyH("LEFT"); dmfFS:SetWordWrap(false); dmfFS:SetTextColor(UI.Color("muted"))
+    -- Round-16b addendum: the "Darkmoon:" word prefix is replaced by the DMF BUFF ICON
+    -- (Sayge's Dark Fortune, aura slot 5) in the dock's standard inset-framed tile
+    -- treatment, sized to the 20px readout host.
+    local dmfTile = makeIconTile(dmfHost, 16)
+    dmfTile:SetPoint("LEFT", dmfHost, "LEFT", 0, 0)
+    dmfTile.icon:SetTexture(Dashboard.AuraIcon(5))
+    D.dmfTile = dmfTile
+    local dmfFS = fstr(dmfHost, "small"); dmfFS:SetPoint("LEFT", dmfTile, "RIGHT", 6, 0)
+    dmfFS:SetJustifyH("LEFT"); dmfFS:SetWordWrap(false)
     dmfHost:SetScript("OnEnter", function(self)
         local sc = Dashboard.GetDMFSchedule and Dashboard.GetDMFSchedule()
         if not sc then return end
@@ -428,7 +496,18 @@ function TimersDock.Attach(parent)
         wbMeta:SetText(("%s \194\183 %s \194\183 live"):format(realm, Dashboard.GetFaction()))
         -- Darkmoon Faire schedule readout (restore #1).
         if D.dmf and Dashboard.GetDMFSchedule and Dashboard.FormatDMFCaption then
-            D.dmf:SetText(Dashboard.FormatDMFCaption(Dashboard.GetDMFSchedule(), now))
+            -- Round-16b: the icon carries the "Darkmoon" label, so the word prefix is
+            -- stripped and the caption reads in the DMF family hue (violet), guarded for
+            -- contrast against the active theme's ground.
+            D.dmf:SetText(Dashboard.StripDMFPrefix(
+                Dashboard.FormatDMFCaption(Dashboard.GetDMFSchedule(), now)))
+            local gr, gg, gb = UI.Color("ground")
+            local tr, tg, tb = UI.Color("text")
+            -- NOTE: DMFInk returns a 4th value (fellBack). Bind r/g/b to locals — passing
+            -- the call straight into SetTextColor would feed that boolean in as ALPHA
+            -- (the multi-return trap that caused the round-4 crash).
+            local ir, ig, ib = Dashboard.DMFInk(gr, gg, gb, tr, tg, tb)
+            D.dmf:SetTextColor(ir, ig, ib)
         end
 
         for _, r in ipairs(D._wbRows) do
@@ -437,11 +516,11 @@ function TimersDock.Attach(parent)
             -- kill-vs-pop precedence and the 360s respawn model). Soft-guarded like
             -- the old ComputeCD call so a partial engine load still renders.
             local st = T and T.BuffStatus and T.BuffStatus(def.key, now)
-            local text, token, pulse, stamp = Dashboard.WBRowContent(st)
+            local text, token, pulse, tip = Dashboard.WBRowContent(st)
             r.status:SetText(text); r.status:SetTextColor(UI.Color(token))
             r.status._pulse = pulse
-            r.stamp:SetText(stamp)
-            if stamp ~= "" then r.stamp:SetTextColor(UI.Color("faint")) end
+            -- Round-16b: the clock time now rides the countdown's hover tooltip.
+            r._tipText = tip
         end
 
         local nUp, nDown, nUnknown = 0, 0, 0
@@ -527,8 +606,40 @@ local function testCellContent(fails)
     ck(t == "UP?" and c == "ok", "up -> 'UP?' / ok green")
 end
 
+-- Round-16b addendum: the DMF readout's caption prefix + family-hue ink. Pure.
+local function testDMFReadout(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+
+    -- The icon now carries the "Darkmoon" label, so the word prefix is stripped.
+    ck(Dashboard.StripDMFPrefix("Darkmoon: Mulgore in 9d 10h (est.)") == "Mulgore in 9d 10h (est.)",
+        "prefix stripped -> 'Mulgore in 9d 10h (est.)'")
+    ck(Dashboard.StripDMFPrefix("Darkmoon: Elwynn Forest \194\183 up now, 2d left (est.)")
+        == "Elwynn Forest \194\183 up now, 2d left (est.)", "active caption prefix stripped")
+    -- Idempotent / defensive: an already-stripped or odd string passes through untouched.
+    ck(Dashboard.StripDMFPrefix("Mulgore in 2d") == "Mulgore in 2d", "no prefix -> unchanged")
+    ck(Dashboard.StripDMFPrefix("") == "", "empty -> empty")
+    ck(Dashboard.StripDMFPrefix(nil) == "", "nil -> empty (no error)")
+    -- Guard the em-dash no-schedule caption too (FormatDMFCaption's nil branch).
+    ck(Dashboard.StripDMFPrefix("Darkmoon: \226\128\148") == "\226\128\148", "em-dash caption stripped")
+
+    -- Ink: the lifted arcane violet on the dark Nexus ground, and the readable-contrast
+    -- fallback when a theme's ground sits too close to that hue.
+    local dark = { 0.086, 0.075, 0.059 }          -- ground-ish (dark themes)
+    local r, g, b, fell = Dashboard.DMFInk(dark[1], dark[2], dark[3], 1, 1, 1)
+    ck(fell == false, "violet clears the contrast guard on a dark ground")
+    ck(r > 0.612 and b > 0.984, "hue is LIFTED toward white from the base violet (as detail rows do)")
+    ck(b > r and b > g, "ink stays blue-dominant (violet, not grey)")
+    -- A light ground close in luminance to the lifted violet must fall back to `text`.
+    local r2, g2, b2, fell2 = Dashboard.DMFInk(0.62, 0.55, 0.90, 0.11, 0.11, 0.11)
+    ck(fell2 == true, "low-contrast ground -> falls back")
+    ck(r2 == 0.11 and g2 == 0.11 and b2 == 0.11, "fallback returns the supplied text colour")
+    -- The 4th return exists precisely so callers do NOT feed it to SetTextColor as alpha.
+    ck(select("#", Dashboard.DMFInk(dark[1], dark[2], dark[3], 1, 1, 1)) == 4,
+        "DMFInk returns 4 values (r,g,b,fellBack) — bind r/g/b before SetTextColor")
+end
+
 -- M:SS formatting + the four-state world-buff row matrix (Timers.BuffStatus ->
--- text / token / pulse / stamp). Pure; no frames, no engine state.
+-- text / token / pulse / tipText). Pure; no frames, no engine state.
 local function testWBRow(fails)
     local function ck(c, m) if not c then fails[#fails + 1] = m end end
     ck(Dashboard.FormatMSS(0)    == "0:00", "FormatMSS 0 -> '0:00'")
@@ -544,22 +655,22 @@ local function testWBRow(fails)
     -- nodata (and the soft-guard path where BuffStatus was unavailable).
     local txt, tok, pulse, stamp = Dashboard.WBRowContent(nil)
     ck(txt == "No data" and tok == "faint" and pulse == false and stamp == "",
-       "nil status -> 'No data' / faint / no pulse / no stamp")
+       "nil status -> 'No data' / faint / no pulse / no tooltip")
     txt, tok, pulse, stamp = Dashboard.WBRowContent({ state = "nodata", remaining = 0, nextAt = 0 })
     ck(txt == "No data" and tok == "faint" and pulse == false and stamp == "",
-       "nodata -> 'No data' / faint / no pulse / no stamp")
+       "nodata -> 'No data' / faint / no pulse / no tooltip")
 
     -- canpop: BRAND_SPEC §6 green "Open", exactly (no pop-phrasing, no suffix).
     txt, tok, pulse, stamp = Dashboard.WBRowContent({ state = "canpop", remaining = 0, nextAt = T0 })
     ck(txt == "Open" and tok == "ok" and pulse == false and stamp == "",
-       "canpop -> exactly 'Open' / ok / no pulse / no stamp")
+       "canpop -> exactly 'Open' / ok / no pulse / no tooltip")
 
     -- killed: live M:SS countdown, warn, NEVER pulses, stamp names the respawn clock.
     txt, tok, pulse, stamp = Dashboard.WBRowContent({ state = "killed", remaining = 125, nextAt = T0 })
     ck(txt == "Killed \194\183 2:05", "killed -> 'Killed \194\183 2:05' (M:SS resolution)")
     ck(tok == "warn", "killed reads warn")
     ck(pulse == false, "killed does NOT pulse (informational respawn)")
-    ck(stamp == "respawns " .. date("%H:%M", T0), "killed stamp -> 'respawns HH:MM'")
+    ck(stamp == "Respawns at " .. date("%H:%M", T0), "killed tip -> 'Respawns at HH:MM'")
     txt = Dashboard.WBRowContent({ state = "killed", remaining = 359, nextAt = T0 })
     ck(txt == "Killed \194\183 5:59", "killed just after the kill -> '5:59'")
 
@@ -567,7 +678,7 @@ local function testWBRow(fails)
     txt, tok, pulse, stamp = Dashboard.WBRowContent({ state = "cd", remaining = 3 * 3600, nextAt = T0 })
     ck(txt == Dashboard.FormatDuration(3 * 3600), "cd text is FormatDuration(remaining)")
     ck(tok == "warn" and pulse == false, "cd far out -> warn / no pulse")
-    ck(stamp == "off CD " .. date("%H:%M", T0), "cd stamp -> 'off CD HH:MM'")
+    ck(stamp == "Off cooldown at " .. date("%H:%M", T0), "cd tip -> 'Off cooldown at HH:MM'")
     tok, pulse = select(2, Dashboard.WBRowContent({ state = "cd", remaining = SF_IMMINENT, nextAt = T0 }))
     ck(tok == "danger" and pulse == true, "cd AT SF_IMMINENT -> danger + pulse")
     tok, pulse = select(2, Dashboard.WBRowContent({ state = "cd", remaining = SF_IMMINENT - 1, nextAt = T0 }))
@@ -579,7 +690,9 @@ end
 if ns.RegisterSelfTest then
     ns:RegisterSelfTest("timersui", function(verbose)
         local fails = {}
-        local ok = pcall(function() testGridLayout(fails); testCellContent(fails); testWBRow(fails) end)
+        local ok = pcall(function()
+            testGridLayout(fails); testCellContent(fails); testWBRow(fails); testDMFReadout(fails)
+        end)
         local passed = ok and #fails == 0
         if verbose and ns and ns.Print then
             if passed then ns:Print("  PASS timersui/songflower grid layout + cell content + WB rows")
