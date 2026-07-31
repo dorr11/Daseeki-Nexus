@@ -82,33 +82,43 @@ local PULL_FRESH_SLACK = 5
 Timers.PULL_FRESH_SLACK = PULL_FRESH_SLACK
 
 ----------------------------------------------------------------------
--- Per-buff, per-yell-stage pull windows + auto-calibration
+-- Per-buff, per-yell-stage pull windows  (AUTHORITATIVE CONSTANTS)
 --
--- World-buff drop yells are MULTI-STAGE (the local detector already
--- distinguishes them, classifyYell below): yell 1 = kill/announce (the head was
--- turned in / the boss announced) and the buff actually drops MINUTES later;
--- yell 2 = "come get buffed", the short final window before the buff lands. The
--- old flat DEFAULT_PULL_WINDOW (40s) was only ever right for yell 2 — on a live
--- Nef drop the owner saw reference trackers showing ~2.4 and ~3.7 MINUTES
--- remaining while our bar ran a 40s window.
+-- A world-buff drop announces in two yell stages. Stage 1 is the announce/
+-- "head turned in" yell and is the ONLY stage that records a pop; stage 2 is
+-- the follow-up flourish. The seconds below are the MEASURED yell -> buff-lands
+-- delays (behaviour spec §10.7) and they are now authoritative: they are short
+-- (6-50s), not the minutes-scale guesses the old PROVISIONAL seeds used.
 --
--- PULL_WINDOWS[buffKey] = { [1] = announce->drop seconds, [2] = final-yell->drop
--- seconds }. The seeds below are PROVISIONAL, deliberately conservative first
--- guesses; they are REPLACED per (buff, yellNum) by the rolling MEDIAN of
--- auto-calibrated observations (Timers.pullObservations) as soon as one drop is
--- witnessed on this client, and a manual override wins over both. Selection
--- precedence lives in Timers.EffectivePullWindow:
---   override (timerSettings.pullWindows[buffKey]) > observed median (>=1 sample)
---   > seeded PROVISIONAL default > DEFAULT_PULL_WINDOW.
+-- `false` means that (buff, stage) raises NO bar at all — stage 2 is a complete
+-- no-op for Rend / Onyxia / Nefarian. Zandalar is the documented exception: its
+-- stage 2 does carry a real 29s bar (spec §10.7), it just never records a pop.
+--
+-- Rend's stage-1 entry is the BARRENS landing; a Rend yell actually raises TWO
+-- bars (Orgrimmar + Barrens) — see REND_BARS in the yell detector below.
+--
+-- AUTO-CALIBRATION: the observation machinery (RecordPullObservation /
+-- NotePullGain / pullObservations / `/dsn debug pulls`) is DELIBERATELY KEPT so
+-- the owner can measure real drift against these constants, but it no longer
+-- feeds bar length — the spec constants win. Only an explicit manual override
+-- (timerSettings.pullWindows) can still displace a constant.
 local PULL_WINDOWS = {
-    rend = { [1] = 180, [2] = 40 },   -- PROVISIONAL — replace with measured median
-    onyH = { [1] = 240, [2] = 40 },   -- PROVISIONAL — replace with measured median
-    onyA = { [1] = 240, [2] = 40 },   -- PROVISIONAL — replace with measured median
-    nefH = { [1] = 240, [2] = 40 },   -- PROVISIONAL — replace with measured median
-    nefA = { [1] = 240, [2] = 40 },   -- PROVISIONAL — replace with measured median
-    zg   = { [1] = 40,  [2] = 40 },   -- PROVISIONAL — replace with measured median
+    rend = { [1] = 17,   [2] = false },  -- Barrens landing; see REND_BARS
+    onyH = { [1] = 14.5, [2] = false },
+    onyA = { [1] = 15,   [2] = false },
+    nefH = { [1] = 15,   [2] = false },
+    nefA = { [1] = 12,   [2] = false },
+    zg   = { [1] = 50.5, [2] = 29    },  -- ZG stage 2 DOES bar (spec §10.7)
 }
 Timers.PULL_WINDOWS = PULL_WINDOWS
+
+-- Rend stage 1 raises two bars: the Orgrimmar landing and the Barrens landing.
+-- A Herald-of-Thrall-sourced yell lands in the Barrens on the SHORT 6s variant.
+local REND_BARS = {
+    thrall = { { zone = "Orgrimmar", seconds = 6 }, { zone = "Barrens", seconds = 17 } },
+    herald = { { zone = "Orgrimmar", seconds = 6 }, { zone = "Barrens", seconds = 6  } },
+}
+Timers.REND_BARS = REND_BARS
 
 -- Keep the newest N observations per (buffKey, yellNum) pair.
 local PULL_OBS_CAP = 10
@@ -119,9 +129,12 @@ Timers.PULL_OBS_CAP = PULL_OBS_CAP
 local PULL_OBS_MAX = 900
 Timers.PULL_OBS_MAX = PULL_OBS_MAX
 
--- Normalize yell stage to 1 or 2 (2 = the actionable "come get buffed" default).
+-- Normalize yell stage to 1 or 2. An UNKNOWN stage normalizes to 1: stage 1 is
+-- the announce stage every remote/bulk ingest path actually means, and stage 2
+-- is a no-op for most buffs, so defaulting to 2 (the old behaviour) silently
+-- swallowed relayed pulls.
 local function normYell(yellNum)
-    return (yellNum == 1) and 1 or 2
+    return (yellNum == 2) and 2 or 1
 end
 
 -- Median of a numeric list (pure). Even counts average the two middle values.
@@ -167,20 +180,31 @@ local function pullWindowOverride(buffKey, yellNum)
 end
 
 -- Effective pull window (seconds) + source label for (buffKey, yellNum).
--- Precedence: override > observed-median (>=1 sample) > seeded default > global.
+-- Precedence: manual override > SPEC CONSTANT > global fallback.
+-- Returns nil, "none" when the spec says this stage raises no bar at all.
+-- (The observed median is NO LONGER in this chain — see the PULL_WINDOWS note:
+-- calibration measures drift, it does not set bar length.)
 function Timers.EffectivePullWindow(buffKey, yellNum)
     yellNum = normYell(yellNum)
     local override = pullWindowOverride(buffKey, yellNum)
     if override then return override, "override" end
-    local store = pullObsStore(false)
-    local list = store and store[buffKey] and store[buffKey][yellNum]
-    if list and #list >= 1 then
-        local m = median(list)
-        if m and m > 0 then return m, "observed-median" end
+    local spec = PULL_WINDOWS[buffKey]
+    if spec then
+        local v = spec[yellNum]
+        if v == false then return nil, "none" end
+        if v then return v, "spec" end
     end
-    local seed = PULL_WINDOWS[buffKey]
-    if seed and seed[yellNum] then return seed[yellNum], "default" end
-    return DEFAULT_PULL_WINDOW, "default"
+    return DEFAULT_PULL_WINDOW, "fallback"
+end
+
+-- The median of observed (yell -> land) delays for a stage, or nil. Reporting
+-- only: this is the DRIFT measurement against the spec constant, never the
+-- window the bar uses.
+function Timers.ObservedPullMedian(buffKey, yellNum)
+    local store = pullObsStore(false)
+    local list = store and store[buffKey] and store[buffKey][normYell(yellNum)]
+    if not (list and #list >= 1) then return nil, 0 end
+    return median(list), #list
 end
 
 -- Append one observed announce/yell -> land delay (seconds) for (buffKey,
@@ -279,20 +303,32 @@ Timers._noteFreshness = noteFreshness
 -- Per-buff runtime state
 --
 -- state[buffKey] = {
---   lastPop    = epoch of the last confirmed buff drop (CD anchor),
---   lastKilled = epoch of the last kill/announce (also anchors CD),
+--   lastPop    = epoch of the last confirmed buff drop (the ONLY CD anchor),
+--   killedAt   = epoch of the last ANNOUNCER DEATH — a 360s respawn, NOT a CD,
 --   trust      = trust tag of the anchoring event,
 --   who        = reporter label,
 --   confirmed  = true once a higher-or-equal-trust source agreed,
 -- }
+--
+-- FIELD RENAME (A3.1): the kill epoch used to live in `lastKilled` and every
+-- reader folded it into `max(lastPop, lastKilled)` as a cooldown anchor — which
+-- inverted the meaning (killing the Onyxia announcer showed a SIX HOUR cooldown
+-- when the truth is "6 minute respawn, then available"). It is now `killedAt`,
+-- so anchor arithmetic anywhere — here or in a UI consumer — sees pops only.
+-- The wire/snapshot key stays `lastKilled` for peer compatibility. Read kill
+-- state through Timers.BuffStatus.
 ----------------------------------------------------------------------
 
 Timers.state = {}
 
+-- Announcer respawn after a kill (spec §10.2). Not a cooldown.
+local ANNOUNCER_RESPAWN = 360
+Timers.ANNOUNCER_RESPAWN = ANNOUNCER_RESPAWN
+
 local function stateOf(buffKey)
     local s = Timers.state[buffKey]
     if not s then
-        s = { lastPop = 0, lastKilled = 0, trust = nil, who = nil, confirmed = false }
+        s = { lastPop = 0, killedAt = 0, trust = nil, who = nil, confirmed = false }
         Timers.state[buffKey] = s
     end
     return s
@@ -308,13 +344,13 @@ end
 ----------------------------------------------------------------------
 -- CD derivation (pure)
 --
--- The CD anchor is the later of lastPop / lastKilled. A "killed" entry
--- resets the CD because the head is freshly available for turn-in.
+-- The CD anchor is the last POP and nothing else. An announcer death is a
+-- respawn event, not a cooldown start (A3.1) — see Timers.BuffStatus.
 ----------------------------------------------------------------------
 
 -- Return the effective anchor epoch for a buff's cooldown.
 local function anchorEpoch(s)
-    return math.max(s.lastPop or 0, s.lastKilled or 0)
+    return s.lastPop or 0
 end
 
 -- Compute {onCD, ready, remaining, nextAt} for a buff at time `t`.
@@ -330,6 +366,35 @@ function Timers.ComputeCD(buffKey, anchor, t)
     local onCD = (t < nextAt)
     -- Display grace keeps a bar visible slightly past ready; not a gate.
     return { onCD = onCD, ready = (not onCD), remaining = remaining, nextAt = nextAt }
+end
+
+-- Public buff readout (spec §10.2). This — not raw ComputeCD — is the correct
+-- source for "what should the UI say about this buff":
+--   nodata  : nothing observed
+--   killed  : the announcer died and is still respawning (remaining <= 360s)
+--   canpop  : off cooldown / respawn elapsed
+--   cd      : on cooldown, `remaining` seconds left
+-- A kill NEWER than the newest pop wins and models a 360s RESPAWN; once that
+-- elapses the buff is immediately can-pop (A3.1). Kills never start a cooldown.
+function Timers.BuffStatus(buffKey, t)
+    t = t or now()
+    local s = Timers.state[buffKey]
+    local pop    = (s and s.lastPop) or 0
+    local killed = (s and s.killedAt) or 0
+    if killed > 0 and killed >= pop then
+        local remaining = ANNOUNCER_RESPAWN - (t - killed)
+        if remaining > 0 then
+            return { state = "killed", remaining = remaining,
+                     nextAt = killed + ANNOUNCER_RESPAWN }
+        end
+        return { state = "canpop", remaining = 0, nextAt = killed + ANNOUNCER_RESPAWN }
+    end
+    if pop <= 0 then return { state = "nodata", remaining = 0, nextAt = 0 } end
+    local info = Timers.ComputeCD(buffKey, pop, t)
+    if info.onCD then
+        return { state = "cd", remaining = info.remaining, nextAt = info.nextAt }
+    end
+    return { state = "canpop", remaining = 0, nextAt = info.nextAt }
 end
 
 -- False-positive gate (pure). A fresh POP within a full CD of the current
@@ -358,11 +423,64 @@ end
 local scheduleWarnings
 local maybeBroadcast
 
+-- Raise ONE pull bar for `buffKey`, `window` seconds long, measured from
+-- `epoch`. Recency-gated: an event older than its own window (plus slack) is a
+-- historical anchor and raises nothing — this is the /reload safety gate, since
+-- re-syncing hours-old anchors must not resurrect a bar for a past event. The
+-- REMAINING window is what ships, so a pull heard 4s late shows a 4s-shorter bar.
+local function raisePull(buffKey, epoch, window, trust, zone, yellNum)
+    if not window or window <= 0 then return false end
+    epoch = epoch or now()
+    local elapsed = now() - epoch
+    if elapsed > window + PULL_FRESH_SLACK then return false end
+    local remaining = window - elapsed
+    if remaining > window then remaining = window end   -- future/clock-skew clamp
+    if remaining < 1 then remaining = 1 end             -- visible sliver at the edge
+    -- Drift measurement seed: a stage-resolved pull arms a pending observation so
+    -- the eventual buff-land can measure the real yell->drop delay for
+    -- `/dsn debug pulls`. Purely diagnostic; it does not feed bar length.
+    if yellNum ~= nil then setPendingPull(buffKey, epoch, yellNum) end
+    ns:Fire("PULL_DETECTED", buffKey, remaining, trust, zone)
+    return true
+end
+Timers._raisePull = raisePull
+
+-- Public: raise a pull bar directly, bypassing the log/anchor path. Used by the
+-- detectors that must bar WITHOUT recording a pop (Rend's second bar, the ZG
+-- stage-2 bar, and the ZG quest hand-in).
+function Timers.RaisePull(buffKey, seconds, trust, zone, epoch, yellNum)
+    return raisePull(buffKey, epoch or now(), seconds, trust or "local", zone, yellNum)
+end
+
+-- Soft-guarded alert emit. hud.lua owns the four-channel dispatcher and loads
+-- AFTER us, so this resolves at call time and degrades to a chat line.
+-- `category` is an alerts-matrix event type: questHandin / pullTimer / npcDied /
+-- npcRespawned / cdWarning / cdExpired / buffGain.
+Timers._lastNotice = nil
+local function notify(buffKey, category, message)
+    Timers._lastNotice = { buff = buffKey, category = category, message = message }
+    if ns.HUD and ns.HUD.Alert then
+        ns:SafeCall(ns.HUD.Alert, buffKey, category, message)
+    else
+        ns:Print(message)
+    end
+end
+Timers._notify = notify
+
+-- Display label for a buff key; borrows the HUD's table when it is loaded.
+local function buffLabelOf(buffKey)
+    local meta = ns.HUD and ns.HUD.BUFF_META and ns.HUD.BUFF_META[buffKey]
+    return (meta and meta.label) or tostring(buffKey)
+end
+
 -- `yellNum` (optional, 1|2) is the yell stage a LOCAL detector resolved (1 =
 -- kill/announce, 2 = come-get-buffed); it selects the per-stage pull window and
 -- seeds auto-calibration. Non-local ingest paths (mesh/SN/NWB/DBM/quest) pass
 -- nil and rely on their own pullDuration or the stage-2 default.
-function Timers.Record(buffKey, epoch, trust, who, kind, zone, pullDuration, yellNum)
+-- `opts` (optional): { noPull = true } records/logs WITHOUT raising a pull bar.
+-- The local yell detector uses it because bars are yell-driven and must show
+-- even when the pop itself is rejected by the cooldown/dedup gate.
+function Timers.Record(buffKey, epoch, trust, who, kind, zone, pullDuration, yellNum, opts)
     if not CD[buffKey] and buffKey ~= "battleShout" then
         return false, "unknown buff " .. tostring(buffKey)
     end
@@ -401,9 +519,10 @@ function Timers.Record(buffKey, epoch, trust, who, kind, zone, pullDuration, yel
         end
     end
 
-    -- Apply the anchor.
+    -- Apply the anchor. A kill stamps the RESPAWN clock (killedAt), never the
+    -- cooldown anchor — see Timers.BuffStatus (A3.1).
     if isKill then
-        s.lastKilled = epoch
+        s.killedAt = epoch
     else
         s.lastPop = epoch
     end
@@ -423,35 +542,18 @@ function Timers.Record(buffKey, epoch, trust, who, kind, zone, pullDuration, yel
     -- still repopulate the Timers tab and CD countdowns after a reload).
     ns:Fire("TIMER_UPDATED", buffKey)
 
-    -- Pull bar / "incoming!" alert: recency-gated so ONLY genuinely fresh
-    -- events raise it. A pop/kill older than its pull window (plus a small
-    -- slack) is a historical anchor — it still applied, persisted, and (below)
-    -- broadcasts, but it must not raise a pull bar for a past event. We pass the
-    -- REMAINING window (full window minus elapsed since the event) so a pull
-    -- heard 20s late shows a ~20s bar, not a fresh full one.
-    if isKill or kind == "pop" then
-        -- Window precedence: an explicit trusted-source remaining (mesh/SN pull
-        -- relay carries a real countdown) always wins; otherwise the per-buff,
-        -- per-yell-stage effective window (override > observed-median > seeded).
+    -- Pull bar. Only a POP means "a buff is incoming"; an announcer KILL is a
+    -- respawn event and raises no bar (A3.1). Window precedence: an explicit
+    -- trusted-source remaining (a mesh/SN pull relay carries a real countdown)
+    -- wins, else the per-stage spec constant.
+    if kind == "pop" and not (opts and opts.noPull) then
         local window
         if pullDuration and pullDuration > 0 then
             window = pullDuration
         else
             window = Timers.EffectivePullWindow(buffKey, yellNum)
         end
-        local elapsed = now() - epoch
-        if elapsed <= window + PULL_FRESH_SLACK then
-            local remaining = window - elapsed
-            if remaining > window then remaining = window end   -- future/clock-skew clamp
-            if remaining < 1 then remaining = 1 end              -- keep a visible sliver at the edge
-            -- Auto-calibration seed: a FRESH local yell (yellNum set) arms a
-            -- pending pull so the eventual buff-land measures announce->drop for
-            -- this (buff, stage). Non-local paths (nil yellNum) never seed.
-            if yellNum ~= nil then
-                setPendingPull(buffKey, epoch, yellNum)
-            end
-            ns:Fire("PULL_DETECTED", buffKey, remaining, trust, zone)
-        end
+        raisePull(buffKey, epoch, window, trust, zone, yellNum)
     end
 
     -- (Re)seed warnings for the CD-scheduled buffs.
@@ -464,77 +566,206 @@ function Timers.Record(buffKey, epoch, trust, who, kind, zone, pullDuration, yel
 end
 
 ----------------------------------------------------------------------
--- Detector 1 — local yell / say scanning
+-- Detector 1 — local yell / say table  (spec §10.3)
 --
--- MONSTER_YELL / MONSTER_SAY carry (text, monsterName, ...). The monster
--- NAME reliably identifies the buff; the TEXT fragment distinguishes the
--- yell number (1 = kill/announce, 2 = come-get-buffed). Alliance cannot
--- read Horde yell text, so Rend is keyed on NPC name alone.
+-- MONSTER_YELL / MONSTER_SAY carry (text, monsterName, ...). Detection is an
+-- EXPLICIT (npcName, textSubstring) -> (buffKey, yellStage) table. The text
+-- substring IS the stage discriminator; there is no keyword heuristic and no
+-- default stage, so an unrecognised line from a known announcer is simply
+-- ignored rather than guessed at (the old heuristic defaulted to stage 2 and
+-- manufactured a pop out of any unreadable line).
+--
+-- Stage rules:
+--   stage 1 = the ONLY stage that records a pop and starts bars
+--   stage 2 = a complete no-op, EXCEPT Zandalar, whose stage 2 carries a real
+--             29s bar but still records nothing (spec §10.7)
+-- `kind="killed"` is reserved exclusively for CLEU announcer deaths — a yell is
+-- never a kill, however much its text talks about slaying things.
 ----------------------------------------------------------------------
 
--- NPC name (lowercased) -> { base buff, split=true if H/A }.
-local YELL_NPC = {
-    ["thrall"]                 = { buff = "rend" },
-    ["herald of thrall"]       = { buff = "rend" },
-    ["overlord runthak"]       = { buff = "onyH" },
-    ["major mattingly"]        = { buff = "onyA" },
-    ["high overlord saurfang"] = { buff = "nefH" },
-    ["field marshal afrasiabi"]= { buff = "nefA" },
-    ["molthor"]                = { buff = "zg" },
-    ["zandalarian emissary"]   = { buff = "zg" },
-}
+-- npc name (lowercased) -> ordered list of { text, buff, yell }.
+local YELL_NPC_ROWS = {}
 
--- Text fragments (lowercased) that mark yell number 1 (kill/announce).
-local YELL1_FRAGMENTS = {
-    "slain", "has been slain", "brought", "victory", "fallen", "killed",
-    "dead", "defeated",
-}
--- Text fragments that mark yell number 2 (buff being applied / come get it).
-local YELL2_FRAGMENTS = {
-    "rallying cry", "dragonslayer", "warchief", "blessing", "zandalar",
-    "spirit", "emissary", "reward",
-}
-
-local function classifyYell(text)
-    text = (text or ""):lower()
-    for i = 1, #YELL2_FRAGMENTS do
-        if text:find(YELL2_FRAGMENTS[i], 1, true) then return 2 end
-    end
-    for i = 1, #YELL1_FRAGMENTS do
-        if text:find(YELL1_FRAGMENTS[i], 1, true) then return 1 end
-    end
-    return nil   -- unknown; caller applies a default
+local function defineYells(npcNames, rows)
+    for i = 1, #npcNames do YELL_NPC_ROWS[npcNames[i]] = rows end
 end
-Timers._classifyYell = classifyYell
 
--- Resolve an inbound yell to (buffKey, yellNum). Returns nil if unmatched.
-function Timers.MatchYell(text, monsterName)
+defineYells({ "thrall", "herald of thrall" }, {
+    { text = "rend blackhand, has fallen",     buff = "rend", yell = 1 },
+    { text = "be bathed in my power",          buff = "rend", yell = 2 },
+})
+defineYells({ "overlord runthak" }, {
+    { text = "onyxia, has been slain",         buff = "onyH", yell = 1 },
+    { text = "be lifted by the rallying cry",  buff = "onyH", yell = 2 },
+})
+defineYells({ "major mattingly" }, {
+    { text = "history has been made",          buff = "onyA", yell = 1 },
+    { text = "hangs from the arches",          buff = "onyA", yell = 2 },
+})
+defineYells({ "high overlord saurfang" }, {
+    { text = "nefarian is slain",              buff = "nefH", yell = 1 },
+    { text = "revel in his rallying cry",      buff = "nefH", yell = 2 },
+})
+-- Field Marshal Stonebridge is the second Alliance Nef announcer; without it
+-- every Stonebridge-sourced Nef drop was invisible to Alliance players (A2.5).
+defineYells({ "field marshal afrasiabi", "field marshal stonebridge" }, {
+    { text = "the lord of blackrock is slain", buff = "nefA", yell = 1 },
+    { text = "revel in the rallying cry",      buff = "nefA", yell = 2 },
+})
+defineYells({ "molthor" }, {
+    { text = "now, only one step",             buff = "zg", yell = 1 },   -- MONSTER_SAY
+    { text = "begin the ritual",               buff = "zg", yell = 2 },
+})
+defineYells({ "zandalarian emissary" }, {
+    { text = "the blood god",                  buff = "zg", yell = 1 },
+})
+-- Alert-only (no bar, no pop, no broadcast) and zone-gated to Swamp of Sorrows.
+defineYells({ "fallen hero of the horde" }, {
+    { text = "my fury is released", buff = "battleShout", yell = 1,
+      alertOnly = true, requireZone = "swamp of sorrows" },
+})
+Timers._yellRows = YELL_NPC_ROWS
+
+-- Sunken Temple reuses the ZG announcer NPCs; those lines mention the Temple of
+-- Atal'ai and must never fire a Zandalar pull (A2.6).
+local ZG_EXCLUDE = "temple of atal"
+
+-- Rend announcers, and which Barrens bar variant each implies.
+local REND_NPC_VARIANT = { ["thrall"] = "thrall", ["herald of thrall"] = "herald" }
+
+-- Resolve a monster name to its canonical table key. Exact match first, then a
+-- loose contains-match so a localized/realm prefix still resolves.
+local function npcKeyOf(monsterName)
     local key = (monsterName or ""):lower()
-    local def = YELL_NPC[key]
-    if not def then
-        -- Loose contains-match so realm-localized prefixes still resolve.
-        for npc, d in pairs(YELL_NPC) do
-            if key:find(npc, 1, true) then def = d break end
+    if key == "" then return nil end
+    if YELL_NPC_ROWS[key] then return key end
+    for npc in pairs(YELL_NPC_ROWS) do
+        if key:find(npc, 1, true) then return npc end
+    end
+    return nil
+end
+Timers._npcKeyOf = npcKeyOf
+
+-- Resolve an inbound yell to (buffKey, yellNum, npcKey, row).
+-- Returns nil when the announcer is unknown OR the line is not one of that
+-- announcer's two known yells — no guessing, no default stage.
+function Timers.MatchYell(text, monsterName)
+    local key = npcKeyOf(monsterName)
+    if not key then return nil end
+    local rows = YELL_NPC_ROWS[key]
+    local body = (text or ""):lower()
+    for i = 1, #rows do
+        local row = rows[i]
+        if body:find(row.text, 1, true) then
+            if row.buff == "zg" and body:find(ZG_EXCLUDE, 1, true) then
+                return nil   -- Sunken Temple false positive
+            end
+            return row.buff, row.yell, key, row
         end
     end
-    if not def then return nil end
-    local yellNum = classifyYell(text)
-    if not yellNum then
-        -- No readable text (e.g. Alliance reading a Horde yell): assume the
-        -- announcer's "buff available" yell (2), the actionable case.
-        yellNum = 2
-    end
-    return def.buff, yellNum
+    return nil
+end
+
+-- Alliance cannot read Horde yell text, so cross-faction Rend is detected by
+-- announcer NAME ALONE. It logs the pop and shows a deliberately vague notice
+-- (the yell was unreadable; it LOOKED like a Rend pop) and deliberately gets NO
+-- pull bar, because we have no idea which stage we just saw. Deduped at 60s.
+local ALLY_REND_DEDUP = 60
+Timers._lastAllyRendAt = 0
+
+local function playerFaction()
+    return (UnitFactionGroup and UnitFactionGroup("player")) or "Horde"
+end
+Timers._playerFaction = playerFaction
+
+-- Hand-in attribution stash (A4.1): a Rend quest hand-in parks the handing-in
+-- player's name here for HANDIN_STASH_TTL seconds so the FOLLOWING yell — the
+-- only thing that actually anchors — can attribute the pop to them.
+local HANDIN_STASH_TTL = 20
+Timers.HANDIN_STASH_TTL = HANDIN_STASH_TTL
+Timers._handinStash = {}
+
+local function stashHandin(buffKey, who, at)
+    Timers._handinStash[buffKey] = { who = who, at = at or now() }
+end
+Timers._stashHandin = stashHandin
+
+local function consumeHandinStash(buffKey, t)
+    local st = Timers._handinStash[buffKey]
+    if not st then return nil end
+    Timers._handinStash[buffKey] = nil
+    if ((t or now()) - (st.at or 0)) > HANDIN_STASH_TTL then return nil end
+    return st.who
+end
+Timers._consumeHandinStash = consumeHandinStash
+
+-- Raise Rend's TWO stage-1 bars (Orgrimmar + Barrens). hud.lua keys bars by
+-- buffKey, so the two fires collapse into one bar there; we therefore emit the
+-- bar for the player's OWN zone LAST so that is the one they end up seeing.
+local function raiseRendBars(npcKey, epoch, trust)
+    local bars = REND_BARS[REND_NPC_VARIANT[npcKey] or "thrall"]
+    local first, second = bars[1], bars[2]
+    local zone = (GetRealZoneText and GetRealZoneText() or ""):lower()
+    if zone:find("orgrimmar", 1, true) then first, second = bars[2], bars[1] end
+    raisePull("rend", epoch, first.seconds,  trust, first.zone,  1)
+    raisePull("rend", epoch, second.seconds, trust, second.zone, 1)
+end
+Timers._raiseRendBars = raiseRendBars
+
+function Timers.OnAllianceRendYell(monsterName, t)
+    t = t or now()
+    if (t - (Timers._lastAllyRendAt or 0)) < ALLY_REND_DEDUP then return false end
+    Timers._lastAllyRendAt = t
+    local who = consumeHandinStash("rend", t) or monsterName
+    Timers.Record("rend", t, "local", who, "pop",
+                  GetRealZoneText and GetRealZoneText() or nil, nil, 1, { noPull = true })
+    notify("rend", "pullTimer",
+        "an unreadable Horde yell just went up — that usually means Rend dropped."
+        .. " No pull timer: cross-faction yell text cannot be read.")
+    return true
 end
 
 local function onMonsterYell(event, text, monsterName)
-    local buffKey, yellNum = Timers.MatchYell(text, monsterName)
-    if not buffKey then return end
+    local t = now()
     local zone = GetRealZoneText and GetRealZoneText() or nil
-    if yellNum == 1 then
-        Timers.Record(buffKey, now(), "local", monsterName, "killed", zone, nil, 1)
+
+    -- Alliance-side Rend: name-only, before any text matching (A2.7).
+    local key = npcKeyOf(monsterName)
+    if key and REND_NPC_VARIANT[key] and playerFaction() == "Alliance" then
+        Timers.OnAllianceRendYell(monsterName, t)
+        return
+    end
+
+    local buffKey, yellNum, npcKey, row = Timers.MatchYell(text, monsterName)
+    if not buffKey then return end
+
+    -- Alert-only rows (Fallen Hero / Battle Shout): no bar, no pop, no
+    -- broadcast, and only inside the row's required zone.
+    if row and row.alertOnly then
+        if row.requireZone and (zone or ""):lower() ~= row.requireZone then return end
+        notify(buffKey, "pullTimer", buffLabelOf(buffKey) .. " is up nearby.")
+        return
+    end
+
+    if yellNum == 2 then
+        -- Stage 2 records nothing. Zandalar is the one buff whose stage 2 still
+        -- carries a real bar (spec §10.7); every other buff no-ops entirely.
+        if buffKey == "zg" then
+            raisePull("zg", t, PULL_WINDOWS.zg[2], "local", zone, 2)
+        end
+        return
+    end
+
+    -- Stage 1: the pop. Bars are raised explicitly (and unconditionally) here
+    -- because a yell always means a buff is inbound, even when the pop itself is
+    -- rejected as a duplicate by the cooldown gate inside Record.
+    local who = consumeHandinStash(buffKey, t) or monsterName
+    Timers.Record(buffKey, t, "local", who, "pop", zone, nil, 1, { noPull = true })
+    if buffKey == "rend" then
+        raiseRendBars(npcKey, t, "local")
     else
-        Timers.Record(buffKey, now(), "local", monsterName, "pop", zone, nil, 2)
+        raisePull(buffKey, t, PULL_WINDOWS[buffKey] and PULL_WINDOWS[buffKey][1],
+                  "local", zone, 1)
     end
 end
 
@@ -547,36 +778,43 @@ end
 -- the detector working even where the numeric id is uncertain.
 ----------------------------------------------------------------------
 
--- Capital zones where announcer events are valid.
+-- Capital zones where announcer events are valid. ONLY the two capitals that
+-- actually host announcers (A3.2) — the four extra capitals we used to accept
+-- could trip on same-named mobs elsewhere.
 local CAPITAL_ZONES = {
-    ["orgrimmar"]    = true,
-    ["stormwind city"]= true,
-    ["thunder bluff"]= true,
-    ["ironforge"]    = true,
-    ["undercity"]    = true,
-    ["darnassus"]    = true,
+    ["orgrimmar"]      = true,
+    ["stormwind city"] = true,
+    ["stormwind"]      = true,
 }
+Timers._capitalZones = CAPITAL_ZONES
 
--- Announcer NPC-id table -> buffKey. IDs are best-known Classic values and
--- are matched alongside the destName so a mislabelled id never blocks a
--- valid name hit. (Verify numeric ids against live CLEU before relying on
--- id-only matching.)
+-- Announcer NPC-id table -> buffKey (spec §10.3). Matched alongside destName so
+-- a mislabelled id never blocks a valid name hit.
 local ANNOUNCER_ID = {
-    [14392] = "onyH",   -- Overlord Runthak (Orgrimmar)   [verify]
-    [16803] = "onyA",   -- Major Mattingly (Stormwind)     [verify]
+    [14392] = "onyH",   -- Overlord Runthak (Orgrimmar)
+    [14394] = "onyA",   -- Major Mattingly (Stormwind City)
+    [14720] = "nefH",   -- High Overlord Saurfang (Orgrimmar)
+    [14721] = "nefA",   -- Field Marshal Afrasiabi (Stormwind City)
 }
 Timers._announcerID = ANNOUNCER_ID
 
--- Same-name fallback keyed on the yell NPC table (announcer names reused).
+-- Name fallback. Deliberately its OWN table, not the yell table: Thrall and the
+-- Zandalar NPCs yell but are not announcers whose death means anything.
+local ANNOUNCER_NAME = {
+    ["overlord runthak"]         = "onyH",
+    ["major mattingly"]          = "onyA",
+    ["high overlord saurfang"]   = "nefH",
+    ["field marshal afrasiabi"]  = "nefA",
+    ["field marshal stonebridge"]= "nefA",
+}
+Timers._announcerName = ANNOUNCER_NAME
+
 local function announcerBuffFor(npcID, destName)
     if npcID and ANNOUNCER_ID[npcID] then return ANNOUNCER_ID[npcID] end
-    if destName then
-        local key = destName:lower()
-        local def = YELL_NPC[key]
-        if def then return def.buff end
-    end
+    if destName then return ANNOUNCER_NAME[destName:lower()] end
     return nil
 end
+Timers._announcerBuffFor = announcerBuffFor
 
 -- Parse the numeric NPC id out of a Creature/Vehicle GUID.
 local function npcIDFromGUID(guid)
@@ -600,10 +838,20 @@ local function onCombatLog()
     local npcID = npcIDFromGUID(destGUID)
     local buffKey = announcerBuffFor(npcID, destName)
     if not buffKey then return end
-    -- Announcer death => the buff cycle just fired; treat as a kill/announce
-    -- (yell stage 1, the minutes-scale announce->drop window).
-    Timers.Record(buffKey, now(), "local", destName, "killed",
-                  GetRealZoneText and GetRealZoneText() or nil, nil, 1)
+    Timers.OnAnnouncerDeath(buffKey, destName)
+end
+
+-- An announcer death is a RESPAWN event, not a cooldown start: it logs a
+-- `killed` entry, alerts, and broadcasts, and the readout becomes
+-- "NPC killed — respawns in <t>" for 360s and then plain can-pop (A3.1).
+-- It raises no pull bar (Record only bars on a pop).
+function Timers.OnAnnouncerDeath(buffKey, destName, t)
+    t = t or now()
+    Timers.Record(buffKey, t, "local", destName, "killed",
+                  GetRealZoneText and GetRealZoneText() or nil)
+    notify(buffKey, "npcDied",
+        (destName or buffLabelOf(buffKey)) .. " was killed — respawns in about 6 minutes.")
+    return true
 end
 
 ----------------------------------------------------------------------
@@ -611,19 +859,60 @@ end
 ----------------------------------------------------------------------
 
 -- questID -> buffKey (H/A resolved for ony/nef where the id is faction-fixed).
+-- FACTION FIX: 7491/7496 and 7782/7784 were mapped to the WRONG factions here.
+-- Per spec §10.3 the hand-ins are 7491 Ony(A) · 7496 Ony(H) · 7782 Nef(A) ·
+-- 7784 Nef(H); we had each pair reversed, so an Ony hand-in was credited to the
+-- opposing faction's timer. (The gap analysis only checked the id SET.)
 local HANDIN_QUEST = {
     [4974] = "rend",
-    [7491] = "onyH",  [7496] = "onyA",
-    [7782] = "nefH",  [7784] = "nefA",
+    [7491] = "onyA",  [7496] = "onyH",
+    [7782] = "nefA",  [7784] = "nefH",
     [8183] = "zg",
 }
 Timers._handinQuest = HANDIN_QUEST
 
-local function onQuestTurnedIn(event, questID)
+-- Hand-ins whose processing is SUPPRESSED while the buff is already on
+-- cooldown (A4.2). Nefarian and Zandalar carry no server cooldown (spec §10.2 —
+-- Nef CD tracking was removed; ZG keeps no pop log) and are never suppressed.
+-- Note this is a detection-side list only; Timers.CD keeps nef/zg entries
+-- because the false-positive gate still uses them to dedup relayed reports.
+local HANDIN_CD_GATED = { rend = true, onyH = true, onyA = true }
+Timers._handinCDGated = HANDIN_CD_GATED
+
+-- QUEST_TURNED_IN(questID, xpReward, moneyReward).
+function Timers.OnQuestHandin(questID, t)
     local buffKey = HANDIN_QUEST[questID]
-    if not buffKey then return end
-    Timers.Record(buffKey, now(), "local", "handin", "quest",
-                  GetRealZoneText and GetRealZoneText() or nil)
+    if not buffKey then return false, "not a buff hand-in" end
+    t = t or now()
+
+    -- A4.2: a hand-in for a buff already on cooldown is ignored ENTIRELY —
+    -- no anchor, no stash, no alert. (The server would have refused it too.)
+    if HANDIN_CD_GATED[buffKey] and Timers.BuffStatus(buffKey, t).state == "cd" then
+        return false, "on cooldown"
+    end
+
+    local who  = (UnitName and UnitName("player")) or "handin"
+    local zone = GetRealZoneText and GetRealZoneText() or nil
+
+    if buffKey == "rend" then
+        -- A4.1: NON-ANCHORING. A Rend hand-in that never produces a buff (wipe,
+        -- or already popped server-side) must not put us on a phantom 3h CD.
+        -- Park the name; only the following yell anchors, and it claims this
+        -- attribution.
+        stashHandin("rend", who, t)
+    elseif buffKey == "zg" then
+        -- A4.3: the Zandalar hand-in itself starts the 50s stage-1 pull.
+        raisePull("zg", t, PULL_WINDOWS.zg[1], "local", zone, 1)
+    else
+        Timers.Record(buffKey, t, "local", who, "quest", zone, nil, nil, { noPull = true })
+    end
+
+    notify(buffKey, "questHandin", buffLabelOf(buffKey) .. " quest handed in by " .. who .. ".")
+    return true, "handled"
+end
+
+local function onQuestTurnedIn(event, questID)
+    Timers.OnQuestHandin(questID)
 end
 
 ----------------------------------------------------------------------
@@ -906,9 +1195,15 @@ function Timers.OnNWBMessage(prefix, message, channel, sender)
         end
         Timers._sawNWB = true
     elseif cmd == "yell" or cmd == "yell2" then
+        -- Carry the yell STAGE through so the relayed bar uses the same spec
+        -- window a local yell would (and so a stage-2 relay for a buff whose
+        -- stage 2 has no bar correctly raises none).
         local t = dataStr and dataStr:match("^(%S+)")
         local buffKey = t and nwbTypeToBuff(t)
-        if buffKey then Timers.Record(buffKey, now(), "nwb", "NWB", "pop") end
+        if buffKey then
+            Timers.Record(buffKey, now(), "nwb", "NWB", "pop", nil, nil,
+                          (cmd == "yell") and 1 or 2)
+        end
         Timers._sawNWB = true
     elseif cmd == "npcKilled" or cmd == "npcKilled2" or cmd == "drop" then
         local t = dataStr and dataStr:match("^(%S+)")
@@ -1169,25 +1464,52 @@ function Timers.GetNodeState(nodeKey)
     return Timers.NodeState(popEpoch, now(), respawn, upDur)
 end
 
+-- The ONE cast that means "a node was picked": Cleansed Songflower. Both
+-- songflowers and Whipper Root Tubers are gathered through it.
+local SONGFLOWER_SPELL = 6478
+Timers.SONGFLOWER_SPELL = SONGFLOWER_SPELL
+
+-- Node match radius in normalized map units (spec §10.3: 6% of map distance).
+-- The old 0.015 was 4x tighter than the reference and missed genuine picks made
+-- a few yards off the stored coordinate (A5.2).
+local NODE_MATCH_RADIUS = 0.06
+Timers.NODE_MATCH_RADIUS = NODE_MATCH_RADIUS
+
+-- Resolve a pick position to (kind, index, distance), or nil when nothing is in
+-- range. The two co-located flower/tuber sites are separated by the NEAREST-
+-- distance tie-break rather than by a tighter radius, so widening the radius
+-- cannot make a flower pick land on its neighbouring tuber.
+function Timers.MatchNodePick(x, y, radius)
+    if not x or not y then return nil end
+    radius = radius or NODE_MATCH_RADIUS
+    local fIdx, fDist = Timers.NearestNode("flower", x, y)
+    local tIdx, tDist = Timers.NearestNode("tuber", x, y)
+    local kind, index, dist
+    if fDist and (not tDist or fDist <= tDist) then
+        kind, index, dist = "flower", fIdx, fDist
+    elseif tDist then
+        kind, index, dist = "tuber", tIdx, tDist
+    end
+    if not kind or dist > radius then return nil end
+    return kind, index, dist
+end
+
 -- Pick detection from a successful player cast in Felwood.
-local function onSpellSucceeded(event, unit)
+-- UNIT_SPELLCAST_SUCCEEDED(unitTarget, castGUID, spellID) — the spell id was
+-- always in the payload and always discarded, so ANY cast near a node (a mount,
+-- a heal, a profession cast) started a 25-minute countdown (A5.1).
+local function onSpellSucceeded(event, unit, castGUID, spellID)
     if unit ~= "player" then return end
+    if spellID ~= SONGFLOWER_SPELL then return end
     if not (C_Map and C_Map.GetBestMapForUnit) then return end
     local mapID = C_Map.GetBestMapForUnit("player")
     if mapID ~= Timers.FELWOOD_MAP then return end
     local pos = C_Map.GetPlayerMapPosition(mapID, "player")
     if not pos then return end
     local x, y = pos:GetXY()
-    if not x or not y then return end
-    -- Match the nearest flower or tuber within a tight radius (~ node size).
-    local RADIUS = 0.015
-    local fIdx, fDist = Timers.NearestNode("flower", x, y)
-    local tIdx, tDist = Timers.NearestNode("tuber", x, y)
-    if fDist and (not tDist or fDist <= tDist) and fDist <= RADIUS then
-        Timers.MarkNode("flower", fIdx, now(), "local")
-    elseif tDist and tDist <= RADIUS then
-        Timers.MarkNode("tuber", tIdx, now(), "local")
-    end
+    local kind, index = Timers.MatchNodePick(x, y)
+    if not kind then return end
+    Timers.MarkNode(kind, index, now(), "local")
 end
 
 ----------------------------------------------------------------------
@@ -1213,11 +1535,20 @@ scheduleWarnings = function(buffKey)
     local warned = false
     for i = 1, #WARNED_BUFFS do if WARNED_BUFFS[i] == buffKey then warned = true break end end
     if not warned then return end
-    if not (C_Timer and C_Timer.After) then return end
 
     local s = stateOf(buffKey)
     local anchor = anchorEpoch(s)
+    -- A3.3: while the newest event is a KILL the buff is respawning, not on
+    -- cooldown, so every scheduled CD warning is suppressed. Kill/respawn timing
+    -- carries ~2 minutes of server jitter; warning off a kill-derived clock is
+    -- worse than saying nothing. Also bump the generation so any arm from a
+    -- previous pop is cancelled.
+    if (s.killedAt or 0) >= math.max(anchor, 1) then
+        Timers._warnGen[buffKey] = (Timers._warnGen[buffKey] or 0) + 1
+        return
+    end
     if anchor <= 0 then return end
+    if not (C_Timer and C_Timer.After) then return end
     local nextAt = anchor + CD[buffKey]
 
     local gen = (Timers._warnGen[buffKey] or 0) + 1
@@ -1270,7 +1601,7 @@ function Timers.RehydrateFromStore()
             if epoch > 0 and cd and (t - epoch) < cd then
                 local s = stateOf(buffKey)
                 if newest.killed then
-                    s.lastKilled = math.max(s.lastKilled or 0, epoch)
+                    s.killedAt = math.max(s.killedAt or 0, epoch)
                 else
                     s.lastPop = math.max(s.lastPop or 0, epoch)
                 end
@@ -1329,7 +1660,9 @@ function Timers.GetSnapshot()
         local k = Timers.BUFF_KEYS[i]
         local s = Timers.state[k]
         if s then
-            snap.buffs[k] = { lastPop = s.lastPop, lastKilled = s.lastKilled, trust = s.trust }
+            -- Wire key stays `lastKilled` for peer compatibility (see the state
+            -- comment); it carries our `killedAt` respawn stamp.
+            snap.buffs[k] = { lastPop = s.lastPop, lastKilled = s.killedAt, trust = s.trust }
         end
     end
     local flower = nodePopTable("flower")
@@ -1576,9 +1909,12 @@ function Timers.DebugDump()
     for i = 1, #Timers.BUFF_KEYS do
         local k = Timers.BUFF_KEYS[i]
         local s = Timers.state[k]
-        if s and anchorEpoch(s) > 0 then
-            local cdInfo = Timers.ComputeCD(k, anchorEpoch(s), t)
-            local status = cdInfo.ready and "READY" or ("CD " .. fmtRemaining(cdInfo.remaining))
+        local st = Timers.BuffStatus(k, t)
+        if s and st.state ~= "nodata" then
+            local status =
+                  (st.state == "cd")     and ("CD " .. fmtRemaining(st.remaining))
+               or (st.state == "killed") and ("NPC KILLED, respawn " .. fmtRemaining(st.remaining))
+               or "READY"
             ns:Print(string.format("  %-5s %s  trust=%s conf=%s",
                 k, status, tostring(s.trust), tostring(s.confirmed)))
         else
@@ -1632,26 +1968,27 @@ function Timers.NWBDebugDump()
         .. " under a layers map (handled). Reassembly is AceComm's, shared-instance.")
 end
 
--- /nexus debug pulls — pull-window calibration self-diagnosis. For each pull buff
--- and yell stage: the observation log, the currently-effective window, and its
--- source (override / observed-median / default). Also lists any pending pulls
--- awaiting a buff-land.
+-- /nexus debug pulls — pull-window self-diagnosis. For each pull buff and yell
+-- stage: the authoritative spec constant, the currently-effective window and its
+-- source (override > spec), and the DRIFT between the spec constant and the
+-- median of drops actually witnessed on this client. Also lists pending pulls.
 function Timers.PullsDebugDump()
-    ns:Print("pull windows (effective = override > observed-median > default):")
-    local store = pullObsStore(false)
+    ns:Print("pull windows (effective = override > spec constant; observations are drift only):")
     for i = 1, #Timers.BUFF_KEYS do
         local k = Timers.BUFF_KEYS[i]
         if PULL_WINDOWS[k] then
             for yn = 1, 2 do
                 local window, source = Timers.EffectivePullWindow(k, yn)
-                local list = store and store[k] and store[k][yn]
-                local samples = {}
-                if list then for j = 1, #list do samples[j] = tostring(math.floor(list[j] + 0.5)) end end
-                local seed = PULL_WINDOWS[k][yn]
+                local obs, n = Timers.ObservedPullMedian(k, yn)
+                local spec = PULL_WINDOWS[k][yn]
+                local drift = (obs and type(spec) == "number")
+                    and string.format("%+.1fs", obs - spec) or "-"
                 ns:Print(string.format(
-                    "  %-4s yell%d  window=%ss (%s)  seed=%ss  n=%d [%s]",
-                    k, yn, tostring(math.floor(window + 0.5)), source,
-                    tostring(seed), #samples, table.concat(samples, ",")))
+                    "  %-4s yell%d  window=%s (%s)  spec=%s  observed=%s n=%d  drift=%s",
+                    k, yn,
+                    window and tostring(window) or "no bar", source,
+                    (spec == false) and "no bar" or tostring(spec),
+                    obs and string.format("%.1f", obs) or "-", n, drift))
             end
         end
     end
@@ -1662,9 +1999,20 @@ function Timers.PullsDebugDump()
         pend[#pend + 1] = k .. "(" .. table.concat(stages, "+") .. ")"
     end
     ns:Print("  pending pulls: " .. (next(Timers._pendingPull) and table.concat(pend, " ") or "(none)"))
-    ns:Print("  NOTE: seeds are PROVISIONAL; the median of witnessed drops replaces"
-        .. " them per (buff, yell). Set timerSettings.pullWindows[buff] to override.")
+    ns:Print("  NOTE: spec constants are AUTHORITATIVE — observations measure drift"
+        .. " only. Set timerSettings.pullWindows[buff] to override a constant.")
 end
+
+----------------------------------------------------------------------
+-- Detector handles exposed for the self-tests (and for `/dsn debug`).
+-- These are the real event handlers, so the tests drive exactly the code the
+-- game drives — no parallel test-only path.
+----------------------------------------------------------------------
+
+Timers._onMonsterYell    = onMonsterYell
+Timers._onCombatLog      = onCombatLog
+Timers._onSpellSucceeded = onSpellSucceeded
+Timers._onQuestTurnedIn  = onQuestTurnedIn
 
 ----------------------------------------------------------------------
 -- Self-tests (pure Lua; run via /dsn debug selftest)
@@ -1687,7 +2035,8 @@ local function testCDDerivation(fails)
     tcheck(info3.onCD == true and info3.ready == false, "onyH on CD just before ready", fails)
 end
 
--- False-positive gate: within-CD pop rejected, kill resets, post-CD ok.
+-- False-positive gate: within-CD pop rejected; a kill does NOT anchor the CD
+-- (A3.1), so a pop after a kill is judged only against the last real pop.
 local function testFalsePositive(fails)
     Timers.state = {}
     local a = 1500000000
@@ -1695,14 +2044,94 @@ local function testFalsePositive(fails)
     tcheck(ok1 == true, "first rend pop applied", fails)
     local ok2 = Timers.Record("rend", a + 3600, "local", "t2", "pop")
     tcheck(ok2 == false, "rend pop within CD rejected as false positive", fails)
-    local ok3 = Timers.Record("rend", a + 1800, "local", "t3", "killed")
-    tcheck(ok3 == true, "kill within CD applied (resets)", fails)
-    -- After a kill reset at a+1800, a pop at a+1801 is within the new CD.
-    local ok4 = Timers.Record("rend", a + 1801, "local", "t4", "pop")
-    tcheck(ok4 == false, "pop right after kill reset still within CD", fails)
-    -- A pop a full CD past the kill anchor is accepted.
-    local ok5 = Timers.Record("rend", a + 1800 + CD.rend + 1, "local", "t5", "pop")
-    tcheck(ok5 == true, "pop a full CD past the kill anchor accepted", fails)
+    -- A kill is always accepted (it is a respawn stamp, not a pop).
+    local ok3 = Timers.Record("onyH", a + 1800, "local", "t3", "killed")
+    tcheck(ok3 == true, "kill entry always applied", fails)
+    tcheck((Timers.state.onyH.lastPop or 0) == 0, "kill does not set the pop anchor", fails)
+    tcheck(Timers.state.onyH.killedAt == a + 1800, "kill stamps killedAt", fails)
+    -- A pop right after a kill is NOT gated by the kill (a kill starts no CD).
+    local ok4 = Timers.Record("onyH", a + 1801, "local", "t4", "pop")
+    tcheck(ok4 == true, "a pop after a kill is accepted (kill starts no CD)", fails)
+    -- A pop a full CD past the real pop anchor is accepted.
+    local ok5 = Timers.Record("rend", a + CD.rend + 1, "local", "t5", "pop")
+    tcheck(ok5 == true, "pop a full CD past the pop anchor accepted", fails)
+    Timers.state = {}
+end
+
+-- A3: announcer death = 360s RESPAWN model, not a 6h cooldown anchor.
+local function testAnnouncerKill(fails)
+    Timers.state = {}
+    local t = 1600000000
+
+    -- (a) a fresh kill reads as "killed" with a shrinking respawn remaining.
+    Timers.Record("onyH", t, "local", "Overlord Runthak", "killed")
+    local st = Timers.BuffStatus("onyH", t + 60)
+    tcheck(st.state == "killed", "fresh kill reads as killed, not cd", fails)
+    tcheck(math.abs(st.remaining - 300) < 0.5,
+        "killed remaining = 360 - elapsed (300s at t+60)", fails)
+
+    -- (b) once the 360s respawn elapses the buff is immediately can-pop --
+    -- emphatically NOT a 6h cooldown (the exact inversion A3.1 describes).
+    local after = Timers.BuffStatus("onyH", t + Timers.ANNOUNCER_RESPAWN + 1)
+    tcheck(after.state == "canpop", "kill -> canpop once the 360s respawn elapses", fails)
+    tcheck(after.remaining == 0, "canpop has no remaining", fails)
+    local wrong = Timers.ComputeCD("onyH", anchorEpoch(Timers.state.onyH), t + 600)
+    tcheck(wrong.ready == true, "kill excluded from ComputeCD's anchor", fails)
+
+    -- (c) a POP still yields a real cooldown.
+    Timers.state = {}
+    Timers.Record("onyH", t, "local", "yeller", "pop")
+    local cdst = Timers.BuffStatus("onyH", t + 60)
+    tcheck(cdst.state == "cd" and cdst.remaining > 0, "a pop still reads as cd", fails)
+
+    -- (d) a kill NEWER than the newest pop wins the readout.
+    Timers.Record("onyH", t + 120, "local", "Overlord Runthak", "killed")
+    tcheck(Timers.BuffStatus("onyH", t + 180).state == "killed",
+        "kill newer than the newest pop wins", fails)
+    -- ...and a pop newer than the kill takes it back.
+    Timers.state.onyH.lastPop = t + 300
+    tcheck(Timers.BuffStatus("onyH", t + 360).state == "cd",
+        "pop newer than the kill restores the cd readout", fails)
+
+    -- (e) CD warnings are suppressed while the newest event is a kill (A3.3).
+    Timers.state = {}
+    local fired = {}
+    ns:On("CD_WARNING", function(buffKey, kind) fired[#fired + 1] = buffKey .. ":" .. kind end)
+    local realAfter = C_Timer and C_Timer.After
+    local armed = 0
+    if C_Timer then C_Timer.After = function() armed = armed + 1 end end
+    Timers.state = {}
+    Timers.Record("onyH", now() - (CD.onyH - 120), "local", "yeller", "pop")
+    local armedAfterPop = armed
+    tcheck(armedAfterPop > 0, "a pop near the CD edge arms warnings", fails)
+    Timers.Record("onyH", now(), "local", "Overlord Runthak", "killed")
+    tcheck(armed == armedAfterPop, "a kill arms NO further CD warnings (A3.3)", fails)
+    if C_Timer then C_Timer.After = realAfter end
+
+    -- (f) the snapshot wire key stays `lastKilled` for peer compatibility.
+    Timers.state = {}
+    Timers.Record("onyA", t, "local", "Major Mattingly", "killed")
+    local snap = Timers.GetSnapshot()
+    tcheck(snap.buffs.onyA and snap.buffs.onyA.lastKilled == t,
+        "snapshot still exports the kill as lastKilled", fails)
+
+    -- (g) capital gate narrowed to the two announcer capitals (A3.2).
+    tcheck(Timers._capitalZones["orgrimmar"] and Timers._capitalZones["stormwind city"]
+        and Timers._capitalZones["stormwind"], "announcer capitals accepted", fails)
+    tcheck(not Timers._capitalZones["thunder bluff"] and not Timers._capitalZones["ironforge"]
+        and not Timers._capitalZones["undercity"] and not Timers._capitalZones["darnassus"],
+        "non-announcer capitals rejected", fails)
+    -- Spec announcer ids resolve, including the two Nef announcers.
+    tcheck(Timers._announcerBuffFor(14392) == "onyH", "14392 -> onyH", fails)
+    tcheck(Timers._announcerBuffFor(14394) == "onyA", "14394 -> onyA", fails)
+    tcheck(Timers._announcerBuffFor(14720) == "nefH", "14720 -> nefH", fails)
+    tcheck(Timers._announcerBuffFor(14721) == "nefA", "14721 -> nefA", fails)
+    tcheck(Timers._announcerBuffFor(nil, "Field Marshal Stonebridge") == "nefA",
+        "Stonebridge resolves as a Nef-A announcer by name", fails)
+    -- Thrall is a yeller, never an announcer whose death means anything.
+    tcheck(Timers._announcerBuffFor(nil, "Thrall") == nil,
+        "Thrall is not an announcer death target", fails)
+
     Timers.state = {}
 end
 
@@ -1718,22 +2147,22 @@ local function testPullRecencyGate(fails)
     end)
     ns:On("TIMER_UPDATED", function(buffKey) cap.timerUpdated[buffKey] = true end)
 
-    local W = Timers.DEFAULT_PULL_WINDOW
     local t = now()
 
-    -- (a) fresh pop (epoch == now) -> PULL_DETECTED with ~full window.
+    -- (a) fresh pop (epoch == now) -> PULL_DETECTED with the ~full spec window
+    -- for the stage (ZG stage 1 = 50.5s).
     Timers.state = {}; cap.pull = nil; cap.timerUpdated = {}
-    Timers.Record("rend", t, "local", "live", "pop")
-    tcheck(cap.pull ~= nil and cap.pull.buff == "rend", "fresh pop raises PULL_DETECTED", fails)
-    tcheck(cap.pull and math.abs(cap.pull.duration - W) <= 1,
-        "fresh pop shows ~full window", fails)
+    Timers.Record("zg", t, "local", "live", "pop", nil, nil, 1)
+    tcheck(cap.pull ~= nil and cap.pull.buff == "zg", "fresh pop raises PULL_DETECTED", fails)
+    tcheck(cap.pull and math.abs(cap.pull.duration - 50.5) <= 1,
+        "fresh pop shows the ~full spec window", fails)
 
     -- (b) pop heard 20s late -> PULL_DETECTED with reduced remaining window.
     Timers.state = {}; cap.pull = nil
-    Timers.Record("onyH", t - 20, "local", "late", "pop")
+    Timers.Record("zg", t - 20, "local", "late", "pop", nil, nil, 1)
     tcheck(cap.pull ~= nil, "late pop still raises PULL_DETECTED", fails)
-    tcheck(cap.pull and math.abs(cap.pull.duration - (W - 20)) <= 1,
-        "late pop shows reduced remaining window (~W-20)", fails)
+    tcheck(cap.pull and math.abs(cap.pull.duration - (50.5 - 20)) <= 1,
+        "late pop shows reduced remaining window (~window-20)", fails)
 
     -- (c) hours-old anchor -> applied + TIMER_UPDATED, but NO pull bar.
     Timers.state = {}; cap.pull = nil; cap.timerUpdated = {}
@@ -1748,7 +2177,311 @@ local function testPullRecencyGate(fails)
     tcheck(cap.pull ~= nil and math.abs(cap.pull.duration - 25) <= 1,
         "explicit pullDuration used as the fresh window", fails)
 
+    -- (e) an announcer KILL raises no bar at all (A3.1): it is a respawn event,
+    -- not an incoming buff.
+    Timers.state = {}; cap.pull = nil
+    Timers.Record("onyH", t, "local", "Overlord Runthak", "killed")
+    tcheck(cap.pull == nil, "a kill raises NO pull bar", fails)
+
+    -- (f) opts.noPull records without barring (the local yell detector's path).
+    Timers.state = {}; cap.pull = nil
+    Timers.Record("onyH", t, "local", "yeller", "pop", nil, nil, 1, { noPull = true })
+    tcheck(cap.pull == nil, "opts.noPull suppresses the bar", fails)
+    tcheck((Timers.state.onyH.lastPop or 0) > 0, "opts.noPull still records the pop", fails)
+
     Timers.state = {}
+end
+
+-- A2: the explicit (npc, text) -> (buff, stage) yell table.
+-- Drives the REAL CHAT_MSG_MONSTER_YELL handler end to end and asserts the
+-- resulting bars, pop records and record KINDs.
+local function testYellTable(fails)
+    -- Capture every bar this suite raises.
+    local bars = {}
+    ns:On("PULL_DETECTED", function(buffKey, duration, trust, zone)
+        bars[#bars + 1] = { buff = buffKey, dur = duration, trust = trust, zone = zone }
+    end)
+    local function yell(text, npc)
+        bars = {}
+        Timers.state = {}
+        Timers._handinStash = {}
+        Timers._onMonsterYell("CHAT_MSG_MONSTER_YELL", text, npc)
+        return bars
+    end
+    local function barFor(list, zone)
+        for i = 1, #list do
+            if (not zone) or list[i].zone == zone then return list[i] end
+        end
+        return nil
+    end
+
+    local savedFaction = _G.UnitFactionGroup
+    _G.UnitFactionGroup = function() return "Horde" end
+
+    -- (1) Rend stage 1: ONE pop recorded as a POP (never a kill) plus the two
+    -- hard bars, Orgrimmar 6s and Barrens 17s (A2.1).
+    local b = yell("The mighty Rend Blackhand, has fallen!", "Thrall")
+    tcheck(#b == 2, "Rend yell 1 raises exactly two bars", fails)
+    local org, barrens = barFor(b, "Orgrimmar"), barFor(b, "Barrens")
+    tcheck(org and math.abs(org.dur - 6) <= 1, "Rend -> Orgrimmar bar is 6s", fails)
+    tcheck(barrens and math.abs(barrens.dur - 17) <= 1, "Rend -> Barrens bar is 17s", fails)
+    tcheck((Timers.state.rend and Timers.state.rend.lastPop or 0) > 0,
+        "Rend yell 1 records a POP anchor", fails)
+    tcheck((Timers.state.rend and Timers.state.rend.killedAt or 0) == 0,
+        "Rend yell 1 is NOT recorded as a kill (A2.1)", fails)
+
+    -- Herald-only Rend takes the SHORT 6s Barrens variant (A2.9).
+    b = yell("The mighty Rend Blackhand, has fallen!", "Herald of Thrall")
+    local hb = barFor(b, "Barrens")
+    tcheck(hb and math.abs(hb.dur - 6) <= 1, "Herald Rend -> Barrens bar is 6s", fails)
+
+    -- (2) Onyxia Horde stage 1 -> pop + 14.5s bar (A2.2).
+    b = yell("Onyxia, has been slain!", "Overlord Runthak")
+    tcheck(#b == 1 and math.abs(b[1].dur - 14.5) <= 1, "Ony-H yell 1 bar is 14.5s", fails)
+    tcheck((Timers.state.onyH and Timers.state.onyH.lastPop or 0) > 0, "Ony-H pop recorded", fails)
+    tcheck((Timers.state.onyH and Timers.state.onyH.killedAt or 0) == 0,
+        "Ony-H yell is not a kill", fails)
+
+    -- (3) Onyxia Alliance stage 1 "history has been made" -> 15s (A2.3): the
+    -- exact line the old keyword classifier matched nothing in and defaulted to
+    -- stage 2 with a 40s bar.
+    b = yell("Onyxia is dead! Today, history has been made!", "Major Mattingly")
+    tcheck(#b == 1 and math.abs(b[1].dur - 15) <= 1,
+        "Ally Ony 'history has been made' -> 15s bar", fails)
+    tcheck((Timers.state.onyA and Timers.state.onyA.lastPop or 0) > 0, "Ony-A pop recorded", fails)
+
+    -- (4) Nefarian, both factions and both Alliance announcers.
+    b = yell("NEFARIAN IS SLAIN! The Horde is victorious!", "High Overlord Saurfang")
+    tcheck(#b == 1 and math.abs(b[1].dur - 15) <= 1, "Nef-H yell 1 bar is 15s", fails)
+    b = yell("People of Stormwind, the Lord of Blackrock is slain!", "Field Marshal Afrasiabi")
+    tcheck(#b == 1 and math.abs(b[1].dur - 12) <= 1, "Nef-A yell 1 bar is 12s", fails)
+    -- A2.5: Stonebridge was missing entirely, so Alliance lost every Nef drop
+    -- he announced.
+    b = yell("People of Stormwind, the Lord of Blackrock is slain!", "Field Marshal Stonebridge")
+    tcheck(#b == 1 and math.abs(b[1].dur - 12) <= 1, "Stonebridge Nef-A bar is 12s", fails)
+    tcheck((Timers.state.nefA and Timers.state.nefA.lastPop or 0) > 0,
+        "Stonebridge records a Nef-A pop (A2.5)", fails)
+
+    -- (5) Stage 2 is a COMPLETE no-op for Rend / Ony / Nef (A2.4): no bar and,
+    -- critically, no second spurious pop.
+    local y2 = {
+        { "Be bathed in my power!",                   "Thrall" },
+        { "Be lifted by the rallying cry!",           "Overlord Runthak" },
+        { "Onyxia's head hangs from the arches!",     "Major Mattingly" },
+        { "Revel in his rallying cry!",               "High Overlord Saurfang" },
+        { "Revel in the rallying cry!",               "Field Marshal Afrasiabi" },
+    }
+    for i = 1, #y2 do
+        b = yell(y2[i][1], y2[i][2])
+        tcheck(#b == 0, "yell 2 raises no bar: " .. y2[i][2], fails)
+        tcheck(next(Timers.state) == nil, "yell 2 records nothing: " .. y2[i][2], fails)
+    end
+
+    -- (6) Zandalar: stage 1 = 50.5s + a pop; stage 2 is the documented exception
+    -- that DOES bar (29s) while still recording nothing (spec §10.7).
+    b = yell("The Blood God Hakkar is no more!", "Zandalarian Emissary")
+    tcheck(#b == 1 and math.abs(b[1].dur - 50.5) <= 1, "ZG yell 1 bar is 50.5s", fails)
+    b = yell("Now, only one step remains!", "Molthor")
+    tcheck(#b == 1 and math.abs(b[1].dur - 50.5) <= 1, "ZG Molthor say -> stage 1, 50.5s", fails)
+    b = yell("Begin the ritual!", "Molthor")
+    tcheck(#b == 1 and math.abs(b[1].dur - 29) <= 1, "ZG yell 2 DOES bar, at 29s", fails)
+    tcheck(next(Timers.state) == nil, "ZG yell 2 records no pop", fails)
+
+    -- (7) Sunken Temple reuses the ZG NPCs — those lines must not fire (A2.6).
+    b = yell("Begin the ritual in the Temple of Atal'Hakkar!", "Molthor")
+    tcheck(#b == 0, "ZG line mentioning Temple of Atal is excluded (A2.6)", fails)
+    tcheck(Timers.MatchYell("The Blood God stirs in the Temple of Atal'Hakkar", "Zandalarian Emissary") == nil,
+        "Atal exclusion applies to the Emissary line too", fails)
+
+    -- (8) An unrecognised line from a KNOWN announcer is ignored outright --
+    -- no default stage, no invented pop. This is the core A2.4 regression gate.
+    b = yell("Some unrelated flavour text nobody parsed.", "Overlord Runthak")
+    tcheck(#b == 0 and next(Timers.state) == nil,
+        "unknown text from a known announcer is ignored (no default stage)", fails)
+    tcheck(Timers.MatchYell("anything at all", "Some Random Mob") == nil,
+        "unknown announcer never matches", fails)
+
+    -- (9) Fallen Hero of the Horde: alert only, zone-gated, no bar, no record.
+    local savedZone = _G.GetRealZoneText
+    _G.GetRealZoneText = function() return "Swamp of Sorrows" end
+    Timers._lastNotice = nil
+    b = yell("My fury is released!", "Fallen Hero of the Horde")
+    tcheck(#b == 0 and next(Timers.state) == nil, "Battle Shout say raises no bar / no pop", fails)
+    tcheck(Timers._lastNotice and Timers._lastNotice.buff == "battleShout",
+        "Battle Shout say alerts", fails)
+    _G.GetRealZoneText = function() return "Orgrimmar" end
+    Timers._lastNotice = nil
+    yell("My fury is released!", "Fallen Hero of the Horde")
+    tcheck(Timers._lastNotice == nil, "Battle Shout say is gated to Swamp of Sorrows", fails)
+    _G.GetRealZoneText = savedZone
+
+    -- (10) Alliance-side Rend: name-only detection, a pop, a vague notice, and
+    -- deliberately NO bar; deduped at 60s (A2.7).
+    _G.UnitFactionGroup = function() return "Alliance" end
+    Timers._lastAllyRendAt = 0
+    Timers._lastNotice = nil
+    b = yell("Kek'lek Rend'aggro zug zug!", "Thrall")   -- scrambled cross-faction text
+    tcheck(#b == 0, "Alliance Rend raises NO pull bar (A2.7)", fails)
+    tcheck((Timers.state.rend and Timers.state.rend.lastPop or 0) > 0,
+        "Alliance Rend still logs the pop", fails)
+    tcheck(Timers._lastNotice ~= nil and Timers._lastNotice.buff == "rend",
+        "Alliance Rend emits the vague notification", fails)
+    -- Dedup: a second scrambled yell inside 60s is swallowed.
+    local firstAt = Timers._lastAllyRendAt
+    tcheck(Timers.OnAllianceRendYell("Thrall", firstAt + 30) == false,
+        "second Alliance Rend yell within 60s deduped", fails)
+    tcheck(Timers.OnAllianceRendYell("Thrall", firstAt + 61) == true,
+        "Alliance Rend accepted again past the 60s dedup", fails)
+    _G.UnitFactionGroup = savedFaction
+
+    Timers.state = {}
+    Timers._handinStash = {}
+    Timers._lastAllyRendAt = 0
+end
+
+-- A4: quest hand-in is non-anchoring for Rend, CD-suppressed, and ZG pulls.
+local function testQuestHandin(fails)
+    local bars = {}
+    ns:On("PULL_DETECTED", function(buffKey, duration) bars[#bars + 1] = { buff = buffKey, dur = duration } end)
+    local function reset() bars = {}; Timers.state = {}; Timers._handinStash = {}; Timers._lastNotice = nil end
+
+    local savedFaction = _G.UnitFactionGroup
+    _G.UnitFactionGroup = function() return "Horde" end
+
+    -- (a) A Rend hand-in does NOT anchor: it stashes the handing-in player so
+    -- the FOLLOWING yell can attribute the pop (A4.1). A hand-in that never
+    -- produces a buff therefore cannot fake a 3h cooldown.
+    reset()
+    local ok = Timers.OnQuestHandin(4974)
+    tcheck(ok == true, "Rend hand-in handled", fails)
+    tcheck((Timers.state.rend == nil) or (Timers.state.rend.lastPop or 0) == 0,
+        "Rend hand-in does NOT anchor the cooldown (A4.1)", fails)
+    tcheck(Timers._handinStash.rend ~= nil, "Rend hand-in stashes the handing-in player", fails)
+    tcheck(Timers._lastNotice and Timers._lastNotice.category == "questHandin",
+        "hand-in fires a questHandin alert", fails)
+
+    -- ...and the following yell CONSUMES that attribution.
+    local who = Timers._handinStash.rend.who
+    Timers._onMonsterYell("CHAT_MSG_MONSTER_YELL", "Rend Blackhand, has fallen!", "Thrall")
+    tcheck((Timers.state.rend and Timers.state.rend.lastPop or 0) > 0,
+        "the yell after a hand-in anchors the pop", fails)
+    tcheck(Timers.state.rend.who == who,
+        "the yell attributes the pop to the handing-in player", fails)
+    tcheck(Timers._handinStash.rend == nil, "the stash is consumed by the yell", fails)
+
+    -- A stash older than 20s is NOT consumed (the yell falls back to the NPC).
+    reset()
+    Timers._stashHandin("rend", "Staleplayer", now() - 25)
+    tcheck(Timers._consumeHandinStash("rend", now()) == nil,
+        "a stash older than 20s expires unconsumed", fails)
+
+    -- (b) A hand-in whose buff is already on cooldown is ignored ENTIRELY --
+    -- no anchor, no stash, no alert (A4.2).
+    reset()
+    Timers.Record("onyH", now(), "local", "yeller", "pop")
+    Timers._lastNotice = nil
+    local ok2, why = Timers.OnQuestHandin(7496)
+    tcheck(ok2 == false and why == "on cooldown", "on-CD hand-in is ignored", fails)
+    tcheck(Timers._lastNotice == nil, "on-CD hand-in emits no alert (A4.2)", fails)
+    -- Rend likewise.
+    reset()
+    Timers.Record("rend", now(), "local", "yeller", "pop")
+    tcheck(Timers.OnQuestHandin(4974) == false, "on-CD Rend hand-in ignored", fails)
+    tcheck(Timers._handinStash.rend == nil, "on-CD Rend hand-in does not even stash", fails)
+
+    -- (c) Nef and ZG carry no cooldown and are NEVER suppressed.
+    reset()
+    Timers.Record("nefH", now(), "local", "yeller", "pop")
+    tcheck(Timers.OnQuestHandin(7784) == true, "Nef hand-in never suppressed", fails)
+
+    -- (d) The ZG hand-in starts the 50s stage-1 pull (A4.3).
+    reset()
+    tcheck(Timers.OnQuestHandin(8183) == true, "ZG hand-in handled", fails)
+    tcheck(#bars == 1 and bars[1].buff == "zg" and math.abs(bars[1].dur - 50.5) <= 1,
+        "ZG hand-in starts the 50.5s stage-1 pull (A4.3)", fails)
+
+    -- (e) A non-buff quest is not our business.
+    reset()
+    local okN = Timers.OnQuestHandin(12345)
+    tcheck(okN == false, "an unrelated quest hand-in is ignored", fails)
+
+    -- (f) Hand-in ids map to the right FACTION (spec §10.3). These were reversed.
+    tcheck(Timers._handinQuest[7491] == "onyA" and Timers._handinQuest[7496] == "onyH",
+        "7491 -> Ony Alliance, 7496 -> Ony Horde", fails)
+    tcheck(Timers._handinQuest[7782] == "nefA" and Timers._handinQuest[7784] == "nefH",
+        "7782 -> Nef Alliance, 7784 -> Nef Horde", fails)
+    tcheck(Timers._handinQuest[4974] == "rend" and Timers._handinQuest[8183] == "zg",
+        "4974 -> Rend, 8183 -> Zandalar", fails)
+
+    _G.UnitFactionGroup = savedFaction
+    reset()
+end
+
+-- A5.1 / A5.2: the songflower pick gate.
+local function testSongflowerPick(fails)
+    if not (ns.Store and ns.Store.GetTimers) then
+        fails[#fails + 1] = "store absent for songflower test"; return
+    end
+    local timers = ns.Store.GetTimers()
+    timers.flower, timers.tuber = {}, {}
+
+    -- Stand up a minimal C_Map so the real handler runs unmodified.
+    local savedMap = _G.C_Map
+    local pos = { x = 0, y = 0 }
+    _G.C_Map = {
+        GetBestMapForUnit = function() return Timers.FELWOOD_MAP end,
+        GetPlayerMapPosition = function()
+            return { GetXY = function() return pos.x, pos.y end }
+        end,
+    }
+    local function standOn(node, dx, dy)
+        pos.x, pos.y = node.x + (dx or 0), node.y + (dy or 0)
+    end
+
+    local f4 = Timers.NODES.flower[4]
+
+    -- (a) THE bug: any old cast next to a node used to mark it picked. A mount /
+    -- heal / profession cast must now do nothing at all (A5.1).
+    standOn(f4)
+    Timers._onSpellSucceeded("UNIT_SPELLCAST_SUCCEEDED", "player", "Cast-1", 8690)  -- Hearthstone
+    tcheck((timers.flower[4] or 0) == 0, "a non-songflower cast on a node marks NOTHING (A5.1)", fails)
+    Timers._onSpellSucceeded("UNIT_SPELLCAST_SUCCEEDED", "player", "Cast-1", 6603)
+    tcheck((timers.flower[4] or 0) == 0, "second unrelated cast still marks nothing", fails)
+
+    -- (b) The real Cleansed Songflower cast (6478) on the node DOES mark it.
+    Timers._onSpellSucceeded("UNIT_SPELLCAST_SUCCEEDED", "player", "Cast-2", Timers.SONGFLOWER_SPELL)
+    tcheck((timers.flower[4] or 0) > 0, "spell 6478 on a node marks the pick", fails)
+
+    -- (c) Another unit's cast is never ours.
+    timers.flower = {}
+    Timers._onSpellSucceeded("UNIT_SPELLCAST_SUCCEEDED", "target", "Cast-3", Timers.SONGFLOWER_SPELL)
+    tcheck((timers.flower[4] or 0) == 0, "another unit's 6478 cast is ignored", fails)
+
+    -- (d) Radius: a pick a real distance off the stored coordinate now lands
+    -- (0.06, not the 4x-too-tight 0.015) -- A5.2.
+    timers.flower = {}
+    standOn(f4, 0.03, 0.02)   -- ~0.036 away: inside 0.06, outside the old 0.015
+    Timers._onSpellSucceeded("UNIT_SPELLCAST_SUCCEEDED", "player", "Cast-4", Timers.SONGFLOWER_SPELL)
+    tcheck((timers.flower[4] or 0) > 0, "a pick 0.036 off the node still matches (A5.2)", fails)
+    tcheck(Timers.NODE_MATCH_RADIUS == 0.06, "node match radius is 0.06 normalized", fails)
+
+    -- Well outside the radius still matches nothing.
+    timers.flower = {}
+    standOn(f4, 0.2, 0.2)
+    Timers._onSpellSucceeded("UNIT_SPELLCAST_SUCCEEDED", "player", "Cast-5", Timers.SONGFLOWER_SPELL)
+    tcheck((timers.flower[4] or 0) == 0, "a cast far from every node matches nothing", fails)
+
+    -- (e) Co-located flower/tuber sites still resolve by nearest-distance, so
+    -- the wider radius cannot bleed a flower pick onto its neighbour tuber.
+    local f3, t1 = Timers.NODES.flower[3], Timers.NODES.tuber[1]
+    local k1 = Timers.MatchNodePick(f3.x, f3.y)
+    tcheck(k1 == "flower", "standing on flower 3 resolves to the flower", fails)
+    local k2, i2 = Timers.MatchNodePick(t1.x, t1.y)
+    tcheck(k2 == "tuber" and i2 == 1, "standing on tuber 1 resolves to the tuber", fails)
+    tcheck(Timers.MatchNodePick(0.9, 0.9) == nil, "far-away position matches no node", fails)
+
+    _G.C_Map = savedMap
+    timers.flower, timers.tuber = {}, {}
 end
 
 -- Confirmation upgrade: a lower-trust anchor, then higher trust inside CD
@@ -1948,11 +2681,11 @@ local function testNWBIngest(fails)
     Timers.state = {}
 end
 
--- Pull-window selection + auto-calibration (per-buff, per-yell-stage).
--- Covers: (a) default vs median vs override precedence; (b) obs capping + even
--- median; (c) yell-1 window != yell-2; (d) recency gate remaining = window -
--- elapsed with the per-stage window; (e) observations only record when a pull
--- was actually active for that buff.
+-- Pull-window selection + drift calibration (per-buff, per-yell-stage).
+-- Covers: (a) the spec constants ARE the windows and the observed median can no
+-- longer displace them; (b) manual override still wins; (c) stage-2 "no bar";
+-- (d) obs capping + even median (still used for drift reporting); (e) the
+-- recency gate; (f) observations only record when a pull was actually active.
 local function testPullWindows(fails)
     local function resetObs()
         local t = ns.Store and ns.Store.GetTimers and ns.Store.GetTimers()
@@ -1976,33 +2709,43 @@ local function testPullWindows(fails)
 
     resetObs(); clearOverride(); Timers._pendingPull = {}
 
-    -- (c) yell-1 window differs from yell-2 for the same buff (seed layout).
-    tcheck(Timers.PULL_WINDOWS.rend[1] ~= Timers.PULL_WINDOWS.rend[2],
-        "rend yell-1 seed != yell-2 seed", fails)
-    tcheck(Timers.PULL_WINDOWS.onyH[1] == 240 and Timers.PULL_WINDOWS.onyH[2] == 40,
-        "onyH seeds are the provisional 240/40", fails)
+    -- (a) The spec constants ARE the windows (§10.7). No PROVISIONAL guesses.
+    tcheck(Timers.PULL_WINDOWS.onyH[1] == 14.5 and Timers.PULL_WINDOWS.onyA[1] == 15,
+        "Ony spec windows are 14.5 (H) / 15 (A)", fails)
+    tcheck(Timers.PULL_WINDOWS.nefH[1] == 15 and Timers.PULL_WINDOWS.nefA[1] == 12,
+        "Nef spec windows are 15 (H) / 12 (A)", fails)
+    tcheck(Timers.PULL_WINDOWS.zg[1] == 50.5 and Timers.PULL_WINDOWS.zg[2] == 29,
+        "ZG spec windows are 50.5 / 29", fails)
+    tcheck(Timers.REND_BARS.thrall[1].seconds == 6 and Timers.REND_BARS.thrall[2].seconds == 17,
+        "Rend bars are Orgrimmar 6s / Barrens 17s", fails)
+    tcheck(Timers.REND_BARS.herald[2].seconds == 6, "Herald Barrens variant is 6s", fails)
 
-    -- (a1) no observations -> seeded default per (buff, yellNum).
-    local w, src = Timers.EffectivePullWindow("rend", 1)
-    tcheck(w == 180 and src == "default", "no obs -> rend yell1 default 180", fails)
-    w, src = Timers.EffectivePullWindow("rend", 2)
-    tcheck(w == 40 and src == "default", "no obs -> rend yell2 default 40", fails)
+    local w, src = Timers.EffectivePullWindow("onyH", 1)
+    tcheck(w == 14.5 and src == "spec", "onyH yell1 window comes from the spec table", fails)
 
-    -- (a2) >=1 (here 3) observations -> rolling MEDIAN wins over default.
-    Timers.RecordPullObservation("rend", 1, 100)
-    Timers.RecordPullObservation("rend", 1, 300)
-    Timers.RecordPullObservation("rend", 1, 200)
-    w, src = Timers.EffectivePullWindow("rend", 1)
-    tcheck(w == 200 and src == "observed-median", "3 obs -> median 200 wins", fails)
-    -- yell-2 for the same buff is untouched (per-stage isolation).
-    w, src = Timers.EffectivePullWindow("rend", 2)
-    tcheck(w == 40 and src == "default", "rend yell2 still default (per-stage)", fails)
+    -- (b) stage 2 raises NO bar for Rend / Ony / Nef.
+    for _, k in ipairs({ "rend", "onyH", "onyA", "nefH", "nefA" }) do
+        local w2, s2 = Timers.EffectivePullWindow(k, 2)
+        tcheck(w2 == nil and s2 == "none", k .. " yell2 has no bar", fails)
+    end
+    tcheck(Timers.EffectivePullWindow("zg", 2) == 29, "ZG yell2 still bars at 29s", fails)
 
-    -- (a3) manual override wins over BOTH median and default. Number pins both
+    -- (c) observations NO LONGER displace a spec constant -- calibration is now
+    -- drift measurement only (the constants are authoritative).
+    Timers.RecordPullObservation("onyH", 1, 100)
+    Timers.RecordPullObservation("onyH", 1, 300)
+    Timers.RecordPullObservation("onyH", 1, 200)
+    w, src = Timers.EffectivePullWindow("onyH", 1)
+    tcheck(w == 14.5 and src == "spec", "3 observations do NOT override the spec window", fails)
+    local obs, n = Timers.ObservedPullMedian("onyH", 1)
+    tcheck(obs == 200 and n == 3, "the observed median is still reported for drift", fails)
+    resetObs()
+
+    -- (d) a manual override still wins over the spec constant. Number pins both
     -- stages; table pins per stage.
     setOverride({ rend = 99 })
     w, src = Timers.EffectivePullWindow("rend", 1)
-    tcheck(w == 99 and src == "override", "numeric override wins over median", fails)
+    tcheck(w == 99 and src == "override", "numeric override wins over the spec constant", fails)
     w, src = Timers.EffectivePullWindow("rend", 2)
     tcheck(w == 99 and src == "override", "numeric override pins both stages", fails)
     setOverride({ onyH = { [1] = 111, [2] = 22 } })
@@ -2023,29 +2766,30 @@ local function testPullWindows(fails)
     Timers.RecordPullObservation("zg", 2, 30)
     Timers.RecordPullObservation("zg", 2, 40)
     tcheck(Timers._median({ 10, 20, 30, 40 }) == 25, "even-count median averages middles", fails)
-    tcheck(Timers.EffectivePullWindow("zg", 2) == 25, "even-count obs median is effective window", fails)
+    tcheck(Timers.ObservedPullMedian("zg", 2) == 25, "even-count obs median reported", fails)
 
-    -- (d) recency gate still passes remaining = window - elapsed, now using the
-    -- per-stage window (rend yell-1 seed = 180). Fresh -> ~180; 20s late -> ~160.
+    -- (e) recency gate: remaining = window - elapsed against the spec window
+    -- (ZG stage 1 = 50.5s). Fresh -> ~50.5; 20s late -> ~30.5.
     resetObs(); Timers._pendingPull = {}
     local cap = { pull = nil }
     ns:On("PULL_DETECTED", function(buffKey, duration) cap.pull = { buff = buffKey, duration = duration } end)
     local t = now()
     Timers.state = {}; cap.pull = nil
-    Timers.Record("rend", t, "local", "live", "killed", nil, nil, 1)
-    tcheck(cap.pull and cap.pull.buff == "rend" and math.abs(cap.pull.duration - 180) <= 1,
-        "fresh yell-1 pull shows ~180s window", fails)
+    Timers.Record("zg", t, "local", "live", "pop", nil, nil, 1)
+    tcheck(cap.pull and cap.pull.buff == "zg" and math.abs(cap.pull.duration - 50.5) <= 1,
+        "fresh yell-1 pull shows the ~50.5s spec window", fails)
     Timers.state = {}; cap.pull = nil
-    Timers.Record("onyH", t - 20, "local", "late", "pop", nil, nil, 2)
-    tcheck(cap.pull and math.abs(cap.pull.duration - (40 - 20)) <= 1,
-        "late yell-2 onyH shows remaining = window - elapsed (~20)", fails)
+    Timers.Record("zg", t - 20, "local", "late", "pop", nil, nil, 1)
+    tcheck(cap.pull and math.abs(cap.pull.duration - (50.5 - 20)) <= 1,
+        "late yell-1 zg shows remaining = window - elapsed (~30.5)", fails)
 
-    -- (e) observation records ONLY when a pull was active for that buff.
+    -- (f) observation records ONLY when a pull was active for that buff.
     resetObs(); Timers._pendingPull = {}
-    -- A fresh yell-2 pull seeds a pending for onyH; a later land books observed.
+    -- A fresh pull seeds a pending for onyH; a later land books the observation.
     Timers.state = {}
-    Timers.Record("onyH", t, "local", "pull", "pop", nil, nil, 2)
-    tcheck(Timers._pendingPull.onyH ~= nil, "fresh local yell seeds a pending pull", fails)
+    Timers.Record("onyH", t, "local", "pull", "pop", nil, nil, 2, nil)
+    Timers._setPendingPull("onyH", t, 2)
+    tcheck(Timers._pendingPull.onyH ~= nil, "a pull seeds a pending observation", fails)
     local recN = Timers.NotePullGain("onyH", t + 30)
     tcheck(recN == 1, "buff-land with active pull books one observation", fails)
     local ol = ns.Store.GetTimers().pullObservations
@@ -2082,8 +2826,12 @@ function Timers.RunSelfTests(verbose)
     local suites = {
         { name = "cd derivation",     fn = testCDDerivation },
         { name = "false-positive gate", fn = testFalsePositive },
+        { name = "yell table (A2)",   fn = testYellTable },
+        { name = "announcer kill respawn (A3)", fn = testAnnouncerKill },
+        { name = "quest hand-in (A4)", fn = testQuestHandin },
+        { name = "songflower pick gate (A5)", fn = testSongflowerPick },
         { name = "pull recency gate", fn = testPullRecencyGate },
-        { name = "pull windows + calibration", fn = testPullWindows },
+        { name = "pull windows + drift", fn = testPullWindows },
         { name = "trust upgrade",     fn = testTrustUpgrade },
         { name = "trust ordering",    fn = testTrustOrdering },
         { name = "request cooldowns", fn = testRequestCooldowns },
