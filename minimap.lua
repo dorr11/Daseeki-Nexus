@@ -101,18 +101,14 @@ local function updatePosition(btn, angle)
 end
 
 ----------------------------------------------------------------------
--- Live cooldown text (Rend / Ony) via Timers.ComputeCD + Timers.state
+-- Live world-buff text (Rend / Ony) via Timers.BuffStatus — the engine owns the
+-- kill-vs-pop precedence and the 360s announcer-respawn model, so the tooltip
+-- just renders the four states it reports.
 ----------------------------------------------------------------------
 
 local function nowEpoch()
     if ns.Store and ns.Store.Now then return ns.Store.Now() end
     return (GetServerTime and GetServerTime()) or 0
-end
-
-local function anchorOf(buffKey)
-    local st = ns.Timers and ns.Timers.state and ns.Timers.state[buffKey]
-    if not st then return 0 end
-    return math.max(st.lastPop or 0, st.lastKilled or 0)
 end
 
 local function fmtRemaining(sec)
@@ -123,18 +119,34 @@ local function fmtRemaining(sec)
     return string.format("%dm", m)
 end
 
--- Returns text, colorToken for a buff's CD state.
-local function cdStatus(buffKey)
-    if not (ns.Timers and ns.Timers.ComputeCD) then return "no data", "faint" end
-    local anchor = anchorOf(buffKey)
-    if anchor <= 0 then return "no data", "faint" end
-    local info = ns.Timers.ComputeCD(buffKey, anchor, nowEpoch())
+-- The announcer respawn is a ~6 minute window, far below fmtRemaining's h/m
+-- resolution, so the killed line gets its own M:SS formatter.
+local function fmtMSS(sec)
+    sec = math.max(0, math.floor(tonumber(sec) or 0))
+    return string.format("%d:%02d", math.floor(sec / 60), sec % 60)
+end
+
+-- Map a Timers.BuffStatus readout to tooltip text + color token. Pure (the
+-- self-test drives the four states through it directly).
+local function statusFor(st)
+    local state = st and st.state
     -- BRAND_SPEC §6: a world buff off-cooldown is green "Open" (the old
     -- pop-phrasing is retired suite-wide).
-    if info.ready then return "Open", "ok" end
-    -- pulse semantics live in the dashboard; the tooltip just states time.
-    local token = (info.remaining <= 20 * 60) and "danger" or "accent"
-    return fmtRemaining(info.remaining), token
+    if state == "canpop" then return "Open", "ok" end
+    -- A kill is a respawn countdown, not a cooldown — amber, seconds resolution.
+    if state == "killed" then return "Killed \194\183 respawns " .. fmtMSS(st.remaining), "warn" end
+    if state == "cd" then
+        -- pulse semantics live in the dashboard; the tooltip just states time.
+        local token = ((st.remaining or 0) <= 20 * 60) and "danger" or "accent"
+        return fmtRemaining(st.remaining or 0), token
+    end
+    return "no data", "faint"
+end
+
+-- Returns text, colorToken for a buff's state.
+local function cdStatus(buffKey)
+    if not (ns.Timers and ns.Timers.BuffStatus) then return "no data", "faint" end
+    return statusFor(ns.Timers.BuffStatus(buffKey, nowEpoch()))
 end
 
 ----------------------------------------------------------------------
@@ -413,8 +425,24 @@ ns:RegisterSelfTest("minimap", function(verbose)
     local function check(c, m) if not c then pass = false; if verbose then ns:Print("  FAIL: " .. m) end end end
     check(fmtRemaining(3661):find("1h"), "fmtRemaining hours")
     check(fmtRemaining(120) == "2m", "fmtRemaining minutes")
+    check(fmtMSS(0) == "0:00", "fmtMSS zero")
+    check(fmtMSS(59) == "0:59", "fmtMSS sub-minute pads seconds")
+    check(fmtMSS(365) == "6:05", "fmtMSS M:SS")
     local t, tok = cdStatus("rend")
     check(type(t) == "string" and type(tok) == "string", "cdStatus returns text+token")
+    -- Four-state readout matrix (Timers.BuffStatus -> tooltip line).
+    t, tok = statusFor(nil)
+    check(t == "no data" and tok == "faint", "no status -> no data / faint")
+    t, tok = statusFor({ state = "nodata" })
+    check(t == "no data" and tok == "faint", "nodata -> no data / faint")
+    t, tok = statusFor({ state = "canpop" })
+    check(t == "Open" and tok == "ok", "canpop -> Open / ok (BRAND_SPEC 6)")
+    t, tok = statusFor({ state = "killed", remaining = 125 })
+    check(t == "Killed \194\183 respawns 2:05" and tok == "warn", "killed -> respawn M:SS / warn")
+    t, tok = statusFor({ state = "cd", remaining = 20 * 60 })
+    check(t == "20m" and tok == "danger", "cd at 20m -> danger")
+    t, tok = statusFor({ state = "cd", remaining = 3 * 3600 })
+    check(t == "3h 00m" and tok == "accent", "cd above 20m -> accent")
     if verbose then ns:Print("  minimap selftest " .. (pass and "PASS" or "FAIL")) end
     return pass
 end)

@@ -73,6 +73,14 @@ function Dashboard.ShortDur(s)
     return s .. "s"
 end
 
+-- Countdown numerals as M:SS. Pure. Dashboard.FormatDuration bottoms out at whole
+-- minutes, which is far too coarse for the 360s announcer respawn — that row needs
+-- a ticking seconds digit. Same shape as InstancesUI.FormatMSS.
+function Dashboard.FormatMSS(sec)
+    sec = math.max(0, math.floor(tonumber(sec) or 0))
+    return string.format("%d:%02d", math.floor(sec / 60), sec % 60)
+end
+
 -- Map a node state ({ state = "up"/"down"/"unknown", remaining = n }) to hero-cell
 -- content. Returns (heroText, heroColorToken, captionColorToken). Pure.
 function Dashboard.SongflowerCellContent(st)
@@ -93,9 +101,29 @@ local WB_ROWS = {
     { key = "onyA", logKey = "onyA", slot = 1, label = "Onyxia", crest = "Alliance", title = "Onyxia (Alliance)" },
 }
 
-local function anchorOf(state)
-    if not state then return 0 end
-    return math.max(state.lastPop or 0, state.lastKilled or 0)
+-- Map a Timers.BuffStatus readout ({ state, remaining, nextAt }) to world-buff row
+-- content. Returns (statusText, statusToken, pulse, stampText). Pure, so the
+-- "timersui" suite drives the whole four-state matrix headless.
+--   nodata : nothing observed yet
+--   canpop : off cooldown / respawn elapsed — BRAND_SPEC §6 green "Open"
+--   killed : the announcer died and is respawning. INFORMATIONAL, not a closing
+--            window, so it reads warn and never pulses.
+--   cd     : on cooldown — danger + brighten pulse once inside SF_IMMINENT.
+function Dashboard.WBRowContent(st, imminent)
+    imminent = imminent or SF_IMMINENT
+    local state = st and st.state
+    if state == "canpop" then
+        return "Open", "ok", false, ""
+    elseif state == "killed" then
+        return "Killed \194\183 " .. Dashboard.FormatMSS(st.remaining), "warn", false,
+               "respawns " .. date("%H:%M", st.nextAt)
+    elseif state == "cd" then
+        local rem = st.remaining or 0
+        local imm = (rem <= imminent)
+        return Dashboard.FormatDuration(rem), imm and "danger" or "warn", imm,
+               "off CD " .. date("%H:%M", st.nextAt)
+    end
+    return "No data", "faint", false, ""
 end
 
 ----------------------------------------------------------------------
@@ -405,27 +433,15 @@ function TimersDock.Attach(parent)
 
         for _, r in ipairs(D._wbRows) do
             local def = r._def
-            local state = T and T.state and T.state[def.key]
-            local anchor = anchorOf(state)
-            local info = T and T.ComputeCD and T.ComputeCD(def.key, anchor, now)
-            if not info or anchor <= 0 then
-                r.status:SetText("No data"); r.status:SetTextColor(UI.Color("faint"))
-                r.status._pulse = false; r.stamp:SetText("")
-            elseif info.ready then
-                r.status:SetText("Open"); r.status:SetTextColor(UI.Color("ok"))
-                r.status._pulse = false; r.stamp:SetText("")
-            else
-                local rem = info.remaining or 0
-                local killed = state.lastKilled and state.lastKilled >= (state.lastPop or 0)
-                r.status:SetText((killed and "Killed \194\183 " or "") .. Dashboard.FormatDuration(rem))
-                if rem <= SF_IMMINENT then
-                    r.status:SetTextColor(UI.Color("danger")); r.status._pulse = true
-                else
-                    r.status:SetTextColor(UI.Color("warn")); r.status._pulse = false
-                end
-                r.stamp:SetText("off CD " .. date("%H:%M", info.nextAt))
-                r.stamp:SetTextColor(UI.Color("faint"))
-            end
+            -- Timers.BuffStatus is the single source of the row readout (it owns the
+            -- kill-vs-pop precedence and the 360s respawn model). Soft-guarded like
+            -- the old ComputeCD call so a partial engine load still renders.
+            local st = T and T.BuffStatus and T.BuffStatus(def.key, now)
+            local text, token, pulse, stamp = Dashboard.WBRowContent(st)
+            r.status:SetText(text); r.status:SetTextColor(UI.Color(token))
+            r.status._pulse = pulse
+            r.stamp:SetText(stamp)
+            if stamp ~= "" then r.stamp:SetTextColor(UI.Color("faint")) end
         end
 
         local nUp, nDown, nUnknown = 0, 0, 0
@@ -462,7 +478,8 @@ end
 
 -- ════════════════════════════════════════════════════════════════════════════
 --  SELF-TEST  (suite "timersui"): the pure songflower-grid math + cell-content
---  matrix, re-housed verbatim. Runs headless (no frames).
+--  matrix (re-housed verbatim) plus the world-buff row matrix. Runs headless
+--  (no frames).
 -- ════════════════════════════════════════════════════════════════════════════
 
 local function testGridLayout(fails)
@@ -510,15 +527,64 @@ local function testCellContent(fails)
     ck(t == "UP?" and c == "ok", "up -> 'UP?' / ok green")
 end
 
+-- M:SS formatting + the four-state world-buff row matrix (Timers.BuffStatus ->
+-- text / token / pulse / stamp). Pure; no frames, no engine state.
+local function testWBRow(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    ck(Dashboard.FormatMSS(0)    == "0:00", "FormatMSS 0 -> '0:00'")
+    ck(Dashboard.FormatMSS(59)   == "0:59", "FormatMSS 59 -> '0:59'")
+    ck(Dashboard.FormatMSS(60)   == "1:00", "FormatMSS 60 -> '1:00'")
+    ck(Dashboard.FormatMSS(360)  == "6:00", "FormatMSS 360 (announcer respawn) -> '6:00'")
+    ck(Dashboard.FormatMSS(95.7) == "1:35", "FormatMSS truncates fractional seconds")
+    ck(Dashboard.FormatMSS(-5)   == "0:00", "FormatMSS clamps negatives to '0:00'")
+    ck(Dashboard.FormatMSS(nil)  == "0:00", "FormatMSS nil -> '0:00'")
+
+    local T0 = 1785000000
+
+    -- nodata (and the soft-guard path where BuffStatus was unavailable).
+    local txt, tok, pulse, stamp = Dashboard.WBRowContent(nil)
+    ck(txt == "No data" and tok == "faint" and pulse == false and stamp == "",
+       "nil status -> 'No data' / faint / no pulse / no stamp")
+    txt, tok, pulse, stamp = Dashboard.WBRowContent({ state = "nodata", remaining = 0, nextAt = 0 })
+    ck(txt == "No data" and tok == "faint" and pulse == false and stamp == "",
+       "nodata -> 'No data' / faint / no pulse / no stamp")
+
+    -- canpop: BRAND_SPEC §6 green "Open", exactly (no pop-phrasing, no suffix).
+    txt, tok, pulse, stamp = Dashboard.WBRowContent({ state = "canpop", remaining = 0, nextAt = T0 })
+    ck(txt == "Open" and tok == "ok" and pulse == false and stamp == "",
+       "canpop -> exactly 'Open' / ok / no pulse / no stamp")
+
+    -- killed: live M:SS countdown, warn, NEVER pulses, stamp names the respawn clock.
+    txt, tok, pulse, stamp = Dashboard.WBRowContent({ state = "killed", remaining = 125, nextAt = T0 })
+    ck(txt == "Killed \194\183 2:05", "killed -> 'Killed \194\183 2:05' (M:SS resolution)")
+    ck(tok == "warn", "killed reads warn")
+    ck(pulse == false, "killed does NOT pulse (informational respawn)")
+    ck(stamp == "respawns " .. date("%H:%M", T0), "killed stamp -> 'respawns HH:MM'")
+    txt = Dashboard.WBRowContent({ state = "killed", remaining = 359, nextAt = T0 })
+    ck(txt == "Killed \194\183 5:59", "killed just after the kill -> '5:59'")
+
+    -- cd: FormatDuration + the existing imminent rule (danger + pulse at/below).
+    txt, tok, pulse, stamp = Dashboard.WBRowContent({ state = "cd", remaining = 3 * 3600, nextAt = T0 })
+    ck(txt == Dashboard.FormatDuration(3 * 3600), "cd text is FormatDuration(remaining)")
+    ck(tok == "warn" and pulse == false, "cd far out -> warn / no pulse")
+    ck(stamp == "off CD " .. date("%H:%M", T0), "cd stamp -> 'off CD HH:MM'")
+    tok, pulse = select(2, Dashboard.WBRowContent({ state = "cd", remaining = SF_IMMINENT, nextAt = T0 }))
+    ck(tok == "danger" and pulse == true, "cd AT SF_IMMINENT -> danger + pulse")
+    tok, pulse = select(2, Dashboard.WBRowContent({ state = "cd", remaining = SF_IMMINENT - 1, nextAt = T0 }))
+    ck(tok == "danger" and pulse == true, "cd below SF_IMMINENT -> danger + pulse")
+    tok, pulse = select(2, Dashboard.WBRowContent({ state = "cd", remaining = SF_IMMINENT + 1, nextAt = T0 }))
+    ck(tok == "warn" and pulse == false, "cd above SF_IMMINENT -> warn / no pulse")
+end
+
 if ns.RegisterSelfTest then
     ns:RegisterSelfTest("timersui", function(verbose)
         local fails = {}
-        local ok = pcall(function() testGridLayout(fails); testCellContent(fails) end)
+        local ok = pcall(function() testGridLayout(fails); testCellContent(fails); testWBRow(fails) end)
         local passed = ok and #fails == 0
         if verbose and ns and ns.Print then
-            if passed then ns:Print("  PASS timersui/songflower grid layout + cell content")
-            elseif not ok then ns:Print("  FAIL timersui/songflower :: error in test")
-            else for _, f in ipairs(fails) do ns:Print("  FAIL timersui/songflower :: " .. f) end end
+            if passed then ns:Print("  PASS timersui/songflower grid layout + cell content + WB rows")
+            elseif not ok then ns:Print("  FAIL timersui :: error in test")
+            else for _, f in ipairs(fails) do ns:Print("  FAIL timersui :: " .. f) end end
         end
         return passed
     end)
