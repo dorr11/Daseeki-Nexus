@@ -34,11 +34,11 @@ local SOULSTONE_ITEMS = { 5232, 16892, 16893, 16895, 16896 }
 -- cooldown probe — a ready spell also means a soulstone can be made). [verify id]
 local SPELL_CREATE_SOULSTONE = 20758
 
--- FFF seasonal world buff. Its exact in-game aura name is NOT a clean-room fact
--- (the spec calls it only "seasonal FFF"); this prefix is a best-guess PLACEHOLDER
--- the owner confirms in-game and corrects here if it differs. A non-match simply
--- leaves slot 10 empty (safe) — it never errors. [verify — owner in-game]
-local FFF_AURA_PREFIX = "fervor of the first feast"
+-- FFF seasonal world buff. The behavioural spec names it "Fire Festival Fury"
+-- and pins it to spell IDs 29338 / 29846, which are now the PRIMARY matcher
+-- (see BUFF_SPELL_IDS). This name prefix is only the localization fallback and
+-- replaces the former self-declared placeholder (A6.6).
+local FFF_AURA_PREFIX = "fire festival fury"
 
 -- World-buff aura name -> fixed slot (1..8). Names are matched
 -- case-insensitively by prefix so localized suffixes (e.g. Sayge's
@@ -61,6 +61,61 @@ local BUFF_SLOTS = {
     { slot = 9,  prefix = "battle shout" },            -- world Battle Shout ("Fallen Hero")
     { slot = 10, prefix = FFF_AURA_PREFIX },           -- seasonal FFF [verify prefix]
 }
+
+-- Spell ID -> Daseeki slot. This is the PRIMARY matcher (A6.4): it is immune to
+-- client localization and to the alternate IDs Blizzard shipped for the reissued
+-- world buffs, which a name prefix cannot see. Name matching (BUFF_SLOTS above)
+-- stays as the fallback for any ID we have not enumerated.
+--
+-- IDs are unprotectable game facts, taken from the behavioural spec's tracked-set
+-- table. Slot numbers are Daseeki's own layout (BUFF_SLOTS), NOT the spec's.
+local BUFF_SPELL_IDS = {
+    -- slot 1 — Rallying Cry of the Dragonslayer (Ony); reissue 355363
+    [22888] = 1, [355363] = 1,
+    -- slot 2 — Warchief's Blessing (Rend); reissue 355366
+    [16609] = 2, [355366] = 2,
+    -- slot 3 — Spirit of Zandalar (ZG); reissue 355365
+    [24425] = 3, [355365] = 3,
+    -- slot 4 — Songflower Serenade
+    [15366] = 4,
+    -- slot 5 — Sayge's Dark Fortune, all 8 fortune variants
+    [23768] = 5, [23769] = 5, [23767] = 5, [23766] = 5,
+    [23738] = 5, [23737] = 5, [23735] = 5, [23736] = 5,
+    -- slot 6 — Fengus' Ferocity (DMT AP)
+    [22817] = 6,
+    -- slot 7 — Mol'dar's Moxie (DMT Stam)
+    [22818] = 7,
+    -- slot 8 — Slip'kik's Savvy (DMT SP)
+    [22820] = 8,
+    -- slot 9 — Battle Shout, the NPC ("Fallen Hero") cast. A PLAYER self-cast
+    -- Battle Shout is a different spell ID and therefore only ever reaches slot 9
+    -- through the name fallback, where the 240 s filter below rejects it.
+    [25101] = 9,
+    -- slot 10 — Fire Festival Fury (seasonal)
+    [29338] = 10, [29846] = 10,
+}
+
+-- Slot indices the capture guards need by name.
+local SLOT_REND = 2      -- Warchief's Blessing
+local SLOT_BS   = 9      -- Battle Shout
+
+-- A6.3: a Battle Shout matched by NAME ONLY with this much time or less left is a
+-- player self-cast (base duration 2 min), not the "Fallen Hero" world buff. An
+-- ID-matched (25101) Battle Shout is always accepted regardless of remaining.
+local BS_SELFCAST_MAX = 240
+
+-- A6.1: a slot known live during teardown but carrying no readable duration is
+-- given a synthetic one rather than being dropped.
+local SYNTH_DURATION_REND  = 3600
+local SYNTH_DURATION_OTHER = 7200
+
+-- A6.2 / A17.2: a scan taken within this many seconds of PLAYER_ENTERING_WORLD is
+-- treated as partial (the aura list and the map position are not warm yet).
+local ENTERING_WORLD_GRACE = 2
+
+-- A9.2: the item-cooldown API is ignored for this long after entering the world —
+-- the documented post-loading-screen race that produces stuck cooldowns.
+local COOLDOWN_GRACE = 3
 
 -- Names that mark a stored-buff chronoboon aura (tooltip capture target).
 local CHRONOBOON_MARKERS = {
@@ -141,6 +196,66 @@ function Tracker.MatchBuffSlot(name)
         end
     end
     return nil
+end
+
+-- Spell-ID matcher (A6.4, PRIMARY). Returns the slot or nil.
+function Tracker.MatchBuffSlotByID(spellID)
+    if type(spellID) ~= "number" then return nil end
+    return BUFF_SPELL_IDS[spellID]
+end
+
+-- The single aura matcher used by the live scan. Spell ID first, then the name
+-- prefix. Returns (slot, matchedByID) so the caller can apply the ID-only
+-- exemptions (the Battle Shout self-cast filter). Pure + self-tested.
+function Tracker.MatchAura(spellID, name)
+    local slot = Tracker.MatchBuffSlotByID(spellID)
+    if slot then return slot, true end
+    return Tracker.MatchBuffSlot(name), false
+end
+
+----------------------------------------------------------------------
+-- Teardown / loading-screen latch (A6.1, A6.2, A17.2, A9.2)
+--
+-- During logout and while leaving the world the aura, map and item-cooldown APIs
+-- return nothing or garbage. Capturing then is what wiped every buff off the
+-- record at logout. The latch below is the single gate all three capture pieces
+-- consult.
+--
+-- Event ordering (Classic Era 1.15.9):
+--   * PLAYER_LEAVING_WORLD fires before EVERY loading screen — logout, /reload,
+--     and ordinary instance / continent transitions alike. It is NOT a
+--     logout-only signal, so the latch must RE-ARM.
+--   * PLAYER_ENTERING_WORLD fires on the far side of every loading screen except
+--     the final one of a logout. It is therefore the re-arm point: it clears
+--     _leavingWorld and stamps _enteredWorldAt, which opens the short
+--     ENTERING_WORLD_GRACE / COOLDOWN_GRACE windows during which a scan is still
+--     treated as partial (A6.2). Once that grace expires a normal full scan runs
+--     and the new zone's buffs/location/cooldowns are captured for real — so a
+--     loading-screen zone change still updates the record, it is just deferred by
+--     ~2 s instead of writing the cold-API emptiness.
+--   * PLAYER_LOGOUT sets _loggingOut, which is never cleared: the session ends.
+----------------------------------------------------------------------
+
+Tracker._leavingWorld   = false
+Tracker._loggingOut     = false
+Tracker._enteredWorldAt = nil   -- GetTime() frame stamp, nil until the first EW
+
+function Tracker.IsTeardown()
+    return (Tracker._loggingOut or Tracker._leavingWorld) and true or false
+end
+
+-- Seconds since the last PLAYER_ENTERING_WORLD, or math.huge before the first.
+function Tracker.SinceEnteringWorld()
+    local at = Tracker._enteredWorldAt
+    if not at then return math.huge end
+    local now = (GetTime and GetTime()) or 0
+    local d = now - at
+    if d < 0 then return 0 end
+    return d
+end
+
+function Tracker.InEnteringWorldGrace(window)
+    return Tracker.SinceEnteringWorld() < (window or ENTERING_WORLD_GRACE)
 end
 
 local function selfNameRealm()
@@ -430,20 +545,56 @@ end
 -- per-character annotation now lives in the separate Notes field (Store.*Note);
 -- Store.GetManualLocation/SetManualLocation remain for data preservation but are
 -- no longer consumed at capture time.
+--
+-- (A17.2) Two guards protect the stored value from teardown / loading-screen
+-- garbage: the location is FROZEN entirely while logging out or leaving the
+-- world, and a coordinate override is not downgraded to a plain zone name within
+-- ENTERING_WORLD_GRACE of entering the world (the map position reads cold or
+-- (0,0) there, so ResolveCoordinateOverride would return nil for a character who
+-- is still standing in the override box).
+local function isOverrideLabel(loc)
+    if not loc or loc == "" then return false end
+    local db = ns.Store.GetSettings()
+    local overrides = db and db.coordinateOverrides
+    if not overrides then return false end
+    for i = 1, #overrides do
+        local o = overrides[i]
+        if (o.label or o.name) == loc then return true end
+    end
+    return false
+end
+
 local function captureLocation(rec)
+    -- A17.2: teardown freeze. C_Map returns nothing mid-unload, so the last
+    -- known-good location is what the character logs out holding.
+    if Tracker.IsTeardown() then return end
+
     local override = Tracker.ResolveCoordinateOverride()
     if override then
         rec.location = override
         return
     end
+
+    -- A17.2: post-loading-screen grace — do not demote a coordinate override to a
+    -- zone name until the map APIs are warm.
+    if Tracker.InEnteringWorldGrace(ENTERING_WORLD_GRACE) and isOverrideLabel(rec.location) then
+        return
+    end
+
     local sub = GetSubZoneText()
     local zone = GetRealZoneText()
+    local loc
     if sub and sub ~= "" then
-        rec.location = sub
+        loc = sub
     elseif zone and zone ~= "" then
-        rec.location = zone
+        loc = zone
     else
-        rec.location = GetMinimapZoneText()
+        loc = GetMinimapZoneText()
+    end
+    -- Never overwrite a good location with nothing (same family as the freeze:
+    -- all three getters read empty while the world is still streaming in).
+    if loc and loc ~= "" then
+        rec.location = loc
     end
 end
 
@@ -526,7 +677,46 @@ local function itemCooldownRemaining(itemID)
     return 0
 end
 
+-- Carry a stored remaining-seconds cooldown forward across a suppressed capture,
+-- decaying it by the time that has passed since it was last actually read. The
+-- storage model is unchanged (remaining seconds, not a start epoch — that is a
+-- later designed change); this only keeps the preserved value honest, because
+-- Store.WriteSelfCharacter re-stamps lastDataUpdate on every capture and the UI
+-- decays against that stamp.
+local function carryCooldown(v, elapsed)
+    v = (tonumber(v) or 0) - elapsed
+    if v < 0 then v = 0 end
+    return math.floor(v)
+end
+
+-- Seconds since the last trusted read of a given piece, or 0 when we have no
+-- in-session reference (a fresh login must FREEZE, never decay by the whole
+-- offline duration — that would wipe the record the moment we log in).
+local function sinceCapture(stamp, now)
+    if not stamp then return 0 end
+    local d = now - stamp
+    if d < 0 then return 0 end
+    return d
+end
+
+Tracker._cdCapturedAt   = nil   -- Store.Now() of the last trusted cooldown read
+Tracker._auraCapturedAt = nil   -- Store.Now() of the last aura slot write
+
 local function captureCooldowns(rec)
+    -- A9.2: BAG_UPDATE_COOLDOWN and the login capture both hit C_Container while
+    -- it is cold right after a loading screen, which is the documented race that
+    -- produces stuck multi-thousand-minute cooldowns. Suppress the read during
+    -- teardown and for COOLDOWN_GRACE seconds after entering the world; carry the
+    -- previous values forward instead of writing the API's garbage (or its 0).
+    if Tracker.IsTeardown() or Tracker.InEnteringWorldGrace(COOLDOWN_GRACE) then
+        local now = ns.Store.Now()
+        local elapsed = sinceCapture(Tracker._cdCapturedAt, now)
+        rec.hearthstoneCD = carryCooldown(rec.hearthstoneCD, elapsed)
+        rec.itemCooldown  = carryCooldown(rec.itemCooldown, elapsed)
+        Tracker._cdCapturedAt = now
+        return
+    end
+
     rec.itemCooldown = 0
     rec.hearthstoneCD = 0
     if C_Container and C_Container.GetItemCooldown then
@@ -539,30 +729,101 @@ local function captureCooldowns(rec)
         end
         rec.itemCooldown = math.min(65535, math.floor(best))
     end
+    Tracker._cdCapturedAt = ns.Store.Now()
+end
+
+-- A6.1: a slot the record knows was live but which carries no readable duration
+-- gets a synthetic one rather than reading as "missing" on every dashboard.
+local function synthDuration(slot)
+    if slot == SLOT_REND then return SYNTH_DURATION_REND end
+    return SYNTH_DURATION_OTHER
+end
+
+-- Copy the previous capture's slots forward into `into` for every slot the
+-- current (untrusted / partial / skipped) scan did not fill. LIVE slots decay by
+-- the time elapsed since they were written and drop out once they hit zero;
+-- BOON-sourced slots are frozen (a suspended buff does not tick).
+local function preserveSlots(prev, elapsed, into)
+    if type(prev) ~= "table" then return into end
+    for slot, cell in pairs(prev) do
+        if type(cell) == "table" and into[slot] == nil then
+            local src = cell.source or 0
+            local dur = tonumber(cell.duration) or 0
+            if src ~= BOON_SOURCE then
+                if dur <= 0 then
+                    dur = synthDuration(slot)     -- known live, duration unreadable
+                else
+                    dur = dur - elapsed
+                end
+            end
+            if dur > 0 then
+                into[slot] = {
+                    duration = math.floor(dur),
+                    option   = cell.option or 0,
+                    source   = src,
+                }
+            end
+        end
+    end
+    return into
 end
 
 -- Scan player buffs, fill the 10 aura slots, track chronoboon + DMF.
+--
+-- Three trust states (A6.1 / A6.2):
+--   TEARDOWN  — logging out or leaving the world. The aura API returns nothing,
+--               so we do not scan at all: every prior slot is carried forward and
+--               the chronoboon / DMF flags are left untouched. This is the fix for
+--               "every buff is wiped from the record at logout".
+--   PARTIAL   — the scan saw ZERO buffs, or we are inside ENTERING_WORLD_GRACE of
+--               a loading screen. Whatever the scan did find is trusted and wins,
+--               but slots it did not find are carried forward instead of being
+--               written as empty, and the boon state is not cleared on this
+--               evidence.
+--   FULL      — normal. The scan is authoritative; anything absent is absent.
 local function captureAuras(rec)
+    local now = ns.Store.Now()
+    local prev = rec.auraStates
+    local elapsed = sinceCapture(Tracker._auraCapturedAt, now)
+
+    if Tracker.IsTeardown() then
+        rec.auraStates = preserveSlots(prev, elapsed, {})
+        Tracker._auraCapturedAt = now
+        return
+    end
+
     local slots = {}
     local chronoActive = false
     local dmfInBoon = false
+    local sawAnyBuff = 0
 
     if C_UnitAuras and C_UnitAuras.GetBuffDataByIndex then
         for i = 1, 40 do
             local aura = C_UnitAuras.GetBuffDataByIndex("player", i)
             if not aura then break end
+            sawAnyBuff = sawAnyBuff + 1
             -- Apostrophe-normalized name for EVERY comparison below. The live
             -- client can render buff names with a typographic apostrophe (U+2019),
             -- so a plain lower() missed "Warchief's Blessing" et al and left the
             -- slot dark (owner-observed). normName folds it to ASCII first.
             local nm = normName(aura.name)
+            local rem = auraRemaining(aura)
 
-            -- World-buff slot assignment (shared matcher so it stays in lockstep
-            -- with the self-test and the boon-tooltip parse).
-            local slot = Tracker.MatchBuffSlot(aura.name)
+            -- World-buff slot assignment. Spell ID first (A6.4), name prefix as
+            -- the fallback; shared matcher so the live path, the self-test and
+            -- the boon-tooltip parse can never drift apart.
+            local slot, byID = Tracker.MatchAura(aura.spellId or aura.spellID, aura.name)
+
+            -- A6.3: reject a NAME-matched Battle Shout that is short enough to be
+            -- the player's own 2-minute self-cast. An ID match (25101 = the NPC
+            -- cast) is authoritative and skips the filter.
+            if slot == SLOT_BS and not byID and rem <= BS_SELFCAST_MAX then
+                slot = nil
+            end
+
             if slot then
                 slots[slot] = {
-                    duration = auraRemaining(aura),
+                    duration = rem,
                     option   = 0,     -- per-aura option code (later waves)
                     source   = 0,     -- 0 = live/self (Store.AURA_SOURCE.LIVE)
                 }
@@ -583,10 +844,17 @@ local function captureAuras(rec)
         end
     end
 
+    -- A6.2: a scan that saw nothing at all, or one taken inside the loading-screen
+    -- grace, is partial evidence — never proof that the buffs are gone.
+    local partial = (sawAnyBuff == 0) or Tracker.InEnteringWorldGrace(ENTERING_WORLD_GRACE)
+    if partial then
+        preserveSlots(prev, elapsed, slots)
+    end
+
     -- Chronoboon fields (count sourced from the tooltip parse cache).
-    rec.chronoboonActive = chronoActive
     if chronoActive then
-        rec.chronoboonLastSeen = ns.Store.Now()
+        rec.chronoboonActive = true
+        rec.chronoboonLastSeen = now
         -- Fold the parsed booned buffs into the aura slots as source = BOON so
         -- the dashboard shows their frozen durations with "(Boon)" (item 37).
         -- Booned buffs are NOT live on the character, so only inject slots that
@@ -603,7 +871,14 @@ local function captureAuras(rec)
         else
             rec.boonCount = Tracker._boonTooltipCount or 0
         end
+    elseif partial then
+        -- A6.2: "no chronoboon aura found" from a partial scan is not an unboon.
+        -- Leave chronoboonActive / boonCount / the persisted boon cache alone.
+        if rec.chronoboonActive and Tracker._boonParsed and Tracker._boonParsed.dmf then
+            dmfInBoon = true
+        end
     else
+        rec.chronoboonActive = false
         rec.boonCount = 0
         -- Unboon: drop any boon-sourced state so stale frozen slots don't linger.
         if Tracker._boonParsed then
@@ -613,10 +888,15 @@ local function captureAuras(rec)
     end
 
     rec.auraStates = slots
+    Tracker._auraCapturedAt = now
 
     -- DMF lifecycle: holding a fortune (live OR stored-in-boon) means the daily
     -- has been taken, so the cooldown is active. offlineSince stays 0 while
     -- online; the store stamps it at logout and clears it after ~8h offline.
+    -- A partial scan must not clear the flag either.
+    if partial and not dmfInBoon then
+        dmfInBoon = rec.dmfInBoon and true or false
+    end
     rec.dmfInBoon = dmfInBoon
     if dmfInBoon then
         rec.dmfCooldownActive = true
@@ -624,6 +904,12 @@ local function captureAuras(rec)
         rec.dmfCooldown.offlineSince = 0
     end
 end
+
+-- Exposed for the self-test harness (pure-Lua fixtures drive these directly;
+-- Tracker.Capture itself needs the whole live client).
+Tracker._captureAuras     = captureAuras
+Tracker._captureLocation  = captureLocation
+Tracker._captureCooldowns = captureCooldowns
 
 -- Raid lockouts from the saved-instance list. Requires a prior
 -- RequestRaidInfo (fired on login and refreshed on UPDATE_INSTANCE_INFO).
@@ -706,6 +992,29 @@ function Tracker.OnLogin()
     -- Ask the server for our saved-instance (lockout) data.
     if RequestRaidInfo then RequestRaidInfo() end
 
+    -- Teardown / loading-screen latch (see IsTeardown above). Registered BEFORE
+    -- the generic capture events so the latch is already correct by the time the
+    -- PLAYER_ENTERING_WORLD capture is queued.
+    ns:RegisterEvent("PLAYER_ENTERING_WORLD", function()
+        -- Re-arm: this is the far side of a loading screen, so we are back in a
+        -- live world. Open the partial-scan grace windows.
+        Tracker._leavingWorld = false
+        Tracker._enteredWorldAt = (GetTime and GetTime()) or 0
+    end)
+
+    ns:RegisterEvent("PLAYER_LEAVING_WORLD", function()
+        Tracker._leavingWorld = true
+        -- Capture SYNCHRONOUSLY, not via RequestCapture: C_Timer.After(0) is not
+        -- guaranteed another frame during teardown, and the mesh's final state
+        -- push must carry the frozen (real) buffs rather than a cold-API scan.
+        ns:SafeCall(Tracker.Capture)
+    end)
+
+    ns:RegisterEvent("PLAYER_LOGOUT", function()
+        Tracker._loggingOut = true
+        ns:SafeCall(Tracker.Capture)
+    end)
+
     local capEvents = {
         "PLAYER_ENTERING_WORLD",
         "ZONE_CHANGED_NEW_AREA",
@@ -753,16 +1062,27 @@ function Tracker.DebugAuras()
         ns:Print("debug auras: C_UnitAuras.GetBuffDataByIndex unavailable")
         return
     end
-    ns:Print("player buffs — [index] raw :: bytes :: slot")
+    ns:Print(string.format("capture gate — teardown=%s leaving=%s logout=%s sinceEW=%.1fs",
+        tostring(Tracker.IsTeardown()), tostring(Tracker._leavingWorld),
+        tostring(Tracker._loggingOut), Tracker.SinceEnteringWorld()))
+    ns:Print("player buffs — [index] raw :: bytes :: id :: slot(via) :: remaining")
     local any = false
     for i = 1, 40 do
         local aura = C_UnitAuras.GetBuffDataByIndex("player", i)
         if not aura then break end
         any = true
         local raw = aura.name or "?"
-        local slot = Tracker.MatchBuffSlot(raw)
-        ns:Print(string.format("  [%d] %s :: %s :: %s",
-            i, raw, byteEscape(raw), slot and ("slot " .. slot) or "none"))
+        local id = aura.spellId or aura.spellID
+        local slot, byID = Tracker.MatchAura(id, raw)
+        local rem = auraRemaining(aura)
+        local via = slot and (byID and "id" or "name") or "-"
+        local note = ""
+        if slot == SLOT_BS and not byID and rem <= BS_SELFCAST_MAX then
+            note = "  <- REJECTED (self-cast Battle Shout <=240s)"
+        end
+        ns:Print(string.format("  [%d] %s :: %s :: %s :: %s(%s) :: %ds%s",
+            i, raw, byteEscape(raw), tostring(id),
+            slot and ("slot " .. slot) or "none", via, rem, note))
     end
     if not any then ns:Print("  (no player buffs)") end
 end
@@ -869,11 +1189,463 @@ local function testLiveAuraMatching(fails)
     ck(Tracker.MatchBuffSlot(nil) == nil, "nil -> nil")
 end
 
+-- A6.4 / A6.6: spell-ID-first matching, the alternate reissue IDs, and FFF by ID.
+local function testSpellIDMatching(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+
+    -- Every enumerated ID resolves to its slot.
+    for id, slot in pairs(BUFF_SPELL_IDS) do
+        ck(Tracker.MatchBuffSlotByID(id) == slot, "id " .. id .. " -> slot " .. slot)
+    end
+
+    -- The alternate (reissue) ID pairs from the spec land on the SAME slot.
+    ck(Tracker.MatchBuffSlotByID(22888) == Tracker.MatchBuffSlotByID(355363), "Ony 22888 == 355363")
+    ck(Tracker.MatchBuffSlotByID(24425) == Tracker.MatchBuffSlotByID(355365), "ZG 24425 == 355365")
+    ck(Tracker.MatchBuffSlotByID(16609) == Tracker.MatchBuffSlotByID(355366), "Rend 16609 == 355366")
+    ck(Tracker.MatchBuffSlotByID(29338) == Tracker.MatchBuffSlotByID(29846), "FFF 29338 == 29846")
+
+    -- A6.6: FFF resolves by ID (both) and by its real name, not the old placeholder.
+    ck(Tracker.MatchBuffSlotByID(29338) == 10, "FFF 29338 -> slot 10")
+    ck(Tracker.MatchBuffSlotByID(29846) == 10, "FFF 29846 -> slot 10")
+    ck(Tracker.MatchBuffSlot("Fire Festival Fury") == 10, "FFF by name -> slot 10")
+    ck(Tracker.MatchBuffSlot("Fervor of the First Feast") == nil,
+       "retired FFF placeholder prefix no longer matches")
+
+    -- Unknown / non-numeric IDs fall through cleanly.
+    ck(Tracker.MatchBuffSlotByID(1) == nil, "unknown id -> nil")
+    ck(Tracker.MatchBuffSlotByID(nil) == nil, "nil id -> nil")
+    ck(Tracker.MatchBuffSlotByID("22888") == nil, "string id -> nil (no coercion)")
+
+    -- A6.4: the ID matcher BEATS the name matcher. A localized / renamed aura
+    -- still lands by ID, and a conflicting name loses.
+    local slot, byID = Tracker.MatchAura(22888, "Sammelruf des Drachentoeters")
+    ck(slot == 1 and byID == true, "localized Ony name still lands slot 1 by ID")
+    slot, byID = Tracker.MatchAura(16609, "Battle Shout")
+    ck(slot == 2 and byID == true, "ID 16609 beats the name 'Battle Shout' -> slot 2")
+    -- Name fallback still works when the ID is unknown.
+    slot, byID = Tracker.MatchAura(999999, "Warchief's Blessing")
+    ck(slot == 2 and byID == false, "unknown id falls back to name -> slot 2")
+    slot, byID = Tracker.MatchAura(nil, "Songflower Serenade")
+    ck(slot == 4 and byID == false, "nil id falls back to name -> slot 4")
+    ck(Tracker.MatchAura(nil, "Some Random Buff") == nil, "no id, no name match -> nil")
+end
+
+-- Capture guards (A6.1, A6.2, A6.3, A17.2, A9.2). These drive the real capture
+-- pieces against stubbed WoW globals and restore every global afterwards, so the
+-- suite is self-contained under the headless harness.
+local function testCaptureGuards(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+
+    -- ---- stub scaffolding -------------------------------------------------
+    local saved = {
+        auras   = _G.C_UnitAuras,
+        cont    = _G.C_Container,
+        getTime = _G.GetTime,
+        sub     = _G.GetSubZoneText,
+        zone    = _G.GetRealZoneText,
+        mini    = _G.GetMinimapZoneText,
+        map     = _G.C_Map,
+        now     = ns.Store and ns.Store.Now,
+        settings = ns.Store and ns.Store.GetSettings,
+    }
+    local savedLatch = {
+        leaving = Tracker._leavingWorld,
+        logout  = Tracker._loggingOut,
+        entered = Tracker._enteredWorldAt,
+        auraAt  = Tracker._auraCapturedAt,
+        cdAt    = Tracker._cdCapturedAt,
+        parsed  = Tracker._boonParsed,
+    }
+
+    local FRAME = 10000          -- GetTime() base
+    local EPOCH = 1700000000     -- Store.Now() base
+    local frameNow, epochNow = FRAME, EPOCH
+
+    _G.GetTime = function() return frameNow end
+    ns.Store.Now = function() return epochNow end
+
+    local auraList = {}
+    _G.C_UnitAuras = { GetBuffDataByIndex = function(_, i) return auraList[i] end }
+
+    -- Build an aura fixture. `rem` seconds of remaining time.
+    local function A(name, id, rem)
+        return { name = name, spellId = id, expirationTime = frameNow + rem }
+    end
+    local function setAuras(...) auraList = { ... } end
+
+    local overrides = { { label = "Rend Staging (N)", zone = "Orgrimmar",
+                          minX = 0.4, maxX = 0.6, minY = 0.4, maxY = 0.6 } }
+    ns.Store.GetSettings = function() return { coordinateOverrides = overrides } end
+
+    local zoneText, subText, miniText = "Orgrimmar", "", ""
+    _G.GetRealZoneText    = function() return zoneText end
+    _G.GetSubZoneText     = function() return subText end
+    _G.GetMinimapZoneText = function() return miniText end
+    -- Map position: nil => ResolveCoordinateOverride bails (cold API).
+    local mapPos = nil
+    _G.C_Map = {
+        GetBestMapForUnit = function() return mapPos and 1454 or nil end,
+        GetPlayerMapPosition = function()
+            if not mapPos then return nil end
+            return { GetXY = function() return mapPos[1], mapPos[2] end }
+        end,
+    }
+
+    local cdStart, cdDuration = 0, 0
+    _G.C_Container = {
+        GetItemCooldown = function() return cdStart, cdDuration, 1 end,
+    }
+
+    -- Reset the latch to "settled, live world" before each case.
+    local function settle()
+        Tracker._leavingWorld = false
+        Tracker._loggingOut   = false
+        Tracker._enteredWorldAt = frameNow - 60   -- long past any grace
+        Tracker._auraCapturedAt = nil
+        Tracker._cdCapturedAt   = nil
+        Tracker._boonParsed     = nil
+    end
+
+    local function liveSlot(dur) return { duration = dur, option = 0, source = 0 } end
+
+    local ok, err = pcall(function()
+
+    -- ---- A6.1 capture during logout -> slots preserved --------------------
+    settle()
+    local rec = { auraStates = { [1] = liveSlot(3000), [4] = liveSlot(900) },
+                  chronoboonActive = true, boonCount = 3, dmfInBoon = true }
+    Tracker._auraCapturedAt = epochNow
+    setAuras()                                   -- teardown: API returns nothing
+    Tracker._loggingOut = true
+    Tracker._captureAuras(rec)
+    ck(rec.auraStates[1] and rec.auraStates[1].duration == 3000, "logout: slot 1 preserved (3000s)")
+    ck(rec.auraStates[4] and rec.auraStates[4].duration == 900,  "logout: slot 4 preserved (900s)")
+    ck(rec.chronoboonActive == true, "logout: chronoboonActive not cleared")
+    ck(rec.boonCount == 3, "logout: boonCount not cleared")
+    ck(rec.dmfInBoon == true, "logout: dmfInBoon not cleared")
+
+    -- Teardown must SKIP the scan outright, not merely distrust an empty one.
+    -- Here the API is still handing back one buff mid-unload: a full scan would
+    -- overwrite slot 4 with it, drop slot 1, and clear the boon state. It must not.
+    settle()
+    rec = { auraStates = { [1] = liveSlot(3000), [4] = liveSlot(900) },
+            chronoboonActive = true, boonCount = 2 }
+    Tracker._auraCapturedAt = epochNow
+    setAuras(A("Songflower Serenade", 15366, 111))
+    Tracker._loggingOut = true
+    Tracker._captureAuras(rec)
+    ck(rec.auraStates[1] and rec.auraStates[1].duration == 3000,
+       "teardown: scan skipped entirely, slot 1 survives a non-empty API")
+    ck(rec.auraStates[4] and rec.auraStates[4].duration == 900,
+       "teardown: slot 4 kept verbatim, NOT overwritten by the mid-unload read")
+    ck(rec.chronoboonActive == true and rec.boonCount == 2,
+       "teardown: boon state survives a non-empty mid-unload scan")
+
+    -- Same via PLAYER_LEAVING_WORLD (instance transition uses the same latch).
+    settle()
+    rec = { auraStates = { [2] = liveSlot(1800) } }
+    Tracker._auraCapturedAt = epochNow
+    Tracker._leavingWorld = true
+    Tracker._captureAuras(rec)
+    ck(rec.auraStates[2] and rec.auraStates[2].duration == 1800, "leaving-world: slot 2 preserved")
+
+    -- A6.1 synthetic duration: known live, no readable duration.
+    settle()
+    rec = { auraStates = { [SLOT_REND] = liveSlot(0), [1] = liveSlot(0) } }
+    Tracker._auraCapturedAt = epochNow
+    Tracker._loggingOut = true
+    Tracker._captureAuras(rec)
+    ck(rec.auraStates[SLOT_REND] and rec.auraStates[SLOT_REND].duration == 3600,
+       "logout synth: Rend with no duration -> 3600s")
+    ck(rec.auraStates[1] and rec.auraStates[1].duration == 7200,
+       "logout synth: non-Rend with no duration -> 7200s")
+
+    -- Preserved LIVE slots decay by in-session elapsed; BOON slots stay frozen.
+    settle()
+    rec = { auraStates = { [1] = liveSlot(3000),
+                           [3] = { duration = 5000, option = 0, source = BOON_SOURCE } } }
+    Tracker._auraCapturedAt = epochNow - 100
+    Tracker._loggingOut = true
+    Tracker._captureAuras(rec)
+    ck(rec.auraStates[1].duration == 2900, "preserve: live slot decays 100s -> 2900")
+    ck(rec.auraStates[3].duration == 5000, "preserve: booned slot frozen at 5000")
+
+    -- A fresh login (no in-session stamp) must FREEZE, never decay by the whole
+    -- offline duration -- otherwise the login capture wipes the record.
+    settle()
+    rec = { auraStates = { [1] = liveSlot(3000) } }
+    Tracker._auraCapturedAt = nil
+    Tracker._loggingOut = true
+    Tracker._captureAuras(rec)
+    ck(rec.auraStates[1].duration == 3000, "no in-session stamp -> freeze, no decay")
+
+    -- ---- A6.2 zero-buff scan -> previous kept -----------------------------
+    settle()
+    rec = { auraStates = { [1] = liveSlot(3000), [4] = liveSlot(900) },
+            chronoboonActive = true, boonCount = 2 }
+    Tracker._auraCapturedAt = epochNow
+    setAuras()                                   -- scan sees ZERO buffs
+    Tracker._captureAuras(rec)
+    ck(rec.auraStates[1] and rec.auraStates[1].duration == 3000, "zero-buff scan: slot 1 kept")
+    ck(rec.auraStates[4] and rec.auraStates[4].duration == 900,  "zero-buff scan: slot 4 kept")
+    ck(rec.chronoboonActive == true, "zero-buff scan: boon state not cleared")
+    ck(rec.boonCount == 2, "zero-buff scan: boonCount not cleared")
+
+    -- Inside the entering-world grace a PARTIAL scan merges: what it found wins,
+    -- what it missed is carried forward.
+    settle()
+    Tracker._enteredWorldAt = frameNow - 1        -- 1s after EW: inside the 2s grace
+    rec = { auraStates = { [1] = liveSlot(3000), [4] = liveSlot(900) } }
+    Tracker._auraCapturedAt = epochNow
+    setAuras(A("Rallying Cry of the Dragonslayer", 22888, 2400))
+    Tracker._captureAuras(rec)
+    ck(rec.auraStates[1] and rec.auraStates[1].duration == 2400, "EW grace: scanned slot 1 wins (2400)")
+    ck(rec.auraStates[4] and rec.auraStates[4].duration == 900,  "EW grace: unscanned slot 4 carried")
+
+    -- After the grace a full scan is authoritative: the missing buff really is gone.
+    settle()
+    Tracker._enteredWorldAt = frameNow - 5        -- outside the 2s grace
+    rec = { auraStates = { [1] = liveSlot(3000), [4] = liveSlot(900) } }
+    Tracker._auraCapturedAt = epochNow
+    setAuras(A("Rallying Cry of the Dragonslayer", 22888, 2400))
+    Tracker._captureAuras(rec)
+    ck(rec.auraStates[1] and rec.auraStates[1].duration == 2400, "post-grace: slot 1 fresh")
+    ck(rec.auraStates[4] == nil, "post-grace: full scan drops the buff that really expired")
+
+    -- ---- A6.3 Battle Shout self-cast filter -------------------------------
+    settle()
+    rec = { auraStates = {} }
+    setAuras(A("Battle Shout", 6673, 110), A("Songflower Serenade", 15366, 1200))
+    Tracker._captureAuras(rec)
+    ck(rec.auraStates[SLOT_BS] == nil, "BS by name, 110s (<=240) -> REJECTED")
+    ck(rec.auraStates[4] ~= nil, "BS rejection does not disturb other slots")
+
+    settle()
+    rec = { auraStates = {} }
+    setAuras(A("Battle Shout", 6673, 240))
+    Tracker._captureAuras(rec)
+    ck(rec.auraStates[SLOT_BS] == nil, "BS by name, exactly 240s -> REJECTED (<=)")
+
+    settle()
+    rec = { auraStates = {} }
+    setAuras(A("Battle Shout", 6673, 241))
+    Tracker._captureAuras(rec)
+    ck(rec.auraStates[SLOT_BS] and rec.auraStates[SLOT_BS].duration == 241,
+       "BS by name, 241s (>240) -> ACCEPTED")
+
+    settle()
+    rec = { auraStates = {} }
+    setAuras(A("Battle Shout", 25101, 110))
+    Tracker._captureAuras(rec)
+    ck(rec.auraStates[SLOT_BS] and rec.auraStates[SLOT_BS].duration == 110,
+       "BS by ID 25101, 110s -> ACCEPTED (ID match skips the filter)")
+
+    -- ---- A6.4 spell-ID match beats name in the LIVE scan ------------------
+    settle()
+    rec = { auraStates = {} }
+    -- Name says Battle Shout, ID says Warchief's Blessing: the ID must win.
+    setAuras(A("Battle Shout", 16609, 3600))
+    Tracker._captureAuras(rec)
+    ck(rec.auraStates[2] and rec.auraStates[2].duration == 3600, "live scan: ID 16609 -> slot 2")
+    ck(rec.auraStates[SLOT_BS] == nil, "live scan: name 'Battle Shout' loses to the ID")
+
+    -- Reissue IDs land live.
+    settle()
+    rec = { auraStates = {} }
+    setAuras(A("(unlocalized)", 355363, 3000), A("(unlocalized)", 355365, 2000),
+             A("(unlocalized)", 355366, 1000))
+    Tracker._captureAuras(rec)
+    ck(rec.auraStates[1] and rec.auraStates[1].duration == 3000, "live scan: Ony reissue 355363 -> slot 1")
+    ck(rec.auraStates[3] and rec.auraStates[3].duration == 2000, "live scan: ZG reissue 355365 -> slot 3")
+    ck(rec.auraStates[2] and rec.auraStates[2].duration == 1000, "live scan: Rend reissue 355366 -> slot 2")
+
+    -- ---- A6.6 FFF by ID in the live scan ----------------------------------
+    settle()
+    rec = { auraStates = {} }
+    setAuras(A("Fire Festival Fury", 29338, 600))
+    Tracker._captureAuras(rec)
+    ck(rec.auraStates[10] and rec.auraStates[10].duration == 600, "live scan: FFF 29338 -> slot 10")
+
+    settle()
+    rec = { auraStates = {} }
+    setAuras(A("(unlocalized)", 29846, 600))
+    Tracker._captureAuras(rec)
+    ck(rec.auraStates[10] and rec.auraStates[10].duration == 600, "live scan: FFF 29846 -> slot 10")
+
+    -- ---- A17.2 location freeze + override grace ---------------------------
+    settle()
+    rec = { location = "Orgrimmar" }
+    zoneText, subText, mapPos = "Wrong Zone During Teardown", "", nil
+    Tracker._loggingOut = true
+    Tracker._captureLocation(rec)
+    ck(rec.location == "Orgrimmar", "logout: location frozen at 'Orgrimmar'")
+
+    settle()
+    rec = { location = "Orgrimmar" }
+    Tracker._leavingWorld = true
+    Tracker._captureLocation(rec)
+    ck(rec.location == "Orgrimmar", "leaving-world: location frozen")
+
+    -- Inside the grace, an override label is NOT downgraded to a zone name even
+    -- though the cold map API makes ResolveCoordinateOverride return nil.
+    settle()
+    Tracker._enteredWorldAt = frameNow - 1
+    rec = { location = "Rend Staging (N)" }
+    zoneText, subText, mapPos = "Orgrimmar", "", nil
+    Tracker._captureLocation(rec)
+    ck(rec.location == "Rend Staging (N)", "EW grace: override label not downgraded")
+
+    -- After the grace, with the map still cold, the zone name legitimately wins.
+    settle()
+    Tracker._enteredWorldAt = frameNow - 5
+    rec = { location = "Rend Staging (N)" }
+    Tracker._captureLocation(rec)
+    ck(rec.location == "Orgrimmar", "post-grace: override downgrades to the zone name")
+
+    -- A warm map inside the box re-establishes the override immediately.
+    settle()
+    Tracker._enteredWorldAt = frameNow - 1
+    rec = { location = "Somewhere Else" }
+    mapPos = { 0.5, 0.5 }
+    Tracker._captureLocation(rec)
+    ck(rec.location == "Rend Staging (N)", "warm map inside the box -> override wins")
+
+    -- A non-override location is not protected by the grace.
+    settle()
+    Tracker._enteredWorldAt = frameNow - 1
+    rec = { location = "Stormwind City" }
+    mapPos, zoneText = nil, "Orgrimmar"
+    Tracker._captureLocation(rec)
+    ck(rec.location == "Orgrimmar", "EW grace: plain zone name is still updated")
+
+    -- Empty zone text never wipes a good location.
+    settle()
+    rec = { location = "Orgrimmar" }
+    zoneText, subText, miniText, mapPos = "", "", "", nil
+    Tracker._captureLocation(rec)
+    ck(rec.location == "Orgrimmar", "empty zone text does not wipe the location")
+    zoneText, subText, miniText = "Orgrimmar", "", ""
+
+    -- ---- A9.2 cooldown capture suppression --------------------------------
+    -- Garbage the cold API would hand us right after a loading screen.
+    cdStart, cdDuration = frameNow, 540000        -- 9000 minutes
+
+    settle()
+    Tracker._enteredWorldAt = frameNow - 1        -- inside the 3s window
+    rec = { hearthstoneCD = 1200, itemCooldown = 600 }
+    Tracker._cdCapturedAt = epochNow
+    Tracker._captureCooldowns(rec)
+    ck(rec.hearthstoneCD == 1200, "EW +1s: hearthstone CD preserved, garbage ignored")
+    ck(rec.itemCooldown == 600, "EW +1s: item CD preserved, garbage ignored")
+
+    settle()
+    Tracker._enteredWorldAt = frameNow - 2.9      -- still inside the 3s window
+    rec = { hearthstoneCD = 1200, itemCooldown = 0 }
+    Tracker._cdCapturedAt = epochNow
+    Tracker._captureCooldowns(rec)
+    ck(rec.hearthstoneCD == 1200, "EW +2.9s: still suppressed")
+
+    settle()
+    Tracker._loggingOut = true
+    rec = { hearthstoneCD = 1200, itemCooldown = 600 }
+    Tracker._cdCapturedAt = epochNow
+    Tracker._captureCooldowns(rec)
+    ck(rec.hearthstoneCD == 1200 and rec.itemCooldown == 600, "logout: cooldowns frozen")
+
+    -- Preserved cooldowns decay by in-session elapsed (lastDataUpdate re-stamps).
+    settle()
+    Tracker._loggingOut = true
+    rec = { hearthstoneCD = 1200, itemCooldown = 30 }
+    Tracker._cdCapturedAt = epochNow - 60
+    Tracker._captureCooldowns(rec)
+    ck(rec.hearthstoneCD == 1140, "preserved hearthstone CD decays 60s -> 1140")
+    ck(rec.itemCooldown == 0, "preserved item CD floors at 0, never negative")
+
+    -- Outside the window the API is trusted again.
+    settle()
+    Tracker._enteredWorldAt = frameNow - 3.1
+    cdStart, cdDuration = frameNow - 100, 3600
+    rec = { hearthstoneCD = 0, itemCooldown = 0 }
+    Tracker._captureCooldowns(rec)
+    ck(rec.hearthstoneCD == 3500, "EW +3.1s: API trusted again -> 3500s")
+    ck(Tracker._cdCapturedAt == epochNow, "a trusted read stamps _cdCapturedAt")
+
+    end)
+
+    -- ---- restore ----------------------------------------------------------
+    _G.C_UnitAuras        = saved.auras
+    _G.C_Container        = saved.cont
+    _G.GetTime            = saved.getTime
+    _G.GetSubZoneText     = saved.sub
+    _G.GetRealZoneText    = saved.zone
+    _G.GetMinimapZoneText = saved.mini
+    _G.C_Map              = saved.map
+    ns.Store.Now          = saved.now
+    ns.Store.GetSettings  = saved.settings
+    Tracker._leavingWorld   = savedLatch.leaving
+    Tracker._loggingOut     = savedLatch.logout
+    Tracker._enteredWorldAt = savedLatch.entered
+    Tracker._auraCapturedAt = savedLatch.auraAt
+    Tracker._cdCapturedAt   = savedLatch.cdAt
+    Tracker._boonParsed     = savedLatch.parsed
+
+    if not ok then fails[#fails + 1] = "error in capture-guard fixtures: " .. tostring(err) end
+end
+
+-- The teardown latch's re-arm contract (event ordering matters: LEAVING_WORLD
+-- also fires on ordinary instance transitions, so it must not be a one-way trip).
+local function testTeardownLatch(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+
+    local savedGetTime = _G.GetTime
+    local savedLatch = { Tracker._leavingWorld, Tracker._loggingOut, Tracker._enteredWorldAt }
+    local frameNow = 10000
+    _G.GetTime = function() return frameNow end
+
+    local ok, err = pcall(function()
+        Tracker._leavingWorld, Tracker._loggingOut, Tracker._enteredWorldAt = false, false, nil
+        ck(Tracker.IsTeardown() == false, "settled: not teardown")
+        ck(Tracker.SinceEnteringWorld() == math.huge, "before the first EW: no grace window open")
+        ck(Tracker.InEnteringWorldGrace(2) == false, "before the first EW: not in grace")
+
+        -- Zoning into an instance: LEAVING_WORLD latches...
+        Tracker._leavingWorld = true
+        ck(Tracker.IsTeardown() == true, "leaving world: teardown latched")
+
+        -- ...and ENTERING_WORLD on the far side of the loading screen RE-ARMS it.
+        Tracker._leavingWorld = false
+        Tracker._enteredWorldAt = frameNow
+        ck(Tracker.IsTeardown() == false, "entering world: latch re-armed")
+        ck(Tracker.InEnteringWorldGrace(2) == true, "entering world: 2s grace open")
+        ck(Tracker.InEnteringWorldGrace(3) == true, "entering world: 3s cooldown grace open")
+
+        frameNow = frameNow + 2.5
+        ck(Tracker.InEnteringWorldGrace(2) == false, "+2.5s: aura grace closed")
+        ck(Tracker.InEnteringWorldGrace(3) == true,  "+2.5s: cooldown grace still open")
+        frameNow = frameNow + 1
+        ck(Tracker.InEnteringWorldGrace(3) == false, "+3.5s: cooldown grace closed")
+
+        -- Logout is terminal: ENTERING_WORLD never follows, so it does not re-arm.
+        Tracker._loggingOut = true
+        ck(Tracker.IsTeardown() == true, "logout: teardown latched")
+        Tracker._leavingWorld = false
+        ck(Tracker.IsTeardown() == true, "logout latch is not cleared by the leaving-world re-arm")
+    end)
+
+    _G.GetTime = savedGetTime
+    Tracker._leavingWorld, Tracker._loggingOut, Tracker._enteredWorldAt =
+        savedLatch[1], savedLatch[2], savedLatch[3]
+    if not ok then fails[#fails + 1] = "error in latch fixtures: " .. tostring(err) end
+end
+
 function Tracker.RunSelfTests(verbose)
     local suites = {
         { name = "boon parsing", fn = testBoonParsing },
         { name = "boon block (owner 7-line fixture)", fn = testBoonBlock },
         { name = "live aura matching (apostrophe matrix)", fn = testLiveAuraMatching },
+        { name = "spell-ID matching (A6.4/A6.6)", fn = testSpellIDMatching },
+        { name = "teardown latch + grace windows", fn = testTeardownLatch },
+        { name = "capture guards (A6.1/A6.2/A6.3/A17.2/A9.2)", fn = testCaptureGuards },
     }
     local allPass = true
     for _, suite in ipairs(suites) do
