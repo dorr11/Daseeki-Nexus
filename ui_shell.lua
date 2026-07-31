@@ -1302,17 +1302,39 @@ local function buildHeader(w)
     wordmark:SetPoint("LEFT", logo, "RIGHT", 10, 0)
     wordmark:SetText(Dashboard.HexColor("accent") .. "NEXUS|r")
 
-    -- Close (far right).
-    local closeBtn = CreateFrame("Button", nil, header)
+    -- Close (far right). ROUND-19b (owner: "update the 'x' button to be the same style as
+    -- the others"): the TEXT "X" becomes a 22x22 white-mask icon button skinned exactly
+    -- like the gear beside it and the dock's Refresh/Broadcast pair — our own glyph
+    -- (textures/icon-close.tga), `muted` at rest, re-tinted on ThemeChanged.
+    -- ONE DELIBERATE DIVERGENCE: hover tints `danger`, not `accent`. Closing is the only
+    -- destructive affordance in the titlebar and the old text X already hovered red, so
+    -- that language is preserved rather than flattened into the shared accent hover.
+    -- No tooltip: ✕ is universal, and the gear beside it needs one only because a cog is
+    -- ambiguous. Escape-close (UISpecialFrames) is untouched.
+    local closeBtn = CreateFrame("Button", nil, header, "BackdropTemplate")
     closeBtn:SetSize(22, 22)
     closeBtn:SetPoint("RIGHT", header, "RIGHT", -8, 0)
-    local cx = closeBtn:CreateFontString(nil, "OVERLAY")
-    cx:SetFontObject(Dashboard.Font("body"))
-    cx:SetPoint("CENTER", closeBtn, "CENTER", 0, 0)
-    cx:SetText("X")
-    closeBtn:SetScript("OnEnter", function() cx:SetFontObject(Dashboard.Font("danger")) end)
-    closeBtn:SetScript("OnLeave", function() cx:SetFontObject(Dashboard.Font("body")) end)
+    local cIcon = closeBtn:CreateTexture(nil, "ARTWORK")
+    cIcon:SetPoint("TOPLEFT", closeBtn, "TOPLEFT", 2, -2)
+    cIcon:SetPoint("BOTTOMRIGHT", closeBtn, "BOTTOMRIGHT", -2, 2)
+    cIcon:SetTexture("Interface\\AddOns\\Daseeki-Nexus\\textures\\icon-close")
+    closeBtn.icon = cIcon
+    UI.Skin(closeBtn, function(self)
+        self:SetBackdrop(UI.FLAT_BACKDROP)
+        self:SetBackdropColor(UI.Color("inset"))
+        self:SetBackdropBorderColor(UI.Color("borderLite"))
+        self.icon:SetVertexColor(UI.Color(self._hot and "danger" or "muted"))
+    end)
+    closeBtn:SetScript("OnEnter", function(self)
+        self._hot = true
+        self.icon:SetVertexColor(UI.Color("danger"))
+    end)
+    closeBtn:SetScript("OnLeave", function(self)
+        self._hot = nil
+        self.icon:SetVertexColor(UI.Color("muted"))
+    end)
     closeBtn:SetScript("OnClick", function() w:Hide() end)
+    tag(closeBtn, "shell.close")
 
     -- Round-6 (item B): the faction toggle MOVED OFF the titlebar into the chip bar
     -- (it filters characters, so it lives with the filters — see ui_cards). The
