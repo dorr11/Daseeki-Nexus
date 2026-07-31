@@ -1248,9 +1248,15 @@ local function testAuraClassRules(fails)
     local a3, r3 = Dashboard.AuraRequirement(SP_SLOT, { classTag = "WARRIOR" }, FAC)
     ck(a3 == true and r3 == "required", "dmtSP Warrior (required) is applicable+required")
     o.required.WARRIOR = pReq; o.ignored.WARRIOR = pIgn   -- restore defaults
-    -- Regression guard: Rend stays class-ruled (empty default map => hidden).
-    local a4 = Dashboard.AuraRequirement(REND_SLOT, { classTag = "MAGE" }, FAC)
-    ck(a4 == false, "rend default (no class in map) stays hidden")
+    -- Rend stays class-ruled, and since B12 its class map SHIPS SEEDED
+    -- (store.lua Store.CLASS_RULE_SEEDS, spec §4.7): Warrior/Rogue required,
+    -- every other class optional. Mage is therefore applicable+optional.
+    -- (This assertion previously read `a4 == false` — that was the B12 defect
+    -- frozen into a guard: with an empty map every non-Warrior collapsed out.)
+    local a4, r4 = Dashboard.AuraRequirement(REND_SLOT, { classTag = "MAGE" }, FAC)
+    ck(a4 == true and r4 == "optional", "rend seeded default: Mage is applicable+optional")
+    local a4b, r4b = Dashboard.AuraRequirement(REND_SLOT, { classTag = "WARRIOR" }, FAC)
+    ck(a4b == true and r4b == "required", "rend seeded default: Warrior is applicable+required")
     -- Regression guard: a non-class-ruled buff (ZG, slot 3) stays required.
     local a5, r5 = Dashboard.AuraRequirement(3, { classTag = "ROGUE" }, FAC)
     ck(a5 == true and r5 == "required", "ZG stays required-by-default (not class-ruled)")

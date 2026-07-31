@@ -136,9 +136,15 @@ local function defaultFactionBlock()
         },
         -- autoInteract removed: the Interact Buttons feature was cut pre-release.
         auraOpts = {
-            -- per-aura normal/minimum duration thresholds (seconds)
+            -- per-aura normal/minimum duration thresholds (seconds).
+            -- Left EMPTY here on purpose: the nine per-aura, per-faction pairs
+            -- (spec §4.6) are installed once by Store.SeedAuraDefaults under the
+            -- `defaultsApplied` guard below, NOT by applyDefaults. If they lived
+            -- in this tree, applyDefaults would resurrect any row the owner
+            -- deliberately deleted on every single login.
             thresholds = {},                 -- ["auraKey"] = { normal=, minimum= }
-            -- per-class required/optional/ignored maps for Rend & Battle Shout
+            -- per-class required/optional/ignored maps for Rend & Battle Shout.
+            -- Also empty here and seeded once (spec §4.7) for the same reason.
             rend        = { required = {}, optional = {}, ignored = {} },
             battleShout = { required = {}, optional = {}, ignored = {} },
             -- Slip'kik's Savvy (DMT SP): physical damage users typically don't
@@ -154,6 +160,11 @@ local function defaultFactionBlock()
                              DRUID = true, PALADIN = true, SHAMAN = true },
                 ignored  = { WARRIOR = true, ROGUE = true, HUNTER = true },
             },
+            -- Sticky one-time seeding guard for thresholds + rend/battleShout
+            -- class maps (mirrors autoGroup.defaultsApplied above). Once true it
+            -- is never re-examined, so an owner who clears a threshold row or
+            -- demotes a class keeps that choice across every future login.
+            defaultsApplied = false,
         },
     }
 end
@@ -165,6 +176,159 @@ local function buildFactionSettings()
     -- so the default fresh-buff window is tightened for summon gating.
     horde.autoSummon.freshBuffWindow = 15
     return { Alliance = alliance, Horde = horde }
+end
+
+----------------------------------------------------------------------
+-- Aura threshold + class-requirement SEEDS (spec §4.6 / §4.7)
+--
+-- These are the "first run" values, deliberately kept OUT of the defaults
+-- tree (see defaultFactionBlock) so applyDefaults can never resurrect a row
+-- the owner removed. Store.SeedAuraDefaults installs them exactly once per
+-- faction, gated by factionSettings[F].auraOpts.defaultsApplied.
+--
+-- UNITS: the store keeps thresholds in SECONDS. The options Auras page
+-- displays and edits them in MINUTES (it divides by 60 on read and
+-- multiplies by 60 on write, options.lua buildAuras), and the spec quotes
+-- minutes — so every pair below is spec-minutes * 60.
+--
+-- Spec §4.6 (minutes, normal/minimum):
+--   Alliance: DMF 117/59 · Ony 89/59 · DMT AP 89/59 · DMT SP 89/59 ·
+--             DMT STAM 89/59 · SF 58/57 · ZG 89/59 · Rend 58/57 · BS 13/12
+--   Horde:    DMF 117/60 · Ony 95/90 · DMT AP 95/90 · DMT SP 95/90 ·
+--             DMT STAM 95/90 · SF 58/57 · ZG 95/90 · Rend 58/57 · BS 13/12
+-- (FFF has no thresholds, and neither do the two tail slots Silithyst /
+-- Boon of Blackfathom — they carry thresholdKey = nil in AURA_META.)
+--
+-- KEYS are the exact aura keys shared by options.lua AURA_DEFS,
+-- import.lua AURA_SLOT_KEY and ui_shell.lua AURA_META.thresholdKey:
+--   dmf, ony, dmtAP, dmtSP, dmtStam, songflower, zg, rend, battleShout
+----------------------------------------------------------------------
+
+local M = 60   -- spec quotes minutes; the store holds seconds
+
+Store.AURA_THRESHOLD_SEEDS = {
+    Alliance = {
+        dmf         = { normal = 117 * M, minimum = 59 * M },   -- 7020 / 3540
+        ony         = { normal =  89 * M, minimum = 59 * M },   -- 5340 / 3540
+        dmtAP       = { normal =  89 * M, minimum = 59 * M },   -- 5340 / 3540
+        dmtSP       = { normal =  89 * M, minimum = 59 * M },   -- 5340 / 3540
+        dmtStam     = { normal =  89 * M, minimum = 59 * M },   -- 5340 / 3540
+        songflower  = { normal =  58 * M, minimum = 57 * M },   -- 3480 / 3420
+        zg          = { normal =  89 * M, minimum = 59 * M },   -- 5340 / 3540
+        rend        = { normal =  58 * M, minimum = 57 * M },   -- 3480 / 3420
+        battleShout = { normal =  13 * M, minimum = 12 * M },   --  780 /  720
+    },
+    Horde = {
+        dmf         = { normal = 117 * M, minimum = 60 * M },   -- 7020 / 3600
+        ony         = { normal =  95 * M, minimum = 90 * M },   -- 5700 / 5400
+        dmtAP       = { normal =  95 * M, minimum = 90 * M },   -- 5700 / 5400
+        dmtSP       = { normal =  95 * M, minimum = 90 * M },   -- 5700 / 5400
+        dmtStam     = { normal =  95 * M, minimum = 90 * M },   -- 5700 / 5400
+        songflower  = { normal =  58 * M, minimum = 57 * M },   -- 3480 / 3420
+        zg          = { normal =  95 * M, minimum = 90 * M },   -- 5700 / 5400
+        rend        = { normal =  58 * M, minimum = 57 * M },   -- 3480 / 3420
+        battleShout = { normal =  13 * M, minimum = 12 * M },   --  780 /  720
+    },
+}
+
+-- Spec §4.7 per-class expectation seeds.
+--   Rend (Warchief's Blessing): Warrior + Rogue required, EVERY other class
+--     optional (warn-when-missing, never red).
+--   Battle Shout: Warrior + Rogue required, every other class ignored
+--     (hidden). The spec's reference table only lists War/Rogue/Hunter and
+--     treats any unlisted class as ignored; we write all nine explicitly so
+--     the shipped default is self-documenting in the Auras page. Absence and
+--     an explicit `ignored` entry are behaviourally identical -- see
+--     Dashboard.ClassRuleState, which falls through to "ignored".
+--   DMT SP (Slip'kik's Savvy) is NOT seeded here: the spec gives it no
+--     required/optional/ignored defaults, and our defaults tree already ships
+--     an owner-approved caster/physical split (see defaultFactionBlock).
+-- Both factions share these class rules (class expectations are not faction-
+-- dependent; the Horde/Alliance split only affects thresholds).
+
+local function classMapSeed(required, otherState)
+    local req, opt, ign = {}, {}, {}
+    local isReq = {}
+    for _, c in ipairs(required) do isReq[c] = true; req[c] = true end
+    for _, c in ipairs(Store.CLASS_ORDER) do
+        if not isReq[c] then
+            if otherState == "optional" then opt[c] = true else ign[c] = true end
+        end
+    end
+    return { required = req, optional = opt, ignored = ign }
+end
+
+Store.CLASS_RULE_SEEDS = {
+    rend        = classMapSeed({ "WARRIOR", "ROGUE" }, "optional"),
+    battleShout = classMapSeed({ "WARRIOR", "ROGUE" }, "ignored"),
+}
+
+-- True when a required/optional/ignored map carries no class at all.
+local function classMapEmpty(o)
+    if type(o) ~= "table" then return true end
+    for _, bucket in ipairs({ "required", "optional", "ignored" }) do
+        local t = o[bucket]
+        if type(t) == "table" and next(t) ~= nil then return false end
+    end
+    return true
+end
+
+local function copyPairs(src)
+    local out = {}
+    for k, v in pairs(src) do
+        if type(v) == "table" then
+            local inner = {}
+            for k2, v2 in pairs(v) do inner[k2] = v2 end
+            out[k] = inner
+        else
+            out[k] = v
+        end
+    end
+    return out
+end
+
+----------------------------------------------------------------------
+-- One-time seeding of aura thresholds + Rend/Battle Shout class rules.
+--
+-- ADDITIVE ONLY, and sticky. For each faction:
+--   * `auraOpts.defaultsApplied` already true -> do nothing at all. This is
+--     what keeps a deleted threshold row or a demoted class deleted.
+--   * thresholds table completely empty -> install all nine pairs.
+--     Non-empty (an older DB the owner already configured) -> left EXACTLY
+--     as-is; we never merge into a table the owner has touched.
+--   * rend / battleShout maps with no class in any of the three buckets ->
+--     install the seed. Any class already present -> left as-is.
+--   * Then stamp defaultsApplied = true so this never runs again.
+--
+-- Nothing is ever deleted or rewritten, so this satisfies the release-safety
+-- rule against destructive SavedVariables migrations. Safe to call repeatedly.
+----------------------------------------------------------------------
+
+function Store.SeedAuraDefaults(db)
+    if type(db) ~= "table" then return end
+    local fsAll = db.factionSettings
+    if type(fsAll) ~= "table" then return end
+
+    for faction, seeds in pairs(Store.AURA_THRESHOLD_SEEDS) do
+        local fs = fsAll[faction]
+        local ao = type(fs) == "table" and fs.auraOpts or nil
+        if type(ao) == "table" and not ao.defaultsApplied then
+            -- Thresholds: only when genuinely unseeded (empty table).
+            if type(ao.thresholds) ~= "table" then ao.thresholds = {} end
+            if next(ao.thresholds) == nil then
+                for key, pair in pairs(seeds) do
+                    ao.thresholds[key] = { normal = pair.normal, minimum = pair.minimum }
+                end
+            end
+            -- Class rules: only when no class is configured in any bucket.
+            for optKey, seed in pairs(Store.CLASS_RULE_SEEDS) do
+                if classMapEmpty(ao[optKey]) then
+                    ao[optKey] = copyPairs(seed)
+                end
+            end
+            ao.defaultsApplied = true
+        end
+    end
 end
 
 -- Default coordinate overrides (spec: up to 15; ships with the three
@@ -545,6 +709,12 @@ function Store.Init()
 
     applyDefaults(DaseekiNexusDB, defaultSettings())
     DaseekiNexusDB.settingsVersion = Store.SETTINGS_VERSION
+
+    -- One-time, additive install of the per-faction aura thresholds (spec §4.6)
+    -- and the Rend / Battle Shout class expectations (spec §4.7). Runs AFTER
+    -- applyDefaults so factionSettings/auraOpts is guaranteed to exist, and
+    -- self-disables via auraOpts.defaultsApplied (never re-seeds).
+    Store.SeedAuraDefaults(DaseekiNexusDB)
 
     -- Data SV
     if type(DaseekiNexusData) ~= "table" then
@@ -1331,6 +1501,175 @@ local function testAlertMigration(fails)
     ck(db.timerSettings.alerts.pullTimer.rend.chat == true, "migration idempotent")
 end
 
+-- B11 + B12: aura threshold + class-requirement seeding (spec §4.6 / §4.7).
+local function testAuraSeeds(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+
+    ------------------------------------------------------------------
+    -- 1. Fresh store: every seed lands, in SECONDS.
+    ------------------------------------------------------------------
+    local db = { factionSettings = buildFactionSettings() }
+    local A0 = db.factionSettings.Alliance.auraOpts
+    ck(next(A0.thresholds) == nil, "pre-seed: thresholds ship empty")
+    ck(A0.defaultsApplied == false, "pre-seed: defaultsApplied is false")
+
+    Store.SeedAuraDefaults(db)
+    local A = db.factionSettings.Alliance.auraOpts
+    local H = db.factionSettings.Horde.auraOpts
+
+    -- All nine keys present on both factions, none nil, both fields set.
+    local KEYS = { "dmf", "ony", "dmtAP", "dmtSP", "dmtStam",
+                   "songflower", "zg", "rend", "battleShout" }
+    local nA, nH = 0, 0
+    for _ in pairs(A.thresholds) do nA = nA + 1 end
+    for _ in pairs(H.thresholds) do nH = nH + 1 end
+    ck(nA == 9, "Alliance seeds exactly 9 thresholds (got " .. nA .. ")")
+    ck(nH == 9, "Horde seeds exactly 9 thresholds (got " .. nH .. ")")
+    for _, k in ipairs(KEYS) do
+        local a, h = A.thresholds[k], H.thresholds[k]
+        ck(type(a) == "table" and a.normal and a.minimum, "Alliance threshold " .. k .. " seeded")
+        ck(type(h) == "table" and h.normal and h.minimum, "Horde threshold " .. k .. " seeded")
+        if a then ck(a.normal >= a.minimum, "Alliance " .. k .. " normal >= minimum") end
+        if h then ck(h.normal >= h.minimum, "Horde " .. k .. " normal >= minimum") end
+    end
+
+    -- Spot-checks against spec §4.6 (minutes * 60).
+    ck(A.thresholds.dmf.normal == 7020, "spot: DMF Alliance normal = 117m (7020s)")
+    ck(A.thresholds.dmf.minimum == 3540, "spot: DMF Alliance minimum = 59m (3540s)")
+    ck(H.thresholds.ony.minimum == 5400, "spot: Ony Horde minimum = 90m (5400s)")
+    ck(H.thresholds.ony.normal == 5700, "spot: Ony Horde normal = 95m (5700s)")
+    ck(H.thresholds.dmf.minimum == 3600, "spot: DMF Horde minimum = 60m (3600s), not 59m")
+    ck(A.thresholds.songflower.normal == 3480 and A.thresholds.songflower.minimum == 3420,
+        "spot: Songflower 58/57 both factions (Alliance)")
+    ck(H.thresholds.songflower.normal == 3480 and H.thresholds.songflower.minimum == 3420,
+        "spot: Songflower 58/57 both factions (Horde)")
+    ck(A.thresholds.battleShout.normal == 780 and A.thresholds.battleShout.minimum == 720,
+        "spot: Battle Shout 13/12 (780/720s)")
+    ck(A.thresholds.rend.normal == 3480 and A.thresholds.rend.minimum == 3420,
+        "spot: Rend 58/57 (3480/3420s)")
+    ck(A.thresholds.zg.normal == 5340 and H.thresholds.zg.normal == 5700,
+        "spot: ZG differs by faction (89m vs 95m)")
+    -- Units sanity: a minutes-valued seed would be absurdly small.
+    ck(A.thresholds.dmf.normal > 600, "units: thresholds stored as seconds, not minutes")
+
+    -- Class rules (spec §4.7).
+    ck(A.rend.required.WARRIOR == true, "spot: rend WARRIOR required")
+    ck(A.rend.required.ROGUE == true, "rend ROGUE required")
+    ck(A.rend.optional.MAGE == true and A.rend.optional.PRIEST == true
+        and A.rend.optional.DRUID == true and A.rend.optional.PALADIN == true
+        and A.rend.optional.HUNTER == true and A.rend.optional.SHAMAN == true
+        and A.rend.optional.WARLOCK == true, "rend: all 7 non-required classes optional")
+    ck(next(A.rend.ignored) == nil, "rend: nothing ignored")
+    ck(A.battleShout.required.WARRIOR == true and A.battleShout.required.ROGUE == true,
+        "battleShout WARRIOR + ROGUE required")
+    ck(A.battleShout.ignored.MAGE == true, "spot: battleShout MAGE ignored")
+    ck(A.battleShout.ignored.HUNTER == true, "battleShout HUNTER ignored (spec §4.7)")
+    ck(next(A.battleShout.optional) == nil, "battleShout: nothing optional")
+    ck(A.rend.required.WARRIOR == H.rend.required.WARRIOR
+        and A.battleShout.ignored.MAGE == H.battleShout.ignored.MAGE,
+        "class rules identical on both factions")
+    -- Seeds must be per-faction copies, never shared references.
+    ck(A.thresholds.ony ~= H.thresholds.ony, "faction threshold tables are distinct objects")
+    ck(A.rend ~= H.rend, "faction class maps are distinct objects")
+    ck(A.rend ~= Store.CLASS_RULE_SEEDS.rend, "seeded map is a copy, not the shared seed")
+    -- dmtSP is NOT part of the seed pass (its defaults ship in the tree).
+    ck(A.dmtSP.ignored.WARRIOR == true and A.dmtSP.optional.MAGE == true,
+        "dmtSP defaults untouched by the seed pass")
+
+    ck(A.defaultsApplied == true and H.defaultsApplied == true,
+        "defaultsApplied stamped on both factions")
+
+    ------------------------------------------------------------------
+    -- 2. Sticky flag: a deleted row is NOT resurrected by a re-seed.
+    ------------------------------------------------------------------
+    A.thresholds.zg = nil
+    A.rend.required.WARRIOR = nil
+    Store.SeedAuraDefaults(db)
+    ck(A.thresholds.zg == nil, "sticky: deleted threshold row stays deleted")
+    ck(A.rend.required.WARRIOR == nil, "sticky: demoted class stays demoted")
+    -- ...and an owner edit survives.
+    A.thresholds.dmf.normal = 42 * 60
+    Store.SeedAuraDefaults(db)
+    ck(A.thresholds.dmf.normal == 2520, "sticky: owner-edited threshold survives re-seed")
+
+    ------------------------------------------------------------------
+    -- 3. Pre-populated DB with the flag already set -> seeding skipped.
+    ------------------------------------------------------------------
+    local db2 = { factionSettings = buildFactionSettings() }
+    local A2 = db2.factionSettings.Alliance.auraOpts
+    A2.thresholds = { ony = { normal = 111, minimum = 22 } }
+    A2.rend.required.MAGE = true
+    A2.defaultsApplied = true
+    Store.SeedAuraDefaults(db2)
+    ck(A2.thresholds.ony.normal == 111, "flag set: existing threshold untouched")
+    ck(A2.thresholds.dmf == nil, "flag set: no new threshold rows added")
+    ck(A2.rend.required.MAGE == true and A2.rend.required.WARRIOR == nil,
+        "flag set: class map untouched")
+
+    ------------------------------------------------------------------
+    -- 4. Legacy DB (no flag) that the owner already configured -> left alone,
+    --    but stamped so it is never touched again.
+    ------------------------------------------------------------------
+    local db3 = { factionSettings = buildFactionSettings() }
+    local A3 = db3.factionSettings.Alliance.auraOpts
+    A3.thresholds = { songflower = { normal = 900, minimum = 300 } }
+    A3.rend.optional.WARRIOR = true
+    Store.SeedAuraDefaults(db3)
+    ck(A3.thresholds.songflower.normal == 900, "legacy edited: threshold preserved")
+    ck(A3.thresholds.dmf == nil, "legacy edited: non-empty table not merged into")
+    ck(A3.rend.optional.WARRIOR == true and A3.rend.required.WARRIOR == nil,
+        "legacy edited: configured class map preserved")
+    ck(A3.defaultsApplied == true, "legacy edited: flag stamped so it never re-runs")
+    -- Its Horde side was genuinely empty, so it DID get seeded (per-faction gate).
+    ck(db3.factionSettings.Horde.auraOpts.thresholds.ony.normal == 5700,
+        "per-faction gate: untouched Horde side still seeds")
+    -- battleShout on A3 was empty in all three buckets -> seeded independently.
+    ck(A3.battleShout.required.WARRIOR == true,
+        "independent gate: empty battleShout map seeds even when rend was edited")
+
+    ------------------------------------------------------------------
+    -- 5. Robustness: no factionSettings / bad input must not throw.
+    ------------------------------------------------------------------
+    Store.SeedAuraDefaults(nil)
+    Store.SeedAuraDefaults({})
+    Store.SeedAuraDefaults({ factionSettings = "nope" })
+    Store.SeedAuraDefaults({ factionSettings = { Alliance = {} } })
+
+    ------------------------------------------------------------------
+    -- 6. UI read path: Dashboard.GetThreshold must return the seeded values
+    --    instead of the generic 20m/5m fallback.
+    ------------------------------------------------------------------
+    local D = ns and ns.Dashboard
+    if D and D.GetThreshold then
+        local savedDB = Store.db
+        local liveDB = { factionSettings = buildFactionSettings() }
+        Store.SeedAuraDefaults(liveDB)
+        Store.db = liveDB
+        local sf = D.GetThreshold("Alliance", "songflower")
+        ck(sf and sf.normal == 3480 and sf.minimum == 3420,
+            "GetThreshold(Alliance, songflower) -> seeded 58/57, not the 20m/5m fallback")
+        local onyH = D.GetThreshold("Horde", "ony")
+        ck(onyH and onyH.minimum == 5400, "GetThreshold(Horde, ony) -> seeded 90m minimum")
+        local dmfA = D.GetThreshold("Alliance", "dmf")
+        ck(dmfA and dmfA.normal == 7020, "GetThreshold(Alliance, dmf) -> seeded 117m normal")
+        -- Keys with no threshold still fall back to the generic default.
+        local none = D.GetThreshold("Alliance", nil)
+        ck(none and none.normal == 1200, "nil thresholdKey still falls back to 20m/5m")
+        -- Class-rule read path (the red-missing attention model).
+        if D.ClassRuleState then
+            ck(D.ClassRuleState("rend", "WARRIOR", "Alliance") == "required",
+                "ClassRuleState rend/WARRIOR -> required")
+            ck(D.ClassRuleState("rend", "MAGE", "Alliance") == "optional",
+                "ClassRuleState rend/MAGE -> optional")
+            ck(D.ClassRuleState("battleShout", "MAGE", "Alliance") == "ignored",
+                "ClassRuleState battleShout/MAGE -> ignored")
+            ck(D.ClassRuleState("battleShout", "ROGUE", "Horde") == "required",
+                "ClassRuleState battleShout/ROGUE (Horde) -> required")
+        end
+        Store.db = savedDB
+    end
+end
+
 local function testSongflowerMigration(fails)
     local function ck(c, m) if not c then fails[#fails + 1] = m end end
     -- Stored old defaults are rewritten to the accurate values.
@@ -1438,6 +1777,7 @@ function Store.RunSelfTests(verbose)
     local suites = {
         { name = "defaults",        fn = testDefaults },
         { name = "alert migration", fn = testAlertMigration },
+        { name = "aura seeds",      fn = testAuraSeeds },
         { name = "songflower migration", fn = testSongflowerMigration },
         { name = "notes",           fn = testNotes },
         { name = "inbound name guard", fn = testInboundNameGuard },
