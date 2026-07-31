@@ -137,10 +137,11 @@ end
 --
 -- /nexus (short /dnx) is the primary slash; /dsn and /daseekinetwork stay
 -- registered as compatibility aliases (owner muscle memory). All four share
--- one dispatcher. Subcommands mirror the
--- functional spec's surface (toggle / x / invite / coord / resetui /
--- help) as stubs this wave, plus `debug selftest` which runs the
--- protocol scaffolding's pure-Lua self-tests.
+-- one dispatcher. core.lua owns the dispatcher plus the subcommands that need
+-- no feature module (help / settings / account / w / debug); every other
+-- subcommand is registered by its owning module via ns:RegisterSubcommand as
+-- that module loads (see the .toc order — core.lua is first, so every later
+-- file can register unconditionally).
 ----------------------------------------------------------------------
 
 local subcommands = {}   -- name -> { fn, help }
@@ -189,33 +190,28 @@ end
 
 ns._debugCommands = debugCommands
 
+-- Short, chat-appropriate command list. The Help page in the settings hub
+-- (options.lua) is the complete reference; this stays skimmable in one screen,
+-- so the debug family is summarized on one line rather than enumerated.
 local function printHelp()
     ns:Print("commands (primary /nexus; short /dnx; aliases /dsn, /daseekinetwork):")
-    ns:Print("  /nexus toggle           - show/hide the dashboard (wave N3)")
-    ns:Print("  /nexus x                - cancel-buffs popup (wave N3)")
-    ns:Print("  /nexus invite            - mass alt-invite (wave N4)")
-    ns:Print("  /nexus resetui           - reset dashboard layout (wave N3)")
-    ns:Print("  /nexus account <id>      - show/set this account's mesh ID")
+    ns:Print("  /nexus toggle           - show/hide the dashboard")
+    ns:Print("  /nexus x                - cancel-buffs popup (alias: cancelbuffs)")
+    ns:Print("  /nexus invite           - invite all online mesh characters")
+    ns:Print("  /nexus mover            - show the mover for the pull-timer bars")
+    ns:Print("  /nexus resetui          - reset dashboard layout (alias: reset)")
+    ns:Print("  /nexus account <id>     - show/set this account's mesh ID")
     ns:Print("  /nexus w <Char[-Server]> <msg> - whisper (server optional -> own realm)")
-    ns:Print("  /nexus settings          - open the Daseeki hub to Nexus settings")
-    ns:Print("  /nexus debug selftest    - run protocol self-tests")
-    ns:Print("  /nexus help              - this list")
+    ns:Print("  /nexus syncsettings     - push your settings to the mesh")
+    ns:Print("  /nexus import [dry]     - import ShadowNetwork settings & data")
+    ns:Print("  /nexus import instances [dry] - import NovaInstanceTracker runs")
+    ns:Print("  /nexus settings         - open the Daseeki hub to Nexus settings")
+    ns:Print("  /nexus debug <sub>      - diagnostics (selftest, timers, mesh, auras, layout, ...)")
+    ns:Print("  /nexus help             - this list")
+    ns:Print("full list: /nexus settings -> Help.")
 end
 
--- Built-in subcommands. Feature stubs announce their target wave so an
--- in-game tester knows they are intentionally inert, not broken.
-local function stub(wave)
-    return function()
-        ns:Print("that feature arrives in wave " .. wave .. ".")
-    end
-end
-
-ns:RegisterSubcommand("help",    printHelp, "show command list")
-ns:RegisterSubcommand("toggle",  stub("N3"), "dashboard toggle")
-ns:RegisterSubcommand("x",       stub("N3"), "cancel-buffs popup")
-ns:RegisterSubcommand("invite",  stub("N4"), "mass invite")
-ns:RegisterSubcommand("resetui", stub("N3"), "reset dashboard layout")
-ns:RegisterSubcommand("reset",   stub("N3"), "reset dashboard layout")
+ns:RegisterSubcommand("help", printHelp, "show command list")
 
 -- Open the Daseeki hub to the Nexus settings section (options.lua owns the
 -- pages; this is just the slash entry point). Guards on the hub being present.
