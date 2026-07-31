@@ -166,7 +166,6 @@ ns:RegisterSelfTest("hudgroups", function(verbose)
     check(HUD.DedupWindow("battleShout", "pullTimer") == 0, "Battle Shout exempt (pullTimer)")
     check(HUD.DedupWindow("battleShout", "cdWarning") == 0, "Battle Shout exempt (cdWarning)")
 
->>>>>>> fix/mesh-presence
     if verbose then ns:Print("  hudgroups selftest " .. (pass and "PASS" or "FAIL")) end
     return pass
 end)
