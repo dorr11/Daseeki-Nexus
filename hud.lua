@@ -787,7 +787,7 @@ local function trustNotice(buffKey, trust, confirmed)
     local t = frameClock()
     local dkey = buffKey .. ":" .. tostring(trust) .. ":" .. tostring(confirmed == true)
     local prev = lastTrustNoticeAt[dkey]
-    if prev and (t - prev) < DEDUP_WINDOW then return end
+    if prev and (t - prev) < HUD.DedupWindow(buffKey, "pullTimer") then return end
     lastTrustNoticeAt[dkey] = t
     local label = buffLabel(buffKey)
     if trust == "dbm" and not confirmed then
