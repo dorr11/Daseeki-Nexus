@@ -838,22 +838,59 @@ function Store.MigrateSettings(db)
 end
 
 ----------------------------------------------------------------------
--- Songflower display-duration default correction (owner-confirmed).
+-- Songflower display-duration correction (owner-confirmed).
 --
 -- An earlier build shipped flowerMinusDuration=120 / flowerUpDuration=5, but
 -- songflower respawn is 25 minutes; those defaults decayed a live node to
--- "No data" ~125s after a pick. The accurate values are 1500s (25m, matching
--- Timers.NODE_RESPAWN) and 0 (indefinite UP? window, matching NodeState). Only
--- values that STILL equal the old defaults are rewritten — a user-customized
--- number is preserved. Idempotent by nature (1500 ~= 120, 0 ~= 5).
+-- "No data" ~125s after a pick. The first version of this migration therefore
+-- rewrote exactly the literal pair 120/5 and left anything else alone.
+--
+-- ROUND-17 (songflower accuracy audit, fix 1) — that was not enough. The 120
+-- did not only arrive as a shipped default: import.lua copied the imported
+-- `flowerMinusTimerDuration` into this key on every SN import, and SN's value is
+-- whatever the user set over there. So a poisoned save could hold 90, or 300, or
+-- any other sub-respawn number, and the old equality test walked straight past
+-- it while GetNodeState used it as the RESPAWN LENGTH — every flower counting a
+-- couple of minutes and then reporting itself available. That is the owner's
+-- "timers don't seem accurate".
+--
+-- Two things fix it together: the engine no longer lets ANY setting shorten the
+-- respawn (timers.lua GetNodeState now always passes NODE_RESPAWN), and this
+-- migration heals the stored values so nothing reads a respawn-shaped number
+-- that lies. ANY flowerMinusDuration below the true 1500s respawn is rewritten,
+-- not just the literal 120.
+--
+-- A value at or above 1500 is left untouched: it cannot under-report a respawn,
+-- so it is either our own old default or a deliberate choice, and we do not
+-- overwrite user intent. Idempotent (1500 is not < 1500).
+--
+-- FOLLOW-UP FOR THE OPTIONS OWNER (options.lua is not this branch's file):
+-- the slider labelled "Minus-timer duration" (options.lua ~2178) still writes
+-- flowerMinusDuration, and that key no longer affects anything — the respawn is
+-- now a constant. The post-respawn "expired" window is the setting that
+-- replaces it, stored as `flowerExpiredWindow` (seconds, default 300, clamped
+-- 0-900 by Timers.ExpiredWindow). Repoint that slider at flowerExpiredWindow
+-- and relabel it "Expired window"; until then it is an inert control.
 ----------------------------------------------------------------------
+
+Store.SONGFLOWER_RESPAWN        = 1500   -- game constant; mirrors Timers.NODE_RESPAWN
+Store.SONGFLOWER_EXPIRED_WINDOW = 300    -- default post-respawn display band
 
 function Store.MigrateSongflowerDefaults(db)
     if type(db) ~= "table" then return end
     local fw = db.timerSettings and db.timerSettings.felwood
     if type(fw) ~= "table" then return end
-    if fw.flowerMinusDuration == 120 then fw.flowerMinusDuration = 1500 end
-    if fw.flowerUpDuration    == 5   then fw.flowerUpDuration    = 0    end
+    -- Heal ANY sub-respawn value (covers the SN-imported poison, not just 120).
+    local minus = tonumber(fw.flowerMinusDuration)
+    if minus and minus < Store.SONGFLOWER_RESPAWN then
+        fw.flowerMinusDuration = Store.SONGFLOWER_RESPAWN
+    end
+    if fw.flowerUpDuration == 5 then fw.flowerUpDuration = 0 end
+    -- Seed the replacement setting once, so the value exists before the options
+    -- slider is repointed at it. Never overwrites an existing choice.
+    if fw.flowerExpiredWindow == nil then
+        fw.flowerExpiredWindow = Store.SONGFLOWER_EXPIRED_WINDOW
+    end
 end
 
 ----------------------------------------------------------------------
@@ -2909,12 +2946,37 @@ local function testSongflowerMigration(fails)
     -- Idempotent by nature: re-running leaves the corrected values alone.
     Store.MigrateSongflowerDefaults(db)
     ck(db.timerSettings.felwood.flowerMinusDuration == 1500, "songflower migration idempotent")
-    -- User-customized values are preserved.
+    ck(db.timerSettings.felwood.flowerExpiredWindow == 300, "expired window seeded to 300")
+
+    -- ROUND-17: ANY sub-respawn value is poison, not just the literal 120. An SN
+    -- import wrote SN's own minus-timer here, so 90 / 300 / 900 were all
+    -- reachable and all made a 25-minute flower report itself available early.
+    -- The old migration only matched 120 and walked past every one of them.
+    for _, poisoned in ipairs({ 5, 90, 120, 300, 900, 1499 }) do
+        local p = { timerSettings = { felwood = { flowerMinusDuration = poisoned } } }
+        Store.MigrateSongflowerDefaults(p)
+        ck(p.timerSettings.felwood.flowerMinusDuration == 1500,
+           "poisoned minus " .. poisoned .. " -> 1500")
+    end
+
+    -- At or above the true respawn the value cannot under-report, so it is left
+    -- alone: either our own old default or a deliberate choice.
     local custom = { timerSettings = { felwood = {
-        flowerMinusDuration = 900, flowerUpDuration = 3 } } }
+        flowerMinusDuration = 1800, flowerUpDuration = 3 } } }
     Store.MigrateSongflowerDefaults(custom)
-    ck(custom.timerSettings.felwood.flowerMinusDuration == 900, "custom minus 900 untouched")
+    ck(custom.timerSettings.felwood.flowerMinusDuration == 1800, "custom minus 1800 untouched")
     ck(custom.timerSettings.felwood.flowerUpDuration == 3, "custom UP? 3 untouched")
+
+    -- An existing expired-window choice is never overwritten.
+    local win = { timerSettings = { felwood = { flowerExpiredWindow = 60 } } }
+    Store.MigrateSongflowerDefaults(win)
+    ck(win.timerSettings.felwood.flowerExpiredWindow == 60, "existing expired window preserved")
+
+    -- Non-numeric junk must not error or be treated as a number.
+    local junk = { timerSettings = { felwood = { flowerMinusDuration = "soon" } } }
+    Store.MigrateSongflowerDefaults(junk)
+    ck(junk.timerSettings.felwood.flowerExpiredWindow == 300, "junk minus still seeds the window")
+
     -- Missing felwood block is a safe no-op.
     Store.MigrateSongflowerDefaults({})
     Store.MigrateSongflowerDefaults(nil)

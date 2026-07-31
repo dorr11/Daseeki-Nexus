@@ -1120,6 +1120,32 @@ local NWB_MIN_VERSION = 2.75
 local NODE_RESPAWN = 1500
 Timers.NODE_RESPAWN = NODE_RESPAWN
 
+-- Post-respawn grace band (seconds) in which a node is still displayed, with a
+-- NEGATIVE countdown ("-M:SS"), before it goes "stale". The reference's
+-- "show expired timers" setting is 5 minutes by default (NWB_BEHAVIOR_SPEC
+-- §6.4, state 3: "the window is 0 to -300 s"), so 300 is our default too.
+local FLOWER_EXPIRED_WINDOW = 300
+Timers.FLOWER_EXPIRED_WINDOW = FLOWER_EXPIRED_WINDOW
+
+-- Minimum "newer-ness" a NETWORK node epoch must have over the stored one
+-- before it may overwrite. NWB_BEHAVIOR_SPEC §5.7 rejects an incoming timestamp
+-- within +/-10 s of the same key on any layer (the cross-layer duplicate guard,
+-- +/-30 s for non-flower keys), and separately refuses an incoming timer that is
+-- "less than 25 s newer (10 s for songflowers)". Both land on 10 s for nodes,
+-- which is what this constant enforces on every inbound path.
+local NODE_NET_MIN_NEWER = 10
+Timers.NODE_NET_MIN_NEWER = NODE_NET_MIN_NEWER
+
+-- Standard opts for any node write that did NOT come from our own eyes.
+-- `localHoldGuard` = a locally-observed pick owns its node for the FULL respawn:
+-- we stood there, we saw the cast/loot/aura, and no second-hand report inside
+-- those 25 minutes can be more accurate than that. `minNewer` is the +/-10 s
+-- duplicate guard above.
+local function netNodeOpts()
+    return { localHoldGuard = NODE_RESPAWN, minNewer = NODE_NET_MIN_NEWER }
+end
+Timers._netNodeOpts = netNodeOpts
+
 Timers._nwb = { serializer = nil, libSerialize = nil, deflate = nil, comm = nil, obj = nil, ready = false }
 
 -- NWB diagnostics (item 40): every stage counted so `/nexus debug nwb` can
@@ -1384,7 +1410,7 @@ end
 -- so there is no zan field to read. `applied` accumulates counts.
 --
 -- Returns false when the whole table was discarded by drop validation.
-local function readNWBTimerFields(tbl, applied, t)
+local function readNWBTimerFields(tbl, applied, t, skipNodes)
     if type(tbl) ~= "table" then return false end
     t = t or now()
 
@@ -1413,17 +1439,35 @@ local function readNWBTimerFields(tbl, applied, t)
         applied.nefRejected = (applied.nefRejected or 0) + 1
     end
 
-    for i = 1, 10 do
-        local e = nwbEpoch(tbl["f" .. i], "node", t) or nwbEpoch(tbl["flower" .. i], "node", t)
-        if e then Timers.MarkNode("flower", i, e, "nwb"); applied.flower = (applied.flower or 0) + 1 end
-    end
-    -- Tubers are read for completeness, but note the sharing rule: the reference
-    -- keeps tubers and dragons as PERSONAL timers on layered realms and never
-    -- puts them on the wire there. On Whitemane `t1`..`t6` will never arrive, so
-    -- the loot detector below is the only way a tuber timer can ever exist.
-    for i = 1, 6 do
-        local e = nwbEpoch(tbl["t" .. i], "node", t) or nwbEpoch(tbl["tuber" .. i], "node", t)
-        if e then Timers.MarkNode("tuber", i, e, "nwb"); applied.tuber = (applied.tuber or 0) + 1 end
+    -- ROUND-17 audit fix 3: node keys are read from the TOP-LEVEL payload only.
+    -- `skipNodes` is set for every per-layer sub-table (see IngestNWBTimers).
+    if not skipNodes then
+        -- Every inbound node write carries the standard network guards (fix 2):
+        -- a local pick owns its node for the full respawn, and an epoch within
+        -- 10s of the stored one is a cross-source duplicate.
+        for i = 1, 10 do
+            local e = nwbEpoch(tbl["f" .. i], "node", t) or nwbEpoch(tbl["flower" .. i], "node", t)
+            if e and Timers.MarkNode("flower", i, e, "nwb", netNodeOpts()) then
+                applied.flower = (applied.flower or 0) + 1
+            end
+        end
+        -- Tubers and dragons are read for completeness, but note the sharing
+        -- rule: the reference keeps them as PERSONAL timers on layered realms
+        -- and never puts them on the wire there. On Whitemane `t1`..`t6` and
+        -- `d1`..`d4` will never arrive, so the loot detector below is the only
+        -- way a tuber or dragon timer can ever exist there.
+        for i = 1, 6 do
+            local e = nwbEpoch(tbl["t" .. i], "node", t) or nwbEpoch(tbl["tuber" .. i], "node", t)
+            if e and Timers.MarkNode("tuber", i, e, "nwb", netNodeOpts()) then
+                applied.tuber = (applied.tuber or 0) + 1
+            end
+        end
+        for i = 1, 4 do
+            local e = nwbEpoch(tbl["d" .. i], "node", t) or nwbEpoch(tbl["dragon" .. i], "node", t)
+            if e and Timers.MarkNode("dragon", i, e, "nwb", netNodeOpts()) then
+                applied.dragon = (applied.dragon or 0) + 1
+            end
+        end
     end
 
     Timers.IngestNWBTimerLog(tbl, applied, t)
@@ -1438,10 +1482,21 @@ Timers._readNWBTimerFields = readNWBTimerFields
 -- as a fallback for a payload that lacks it, with the timer-log array excluded
 -- so its entries can no longer be mistaken for layers.
 --
--- We flatten layers deliberately: the reference flags world buffs as shared
--- across ALL layers globally and disables per-layer chat labelling, so a buff
--- genuinely drops on every layer at once. We hold no layer model and must not
--- present per-layer precision we cannot deliver.
+-- We flatten layers deliberately FOR WORLD BUFFS: the reference flags world
+-- buffs as shared across ALL layers globally and disables per-layer chat
+-- labelling, so a buff genuinely drops on every layer at once. We hold no layer
+-- model and must not present per-layer precision we cannot deliver.
+--
+-- ROUND-17 audit fix 3 — NODE keys are the opposite case and are no longer
+-- flattened. Songflowers are NOT shared across layers: each layer has its own
+-- ten nodes, picked at its own times. Folding every layer's f1..f10 into one set
+-- meant the newest pick of node 3 on ANY layer became "the" node-3 timer, which
+-- on a layered realm (Whitemane is layered) is wrong roughly as often as there
+-- are layers. Full per-layer tracking is out of scope for this release, so we
+-- take the cheap and honest option: read node keys from the TOP-LEVEL payload
+-- only and ignore the per-layer copies entirely. One layer's truth beats a
+-- blend of all of them. The +/-10s duplicate guard in MarkNode then catches the
+-- same pick arriving again from a second source.
 function Timers.IngestNWBTimers(payload)
     if type(payload) ~= "table" then return end
     local applied = {}
@@ -1450,7 +1505,7 @@ function Timers.IngestNWBTimers(payload)
 
     local layers = payload.layers
     if type(layers) == "table" then
-        for _, layer in pairs(layers) do readNWBTimerFields(layer, applied, t) end
+        for _, layer in pairs(layers) do readNWBTimerFields(layer, applied, t, true) end
     else
         for key, v in pairs(payload) do
             if key ~= NWB_LOG_KEY and type(v) == "table" then
@@ -1459,7 +1514,7 @@ function Timers.IngestNWBTimers(payload)
                     if type(lv) == "table" then looksLayerMap = true break end
                 end
                 if looksLayerMap then
-                    for _, layer in pairs(v) do readNWBTimerFields(layer, applied, t) end
+                    for _, layer in pairs(v) do readNWBTimerFields(layer, applied, t, true) end
                 end
             end
         end
@@ -1518,7 +1573,8 @@ function Timers.OnNWBMessage(prefix, message, channel, sender)
                 -- merged. `applied` now also carries REJECTION counters, so a
                 -- non-empty table no longer implies we took anything from it.
                 if applied and (applied.rend or applied.ony or (applied.flower or 0) > 0
-                                or (applied.tuber or 0) > 0 or (applied.log or 0) > 0) then
+                                or (applied.tuber or 0) > 0 or (applied.dragon or 0) > 0
+                                or (applied.log or 0) > 0) then
                     stats.ingested = stats.ingested + 1
                 end
             end
@@ -1546,9 +1602,18 @@ function Timers.OnNWBMessage(prefix, message, channel, sender)
         end
         Timers._sawNWB = true
     elseif cmd == "flower" or cmd == "flower2" then
-        -- Node pick relayed from another NWB client; index unknown here,
-        -- so it is folded in via the periodic full-data sync above.
+        -- Node pick relayed from another NWB client. The event opcode carries
+        -- only "<type> <layer>" — no node index and no epoch — so it cannot set
+        -- a timer by itself (NWB_BEHAVIOR_SPEC §5.4: flower/flower2 "does not
+        -- set a timer by itself").
+        --
+        -- ROUND-17 audit fix 4: what it IS, is a reliable signal that a flower
+        -- was just picked somewhere and that the sender's full payload now has
+        -- an index and epoch we lack. So we pull. RequestNWBData is 60s-cooled
+        -- internally, which is what keeps a circuit-running guild from turning
+        -- ten picks into ten requests.
         Timers._sawNWB = true
+        ns:SafeCall(Timers.RequestNWBData)
     end
 end
 
@@ -1694,7 +1759,43 @@ Timers.NODES = {
         { x = 0.341, y = 0.603, label = "Jaedenar" },
         { x = 0.402, y = 0.852, label = "West of Emerald Sanctuary" },
     },
+    -- Night Dragon's Breath (item 11952) — the third Felwood node type, wire
+    -- keys `d1`..`d4`. Coordinates are the reference's (NWB_BEHAVIOR_SPEC §6.2,
+    -- "Night Dragon's Breath nodes"); like the tuber list they are sourced from
+    -- Wowhead and flagged upstream as possibly incomplete. Same 1500s respawn,
+    -- same loot-line detection path as tubers, 2.0 map-percent match radius.
+    dragon = {
+        { x = 0.425, y = 0.139, label = "North-West of Irontree Woods" },
+        { x = 0.506, y = 0.305, label = "South of Irontree Woods" },
+        { x = 0.351, y = 0.590, label = "Jaedenar" },
+        { x = 0.407, y = 0.783, label = "West of Emerald Sanctuary" },
+    },
 }
+
+-- Node counts per kind, so the snapshot / debug / ingest loops stop hardcoding
+-- 10 and 6 in five places (and so `dragon` cannot be forgotten in one of them).
+Timers.NODE_COUNTS = { flower = 10, tuber = 6, dragon = 4 }
+
+-- Per-node trust of the LAST write ("local" / "nwb" / "sn" / "mesh"), keyed
+-- "flower3". Feeds the localHoldGuard in MarkNode.
+--
+-- PERSISTED, deliberately: the whole point of the guard is that our own pick
+-- owns its node for 25 minutes, and a /reload inside those 25 minutes must not
+-- silently downgrade it back to stompable. It rides the timers data graph and is
+-- created lazily on first touch — the same pattern (and the same reasoning) as
+-- `pullObservations`, which store.lua documents as engine-created so it appears
+-- on pre-existing saves. Falls back to a module-local table in a bare VM.
+Timers._nodeTrustFallback = {}
+local function nodeTrustTable()
+    local t = ns.Store and ns.Store.GetTimers and ns.Store.GetTimers()
+    if not t then return Timers._nodeTrustFallback end
+    t.nodeTrust = t.nodeTrust or {}
+    return t.nodeTrust
+end
+Timers._nodeTrust = setmetatable({}, {
+    __index    = function(_, k) return nodeTrustTable()[k] end,
+    __newindex = function(_, k, v) nodeTrustTable()[k] = v end,
+})
 
 -- Store key for a node kind: flower -> timers.flower, tuber -> timers.tuber.
 local function nodePopTable(kind)
@@ -1702,6 +1803,13 @@ local function nodePopTable(kind)
     if not t then return nil end
     if kind == "flower" then return t.flower end
     if kind == "tuber"  then return t.tuber end
+    if kind == "dragon" then
+        -- Lazily created: `dragon` is new in this release, so a pre-existing SV
+        -- has no such table and the store's defaults pass only backfills
+        -- SETTINGS, not the data graph. Create on first touch.
+        t.dragon = t.dragon or {}
+        return t.dragon
+    end
     return nil
 end
 
@@ -1723,24 +1831,52 @@ function Timers.NearestNode(kind, x, y)
 end
 
 -- Compute a node's state at time `t` from its pop epoch. Pure helper.
--- `respawn` = minus-timer duration (the down-count); `upDuration` = how long
--- the post-respawn "up" (UP?) window is shown before reverting to "unknown".
--- upDuration nil/<=0 means the up window is indefinite (default; reproduces the
--- prior always-up-after-respawn behavior).
-function Timers.NodeState(popEpoch, t, respawn, upDuration)
+--
+-- ROUND-17 (songflower accuracy, audit fix 1 + 6). Two changes:
+--
+-- 1. `respawn` is the REAL respawn length and callers must pass NODE_RESPAWN.
+--    It used to double as a user-configurable "minus-timer duration", which is
+--    what let an SN import (which copied SN's 120s minus-timer into that
+--    setting) make every flower count 2 minutes and then read as available.
+--    Respawn is a game constant — 1500s for flowers, tubers and dragons alike
+--    (NWB_BEHAVIOR_SPEC §6.4: "exactly 1500 s ... No variance, no jitter, no
+--    min/max") — so no setting may shorten it.
+--
+-- 2. There is no longer an indefinite "up" state. The reference has exactly
+--    three display states and a respawned node reverts to "no timer" — it never
+--    reads "up" forever, because after 25 minutes we simply do not know whether
+--    anyone has picked it. `expiredWindow` (default FLOWER_EXPIRED_WINDOW) is
+--    the post-respawn grace band in which we still show the node, counting
+--    NEGATIVE so the consumer can render "-M:SS".
+--
+-- States:
+--   "unknown" — no observation at all (stored epoch 0)
+--   "down"    — picked, counting down; `remaining` > 0
+--   "expired" — respawned within the last `expiredWindow`; `remaining` < 0
+--   "stale"   — respawned longer ago than that; data too old to assert anything
+--
+-- `legacyState` projects the four onto the old three-state vocabulary
+-- ("unknown"/"down"/"up") for consumers not yet migrated: "expired" -> "up"
+-- (we are inside the grace band, it plausibly is up), "stale" -> "unknown" (the
+-- observation is too old to claim anything). Consumers should prefer `state`.
+function Timers.NodeState(popEpoch, t, respawn, expiredWindow)
     respawn = respawn or NODE_RESPAWN
+    if expiredWindow == nil then expiredWindow = FLOWER_EXPIRED_WINDOW end
     if not popEpoch or popEpoch <= 0 then
-        return { state = "unknown", remaining = 0, since = 0 }
+        return { state = "unknown", legacyState = "unknown", remaining = 0, since = 0 }
     end
     local elapsed = t - popEpoch
     if elapsed < respawn then
-        return { state = "down", remaining = respawn - elapsed, since = elapsed }
+        return { state = "down", legacyState = "down",
+                 remaining = respawn - elapsed, since = elapsed }
     end
     local sinceUp = elapsed - respawn
-    if not upDuration or upDuration <= 0 or sinceUp < upDuration then
-        return { state = "up", remaining = 0, since = sinceUp }
+    if expiredWindow > 0 and sinceUp < expiredWindow then
+        -- NEGATIVE remaining: the renderer formats it as "-M:SS".
+        return { state = "expired", legacyState = "up",
+                 remaining = -sinceUp, since = sinceUp }
     end
-    return { state = "unknown", remaining = 0, since = sinceUp }
+    return { state = "stale", legacyState = "unknown", remaining = 0, since = sinceUp }
 end
 
 -- Record a node pick. kind ∈ "flower"/"tuber", index 1-based. Applies a
@@ -1763,7 +1899,23 @@ function Timers.MarkNode(kind, index, epoch, trust, opts)
     if epoch <= prev then return false end
     local guard = opts and opts.overwriteGuard
     if guard and prev > 0 and (epoch - prev) < guard then return false end
+    -- ROUND-17 audit fix 2: a locally-observed pick OWNS its node for the full
+    -- respawn. Our own pick is position- and spell/loot-validated; every network
+    -- report of the same node inside those 25 minutes is either the same pick
+    -- relayed back to us or someone's heuristic guess, and neither may stomp it.
+    -- Keyed off the trust recorded WITH the stored value, so this costs nothing
+    -- when the stored value was itself second-hand.
+    local hold = opts and opts.localHoldGuard
+    if hold and prev > 0 and (epoch - prev) < hold
+       and Timers._nodeTrust[kind .. index] == "local" then
+        return false
+    end
+    -- +/-10 s cross-source duplicate guard (NWB_BEHAVIOR_SPEC §5.7). The `<=`
+    -- test above already covers the "older" half of the window.
+    local minNewer = opts and opts.minNewer
+    if minNewer and prev > 0 and (epoch - prev) < minNewer then return false end
     pops[index] = epoch
+    Timers._nodeTrust[kind .. index] = trust
     ns:Fire("NODE_UPDATED", kind .. index)
     if maybeBroadcast then maybeBroadcast() end
     -- Songflower picked chat alert (round-12 restore 3b — item 28). The options toggle
@@ -1788,22 +1940,33 @@ local function felwoodSettings()
     return (s and s.timerSettings and s.timerSettings.felwood) or {}
 end
 
--- Public: current state for a node key like "flower3".
+-- The configurable post-respawn "expired" window, in seconds. Clamped so a
+-- corrupt or SN-imported value cannot produce a nonsense band.
+function Timers.ExpiredWindow()
+    local fw = felwoodSettings()
+    local v = tonumber(fw.flowerExpiredWindow)
+    if not v then return FLOWER_EXPIRED_WINDOW end
+    if v < 0 then return 0 end
+    if v > 900 then return 900 end
+    return v
+end
+
+-- Public: current state for a node key like "flower3" / "tuber2" / "dragon1".
+--
+-- ROUND-17 audit fix 1 — THE headline bug. This used to read
+-- `felwood.flowerMinusDuration` as the RESPAWN LENGTH. import.lua copied SN's
+-- `flowerMinusTimerDuration` (120s on a stock SN install) straight into that
+-- key, so after an SN import every songflower counted down ~2 minutes and then
+-- reported itself available — "timers don't seem accurate". The respawn is a
+-- game constant and is now ALWAYS NODE_RESPAWN; the only thing a setting may
+-- move is the post-respawn expired window.
 function Timers.GetNodeState(nodeKey)
     local kind, idxStr = nodeKey:match("^(%a+)(%d+)$")
     local index = tonumber(idxStr)
     if not kind or not index then return nil end
     local pops = nodePopTable(kind)
     local popEpoch = pops and pops[index] or 0
-    -- Songflowers honor the configurable display durations; tubers keep the
-    -- fixed respawn with an indefinite up window (unchanged).
-    local respawn, upDur = NODE_RESPAWN, 0
-    if kind == "flower" then
-        local fw = felwoodSettings()
-        respawn = fw.flowerMinusDuration or NODE_RESPAWN
-        upDur   = fw.flowerUpDuration or 0
-    end
-    return Timers.NodeState(popEpoch, now(), respawn, upDur)
+    return Timers.NodeState(popEpoch, now(), NODE_RESPAWN, Timers.ExpiredWindow())
 end
 
 -- The songflower gather cast. This is a SONGFLOWER-ONLY trigger: the old comment
@@ -1830,7 +1993,7 @@ Timers.SONGFLOWER_SPELL = SONGFLOWER_SPELL
 -- rate for no gain.
 local NODE_MATCH_RADIUS = 0.015
 Timers.NODE_MATCH_RADIUS = NODE_MATCH_RADIUS
-local NODE_MATCH_RADIUS_BY_KIND = { flower = 0.015, tuber = 0.02 }
+local NODE_MATCH_RADIUS_BY_KIND = { flower = 0.015, tuber = 0.02, dragon = 0.02 }
 Timers.NODE_MATCH_RADIUS_BY_KIND = NODE_MATCH_RADIUS_BY_KIND
 
 local function radiusFor(kind, radius)
@@ -1854,7 +2017,7 @@ end
 function Timers.MatchNodePick(x, y, radius)
     if not x or not y then return nil end
     local bKind, bIdx, bDist
-    for _, kind in ipairs({ "flower", "tuber" }) do
+    for _, kind in ipairs({ "flower", "tuber", "dragon" }) do
         local idx, dist = Timers.MatchNodeOfKind(kind, x, y, radius)
         if idx and (not bDist or dist < bDist) then bKind, bIdx, bDist = kind, idx, dist end
     end
@@ -1939,10 +2102,14 @@ end
 -- silently, exactly like the flower path.
 ----------------------------------------------------------------------
 
--- Looted item id -> node kind (false = recognised but not tracked).
+-- Looted item id -> node kind.
+-- ROUND-17 audit fix 8: 11952 (Night Dragon's Breath) was recognised and then
+-- deliberately DISCARDED because we had no dragon node set. We have one now
+-- (Timers.NODES.dragon), so it records like a tuber — same loot-line trigger,
+-- same 1500s respawn, same 2.0 map-percent radius.
 local LOOT_ITEM_NODE = {
     [11951] = "tuber",
-    [11952] = false,
+    [11952] = "dragon",
 }
 Timers._lootItemNode = LOOT_ITEM_NODE
 
@@ -2039,6 +2206,45 @@ end
 
 local SONGFLOWER_AURA = 15366
 Timers.SONGFLOWER_AURA = SONGFLOWER_AURA
+
+-- Songflower Serenade runs 3600s (NWB_BEHAVIOR_SPEC §2). A remaining duration at
+-- or above this threshold means the buff landed within the last second — the
+-- signature of a pick we just made, as opposed to one we were already carrying.
+local SONGFLOWER_DURATION   = 3600
+local SONGFLOWER_FRESH_MIN  = 3599
+Timers.SONGFLOWER_DURATION  = SONGFLOWER_DURATION
+Timers.SONGFLOWER_FRESH_MIN = SONGFLOWER_FRESH_MIN
+
+-- Localized buff name, resolved once at load and used as the secondary match.
+-- nil on a client/VM without GetSpellInfo — the spell-id match still works.
+Timers._songflowerAuraName = (GetSpellInfo and GetSpellInfo(SONGFLOWER_AURA)) or nil
+
+-- Remaining seconds on OUR songflower buff, or nil when we do not have it (or
+-- the aura API is unavailable, as in a bare VM). Scans by spell id, then by
+-- localized name, because GetBuffDataByIndex fills spellId on modern clients but
+-- the name is the only field guaranteed across the versions we target.
+function Timers.OwnSongflowerRemaining(nowTime)
+    if not (C_UnitAuras and C_UnitAuras.GetBuffDataByIndex) then return nil end
+    local t = nowTime or ((GetTime and GetTime()) or 0)
+    local wantName = Timers._songflowerAuraName
+    for i = 1, 40 do
+        local aura = C_UnitAuras.GetBuffDataByIndex("player", i)
+        if not aura then break end
+        -- Field casing varies by client build, so read BOTH — tracker.lua does
+        -- the same and is the surface proven in-game.
+        local id = aura.spellId or aura.spellID
+        local hit = (id == SONGFLOWER_AURA)
+                 or (wantName and aura.name and aura.name == wantName)
+        if hit then
+            local exp = tonumber(aura.expirationTime) or 0
+            -- expirationTime 0 = no duration (should not happen for songflower);
+            -- treat as unknown rather than inventing a fresh pick.
+            if exp <= 0 then return nil end
+            return exp - t
+        end
+    end
+    return nil
+end
 
 -- The chronoboon RELEASE cast. A release re-applies a stored songflower, which
 -- looks identical to a fresh pick in the combat log; both parties are suppressed
@@ -2178,6 +2384,37 @@ function Timers.FelwoodCombatLog(subevent, sourceGUID, sourceName,
     end
     if spellID ~= SONGFLOWER_AURA then return false end
     if not isPlayerGUID(destGUID) then return false end
+
+    -- ROUND-17 audit fix 5 — OWN-PICK AURA FALLBACK.
+    --
+    -- OnOtherSongflower rejects our own name outright ("own pick"), on the
+    -- assumption that our own picks are already caught by the 6478 cast event.
+    -- When that event does not fire — a cast eaten by a loading screen, a
+    -- lost UNIT_SPELLCAST_SUCCEEDED, a pick completed as the zone changes — we
+    -- recorded NOTHING for a flower we personally picked and stood on.
+    --
+    -- The aura itself is the insurance. Unlike another player's buff, our own
+    -- remaining duration IS readable, and that is what makes this safe: a
+    -- songflower lasts 3600s, so a reading of >= 3599s means the buff landed
+    -- within the last second, i.e. we just picked it. Anything less is a buff we
+    -- were already carrying (a login aura burst, a chronoboon restore, a refresh
+    -- from someone else's flower) and is ignored. No overwrite guard: this is a
+    -- first-hand, position-validated observation and it should win outright,
+    -- exactly like the cast path it backstops.
+    if destName == playerNameOf() then
+        local rem = Timers.OwnSongflowerRemaining()
+        if rem and rem >= SONGFLOWER_FRESH_MIN then
+            if (t - (Timers._felwoodUnboon[destName] or 0)) < FLOWER_UNBOON_WINDOW then
+                return false
+            end
+            local x, y = playerFelwoodPos()
+            if not x then return false end
+            local index = Timers.MatchNodeOfKind("flower", x, y)
+            if not index then return false end
+            return (Timers.MarkNode("flower", index, t, "local"))
+        end
+        return false
+    end
 
     return (Timers.OnOtherSongflower(destName, {
         at      = t,
@@ -2355,7 +2592,7 @@ end
 
 -- Snapshot of merged timer data for the broadcaster / bulk sync.
 function Timers.GetSnapshot()
-    local snap = { buffs = {}, flower = {}, tuber = {}, at = now() }
+    local snap = { buffs = {}, flower = {}, tuber = {}, dragon = {}, at = now() }
     for i = 1, #Timers.BUFF_KEYS do
         local k = Timers.BUFF_KEYS[i]
         local s = Timers.state[k]
@@ -2367,10 +2604,32 @@ function Timers.GetSnapshot()
     end
     local flower = nodePopTable("flower")
     local tuber  = nodePopTable("tuber")
+    local dragon = nodePopTable("dragon")
     if flower then for i = 1, 10 do snap.flower[i] = flower[i] end end
     if tuber  then for i = 1, 6  do snap.tuber[i]  = tuber[i]  end end
+    -- ROUND-17 audit fix 8: dragons ride the mesh snapshot. This is safely
+    -- ADDITIVE — an older peer receiving `snap.dragon` simply has no branch that
+    -- reads it and ignores the field. The timer HASH is a different matter and
+    -- is deliberately NOT extended; see the note on Mesh.HashTimers below.
+    if dragon then for i = 1, 4  do snap.dragon[i] = dragon[i] end end
     return snap
 end
+
+-- NOTE (ROUND-17 audit fix 8, HashTimers verdict) — mesh.lua's Mesh.HashTimers
+-- hashes f1..f10, t1..t6 and timers.timerVersion, and the heartbeat compares
+-- that hash against peers to decide whether to run a timer sync. It carries NO
+-- version/capability guard of its own: `timerVersion` is a LOCAL edit counter,
+-- not a schema version, so it does not separate old code from new.
+--
+-- Appending d1..d4 would therefore change the hash of every new client even when
+-- all four dragon epochs are 0, and an old peer — running old code that hashes
+-- 16 fields, not 20 — would compute a different value for identical data. The
+-- two would mismatch on every heartbeat and sync forever without converging.
+-- So dragons stay OUT of the hash this release. The cost is only that a
+-- dragon-only divergence does not by itself trigger a sync; dragon epochs still
+-- travel in the snapshot whenever any sync runs for any other reason.
+-- Follow-up for the mesh owner (mesh.lua is not this branch's file): gate the
+-- extended hash behind a peer-capability flag, then add d1..d4.
 
 -- Apply an inbound merged snapshot (from a peer / broadcaster). Everything
 -- routes through Record/MarkNode so trust + false-positive gates still hold.
@@ -2388,8 +2647,12 @@ function Timers.ApplySnapshot(snap, trust)
             end
         end
     end
-    if snap.flower then for i, e in pairs(snap.flower) do Timers.MarkNode("flower", i, e, trust) end end
-    if snap.tuber  then for i, e in pairs(snap.tuber)  do Timers.MarkNode("tuber",  i, e, trust) end end
+    -- ROUND-17 audit fix 2: a peer snapshot is second-hand for nodes exactly as
+    -- NWB data is, so it carries the same guards — our own pick is not stomped
+    -- by a relay of it, and a re-report inside 10s is a duplicate.
+    if snap.flower then for i, e in pairs(snap.flower) do Timers.MarkNode("flower", i, e, trust, netNodeOpts()) end end
+    if snap.tuber  then for i, e in pairs(snap.tuber)  do Timers.MarkNode("tuber",  i, e, trust, netNodeOpts()) end end
+    if snap.dragon then for i, e in pairs(snap.dragon) do Timers.MarkNode("dragon", i, e, trust, netNodeOpts()) end end
 end
 
 -- Inbound single-timer event from the mesh (peer relay). trust "mesh".
@@ -2539,13 +2802,36 @@ local NWB_REQUEST_CD = 60
 -- Build the plaintext NWB wire text (before serialize/deflate/encode). Pure
 -- string assembly so self-tests can validate the field layout without touching
 -- the deflate pipeline. `innerData` is the already-serialized field-5 payload.
+-- Base-36 (lowercase, as NWB emits) encode of a non-negative integer.
+function Timers.ToBase36(n)
+    n = math.floor(tonumber(n) or 0)
+    if n <= 0 then return "0" end
+    local digits = "0123456789abcdefghijklmnopqrstuvwxyz"
+    local out = ""
+    while n > 0 do
+        local r = n % 36
+        out = digits:sub(r + 1, r + 1) .. out
+        n = math.floor(n / 36)
+    end
+    return out
+end
+
 function Timers.BuildNWBText(innerData)
     local level = (UnitLevel and UnitLevel("player")) or 60
     local st = (GetServerTime and GetServerTime()) or 0
-    -- NWB's coarse server-time token: (serverTime+1998) stringified, last 3 chopped.
-    local ktoken = tonumber(string.sub(tostring(st + 1998), 1, -4)) or 0
+    -- Field 4 is NWB's coarse ~16.7-minute epoch bucket, and the receiver
+    -- RECOMPUTES it from its own clock and requires EQUALITY before merging any
+    -- bulk timer data (NWB_BEHAVIOR_SPEC §5.3: "a base-36 encoding of
+    -- floor((serverTime + 1998) / 1000)").
+    --
+    -- ROUND-17 audit fix 4: we were sending a DECIMAL string built by chopping
+    -- the last three characters off tostring(serverTime + 1998). That is a
+    -- different function of the clock and a different alphabet, so it could
+    -- never equal what a real NWB client computes — every requestData we sent
+    -- was silently discarded on arrival, which is why the pull "did nothing".
+    local ktoken = Timers.ToBase36(math.floor((st + 1998) / 1000))
     return "requestData " .. NWB_REQ_VERSION .. " " .. tostring(level)
-           .. " " .. tostring(ktoken) .. " " .. (innerData or "")
+           .. " " .. ktoken .. " " .. (innerData or "")
 end
 
 function Timers.BuildNWBRequest()
@@ -2588,6 +2874,12 @@ local function startNWBRewatch()
     C_Timer.NewTicker(NWB_REREQUEST_INTERVAL, function()
         if not Timers._sawNWB then
             Timers.RequestTimerData()
+            -- ROUND-17 audit fix 4: the re-watch existed to recover when no NWB
+            -- traffic had been heard, but it only re-asked the MESH. The one
+            -- thing it never did was ask NWB — so a guild whose only timer
+            -- source is NWB sat silent forever. Both are asked now; each has its
+            -- own cooldown, so the pair cannot amplify.
+            ns:SafeCall(Timers.RequestNWBData)
         end
     end)
 end
@@ -2622,14 +2914,21 @@ function Timers.DebugDump()
         end
     end
     ns:Print("felwood nodes:")
-    for _, kind in ipairs({ "flower", "tuber" }) do
+    for _, kind in ipairs({ "flower", "tuber", "dragon" }) do
         local pops = nodePopTable(kind)
-        local count = (kind == "flower") and 10 or 6
+        local count = Timers.NODE_COUNTS[kind] or 0
         for i = 1, count do
-            local st = Timers.NodeState(pops and pops[i] or 0, t, NODE_RESPAWN)
+            local st = Timers.NodeState(pops and pops[i] or 0, t, NODE_RESPAWN,
+                                        Timers.ExpiredWindow())
             if st.state ~= "unknown" then
-                ns:Print(string.format("  %s%d %s %s", kind, i, st.state,
-                    st.state == "down" and fmtRemaining(st.remaining) or ""))
+                local detail = ""
+                if st.state == "down" then
+                    detail = fmtRemaining(st.remaining)
+                elseif st.state == "expired" then
+                    detail = "-" .. fmtRemaining(-st.remaining)
+                end
+                ns:Print(string.format("  %s%d %s %s  trust=%s", kind, i, st.state, detail,
+                    tostring(Timers._nodeTrust[kind .. i])))
             end
         end
     end
@@ -3532,26 +3831,380 @@ local function testNodeStateMachine(fails)
     local idx, dist = Timers.NearestNode("flower", n4.x, n4.y)
     tcheck(idx == 4, "nearest flower resolves to the exact node", fails)
     tcheck(dist ~= nil and dist < 0.001, "distance ~0 on the node", fails)
-    -- State transitions: unknown -> down -> up.
+    -- ROUND-17 audit fix 6 — the four-state machine.
+    --   unknown -> down -> expired -> stale
+    -- There is no indefinite "up": a node that respawned an hour ago tells us
+    -- nothing about whether it is standing there now, and reading "up" forever
+    -- was a claim we could not support.
+    local W = FLOWER_EXPIRED_WINDOW
     local st0 = Timers.NodeState(0, 1000, NODE_RESPAWN)
-    tcheck(st0.state == "unknown", "no pop => unknown (UP?)", fails)
+    tcheck(st0.state == "unknown", "no pop => unknown", fails)
+    tcheck(st0.remaining == 0, "unknown carries no remaining", fails)
+
     local pop = 1000
     local stDown = Timers.NodeState(pop, pop + 100, NODE_RESPAWN)
     tcheck(stDown.state == "down" and math.abs(stDown.remaining - (NODE_RESPAWN - 100)) < 0.5,
         "picked node counts down", fails)
-    local stUp = Timers.NodeState(pop, pop + NODE_RESPAWN + 5, NODE_RESPAWN)
-    tcheck(stUp.state == "up", "node returns to up after respawn", fails)
-    -- upDuration=0/nil keeps the up window indefinite (default behavior).
-    local stUpForever = Timers.NodeState(pop, pop + NODE_RESPAWN + 100000, NODE_RESPAWN, 0)
-    tcheck(stUpForever.state == "up", "upDuration 0 => up indefinitely", fails)
-    -- A finite upDuration reverts to unknown once the window elapses.
-    local stUpWin = Timers.NodeState(pop, pop + NODE_RESPAWN + 50, NODE_RESPAWN, 100)
-    tcheck(stUpWin.state == "up", "up shown within upDuration window", fails)
-    local stUpExp = Timers.NodeState(pop, pop + NODE_RESPAWN + 200, NODE_RESPAWN, 100)
-    tcheck(stUpExp.state == "unknown", "up window expires after upDuration", fails)
-    -- A shortened minus-timer flips down->up earlier.
-    local stShort = Timers.NodeState(pop, pop + 1300, 1200, 0)
-    tcheck(stShort.state == "up", "shorter minus-timer respawns earlier", fails)
+
+    -- Boundary: one second BEFORE respawn is still down.
+    local stEdgeDown = Timers.NodeState(pop, pop + NODE_RESPAWN - 1, NODE_RESPAWN)
+    tcheck(stEdgeDown.state == "down", "1s before respawn is still down", fails)
+    -- Exactly at respawn it flips to expired with remaining 0.
+    local stEdgeExp = Timers.NodeState(pop, pop + NODE_RESPAWN, NODE_RESPAWN)
+    tcheck(stEdgeExp.state == "expired" and stEdgeExp.remaining == 0,
+        "at exactly respawn => expired, remaining 0", fails)
+
+    -- Inside the expired band `remaining` is NEGATIVE, so the renderer can show
+    -- "-M:SS" without a second field telling it which side of zero it is on.
+    local stExp = Timers.NodeState(pop, pop + NODE_RESPAWN + 80, NODE_RESPAWN)
+    tcheck(stExp.state == "expired", "just-respawned node reads expired", fails)
+    tcheck(math.abs(stExp.remaining + 80) < 0.5, "expired remaining is negative (-80)", fails)
+    tcheck(math.abs(stExp.since - 80) < 0.5, "expired `since` is positive", fails)
+
+    -- Last second of the band is expired; one past it is stale.
+    local stExpEdge = Timers.NodeState(pop, pop + NODE_RESPAWN + W - 1, NODE_RESPAWN)
+    tcheck(stExpEdge.state == "expired", "last second of the expired window", fails)
+    local stStale = Timers.NodeState(pop, pop + NODE_RESPAWN + W, NODE_RESPAWN)
+    tcheck(stStale.state == "stale", "past the expired window => stale", fails)
+    tcheck(stStale.remaining == 0, "stale carries no remaining", fails)
+    local stStaleOld = Timers.NodeState(pop, pop + NODE_RESPAWN + 100000, NODE_RESPAWN)
+    tcheck(stStaleOld.state == "stale", "a day-old pop is stale, never 'up'", fails)
+
+    -- A custom window moves only the expired/stale boundary.
+    local stW = Timers.NodeState(pop, pop + NODE_RESPAWN + 50, NODE_RESPAWN, 100)
+    tcheck(stW.state == "expired", "custom window: inside => expired", fails)
+    local stW2 = Timers.NodeState(pop, pop + NODE_RESPAWN + 150, NODE_RESPAWN, 100)
+    tcheck(stW2.state == "stale", "custom window: outside => stale", fails)
+    -- A zero window skips the expired band entirely.
+    local stW0 = Timers.NodeState(pop, pop + NODE_RESPAWN + 1, NODE_RESPAWN, 0)
+    tcheck(stW0.state == "stale", "zero window => straight to stale", fails)
+
+    -- legacyState keeps un-migrated consumers working: they read the old
+    -- three-word vocabulary and never see "expired"/"stale".
+    tcheck(st0.legacyState == "unknown", "legacy: unknown -> unknown", fails)
+    tcheck(stDown.legacyState == "down", "legacy: down -> down", fails)
+    tcheck(stExp.legacyState == "up", "legacy: expired -> up", fails)
+    tcheck(stStale.legacyState == "up" or stStale.legacyState == "unknown",
+        "legacy: stale projects onto the old vocabulary", fails)
+    tcheck(stStale.legacyState == "unknown", "legacy: stale -> unknown (too old to assert)", fails)
+    for _, s in ipairs({ st0, stDown, stExp, stStale }) do
+        tcheck(s.legacyState == "up" or s.legacyState == "down" or s.legacyState == "unknown",
+            "legacyState only ever uses the old three states", fails)
+    end
+end
+
+-- ROUND-17 audit fix 1 — THE headline bug: a setting must never be able to
+-- shorten the respawn countdown.
+local function testRespawnSettingSplit(fails)
+    local pops = nodePopTable("flower")
+    if not pops then
+        fails[#fails + 1] = "respawn split: no flower pop table"
+        return
+    end
+    local s = ns.Store and ns.Store.GetSettings and ns.Store.GetSettings()
+    local fw = s and s.timerSettings and s.timerSettings.felwood
+    if not fw then
+        fails[#fails + 1] = "respawn split: no felwood settings block"
+        return
+    end
+    local savedMinus, savedWin = fw.flowerMinusDuration, fw.flowerExpiredWindow
+    local savedPop = pops[1]
+
+    -- Reproduce the exact poisoned save an SN import used to produce: SN's
+    -- 120s minus-timer copied into the key GetNodeState read as the RESPAWN.
+    fw.flowerMinusDuration = 120
+    fw.flowerExpiredWindow = nil
+    pops[1] = now() - 200
+
+    local st = Timers.GetNodeState("flower1")
+    -- Before the fix this read "up" at 200s: the flower "respawned" after two
+    -- minutes and the owner saw a 25-minute node go available in a tenth of it.
+    tcheck(st.state == "down", "poisoned flowerMinusDuration no longer shortens the respawn", fails)
+    tcheck(st.remaining > 1200,
+        "a 200s-old pick still has >20min left regardless of the setting", fails)
+
+    -- Every sub-respawn value behaves identically — the setting is simply not
+    -- consulted for the countdown any more.
+    for _, poison in ipairs({ 5, 90, 120, 300, 900, 1499 }) do
+        fw.flowerMinusDuration = poison
+        local p = Timers.GetNodeState("flower1")
+        tcheck(p.state == "down" and p.remaining > 1200,
+            "respawn ignores flowerMinusDuration = " .. poison, fails)
+    end
+
+    -- The expired WINDOW is the thing the setting now moves.
+    fw.flowerExpiredWindow = 100
+    pops[1] = now() - (NODE_RESPAWN + 50)
+    tcheck(Timers.GetNodeState("flower1").state == "expired",
+        "inside the configured expired window", fails)
+    pops[1] = now() - (NODE_RESPAWN + 150)
+    tcheck(Timers.GetNodeState("flower1").state == "stale",
+        "outside the configured expired window", fails)
+
+    -- The window is clamped, so a junk or hostile value cannot produce nonsense.
+    fw.flowerExpiredWindow = 99999
+    tcheck(Timers.ExpiredWindow() == 900, "expired window clamps to 900", fails)
+    fw.flowerExpiredWindow = -5
+    tcheck(Timers.ExpiredWindow() == 0, "negative expired window clamps to 0", fails)
+    fw.flowerExpiredWindow = "banana"
+    tcheck(Timers.ExpiredWindow() == FLOWER_EXPIRED_WINDOW,
+        "non-numeric expired window falls back to the default", fails)
+    fw.flowerExpiredWindow = nil
+    tcheck(Timers.ExpiredWindow() == FLOWER_EXPIRED_WINDOW,
+        "absent expired window falls back to the default", fails)
+
+    -- Tubers and dragons use the same constant respawn.
+    for _, kind in ipairs({ "tuber", "dragon" }) do
+        local tp = nodePopTable(kind)
+        if tp then
+            local sv = tp[1]
+            tp[1] = now() - 200
+            local ts = Timers.GetNodeState(kind .. "1")
+            tcheck(ts.state == "down" and ts.remaining > 1200,
+                kind .. " uses the 1500s respawn too", fails)
+            tp[1] = sv
+        end
+    end
+
+    fw.flowerMinusDuration, fw.flowerExpiredWindow = savedMinus, savedWin
+    pops[1] = savedPop
+end
+
+-- ROUND-17 audit fix 2 — the overwrite-guard matrix, per source.
+-- A locally-observed pick owns its node for the full 1500s respawn; every
+-- network source honours that plus the +/-10s duplicate guard.
+local function testNodeGuardMatrix(fails)
+    local pops = nodePopTable("flower")
+    if not pops then fails[#fails + 1] = "guard matrix: no flower pop table"; return end
+    local t = now()
+    local IDX = 7
+    local function reset(epoch, trust)
+        pops[IDX] = epoch
+        Timers._nodeTrust["flower" .. IDX] = trust
+    end
+
+    -- Baseline, no guards: newest-wins, older/equal refused.
+    reset(t - 100, "nwb")
+    tcheck(Timers.MarkNode("flower", IDX, t - 200, "nwb") == false,
+        "an older epoch is always refused", fails)
+    tcheck(Timers.MarkNode("flower", IDX, t - 100, "nwb") == false,
+        "an identical epoch is refused (dup relay)", fails)
+
+    -- LOCAL PICK PROTECTION. Our own pick 60s ago; each network source tries to
+    -- overwrite it with something much newer and must be refused for 1500s.
+    for _, src in ipairs({ "nwb", "mesh", "sn" }) do
+        reset(t - 60, "local")
+        tcheck(Timers.MarkNode("flower", IDX, t, src, netNodeOpts()) == false,
+            src .. " cannot stomp a 60s-old LOCAL pick", fails)
+        tcheck(pops[IDX] == t - 60, src .. " left the local epoch intact", fails)
+    end
+
+    -- ...for the WHOLE respawn, right up to the boundary.
+    reset(t - (NODE_RESPAWN - 1), "local")
+    tcheck(Timers.MarkNode("flower", IDX, t, "nwb", netNodeOpts()) == false,
+        "local pick is protected 1s before its respawn elapses", fails)
+    -- Once the respawn HAS elapsed the node is fair game again.
+    reset(t - (NODE_RESPAWN + 1), "local")
+    tcheck(Timers.MarkNode("flower", IDX, t, "nwb", netNodeOpts()) == true,
+        "after the full respawn a network epoch may take the node", fails)
+    tcheck(Timers._nodeTrust["flower" .. IDX] == "nwb", "trust follows the winning write", fails)
+
+    -- The hold applies ONLY to a stored LOCAL pick: second-hand data is freely
+    -- superseded by fresher second-hand data.
+    reset(t - 60, "nwb")
+    tcheck(Timers.MarkNode("flower", IDX, t, "mesh", netNodeOpts()) == true,
+        "a network epoch may overwrite a 60s-old NETWORK epoch", fails)
+
+    -- +/-10s CROSS-SOURCE DUPLICATE GUARD (NWB §5.7): the same pick arriving
+    -- from a second source, a few seconds later, is not a new observation.
+    reset(t - 60, "nwb")
+    tcheck(Timers.MarkNode("flower", IDX, t - 55, "mesh", netNodeOpts()) == false,
+        "an epoch 5s newer is a cross-source duplicate", fails)
+    reset(t - 60, "nwb")
+    tcheck(Timers.MarkNode("flower", IDX, t - 51, "mesh", netNodeOpts()) == false,
+        "an epoch 9s newer is still a duplicate", fails)
+    reset(t - 60, "nwb")
+    tcheck(Timers.MarkNode("flower", IDX, t - 50, "mesh", netNodeOpts()) == true,
+        "an epoch exactly 10s newer is accepted", fails)
+
+    -- Our OWN pick passes no guard and wins outright, even over a fresher
+    -- network epoch — it is position- and spell-validated.
+    reset(t - 5, "nwb")
+    tcheck(Timers.MarkNode("flower", IDX, t, "local") == true,
+        "our own pick overrides recent network data with no guard", fails)
+    tcheck(Timers._nodeTrust["flower" .. IDX] == "local", "own pick records local trust", fails)
+
+    -- Trust is PERSISTED in the timers graph, so a /reload inside the 25 minutes
+    -- does not quietly downgrade our pick to stompable.
+    local tt = ns.Store and ns.Store.GetTimers and ns.Store.GetTimers()
+    tcheck(tt and type(tt.nodeTrust) == "table" and tt.nodeTrust["flower" .. IDX] == "local",
+        "node trust rides the persisted timers table", fails)
+
+    pops[IDX] = nil
+    Timers._nodeTrust["flower" .. IDX] = nil
+end
+
+-- ROUND-17 audit fix 5 — own-pick aura fallback.
+local function testOwnPickAuraFallback(fails)
+    local pops = nodePopTable("flower")
+    if not pops then fails[#fails + 1] = "aura fallback: no flower pop table"; return end
+
+    local savedAuras, savedName = _G.C_UnitAuras, _G.UnitName
+    local savedGetTime, savedMap = _G.GetTime, _G.C_Map
+    local NODE = Timers.NODES.flower[5]
+    local t = now()
+
+    -- Stand exactly on flower 5, in Felwood, as ourselves.
+    local pos = { x = NODE.x, y = NODE.y }
+    _G.C_Map = {
+        GetBestMapForUnit = function() return Timers.FELWOOD_MAP end,
+        GetPlayerMapPosition = function()
+            return { GetXY = function() return pos.x, pos.y end }
+        end,
+    }
+    Timers.InvalidateFelwoodCache()
+    _G.UnitName = function(u) return (u == "player") and "Me" or "Someone" end
+    _G.GetTime  = function() return 10000 end
+
+    local function setAura(remaining)
+        if remaining == nil then
+            _G.C_UnitAuras = { GetBuffDataByIndex = function() return nil end }
+            return
+        end
+        _G.C_UnitAuras = { GetBuffDataByIndex = function(unit, i)
+            if unit == "player" and i == 1 then
+                return { spellId = SONGFLOWER_AURA, name = "Songflower Serenade",
+                         expirationTime = 10000 + remaining }
+            end
+            return nil
+        end }
+    end
+
+    -- A full-duration buff means we picked it in the last second.
+    setAura(3600)
+    tcheck(Timers.OwnSongflowerRemaining() == 3600, "own remaining reads 3600", fails)
+    tcheck(Timers.OwnSongflowerRemaining(10000) >= SONGFLOWER_FRESH_MIN,
+        "3600s remaining clears the freshness bar", fails)
+    -- The upper-case spellID spelling some builds use must match too.
+    _G.C_UnitAuras = { GetBuffDataByIndex = function(unit, i)
+        if unit == "player" and i == 1 then
+            return { spellID = SONGFLOWER_AURA, expirationTime = 10000 + 3600 }
+        end
+        return nil
+    end }
+    tcheck(Timers.OwnSongflowerRemaining() == 3600,
+        "aura.spellID (upper-case D) is matched too", fails)
+    -- 3599 is the boundary and still counts.
+    setAura(3599)
+    tcheck(Timers.OwnSongflowerRemaining() >= SONGFLOWER_FRESH_MIN,
+        "3599s remaining still counts as a fresh pick", fails)
+    -- A buff we were already carrying must NOT create a timer.
+    setAura(3000)
+    tcheck(Timers.OwnSongflowerRemaining() < SONGFLOWER_FRESH_MIN,
+        "3000s remaining is a carried buff, not a pick", fails)
+    -- No buff at all, and a durationless aura, both read nil.
+    setAura(nil)
+    tcheck(Timers.OwnSongflowerRemaining() == nil, "no songflower => nil", fails)
+    _G.C_UnitAuras = { GetBuffDataByIndex = function(unit, i)
+        if i == 1 then return { spellId = SONGFLOWER_AURA, expirationTime = 0 } end
+        return nil
+    end }
+    tcheck(Timers.OwnSongflowerRemaining() == nil, "expirationTime 0 => nil, never a fresh pick", fails)
+
+    -- END TO END through the real combat-log entry point, which is where the
+    -- old code gave up: OnOtherSongflower rejects our own name ("own pick") on
+    -- the assumption the 6478 cast event already caught it. When that event does
+    -- not fire, this is the only thing standing between the owner and a flower
+    -- they picked, stood on, and got no timer for.
+    local PGUID = "Player-1-AAA"
+    _G.UnitGUID = _G.UnitGUID or function() return PGUID end
+    local savedGUID = _G.UnitGUID
+    _G.UnitGUID = function(u) return (u == "player") and PGUID or "Player-1-BBB" end
+
+    pops[5] = nil
+    Timers._nodeTrust["flower5"] = nil
+    setAura(3600)
+    local ok = Timers.FelwoodCombatLog("SPELL_AURA_APPLIED", PGUID, "Me",
+                                       PGUID, "Me", 0, SONGFLOWER_AURA, t)
+    tcheck(ok == true, "own fresh songflower aura marks the node", fails)
+    tcheck((pops[5] or 0) == t, "the nearest flower node got our epoch", fails)
+    tcheck(Timers._nodeTrust["flower5"] == "local", "own aura pick records LOCAL trust", fails)
+
+    -- A carried buff (login aura burst, chronoboon restore, someone else's
+    -- flower refreshing ours) must never manufacture a pick.
+    pops[5] = nil
+    setAura(3000)
+    local ok2 = Timers.FelwoodCombatLog("SPELL_AURA_APPLIED", PGUID, "Me",
+                                        PGUID, "Me", 0, SONGFLOWER_AURA, t)
+    tcheck(ok2 == false and (pops[5] or 0) == 0,
+        "a carried songflower buff marks nothing", fails)
+
+    -- A chronoboon release re-applies a stored songflower at full duration, so
+    -- the duration test alone cannot distinguish it from a pick. Suppressed.
+    pops[5] = nil
+    setAura(3600)
+    Timers._felwoodUnboon["Me"] = t
+    local ok3 = Timers.FelwoodCombatLog("SPELL_AURA_APPLIED", PGUID, "Me",
+                                        PGUID, "Me", 0, SONGFLOWER_AURA, t)
+    tcheck(ok3 == false and (pops[5] or 0) == 0,
+        "a chronoboon release is not a pick even at full duration", fails)
+    Timers._felwoodUnboon["Me"] = nil
+
+    -- Standing nowhere near a node records nothing, however fresh the buff.
+    pops[5] = nil
+    pos.x, pos.y = 0.9, 0.9
+    Timers.InvalidateFelwoodCache()
+    setAura(3600)
+    local ok4 = Timers.FelwoodCombatLog("SPELL_AURA_APPLIED", PGUID, "Me",
+                                        PGUID, "Me", 0, SONGFLOWER_AURA, t)
+    tcheck(ok4 == false and (pops[5] or 0) == 0,
+        "a fresh buff away from every node marks nothing", fails)
+
+    _G.C_UnitAuras = savedAuras
+    _G.UnitName    = savedName
+    _G.GetTime     = savedGetTime
+    _G.UnitGUID    = savedGUID
+    _G.C_Map       = savedMap
+    Timers.InvalidateFelwoodCache()
+    pops[5] = nil
+    Timers._nodeTrust["flower5"] = nil
+end
+
+-- ROUND-17 audit fix 8 — dragon nodes d1..d4.
+local function testDragonNodes(fails)
+    tcheck(type(Timers.NODES.dragon) == "table" and #Timers.NODES.dragon == 4,
+        "four dragon nodes defined", fails)
+    tcheck(Timers.NODE_COUNTS.dragon == 4, "dragon node count is 4", fails)
+    -- Coordinates match NWB_BEHAVIOR_SPEC §6.2 (normalized from map percent).
+    local d = Timers.NODES.dragon
+    tcheck(math.abs(d[1].x - 0.425) < 1e-9 and math.abs(d[1].y - 0.139) < 1e-9,
+        "dragon 1 at 42.5 / 13.9", fails)
+    tcheck(math.abs(d[4].x - 0.407) < 1e-9 and math.abs(d[4].y - 0.783) < 1e-9,
+        "dragon 4 at 40.7 / 78.3", fails)
+    -- 11952 is DETECTED now, not discarded.
+    tcheck(Timers._lootItemNode[11952] == "dragon",
+        "Night Dragon's Breath (11952) maps to a dragon node", fails)
+    tcheck(Timers._lootItemNode[11951] == "tuber", "Whipper Root Tuber still maps to tuber", fails)
+    -- Dragons share the tuber match radius (2.0 map-percent).
+    tcheck(Timers.NODE_MATCH_RADIUS_BY_KIND.dragon == 0.02, "dragon radius is 0.02", fails)
+    -- The store table is lazily created and MarkNode round-trips through it.
+    local pops = nodePopTable("dragon")
+    tcheck(type(pops) == "table", "dragon pop table is lazily created", fails)
+    if pops then
+        local t = now()
+        tcheck(Timers.MarkNode("dragon", 2, t, "local") == true, "a dragon pick records", fails)
+        tcheck(Timers.GetNodeState("dragon2").state == "down", "dragon node counts down", fails)
+        -- NWB d1..d4 keys ingest.
+        local a = Timers.IngestNWBTimers({ d1 = t - 100 })
+        tcheck((a.dragon or 0) == 1, "NWB d1 key ingested", fails)
+        tcheck(pops[1] == t - 100, "d1 epoch stored", fails)
+        -- Snapshot carries dragons (additive; old peers ignore the field).
+        local snap = Timers.GetSnapshot()
+        tcheck(type(snap.dragon) == "table" and snap.dragon[2] == t,
+            "mesh snapshot includes dragon epochs", fails)
+        pops[1], pops[2] = nil, nil
+        Timers._nodeTrust["dragon2"] = nil
+    end
 end
 
 -- DBM / NWB parse helpers.
@@ -3633,8 +4286,32 @@ local function testNWBRequestBuild(fails)
     tcheck(tonumber(parts[2]) ~= nil and tonumber(parts[2]) >= 2.75,
         "advertised version >= 2.75 (clears NWB classic gate)", fails)
     tcheck(tonumber(parts[3]) ~= nil, "level field is numeric", fails)
-    tcheck(tonumber(parts[4]) ~= nil, "server-time token is numeric", fails)
     tcheck(parts[5] == "PAYLOAD", "field 5 carries the serialized data", fails)
+
+    -- ROUND-17 audit fix 4: field 4 is BASE-36 of floor((serverTime+1998)/1000),
+    -- and the receiver recomputes it from its own clock and demands EQUALITY
+    -- before merging bulk data. It used to be a decimal string built by chopping
+    -- three characters off tostring(serverTime + 1998) — a different function
+    -- AND a different alphabet, so every request we sent was discarded on
+    -- arrival. "numeric" was exactly the assertion that let that through, so the
+    -- test now pins the encoding itself rather than its shape.
+    tcheck(Timers.ToBase36(0)  == "0",  "base36(0) = 0",  fails)
+    tcheck(Timers.ToBase36(35) == "z",  "base36(35) = z", fails)
+    tcheck(Timers.ToBase36(36) == "10", "base36(36) = 10", fails)
+    tcheck(Timers.ToBase36(1295) == "zz", "base36(1295) = zz", fails)
+    tcheck(Timers.ToBase36(1296) == "100", "base36(1296) = 100", fails)
+    -- A real Whitemane-era clock: the bucket must round-trip through base 36.
+    local sampleST = 1785275503
+    local expectBucket = math.floor((sampleST + 1998) / 1000)
+    tcheck(expectBucket == 1785277 and Timers.ToBase36(expectBucket) == "129j1",
+        "base36 bucket for a live server time", fails)
+    -- And the live field must equal base36 of the bucket from the SAME clock the
+    -- builder read, not merely parse as a number.
+    local st = (GetServerTime and GetServerTime()) or 0
+    tcheck(parts[4] == Timers.ToBase36(math.floor((st + 1998) / 1000)),
+        "field 4 is base-36 of floor((serverTime+1998)/1000)", fails)
+    tcheck(parts[4]:match("^[0-9a-z]+$") ~= nil,
+        "field 4 uses the lowercase base-36 alphabet", fails)
     -- Integration: with the libs present, the full encode yields a wire string.
     local nwb = Timers._nwb
     nwb.libSerialize = nwb.libSerialize or (LibStub and LibStub.GetLibrary and LibStub:GetLibrary("LibSerialize", true))
@@ -3692,10 +4369,34 @@ local function testNWBIngest(fails)
     tcheck((a1.flower or 0) >= 1 and (a1.tuber or 0) >= 1, "flat flower/tuber ingested", fails)
 
     -- Layered realm: timers nested under the literally-named `layers` key.
+    --
+    -- ROUND-17 audit fix 3 — world buffs still flatten across layers (they
+    -- genuinely drop on every layer at once), but NODES no longer do. Each layer
+    -- has its own ten flowers picked at its own times, so folding them together
+    -- made the newest pick of node N on ANY layer masquerade as node N's timer.
+    -- The old assertion here ("layered flower ingested") was asserting the bug.
     reset()
     local a2 = Timers.IngestNWBTimers({ layers = { [1] = { n = t - 300, o = t - 310, f2 = t - 70 } } })
     tcheck(a2.rend, "layered rend ingested from payload.layers", fails)
-    tcheck((a2.flower or 0) >= 1, "layered flower ingested", fails)
+    tcheck((a2.flower or 0) == 0, "layered flower IGNORED (nodes are per-layer)", fails)
+    tcheck((nodePopTable("flower") or {})[2] == nil,
+        "no node epoch written from a layer sub-table", fails)
+
+    -- The heuristic layer-map fallback (payload without a literal `layers` key)
+    -- is held to the same rule: buffs yes, nodes no.
+    reset()
+    local a2b = Timers.IngestNWBTimers({ someMap = { [1] = { n = t - 300, o = t - 310, f4 = t - 70 } } })
+    tcheck(a2b.rend, "heuristic layer map still ingests buffs", fails)
+    tcheck((a2b.flower or 0) == 0, "heuristic layer map does NOT ingest nodes", fails)
+
+    -- Top-level nodes are still read on a layered payload — one layer's truth.
+    reset()
+    local a2c = Timers.IngestNWBTimers({
+        f3 = t - 80, layers = { [1] = { f3 = t - 10 } },
+    })
+    tcheck((a2c.flower or 0) == 1, "top-level flower still ingested alongside layers", fails)
+    tcheck((nodePopTable("flower") or {})[3] == t - 80,
+        "the TOP-LEVEL epoch wins, not the fresher per-layer one", fails)
 
     -- Word keys tolerated (un-compacted layer).
     reset()
@@ -4064,6 +4765,11 @@ function Timers.RunSelfTests(verbose)
         { name = "nwb request build", fn = testNWBRequestBuild },
         { name = "log dedup",         fn = testLogDedup },
         { name = "node state machine", fn = testNodeStateMachine },
+        -- ROUND-17 songflower accuracy audit.
+        { name = "respawn vs setting split", fn = testRespawnSettingSplit },
+        { name = "node overwrite guards",    fn = testNodeGuardMatrix },
+        { name = "own-pick aura fallback",   fn = testOwnPickAuraFallback },
+        { name = "dragon nodes",             fn = testDragonNodes },
         { name = "ingest parsers",    fn = testIngestParsers },
         { name = "rehydrate from store", fn = testRehydrateFromStore },
         { name = "nwb payload ingest", fn = testNWBIngest },
@@ -4181,6 +4887,15 @@ function Timers.OnLogin()
     -- Login data requests + NWB re-watch.
     Timers.RequestTimerData()
     startNWBRewatch()
+    -- ROUND-17 audit fix 4: actually ask NWB for data at login. RequestNWBData
+    -- was a published, fully-built surface that NOTHING in the lifecycle ever
+    -- called — only a UI button — so on a fresh login we waited for someone
+    -- else's broadcast instead of asking. Deferred ~3s so AceComm, the guild
+    -- roster and NWB's own receiver are all up first; a request fired before the
+    -- roster is populated goes nowhere because IsInGuild() is still false.
+    if C_Timer and C_Timer.After then
+        C_Timer.After(3, function() ns:SafeCall(Timers.RequestNWBData) end)
+    end
 end
 
 -- Register self-tests + the debug dump through the Core registries (added

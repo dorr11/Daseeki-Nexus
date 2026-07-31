@@ -490,9 +490,21 @@ function Import._MapTimerSettings(t)
             worldTimerFont    = t.wmTimerFontSize,
             minimapFlowerSize = t.mmFlowerIconSize,
             minimapTuberSize  = t.mmTuberIconSize,
-            -- Songflower display durations (nil leaves our store default).
-            flowerMinusDuration = t.flowerMinusTimerDuration,
-            flowerUpDuration    = t.flowerUpDuration,
+            -- ROUND-17 (songflower accuracy audit, fix 1) — DELIBERATELY NOT
+            -- IMPORTED: SN's `flowerMinusTimerDuration` and `flowerUpDuration`.
+            --
+            -- These used to be copied into felwood.flowerMinusDuration /
+            -- flowerUpDuration, and GetNodeState read the former as the RESPAWN
+            -- LENGTH. SN's stock minus-timer is 120s, so importing a profile
+            -- made every songflower count down two minutes and then report
+            -- itself available — the owner's "timers don't seem accurate", with
+            -- an import as the trigger. Songflower respawn is a game constant
+            -- (1500s) and is no longer configurable from anywhere, so there is
+            -- nothing on the SN side left to map: SN's value describes SN's
+            -- display model, not the game's respawn.
+            --
+            -- store.lua's MigrateSongflowerDefaults heals saves already poisoned
+            -- by an earlier import.
         },
         pullBar = {
             width     = t.pullTimerMainBarWidth,
@@ -1263,11 +1275,56 @@ function Import._Apply(settingsPartial, dataPartial)
 
     overwriteMerge(db, settingsPartial)
 
-    -- Data: overwrite the account graph, timers, manualLocations, tombstones.
+    -- Data: overwrite the account graph, manualLocations, tombstones.
     data.accounts = dataPartial.accounts
-    data.timers = dataPartial.timers
     overwriteMerge(data.manualLocations, dataPartial.manualLocations)
     overwriteMerge(data.deletedAIDs, dataPartial.deletedAIDs)
+
+    -- ROUND-17 (songflower accuracy audit, fix 7) — TIMERS MERGE, NOT REPLACE.
+    --
+    -- This used to be `data.timers = dataPartial.timers`, a wholesale swap. An
+    -- import is not a point-in-time restore of a dead profile: SN's saved
+    -- variables were written when the user last logged out of SN, so its node
+    -- epochs are routinely HOURS stale, while ours may have been set seconds ago
+    -- by a live pick, an NWB payload or a mesh peer. Replacing the table threw
+    -- every one of those away and handed the user a screen of expired flowers.
+    --
+    -- Node epochs now go through Timers.MarkNode, which already owns the
+    -- newest-wins rule and the overwrite guards — so a fresher local epoch
+    -- survives an import of an older one, and an import can still fill in nodes
+    -- we have never seen. Everything else in the timers block keeps the previous
+    -- replace semantics.
+    local incoming = dataPartial.timers or {}
+    local nodeKinds = { flower = true, tuber = true, dragon = true }
+    local Timers = ns.Timers
+    data.timers = data.timers or {}
+
+    for key, v in pairs(incoming) do
+        if not nodeKinds[key] then data.timers[key] = v end
+    end
+
+    for kind in pairs(nodeKinds) do
+        local src = incoming[kind]
+        if type(src) == "table" then
+            -- MarkNode reads and writes through the store, so the destination
+            -- table is guaranteed to exist by the time we call it.
+            data.timers[kind] = data.timers[kind] or {}
+            for i, epoch in pairs(src) do
+                local idx, z = tonumber(i), tonumber(epoch)
+                if idx and z and z > 0 then
+                    if Timers and Timers.MarkNode then
+                        -- "sn" trust + the standard network guards: an imported
+                        -- epoch is second-hand and must not stomp a local pick.
+                        Timers.MarkNode(kind, idx, z, "sn",
+                            Timers._netNodeOpts and Timers._netNodeOpts() or nil)
+                    elseif z > (data.timers[kind][idx] or 0) then
+                        -- Engine absent (bare VM): fall back to newest-wins.
+                        data.timers[kind][idx] = z
+                    end
+                end
+            end
+        end
+    end
 
     -- Backfill any structure the imported partials didn't set, from defaults.
     if Store.ApplyDefaults then
@@ -1727,6 +1784,75 @@ local function selfTest(verbose)
         check("nit merge first pass adds all", addedA == 2)
         local _, addedB = ns.Instances.MergeEntryList(listA, jg.entries)
         check("nit merge re-import idempotent (adds 0)", addedB == 0)
+    end
+
+    ------------------------------------------------------------------
+    -- ROUND-17 songflower accuracy audit: fixes 1 and 7 on the apply path.
+    ------------------------------------------------------------------
+
+    -- Fix 1: SN's minus-timer must NOT reach any respawn-affecting key. It used
+    -- to be copied into felwood.flowerMinusDuration, which GetNodeState read as
+    -- the respawn length — a stock SN install (120s) made every songflower count
+    -- two minutes and then read available.
+    do
+        local ts = Import._MapTimerSettings({
+            flowerMinusTimerDuration = 120,
+            flowerUpDuration = 5,
+            showFelwoodPins = true,
+        })
+        local fw = ts and ts.felwood
+        if fw then
+            check("SN flowerMinusTimerDuration is NOT imported", fw.flowerMinusDuration == nil)
+            check("SN flowerUpDuration is NOT imported", fw.flowerUpDuration == nil)
+            -- The rest of the felwood mapping is untouched by that removal.
+            check("other felwood mapping survives", fw.showFlowerPins == true)
+        end
+    end
+
+    -- Fix 7: node epochs merge, they do not replace. An SN profile's saved
+    -- variables were written at ITS last logout, so its flower epochs are
+    -- routinely hours stale while ours may be seconds old.
+    if ns.Store and ns.Store.GetData and ns.Store.GetTimers and ns.Timers then
+        local data = ns.Store.GetData()
+        local savedTimers = data.timers
+        local nowT = (ns.Timers._now and ns.Timers._now()) or os.time()
+
+        data.timers = {
+            flower = { [1] = nowT - 10, [2] = nowT - 1200 },
+            tuber  = {},
+            logs   = { rend = {}, onyH = {}, onyA = {} },
+            timerVersion = 9,
+            lastWeeklyResetAt = 42,
+        }
+        -- Clear trust so the local-hold guard is not what we are measuring here.
+        local tt = ns.Store.GetTimers()
+        tt.nodeTrust = {}
+
+        Import._Apply({}, {
+            accounts = {},
+            manualLocations = {},
+            deletedAIDs = {},
+            timers = {
+                -- node 1: STALE import vs our fresh live epoch -> ours survives
+                -- node 2: fresher than ours                    -> import wins
+                -- node 5: we have never seen it                -> import fills in
+                flower = { [1] = nowT - 5000, [2] = nowT - 300, [5] = nowT - 600 },
+                tuber  = { [3] = nowT - 400 },
+                logs   = { rend = {}, onyH = {}, onyA = {} },
+                timerVersion = 1,
+                lastWeeklyResetAt = 7,
+            },
+        })
+
+        local f = ns.Store.GetTimers().flower
+        check("import does NOT clobber a fresher live flower epoch", f[1] == nowT - 10)
+        check("a fresher imported epoch still wins", f[2] == nowT - 300)
+        check("an unseen node is filled in by the import", f[5] == nowT - 600)
+        check("imported tuber merges too", ns.Store.GetTimers().tuber[3] == nowT - 400)
+        -- Non-node timer fields keep the previous replace semantics.
+        check("non-node timer fields still replace", ns.Store.GetTimers().lastWeeklyResetAt == 7)
+
+        data.timers = savedTimers
     end
 
     if verbose and ns.Print then

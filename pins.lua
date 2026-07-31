@@ -33,6 +33,8 @@ local WHITE = "Interface\\Buttons\\WHITE8X8"
 local KIND_ICON = {
     flower = "Interface\\Icons\\INV_Misc_Herb_Fellotus",
     tuber  = "Interface\\Icons\\INV_Misc_Food_59",
+    -- Night Dragon's Breath (item 11952) — the item's own icon.
+    dragon = "Interface\\Icons\\INV_Misc_Herb_10",
 }
 
 local function fmtCountdown(sec)
@@ -83,7 +85,8 @@ ns:RegisterSelfTest("pins", function(verbose)
     local function check(c, m) if not c then pass = false; if verbose then ns:Print("  FAIL: " .. m) end end end
     check(fmtCountdown(90) == "1:30", "fmtCountdown 90 -> 1:30")
     check(fmtCountdown(5) == "5s", "fmtCountdown 5 -> 5s")
-    check(KIND_ICON.flower ~= nil and KIND_ICON.tuber ~= nil, "kind icons present")
+    check(KIND_ICON.flower ~= nil and KIND_ICON.tuber ~= nil and KIND_ICON.dragon ~= nil,
+        "kind icons present (flower/tuber/dragon)")
 
     -- Projection: fixture world coords -> expected minimap offsets (north-up).
     -- player @ (0,0); node 100yd north (worldX+100) and 100yd east (worldY-100),
@@ -124,6 +127,14 @@ end
 local function kindEnabled(kind)
     local c = felwoodCfg()
     if kind == "flower" then return c.showFlowerPins ~= false end
+    -- Dragons are new in ROUND-17 and have no options toggle yet, so they follow
+    -- the tuber switch: both are loot-detected Felwood herb nodes and a user who
+    -- wants one almost certainly wants the other. A dedicated `showDragonPins`
+    -- is honoured the moment options.lua grows one (not this branch's file).
+    if kind == "dragon" then
+        if c.showDragonPins ~= nil then return c.showDragonPins ~= false end
+        return c.showTuberPins ~= false
+    end
     return c.showTuberPins ~= false
 end
 
@@ -164,10 +175,18 @@ end
 -- BRAND_SPEC §5: pins are a diamond BACKING (state-tinted) with a PLAIN icon on
 -- top — the icon is never masked (masked-icon diamonds are >=24px hero spots
 -- only, never repeated). State tint lives on the backing, icon stays legible.
+-- ROUND-17 (songflower accuracy audit, fix 6): the node state machine gained
+-- "expired" and "stale" in place of an indefinite "up".
+--   down    -> respawning (amber)
+--   expired -> respawned within the last few minutes; plausibly standing there
+--              right now, so this is the state worth walking to (green)
+--   stale   -> respawned long ago, nobody has reported it since; we know
+--              nothing (faint, same as never-seen)
+-- "up" is still accepted so an older engine paired with this file keeps working.
 local function tintPin(pin, state)
     local back = pin._back
     if not back then return end
-    if state == "up" then
+    if state == "up" or state == "expired" then
         back:SetVertexColor(UI.Color("ok"))
     elseif state == "down" then
         back:SetVertexColor(warnColor())
@@ -242,10 +261,18 @@ local function ensureWorldPin(kind, index, node)
         GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
         GameTooltip:AddLine(node.label or (kind .. " " .. index), UI.Color("text"))
         local st = nodeState(kind, index)
-        if st.state == "up" then
-            GameTooltip:AddLine("Available", UI.Color("ok"))
-        elseif st.state == "down" then
+        if st.state == "down" then
             GameTooltip:AddLine("Respawns in " .. fmtCountdown(st.remaining), UI.Color("muted"))
+        elseif st.state == "expired" or st.state == "up" then
+            -- `remaining` is NEGATIVE in the expired band: how long ago it came
+            -- back. Shown as "-M:SS" so the age of the claim is visible rather
+            -- than an open-ended "Available" that was previously never revoked.
+            local ago = st.remaining and -st.remaining or 0
+            if ago > 0 then
+                GameTooltip:AddLine("Respawned -" .. fmtCountdown(ago) .. " ago", UI.Color("ok"))
+            else
+                GameTooltip:AddLine("Available", UI.Color("ok"))
+            end
         else
             GameTooltip:AddLine("No data", UI.Color("faint"))
         end
@@ -301,6 +328,11 @@ local function refreshWorldPins()
                     if st.state == "down" then
                         pin._timer:SetText(fmtCountdown(st.remaining))
                         pin._timer:SetTextColor(UI.Color("muted"))
+                    elseif st.state == "expired" then
+                        -- Negative countdown, e.g. "-1:20" — how long since it
+                        -- respawned. Reference behaviour (NWB §6.4 state 3).
+                        pin._timer:SetText("-" .. fmtCountdown(-st.remaining))
+                        pin._timer:SetTextColor(UI.Color("ok"))
                     else
                         pin._timer:SetText("")
                     end

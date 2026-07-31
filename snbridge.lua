@@ -253,10 +253,32 @@ local SN_LOG_BUFF = {
     nefLogH = "nefH", nefLogA = "nefA", zgLog = "zg",
 }
 
+-- Guards applied to every node write from SN. Resolved through the engine so
+-- there is exactly one definition of "second-hand node data" (timers.lua), and
+-- degrades to nil — plain newest-wins — in a bare VM without the engine.
+local function netOpts()
+    local T = ns.Timers
+    return (T and T._netNodeOpts and T._netNodeOpts()) or nil
+end
+
 -- Songflower/node translation. Accepts ONLY unambiguous indexed-epoch shapes and
 -- routes through the public Timers.MarkNode surface with "sn" trust. Returns the
--- number of node picks applied. Defensive/forward-looking: the current real
--- capture carries no node data, so this is a no-op against today's fixture.
+-- number of node picks applied.
+--
+-- ═══ NOT SOURCED FROM A WIRE CAPTURE (audit item 8, owner-acknowledged) ═══
+-- Everything below this line is INFERENCE, not observation. Our SN capture
+-- carries no node data at all, so the key shapes this function accepts — a
+-- `flower`/`tuber` sub-table of index->epoch, and flat `flowerN`/`tuberN` keys —
+-- are guesses at what SN *might* send, modelled on how it stores nodes locally.
+-- No SN payload we have ever decoded has exercised a single branch of it, and
+-- the fixture-backed self-tests prove only that our own synthetic shapes are
+-- handled, NOT that they match SN.
+--
+-- Consequence: treat a non-zero return from here as unverified. Decoding SN's
+-- real node format needs a live wire capture from a client running SN with
+-- Felwood timers set; until someone produces one, this stays defensive
+-- scaffolding and must not be described as SN node support.
+-- ═════════════════════════════════════════════════════════════════════════
 local function markNodesFrom(map, kind)
     if type(map) ~= "table" then return 0 end
     local n = 0
@@ -264,7 +286,10 @@ local function markNodesFrom(map, kind)
         local i = tonumber(idx)
         local z = tonumber(epoch)
         if i and i >= 1 and z and z > 1000000000 then
-            if ns.Timers.MarkNode(kind, i, z, "sn") then n = n + 1 end
+            -- Standard network guards (audit fix 2): an SN-relayed epoch is
+            -- second-hand and may not stomp our own pick inside its respawn,
+            -- nor re-report the same pick within 10s.
+            if ns.Timers.MarkNode(kind, i, z, "sn", netOpts()) then n = n + 1 end
         end
     end
     return n
@@ -283,9 +308,9 @@ local function translateNodes(payload)
             local ti = k:match("^tuber(%d+)$")
             local z = tonumber(v)
             if fi and z and z > 1000000000 then
-                if ns.Timers.MarkNode("flower", tonumber(fi), z, "sn") then n = n + 1 end
+                if ns.Timers.MarkNode("flower", tonumber(fi), z, "sn", netOpts()) then n = n + 1 end
             elseif ti and z and z > 1000000000 then
-                if ns.Timers.MarkNode("tuber", tonumber(ti), z, "sn") then n = n + 1 end
+                if ns.Timers.MarkNode("tuber", tonumber(ti), z, "sn", netOpts()) then n = n + 1 end
             end
         end
     end
