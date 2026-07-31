@@ -82,27 +82,43 @@ function Dashboard.FormatMSS(sec)
     return string.format("%d:%02d", math.floor(sec / 60), sec % 60)
 end
 
--- Map a node state ({ state = "up"/"down"/"unknown", remaining = n }) to hero-cell
--- content. Returns (heroText, heroColorToken, captionColorToken). Pure.
--- ROUND-17b: the engine's new EXPIRED and STALE states used to fall through the bare else
--- and render as "UP?", which claimed a flower was up when it was not.
---   unknown / stale -> em-dash, faint   (stale = the up-window lapsed; we no longer know)
---   down            -> ShortDur remaining (amber under a minute)
---   expired         -> "-M:SS" counting through the expired window, warn
---   up              -> "UP?"
+-- Map a node state ({ state, remaining }) to hero-cell content.
+-- Returns (heroText, heroColorToken, captionColorToken). Pure.
+-- ROUND-17c (owner: 'instead of "UP?" if we dont know the timer, we should display
+-- "no data", grey text'): "UP?" is GONE. An unverified node is not an up node, so every
+-- uncertain path — no epoch recorded (`unknown`), the up-window lapsed (`stale`), or any
+-- state this renderer does not recognise — reads "No data" in faint grey, the same
+-- treatment the world-buff rows use. Only a LIVE-VERIFIED `up` earns green "Up".
+--   up              -> "Up", ok green            (confirmed available)
+--   down            -> ShortDur remaining        (amber under a minute)
+--   expired         -> "-M:SS" through the expired window, warn
+--   unknown / stale -> "No data", faint          (and so does anything unrecognised)
 -- `remaining` for `expired` is time SINCE the window opened; abs() so either sign
 -- convention renders the same negative-looking counter.
 function Dashboard.SongflowerCellContent(st)
     local state = st and st.state
-    if not st or state == "unknown" or state == "stale" then
-        return "\226\128\148", "faint", "faint"   -- em-dash, no data
+    if state == "up" then
+        return "Up", "ok", "muted"
     elseif state == "down" then
         local rem = st.remaining or 0
         return Dashboard.ShortDur(rem), (rem < 60) and "warn" or "text", "muted"
     elseif state == "expired" then
         return "-" .. Dashboard.FormatMSS(math.abs(st.remaining or 0)), "warn", "muted"
     end
-    return "UP?", "ok", "muted"
+    -- unknown / stale / nil / unrecognised — never claim the node is up.
+    return "No data", "faint", "faint"
+end
+
+-- ROUND-17c: which meta bucket a node counts in. The SONGFLOWERS meta line used a bare
+-- `else` that swept BOTH `expired` and `stale` into "up" — so a node we had lost track of
+-- was advertised as up (the owner's "7 up" beside seven uncertain cells). A node only
+-- counts as UP when it is verified up or inside its expired window (it has demonstrably
+-- respawned); everything uncertain counts as unknown. Pure. -> "up" / "down" / "unknown".
+function Dashboard.SongflowerMetaBucket(st)
+    local state = st and st.state
+    if state == "up" or state == "expired" then return "up" end
+    if state == "down" then return "down" end
+    return "unknown"
 end
 
 -- World-buff rows. Onyxia rows carry a faction crest; `title` names the pop-log.
@@ -158,7 +174,8 @@ function Dashboard.SongflowerTipState(st)
     if state == "expired" then
         return "Expired \226\128\148 " .. Dashboard.FormatMSS(math.abs(st.remaining or 0)), "warn"
     end
-    return "No data", "faint"
+    -- Round-17c: the hover says WHY the cell is blank — nothing has been recorded for it.
+    return "No data recorded", "faint"
 end
 
 -- ── DMF readout ink + copy (round-16b addendum) ──────────────────────────────
@@ -580,12 +597,17 @@ function TimersDock.Attach(parent)
         local nUp, nDown, nUnknown = 0, 0, 0
         for _, cell in ipairs(D._sfCells) do
             local st = T and T.GetNodeState and T.GetNodeState(cell._nodeKey)
+            -- Round-17c: SongflowerCellContent now owns the confirmed-up wording too, so
+            -- the old `if st.state == "up" then heroText = "Up"` override is gone — one
+            -- source of truth for the cell text.
             local heroText, heroTok = Dashboard.SongflowerCellContent(st)
-            if st and st.state == "up" then heroText = "Up" end
             cell.st:SetText(heroText); cell.st:SetTextColor(UI.Color(heroTok))
-            if not st or st.state == "unknown" then nUnknown = nUnknown + 1
-            elseif st.state == "down" then nDown = nDown + 1
-            else nUp = nUp + 1 end
+            -- ...and the meta line buckets through the same pure rule, so the count can
+            -- never disagree with the cells (a stale node is unknown, not up).
+            local bucket = Dashboard.SongflowerMetaBucket(st)
+            if bucket == "up" then nUp = nUp + 1
+            elseif bucket == "down" then nDown = nDown + 1
+            else nUnknown = nUnknown + 1 end
         end
         sfMeta:SetText(("%d up \194\183 %d respawning \194\183 %d unknown"):format(nUp, nDown, nUnknown))
     end
@@ -646,10 +668,11 @@ local function testCellContent(fails)
     ck(Dashboard.ShortDur(60) == "1m",  "ShortDur 60 -> '1m'")
     ck(Dashboard.ShortDur(18 * 60) == "18m", "ShortDur 1080 -> '18m'")
     ck(Dashboard.ShortDur(2 * 3600) == "2h", "ShortDur 7200 -> '2h'")
+    -- ROUND-17c: uncertainty reads "No data" in grey, never "UP?" and never a bare dash.
     local t, c, cap = Dashboard.SongflowerCellContent(nil)
-    ck(t == EMDASH and c == "faint" and cap == "faint", "no state -> em-dash / faint / faint")
+    ck(t == "No data" and c == "faint" and cap == "faint", "no state -> 'No data' / faint")
     t, c = Dashboard.SongflowerCellContent({ state = "unknown" })
-    ck(t == EMDASH and c == "faint", "unknown -> em-dash / faint")
+    ck(t == "No data" and c == "faint", "unknown -> 'No data' / faint")
     t, c, cap = Dashboard.SongflowerCellContent({ state = "down", remaining = 18 * 60 })
     ck(t == "18m" and c == "text" and cap == "muted", "down >60s -> '18m' / cream / muted")
     t, c = Dashboard.SongflowerCellContent({ state = "down", remaining = 45 })
@@ -657,7 +680,7 @@ local function testCellContent(fails)
     ck(select(2, Dashboard.SongflowerCellContent({ state = "down", remaining = 60 })) == "text", "60s boundary is cream")
     ck(select(2, Dashboard.SongflowerCellContent({ state = "down", remaining = 59 })) == "warn", "59s is amber")
     t, c = Dashboard.SongflowerCellContent({ state = "up" })
-    ck(t == "UP?" and c == "ok", "up -> 'UP?' / ok green")
+    ck(t == "Up" and c == "ok", "CONFIRMED up -> 'Up' / ok green (the only green state)")
 
     -- ROUND-17b: the engine's expired/stale states used to fall through to "UP?", which
     -- claimed a flower was up when it was not. They now render distinctly.
@@ -668,18 +691,45 @@ local function testCellContent(fails)
     t = Dashboard.SongflowerCellContent({ state = "expired", remaining = 0 })
     ck(t == "-0:00", "expired at the window edge -> '-0:00'")
     t, c, cap = Dashboard.SongflowerCellContent({ state = "stale" })
-    ck(t == EMDASH and c == "faint" and cap == "faint", "stale -> em-dash / faint (like unknown)")
-    -- Regression guard: neither new state may read as UP.
-    for _, s in ipairs({ "expired", "stale" }) do
-        ck(Dashboard.SongflowerCellContent({ state = s, remaining = 60 }) ~= "UP?",
-            s .. " must NOT render as 'UP?'")
+    ck(t == "No data" and c == "faint" and cap == "faint", "stale -> 'No data' / faint (like unknown)")
+
+    -- ROUND-17c regression guards: "UP?" is retired, and nothing uncertain may read green.
+    ck(EMDASH ~= nil, "em-dash constant retained for other cells")
+    for _, s in ipairs({ "expired", "stale", "unknown", "wat" }) do
+        local txt, tok = Dashboard.SongflowerCellContent({ state = s, remaining = 60 })
+        ck(txt ~= "UP?", s .. " must never render 'UP?'")
+        if s ~= "expired" then
+            ck(txt == "No data" and tok == "faint", s .. " -> 'No data' / faint")
+        end
+    end
+    -- An UNRECOGNISED state must fall to No data, never to green up.
+    ck(select(2, Dashboard.SongflowerCellContent({ state = "brand-new-state" })) ~= "ok",
+        "unrecognised state must not be green")
+
+    -- Meta buckets: the count must agree with what the cells show. Only verified-up and
+    -- expired (demonstrably respawned) count as UP; everything uncertain is unknown.
+    ck(Dashboard.SongflowerMetaBucket({ state = "up" }) == "up", "up -> up bucket")
+    ck(Dashboard.SongflowerMetaBucket({ state = "expired" }) == "up", "expired -> up bucket")
+    ck(Dashboard.SongflowerMetaBucket({ state = "down" }) == "down", "down -> down bucket")
+    ck(Dashboard.SongflowerMetaBucket({ state = "stale" }) == "unknown",
+        "stale -> UNKNOWN bucket (the owner's '7 up' bug)")
+    ck(Dashboard.SongflowerMetaBucket({ state = "unknown" }) == "unknown", "unknown -> unknown bucket")
+    ck(Dashboard.SongflowerMetaBucket(nil) == "unknown", "nil -> unknown bucket")
+    ck(Dashboard.SongflowerMetaBucket({ state = "wat" }) == "unknown", "unrecognised -> unknown bucket")
+    -- Cross-check: any node the cell calls "No data" must NOT be counted as up.
+    for _, s in ipairs({ "unknown", "stale", "wat" }) do
+        local txt = Dashboard.SongflowerCellContent({ state = s })
+        if txt == "No data" then
+            ck(Dashboard.SongflowerMetaBucket({ state = s }) ~= "up",
+                s .. ": cell says No data so the meta must not count it up")
+        end
     end
 
     -- The hover mirrors the cell rather than saying "No data" over a live counter.
     local line, tok = Dashboard.SongflowerTipState({ state = "expired", remaining = 125 })
     ck(line == "Expired \226\128\148 2:05" and tok == "warn", "expired hover -> 'Expired — 2:05'")
     line, tok = Dashboard.SongflowerTipState({ state = "stale" })
-    ck(line == "No data" and tok == "faint", "stale hover -> 'No data'")
+    ck(line == "No data recorded" and tok == "faint", "stale hover -> 'No data recorded'")
 end
 
 -- Round-16c: the songflower cell hover state line (the full name lives beside it).
@@ -691,10 +741,12 @@ local function testSongflowerTip(fails)
     ck(line == "Respawning \226\128\148 13m" and tok == "warn", "down -> 'Respawning — 13m' / warn")
     line = Dashboard.SongflowerTipState({ state = "down", remaining = 45 })
     ck(line == "Respawning \226\128\148 45s", "down under a minute -> seconds")
+    -- Round-17c: the hover says WHY it is blank ("No data recorded"), while the cell
+    -- itself reads the shorter "No data" that fits the ~57px cell.
     line, tok = Dashboard.SongflowerTipState({ state = "unknown" })
-    ck(line == "No data" and tok == "faint", "unknown -> 'No data' / faint")
+    ck(line == "No data recorded" and tok == "faint", "unknown hover -> 'No data recorded' / faint")
     line, tok = Dashboard.SongflowerTipState(nil)
-    ck(line == "No data" and tok == "faint", "nil state -> 'No data' / faint (no error)")
+    ck(line == "No data recorded" and tok == "faint", "nil state hover -> 'No data recorded' (no error)")
 end
 
 -- Round-16b addendum: the DMF readout's caption prefix + family-hue ink. Pure.
