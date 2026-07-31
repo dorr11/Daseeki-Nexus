@@ -45,9 +45,13 @@ local STATUS_X    = 210       -- round-18: buff-row STATUS left rail, measured f
                               -- the Dragonslayer") at the default font scale. Was effectively
                               -- ~486 (the left column's far edge) before the owner's fix.
 local BUFF_ROW_H  = 18        -- buff row height (round-4: 18 so all 10 slots fit the pane)
-local BUFF_ROW_GAP = 1        -- round-17: 2 -> 1 (pitch 20 -> 19). The 10-row list needs
-                              -- 10*18+9*1 = 189px; this is the 6px reclaimed to pay for
-                              -- GRID_GAP below (the pane was down to 6px of slack).
+local BUFF_ROW_GAP = 2        -- ROUND-19: restored 1 -> 2 (pitch 19 -> 20). Round-17 had cut
+                              -- this to buy the header-rule padding, under protest; the
+                              -- round-19 pane growth repays that debt. 10*18+9*2 = 198px.
+local LOCK_H      = 13        -- round-19: the bottom-left RAID LOCKOUTS line
+local LOCK_GAP    = 6         -- ...and the air between it and the buff list
+local NOTE_H      = 66        -- round-19: NOTE grew into the space RAID LOCKOUTS vacated
+                              -- in the right column (22 -> 66, multi-line)
 -- Round-17 (owner, yellow arrow): the header's bottom hairline was OVERLAPPING the column
 -- eyebrows. The rule sits HRULE_GAP below the header band, but the grid started at the
 -- header's bottom edge (gridTop = -(PAD_V+HEADER_H)), i.e. 6px ABOVE the rule — so the
@@ -216,14 +220,17 @@ end
 --   listH      = n*BUFF_ROW_H + (n-1)*BUFF_ROW_GAP     (no trailing gap)
 --   limit      = paneH - PAD_V                         (bottom padding)
 -- Returns the measurements + `fits` and the leftover slack.
+-- ROUND-19: the limit now also reserves the bottom-left RAID LOCKOUTS line, so `fits`
+-- means "the 10-row list AND the lockout line both clear the bottom pad".
 function Detail.BuffListFit(paneH, rows)
-    paneH = paneH or 292          -- detail.pane height (LAYOUT_SPEC)
+    paneH = paneH or 315          -- detail.pane height (LAYOUT_SPEC, round-19)
     rows  = rows or 10            -- all 10 aura slots applicable = the worst case
     local listTop = -Detail.GridTop() + BUFF_TOP
     local listH   = rows * BUFF_ROW_H + (rows - 1) * BUFF_ROW_GAP
-    local limit   = paneH - PAD_V
+    local limit   = paneH - PAD_V - (LOCK_H + LOCK_GAP)   -- lockout line is reserved
     return {
         listTop = listTop, listH = listH, limit = limit,
+        lockH   = LOCK_H + LOCK_GAP,
         bottom  = listTop + listH,
         slack   = limit - (listTop + listH),
         fits    = (listTop + listH) <= limit,
@@ -487,7 +494,9 @@ function Detail.Attach(parent)
     -- Buff ROW-LIST container (tagged for the geometry checker) below the eyebrow.
     local buffRows = CreateFrame("Frame", nil, leftCol)
     buffRows:SetPoint("TOPLEFT", leftCol, "TOPLEFT", 0, -BUFF_TOP)
-    buffRows:SetPoint("BOTTOMRIGHT", leftCol, "BOTTOMRIGHT", 0, 0)
+    -- Round-19: the list now stops above the bottom-left RAID LOCKOUTS line (offset by
+    -- creation-order-independent arithmetic rather than anchoring to a later-built frame).
+    buffRows:SetPoint("BOTTOMRIGHT", leftCol, "BOTTOMRIGHT", 0, LOCK_H + LOCK_GAP)
     tag(buffRows, "detail.buffrows")
     D.buffRows = buffRows
 
@@ -560,13 +569,20 @@ function Detail.Attach(parent)
     D.chronoVal, D.hearthVal = chronoVal, hearthVal
     D.chronoIcon, D.hearthIcon = chronoIcon, hearthIcon
 
-    -- RAID LOCKOUTS block (top-right), sharing the top rail.
-    local raidLbl = microLabel(rightCol, "RAID LOCKOUTS")
-    raidLbl:SetPoint("TOPLEFT", rightCol, "TOPLEFT", LOCK_X, 0)
+    -- ROUND-19 (owner, deferred from round-18): RAID LOCKOUTS moves OUT of the right
+    -- column's top rail and into the detail pane's BOTTOM-LEFT, under the buff list. It is
+    -- now ONE line — the eyebrow on the left, the 7-key tally beside it — so it costs
+    -- LOCK_H + LOCK_GAP (19px) instead of the ~34px a stacked label+tally block would.
+    -- The three-state ink (round-17: locked danger / attuned ok / not-attuned faint) and
+    -- TALLY_ORDER are unchanged; only the home moved. This is what freed the right column
+    -- for the NOTE box to grow.
+    local raidLbl = microLabel(leftCol, "RAID LOCKOUTS")
+    raidLbl:SetPoint("BOTTOMLEFT", leftCol, "BOTTOMLEFT", 0, 0)
     tag(raidLbl, "detail.raidlabel")
-    -- Round-13: +6 gap below the RAID LOCKOUTS header (-6 -> -12), matching the others.
-    local tallyFS = fstr(rightCol, "numeral"); tallyFS:SetPoint("TOPLEFT", raidLbl, "BOTTOMLEFT", 0, -12)
-    tallyFS:SetPoint("RIGHT", rightCol, "RIGHT", 0, 0); tallyFS:SetJustifyH("LEFT"); tallyFS:SetWordWrap(true)
+    local tallyFS = fstr(leftCol, "numeral")
+    tallyFS:SetPoint("LEFT", raidLbl, "RIGHT", 10, 0)
+    tallyFS:SetPoint("RIGHT", leftCol, "RIGHT", 0, 0)
+    tallyFS:SetJustifyH("LEFT"); tallyFS:SetWordWrap(false)
     D.tallyFS = tallyFS
 
     -- NOTE block — PINNED TO THE PANE BOTTOM (owner round-4 item 2): the editbox sits
@@ -575,7 +591,12 @@ function Detail.Attach(parent)
     local noteBox = CreateFrame("EditBox", nil, rightCol, "BackdropTemplate")
     noteBox:SetPoint("BOTTOMLEFT", rightCol, "BOTTOMLEFT", 0, 0)
     noteBox:SetPoint("RIGHT", rightCol, "RIGHT", 0, 0)
-    noteBox:SetHeight(22); noteBox:SetAutoFocus(false)
+    -- ROUND-19 priority 3: RAID LOCKOUTS vacated the right column's top-right, so NOTE
+    -- claims that space — 22 -> NOTE_H (66), and MULTI-LINE so the height is actually
+    -- usable text rather than one line floating in a tall box. Enter still commits (the
+    -- OnEnterPressed handler below clears focus), so the interaction is unchanged.
+    noteBox:SetHeight(NOTE_H); noteBox:SetAutoFocus(false)
+    noteBox:SetMultiLine(true)
     local noteLbl = microLabel(rightCol, "NOTE")
     noteLbl:SetPoint("BOTTOMLEFT", noteBox, "TOPLEFT", 0, 4)
     tag(noteLbl, "detail.notelabel")
@@ -922,18 +943,19 @@ local function testDetailGeometry(fails)
     ck(Detail.HeaderRuleOffset() == 44 + 12,
         "...which is exactly CHIP_H + LIST_PAD, i.e. the first card's top rail")
 
-    local f = Detail.BuffListFit(292, 10)
-    ck(f.listH == 189, "10 rows at pitch 19 = 189px (got " .. tostring(f.listH) .. ")")
+    -- ROUND-19: pane grew 292 -> 315 (window 620 -> 643), the 2px row gap is restored, and
+    -- the bottom-left RAID LOCKOUTS line is reserved out of the usable height.
+    local f = Detail.BuffListFit(315, 10)
+    ck(f.listH == 198, "10 rows at the RESTORED pitch 20 = 198px (got " .. tostring(f.listH) .. ")")
     ck(f.listTop == 86, "list starts at 86 (62 grid + 24 eyebrow offset)")
-    ck(f.limit == 280, "usable bottom is 280 (292 pane - 12 pad)")
-    ck(f.fits == true, "the 10-row list still fits the 292px pane")
-    ck(f.slack == 5, "5px slack remains (got " .. tostring(f.slack) .. ")")
-    -- The 2px reclaimed by the alignment is still NOT enough to restore the 2px row gap
-    -- (round-17 took it under protest): 198 > 194 available. Pinned so the next attempt
-    -- to relax it fails loudly rather than silently clipping the 10th buff row.
-    local wide = 10 * 18 + 9 * 2                    -- 198 = the pre-round-17 list height
-    ck(f.listTop + wide > f.limit, "a 2px row gap would STILL overflow (short by "
-        .. tostring(f.listTop + wide - f.limit) .. "px)")
+    ck(f.lockH == 19, "lockout line reserves 19px (13 line + 6 gap)")
+    ck(f.limit == 284, "usable bottom is 284 (315 pane - 12 pad - 19 lockout)")
+    ck(f.fits == true, "10 rows AND the lockout line fit the 315px pane")
+    ck(f.slack == 0, "the pane is sized EXACTLY (0 slack, got " .. tostring(f.slack) .. ")")
+    -- 315 is the minimum that works: one px less and the 10th row collides with lockouts.
+    ck(Detail.BuffListFit(314, 10).fits == false, "314 would NOT fit — 315 is the true minimum")
+    -- And the debt really is repaid: the old 1px gap is no longer what makes it fit.
+    ck(198 - (10 * 18 + 9 * 1) == 9, "restoring the gap cost 9px, funded by the +23 growth")
 end
 
 -- Row-list STATUS matrix (owner round-3): map a BuffTileState result -> (text, tok).

@@ -24,8 +24,16 @@ ns.Dashboard = Dashboard
 -- titlebar (tabs live IN the titlebar; the former tab-band + status-band are gone).
 -- Round-6: grew to 1120 wide for the panel-layer layout (cards panel + detail panel +
 -- the two-panel instances/timers bottom row need the extra room to stay legible).
-local DEFAULT_W, DEFAULT_H = 1120, 620
-local MIN_W, MIN_H = 1120, 620
+-- ROUND-19: height 620 -> 643 (+23). The detail pane had to grow to seat RAID LOCKOUTS
+-- bottom-left AND repay round-17's 1px buff-row gap, but measurement showed the bottom row
+-- has ZERO px to give: the timers dock's fixed stack floors at 265 and BOTTOM_H is already
+-- 268 (3px of air above its footer), and BOTTOM_H governs the instances panel too. Growing
+-- the window is the only funding source that squeezes nothing — the dock, the instances
+-- panel and every other metric are untouched. The window is fixed-size (not resizable), so
+-- this is purely 23 more pixels of content. Arithmetic:
+--     body = 643 - HEADER_H 34 = 609 = DETAIL_H 315 + GUTTER 10 + BOTTOM_H 268 + 2*MARGIN 16
+local DEFAULT_W, DEFAULT_H = 1120, 643
+local MIN_W, MIN_H = 1120, 643
 local HEADER_H = 34    -- round-13: tab strip removed, so the titlebar tightens (was 44);
                        -- the reclaimed 10px goes to the body (DETAIL_H grows to match)
 local TAB_H    = 34    -- retained constant (unused by the fixed layout)

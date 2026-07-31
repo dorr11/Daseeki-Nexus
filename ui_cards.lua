@@ -42,9 +42,13 @@ local MARGIN     = 8        -- window edge -> outer panels (tight left margin, i
 local GUTTER     = 10       -- base-colored gap between panels
 local CARDS_W    = 352      -- cards panel width (shifted left; right side gains room)
 local RIGHT_X    = MARGIN + CARDS_W + GUTTER   -- 370: left edge of the right cluster
-local DETAIL_H   = 292      -- detail panel height (upper right); round-13: +10 to absorb
-                            -- the reclaimed header space (HEADER_H 44->34) so the right
-                            -- cluster still fills to the cards panel's bottom edge
+local DETAIL_H   = 315      -- detail panel height (upper right). Round-13: +10 absorbing the
+                            -- reclaimed header space (HEADER_H 44->34). ROUND-19: 292 -> 315
+                            -- (+23), funded by the window growing 620 -> 643, to seat RAID
+                            -- LOCKOUTS bottom-left and restore the 2px buff-row gap:
+                            --   86 (top stack) + 198 (10 rows @ pitch 20) + 19 (lockout
+                            --   line + gap) + 12 (bottom pad) = 315, exactly.
+                            -- BOTTOM_H is deliberately UNCHANGED — the dock is at its floor.
 local BOTTOM_H   = 268      -- bottom-row panel height (instances + timers)
 local INST_W     = 364      -- instances panel width (bottom-left of the right cluster)
 
