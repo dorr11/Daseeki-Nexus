@@ -45,7 +45,11 @@ Mesh.REASM_TIMEOUT   = 10           -- chunk reassembly timeout (s)
 Mesh.REASM_TIMEOUT_BIG = 60         -- large settings payload window (s)
 Mesh.FAIL_SKIP_COUNT = 5            -- consecutive fails -> skip target
 Mesh.FAIL_SKIP_TIME  = 10           -- skip duration (s)
-Mesh.DIRECT_BUDGET   = 4            -- direct state sends before delegating
+Mesh.DIRECT_BUDGET   = 4            -- FLOOR for direct sends (A10.9: the live
+                                    -- token count raises it, never lowers it)
+Mesh.PEER_TIMEOUT    = 30           -- A1.3: roster entry expires after 30s silence
+Mesh.PEER_SWEEP_INTERVAL = 5        -- A1.3: sweep cadence (spec §2.3)
+Mesh.RELAY_MAX_AGE   = 10           -- A10.8: drop relays older than 10s (spec §9.4)
 Mesh.CHUNK_DATA_MAX  = 230          -- payload bytes/chunk (255 - envelope room)
 
 -- Bucket cap / refill per prefix (spec: cap 8, refill 1/s).
@@ -206,6 +210,96 @@ function Mesh.HashInstances(charMap)
     return fnv1a(joinList(parts, "\30"))
 end
 
+----------------------------------------------------------------------
+-- A10.1 — state-push CHANGE FILTER (spec §3.3 + §9.4)
+--
+-- THE bug this closes: Tracker.Capture fired STATE_CHANGED unconditionally at
+-- the end of every capture, and capture is bound to UNIT_AURA / BAG_UPDATE_* /
+-- resting / flags / XP. In a raid that is a continuous stream of full-state
+-- whispers to N direct peers PLUS two backup relays, which saturates an
+-- 8-token / 1-per-second bucket within seconds and starves the heartbeat behind
+-- it. Starved heartbeats are exactly what makes live peers read OFFLINE.
+--
+-- The filter is a CONTENT hash of the record. Volatile bookkeeping is excluded
+-- by construction — no message id, no lastSeen / lastDataUpdate / ownerEpoch —
+-- so a capture that changed nothing but the clock hashes identical and is
+-- dropped. Durations are COARSENED so a buff ticking down does not re-broadcast
+-- every second:
+--   * aura durations  DIV 60  (spec §3.3: "duration floor-divided by 60")
+--   * cooldowns and raid lockouts DIV 300 (spec §9.6's 5-minute divisor).
+--     The reference stores cooldown START EPOCHS (stable); we store REMAINING
+--     seconds (A9.1, out of scope here), so the 5-minute divisor is the faithful
+--     analogue — it is what stops a decaying hearthstone timer churning the hash.
+--
+-- OURS (documented divergence): `level` is in the digest. The reference's §3.3
+-- list omits it, but a level-up must reach peers and it is a once-per-character
+-- event, so it cannot churn. XP / rested XP are deliberately NOT in the digest:
+-- they tick constantly while questing and would defeat the whole filter.
+----------------------------------------------------------------------
+
+Mesh.AURA_COARSE = 60    -- aura durations round to the minute
+Mesh.CD_COARSE   = 300   -- cooldowns / lockouts round to 5 minutes
+
+local function hashBool(v) return v and "1" or "0" end
+local function hashCoarse(v, div)
+    return tostring(math.floor((tonumber(v) or 0) / div))
+end
+
+-- PURE: the canonical digest INPUT for a character record. Exposed separately
+-- from the hash so a failing test can print the two strings and diff them.
+function Mesh.StateHashInput(rec)
+    if type(rec) ~= "table" then return "" end
+    local parts = {
+        hashBool(rec.chronoboonActive),
+        hashBool(rec.dmfInBoon),
+        hashBool(rec.dmfCooldownActive),
+        hashBool(rec.pvpFlagged),
+        hashBool(rec.isResting),
+        hashBool(rec.inInstance),
+        hashBool(rec.soulstoneReady),
+        tostring(rec.location or ""),
+        tostring(rec.level or 0),
+        tostring(rec.shardCount or 0),
+        tostring(rec.boonCount or 0),
+        hashCoarse(rec.hearthstoneCD, Mesh.CD_COARSE),
+        hashCoarse(rec.itemCooldown, Mesh.CD_COARSE),
+    }
+    local keys = (Store and Store.RAID_KEYS) or {}
+    for i = 1, #keys do
+        local expiry = rec.raidLockouts and rec.raidLockouts[keys[i]]
+        parts[#parts + 1] = hashCoarse(expiry, Mesh.CD_COARSE)
+    end
+    local auras = rec.auraStates or {}
+    for i = 1, 10 do
+        local a = auras[i]
+        if a then
+            parts[#parts + 1] = i .. ":" .. tostring(a.source or 0)
+                .. ":" .. tostring(a.option or 0)
+                .. ":" .. hashCoarse(a.duration, Mesh.AURA_COARSE)
+        else
+            parts[#parts + 1] = i .. ":-"
+        end
+    end
+    return joinList(parts, "\31")
+end
+
+-- PURE: 8-hex content hash of a record, or nil for a non-record.
+function Mesh.StateHash(rec)
+    if type(rec) ~= "table" then return nil end
+    return fnv1a(Mesh.StateHashInput(rec))
+end
+
+-- A10.9 — PURE: direct-send budget from the LIVE state-prefix token count.
+-- Spec §9.4: "whispers directly to as many targets as it has tokens for". We
+-- keep DIRECT_BUDGET (4) as the FLOOR so a momentarily-drained bucket can never
+-- delegate everything, and BUCKET_CAP as the ceiling.
+function Mesh.DirectBudget(tokens)
+    local n = math.floor(tonumber(tokens) or 0)
+    if n < Mesh.DIRECT_BUDGET then n = Mesh.DIRECT_BUDGET end
+    if n > Mesh.BUCKET_CAP then n = Mesh.BUCKET_CAP end
+    return n
+end
+
 -- Compute the hash bundle we advertise for an account bucket.
 function Mesh.AccountHashes(bucket)
     local seg = bucket and bucket.segments or {}
@@ -323,6 +417,13 @@ Mesh._disco = {          -- last discovery ping/pong timestamps (for /dsn debug 
 -- this client CHANNEL distribution silently drops addon messages, so discovery
 -- pings and heartbeats travel by WHISPER to members we learn from the channel
 -- ROSTER and from CHAT_MSG_CHANNEL_JOIN/LEAVE notices (see §Presence roster).
+Mesh._lastPeerSweep  = 0    -- ts of the last peer timeout sweep (A1.3)
+Mesh._lastPush       = {}   -- [nameRealm] = { hash, peers } of the last push.
+                            -- Keyed per character: IsSelfRecord admits ANY
+                            -- character in our own bucket, so a single slot
+                            -- could let two alts alias each other's hash.
+Mesh._pushSuppressed = 0    -- telemetry: change-filter suppressions (debug)
+Mesh._relayAgeDrops  = 0    -- telemetry: relays dropped by the 10s age gate
 Mesh._pingCooldowns  = {}   -- [name] = ts we last whisper-pinged that name
 Mesh._lastRosterSweep = 0   -- ts of the last full roster sweep (debug telemetry)
 
@@ -475,7 +576,69 @@ function Mesh.NotePeer(aid, name, now)
     if name and name ~= "" then p.name = name end
     p.lastSeen = now or (Store and Store.Now and Store.Now()) or 0
     p.online = true
+    -- A peer that answers again clears both offline latches (timeout sweep and
+    -- channel-leave notice), exactly as the reference re-admits on any inbound.
+    p.timedOut = nil
+    p.presenceStale = nil
     return p
+end
+
+----------------------------------------------------------------------
+-- A1.3 — peer timeout sweep (spec §2.3)
+--
+-- Before this, `online` was set TRUE in NotePeer and set FALSE in exactly one
+-- place: a CHAT_MSG_CHANNEL_LEAVE notice. A peer that crashed, disconnected or
+-- lost the channel without a leave notice reaching us stayed "online" FOREVER,
+-- so we kept whispering state at a dead target — burning token budget and
+-- racking up the 5-failure skip. The reference expires a roster entry after 30s
+-- of silence on a 5s sweep; this is that sweep.
+----------------------------------------------------------------------
+
+-- PURE (given a peers table + a clock): mark every peer silent for longer than
+-- PEER_TIMEOUT offline. Returns the number newly marked.
+function Mesh.SweepPeers(t, peers)
+    t = t or (Store and Store.Now and Store.Now()) or 0
+    peers = peers or Mesh.peers
+    local marked = 0
+    for _, p in pairs(peers) do
+        if type(p) == "table" and p.online
+           and (t - (p.lastSeen or 0)) > Mesh.PEER_TIMEOUT then
+            p.online = false
+            p.timedOut = true
+            marked = marked + 1
+        end
+    end
+    return marked
+end
+
+-- Spec §2.2: ANY inbound mesh message refreshes the sender's roster timestamp,
+-- *before* payload validation. Only heartbeat / discovery / manifest carried an
+-- account ID and therefore reached NotePeer, so a peer that was mid-burst on the
+-- STATE or SYNC prefix contributed nothing to its own liveness. That was
+-- harmless while nothing ever expired a peer — with the 30s sweep above it is
+-- not, so every raw receive now stamps a KNOWN peer by name. (Admitting an
+-- UNKNOWN sender still requires an account ID; discovery handles that.)
+function Mesh.TouchPeerByName(name, t)
+    if not name or name == "" then return nil end
+    t = t or (Store and Store.Now and Store.Now()) or 0
+    for _, p in pairs(Mesh.peers) do
+        if type(p) == "table" and p.name == name then
+            p.lastSeen = t
+            p.online = true          -- evidence of life outranks a stale latch
+            p.timedOut = nil
+            p.presenceStale = nil
+            return p
+        end
+    end
+    return nil
+end
+
+-- Cadence gate for the drain ticker: sweep at most once per PEER_SWEEP_INTERVAL.
+function Mesh.MaybeSweepPeers(t)
+    t = t or (Store and Store.Now and Store.Now()) or 0
+    if (t - (Mesh._lastPeerSweep or 0)) < Mesh.PEER_SWEEP_INTERVAL then return 0 end
+    Mesh._lastPeerSweep = t
+    return Mesh.SweepPeers(t)
 end
 
 -- Resolve an account ID to its most-recently-seen Name-Realm (for relay lists).
@@ -812,6 +975,8 @@ function Mesh.DrainTick(t)
     end
     Mesh.PruneDedup(t)
     Mesh.SweepReassembly(t)
+    -- A1.3: expire peers silent for >30s (self-gated to a 5s cadence).
+    Mesh.MaybeSweepPeers(t)
 end
 
 ----------------------------------------------------------------------
@@ -903,18 +1068,52 @@ end
 -- STATE_CHANGED subscriber. Guards the (nameRealm, record) contract: a nil or
 -- non-self record (e.g. a stray args-free fire, or an imported other-account
 -- record) is ignored so it can never be pushed to peers or crash the encoder.
-function Mesh.OnStateChanged(nameRealm, record)
+-- `force` (spec §9.4) bypasses the change filter: teardown/logout, the 1s
+-- post-entering-world push, and the max-quiet refresh all set it.
+function Mesh.OnStateChanged(nameRealm, record, force)
     if not Mesh.IsSelfRecord(nameRealm, record) then return end
-    ns:SafeCall(Mesh.PushState, nameRealm, record)
+    ns:SafeCall(Mesh.PushState, nameRealm, record, force)
+end
+
+-- PURE: stable key for a set of target account IDs. A newly-discovered peer
+-- changes this key, which is what stops the payload-hash suppressor from
+-- starving a peer that joined AFTER the last identical push.
+function Mesh.PeerSetKey(plan)
+    local ids = {}
+    for i = 1, #(plan.direct or {}) do ids[#ids + 1] = tostring(plan.direct[i]) end
+    for i = 1, #(plan.backups or {}) do ids[#ids + 1] = tostring(plan.backups[i]) end
+    table.sort(ids)
+    return joinList(ids, ",")
 end
 
 -- Push a live character record to the mesh (called on STATE_CHANGED).
-function Mesh.PushState(nameRealm, record)
+--
+-- A10.1 belt-and-suspenders: Tracker.Capture already gates the STATE_CHANGED
+-- fire on the same content hash, but ANY other caller (an import refresh, a
+-- future module, a manual /nexus push) funnels through here, so the suppressor
+-- is repeated at the transport edge. It is deliberately keyed on
+-- (content hash, target set) so it can never withhold state from a peer that
+-- was not in the previous send.
+function Mesh.PushState(nameRealm, record, force)
     if not Mesh.IsEnabled() then return end
     local payload = Protocol.EncodeCharacter(record)
     if not payload then return end   -- nothing encodable (nil/foreign record)
     local ids = onlinePeerIDs()
-    local plan = Mesh.ComputeRelayPlan(ids, Mesh.DIRECT_BUDGET, ns:GetAccountID())
+    -- A10.9: adapt the direct-send budget to the live token count.
+    local sched = Mesh._sched[Protocol.PREFIX.STATE]
+    local tokens = sched and sched.bucket and sched.bucket.tokens
+    local plan = Mesh.ComputeRelayPlan(ids, Mesh.DirectBudget(tokens),
+        ns:GetAccountID())
+
+    local key     = (type(record) == "table" and record.nameRealm) or nameRealm or "?"
+    local hash    = Mesh.StateHash(record)
+    local peerKey = Mesh.PeerSetKey(plan)
+    local prev    = Mesh._lastPush[key]
+    if not force and hash and prev and hash == prev.hash and peerKey == prev.peers then
+        Mesh._pushSuppressed = (Mesh._pushSuppressed or 0) + 1
+        return
+    end
+    Mesh._lastPush[key] = { hash = hash, peers = peerKey }
 
     local sent = {}    -- guard against double-whispering a backup
     local function sendDirect(aid, delegated)
@@ -938,6 +1137,30 @@ function Mesh.PushState(nameRealm, record)
     for i = 1, #plan.backups do
         sendDirect(plan.backups[i], nil)
     end
+end
+
+----------------------------------------------------------------------
+-- A10.8 — relay age gate (spec §9.4: "relayed payloads older than 10s are
+-- dropped rather than forwarded").
+--
+-- VERDICT: implementable WITHOUT a wire-format change. The frame header
+-- (version / op / msgId / seq / relayTo) carries no send timestamp, and adding
+-- one would be a protocol bump — explicitly out of bounds. But the STATE
+-- payload already carries the owner's own epochs (lastDataUpdate / ownerEpoch),
+-- stamped by Tracker.Capture in the same frame as the push, so the decoded
+-- record IS a send timestamp for the only op that is ever relayed. We gate on
+-- that. Limitation to note: it measures OWNER-STAMP age, not hop age, so a
+-- payload that sat in the originator's own send queue counts that delay too
+-- (strictly more conservative than the reference, never less). A record with no
+-- usable stamp (all epochs zero) is forwarded rather than silently dropped.
+----------------------------------------------------------------------
+function Mesh.RelayAgeOK(rec, t)
+    if type(rec) ~= "table" then return false end
+    local stamp = rec.lastDataUpdate or 0
+    if stamp <= 0 then stamp = rec.ownerEpoch or 0 end
+    if stamp <= 0 then stamp = rec.lastSeen or 0 end
+    if stamp <= 0 then return true end     -- unstamped: forward (fail-open)
+    return ((t or 0) - stamp) <= Mesh.RELAY_MAX_AGE
 end
 
 -- Forward a received state push one hop to its delegated targets, then strip.
@@ -982,8 +1205,14 @@ local function handleState(f, sender, isRelay)
     local senderAID = aidForName(sender)
     Store.WriteInboundCharacter(ownerAID, rec.nameRealm, rec, senderAID)
     -- One-hop forward for genuine (non-relay) pushes carrying a relayTo list.
+    -- A10.8: a stale payload is DROPPED, not forwarded — a slow relay must not
+    -- resurrect state that the owner has already superseded.
     if not isRelay then
-        forwardRelay(f, f.relayTo, f.payload, f.seq)
+        if Mesh.RelayAgeOK(rec, now()) then
+            forwardRelay(f, f.relayTo, f.payload, f.seq)
+        elseif f.relayTo and f.relayTo ~= "" then
+            Mesh._relayAgeDrops = (Mesh._relayAgeDrops or 0) + 1
+        end
     end
 end
 
@@ -1010,6 +1239,30 @@ function Mesh.CheckAccountConflict(aid, sender, t)
     return true
 end
 
+-- A1.4 — discovery-ping every character a peer advertises as online that we do
+-- not already track. Reuses the roster-sweep selector so the SAME per-name
+-- cooldown map (ROSTER_PING_COOLDOWN) throttles both paths: a heartbeat every
+-- ~20s can never out-run the ping dedup. Returns the names pinged (for tests).
+function Mesh.ConsumeOnlineHint(onlineList, t)
+    if type(onlineList) ~= "table" or #onlineList == 0 then return {} end
+    t = t or now()
+    -- Drop self-echoes robustly (short name or Name-Realm) before selecting.
+    local candidates = {}
+    for i = 1, #onlineList do
+        local nm = onlineList[i]
+        if type(nm) == "string" and nm ~= "" and not Mesh.IsSelfSender(nm) then
+            candidates[#candidates + 1] = nm
+        end
+    end
+    local targets = Mesh.SelectRosterPings(candidates, selfNameRealm(),
+        Mesh.KnownPeerNames(), Mesh._pingCooldowns, t, Mesh.ROSTER_PING_COOLDOWN)
+    for i = 1, #targets do
+        Mesh._pingCooldowns[targets[i]] = t
+        ns:SafeCall(Mesh.SendDiscovery, OP.PING, targets[i])
+    end
+    return targets
+end
+
 local function handleHeartbeat(f, sender)
     local hb = Mesh.Unpack(f.payload)
     if not hb or not hb.aid then return end
@@ -1019,6 +1272,12 @@ local function handleHeartbeat(f, sender)
     if not p then return end
     p.hashes = hb.hashes or {}
     p.timerHash = hb.timerHash
+    -- A1.4: consume the online-character hint for DISCOVERY ONLY (spec §2.5).
+    -- Any advertised character we have never met gets a discovery ping so a
+    -- fresh install converges without waiting for a roster sweep. The field is
+    -- NEVER used to evict or correct a sibling — that is the reference's own
+    -- documented limitation and our per-account exclusivity already covers it.
+    Mesh.ConsumeOnlineHint(hb.online, now())
     -- Compare advertised segment hashes with what we hold for that account.
     local bucket = Store.GetAccount(hb.aid, false)
     local localH = bucket and Mesh.AccountHashes(bucket) or {}
@@ -1223,9 +1482,8 @@ function Mesh.SendHeartbeat()
     -- a lastSeen (which advertised the entire roster as "online" and matched
     -- the same-account double-green-pip bug the dashboard just fixed).
     -- Wire shape is unchanged (Name-Realm string array), so no SCHEMA_VERSION
-    -- bump. NOTE: no receiver reads hb.online today — handleHeartbeat ignores
-    -- the field entirely — this only keeps the advertised value honest for a
-    -- future presence consumer.
+    -- bump. A1.4: handleHeartbeat now CONSUMES this field via
+    -- Mesh.ConsumeOnlineHint — discovery only, never eviction (spec §2.5).
     local me = selfNameRealm()
     if me and me ~= "" then hb.online[1] = me end
     local payload = Mesh.Pack(hb)
@@ -1308,6 +1566,9 @@ local function knownPeerNames()
     end
     return set
 end
+-- Public alias: handleHeartbeat (defined ABOVE this local) needs the same set
+-- for A1.4 discovery, and a table field resolves at call time.
+Mesh.KnownPeerNames = knownPeerNames
 
 -- PURE: per-name cooldown gate. True if `name` may be pinged at nowT.
 function Mesh.ShouldPingName(name, cooldowns, nowT, cooldownWin)
@@ -2195,6 +2456,10 @@ local function onChatMsgAddon(event, prefix, text, channel, sender)
     -- mesh data now arrives by WHISPER (channel="WHISPER") or guild fallback;
     -- the presence channel carries no addon data, so there is no CHANNEL path.
     if Mesh.IsSelfSender(sender) then return end
+    -- Spec §2.2: stamp the sender's liveness on RAW RECEIVE, before any framing
+    -- or payload validation — a chunk that never completes still proves the peer
+    -- is alive and must not be swept by the 30s timeout.
+    Mesh.TouchPeerByName(sender, now())
     -- De-envelope, reassemble, then dispatch.
     local env = Mesh.DeEnvelope(text)
     if not env then return end
@@ -2248,8 +2513,8 @@ function Mesh.OnLogin()
     end)
 
     -- Push live state changes onto the mesh (self-record-guarded).
-    ns:On("STATE_CHANGED", function(nameRealm, record)
-        Mesh.OnStateChanged(nameRealm, record)
+    ns:On("STATE_CHANGED", function(nameRealm, record, force)
+        Mesh.OnStateChanged(nameRealm, record, force)
     end)
 
     -- Final flush on the way out.
@@ -2354,10 +2619,19 @@ local function debugMesh()
     local n = 0
     for aid, p in pairs(Mesh.peers) do
         n = n + 1
-        ns:Print(string.format("  peer %s (%s) online=%s lastSeen=%s",
-            aid, p.name or "?", tostring(p.online), tostring(p.lastSeen or 0)))
+        local why = p.timedOut and " (30s-timeout)"
+            or (p.presenceStale and " (channel-leave)") or ""
+        ns:Print(string.format("  peer %s (%s) online=%s%s lastSeen=%s silent=%ss",
+            aid, p.name or "?", tostring(p.online), why,
+            tostring(p.lastSeen or 0), tostring(now() - (p.lastSeen or 0))))
     end
     if n == 0 then ns:Print("  no peers known.") end
+    -- A10.1 / A10.8 / A1.3 telemetry: how much traffic the filters removed.
+    ns:Print(string.format(
+        "  filters: pushSuppressed=%d capturesFiltered=%d relayAgeDrops=%d lastPeerSweep=%s",
+        Mesh._pushSuppressed or 0,
+        (ns.Tracker and ns.Tracker._capturesFiltered) or 0,
+        Mesh._relayAgeDrops or 0, tostring(Mesh._lastPeerSweep or 0)))
     for prefix, s in pairs(Mesh._sched) do
         ns:Print(string.format("  prefix %s: queue=%d bucket=%.1f/%d",
             prefix, s.queue:Size(), s.bucket.tokens, s.bucket.cap))
@@ -2913,8 +3187,270 @@ local function testNamespaceDiff()
     return true
 end
 
+-- A10.1 — the change-filter hash recipe. Everything the reference calls a data
+-- change must move the hash; everything it calls volatile must NOT.
+local function testStateHash()
+    local function rec(over)
+        local r = {
+            location = "Orgrimmar", level = 60, shardCount = 12, boonCount = 1,
+            isResting = true, inInstance = false, pvpFlagged = false,
+            chronoboonActive = false, dmfInBoon = false, dmfCooldownActive = false,
+            soulstoneReady = true,
+            hearthstoneCD = 1000, itemCooldown = 0,   -- 1000 -> 5-min bucket 3
+            raidLockouts = { MC = 1700100000, ZG = 0 },
+            auraStates = {
+                [1] = { duration = 3630, option = 0, source = 0 },  -- minute 60
+                [4] = { duration = 900,  option = 0, source = 0 },
+            },
+            -- Volatile bookkeeping the filter MUST ignore.
+            lastSeen = 1700000000, lastDataUpdate = 1700000000,
+            ownerEpoch = 1700000000, msgId = "1-abc-1",
+        }
+        for k, v in pairs(over or {}) do r[k] = v end
+        return r
+    end
+
+    if Mesh.StateHash(nil) ~= nil then return false, "non-record must hash nil" end
+    if Mesh.StateHash("x") ~= nil then return false, "string must hash nil" end
+
+    local base = Mesh.StateHash(rec())
+    if Mesh.StateHash(rec()) ~= base then return false, "identical records hashed differently" end
+
+    -- 1) VOLATILE-ONLY change -> identical hash (this is the whole point).
+    local vol = rec({ lastSeen = 1700009999, lastDataUpdate = 1700009999,
+                      ownerEpoch = 1700009999, msgId = "1-abc-77" })
+    if Mesh.StateHash(vol) ~= base then
+        return false, "epoch-only change moved the hash"
+    end
+
+    -- 2) An aura ticking WITHIN the same minute -> identical hash.
+    local same = rec()
+    same.auraStates[1].duration = 3601             -- 3630 -> 3601, both minute 60
+    if Mesh.StateHash(same) ~= base then
+        return false, "sub-minute aura tick moved the hash"
+    end
+
+    -- 3) Crossing the minute boundary -> hash MUST move.
+    local tick = rec()
+    tick.auraStates[1].duration = 3599             -- minute 60 -> 59
+    if Mesh.StateHash(tick) == base then
+        return false, "aura minute boundary did not move the hash"
+    end
+
+    -- 4) Cooldowns coarsen at 5 minutes (we store REMAINING, not an epoch).
+    if Mesh.StateHash(rec({ hearthstoneCD = 901 })) ~= base then
+        return false, "sub-5-minute cooldown tick moved the hash"
+    end
+    if Mesh.StateHash(rec({ hearthstoneCD = 899 })) == base then
+        return false, "5-minute cooldown boundary did not move the hash"
+    end
+
+    -- 5) Every genuine §3.3 field moves the hash.
+    local moves = {
+        { "location", "The Barrens" }, { "level", 59 }, { "shardCount", 11 },
+        { "boonCount", 0 }, { "isResting", false }, { "inInstance", true },
+        { "pvpFlagged", true }, { "chronoboonActive", true }, { "dmfInBoon", true },
+        { "dmfCooldownActive", true }, { "soulstoneReady", false },
+        { "itemCooldown", 3600 },
+    }
+    for i = 1, #moves do
+        if Mesh.StateHash(rec({ [moves[i][1]] = moves[i][2] })) == base then
+            return false, "field " .. moves[i][1] .. " did not move the hash"
+        end
+    end
+
+    -- 6) Raid lockouts (deep) and aura source/variant.
+    local lock = rec(); lock.raidLockouts = { MC = 1700100000 + 400, ZG = 0 }
+    if Mesh.StateHash(lock) == base then return false, "raid lockout change missed" end
+    local src = rec(); src.auraStates[4].source = 1
+    if Mesh.StateHash(src) == base then return false, "aura source change missed" end
+    local opt = rec(); opt.auraStates[4].option = 3
+    if Mesh.StateHash(opt) == base then return false, "aura variant change missed" end
+    -- 7) Losing a slot entirely.
+    local lost = rec(); lost.auraStates[4] = nil
+    if Mesh.StateHash(lost) == base then return false, "lost aura slot missed" end
+    return true
+end
+
+-- A1.3 — peer timeout sweep. Runs entirely on a LOCAL peers table so it can
+-- never disturb the live Mesh.peers other suites read.
+local function testPeerSweep()
+    local T = 1700000000
+    local peers = {
+        ["2"] = { aid = "2", name = "Alive-R",  online = true, lastSeen = T - 29 },
+        ["3"] = { aid = "3", name = "Crashed-R", online = true, lastSeen = T - 31 },
+        ["4"] = { aid = "4", name = "Gone-R",   online = false, lastSeen = T - 999 },
+    }
+    local marked = Mesh.SweepPeers(T, peers)
+    if marked ~= 1 then return false, "expected 1 newly offline, got " .. marked end
+    if peers["2"].online ~= true then return false, "29s-silent peer wrongly expired" end
+    if peers["3"].online ~= false then return false, "31s-silent peer still online" end
+    if peers["3"].timedOut ~= true then return false, "timeout latch not set" end
+    -- Idempotent: a second sweep marks nothing new.
+    if Mesh.SweepPeers(T, peers) ~= 0 then return false, "second sweep re-marked" end
+    -- Exactly at the boundary (30s) is still alive; 30.5s is not.
+    peers["2"].lastSeen = T - 30
+    if Mesh.SweepPeers(T, peers) ~= 0 then return false, "30s boundary expired early" end
+
+    -- The 5s cadence gate. Save/restore the real sweep clock.
+    local savedTs, savedPeers = Mesh._lastPeerSweep, Mesh.peers
+    Mesh.peers = { ["9"] = { aid = "9", name = "Z-R", online = true, lastSeen = T - 60 } }
+    Mesh._lastPeerSweep = 0
+    local ok, why = true, nil
+    if Mesh.MaybeSweepPeers(T) ~= 1 then ok, why = false, "first gated sweep did not run" end
+    Mesh.peers["9"].online = true
+    if ok and Mesh.MaybeSweepPeers(T + 4) ~= 0 then
+        ok, why = false, "sweep ran again inside the 5s cadence"
+    end
+    if ok and Mesh.MaybeSweepPeers(T + 5) ~= 1 then
+        ok, why = false, "sweep did not run at the 5s cadence"
+    end
+    Mesh.peers, Mesh._lastPeerSweep = savedPeers, savedTs
+    if not ok then return false, why end
+
+    -- Spec §2.2: a raw receive from a KNOWN peer refreshes it and un-expires it,
+    -- so an actively-pushing peer can never be swept just because a heartbeat
+    -- was dropped. An unknown sender is NOT admitted (that needs an account ID).
+    local sp = Mesh.peers
+    Mesh.peers = {
+        ["5"] = { aid = "5", name = "Busy-R", online = false, timedOut = true,
+                  presenceStale = true, lastSeen = T - 99 },
+    }
+    local touched = Mesh.TouchPeerByName("Busy-R", T)
+    local tOk, tWhy = true, nil
+    if not touched then tOk, tWhy = false, "known sender not stamped"
+    elseif Mesh.peers["5"].lastSeen ~= T then tOk, tWhy = false, "lastSeen not refreshed"
+    elseif Mesh.peers["5"].online ~= true then tOk, tWhy = false, "peer not re-admitted"
+    elseif Mesh.peers["5"].timedOut then tOk, tWhy = false, "timeout latch not cleared"
+    elseif Mesh.peers["5"].presenceStale then tOk, tWhy = false, "leave latch not cleared"
+    elseif Mesh.TouchPeerByName("Nobody-R", T) ~= nil then
+        tOk, tWhy = false, "unknown sender was admitted"
+    elseif Mesh.TouchPeerByName(nil, T) ~= nil then
+        tOk, tWhy = false, "nil sender was admitted"
+    end
+    -- And a peer kept alive this way survives the very next sweep.
+    if tOk and Mesh.SweepPeers(T + 10) ~= 0 then
+        tOk, tWhy = false, "freshly-stamped peer was swept"
+    end
+    Mesh.peers = sp
+    if not tOk then return false, tWhy end
+    return true
+end
+
+-- A10.9 — direct-send budget tracks the live token count, floored at
+-- DIRECT_BUDGET and capped at BUCKET_CAP.
+local function testDirectBudget()
+    local cases = {
+        { 0, 4 }, { 3.9, 4 }, { 4, 4 }, { 5, 5 }, { 6.9, 6 }, { 8, 8 }, { 99, 8 },
+        { nil, 4 },
+    }
+    for i = 1, #cases do
+        local got = Mesh.DirectBudget(cases[i][1])
+        if got ~= cases[i][2] then
+            return false, "tokens=" .. tostring(cases[i][1]) .. " -> " .. got
+                .. " (want " .. cases[i][2] .. ")"
+        end
+    end
+    -- A full bucket must let a 6-peer mesh go all-direct (the old fixed 4
+    -- delegated 2 even with tokens to spare).
+    local plan = Mesh.ComputeRelayPlan({ "1", "2", "3", "4", "5", "6" },
+        Mesh.DirectBudget(8), "9")
+    if #plan.direct ~= 6 then
+        return false, "full bucket still delegated: direct=" .. #plan.direct
+    end
+    return true
+end
+
+-- A10.8 — relayed payloads older than 10s are dropped, not forwarded.
+local function testRelayAgeGate()
+    local T = 1700000000
+    if not Mesh.RelayAgeOK({ lastDataUpdate = T - 9 }, T) then
+        return false, "9s-old payload wrongly dropped"
+    end
+    if not Mesh.RelayAgeOK({ lastDataUpdate = T - 10 }, T) then
+        return false, "exactly 10s wrongly dropped (gate is > 10)"
+    end
+    if Mesh.RelayAgeOK({ lastDataUpdate = T - 11 }, T) then
+        return false, "11s-old payload was forwarded"
+    end
+    -- Falls back through ownerEpoch then lastSeen.
+    if Mesh.RelayAgeOK({ lastDataUpdate = 0, ownerEpoch = T - 60 }, T) then
+        return false, "stale ownerEpoch fallback forwarded"
+    end
+    if Mesh.RelayAgeOK({ lastDataUpdate = 0, ownerEpoch = 0, lastSeen = T - 60 }, T) then
+        return false, "stale lastSeen fallback forwarded"
+    end
+    -- Fail-open: an entirely unstamped record still forwards.
+    if not Mesh.RelayAgeOK({ lastDataUpdate = 0, ownerEpoch = 0, lastSeen = 0 }, T) then
+        return false, "unstamped record must fail open"
+    end
+    -- Clock skew (stamp in the future) must not drop.
+    if not Mesh.RelayAgeOK({ lastDataUpdate = T + 5 }, T) then
+        return false, "future stamp dropped"
+    end
+    if Mesh.RelayAgeOK(nil, T) then return false, "nil record must not forward" end
+    return true
+end
+
+-- A1.4 — the heartbeat's online-character hint drives DISCOVERY, honouring the
+-- existing per-name ping cooldown.
+local function testOnlineHintDiscovery()
+    local T = 1700000000
+    local savedPeers, savedCd = Mesh.peers, Mesh._pingCooldowns
+    Mesh.peers = { ["2"] = { aid = "2", name = "Known-R", online = true, lastSeen = T } }
+    Mesh._pingCooldowns = {}
+    local ok, why = true, nil
+
+    -- Unknown character advertised as online -> pinged. Known peer -> skipped.
+    local got = Mesh.ConsumeOnlineHint({ "Known-R", "Stranger-R" }, T)
+    if #got ~= 1 or got[1] ~= "Stranger-R" then
+        ok, why = false, "expected only Stranger-R, got " .. table.concat(got, ",")
+    end
+    -- Dedup: the same hint one heartbeat later (well inside the cooldown) is a
+    -- no-op, so a 20s heartbeat can never out-run the ping throttle.
+    if ok then
+        local again = Mesh.ConsumeOnlineHint({ "Stranger-R" }, T + 20)
+        if #again ~= 0 then ok, why = false, "ping dedup not respected" end
+    end
+    -- Past the cooldown it may ping again.
+    if ok then
+        local later = Mesh.ConsumeOnlineHint({ "Stranger-R" },
+            T + Mesh.ROSTER_PING_COOLDOWN + 1)
+        if #later ~= 1 then ok, why = false, "cooldown never expired" end
+    end
+    -- Empty / absent / non-table hints are safe no-ops.
+    if ok and #Mesh.ConsumeOnlineHint(nil, T) ~= 0 then ok, why = false, "nil hint pinged" end
+    if ok and #Mesh.ConsumeOnlineHint({}, T) ~= 0 then ok, why = false, "empty hint pinged" end
+
+    Mesh.peers, Mesh._pingCooldowns = savedPeers, savedCd
+    if not ok then return false, why end
+    return true
+end
+
+-- A10.1 belt-and-suspenders: PushState's own payload-hash suppressor, and the
+-- peer-set key that stops it starving a newly-discovered peer.
+local function testPushSuppressor()
+    local a = { direct = { "1", "2" }, backups = { "1", "2" } }
+    local b = { direct = { "2", "1" }, backups = { "2", "1" } }
+    if Mesh.PeerSetKey(a) ~= Mesh.PeerSetKey(b) then
+        return false, "peer-set key is order-sensitive"
+    end
+    local c = { direct = { "1", "2", "3" }, backups = { "1", "3" } }
+    if Mesh.PeerSetKey(a) == Mesh.PeerSetKey(c) then
+        return false, "a new peer did not change the peer-set key"
+    end
+    if Mesh.PeerSetKey({}) ~= "" then return false, "empty plan key not empty" end
+    return true
+end
+
 function Mesh.RunSelfTests(verbose)
     local suite = {
+        { name = "state content hash", fn = testStateHash },
+        { name = "push suppressor",    fn = testPushSuppressor },
+        { name = "peer timeout sweep", fn = testPeerSweep },
+        { name = "direct budget",      fn = testDirectBudget },
+        { name = "relay age gate",     fn = testRelayAgeGate },
+        { name = "online-hint discovery", fn = testOnlineHintDiscovery },
         { name = "transmit safety",  fn = testTransmitSafety },
         { name = "snapshot handoff", fn = testSnapshotHandoff },
         { name = "state-changed guard", fn = testStateChangedGuard },

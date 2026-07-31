@@ -45,7 +45,13 @@ Dashboard.SPLIT_GAP   = 12
 
 -- Online heuristic: a record whose lastSeen is within this window counts as
 -- online (the current player character is always treated online).
-local ONLINE_WINDOW = 150
+-- A1.1: the recency window is 15s, not 150s (spec §2.1 rule 3). At 150s a
+-- sibling you logged out of stayed green for two and a half minutes, which is
+-- the owner's original complaint — the exclusivity fix only REDUCED it, because
+-- the elected winner is still "online" for the whole window after it goes
+-- quiet. 15s is safe precisely because live mesh presence (below) is now the
+-- primary source and recency is only the fallback.
+local ONLINE_WINDOW = 15
 
 ----------------------------------------------------------------------
 -- Faction crest textures (Blizzard built-ins; no atlas dependency so this
@@ -505,11 +511,20 @@ end
 -- So the roster used to paint a green pip on BOTH the character you left and
 -- the one you just entered (owner bug: Daseeki -> Shalk, both on account #1).
 --
+-- A1.2 (this pass): the records still carry no live-online flag, but the MESH
+-- does — Mesh.peers[aid].online plus the peer's current character name. That is
+-- first-hand evidence refreshed by every inbound message on any mesh prefix,
+-- and (since A1.3) expired after 30s of silence. It is now the PRIMARY online
+-- source for a remote account; lastSeen recency is the fallback for accounts the
+-- mesh has nothing to say about. Exclusivity itself is unchanged.
+--
 -- Rule: at most ONE character per account id may read online.
 --   * LOCAL account  -> the character we are logged in as wins outright; every
 --     local sibling is offline no matter how fresh its lastSeen looks.
---   * REMOTE account -> the sibling with the newest lastSeen wins, and only if
---     that lastSeen is itself inside ONLINE_WINDOW (else nobody on it is on).
+--   * REMOTE account -> the character the MESH says is live for that account
+--     wins, if we hold a record for it. Otherwise the sibling with the newest
+--     lastSeen wins, and only if that lastSeen is itself inside ONLINE_WINDOW
+--     (else nobody on it is on).
 --   * ORPHAN bucket (aid == "", and not ours) is EXEMPT: it is a grab-bag of
 --     synced-but-unattributed characters from potentially MANY accounts, so
 --     "one per account" is not a claim we can make there. Recency still rules.
@@ -536,14 +551,35 @@ local function shortOf(nameRealm)
     return nameRealm:match("^([^%-]+)") or nameRealm
 end
 
+-- PURE: snapshot live mesh presence as { [accountID] = nameRealm } for every
+-- peer the mesh currently believes is online AND for which it knows the current
+-- character name. Kept separate from ComputeOnlineWinners so the winners pass
+-- stays a pure function of its arguments.
+function Dashboard.MeshPresence()
+    local out = {}
+    local Mesh = ns.Mesh
+    local peers = Mesh and Mesh.peers
+    if not peers then return out end
+    for aid, p in pairs(peers) do
+        if type(p) == "table" and p.online and p.name and p.name ~= "" then
+            out[aid] = p.name
+        end
+    end
+    return out
+end
+
 -- PURE exclusivity pass. `records` is an array of
 --   { nameRealm = , aid = , rec = , selfAcct = bool }
 -- `selfName` is the short name of the logged-in character (nil when unknown).
+-- `meshOnline` is the optional { [aid] = nameRealm } live-presence snapshot;
+-- when it names a character we actually hold a record for, that character wins
+-- its account outright (A1.2) — no recency test, because live mesh presence is
+-- stronger evidence than any stored epoch.
 -- Returns
 --   { winner  = { [aid] = nameRealm | false },   -- false = nobody online here
 --     charAID = { [nameRealm] = aid | false } }  -- false = name spans >1 aid
 -- An aid absent from `winner` is exempt (no exclusivity claim).
-function Dashboard.ComputeOnlineWinners(records, nowE, selfName)
+function Dashboard.ComputeOnlineWinners(records, nowE, selfName, meshOnline)
     local groups, charAID = {}, {}
     for _, r in ipairs(records or {}) do
         local aid = r.aid or ""
@@ -566,6 +602,17 @@ function Dashboard.ComputeOnlineWinners(records, nowE, selfName)
         if g.selfAcct and selfName then
             for _, r in ipairs(g) do
                 if shortOf(r.nameRealm) == selfName then pick = r.nameRealm; break end
+            end
+        end
+        -- A1.2: live mesh presence beats stored recency for a REMOTE account.
+        -- Never for our own account — the character we are standing in always
+        -- wins there, and the mesh never carries our own AID as a peer anyway.
+        if not pick and not g.selfAcct then
+            local live = meshOnline and meshOnline[aid]
+            if live then
+                for _, r in ipairs(g) do
+                    if r.nameRealm == live then pick = live; break end
+                end
             end
         end
         if not pick then
@@ -607,8 +654,8 @@ function Dashboard.RefreshOnlineWinners()
             for nameRealm, rec in pairs(bucket.homeless or {}) do add(nameRealm, rec) end
         end
     end
-    Dashboard._onlineWinners =
-        Dashboard.ComputeOnlineWinners(records, now(), selfShortName())
+    Dashboard._onlineWinners = Dashboard.ComputeOnlineWinners(
+        records, now(), selfShortName(), Dashboard.MeshPresence())
     return Dashboard._onlineWinners
 end
 
@@ -630,9 +677,17 @@ function Dashboard.IsOnline(rec, nameRealm, aid)
             if win ~= nil then return win == nameRealm end
         end
     end
-    -- Exempt / unattributable character: the original recency heuristic.
+    -- Exempt / unattributable character (orphan bucket, or a Name-Realm that
+    -- sits under more than one account). Self always wins; then live mesh
+    -- presence (A1.2); then the 15s recency heuristic (A1.1).
     local selfName = selfShortName()
     if selfName and nameRealm and shortOf(nameRealm) == selfName then return true end
+    if nameRealm then
+        local live = Dashboard.MeshPresence()
+        for _, name in pairs(live) do
+            if name == nameRealm then return true end
+        end
+    end
     return (now() - (rec.lastSeen or 0)) <= ONLINE_WINDOW
 end
 
@@ -1387,6 +1442,76 @@ local function testOnlineExclusivity(fails)
     Dashboard._onlineWinners = saved
 end
 
+-- A1.1 + A1.2 — the 15s recency window and live mesh presence as the PRIMARY
+-- online source for a remote account. Exclusivity is unchanged; only the
+-- freshness evidence improves.
+local function testMeshPresence(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local T = 1000000
+    local function r(nameRealm, aid, lastSeen, selfAcct)
+        return { nameRealm = nameRealm, aid = aid, selfAcct = selfAcct or false,
+                 rec = { lastSeen = lastSeen } }
+    end
+
+    -- A1.1: the window is 15s. A sibling silent for 16s is grey; the old 150s
+    -- window kept it green for two and a half minutes (the owner's complaint).
+    ck(ONLINE_WINDOW == 15, "ONLINE_WINDOW must be 15s (got " .. ONLINE_WINDOW .. ")")
+    local w = Dashboard.ComputeOnlineWinners({ r("Quiet-R", "2", T - 16) }, T, "Tester")
+    ck(w.winner["2"] == false, "16s-silent remote sibling -> offline at the 15s window")
+    w = Dashboard.ComputeOnlineWinners({ r("Quiet-R", "2", T - 14) }, T, "Tester")
+    ck(w.winner["2"] == "Quiet-R", "14s-silent remote sibling still online")
+
+    -- A1.2 (a): mesh presence WINS over recency. The mesh says account 2 is on
+    -- Shalk; Daseeki's stored lastSeen is fresher, but the mesh is first-hand.
+    w = Dashboard.ComputeOnlineWinners(
+        { r("Daseeki-R", "2", T - 1), r("Shalk-R", "2", T - 300) }, T, "Tester",
+        { ["2"] = "Shalk-R" })
+    ck(w.winner["2"] == "Shalk-R", "mesh presence beats a fresher stored lastSeen")
+
+    -- A1.2 (b): mesh presence RESCUES a peer whose state pushes are throttled —
+    -- every record is outside the 15s window, but the peer is heartbeating.
+    w = Dashboard.ComputeOnlineWinners(
+        { r("Live-R", "2", T - 600) }, T, "Tester", { ["2"] = "Live-R" })
+    ck(w.winner["2"] == "Live-R", "mesh-live peer stays online past the recency window")
+
+    -- A1.2 (c): the mesh naming a character we hold NO record for must not
+    -- invent a winner — we fall back to recency.
+    w = Dashboard.ComputeOnlineWinners(
+        { r("Known-R", "2", T - 3) }, T, "Tester", { ["2"] = "Stranger-R" })
+    ck(w.winner["2"] == "Known-R", "unknown mesh name -> recency fallback")
+    w = Dashboard.ComputeOnlineWinners(
+        { r("Known-R", "2", T - 99) }, T, "Tester", { ["2"] = "Stranger-R" })
+    ck(w.winner["2"] == false, "unknown mesh name + stale record -> offline")
+
+    -- A1.3 interlock: once the peer sweep flips Mesh.peers[aid].online false the
+    -- snapshot no longer names it, so a crashed peer goes grey. (MeshPresence
+    -- only reports peers still flagged online.)
+    w = Dashboard.ComputeOnlineWinners({ r("Live-R", "2", T - 600) }, T, "Tester", {})
+    ck(w.winner["2"] == false, "swept (offline) peer -> grey")
+
+    -- LOCAL account rule is UNTOUCHED: the character we are standing in wins
+    -- outright, and mesh presence can never override or double-green it.
+    w = Dashboard.ComputeOnlineWinners(
+        { r("Daseeki-R", "1", T, true), r("Shalk-R", "1", T - 90, true) }, T, "Shalk",
+        { ["1"] = "Daseeki-R" })
+    ck(w.winner["1"] == "Shalk-R", "local account: current player still wins over mesh hint")
+
+    -- Dashboard.MeshPresence reads the live peer table: online peers only.
+    local savedPeers = ns.Mesh and ns.Mesh.peers
+    if ns.Mesh then
+        ns.Mesh.peers = {
+            ["2"] = { aid = "2", name = "On-R",   online = true },
+            ["3"] = { aid = "3", name = "Off-R",  online = false },
+            ["4"] = { aid = "4", online = true },              -- no name yet
+        }
+        local snap = Dashboard.MeshPresence()
+        ck(snap["2"] == "On-R", "MeshPresence includes an online named peer")
+        ck(snap["3"] == nil, "MeshPresence excludes an offline peer")
+        ck(snap["4"] == nil, "MeshPresence excludes a nameless peer")
+        ns.Mesh.peers = savedPeers
+    end
+end
+
 if ns.RegisterSelfTest then
     ns:RegisterSelfTest("dashboard", function(verbose)
         local cases = {
@@ -1394,6 +1519,7 @@ if ns.RegisterSelfTest then
             { name = "cooldown decay", fn = testDecayRemaining },
             { name = "dmf schedule", fn = testDMFSchedule },
             { name = "online exclusivity", fn = testOnlineExclusivity },
+            { name = "mesh presence + 15s window (A1.1/A1.2)", fn = testMeshPresence },
         }
         local allPass = true
         for _, c in ipairs(cases) do
