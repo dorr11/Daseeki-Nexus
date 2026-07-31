@@ -79,18 +79,15 @@ end
 --  Re-housed verbatim from ui_ledgerpage.lua (the proven, owner-approved model).
 -- ════════════════════════════════════════════════════════════════════════════
 
--- DMF cooldown remaining (prefers the Store accessor if present, else the 8h
--- resting-offline auto-clear rule). Clean end state is Store.DMFCooldownRemaining.
-local DMF_OFFLINE_CLEAR = 8 * 3600
+-- DMF cooldown remaining. A8 landed the real 4h online-time model in store.lua,
+-- so this is now a thin delegation — the old local 8h-offline mirror is gone
+-- (it returned 0 for any ONLINE character, which is why a 60 that had just taken
+-- a fortune rendered READY, A8.2).
 local function dmfCooldownRemaining(rec, e)
     if ns.Store and ns.Store.DMFCooldownRemaining then
         return ns.Store.DMFCooldownRemaining(rec, e) or 0
     end
-    if not (rec and rec.dmfCooldownActive and rec.dmfCooldown) then return 0 end
-    local since = rec.dmfCooldown.offlineSince or 0
-    if since <= 0 then return 0 end
-    local rem = (since + DMF_OFFLINE_CLEAR) - (e or nowE())
-    return rem > 0 and math.floor(rem) or 0
+    return 0
 end
 
 -- DMF READY / remaining-CD parenthetical.
@@ -128,8 +125,13 @@ function Detail.BuffTileState(slot, rec, faction, e)
     local D = Dash()
     local meta = D and D.AURA_META and D.AURA_META[slot]
     if not meta then return { shown = false } end
-    local st = rec.auraStates and rec.auraStates[slot]
-    local present = st and (st.duration or 0) > 0
+    -- A6.8: the displayed remaining, not the raw stored number — decayed for an
+    -- ONLINE character, frozen for an offline one, and ALWAYS frozen for a booned
+    -- slot (A7.6). Everything below reads `remaining`, so the tile caption, the
+    -- threshold colour and the "Missing" verdict can never disagree about how
+    -- much time is actually left.
+    local remaining, st = D.AuraRemaining(rec, slot, e)
+    local present = remaining > 0
     local applicable, requirement = D.AuraRequirement(slot, rec, faction)
     local isDMF = meta.key == "dmf"
 
@@ -140,20 +142,20 @@ function Detail.BuffTileState(slot, rec, faction, e)
     if present then
         local BOON = (ns.Store and ns.Store.AURA_SOURCE and ns.Store.AURA_SOURCE.BOON) or 2
         local booned = (st.source == BOON or st.source == "boon")
-        local full = D.FormatDuration(st.duration)
+        local full = D.FormatDuration(remaining)
         if booned then
             -- Booned tile: FROZEN duration in GREEN (the ok color carries "boon");
             -- "(Boon)" surfaces once in the eyebrow + the tile hover tooltip.
             return { shown = true, slot = slot, missing = false, boon = true,
                      calm = true, tint = "ok",
-                     durText = Detail.CompactDuration(st.duration), durTok = "ok",
+                     durText = Detail.CompactDuration(remaining), durTok = "ok",
                      fullText = full .. " (Boon)", spellID = meta.spellID }
         end
         local th  = D.GetThreshold(faction, meta.thresholdKey)
-        local tok = D.AuraColorToken(st.duration, th)    -- ok / warn / danger
+        local tok = D.AuraColorToken(remaining, th)    -- ok / warn / danger
         return { shown = true, slot = slot, missing = false, boon = false,
                  calm = (tok == "ok"), tint = tok,
-                 durText = Detail.CompactDuration(st.duration), durTok = tok,
+                 durText = Detail.CompactDuration(remaining), durTok = tok,
                  fullText = full, spellID = meta.spellID }
     end
 
@@ -615,15 +617,38 @@ end
 --  one-open-max / auto-open-event / reflow suites RETIRE with the feature.
 -- ════════════════════════════════════════════════════════════════════════════
 
+-- A8: the parenthetical now reads the real 4h ONLINE-TIME model. The UI contract
+-- is unchanged (READY / a red duration / "on CD"); what changed is that a
+-- character who is ONLINE and mid-cooldown finally produces a duration instead
+-- of always reading READY (A8.2).
 local function testDMFParenthetical(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
     local base = 1000000
+
     local t, tok = Detail.DMFParenthetical({ dmfCooldownActive = false }, base)
-    if t ~= "READY" or tok ~= "ok" then fails[#fails + 1] = "DMF not-CD should be READY/ok" end
-    local rec = { dmfCooldownActive = true, dmfCooldown = { offlineSince = base } }
-    t, tok = Detail.DMFParenthetical(rec, base + 3600)
-    if tok ~= "danger" or t == "on CD" then fails[#fails + 1] = "DMF mid-CD should be a red duration" end
-    t, tok = Detail.DMFParenthetical(rec, base + 9 * 3600)
-    if t ~= "on CD" or tok ~= "danger" then fails[#fails + 1] = "DMF elapsed should be on CD/danger" end
+    ck(t == "READY" and tok == "ok", "DMF not-CD should be READY/ok")
+
+    -- Mid-cooldown while ONLINE: a real red duration (this is the A8.2 fix — the
+    -- old offlineSince-based model returned 0 here and rendered READY).
+    local rec = { dmfCooldownActive = true,
+                  dmfCooldown = { offlineSince = 0, remainingOnlineSecs = 3600,
+                                  lastTickEpoch = base } }
+    t, tok = Detail.DMFParenthetical(rec, base)
+    ck(tok == "danger" and t ~= "on CD" and t ~= "READY",
+       "DMF mid-CD while online should be a red duration")
+
+    -- Active but with no knowable remaining (a REMOTE record: the wire carries
+    -- only the boolean) -> the tri-state "on CD".
+    local remote = { dmfCooldownActive = true, dmfCooldown = { offlineSince = base } }
+    t, tok = Detail.DMFParenthetical(remote, base + 3600)
+    ck(t == "on CD" and tok == "danger", "DMF remote/unknown-remaining should be on CD/danger")
+
+    -- Cleared cooldown reads READY again.
+    if ns.Store and ns.Store.DMFCooldownClear then
+        ns.Store.DMFCooldownClear(rec)
+        t, tok = Detail.DMFParenthetical(rec, base)
+        ck(t == "READY" and tok == "ok", "DMF cleared -> READY/ok")
+    end
 end
 
 local function testBuffMatrix(fails)
@@ -664,6 +689,47 @@ local function testBuffMatrix(fails)
     st = Detail.BuffTileState(boonSlot, { classTag = "MAGE", auraStates = {} }, "Horde", e)
     if st.shown then fails[#fails + 1] = "absent tail slot (boon) should collapse (hidden)" end
 
+    -- ---- A6.8 / A7.6 through the TILE, not just the helper -----------------
+    -- An ONLINE character's tile caption ages; an offline one's does not; a
+    -- booned tile never does. The tile is what the owner actually looks at, so
+    -- the decay is asserted here and not only on Dashboard.AuraRemaining.
+    local savedWinners = D._onlineWinners
+    D._onlineWinners = { winner = { ["9"] = "Live-R" }, charAID = { ["Live-R"] = "9",
+                                                                   ["Dead-R"] = "9" } }
+
+    local liveRec = { nameRealm = "Live-R", classTag = "WARRIOR", lastDataUpdate = e,
+                      lastSeen = e, auraStates = { [onySlot] = { duration = 3600, source = 0 } } }
+    st = Detail.BuffTileState(onySlot, liveRec, "Horde", e + 600)
+    if st.durText ~= Detail.CompactDuration(3000) then
+        fails[#fails + 1] = "A6.8: an ONLINE character's tile must decay (3600 -> 3000 after 600s)"
+    end
+
+    -- Same account, NOT the winner -> offline -> frozen.
+    local deadRec = { nameRealm = "Dead-R", classTag = "WARRIOR", lastDataUpdate = e,
+                      lastSeen = e, auraStates = { [onySlot] = { duration = 3600, source = 0 } } }
+    st = Detail.BuffTileState(onySlot, deadRec, "Horde", e + 600)
+    if st.durText ~= Detail.CompactDuration(3600) then
+        fails[#fails + 1] = "A6.8: an OFFLINE character's tile stays FROZEN at 3600"
+    end
+
+    -- A7.6: booned + online -> still frozen, still green, still "(Boon)".
+    local boonedRec = { nameRealm = "Live-R", classTag = "WARRIOR", lastDataUpdate = e,
+                        lastSeen = e,
+                        auraStates = { [onySlot] = { duration = 3600, source = BOON } } }
+    st = Detail.BuffTileState(onySlot, boonedRec, "Horde", e + 600)
+    if not (st.boon and st.durText == Detail.CompactDuration(3600)) then
+        fails[#fails + 1] = "A7.6: a BOONED tile never decays, even for an online character"
+    end
+
+    -- A buff that has fully run out on an online character reads MISSING.
+    local goneRec = { nameRealm = "Live-R", classTag = "WARRIOR", lastDataUpdate = e,
+                      lastSeen = e, auraStates = { [onySlot] = { duration = 300, source = 0 } } }
+    st = Detail.BuffTileState(onySlot, goneRec, "Horde", e + 600)
+    if not (st.shown and st.missing) then
+        fails[#fails + 1] = "A6.8: a buff decayed past 0 on an online character reads MISSING"
+    end
+
+    D._onlineWinners = savedWinners
     if ns.Store then ns.Store.GetFactionSettings = savedGFS end
 end
 

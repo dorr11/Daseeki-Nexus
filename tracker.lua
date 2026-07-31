@@ -27,6 +27,47 @@ local ITEM_HEARTHSTONE = 6948
 -- simply gets no cooldown (GetItemCooldown returns nothing for an absent item).
 local CHRONOBOON_ITEMS = { 184937, 184938 }
 
+-- A7 / spec §4.4 — the chronoboon CAST lifecycle. Using the item to store buffs
+-- casts 349858; using the Super-charged item to restore them casts 349863. This
+-- is the reference's PRIMARY way of learning what is in the boon; the tooltip
+-- parser (below) drops to a secondary, reconciling source.
+local SPELL_BOON_CAST   = 349858
+local SPELL_UNBOON_CAST = 349863
+
+-- Item USE cooldown for both the hearthstone and the chronoboon (spec §4.4/§6).
+local CHRONOBOON_ITEM_CD = 3600
+
+-- A removal seen within this many seconds BEFORE the boon cast succeeded is the
+-- chronoboon stripping the aura (restore it as booned). Anything earlier is a
+-- deliberate player cancel and stays gone (spec §4.4 step 4, A7.3).
+local BOON_STRIP_WINDOW = 0.3
+
+-- A delayed re-snapshot this long after cast start catches buffs GAINED during
+-- the cast (spec §4.4 step 3).
+local BOON_RESNAPSHOT_DELAY = 5
+
+-- After an unboon, restored buffs are not "fresh" for this long (spec §4.4).
+local UNBOON_WINDOW = 3
+-- ...and a rescan this soon after picks up their real durations.
+local UNBOON_RESCAN_DELAY = 0.25
+
+-- A tooltip-vs-stored duration disagreement larger than this is corrected from
+-- the tooltip (spec §4.4 "Reading the boon's contents" reconciliation).
+local BOON_DRIFT_TOLERANCE = 120
+
+-- Which of OUR ten slots can actually go into a chronoboon. Slots 9 (Battle
+-- Shout) and 10 (Fire Festival Fury) are explicitly NOT boonable per the spec's
+-- tracked-set table, so a live Battle Shout must never be flipped to "booned"
+-- when a boon cast succeeds. Slots 1-8 are the boonable world buffs.
+local BOONABLE_SLOT = {
+    [1] = true, [2] = true, [3] = true, [4] = true,
+    [5] = true, [6] = true, [7] = true, [8] = true,
+}
+
+-- Our DMF slot (Sayge's Dark Fortune). Named because the whole A8 lifecycle
+-- keys off it.
+local SLOT_DMF = 5
+
 -- Created Soulstone reagent item IDs (any in bags => a soulstone is available).
 -- Minor / Lesser / (regular) / Greater / Major Soulstone. Item 6.
 local SOULSTONE_ITEMS = { 5232, 16892, 16893, 16895, 16896 }
@@ -396,6 +437,50 @@ function Tracker.RehydrateBoonCache()
     end
 end
 
+-- A7.5 — tooltip RECONCILIATION (spec §4.4 "Reading the boon's contents").
+--
+-- Since A7.1 the cast path writes the boon cache directly, so a hover is no
+-- longer how we LEARN what is booned — it is a second opinion that corrects the
+-- first. The spec's two corrections, and only those:
+--   (a) any slot we claim is booned that the tooltip does NOT list is a phantom
+--       and is dropped;
+--   (b) a slot the tooltip DOES list whose stored duration is off by more than
+--       120 s is corrected to the tooltip's value. Smaller disagreements keep
+--       the cached value — the cast snapshot is the more precise number and we
+--       do not want a hover to jitter the display by a few seconds.
+-- The DMF slot's `option` (fortune variant) is NEVER taken from a tooltip: the
+-- tooltip renders the generic "Sayge's Dark Fortune" name and adopting it would
+-- destroy a variant the live scan resolved by spell ID.
+--
+-- `parsed` is the fresh tooltip read, `cached` the snapshot we already hold
+-- (nil on the very first hover, in which case the tooltip is adopted whole).
+-- Returns a NEW snapshot table; pure and self-tested.
+function Tracker.ReconcileBoonSnapshot(parsed, cached)
+    if type(parsed) ~= "table" then return cached end
+    if type(cached) ~= "table" or type(cached.slots) ~= "table" then
+        return { slots = parsed.slots or {}, dmf = parsed.dmf or false,
+                 count = parsed.count or 0 }
+    end
+    local out = {}
+    for slot, tip in pairs(parsed.slots or {}) do
+        local have = cached.slots[slot]
+        local tipDur = tonumber(tip and tip.duration) or 0
+        if have then
+            local haveDur = tonumber(have.duration) or 0
+            local drift = haveDur - tipDur
+            if drift < 0 then drift = -drift end
+            -- (b) correct only a real disagreement; keep `option` either way.
+            local dur = (drift > BOON_DRIFT_TOLERANCE) and tipDur or haveDur
+            out[slot] = { duration = dur, option = have.option }
+        else
+            -- The tooltip knows about a slot we did not: adopt it.
+            out[slot] = { duration = tipDur }
+        end
+    end
+    -- (a) every cached slot absent from `out` was a phantom and is now dropped.
+    return { slots = out, dmf = parsed.dmf or false, count = parsed.count or 0 }
+end
+
 -- Shallow-equality of two parsed boon snapshots (for change detection).
 local function boonSnapshotsEqual(a, b)
     if (a == nil) ~= (b == nil) then return false end
@@ -451,8 +536,11 @@ local function scanTooltipForStoredBuffs()
     -- Per-slot identity + duration from the whole block (see ParseBoonBlock).
     local slots, dmf = Tracker.ParseBoonBlock(block)
 
-    local parsed = { slots = slots, dmf = dmf, count = count }
-    Tracker._boonTooltipCount = count
+    -- A7.5: the cast path (if it ran) already wrote the authoritative snapshot;
+    -- this hover reconciles it rather than replacing it wholesale.
+    local parsed = Tracker.ReconcileBoonSnapshot(
+        { slots = slots, dmf = dmf, count = count }, Tracker._boonParsed)
+    Tracker._boonTooltipCount = parsed.count or count
     Tracker._boonTooltipSeen  = GetTime()
 
     -- Only re-capture/propagate when the parsed set actually changed (a hover
@@ -481,6 +569,256 @@ local function installTooltipHooks()
         end)
     end
     Tracker._tooltipHooked = true
+end
+
+----------------------------------------------------------------------
+-- A7 — chronoboon CAST lifecycle (spec §4.4). THE HEADLINE FIX.
+--
+-- Before this, the tooltip parser was the ONLY way we ever learned what was in
+-- a chronoboon: boon your buffs and walk away without hovering the icon, and
+-- every other account saw `chronoboonActive = true` with zero slots — a booned
+-- 60 rendering as a character with no buffs at all (A7.1).
+--
+-- The cast is now the primary source, exactly as the reference has it:
+--   * cast START   snapshots every live BOONABLE slot (duration + variant + the
+--                  frame time it was taken) and opens an "in boon cast" window;
+--   * DURING       a boonable aura that vanishes is recorded as "removed at T"
+--                  (see the recorder in captureAuras);
+--   * cast SUCCESS re-classifies those removals — within 0.3 s of the success it
+--                  was the chronoboon stripping the aura (restore as BOONED with
+--                  the snapshot duration minus what elapsed), earlier than that
+--                  it was a deliberate player cancel (stays gone, and is dropped
+--                  from the snapshot so the next scan cannot resurrect it).
+--                  Every boonable slot still live is flipped to BOONED, the
+--                  cache is rewritten FROM THAT PROJECTION, the item cooldown is
+--                  stamped, and a forced mesh push fires;
+--   * INTERRUPT    drops the pending state; nothing is retroactively flipped.
+-- Unboon flips BOONED back to LIVE, opens the 3 s unboon window and schedules a
+-- 0.25 s rescan for the real durations.
+--
+-- SIMPLIFICATIONS vs the spec, and why (all deliberate, none silent):
+--   1. The spec's cast-start step does "a fresh scan" before snapshotting. We
+--      snapshot from `rec.auraStates`, which UNIT_AURA has kept current to
+--      within the same frame — the tracker has no scan entry point separate
+--      from a full capture, and forcing a whole capture inside a cast-start
+--      handler would re-enter the change filter for no new information.
+--   2. `boonCount` keeps OUR meaning (buffs in the boon), per the standing owner
+--      decision; the items-in-bags meaning (A7.4) is queued separately.
+--   3. The 3 s unboon window is exposed as `Tracker.InUnboonWindow()` but is not
+--      yet consumed: the fresh-buff / alert filter that should honour it lives in
+--      timers.lua, which this batch does not own. FLAGGED FOLLOW-UP.
+----------------------------------------------------------------------
+
+Tracker._inBoonCast   = false   -- a boon cast is in flight
+Tracker._boonCastAt   = nil     -- GetTime() of cast start
+Tracker._boonSnapshot = nil     -- [slot] = { duration, option, at }
+Tracker._boonRemovals = {}      -- [slot] = GetTime() the aura vanished
+Tracker._unboonUntil  = 0       -- GetTime() the 3 s unboon window closes
+
+local function frameTime()
+    return (GetTime and GetTime()) or 0
+end
+
+-- Snapshot every LIVE boonable slot from the record. Pure over `rec`.
+function Tracker.SnapshotBoonable(rec, atFrame)
+    local snap = {}
+    local states = rec and rec.auraStates
+    if type(states) ~= "table" then return snap end
+    atFrame = atFrame or frameTime()
+    for slot, cell in pairs(states) do
+        if BOONABLE_SLOT[slot] and type(cell) == "table" then
+            local dur = tonumber(cell.duration) or 0
+            if dur > 0 and (cell.source or 0) ~= BOON_SOURCE then
+                snap[slot] = { duration = dur, option = cell.option or 0, at = atFrame }
+            end
+        end
+    end
+    return snap
+end
+
+-- Project the record's BOONED slots into a cache snapshot ({slots, dmf, count}).
+local function projectBoonCache(rec)
+    local parsed = { slots = {}, dmf = false, count = 0 }
+    local states = rec and rec.auraStates
+    if type(states) ~= "table" then return parsed end
+    for slot, cell in pairs(states) do
+        if type(cell) == "table" and (cell.source or 0) == BOON_SOURCE
+           and (tonumber(cell.duration) or 0) > 0 then
+            parsed.slots[slot] = { duration = math.floor(cell.duration),
+                                   option = cell.option or 0 }
+            parsed.count = parsed.count + 1
+            if slot == SLOT_DMF then parsed.dmf = true end
+        end
+    end
+    return parsed
+end
+
+-- Cast START.
+function Tracker.BeginBoonCast(rec, atFrame)
+    atFrame = atFrame or frameTime()
+    Tracker._inBoonCast   = true
+    Tracker._boonCastAt   = atFrame
+    Tracker._boonRemovals = {}
+    Tracker._boonSnapshot = Tracker.SnapshotBoonable(rec, atFrame)
+    -- Spec: write the local boon cache now and drop the tooltip's stale opinion.
+    -- Safe to do before the cast lands: captureAuras only injects boon slots when
+    -- the chronoboon AURA is actually present, so an interrupted cast never shows
+    -- these as booned, and the next full scan clears the cache.
+    if next(Tracker._boonSnapshot) ~= nil then
+        local parsed = { slots = {}, dmf = false, count = 0 }
+        for slot, s in pairs(Tracker._boonSnapshot) do
+            parsed.slots[slot] = { duration = s.duration, option = s.option }
+            parsed.count = parsed.count + 1
+            if slot == SLOT_DMF then parsed.dmf = true end
+        end
+        Tracker._boonParsed = parsed
+        Tracker._boonTooltipCount = parsed.count
+    end
+end
+
+-- Cast INTERRUPTED / FAILED (spec §4.4 step 5): drop the pending state only.
+function Tracker.AbortBoonCast()
+    Tracker._inBoonCast   = false
+    Tracker._boonCastAt   = nil
+    Tracker._boonSnapshot = nil
+    Tracker._boonRemovals = {}
+end
+
+-- Record a boonable aura that vanished during the cast. Idempotent per slot
+-- (the FIRST disappearance is the one that matters).
+function Tracker.NoteBoonRemoval(slot, atFrame)
+    if not Tracker._inBoonCast or not BOONABLE_SLOT[slot] then return end
+    Tracker._boonRemovals = Tracker._boonRemovals or {}
+    if Tracker._boonRemovals[slot] == nil then
+        Tracker._boonRemovals[slot] = atFrame or frameTime()
+    end
+end
+
+-- Cast SUCCESS. Mutates `rec` into the post-boon projection and returns the
+-- cache snapshot it wrote. `atFrame` / `atEpoch` are injectable for the suite.
+function Tracker.FinishBoonCast(rec, atFrame, atEpoch)
+    if type(rec) ~= "table" then return nil end
+    atFrame = atFrame or frameTime()
+    atEpoch = atEpoch or (ns.Store and ns.Store.Now and ns.Store.Now()) or 0
+    local snap     = Tracker._boonSnapshot or {}
+    local removals = Tracker._boonRemovals or {}
+    local states   = rec.auraStates or {}
+    rec.auraStates = states
+
+    -- (1) Re-classify every removal seen during the cast.
+    for slot, removedAt in pairs(removals) do
+        if BOONABLE_SLOT[slot] then
+            local s = snap[slot]
+            if s and (atFrame - removedAt) <= BOON_STRIP_WINDOW then
+                -- The chronoboon stripped it: restore as BOONED, snapshot-adjusted.
+                local dur = math.floor(s.duration - (removedAt - s.at))
+                states[slot] = (dur > 0)
+                    and { duration = dur, option = s.option or 0, source = BOON_SOURCE }
+                    or nil
+            else
+                -- Deliberate player cancel: stays gone, and is dropped from the
+                -- snapshot so no later scan or cache write can resurrect it.
+                snap[slot]   = nil
+                states[slot] = nil
+            end
+        end
+    end
+
+    -- (2) Every boonable slot still LIVE is flipped to BOONED. Only existing
+    -- keys are rewritten here, so the traversal is well-defined.
+    for slot, cell in pairs(states) do
+        if BOONABLE_SLOT[slot] and type(cell) == "table"
+           and (cell.source or 0) ~= BOON_SOURCE then
+            local s   = snap[slot]
+            local dur = tonumber(cell.duration) or 0
+            if s then dur = math.floor(s.duration - (atFrame - s.at)) end
+            states[slot] = (dur > 0)
+                and { duration = dur, option = cell.option or (s and s.option) or 0,
+                      source = BOON_SOURCE }
+                or nil
+        end
+    end
+
+    -- (3) Rewrite the cache FROM THE PROJECTION (not from the pre-cast snapshot).
+    local parsed = projectBoonCache(rec)
+    Tracker._boonParsed       = parsed
+    Tracker._boonTooltipCount = parsed.count
+    persistBoonCache(rec.nameRealm or selfNameRealm(), parsed)
+
+    rec.chronoboonActive   = true
+    rec.chronoboonLastSeen = atEpoch
+    rec.dmfInBoon          = parsed.dmf
+    -- A7.4 (owner decision): boonCount is ITEMS IN BAGS. The cast consumed one,
+    -- so decrement optimistically here (spec §4.4 step 4) — BAG_UPDATE_DELAYED
+    -- will re-read the true count a moment later and correct any drift.
+    if Tracker._noteBoonCount then
+        Tracker._noteBoonCount(rec, math.max(0, (tonumber(rec.boonCount) or 0) - 1))
+    end
+    -- A7.2: the cast is authoritative for the item cooldown; the bag API is a
+    -- fallback from here on (see captureCooldowns).
+    rec.chronoboonCDStart  = atEpoch
+    rec.itemCooldown       = CHRONOBOON_ITEM_CD
+
+    -- A8.5: entering a boon CARRYING DMF re-stamps a full 4 h. Safety net for a
+    -- missed unboon edge — the cooldown then freezes until the buffs come out.
+    if parsed.dmf and ns.Store and ns.Store.DMFCooldownStart then
+        ns.Store.DMFCooldownStart(rec, atEpoch)
+    end
+
+    Tracker._boonSnapshot = nil
+    Tracker._boonRemovals = {}
+    -- Spec: the window closes on the NEXT frame, so same-frame aura events stay
+    -- gated behind it.
+    if C_Timer and C_Timer.After then
+        C_Timer.After(0, function()
+            Tracker._inBoonCast = false
+            Tracker._boonCastAt = nil
+        end)
+    else
+        Tracker._inBoonCast = false
+        Tracker._boonCastAt = nil
+    end
+    return parsed
+end
+
+-- Unboon SUCCESS: every BOONED slot flips back to LIVE.
+function Tracker.FinishUnboonCast(rec, atFrame, atEpoch)
+    if type(rec) ~= "table" then return false end
+    atFrame = atFrame or frameTime()
+    atEpoch = atEpoch or (ns.Store and ns.Store.Now and ns.Store.Now()) or 0
+    local states = rec.auraStates or {}
+    rec.auraStates = states
+
+    local restoredDMF = false
+    for slot, cell in pairs(states) do
+        if type(cell) == "table" and (cell.source or 0) == BOON_SOURCE then
+            states[slot] = { duration = tonumber(cell.duration) or 0,
+                             option = cell.option or 0, source = 0 }
+            if slot == SLOT_DMF then restoredDMF = true end
+        end
+    end
+
+    Tracker._unboonUntil      = atFrame + UNBOON_WINDOW
+    Tracker._boonParsed       = nil
+    Tracker._boonTooltipCount = 0
+    persistBoonCache(rec.nameRealm or selfNameRealm(), nil)
+
+    rec.chronoboonActive = false
+    rec.dmfInBoon        = false
+    -- A7.4: boonCount is items-in-bags, so an unboon does NOT zero it. The bag
+    -- re-read that follows the item use reports the true remaining count.
+
+    -- A8.5: an unboon that RESTORES DMF re-stamps a full 4 h (spec §5 Start).
+    if restoredDMF and ns.Store and ns.Store.DMFCooldownStart then
+        ns.Store.DMFCooldownStart(rec, atEpoch)
+    end
+    return restoredDMF
+end
+
+-- Is a boonable buff gained right now a RESTORED one rather than a fresh pickup?
+-- Exposed for the fresh-buff / alert filter (see simplification 3 above).
+function Tracker.InUnboonWindow(atFrame)
+    return (atFrame or frameTime()) < (Tracker._unboonUntil or 0)
 end
 
 ----------------------------------------------------------------------
@@ -702,6 +1040,28 @@ end
 Tracker._cdCapturedAt   = nil   -- Store.Now() of the last trusted cooldown read
 Tracker._auraCapturedAt = nil   -- Store.Now() of the last aura slot write
 
+-- A7.2 — remaining on the chronoboon item, derived from the CAST STAMP.
+--
+-- The bag API was our only source, which meant a boon cast while C_Container was
+-- cold, or any relog, lost the "when can I re-boon" countdown entirely. The
+-- successful cast now writes rec.chronoboonCDStart (a server epoch) and that is
+-- authoritative; the API drops to a fallback consulted only when no live stamp
+-- exists (spec §6: "the API is only consulted when nothing is stored").
+--
+-- Self-healing: a stamp in the future (clock skew) or older than the cooldown is
+-- cleared and reads 0. Returns seconds remaining, 0 when there is no live stamp.
+local function chronoboonStampRemaining(rec, now)
+    local at = tonumber(rec.chronoboonCDStart) or 0
+    if at <= 0 then return 0 end
+    local since = now - at
+    if since < 0 or since >= CHRONOBOON_ITEM_CD then
+        rec.chronoboonCDStart = 0
+        return 0
+    end
+    return CHRONOBOON_ITEM_CD - since
+end
+Tracker._chronoboonStampRemaining = chronoboonStampRemaining
+
 local function captureCooldowns(rec)
     -- A9.2: BAG_UPDATE_COOLDOWN and the login capture both hit C_Container while
     -- it is cold right after a loading screen, which is the documented race that
@@ -712,24 +1072,41 @@ local function captureCooldowns(rec)
         local now = ns.Store.Now()
         local elapsed = sinceCapture(Tracker._cdCapturedAt, now)
         rec.hearthstoneCD = carryCooldown(rec.hearthstoneCD, elapsed)
-        rec.itemCooldown  = carryCooldown(rec.itemCooldown, elapsed)
+        -- A7.2: an epoch stamp needs no carrying — it is exact through a loading
+        -- screen and through a relog, which is the whole point of having it.
+        local stamped = chronoboonStampRemaining(rec, now)
+        if stamped > 0 then
+            rec.itemCooldown = math.min(65535, math.floor(stamped))
+        else
+            rec.itemCooldown = carryCooldown(rec.itemCooldown, elapsed)
+        end
         Tracker._cdCapturedAt = now
         return
     end
 
+    local now = ns.Store.Now()
     rec.itemCooldown = 0
     rec.hearthstoneCD = 0
+
+    -- A7.2: cast stamp first, bag API only as the fallback.
+    local stamped = chronoboonStampRemaining(rec, now)
+    if stamped > 0 then
+        rec.itemCooldown = math.min(65535, math.floor(stamped))
+    end
+
     if C_Container and C_Container.GetItemCooldown then
         rec.hearthstoneCD = math.min(65535, math.floor(itemCooldownRemaining(ITEM_HEARTHSTONE)))
-        -- Chronoboon Displacer: max remaining across the base + super-charged IDs.
-        local best = 0
-        for i = 1, #CHRONOBOON_ITEMS do
-            local rem = itemCooldownRemaining(CHRONOBOON_ITEMS[i])
-            if rem > best then best = rem end
+        if stamped <= 0 then
+            -- Chronoboon Displacer: max remaining across base + super-charged IDs.
+            local best = 0
+            for i = 1, #CHRONOBOON_ITEMS do
+                local rem = itemCooldownRemaining(CHRONOBOON_ITEMS[i])
+                if rem > best then best = rem end
+            end
+            rec.itemCooldown = math.min(65535, math.floor(best))
         end
-        rec.itemCooldown = math.min(65535, math.floor(best))
     end
-    Tracker._cdCapturedAt = ns.Store.Now()
+    Tracker._cdCapturedAt = now
 end
 
 -- A6.1: a slot the record knows was live but which carries no readable duration
@@ -837,21 +1214,45 @@ local function captureAuras(rec)
                 end
             end
 
-            -- DMF fortune.
-            if nm:find(DMF_BUFF_PREFIX, 1, true) == 1 then
-                dmfInBoon = true
+            -- NOTE (A8): a LIVE Sayge's fortune used to set `dmfInBoon` here.
+            -- It is not "in boon" — it is on your character — and the flag now
+            -- freezes the 4 h cooldown, so setting it for a live fortune would
+            -- stop the clock for exactly the two hours you are holding the buff.
+            -- `dmfInBoon` is set below, from BOON-sourced state only.
+        end
+    end
+
+    -- A7.3: while a boon cast is in flight, a boonable aura that DISAPPEARS is
+    -- recorded with the frame time it went. FinishBoonCast then decides whether
+    -- the chronoboon stripped it (restore as booned) or the player cancelled it
+    -- (stays gone) from how close that moment was to the cast succeeding.
+    if Tracker._inBoonCast and type(prev) == "table" then
+        local atFrame = frameTime()
+        for slot, cell in pairs(prev) do
+            if type(cell) == "table" and slots[slot] == nil
+               and (cell.source or 0) ~= BOON_SOURCE
+               and (tonumber(cell.duration) or 0) > 0 then
+                Tracker.NoteBoonRemoval(slot, atFrame)
             end
         end
     end
 
     -- A6.2: a scan that saw nothing at all, or one taken inside the loading-screen
     -- grace, is partial evidence — never proof that the buffs are gone.
+    -- A7: a scan taken DURING a boon cast is partial for the same reason — the
+    -- buffs are mid-transfer into the chronoboon, so nothing may be dropped on
+    -- its evidence. The removals recorded just above are the real signal, and
+    -- FinishBoonCast is what resolves them.
     local partial = (sawAnyBuff == 0) or Tracker.InEnteringWorldGrace(ENTERING_WORLD_GRACE)
+                    or (Tracker._inBoonCast and true or false)
     if partial then
         preserveSlots(prev, elapsed, slots)
     end
 
-    -- Chronoboon fields (count sourced from the tooltip parse cache).
+    -- Chronoboon fields. NOTE (A7.4): `boonCount` no longer lives here — it is
+    -- now "Chronoboon Displacer ITEMS IN BAGS" and is captured from the bags in
+    -- captureBoonItems below. The buffs-actually-in-the-boon number stays
+    -- available as Tracker.BoonedBuffCount() for anything that wants it.
     if chronoActive then
         rec.chronoboonActive = true
         rec.chronoboonLastSeen = now
@@ -863,46 +1264,217 @@ local function captureAuras(rec)
         if parsed then
             for slot, cell in pairs(parsed.slots) do
                 if not slots[slot] then
-                    slots[slot] = { duration = cell.duration or 0, option = 0, source = BOON_SOURCE }
+                    slots[slot] = { duration = cell.duration or 0,
+                                    option = cell.option or 0, source = BOON_SOURCE }
                 end
             end
             if parsed.dmf then dmfInBoon = true end
-            rec.boonCount = parsed.count or Tracker._boonTooltipCount or 0
-        else
-            rec.boonCount = Tracker._boonTooltipCount or 0
         end
     elseif partial then
         -- A6.2: "no chronoboon aura found" from a partial scan is not an unboon.
-        -- Leave chronoboonActive / boonCount / the persisted boon cache alone.
+        -- Leave chronoboonActive / the persisted boon cache alone.
         if rec.chronoboonActive and Tracker._boonParsed and Tracker._boonParsed.dmf then
             dmfInBoon = true
         end
     else
         rec.chronoboonActive = false
-        rec.boonCount = 0
         -- Unboon: drop any boon-sourced state so stale frozen slots don't linger.
         if Tracker._boonParsed then
             Tracker._boonParsed = nil
+            Tracker._boonTooltipCount = 0
             persistBoonCache(rec.nameRealm, nil)
         end
     end
 
+    -- A7.6 / A6.8: a BOON-sourced slot must never be dropped for having "run
+    -- out" — suspended buffs do not tick. The injection above and preserveSlots
+    -- both keep them verbatim; the DISPLAY-side freeze is Dashboard.AuraRemaining.
     rec.auraStates = slots
     Tracker._auraCapturedAt = now
 
-    -- DMF lifecycle: holding a fortune (live OR stored-in-boon) means the daily
-    -- has been taken, so the cooldown is active. offlineSince stays 0 while
-    -- online; the store stamps it at logout and clears it after ~8h offline.
-    -- A partial scan must not clear the flag either.
+    -- A8: `dmfInBoon` is now literally "the fortune is stashed in the boon", and
+    -- nothing else. The cooldown itself is owned by captureDMF.
     if partial and not dmfInBoon then
         dmfInBoon = rec.dmfInBoon and true or false
     end
     rec.dmfInBoon = dmfInBoon
-    if dmfInBoon then
-        rec.dmfCooldownActive = true
-        rec.dmfCooldown = rec.dmfCooldown or {}
-        rec.dmfCooldown.offlineSince = 0
+end
+
+-- How many tracked world buffs are currently inside the boon (our old
+-- boonCount meaning). Kept for callers that want it; `rec.boonCount` is now
+-- items-in-bags (A7.4, owner decision).
+function Tracker.BoonedBuffCount()
+    local p = Tracker._boonParsed
+    return (p and p.count) or 0
+end
+
+----------------------------------------------------------------------
+-- A7.4 — boonCount = Chronoboon Displacer ITEMS IN BAGS (owner decision).
+--
+-- It used to be "how many buffs did the tooltip parser find inside the boon",
+-- which answers a question nobody asks; the reference's meaning answers the
+-- actionable one — "do I have a boon left to use". Both card and detail already
+-- render this number as "N in bags", so the label was simply wrong before.
+--
+-- Counted across BOTH probed item IDs (base + Super-charged). Bag reads are
+-- suppressed during teardown and the post-loading-screen grace for the same
+-- reason the item cooldowns are: C_Item is cold there and reports 0, which would
+-- fire a spurious "no boons left" warning on every zone change.
+----------------------------------------------------------------------
+
+Tracker._boonCountSeeded = false
+
+local function bagItemCount(itemID)
+    if C_Item and C_Item.GetItemCount then
+        return tonumber(C_Item.GetItemCount(itemID)) or 0
     end
+    return 0
+end
+
+-- Warn once per transition into "none left" (spec §6). Pure-ish: the warning is
+-- suppressed until we have seen at least one honest count this session, so a
+-- login does not open with it.
+local function noteBoonCount(rec, count)
+    local prev = Tracker._lastBoonCount
+    rec.boonCount = count
+    if Tracker._boonCountSeeded and (prev or 0) > 0 and count == 0 then
+        if ns and ns.Print then
+            ns:Print("|cffff5555You have no Chronoboon Displacers left.|r")
+        end
+    end
+    Tracker._boonCountSeeded = true
+    Tracker._lastBoonCount = count
+end
+Tracker._noteBoonCount = noteBoonCount
+
+local function captureBoonItems(rec)
+    if Tracker.IsTeardown() or Tracker.InEnteringWorldGrace(COOLDOWN_GRACE) then
+        return   -- cold API: keep the last honest count
+    end
+    local n = 0
+    for i = 1, #CHRONOBOON_ITEMS do
+        n = n + bagItemCount(CHRONOBOON_ITEMS[i])
+    end
+    noteBoonCount(rec, n)
+end
+
+----------------------------------------------------------------------
+-- A8 — the DMF (Darkmoon fortune) cooldown lifecycle (spec §5).
+--
+-- The store owns the arithmetic (Store.DMFCooldown*); this owns the EDGES that
+-- drive it: a fresh fortune starts the 4 h, every capture ticks it down by the
+-- online time that passed, logout stamps the offline epoch, and the debuff-bar
+-- push clears it. The boon/unboon re-stamps live in the A7 cast handlers.
+--
+-- The FIRST capture of a session only seeds the edge detector. Login fires aura
+-- events for every buff already on the character, so treating that as a fresh
+-- fortune would re-stamp a full 4 h on every /reload — the exact failure the
+-- reference's "login stabilized" latch exists to prevent.
+----------------------------------------------------------------------
+
+-- A8.4 — DEBUFF-BAR PUSH DETECTION.
+--
+-- Classic Era shows at most 16 debuffs. The DMF cooldown is enforced by a hidden
+-- debuff, so once the visible debuff count reaches 16 that hidden aura has been
+-- evicted server-side and the cooldown is genuinely gone — you can take another
+-- fortune immediately. We presume the eviction, clear the cooldown, and
+-- (optionally) tell the raid, because in a 40-man everyone's DMF is being pushed
+-- at the same moment and nobody can see it happen.
+--
+-- Skipped entirely inside any instance (the debuff bar fills for ordinary raid
+-- reasons there and the eviction heuristic is not trustworthy), and skipped when
+-- DMF is booned or no cooldown is tracked.
+local DEBUFF_BAR_LIMIT = 16
+
+local function visibleDebuffCount()
+    if not (C_UnitAuras and C_UnitAuras.GetDebuffDataByIndex) then return 0 end
+    local n = 0
+    for i = 1, 40 do
+        if not C_UnitAuras.GetDebuffDataByIndex("player", i) then break end
+        n = n + 1
+    end
+    return n
+end
+
+-- Should the push heuristic fire? PURE — takes the facts, returns a decision, so
+-- the whole gate matrix is testable without a client.
+function Tracker.ShouldClearDMFOnDebuffPush(rec, debuffCount)
+    if type(rec) ~= "table" then return false end
+    if not rec.dmfCooldownActive then return false end   -- nothing tracked
+    if rec.dmfInBoon then return false end               -- stashed: not on the bar
+    if rec.inInstance then return false end              -- untrustworthy in here
+    return (tonumber(debuffCount) or 0) >= DEBUFF_BAR_LIMIT
+end
+
+-- Is the public announcement enabled? Additive setting, DEFAULT ON: absent means
+-- on, so an existing SavedVariables file keeps the spec'd behaviour.
+function Tracker.DMFPushAnnounceEnabled()
+    local db = ns.Store and ns.Store.GetSettings and ns.Store.GetSettings()
+    if type(db) ~= "table" then return true end
+    if db.dmfPushAnnounce == nil then return true end
+    return db.dmfPushAnnounce and true or false
+end
+
+-- Which channels the announcement goes to (spec §5: SAY always, plus RAID when
+-- in a raid or PARTY when in a party). PURE so the routing is testable.
+function Tracker.DMFPushChannels(inRaid, inParty)
+    local out = { "SAY" }
+    if inRaid then out[#out + 1] = "RAID"
+    elseif inParty then out[#out + 1] = "PARTY" end
+    return out
+end
+
+local DMF_PUSH_MESSAGE = "DMF cooldown got pushed off the debuff bar."
+
+local function announceDMFPush()
+    if not Tracker.DMFPushAnnounceEnabled() then return end
+    local inRaid  = IsInRaid and IsInRaid() or false
+    local inParty = IsInGroup and IsInGroup() or false
+    local channels = Tracker.DMFPushChannels(inRaid, inParty)
+    for i = 1, #channels do
+        if SendChatMessage then SendChatMessage(DMF_PUSH_MESSAGE, channels[i]) end
+    end
+end
+
+Tracker._dmfSeeded  = false   -- first capture only seeds the fresh-gain edge
+Tracker._dmfWasLive = false
+
+local function captureDMF(rec)
+    local Store = ns.Store
+    if not (Store and Store.DMFCooldownTick) then return end
+    local now = Store.Now()
+
+    -- Teardown: a final tick, then stamp the offline epoch (spec §5 Logout).
+    -- isResting was refreshed by captureFlags moments ago, so the value the
+    -- login-resume rule reads is genuinely "resting at logout".
+    if Tracker.IsTeardown() then
+        Store.DMFCooldownStampOffline(rec, now)
+        return
+    end
+
+    local cell = rec.auraStates and rec.auraStates[SLOT_DMF]
+    local live = (type(cell) == "table"
+                  and (tonumber(cell.duration) or 0) > 0
+                  and (cell.source or 0) ~= BOON_SOURCE) and true or false
+
+    if not Tracker._dmfSeeded then
+        Tracker._dmfSeeded = true                       -- seed only; no edge
+    elseif live and not Tracker._dmfWasLive
+           and not rec.dmfInBoon and not rec.dmfCooldownActive then
+        Store.DMFCooldownStart(rec, now)                -- fresh fortune: 0 -> live
+    end
+    Tracker._dmfWasLive = live
+
+    -- A8.4: the push check runs BEFORE the tick so a cleared cooldown does not
+    -- also get billed for the elapsed time on its way out.
+    if Tracker.ShouldClearDMFOnDebuffPush(rec, visibleDebuffCount()) then
+        Store.DMFCooldownClear(rec, rec.nameRealm, "pushed off the debuff bar")
+        announceDMFPush()
+        Tracker._dmfPushes = (Tracker._dmfPushes or 0) + 1
+        return
+    end
+
+    Store.DMFCooldownTick(rec, now, rec.nameRealm)
 end
 
 -- Exposed for the self-test harness (pure-Lua fixtures drive these directly;
@@ -910,6 +1482,8 @@ end
 Tracker._captureAuras     = captureAuras
 Tracker._captureLocation  = captureLocation
 Tracker._captureCooldowns = captureCooldowns
+Tracker._captureDMF       = captureDMF
+Tracker._captureBoonItems = captureBoonItems
 
 -- Raid lockouts from the saved-instance list. Requires a prior
 -- RequestRaidInfo (fired on login and refreshed on UPDATE_INSTANCE_INFO).
@@ -1000,7 +1574,9 @@ function Tracker.Capture(force)
     captureShards(rec)
     captureSoulstone(rec)
     captureCooldowns(rec)
+    captureBoonItems(rec)      -- A7.4: boonCount = displacers in bags
     captureAuras(rec)
+    captureDMF(rec)            -- A8: must follow captureAuras (reads the DMF slot)
     captureRaidLockouts(rec)
 
     rec.lastSeen = ns.Store.Now()
@@ -1048,6 +1624,15 @@ function Tracker.OnLogin()
     -- Rehydrate the booned-buff snapshot from the persisted cache so a relog
     -- keeps showing "(Boon)" durations before the next tooltip hover (item 37).
     Tracker.RehydrateBoonCache()
+
+    -- A8 login resume (spec §5): either forgive the cooldown (logged out RESTING
+    -- with DMF not booned, gone >= 8h01m) or resume it from the SAME value with a
+    -- fresh tick base, so the offline span is never billed as online time. Runs
+    -- BEFORE the first capture, whose tick would otherwise see a stale timestamp.
+    if ns.Store and ns.Store.DMFCooldownResume then
+        local selfRec = ns.Store.EnsureSelfCharacter(selfNameRealm())
+        if selfRec then ns.Store.DMFCooldownResume(selfRec, ns.Store.Now()) end
+    end
 
     -- Ask the server for our saved-instance (lockout) data.
     if RequestRaidInfo then RequestRaidInfo() end
@@ -1100,6 +1685,72 @@ function Tracker.OnLogin()
         "PLAYER_XP_UPDATE",       -- XP earned -> refresh xp/xpMax (debounced)
         "UPDATE_EXHAUSTION",      -- rested pool changed -> refresh restedXP
     }
+    ----------------------------------------------------------------------
+    -- A7 — chronoboon cast wiring (spec §4.4). This is what removes the hover
+    -- dependency: boon your buffs and walk away, and the card still shows them.
+    --
+    -- Both are registered even though using the ITEM often produces no visible
+    -- cast bar: an instant use fires only _SUCCEEDED, and FinishBoonCast handles
+    -- an empty snapshot by falling back to each slot's own live duration.
+    ----------------------------------------------------------------------
+    ns:RegisterEvent("UNIT_SPELLCAST_START", function(_, unit, _, spellID)
+        if unit ~= "player" or spellID ~= SPELL_BOON_CAST then return end
+        local rec = ns.Store.EnsureSelfCharacter(selfNameRealm())
+        if not rec then return end
+        Tracker.BeginBoonCast(rec)
+        -- Spec step 3: a delayed re-snapshot catches buffs gained DURING the cast.
+        if C_Timer and C_Timer.After then
+            C_Timer.After(BOON_RESNAPSHOT_DELAY, function()
+                if not Tracker._inBoonCast then return end
+                local r = ns.Store.EnsureSelfCharacter(selfNameRealm())
+                if not r then return end
+                local fresh = Tracker.SnapshotBoonable(r)
+                local snap = Tracker._boonSnapshot or {}
+                for slot, s in pairs(fresh) do
+                    if snap[slot] == nil then snap[slot] = s end
+                end
+                Tracker._boonSnapshot = snap
+            end)
+        end
+    end)
+
+    ns:RegisterEvent("UNIT_SPELLCAST_SUCCEEDED", function(_, unit, _, spellID)
+        if unit ~= "player" then return end
+        if spellID ~= SPELL_BOON_CAST and spellID ~= SPELL_UNBOON_CAST then return end
+        local rec = ns.Store.EnsureSelfCharacter(selfNameRealm())
+        if not rec then return end
+        if spellID == SPELL_BOON_CAST then
+            Tracker.FinishBoonCast(rec)
+        else
+            Tracker.FinishUnboonCast(rec)
+            -- Spec: rescan 0.25 s later for the restored buffs' real durations.
+            if C_Timer and C_Timer.After then
+                C_Timer.After(UNBOON_RESCAN_DELAY, function()
+                    ns:SafeCall(Tracker.Capture, true)
+                end)
+            end
+        end
+        -- Spec §9.4: boon and unboon success are FORCED pushes — the change
+        -- filter must never be able to swallow them.
+        ns:SafeCall(Tracker.Capture, true)
+    end)
+
+    for _, evt in ipairs({ "UNIT_SPELLCAST_INTERRUPTED", "UNIT_SPELLCAST_FAILED",
+                           "UNIT_SPELLCAST_STOP" }) do
+        ns:RegisterEvent(evt, function(_, unit, _, spellID)
+            if unit ~= "player" or spellID ~= SPELL_BOON_CAST then return end
+            -- Spec step 5: drop the pending state. Nothing is re-flipped, so an
+            -- interrupted boon leaves the buffs exactly as live as they still are.
+            -- _STOP also fires immediately after a SUCCESS, in the SAME frame in
+            -- which FinishBoonCast is still holding the window open on purpose.
+            -- FinishBoonCast nils the snapshot, so its absence is how we tell a
+            -- real interrupt from the tail of a successful cast.
+            if Tracker._inBoonCast and Tracker._boonSnapshot then
+                Tracker.AbortBoonCast()
+            end
+        end)
+    end
+
     for _, evt in ipairs(capEvents) do
         ns:RegisterEvent(evt, function(event, unit)
             -- UNIT_AURA fires for many units; only react to the player.
@@ -1854,6 +2505,356 @@ local function testChangeFilter(fails)
     if not ok then fails[#fails + 1] = "error in change-filter fixtures: " .. tostring(err) end
 end
 
+----------------------------------------------------------------------
+-- A7 — the chronoboon CAST lifecycle. This is the suite that proves the
+-- headline fix: booned buffs are known WITHOUT ever hovering the icon.
+----------------------------------------------------------------------
+local function testBoonCastLifecycle(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+
+    local savedGetTime = _G.GetTime
+    local savedNow     = ns.Store and ns.Store.Now
+    local savedState = {
+        inCast   = Tracker._inBoonCast,
+        snap     = Tracker._boonSnapshot,
+        removals = Tracker._boonRemovals,
+        parsed   = Tracker._boonParsed,
+        unboon   = Tracker._unboonUntil,
+        count    = Tracker._lastBoonCount,
+        seeded   = Tracker._boonCountSeeded,
+    }
+    local FRAME, EPOCH = 10000, 1700000000
+    local frameNow = FRAME
+    _G.GetTime   = function() return frameNow end
+    ns.Store.Now = function() return EPOCH end
+
+    local function reset()
+        Tracker._inBoonCast   = false
+        Tracker._boonSnapshot = nil
+        Tracker._boonRemovals = {}
+        Tracker._boonParsed   = nil
+        Tracker._unboonUntil  = 0
+        frameNow = FRAME
+    end
+    local function live(dur) return { duration = dur, option = 0, source = 0 } end
+    local function boon(dur) return { duration = dur, option = 0, source = BOON_SOURCE } end
+    local function newRec(states)
+        return { nameRealm = "Tester-TestRealm", auraStates = states, boonCount = 3 }
+    end
+
+    local ok, err = pcall(function()
+
+    -- ---- A7.1 the headline: boon WITHOUT hovering -------------------------
+    -- Cast start snapshots the live boonable slots; cast success flips them to
+    -- BOONED. No tooltip is ever read.
+    reset()
+    local rec = newRec({ [1] = live(3000), [4] = live(900), [9] = live(1200) })
+    Tracker.BeginBoonCast(rec, frameNow)
+    ck(Tracker._inBoonCast == true, "cast start: the in-boon-cast window opens")
+    ck(Tracker._boonSnapshot[1].duration == 3000, "cast start: slot 1 snapshotted at 3000")
+    ck(Tracker._boonSnapshot[9] == nil,
+       "cast start: Battle Shout (slot 9) is NOT boonable and is not snapshotted")
+
+    frameNow = FRAME + 2                       -- a 2s cast
+    local parsed = Tracker.FinishBoonCast(rec, frameNow, EPOCH)
+    ck(rec.auraStates[1].source == BOON_SOURCE, "cast success: slot 1 is now BOONED")
+    ck(rec.auraStates[1].duration == 2998, "cast success: slot 1 snapshot-adjusted 3000 -> 2998")
+    ck(rec.auraStates[4].source == BOON_SOURCE, "cast success: slot 4 is now BOONED")
+    ck(rec.auraStates[9].source == 0,
+       "cast success: a live Battle Shout stays LIVE (not boonable)")
+    ck(rec.chronoboonActive == true, "cast success: chronoboonActive set")
+    ck(parsed.count == 2, "cast success: two buffs projected into the boon cache")
+    ck(Tracker.BoonedBuffCount() == 2, "cast success: BoonedBuffCount reports 2")
+    ck(Tracker._boonParsed ~= nil and Tracker._boonParsed.slots[1].duration == 2998,
+       "cast success: the cache is rewritten FROM THE PROJECTION")
+
+    -- ---- A7.2 the item cooldown is stamped from the cast ------------------
+    ck(rec.chronoboonCDStart == EPOCH, "A7.2: chronoboon CD start epoch stamped by the cast")
+    ck(rec.itemCooldown == 3600, "A7.2: item cooldown reads a full hour immediately")
+    local cdRec = { chronoboonCDStart = EPOCH }
+    ck(Tracker._chronoboonStampRemaining(cdRec, EPOCH + 600) == 3000,
+       "A7.2: stamp derives 3000s remaining after 600s")
+    ck(Tracker._chronoboonStampRemaining(cdRec, EPOCH + 3600) == 0,
+       "A7.2: an elapsed stamp reads 0")
+    ck(cdRec.chronoboonCDStart == 0, "A7.2: an elapsed stamp is self-healed away")
+    local skew = { chronoboonCDStart = EPOCH + 500 }
+    ck(Tracker._chronoboonStampRemaining(skew, EPOCH) == 0, "A7.2: a future stamp is discarded")
+
+    -- ---- A7.4 boonCount is ITEMS IN BAGS, decremented by the cast ---------
+    ck(rec.boonCount == 2, "A7.4: the cast consumed one displacer (3 -> 2 in bags)")
+
+    -- ---- A7.3 strip vs player-cancel discrimination -----------------------
+    -- Slot 1 vanished 0.1s before the success (the chronoboon stripping it);
+    -- slot 4 vanished a full second before (the player cancelled it).
+    reset()
+    rec = newRec({ [1] = live(3000), [4] = live(900) })
+    Tracker.BeginBoonCast(rec, frameNow)
+    Tracker.NoteBoonRemoval(4, frameNow + 1.0)     -- deliberate cancel
+    Tracker.NoteBoonRemoval(1, frameNow + 1.9)     -- stripped by the boon
+    frameNow = FRAME + 2
+    Tracker.FinishBoonCast(rec, frameNow, EPOCH)
+    ck(rec.auraStates[1] and rec.auraStates[1].source == BOON_SOURCE,
+       "A7.3: a removal 0.1s before success = STRIPPED -> restored as booned")
+    -- Snapshot taken at FRAME with 3000s left; stripped at FRAME+1.9 -> 2998.1,
+    -- floored to 2998. The credit is against the moment it was STRIPPED, not the
+    -- moment the cast landed — that is the whole point of recording removal times.
+    ck(rec.auraStates[1].duration == 2998,
+       "A7.3: the stripped slot carries snapshot duration minus elapsed-at-strip")
+    ck(rec.auraStates[4] == nil,
+       "A7.3: a removal 1.0s before success = PLAYER CANCEL -> stays gone")
+    ck(Tracker._boonParsed.slots[4] == nil,
+       "A7.3: the cancelled slot is dropped from the cache, so no scan resurrects it")
+
+    -- Exactly on the 0.3s boundary counts as a strip (spec says "within 0.3s").
+    reset()
+    rec = newRec({ [1] = live(3000) })
+    Tracker.BeginBoonCast(rec, frameNow)
+    Tracker.NoteBoonRemoval(1, frameNow + 1.7)
+    frameNow = FRAME + 2.0
+    Tracker.FinishBoonCast(rec, frameNow, EPOCH)
+    ck(rec.auraStates[1] and rec.auraStates[1].source == BOON_SOURCE,
+       "A7.3: exactly 0.3s before success still counts as stripped")
+
+    -- ---- an INSTANT item use (no cast start) still works -------------------
+    -- Using the item often fires only _SUCCEEDED. With no snapshot, each slot's
+    -- own live duration is used.
+    reset()
+    rec = newRec({ [3] = live(1500) })
+    Tracker.FinishBoonCast(rec, frameNow, EPOCH)
+    ck(rec.auraStates[3].source == BOON_SOURCE and rec.auraStates[3].duration == 1500,
+       "instant use (no cast start): live slots still flip to booned at their own duration")
+
+    -- ---- interrupt: nothing is retroactively flipped -----------------------
+    reset()
+    rec = newRec({ [1] = live(3000) })
+    Tracker.BeginBoonCast(rec, frameNow)
+    Tracker.AbortBoonCast()
+    ck(Tracker._inBoonCast == false, "interrupt: the cast window closes")
+    ck(Tracker._boonSnapshot == nil, "interrupt: the snapshot is dropped")
+    ck(rec.auraStates[1].source == 0, "interrupt: slot 1 is still LIVE, not booned")
+
+    -- ---- unboon restores booned slots as LIVE ------------------------------
+    reset()
+    rec = newRec({ [1] = boon(2500), [SLOT_DMF] = boon(4000), [9] = live(600) })
+    rec.chronoboonActive = true
+    rec.dmfInBoon = true
+    local restoredDMF = Tracker.FinishUnboonCast(rec, frameNow, EPOCH)
+    ck(rec.auraStates[1].source == 0, "unboon: slot 1 flips BOONED -> LIVE")
+    ck(rec.auraStates[1].duration == 2500, "unboon: the stored duration carries over intact")
+    ck(rec.auraStates[9].source == 0, "unboon: an already-live slot is untouched")
+    ck(rec.chronoboonActive == false, "unboon: chronoboonActive cleared")
+    ck(rec.dmfInBoon == false, "unboon: dmfInBoon cleared")
+    ck(restoredDMF == true, "unboon: reports that it restored DMF")
+    ck(Tracker._boonParsed == nil, "unboon: the boon cache is dropped")
+    ck(Tracker.InUnboonWindow(frameNow + 2.9) == true, "unboon: the 3s window is open at +2.9s")
+    ck(Tracker.InUnboonWindow(frameNow + 3.1) == false, "unboon: the window has closed at +3.1s")
+
+    -- ---- A8.5 the boon/unboon DMF re-stamps -------------------------------
+    reset()
+    rec = newRec({ [SLOT_DMF] = boon(4000) })
+    rec.dmfCooldown = { offlineSince = 0, remainingOnlineSecs = 120, lastTickEpoch = EPOCH }
+    rec.dmfCooldownActive = true
+    Tracker.FinishUnboonCast(rec, frameNow, EPOCH)
+    ck(ns.Store.DMFCooldownRemaining(rec) == 14400,
+       "A8.5: an unboon that RESTORES DMF re-stamps a full 4h")
+
+    reset()
+    rec = newRec({ [SLOT_DMF] = live(3000) })
+    rec.dmfCooldown = { offlineSince = 0, remainingOnlineSecs = 120, lastTickEpoch = EPOCH }
+    rec.dmfCooldownActive = true
+    Tracker.FinishBoonCast(rec, frameNow, EPOCH)
+    ck(rec.dmfInBoon == true, "A8.5: booning a live DMF sets dmfInBoon")
+    ck(ns.Store.DMFCooldownRemaining(rec) == 14400,
+       "A8.5: entering a boon CARRYING DMF re-stamps a full 4h (missed-unboon safety net)")
+
+    -- ---- the removal recorder fires from a scan during the cast -----------
+    reset()
+    local savedAuras = _G.C_UnitAuras
+    _G.C_UnitAuras = { GetBuffDataByIndex = function(_, i)
+        if i == 1 then
+            return { name = "Songflower Serenade", spellId = 15366,
+                     expirationTime = frameNow + 900 }
+        end
+        return nil
+    end }
+    Tracker._auraCapturedAt = nil
+    Tracker._enteredWorldAt = frameNow - 60
+    Tracker._leavingWorld, Tracker._loggingOut = false, false
+    rec = newRec({ [1] = live(3000), [4] = live(900) })
+    Tracker._inBoonCast = true                   -- pretend a cast is in flight
+    Tracker._boonRemovals = {}
+    Tracker._captureAuras(rec)
+    ck(Tracker._boonRemovals[1] == frameNow,
+       "in-cast scan: slot 1 vanishing is RECORDED with the frame time")
+    ck(rec.auraStates[1] ~= nil,
+       "in-cast scan: the vanished slot is preserved, not dropped (the cast resolves it)")
+    _G.C_UnitAuras = savedAuras
+
+    end)
+
+    _G.GetTime   = savedGetTime
+    ns.Store.Now = savedNow
+    Tracker._inBoonCast      = savedState.inCast
+    Tracker._boonSnapshot    = savedState.snap
+    Tracker._boonRemovals    = savedState.removals
+    Tracker._boonParsed      = savedState.parsed
+    Tracker._unboonUntil     = savedState.unboon
+    Tracker._lastBoonCount   = savedState.count
+    Tracker._boonCountSeeded = savedState.seeded
+    if not ok then fails[#fails + 1] = "error in boon-cast fixtures: " .. tostring(err) end
+end
+
+----------------------------------------------------------------------
+-- A7.5 — tooltip reconciliation. The parser stays (it is better than the
+-- reference's), but it is now the SECOND opinion, not the only one.
+----------------------------------------------------------------------
+local function testBoonReconcile(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local R = Tracker.ReconcileBoonSnapshot
+
+    -- No cache yet (first hover ever): the tooltip is adopted whole.
+    local out = R({ slots = { [1] = { duration = 3000 } }, dmf = false, count = 1 }, nil)
+    ck(out.slots[1].duration == 3000, "reconcile: with no cache the tooltip is adopted")
+
+    -- (a) a slot we claim is booned that the tooltip does NOT list is a phantom.
+    local cached = { slots = { [1] = { duration = 3000 }, [4] = { duration = 900 } },
+                     dmf = false, count = 2 }
+    out = R({ slots = { [1] = { duration = 3000 } }, dmf = false, count = 1 }, cached)
+    ck(out.slots[1] ~= nil, "reconcile: a slot present in both survives")
+    ck(out.slots[4] == nil, "reconcile: a cached slot absent from the tooltip is a PHANTOM, dropped")
+    ck(out.count == 1, "reconcile: the count comes from the tooltip (it saw the real thing)")
+
+    -- (b) drift <= 120s keeps the cached (more precise) cast-snapshot value...
+    cached = { slots = { [1] = { duration = 3000 } }, dmf = false, count = 1 }
+    out = R({ slots = { [1] = { duration = 2910 } }, dmf = false, count = 1 }, cached)
+    ck(out.slots[1].duration == 3000, "reconcile: 90s of drift is tolerated, cache wins")
+    out = R({ slots = { [1] = { duration = 2880 } }, dmf = false, count = 1 }, cached)
+    ck(out.slots[1].duration == 3000, "reconcile: exactly 120s of drift is still tolerated")
+    -- ...but more than 120s is corrected from the tooltip.
+    out = R({ slots = { [1] = { duration = 2879 } }, dmf = false, count = 1 }, cached)
+    ck(out.slots[1].duration == 2879, "reconcile: >120s of drift is CORRECTED from the tooltip")
+
+    -- The DMF variant is never overwritten from a tooltip (it shows the generic name).
+    cached = { slots = { [SLOT_DMF] = { duration = 4000, option = 7 } }, dmf = true, count = 1 }
+    out = R({ slots = { [SLOT_DMF] = { duration = 100 } }, dmf = true, count = 1 }, cached)
+    ck(out.slots[SLOT_DMF].duration == 100, "reconcile: the DMF DURATION is corrected")
+    ck(out.slots[SLOT_DMF].option == 7, "reconcile: the DMF VARIANT is never taken from a tooltip")
+
+    -- A tooltip slot the cache never had is adopted.
+    out = R({ slots = { [1] = { duration = 3000 }, [6] = { duration = 500 } }, count = 2 },
+            { slots = { [1] = { duration = 3000 } }, count = 1 })
+    ck(out.slots[6] and out.slots[6].duration == 500,
+       "reconcile: a slot only the tooltip knows about is adopted")
+
+    ck(R(nil, cached) == cached, "reconcile: a nil tooltip parse leaves the cache alone")
+end
+
+----------------------------------------------------------------------
+-- A8 — the capture-side DMF edges (the arithmetic itself is store/dmf cooldown).
+----------------------------------------------------------------------
+local function testDMFCapture(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local savedNow    = ns.Store.Now
+    local savedDebuff = _G.C_UnitAuras
+    local savedSeeded, savedWasLive = Tracker._dmfSeeded, Tracker._dmfWasLive
+    local savedLatch  = { Tracker._leavingWorld, Tracker._loggingOut }
+    local EPOCH = 1700000000
+    local epochNow = EPOCH
+    ns.Store.Now = function() return epochNow end
+
+    local nDebuffs = 0
+    _G.C_UnitAuras = { GetDebuffDataByIndex = function(_, i)
+        if i <= nDebuffs then return { name = "d" .. i } end
+        return nil
+    end }
+
+    local ok, err = pcall(function()
+    Tracker._leavingWorld, Tracker._loggingOut = false, false
+
+    local function newRec(dmfCell)
+        return { nameRealm = "Tester-TestRealm", auraStates = { [SLOT_DMF] = dmfCell },
+                 dmfCooldown = { offlineSince = 0, remainingOnlineSecs = 0, lastTickEpoch = 0 } }
+    end
+
+    -- ---- the FIRST capture only seeds the edge (login must not re-stamp) ----
+    Tracker._dmfSeeded, Tracker._dmfWasLive = false, false
+    local rec = newRec({ duration = 3000, option = 0, source = 0 })
+    Tracker._captureDMF(rec)
+    ck(rec.dmfCooldownActive ~= true,
+       "login seed: a fortune already live at login does NOT start a fresh 4h")
+
+    -- ---- a genuine 0 -> live gain starts the cooldown ----------------------
+    Tracker._dmfSeeded, Tracker._dmfWasLive = true, false
+    rec = newRec({ duration = 7200, option = 0, source = 0 })
+    Tracker._captureDMF(rec)
+    ck(rec.dmfCooldownActive == true, "fresh gain: cooldown started")
+    ck(ns.Store.DMFCooldownRemaining(rec) == 14400, "fresh gain: a full 4h is owed")
+
+    -- ...and holding it does not re-stamp on every capture.
+    epochNow = EPOCH + 900
+    Tracker._captureDMF(rec)
+    ck(ns.Store.DMFCooldownRemaining(rec) == 13500,
+       "holding the fortune: the tick decrements, it does not re-stamp")
+
+    -- ---- teardown stamps the offline epoch ---------------------------------
+    Tracker._loggingOut = true
+    epochNow = EPOCH + 1000
+    Tracker._captureDMF(rec)
+    ck(rec.dmfCooldown.offlineSince == EPOCH + 1000, "teardown: offlineSince stamped")
+    Tracker._loggingOut = false
+
+    -- ---- A8.4 debuff-bar push: the gate matrix (PURE) ----------------------
+    local S = Tracker.ShouldClearDMFOnDebuffPush
+    local on = { dmfCooldownActive = true, dmfInBoon = false, inInstance = false }
+    ck(S(on, 15) == false, "push: 15 debuffs is below the 16-slot bar")
+    ck(S(on, 16) == true,  "push: 16 debuffs means the hidden CD aura was evicted")
+    ck(S(on, 20) == true,  "push: above 16 also fires")
+    ck(S({ dmfCooldownActive = true, dmfInBoon = true }, 16) == false,
+       "push: skipped while DMF is stashed in the boon")
+    ck(S({ dmfCooldownActive = true, inInstance = true }, 16) == false,
+       "push: skipped entirely inside an instance")
+    ck(S({ dmfCooldownActive = false }, 16) == false,
+       "push: skipped when no cooldown is tracked")
+    ck(S(nil, 16) == false, "push: nil record is inert")
+
+    -- ---- A8.4 the push actually clears, through the capture path -----------
+    Tracker._dmfSeeded, Tracker._dmfWasLive = true, true
+    rec = newRec({ duration = 7200, option = 0, source = 0 })
+    ns.Store.DMFCooldownStart(rec, epochNow)
+    nDebuffs = 16
+    local before = Tracker._dmfPushes or 0
+    Tracker._captureDMF(rec)
+    ck(rec.dmfCooldownActive == false, "push: the capture path clears the cooldown")
+    ck((Tracker._dmfPushes or 0) == before + 1, "push: the event is counted")
+    nDebuffs = 0
+
+    -- ---- A8.4 announcement routing (PURE) ----------------------------------
+    local C = Tracker.DMFPushChannels
+    local solo = C(false, false)
+    ck(#solo == 1 and solo[1] == "SAY", "announce: solo -> SAY only")
+    local party = C(false, true)
+    ck(#party == 2 and party[1] == "SAY" and party[2] == "PARTY", "announce: party -> SAY + PARTY")
+    local raid = C(true, true)
+    ck(#raid == 2 and raid[1] == "SAY" and raid[2] == "RAID",
+       "announce: raid -> SAY + RAID (RAID wins over PARTY)")
+
+    -- The toggle defaults ON, including when the key is absent entirely.
+    local savedGS = ns.Store.GetSettings
+    ns.Store.GetSettings = function() return {} end
+    ck(Tracker.DMFPushAnnounceEnabled() == true, "announce: an ABSENT setting means ON")
+    ns.Store.GetSettings = function() return { dmfPushAnnounce = false } end
+    ck(Tracker.DMFPushAnnounceEnabled() == false, "announce: the toggle can turn it off")
+    ns.Store.GetSettings = savedGS
+
+    end)
+
+    ns.Store.Now   = savedNow
+    _G.C_UnitAuras = savedDebuff
+    Tracker._dmfSeeded, Tracker._dmfWasLive = savedSeeded, savedWasLive
+    Tracker._leavingWorld, Tracker._loggingOut = savedLatch[1], savedLatch[2]
+    if not ok then fails[#fails + 1] = "error in DMF capture fixtures: " .. tostring(err) end
+end
+
 function Tracker.RunSelfTests(verbose)
     local suites = {
         { name = "state-push change filter (A10.1)", fn = testChangeFilter },
@@ -1863,6 +2864,9 @@ function Tracker.RunSelfTests(verbose)
         { name = "spell-ID matching (A6.4/A6.6)", fn = testSpellIDMatching },
         { name = "teardown latch + grace windows", fn = testTeardownLatch },
         { name = "capture guards (A6.1/A6.2/A6.3/A17.2/A9.2)", fn = testCaptureGuards },
+        { name = "boon cast lifecycle (A7.1/A7.2/A7.3/A7.4)", fn = testBoonCastLifecycle },
+        { name = "boon tooltip reconciliation (A7.5)", fn = testBoonReconcile },
+        { name = "DMF capture edges + debuff push (A8)", fn = testDMFCapture },
     }
     local allPass = true
     for _, suite in ipairs(suites) do

@@ -113,23 +113,36 @@ function Cards.IsLocked(rec, nowE)
     return false
 end
 
-function Cards.MissingCount(entry)
+-- A6.8: presence is decided on the DISPLAYED remaining, not the raw stored
+-- number — a buff that has run out on a live alt must count as missing here too,
+-- or the card would keep claiming "0 missing" for a character whose buffs all
+-- expired an hour ago. Booned slots never decay, so they always read present.
+local function slotRemaining(entry, slot, nowE)
+    local rec = entry and entry.rec
+    if not (rec and Dashboard and Dashboard.AuraRemaining) then
+        local st = rec and rec.auraStates and rec.auraStates[slot]
+        return (st and tonumber(st.duration)) or 0, st
+    end
+    return Dashboard.AuraRemaining(rec, slot, nowE, entry.online)
+end
+Cards._SlotRemaining = slotRemaining
+
+function Cards.MissingCount(entry, nowE)
     local rec = entry and entry.rec
     if not rec then return 0 end
     local faction = entry.faction or rec.faction
     local order = (Dashboard and Dashboard.AURA_DISPLAY_ORDER) or {}
     local n = 0
     for _, slot in ipairs(order) do
-        local st = rec.auraStates and rec.auraStates[slot]
-        local present = st and (st.duration or 0) > 0
+        local present = slotRemaining(entry, slot, nowE) > 0
         local applicable = Dashboard.AuraRequirement(slot, rec, faction)
         if applicable and not present then n = n + 1 end
     end
     return n
 end
 
-function Cards.NeedsBuffs(entry)
-    return Cards.MissingCount(entry) > 0
+function Cards.NeedsBuffs(entry, nowE)
+    return Cards.MissingCount(entry, nowE) > 0
 end
 
 -- Hover-peek (round-12 restore #2; BRAND_SPEC §8 ~200ms GameTooltip). Pure helpers so
@@ -150,7 +163,7 @@ function Cards.PeekLines(entry, nowE)
     return {
         online   = entry and entry.online and true or false,
         location = hasLoc and rec.location or nil,
-        missing  = Cards.MissingCount(entry),
+        missing  = Cards.MissingCount(entry, nowE),
         ago      = Cards.AgoText(rec, nowE),
     }
 end
@@ -165,7 +178,7 @@ end
 function Cards.MatchesMods(entry, mods, nowE)
     mods = mods or {}
     if mods.online and not entry.online then return false end
-    if mods.needs and not Cards.NeedsBuffs(entry) then return false end
+    if mods.needs and not Cards.NeedsBuffs(entry, nowE) then return false end
     if mods.stale and not Cards.IsStale(entry.rec, nowE) then return false end
     if mods.locked and not Cards.IsLocked(entry.rec, nowE) then return false end
     return true
@@ -292,10 +305,11 @@ end
 -- -> warn; non-applicable -> faint (hidden).
 --   present -> "owned","idle" ; missing(req) -> "missing","danger"
 --   missing(opt) -> "warn","warn" ; non-applicable -> "na","faint"
-function Cards.SlotState(entry, slot)
+function Cards.SlotState(entry, slot, nowE)
     local rec = entry.rec
-    local st = rec.auraStates and rec.auraStates[slot]
-    local present = st and (st.duration or 0) > 0
+    -- A6.8: decayed for an ONLINE character, frozen for an offline one, and
+    -- always frozen for a booned slot (A7.6). One shared helper, one meaning.
+    local present = slotRemaining(entry, slot, nowE) > 0
     local applicable, requirement = Dashboard.AuraRequirement(slot, rec, entry.faction or rec.faction)
     if present then return "owned", "idle" end
     if not applicable then return "na", "faint" end
@@ -310,8 +324,8 @@ end
 --   { shown, desat (bool), border (token), state }  -- shown=false for a hidden slot.
 -- (The DETAIL pane's larger tiles use their own BuffTileState paint; this is the
 -- compact strip's dedicated, headless-tested style matrix.)
-function Cards.StripTileStyle(entry, slot)
-    local state, token = Cards.SlotState(entry, slot)
+function Cards.StripTileStyle(entry, slot, nowE)
+    local state, token = Cards.SlotState(entry, slot, nowE)
     if state == "na" then return { shown = false, state = state } end
     local owned = (state == "owned")
     return {
@@ -663,7 +677,7 @@ local function makeCard(parent, pane)
         local order = Dashboard.AURA_DISPLAY_ORDER or {}
         local ti = 0
         for _, slot in ipairs(order) do
-            local sty = Cards.StripTileStyle(entry, slot)
+            local sty = Cards.StripTileStyle(entry, slot, nowE)
             if sty.shown then
                 ti = ti + 1
                 local t = self.tiles[ti]
@@ -1168,6 +1182,35 @@ local function testSlotState(fails)
         local s4, t4 = Cards.SlotState(mageE, rendSlot)
         ck(s4 == "warn" and t4 == "warn", "optional missing -> warn/warn")
         ns.Store.GetFactionSettings = savedGFS
+    end
+
+    -- ---- A6.8 / A7.6 on the card strip -----------------------------------
+    -- `entry.online` is already stamped by the roster gather, so the strip does
+    -- not have to re-resolve presence — it just has to USE it.
+    if onySlot then
+        local BOON = (ns.Store and ns.Store.AURA_SOURCE and ns.Store.AURA_SOURCE.BOON) or 2
+        local T = 1700000000
+        local function entry(dur, source, online)
+            return { faction = "Horde", online = online,
+                     rec = { nameRealm = "X-R", classTag = "WARRIOR", lastDataUpdate = T,
+                             lastSeen = T,
+                             auraStates = { [onySlot] = { duration = dur, source = source } } } }
+        end
+        -- Online, decayed past zero -> the strip flips to missing.
+        ck(Cards.SlotState(entry(300, 0, true), onySlot, T + 600) == "missing",
+           "A6.8 strip: an online alt's expired buff reads MISSING, not owned")
+        -- Same numbers, offline -> frozen, still owned.
+        ck(Cards.SlotState(entry(300, 0, false), onySlot, T + 600) == "owned",
+           "A6.8 strip: an offline record stays frozen and still reads owned")
+        -- Booned -> frozen for an online character too.
+        ck(Cards.SlotState(entry(300, BOON, true), onySlot, T + 600) == "owned",
+           "A7.6 strip: a booned slot never decays out of the strip")
+        -- MissingCount uses the same rule.
+        ck(Cards.MissingCount(entry(300, 0, true), T + 600) > 0,
+           "A6.8: MissingCount counts an online alt's decayed-out buff as missing")
+        ck(Cards.MissingCount(entry(300, BOON, true), T + 600)
+           < Cards.MissingCount(entry(300, 0, true), T + 600),
+           "A7.6: a booned buff is not counted missing")
     end
 end
 

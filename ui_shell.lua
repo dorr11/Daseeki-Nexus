@@ -472,25 +472,67 @@ function Dashboard.DecayRemaining(stored, lastUpdate, nowE)
 end
 
 -- DMF cooldown remaining (owner task 4 — the "DMFable" tracker, folded onto the
--- DMF buff row). The engine models the Darkmoon-fortune cooldown as a boolean
--- (rec.dmfCooldownActive) plus rec.dmfCooldown.offlineSince; the only duration in
--- the model is the sibling ~8h resting-offline auto-clear (store.lua's private
--- DMF_OFFLINE_CLEAR + Store.SweepOfflineDMF). We must not touch store.lua here
--- (a concurrent branch owns it), so: prefer a Store accessor if that branch adds
--- one, otherwise mirror the 8h rule locally. Returns seconds until the CD would
--- auto-clear, or 0 when not on cooldown / online (offlineSince == 0 → no clock).
--- ⚠ The mirrored constant duplicates store.lua's private one; the clean end state
--- is Store exposing Store.DMFCooldownRemaining and this fallback being deleted.
-local DMF_OFFLINE_CLEAR = 8 * 3600
+-- DMF buff row). A8 landed the real model in store.lua: a 14,400 s ONLINE-TIME
+-- cooldown carried on rec.dmfCooldown.remainingOnlineSecs, ticked down by the
+-- tracker and frozen while the fortune is stashed in a chronoboon. This is now a
+-- thin delegation; the old local 8h mirror is gone, and with it the bug where an
+-- ONLINE character always read 0 remaining (offlineSince is 0 while online) and
+-- so rendered READY the instant after taking a fortune (A8.2).
+--
+-- Contract kept exactly as the UI expects:
+--   not on cooldown       -> 0   (callers render "READY")
+--   on cooldown, rem > 0  -> the remaining seconds
+--   on cooldown, rem == 0 -> 0   (callers render "on CD"; this is the remote /
+--                                 legacy case, where the real remaining is not
+--                                 something we can know — see the tri-state note
+--                                 on Store.DMFCooldownRemaining)
 local function dmfCooldownRemaining(rec, nowE)
     if ns.Store and ns.Store.DMFCooldownRemaining then
         return ns.Store.DMFCooldownRemaining(rec, nowE) or 0
     end
-    if not (rec and rec.dmfCooldownActive and rec.dmfCooldown) then return 0 end
-    local since = rec.dmfCooldown.offlineSince or 0
-    if since <= 0 then return 0 end
-    local rem = (since + DMF_OFFLINE_CLEAR) - (nowE or now())
-    return rem > 0 and math.floor(rem) or 0
+    return 0
+end
+
+----------------------------------------------------------------------
+-- A6.8 — DISPLAYED aura remaining. THE single choke point.
+--
+-- Every aura duration in the record is the seconds left AT THE MOMENT IT WAS
+-- CAPTURED (rec.lastDataUpdate). We used to render that number raw, everywhere,
+-- for every character — so a buff on a live alt sat frozen on your other
+-- account's screen at whatever it read when the last update arrived, and an
+-- "Ony 1h 20m" could still be showing 1h 20m twenty minutes later.
+--
+-- The rule, in one place so cards, detail tiles and the missing-buff counts can
+-- never disagree:
+--   * BOONED slot        -> FROZEN, always. A suspended buff does not tick, on
+--                           anyone's screen, online or not. This is A7.6: it used
+--                           to be right by accident (nothing decayed at all), and
+--                           is now an explicit, tested exception.
+--   * ONLINE character   -> stored - (now - lastDataUpdate), floored at 0. The
+--                           record is being refreshed, so the elapsed time since
+--                           the last refresh is real time off the buff.
+--   * OFFLINE character  -> FROZEN at its last known value (unchanged: nothing is
+--                           updating the record, and decaying it would invent an
+--                           expiry the character may never have reached).
+--
+-- `online` may be passed by a caller that already computed it (the card gather
+-- stamps entry.online); otherwise it is resolved through Dashboard.IsOnline.
+-- Returns (remaining, cell) so callers can still read source/option.
+function Dashboard.AuraRemaining(rec, slot, nowE, online)
+    local st = rec and rec.auraStates and rec.auraStates[slot]
+    if type(st) ~= "table" then return 0, nil end
+    local stored = tonumber(st.duration) or 0
+    if stored <= 0 then return 0, st end
+
+    local BOON = (ns.Store and ns.Store.AURA_SOURCE and ns.Store.AURA_SOURCE.BOON) or 2
+    if st.source == BOON or st.source == "boon" then
+        return math.floor(stored), st          -- A7.6: never decays
+    end
+
+    if online == nil then online = Dashboard.IsOnline(rec, rec.nameRealm) end
+    if not online then return math.floor(stored), st end   -- offline: frozen
+
+    return Dashboard.DecayRemaining(stored, rec.lastDataUpdate, nowE), st
 end
 
 -- "Updated 3m ago" style freshness string from an epoch.
@@ -1512,11 +1554,61 @@ local function testMeshPresence(fails)
     end
 end
 
+-- A6.8 — the display-decay choke point. Three behaviours, one helper:
+-- online decays, offline freezes, booned NEVER decays (A7.6).
+local function testAuraDisplayDecay(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local BOON = (ns.Store and ns.Store.AURA_SOURCE and ns.Store.AURA_SOURCE.BOON) or 2
+    local T = 1700000000
+
+    local function rec(cell, upd)
+        return { nameRealm = "Zzz-Nowhere", lastDataUpdate = upd or T,
+                 lastSeen = upd or T, auraStates = { [1] = cell } }
+    end
+
+    -- ONLINE: the stored number ages by the time since the record was refreshed.
+    local r = rec({ duration = 3600, source = 0 })
+    ck(Dashboard.AuraRemaining(r, 1, T, true) == 3600, "online, no elapsed -> unchanged")
+    ck(Dashboard.AuraRemaining(r, 1, T + 600, true) == 3000,
+       "online: 600s since the last update -> 600s off the buff (THE A6.8 FIX)")
+    ck(Dashboard.AuraRemaining(r, 1, T + 99999, true) == 0, "online: floors at 0, never negative")
+
+    -- OFFLINE: frozen at its last known value.
+    ck(Dashboard.AuraRemaining(r, 1, T + 600, false) == 3600,
+       "offline: FROZEN — nothing is refreshing the record, so nothing is inferred")
+    ck(Dashboard.AuraRemaining(r, 1, T + 99999, false) == 3600, "offline: still frozen much later")
+
+    -- BOONED: frozen for EVERYONE, online or not (A7.6, now explicit).
+    local b = rec({ duration = 3600, source = BOON })
+    ck(Dashboard.AuraRemaining(b, 1, T + 600, true) == 3600,
+       "booned + ONLINE: frozen — a suspended buff does not tick (A7.6)")
+    ck(Dashboard.AuraRemaining(b, 1, T + 99999, true) == 3600,
+       "booned + ONLINE: still frozen after a whole day")
+    ck(Dashboard.AuraRemaining(b, 1, T + 600, false) == 3600, "booned + offline: frozen")
+    -- The string form of the same flag is honoured (legacy records).
+    local bs = rec({ duration = 1800, source = "boon" })
+    ck(Dashboard.AuraRemaining(bs, 1, T + 600, true) == 1800, "booned via the legacy string source: frozen")
+
+    -- Clock skew: a lastDataUpdate in the future must not inflate the countdown.
+    local skew = rec({ duration = 3600, source = 0 }, T + 500)
+    ck(Dashboard.AuraRemaining(skew, 1, T, true) == 3600, "clock skew: elapsed clamps at 0")
+
+    -- Empty / absent slots are inert.
+    ck(Dashboard.AuraRemaining(rec({ duration = 0, source = 0 }), 1, T, true) == 0, "zero duration -> 0")
+    ck(Dashboard.AuraRemaining({ auraStates = {} }, 1, T, true) == 0, "absent slot -> 0")
+    ck(Dashboard.AuraRemaining(nil, 1, T, true) == 0, "nil record -> 0")
+
+    -- The second return is the raw cell, so callers can still read source/option.
+    local _, cell = Dashboard.AuraRemaining(b, 1, T, true)
+    ck(cell and cell.source == BOON, "returns the raw cell alongside the remaining")
+end
+
 if ns.RegisterSelfTest then
     ns:RegisterSelfTest("dashboard", function(verbose)
         local cases = {
             { name = "aura class rules", fn = testAuraClassRules },
             { name = "cooldown decay", fn = testDecayRemaining },
+            { name = "aura display decay (A6.8/A7.6)", fn = testAuraDisplayDecay },
             { name = "dmf schedule", fn = testDMFSchedule },
             { name = "online exclusivity", fn = testOnlineExclusivity },
             { name = "mesh presence + 15s window (A1.1/A1.2)", fn = testMeshPresence },

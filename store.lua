@@ -33,7 +33,17 @@ local LOG_DEDUP_WINDOW   = 30            -- 30s
 local NOROLE_CAP         = 10            -- per account, evict oldest, never self
 local MESH_CAP           = 8             -- accounts
 local TOMBSTONE_TTL      = 14 * 86400    -- 14 days
-local DMF_OFFLINE_CLEAR  = 8 * 3600      -- ~8h resting-offline clears sibling DMF CD
+-- A8: the Darkmoon-fortune cooldown model (spec §5). ONLINE_TIME length is what
+-- the countdown actually spends: 4h of time spent logged in, decremented on
+-- capture ticks and FROZEN while the fortune is stashed in a chronoboon. The
+-- OFFLINE_CLEAR threshold (8h + 1 min safety margin) is the separate rule that
+-- forgives the cooldown for a character parked offline — and only when it logged
+-- out RESTING with DMF not booned (A8.3; the old code applied a flat 8h to every
+-- offline record regardless).
+local DMF_COOLDOWN_ONLINE = 14400        -- 4h of ONLINE time
+local DMF_OFFLINE_CLEAR   = 28860        -- 8h + 60s safety margin, resting-only
+Store.DMF_COOLDOWN_ONLINE = DMF_COOLDOWN_ONLINE
+Store.DMF_OFFLINE_CLEAR   = DMF_OFFLINE_CLEAR
 local WEEK_SECONDS       = 7 * 86400
 -- Suite-namespace store (Daseeki.Sync v2, wave N5): retention for the
 -- cross-account payloads other suite addons publish through Nexus (e.g. Bags).
@@ -480,6 +490,14 @@ local function defaultSettings()
         -- warn threshold ("4 of 5 hourly instances used."). Default ON. ADDITIVE;
         -- the engine only READS this key — the options UI lands with the tab wave.
         instancesWarnOnEntry = true,
+        -- A8.4: when the debuff bar pushes the hidden DMF cooldown aura off,
+        -- announce it publicly (SAY, plus RAID/PARTY when grouped) so the raid
+        -- knows everyone's fortune just came back up. Default ON per the spec.
+        -- ADDITIVE and read through Tracker.DMFPushAnnounceEnabled, which treats
+        -- an ABSENT key as ON — so an existing SavedVariables file behaves the
+        -- same as a fresh one. FLAGGED: the options UI checkbox for this lives in
+        -- options.lua, which this batch does not own.
+        dmfPushAnnounce   = true,
         accountID         = "",           -- user sets via /dsn account
         minimap = {
             hide = false,
@@ -848,15 +866,28 @@ function Store.NewCharacterRecord(nameRealm)
         pvpExpiry       = 0,       -- epoch when the flag drops (0 = none)
         chronoboonActive = false,
         chronoboonLastSeen = 0,
+        chronoboonCDStart = 0,     -- A7.2: epoch of the last successful BOON CAST.
+                                   -- Authoritative source for the chronoboon item
+                                   -- cooldown; the bag API is only a fallback.
         boonCount       = 0,
         shardCount      = 0,       -- warlock soul shards
         soulstoneReady  = false,   -- warlock: a soulstone is available (item in bags
                                    -- and/or Create Soulstone off cooldown) — item 6
         itemCooldown    = 0,       -- remaining seconds on the tracked trinket/item
         hearthstoneCD   = 0,       -- remaining seconds
-        dmfInBoon       = false,   -- currently holding a Darkmoon fortune
+        dmfInBoon       = false,   -- the Darkmoon fortune is stashed IN the boon.
+                                   -- A8: this is now literally "in boon" (it used
+                                   -- to mean "holds a fortune, live or booned"),
+                                   -- because the cooldown FREEZES on this flag.
         dmfCooldownActive = false,
-        dmfCooldown     = { offlineSince = 0 },
+        -- A8.1: a real 4h ONLINE-TIME cooldown, not a boolean.
+        --   remainingOnlineSecs — seconds of ONLINE time still owed.
+        --   lastTickEpoch       — epoch the remaining was last decremented at.
+        --   offlineSince        — epoch of logout (0 while online / resumed).
+        -- Both new fields are ADDITIVE: an older record that carries only
+        -- offlineSince still loads, and reads as "on CD, remaining unknown" until
+        -- the local tick seeds it (see Store.DMFCooldownTick).
+        dmfCooldown     = { offlineSince = 0, remainingOnlineSecs = 0, lastTickEpoch = 0 },
         raidLockouts    = {},      -- [raidKey] = expiryEpoch
         auraStates      = {},      -- [1..10] = { duration, option, source }
         lastSeen        = 0,
@@ -1146,22 +1177,210 @@ function Store.SweepOrphanBucket()
 end
 
 ----------------------------------------------------------------------
--- Retention: offline sibling DMF cooldown clear (~8h resting-offline)
+-- A8 — Darkmoon Faire cooldown lifecycle (spec §5)
+--
+-- MODEL. The cooldown is 14,400 s of ONLINE time. It is not a wall-clock
+-- deadline: a character that logs out at 3h30m remaining still owes 3h30m of
+-- play when it logs back in. Three gates stop the clock:
+--   * `offlineSince > 0`  — logout stamped but the login-resume handler has not
+--     run yet. Ticking here would burn the whole offline span in one step.
+--   * `rec.dmfInBoon`     — the fortune is suspended in a chronoboon; the game
+--     does not run the cooldown against it, so neither do we (only the tick
+--     timestamp advances so the freeze does not bank elapsed time).
+--   * not `dmfCooldownActive` — nothing to tick.
+--
+-- The ONLY wall-clock rule is the offline forgiveness (A8.3): a character that
+-- logged out RESTING, with DMF NOT booned, and has been gone >= 28,860 s has its
+-- cooldown cleared. The previous code applied a flat 8h to EVERY offline record
+-- with no resting/boon precondition, so a character parked in the open world got
+-- a free reset.
+--
+-- BACKWARD COMPATIBILITY. `remainingOnlineSecs` / `lastTickEpoch` are additive.
+-- A record written before this change carries neither: it reads as "on cooldown,
+-- remaining unknown" (Store.DMFCooldownRemaining -> 0, which the UI renders as
+-- "on CD"), and the first local tick seeds it to a full 4h rather than inventing
+-- a number. Remote records never carry the new fields at all — see the FLAGGED
+-- FOLLOW-UP note on Store.DMFCooldownRemaining.
+----------------------------------------------------------------------
+
+local function dmfCD(rec)
+    if type(rec) ~= "table" then return nil end
+    rec.dmfCooldown = rec.dmfCooldown or {}
+    return rec.dmfCooldown
+end
+
+-- "3h 12m" for the chat lines (local, so store.lua does not depend on the UI).
+local function dmfHM(secs)
+    secs = math.max(0, math.floor(tonumber(secs) or 0))
+    local h = math.floor(secs / 3600)
+    local m = math.floor((secs % 3600) / 60)
+    if h > 0 then return string.format("%dh %02dm", h, m) end
+    return string.format("%dm", m)
+end
+
+local function dmfChat(msg)
+    if ns and ns.Print then ns:Print("|cff44ff44" .. msg .. "|r") end
+end
+
+-- Seconds of ONLINE time still owed, for display. 0 means either "not on
+-- cooldown" (caller checks rec.dmfCooldownActive first) or "on cooldown,
+-- remaining unknown" — the UI contract keeps those distinct:
+--   not active            -> "READY"
+--   active, remaining > 0 -> the duration
+--   active, remaining = 0 -> "on CD"
+--
+-- ⚠ FLAGGED FOLLOW-UP (no wire change in this batch): Protocol.DecodeCharacter
+-- rebuilds `rec.dmfCooldown` as `{ offlineSince = <u32> }`, so a record that
+-- arrives over the mesh never carries remainingOnlineSecs. Remote characters
+-- therefore render the spec's tri-state (DMF in Boon / DMF on CD / DMFable) and
+-- never a countdown — which is exactly what spec §5 "Display" prescribes for
+-- other accounts. Syncing the real remaining would need a protocol bump.
+function Store.DMFCooldownRemaining(rec, nowE)
+    if type(rec) ~= "table" or not rec.dmfCooldownActive then return 0 end
+    local cd = rec.dmfCooldown
+    if type(cd) ~= "table" then return 0 end
+    local rem = tonumber(cd.remainingOnlineSecs)
+    if not rem or rem <= 0 then return 0 end
+    return math.floor(rem)
+end
+
+-- Start (or hard re-stamp) a full 4h cooldown. Used on a fresh DMF gain, on an
+-- unboon that restores DMF, and on entering a boon carrying DMF (spec §5 Start).
+function Store.DMFCooldownStart(rec, nowE)
+    local cd = dmfCD(rec)
+    if not cd then return end
+    nowE = nowE or serverNow()
+    rec.dmfCooldownActive     = true
+    cd.remainingOnlineSecs    = DMF_COOLDOWN_ONLINE
+    cd.lastTickEpoch          = nowE
+    cd.offlineSince           = 0
+end
+
+-- Clear the cooldown. `label` (a character name) prints the spec's green line.
+function Store.DMFCooldownClear(rec, label, extra)
+    local cd = dmfCD(rec)
+    if not cd then return end
+    rec.dmfCooldownActive  = false
+    cd.remainingOnlineSecs = 0
+    cd.lastTickEpoch       = 0
+    cd.offlineSince        = 0
+    if label then
+        dmfChat("Darkmoon fortune cooldown is up for " .. label
+                .. (extra and (" (" .. extra .. ")") or "") .. " — DMFable.")
+    end
+end
+
+-- Decrement by elapsed ONLINE time. Returns true when this tick cleared the CD.
+-- Called from the tracker on every capture of the played character.
+function Store.DMFCooldownTick(rec, nowE, label)
+    if type(rec) ~= "table" or not rec.dmfCooldownActive then return false end
+    local cd = dmfCD(rec)
+    nowE = nowE or serverNow()
+
+    -- Legacy / never-seeded record: adopt a full 4h rather than invent a number.
+    if tonumber(cd.remainingOnlineSecs) == nil then
+        cd.remainingOnlineSecs = DMF_COOLDOWN_ONLINE
+        cd.lastTickEpoch = nowE
+        return false
+    end
+
+    -- Gate 1: logout stamped, login-resume has not run. Do not burn the gap.
+    if (tonumber(cd.offlineSince) or 0) > 0 then return false end
+
+    local last = tonumber(cd.lastTickEpoch) or 0
+    if last <= 0 then cd.lastTickEpoch = nowE return false end
+    local elapsed = nowE - last
+    if elapsed < 0 then elapsed = 0 end
+    cd.lastTickEpoch = nowE
+
+    -- Gate 2: frozen while stashed in the boon (timestamp still advances, so the
+    -- freeze cannot bank the elapsed time and dump it on the next tick).
+    if rec.dmfInBoon then return false end
+
+    cd.remainingOnlineSecs = cd.remainingOnlineSecs - elapsed
+    if cd.remainingOnlineSecs <= 0 then
+        Store.DMFCooldownClear(rec, label)
+        return true
+    end
+    return false
+end
+
+-- Logout: a final tick, then stamp the offline epoch (spec §5 Logout).
+function Store.DMFCooldownStampOffline(rec, nowE)
+    if type(rec) ~= "table" or not rec.dmfCooldownActive then return end
+    nowE = nowE or serverNow()
+    Store.DMFCooldownTick(rec, nowE)
+    if not rec.dmfCooldownActive then return end   -- the final tick cleared it
+    local cd = dmfCD(rec)
+    cd.offlineSince = nowE
+end
+
+-- Is this record eligible for the offline forgiveness? Pure; shared by the
+-- login-resume path and the sibling sweep so the two can never drift.
+function Store.DMFOfflineClearable(rec, nowE)
+    if type(rec) ~= "table" or not rec.dmfCooldownActive then return false end
+    local cd = rec.dmfCooldown
+    if type(cd) ~= "table" then return false end
+    local since = tonumber(cd.offlineSince) or 0
+    if since <= 0 then return false end
+    if not rec.isResting then return false end     -- A8.3: resting at logout
+    if rec.dmfInBoon then return false end          -- A8.3: not stashed in a boon
+    nowE = nowE or serverNow()
+    return (nowE - since) >= DMF_OFFLINE_CLEAR, (nowE - since)
+end
+
+-- Login resume for the character we just logged into (spec §5 Login resume).
+-- Either forgives the cooldown outright or resumes it from the SAME value with a
+-- fresh tick timestamp (so the offline span is never billed as online time).
+-- Returns true if the cooldown was cleared.
+function Store.DMFCooldownResume(rec, nowE)
+    if type(rec) ~= "table" or not rec.dmfCooldownActive then return false end
+    local cd = dmfCD(rec)
+    nowE = nowE or serverNow()
+    local since = tonumber(cd.offlineSince) or 0
+    if since <= 0 then
+        cd.lastTickEpoch = nowE
+        return false
+    end
+    local clearable, offlineFor = Store.DMFOfflineClearable(rec, nowE)
+    if clearable then
+        Store.DMFCooldownClear(rec, rec.nameRealm or "you", dmfHM(offlineFor) .. " offline")
+        return true
+    end
+    cd.offlineSince  = 0
+    cd.lastTickEpoch = nowE
+    return false
+end
+
+----------------------------------------------------------------------
+-- Retention: offline sibling DMF cooldown clear (resting-only, >= 8h01m)
+--
+-- Spec §5 "Sibling reconciliation": walk the OTHER characters of OUR OWN
+-- account and apply the same offline-rest rule, bumping the data epoch so peers
+-- re-sync, one green chat line per character that crossed.
+--
+-- ⚠ NARROWED from the previous behaviour, deliberately: the old sweep walked
+-- EVERY account bucket, so it forgave cooldowns on characters owned by other
+-- clients. Those records are the remote owner's to age out (and its sweep does
+-- exactly that), and clearing them locally just loses to the next inbound sync.
 ----------------------------------------------------------------------
 
 function Store.SweepOfflineDMF()
     local now = serverNow()
-    for aid, bucket in pairs(Store.data.accounts) do
-        for _, rec in pairs(bucket.characters) do
-            if rec.dmfCooldownActive and rec.dmfCooldown then
-                local since = rec.dmfCooldown.offlineSince or 0
-                if since > 0 and (now - since) >= DMF_OFFLINE_CLEAR then
-                    rec.dmfCooldownActive = false
-                    rec.dmfCooldown.offlineSince = 0
-                end
-            end
+    local bucket = Store.GetSelfAccount(false)
+    if not bucket or not bucket.characters then return 0 end
+    local cleared = 0
+    for nameRealm, rec in pairs(bucket.characters) do
+        local clearable, offlineFor = Store.DMFOfflineClearable(rec, now)
+        if clearable then
+            Store.DMFCooldownClear(rec, nameRealm, dmfHM(offlineFor) .. " offline")
+            -- Bump the data epoch so peers accept our clear on the next sync.
+            rec.lastDataUpdate = now
+            rec.ownerEpoch     = now
+            cleared = cleared + 1
         end
     end
+    return cleared
 end
 
 ----------------------------------------------------------------------
@@ -1773,6 +1992,102 @@ local function testRestedPercent(fails)
         "default record (0/0/0) -> nil")
 end
 
+-- A8 — the DMF cooldown model. Everything here is driven with EXPLICIT epochs so
+-- the suite is deterministic; nothing touches the real clock.
+local function testDMFCooldown(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local T0 = 1700000000
+
+    -- Constants are the spec's, not the old flat 8h.
+    ck(Store.DMF_COOLDOWN_ONLINE == 14400, "DMF online cooldown is 14400s (4h)")
+    ck(Store.DMF_OFFLINE_CLEAR == 28860, "DMF offline clear is 28860s (8h + 60s)")
+
+    -- ---- start + online tick decrement ------------------------------------
+    local rec = Store.NewCharacterRecord("Alt-Realm")
+    Store.DMFCooldownStart(rec, T0)
+    ck(rec.dmfCooldownActive == true, "start: cooldown active")
+    ck(Store.DMFCooldownRemaining(rec) == 14400, "start: remaining is a full 4h")
+    ck(rec.dmfCooldown.offlineSince == 0, "start: offline stamp cleared")
+
+    Store.DMFCooldownTick(rec, T0 + 600)
+    ck(Store.DMFCooldownRemaining(rec) == 13800, "tick: 600s online -> 13800 left")
+    Store.DMFCooldownTick(rec, T0 + 600)     -- same epoch twice = no double-bill
+    ck(Store.DMFCooldownRemaining(rec) == 13800, "tick: repeated at the same epoch is a no-op")
+
+    -- ---- frozen while stashed in the boon ---------------------------------
+    rec.dmfInBoon = true
+    Store.DMFCooldownTick(rec, T0 + 4000)
+    ck(Store.DMFCooldownRemaining(rec) == 13800, "boon freeze: remaining does not move")
+    ck(rec.dmfCooldown.lastTickEpoch == T0 + 4000,
+       "boon freeze: tick timestamp still advances (no banked time)")
+    rec.dmfInBoon = false
+    Store.DMFCooldownTick(rec, T0 + 4100)
+    ck(Store.DMFCooldownRemaining(rec) == 13700,
+       "unfreeze: only the 100s since the last tick is billed, not the frozen span")
+
+    -- ---- reaching zero clears --------------------------------------------
+    Store.DMFCooldownTick(rec, T0 + 4100 + 13700)
+    ck(rec.dmfCooldownActive == false, "tick to zero: cooldown cleared")
+    ck(Store.DMFCooldownRemaining(rec) == 0, "tick to zero: remaining reads 0")
+
+    -- ---- logout stamp then the pending-offline gate -----------------------
+    rec = Store.NewCharacterRecord("Alt-Realm")
+    Store.DMFCooldownStart(rec, T0)
+    Store.DMFCooldownStampOffline(rec, T0 + 1000)
+    ck(rec.dmfCooldown.offlineSince == T0 + 1000, "logout: offlineSince stamped")
+    ck(Store.DMFCooldownRemaining(rec) == 13400, "logout: a final tick ran first")
+    Store.DMFCooldownTick(rec, T0 + 100000)
+    ck(Store.DMFCooldownRemaining(rec) == 13400,
+       "offline gate: no tick while an offline stamp is pending")
+
+    -- ---- resume: not resting -> resumes at the SAME value -----------------
+    rec.isResting = false
+    local wasCleared = Store.DMFCooldownResume(rec, T0 + 1000 + 40000)
+    ck(wasCleared == false, "resume (not resting): NOT cleared even after 11h offline")
+    ck(Store.DMFCooldownRemaining(rec) == 13400, "resume (not resting): value preserved")
+    ck(rec.dmfCooldown.offlineSince == 0, "resume: offline stamp cleared")
+    ck(rec.dmfCooldown.lastTickEpoch == T0 + 1000 + 40000,
+       "resume: tick epoch re-based so the offline span is never billed")
+
+    -- ---- resume: resting + long enough -> cleared -------------------------
+    rec = Store.NewCharacterRecord("Alt-Realm")
+    Store.DMFCooldownStart(rec, T0)
+    rec.isResting = true
+    Store.DMFCooldownStampOffline(rec, T0 + 10)
+    ck(Store.DMFOfflineClearable(rec, T0 + 10 + 28859) == false,
+       "offline clear: 28859s is one second short")
+    ck(Store.DMFOfflineClearable(rec, T0 + 10 + 28860) == true,
+       "offline clear: 28860s exactly is enough")
+    Store.DMFCooldownResume(rec, T0 + 10 + 28860)
+    ck(rec.dmfCooldownActive == false, "resume (resting, >=8h01m): cleared")
+
+    -- ---- resume: resting but BOONED -> not cleared (A8.3) -----------------
+    rec = Store.NewCharacterRecord("Alt-Realm")
+    Store.DMFCooldownStart(rec, T0)
+    rec.isResting = true
+    rec.dmfInBoon = true
+    Store.DMFCooldownStampOffline(rec, T0 + 10)
+    ck(Store.DMFOfflineClearable(rec, T0 + 100000) == false,
+       "offline clear: booned DMF is never forgiven, however long the logout")
+    ck(Store.DMFCooldownResume(rec, T0 + 100000) == false, "resume (booned): not cleared")
+
+    -- ---- legacy record tolerance (additive SV) ----------------------------
+    local legacy = { dmfCooldownActive = true, dmfCooldown = { offlineSince = 0 } }
+    ck(Store.DMFCooldownRemaining(legacy) == 0,
+       "legacy record (no remainingOnlineSecs): reads 0 -> UI shows 'on CD'")
+    Store.DMFCooldownTick(legacy, T0)
+    ck(legacy.dmfCooldown.remainingOnlineSecs == 14400,
+       "legacy record: the first tick SEEDS a full 4h rather than inventing a number")
+    Store.DMFCooldownTick(legacy, T0 + 60)
+    ck(Store.DMFCooldownRemaining(legacy) == 14340, "legacy record: ticks normally after seeding")
+
+    -- ---- not-on-cooldown records are inert --------------------------------
+    ck(Store.DMFCooldownRemaining({ dmfCooldownActive = false }) == 0, "inactive -> 0")
+    ck(Store.DMFCooldownRemaining(nil) == 0, "nil rec -> 0")
+    ck(Store.DMFCooldownTick({ dmfCooldownActive = false }, T0) == false, "inactive tick -> no-op")
+    ck(Store.DMFOfflineClearable(nil) == false, "nil rec is not clearable")
+end
+
 function Store.RunSelfTests(verbose)
     local suites = {
         { name = "defaults",        fn = testDefaults },
@@ -1782,6 +2097,7 @@ function Store.RunSelfTests(verbose)
         { name = "notes",           fn = testNotes },
         { name = "inbound name guard", fn = testInboundNameGuard },
         { name = "rested percent",  fn = testRestedPercent },
+        { name = "dmf cooldown",    fn = testDMFCooldown },
     }
     local allPass = true
     for _, suite in ipairs(suites) do
