@@ -50,17 +50,41 @@ end
 
 Timers.BUFF_KEYS = { "rend", "onyH", "onyA", "nefH", "nefA", "zg" }
 
--- Raw cooldowns (seconds). Rend 3h, Ony 6h per faction; nef mirrors ony;
--- zg (Spirit of Zandalar) cycles on the shorter 3h window.
+-- Raw cooldowns (seconds). Rend 3h, Ony 6h per faction; zg (Spirit of Zandalar)
+-- cycles on the shorter 3h window.
+--
+-- NEFARIAN IS DISABLED (0) ON CLASSIC ERA — and a 0 here is not cosmetic.
+-- Both reference addons agree with each other and disagreed with us: the
+-- canonical world-buff addon forces the Nefarian cooldown to 0 on Era, which
+-- means no countdown, no cooldown bar, the type is never packed into an outgoing
+-- payload, and an INBOUND Nefarian timer is silently discarded. The other
+-- reference simply removed Nef cooldown tracking. Our old 21600 was wrong twice
+-- over: the base constant is 28800 (8h, not 6h) and Era zeroes it regardless, so
+-- we were displaying a six-hour Nefarian cooldown that no reference shows.
+--
+-- Detection is deliberately untouched: a Nef drop still alerts and still raises
+-- its pull bar, the announcer kill still runs the 360s respawn model, and the
+-- Nef alert-matrix rows stay. Only the COOLDOWN/timer model goes.
 local CD = {
     rend = 3 * 3600,
     onyH = 6 * 3600,
     onyA = 6 * 3600,
-    nefH = 6 * 3600,
-    nefA = 6 * 3600,
+    nefH = 0,          -- DISABLED on Classic Era (see above)
+    nefA = 0,          -- DISABLED on Classic Era
     zg   = 3 * 3600,
 }
 Timers.CD = CD
+
+-- A buff whose cooldown constant is 0 is NOT COOLDOWN-TRACKED: no pop anchor is
+-- ever set for it from any source, no cooldown is computed or displayed, and
+-- inbound timer data for it is dropped. Kill/respawn state and alerts are
+-- unaffected. Deliberately false for a key absent from CD entirely (battleShout
+-- is an alert-only callback key and must keep flowing through Record's guard).
+local function cdDisabled(buffKey)
+    local cd = CD[buffKey]
+    return cd ~= nil and cd <= 0
+end
+Timers.IsCooldownDisabled = cdDisabled
 
 -- +5s display grace: bars linger this long past the raw CD. Excluded from
 -- the dedup / false-positive gate (that uses the raw CD), per spec.
@@ -357,7 +381,9 @@ end
 -- Pure helper (no globals) so the self-tests can drive it directly.
 function Timers.ComputeCD(buffKey, anchor, t)
     local cd = CD[buffKey]
-    if not cd or not anchor or anchor <= 0 then
+    -- `cd <= 0` is the cooldown-disabled case (Nefarian on Era): there is no
+    -- cooldown to compute, so the buff reads as "nothing to count down".
+    if not cd or cd <= 0 or not anchor or anchor <= 0 then
         return { onCD = false, ready = true, remaining = 0, nextAt = 0 }
     end
     local nextAt = anchor + cd
@@ -389,6 +415,10 @@ function Timers.BuffStatus(buffKey, t)
         end
         return { state = "canpop", remaining = 0, nextAt = killed + ANNOUNCER_RESPAWN }
     end
+    -- Cooldown-disabled buffs (Nefarian on Era) never report a cooldown. The
+    -- kill/respawn branch above still applies to them — only the CD model is
+    -- gone, so with no live kill they simply read as "no data".
+    if cdDisabled(buffKey) then return { state = "nodata", remaining = 0, nextAt = 0 } end
     if pop <= 0 then return { state = "nodata", remaining = 0, nextAt = 0 } end
     local info = Timers.ComputeCD(buffKey, pop, t)
     if info.onCD then
@@ -403,7 +433,7 @@ end
 function Timers.IsFalsePositive(buffKey, anchor, newEpoch, isKill)
     if isKill then return false end
     local cd = CD[buffKey]
-    if not cd or not anchor or anchor <= 0 then return false end
+    if not cd or cd <= 0 or not anchor or anchor <= 0 then return false end
     -- Within a full CD after the anchor => false positive.
     if newEpoch >= anchor and (newEpoch - anchor) < cd then
         return true
@@ -488,6 +518,17 @@ function Timers.Record(buffKey, epoch, trust, who, kind, zone, pullDuration, yel
     trust = trust or "local"
     kind  = kind or "pop"
     local isKill = (kind == "killed")
+
+    -- Cooldown-disabled types (Nefarian on Era) are NEVER anchored, from any
+    -- source: local yell, quest hand-in, mesh/SN relay, NWB payload or timer
+    -- log. This is the single choke point that implements "stop anchoring Nef
+    -- from any source, and reject inbound Nef timer data" — every ingest path in
+    -- this file and in snbridge/mesh/import funnels through Record.
+    -- An announcer KILL is still recorded: it drives the 360s respawn readout,
+    -- which both references keep.
+    if not isKill and cdDisabled(buffKey) then
+        return false, "cooldown disabled for this buff"
+    end
 
     local s = stateOf(buffKey)
     local prevAnchor = anchorEpoch(s)
@@ -829,11 +870,29 @@ local function inCapital()
     return CAPITAL_ZONES[zone:lower()] == true
 end
 
+-- Combat-log fan-out. TWO independent consumers ride this event now: the capital
+-- announcer-death detector here, and the Felwood presence / songflower witness
+-- engine further down the file. The old early `if not inCapital() then return`
+-- meant nothing outside Orgrimmar or Stormwind ever reached the combat log at
+-- all, so the Felwood half has to run BEFORE that gate.
+--
+-- CLEU payload order (Interface 11509):
+--   1 timestamp · 2 subevent · 3 hideCaster · 4 sourceGUID · 5 sourceName
+--   6 sourceFlags · 7 sourceRaidFlags · 8 destGUID · 9 destName · 10 destFlags
+--   11 destRaidFlags · 12 spellID · 13 spellName · ...
 local function onCombatLog()
     if not CombatLogGetCurrentEventInfo then return end
-    if not inCapital() then return end
-    local _, subevent, _, _, _, _, _, destGUID, destName = CombatLogGetCurrentEventInfo()
+    local _, subevent, _, sourceGUID, sourceName, _, _,
+          destGUID, destName, destFlags, _, spellID = CombatLogGetCurrentEventInfo()
+
+    -- Felwood engine (resolved at call time; it is defined below this point).
+    if Timers.FelwoodCombatLog then
+        Timers.FelwoodCombatLog(subevent, sourceGUID, sourceName,
+                                destGUID, destName, destFlags, spellID)
+    end
+
     if subevent ~= "UNIT_DIED" and subevent ~= "PARTY_KILL" then return end
+    if not inCapital() then return end
     local npcID = npcIDFromGUID(destGUID)
     local buffKey = announcerBuffFor(npcID, destName)
     if not buffKey then return end
@@ -858,23 +917,35 @@ end
 ----------------------------------------------------------------------
 
 -- questID -> buffKey (H/A resolved for ony/nef where the id is faction-fixed).
--- FACTION FIX: 7491/7496 and 7782/7784 were mapped to the WRONG factions here.
--- Per spec §10.3 the hand-ins are 7491 Ony(A) · 7496 Ony(H) · 7782 Nef(A) ·
--- 7784 Nef(H); we had each pair reversed, so an Ony hand-in was credited to the
--- opposing faction's timer. (The gap analysis only checked the id SET.)
+--
+-- FACTION SPLIT — settled from GAME DATA, not from an addon. The canonical
+-- world-buff addon maps BOTH ids of each pair to the same buff type and carries
+-- no faction annotation anywhere, so it is no evidence either way (and the way
+-- the six ids happen to line-wrap in it actively baits a wrong reading). Ground
+-- truth from the classic quest database, verified 2026-07-31:
+--
+--   7491  "For All To See"          Overlord Runthak,    Orgrimmar  -> Ony HORDE
+--   7496  "Celebrating Good Times"  Major Mattingly,     Stormwind  -> Ony ALLIANCE
+--   7782  "The Lord of Blackrock"   Field Marshal Stonebridge       -> Nef ALLIANCE
+--   7784  "The Lord of Blackrock"   High Overlord Saurfang          -> Nef HORDE
+--
+-- A previous pass swapped BOTH pairs on the strength of the other reference's
+-- spec text. Only the NEF pair was ever wrong and it is now right; the ONY pair
+-- is swapped BACK here, because the swap credited every Onyxia head turn-in to
+-- the opposing faction's timer.
 local HANDIN_QUEST = {
     [4974] = "rend",
-    [7491] = "onyA",  [7496] = "onyH",
+    [7491] = "onyH",  [7496] = "onyA",
     [7782] = "nefA",  [7784] = "nefH",
     [8183] = "zg",
 }
 Timers._handinQuest = HANDIN_QUEST
 
 -- Hand-ins whose processing is SUPPRESSED while the buff is already on
--- cooldown (A4.2). Nefarian and Zandalar carry no server cooldown (spec §10.2 —
--- Nef CD tracking was removed; ZG keeps no pop log) and are never suppressed.
--- Note this is a detection-side list only; Timers.CD keeps nef/zg entries
--- because the false-positive gate still uses them to dedup relayed reports.
+-- cooldown (A4.2). Nefarian and Zandalar are never suppressed: Nef's cooldown is
+-- disabled outright on Era (CD table above) and ZG keeps no pop log. A Nef
+-- hand-in therefore still ALERTS — it just no longer anchors anything, because
+-- Record refuses a pop for a cooldown-disabled type.
 local HANDIN_CD_GATED = { rend = true, onyH = true, onyA = true }
 Timers._handinCDGated = HANDIN_CD_GATED
 
@@ -1084,56 +1155,285 @@ local function explodeSpace(str, maxFields)
 end
 Timers._explodeSpace = explodeSpace
 
--- Read a numeric epoch from a payload short-key, tolerating string values.
-local function nwbEpoch(v)
+----------------------------------------------------------------------
+-- Inbound epoch validation  (the ingest hardening)
+--
+-- Our only sanity guard used to be `> 1e9`, which meant a single malformed or
+-- hostile sender could plant a cooldown we would then display for hours — a
+-- phantom that never clears. The reference applies a layered set of rejections
+-- and we now apply the same ones.
+----------------------------------------------------------------------
+
+-- Absolute epoch ceiling (~year 2051) and a generic "not this far ahead" slack.
+local EPOCH_CEILING = 2585912598
+local FUTURE_SLACK  = 30000
+
+-- Per-type future clamp: each is that type's real cooldown + 60s of slack.
+-- Nef uses its TRUE 8h base here (not our disabled 0) because the clamp is a
+-- wire-sanity bound on what a sender could legitimately claim; the Nef value is
+-- rejected later regardless, by the cooldown-disabled rule.
+local FUTURE_CLAMP = {
+    rend = 10800 + 60,
+    onyH = 21600 + 60, onyA = 21600 + 60,
+    nefH = 28800 + 60, nefA = 28800 + 60,
+    node = 1500 + 30,
+}
+Timers.FUTURE_CLAMP = FUTURE_CLAMP
+
+-- Yell-vs-drop agreement window. A claimed drop whose accompanying stage-1 yell
+-- epoch sits more than this many seconds on EITHER side of it did not happen the
+-- way the sender says it did, and that buff is stripped from the payload. The
+-- direction matters and it is symmetric: the reference rejects a stage-1 yell
+-- more than 120s BEFORE the claimed drop and, separately, more than 120s AFTER
+-- it. (A real drop follows its yell by 6-15s.)
+local YELL_DROP_TOLERANCE = 120
+Timers.YELL_DROP_TOLERANCE = YELL_DROP_TOLERANCE
+
+-- Read a numeric epoch from a payload short-key, tolerating string values, and
+-- apply the universal sanity rules: numeric, above the epoch floor, at or below
+-- the absolute ceiling, and not absurdly in the future. `clampKey` (a buff key
+-- or "node") additionally applies the per-type future clamp.
+local function nwbEpoch(v, clampKey, t)
     local n = tonumber(v)
-    if n and n > 1000000000 then return n end   -- sane epoch guard
-    return nil
+    if not n or n <= 1000000000 then return nil end   -- sane epoch floor
+    if n > EPOCH_CEILING then return nil end
+    t = t or now()
+    if n > t + FUTURE_SLACK then return nil end
+    local clamp = clampKey and FUTURE_CLAMP[clampKey]
+    if clamp and n > t + clamp then return nil end
+    return n
+end
+Timers._nwbEpoch = nwbEpoch
+
+-- Wire layout of the three drop epochs and their companion stage-1 yell epochs.
+-- The yell epochs are the entire point of the validation below, and we were
+-- simply not reading them: they have been arriving as `o` / `t` / `z` all along.
+-- (`t` is the Onyxia stage-1 yell; the tuber keys are `t1`..`t6` and do not
+-- collide with it.)
+local NWB_DROP_FIELDS = {
+    { base = "rend", drop = "n", dropWord = "rendTimer", yell1 = "o" },
+    { base = "ony",  drop = "s", dropWord = "onyTimer",  yell1 = "t" },
+    { base = "nef",  drop = "y", dropWord = "nefTimer",  yell1 = "z" },
+}
+Timers._nwbDropFields = NWB_DROP_FIELDS
+
+-- Resolve a wire base type to our buff key.
+local function dropBuffKey(base)
+    if base == "rend" then return "rend" end
+    return factionKey(base)
 end
 
--- Read the world-buff + node timer fields out of ONE NWB data table. Verified
--- against NWB 3.39 source (Modules\Data.lua shortKeys): wire SHORT keys are
--- n=rendTimer, s=onyTimer, y=nefTimer, f1..f10=flower1..10, t1..t6=tuber1..6.
--- We also tolerate the WORD keys (rendTimer/onyTimer/nefTimer/flowerN/tuberN) in
--- case a layer sub-table was not key-compacted. ZG/Zandalar is NOT transmitted
--- by NWB at all, so there is no zan field to read. `applied` accumulates counts.
-local function readNWBTimerFields(tbl, applied)
-    if type(tbl) ~= "table" then return end
-    local r = nwbEpoch(tbl.n) or nwbEpoch(tbl.rendTimer)
-    if r then Timers.Record("rend", r, "nwb", "NWB", "pop"); applied.rend = true end
-    local o = nwbEpoch(tbl.s) or nwbEpoch(tbl.onyTimer)
-    if o then Timers.Record(factionKey("ony"), o, "nwb", "NWB", "pop"); applied.ony = true end
-    local nf = nwbEpoch(tbl.y) or nwbEpoch(tbl.nefTimer)
-    if nf then Timers.Record(factionKey("nef"), nf, "nwb", "NWB", "pop"); applied.nef = true end
+-- Validate ONE data table's world-buff drops. Returns a result table:
+--   { ok = boolean, reason = string|nil,
+--     accept = { rend = epoch, ony = epoch, nef = epoch },
+--     reject = { <base> = "reason" } }
+--
+-- Two distinct severities, exactly as the reference applies them:
+--   * a drop epoch carried with NO accompanying stage-1 yell epoch discards the
+--     WHOLE table (ok = false) — an unwitnessed drop invalidates the payload;
+--   * a stage-1 yell more than ±120s from the claimed drop strips THAT BUFF only
+--     and the rest of the table still merges.
+function Timers.ValidateNWBDrops(tbl, t)
+    local res = { ok = true, accept = {}, reject = {} }
+    if type(tbl) ~= "table" then res.ok = false; res.reason = "not a table"; return res end
+    t = t or now()
+    for i = 1, #NWB_DROP_FIELDS do
+        local f = NWB_DROP_FIELDS[i]
+        local key  = dropBuffKey(f.base)
+        local drop = nwbEpoch(tbl[f.drop], key, t) or nwbEpoch(tbl[f.dropWord], key, t)
+        if drop then
+            local yell1 = nwbEpoch(tbl[f.yell1], nil, t)
+            if not yell1 then
+                res.ok = false
+                res.reason = "drop with no stage-1 yell epoch (" .. f.base .. ")"
+                res.accept = {}
+                return res
+            end
+            local delta = yell1 - drop
+            if delta > YELL_DROP_TOLERANCE then
+                res.reject[f.base] = "stage-1 yell >120s after the claimed drop"
+            elseif delta < -YELL_DROP_TOLERANCE then
+                res.reject[f.base] = "stage-1 yell >120s before the claimed drop"
+            else
+                res.accept[f.base] = drop
+            end
+        end
+    end
+    return res
+end
+
+----------------------------------------------------------------------
+-- NWB timer-log ingestion  (the biggest ingest gap on a layered realm)
+--
+-- The bulk payload carries an array under key `F` of log entries shaped
+--   G = entry type · H = timestamp · I = layer id · J = who
+-- with types `r` = Rend drop, `o` = Onyxia drop, `n` = Nefarian drop and
+-- `q` = quest hand-in.
+--
+-- Why this matters on Whitemane specifically: Whitemane is a LAYERED realm, and
+-- on layered realms the reference logs Rend only (`r` and `q`) and then PREFERS
+-- the log over the raw per-layer Rend timer, because the raw Rend timer is
+-- unreliable post-hotfix (the yell fires on every layer and the buff source
+-- carries the player's current layer, not the hand-in layer). So the log carries
+-- the reference's own most-trusted Rend data — and we were walking straight past
+-- it. Our defensive layer scan did iterate the array, but `G`/`H`/`I`/`J` collide
+-- with none of the timer keys, so it extracted precisely nothing.
+--
+-- A `q` entry is a HAND-IN, not a drop: the reference converts it to an assumed
+-- drop by adding 15s (measured ~13s plus 2s leeway). We do the same.
+--
+-- Everything routes through Timers.Record at trust "nwb", so the trust ladder
+-- and the full-cooldown false-positive gate arbitrate exactly as for every other
+-- source: a log entry can never outrank a local or mesh anchor, and a duplicate
+-- inside the cooldown window is rejected rather than re-anchoring.
+----------------------------------------------------------------------
+
+local NWB_LOG_KEY   = "F"
+local NWB_LOG_TYPE  = "G"
+local NWB_LOG_TIME  = "H"
+local NWB_LOG_LAYER = "I"
+local NWB_LOG_WHO   = "J"
+
+-- Hand-in -> assumed drop offset (measured ~13s, +2s leeway).
+local NWB_HANDIN_LEAD = 15
+Timers.NWB_HANDIN_LEAD = NWB_HANDIN_LEAD
+
+-- Log entry type -> base buff, and whether the timestamp is a hand-in rather
+-- than a drop. Nefarian entries are parsed so they can be explicitly counted and
+-- dropped rather than silently vanishing.
+local NWB_LOG_ENTRY = {
+    r = { base = "rend", handin = false },
+    o = { base = "ony",  handin = false },
+    n = { base = "nef",  handin = false },
+    q = { base = "rend", handin = true  },
+}
+Timers._nwbLogEntry = NWB_LOG_ENTRY
+
+-- Parse ONE log entry. Returns buffKey, epoch, who, layerID — or nil.
+function Timers.ParseNWBLogEntry(entry, t)
+    if type(entry) ~= "table" then return nil end
+    local meta = NWB_LOG_ENTRY[entry[NWB_LOG_TYPE]]
+    if not meta then return nil end
+    local buffKey = dropBuffKey(meta.base)
+    local epoch = nwbEpoch(entry[NWB_LOG_TIME], buffKey, t)
+    if not epoch then return nil end
+    if meta.handin then epoch = epoch + NWB_HANDIN_LEAD end
+    local who = entry[NWB_LOG_WHO]
+    return buffKey, epoch, (type(who) == "string" and who) or nil, entry[NWB_LOG_LAYER]
+end
+
+-- Walk the `F` array of one data table. Returns the number of entries parsed.
+function Timers.IngestNWBTimerLog(tbl, applied, t)
+    applied = applied or {}
+    t = t or now()
+    local log = (type(tbl) == "table") and tbl[NWB_LOG_KEY] or nil
+    if type(log) ~= "table" then return 0 end
+    local parsed = 0
+    -- The log is an ARRAY on the wire, so walk it in order: entry order decides
+    -- which timestamp reaches Record first, and therefore which one wins the
+    -- anchor and which is gated out as a within-cooldown duplicate.
+    for _, entry in ipairs(log) do
+        local buffKey, epoch, who = Timers.ParseNWBLogEntry(entry, t)
+        if buffKey then
+            parsed = parsed + 1
+            if cdDisabled(buffKey) then
+                -- Nefarian log entries go the same way as Nefarian timers on Era.
+                applied.nefRejected = (applied.nefRejected or 0) + 1
+            else
+                applied.log = (applied.log or 0) + 1
+                local ok = Timers.Record(buffKey, epoch, "nwb", who or "NWB log", "pop")
+                if ok then applied.logApplied = (applied.logApplied or 0) + 1 end
+            end
+        end
+    end
+    return parsed
+end
+
+-- Read the world-buff + node timer fields out of ONE NWB data table. Wire SHORT
+-- keys: n=rendTimer, s=onyTimer, y=nefTimer, o/t/z = the matching stage-1 yell
+-- epochs, f1..f10=flower1..10, t1..t6=tuber1..6, F=timer log. We also tolerate
+-- the WORD keys (rendTimer/onyTimer/nefTimer/flowerN/tuberN) in case a layer
+-- sub-table was not key-compacted. ZG/Zandalar is NOT transmitted by NWB at all,
+-- so there is no zan field to read. `applied` accumulates counts.
+--
+-- Returns false when the whole table was discarded by drop validation.
+local function readNWBTimerFields(tbl, applied, t)
+    if type(tbl) ~= "table" then return false end
+    t = t or now()
+
+    local v = Timers.ValidateNWBDrops(tbl, t)
+    if not v.ok then
+        -- Whole-table rejection: a claimed drop arrived with no witnessing yell.
+        applied.rejectedPayload = (applied.rejectedPayload or 0) + 1
+        applied.rejectReason = v.reason
+        return false
+    end
+    for base, why in pairs(v.reject) do
+        applied.rejectedYell = (applied.rejectedYell or 0) + 1
+        applied.rejectReason = base .. ": " .. why
+    end
+
+    if v.accept.rend then
+        Timers.Record("rend", v.accept.rend, "nwb", "NWB", "pop"); applied.rend = true
+    end
+    if v.accept.ony then
+        Timers.Record(factionKey("ony"), v.accept.ony, "nwb", "NWB", "pop"); applied.ony = true
+    end
+    -- Nefarian: disabled on Era, so an inbound Nef timer is discarded outright.
+    -- Record would refuse it anyway; counting it here makes the drop VISIBLE in
+    -- `/nexus debug nwb` instead of looking like a silent no-op.
+    if v.accept.nef then
+        applied.nefRejected = (applied.nefRejected or 0) + 1
+    end
+
     for i = 1, 10 do
-        local e = nwbEpoch(tbl["f" .. i]) or nwbEpoch(tbl["flower" .. i])
+        local e = nwbEpoch(tbl["f" .. i], "node", t) or nwbEpoch(tbl["flower" .. i], "node", t)
         if e then Timers.MarkNode("flower", i, e, "nwb"); applied.flower = (applied.flower or 0) + 1 end
     end
+    -- Tubers are read for completeness, but note the sharing rule: the reference
+    -- keeps tubers and dragons as PERSONAL timers on layered realms and never
+    -- puts them on the wire there. On Whitemane `t1`..`t6` will never arrive, so
+    -- the loot detector below is the only way a tuber timer can ever exist.
     for i = 1, 6 do
-        local e = nwbEpoch(tbl["t" .. i]) or nwbEpoch(tbl["tuber" .. i])
+        local e = nwbEpoch(tbl["t" .. i], "node", t) or nwbEpoch(tbl["tuber" .. i], "node", t)
         if e then Timers.MarkNode("tuber", i, e, "nwb"); applied.tuber = (applied.tuber or 0) + 1 end
     end
+
+    Timers.IngestNWBTimerLog(tbl, applied, t)
+    return true
 end
 Timers._readNWBTimerFields = readNWBTimerFields
 
 -- Ingest a decoded NWB timer payload table. Handles BOTH flat (non-layered) and
--- LAYERED realms (item 40): on layered realms NWB nests per-layer timer tables
--- one level down under a "layers" map. The short key for "layers" is not a
--- clean-room fact, so we scan defensively — any sub-table whose values are
--- themselves tables is treated as a layer map and each layer is read. Reading is
--- idempotent (Record's CD gate dedups), so scanning is safe.
+-- LAYERED realms: on layered realms NWB nests per-layer timer tables one level
+-- down under `layers`, which — unlike every timer key — is NOT key-compacted and
+-- appears literally, so we read it directly. The old heuristic scan is kept only
+-- as a fallback for a payload that lacks it, with the timer-log array excluded
+-- so its entries can no longer be mistaken for layers.
+--
+-- We flatten layers deliberately: the reference flags world buffs as shared
+-- across ALL layers globally and disables per-layer chat labelling, so a buff
+-- genuinely drops on every layer at once. We hold no layer model and must not
+-- present per-layer precision we cannot deliver.
 function Timers.IngestNWBTimers(payload)
     if type(payload) ~= "table" then return end
     local applied = {}
-    readNWBTimerFields(payload, applied)
-    for _, v in pairs(payload) do
-        if type(v) == "table" then
-            local looksLayerMap = false
-            for _, lv in pairs(v) do
-                if type(lv) == "table" then looksLayerMap = true break end
-            end
-            if looksLayerMap then
-                for _, layer in pairs(v) do readNWBTimerFields(layer, applied) end
+    local t = now()
+    readNWBTimerFields(payload, applied, t)
+
+    local layers = payload.layers
+    if type(layers) == "table" then
+        for _, layer in pairs(layers) do readNWBTimerFields(layer, applied, t) end
+    else
+        for key, v in pairs(payload) do
+            if key ~= NWB_LOG_KEY and type(v) == "table" then
+                local looksLayerMap = false
+                for _, lv in pairs(v) do
+                    if type(lv) == "table" then looksLayerMap = true break end
+                end
+                if looksLayerMap then
+                    for _, layer in pairs(v) do readNWBTimerFields(layer, applied, t) end
+                end
             end
         end
     end
@@ -1187,7 +1487,13 @@ function Timers.OnNWBMessage(prefix, message, channel, sender)
                 nwbBump("drop", "payloadNotTable")
             else
                 local applied = Timers.IngestNWBTimers(payload)
-                if applied and next(applied) ~= nil then stats.ingested = stats.ingested + 1 end
+                -- Count a payload as ingested only when something actually
+                -- merged. `applied` now also carries REJECTION counters, so a
+                -- non-empty table no longer implies we took anything from it.
+                if applied and (applied.rend or applied.ony or (applied.flower or 0) > 0
+                                or (applied.tuber or 0) > 0 or (applied.log or 0) > 0) then
+                    stats.ingested = stats.ingested + 1
+                end
             end
         else
             nwbBump("drop", "emptyData")
@@ -1413,13 +1719,23 @@ end
 -- Record a node pick. kind ∈ "flower"/"tuber", index 1-based. Applies a
 -- simple freshness gate (ignore a stale duplicate of the same pop) and
 -- fires NODE_UPDATED.
-function Timers.MarkNode(kind, index, epoch, trust)
+--
+-- `opts.overwriteGuard` (seconds) additionally refuses to overwrite a stored
+-- timer that is still young. The reference applies exactly this to its two
+-- second-hand observations: 1500s for a looted tuber (a live node cannot
+-- legitimately be picked again inside its own respawn, so a second loot line is
+-- a duplicate) and 1440s for ANOTHER player's songflower pick (their pick is
+-- heuristic, so it must not stomp a fresher record). Our OWN songflower pick
+-- passes no guard — it is position- and spell-validated and should win outright.
+function Timers.MarkNode(kind, index, epoch, trust, opts)
     local pops = nodePopTable(kind)
     if not pops then return false end
     epoch = epoch or now()
     local prev = pops[index] or 0
     -- Ignore an older or identical epoch (dup relay); accept fresher picks.
     if epoch <= prev then return false end
+    local guard = opts and opts.overwriteGuard
+    if guard and prev > 0 and (epoch - prev) < guard then return false end
     pops[index] = epoch
     ns:Fire("NODE_UPDATED", kind .. index)
     if maybeBroadcast then maybeBroadcast() end
@@ -1463,52 +1779,410 @@ function Timers.GetNodeState(nodeKey)
     return Timers.NodeState(popEpoch, now(), respawn, upDur)
 end
 
--- The ONE cast that means "a node was picked": Cleansed Songflower. Both
--- songflowers and Whipper Root Tubers are gathered through it.
+-- The songflower gather cast. This is a SONGFLOWER-ONLY trigger: the old comment
+-- here claimed Whipper Root Tubers were gathered through it too, which is false.
+-- Tubers are LOOTED (see the loot detector below), so the cast path's tuber
+-- branch was dead code that could only ever mis-credit a flower pick — the
+-- nearest-node tie-break at a flower always resolves to the flower.
 local SONGFLOWER_SPELL = 6478
 Timers.SONGFLOWER_SPELL = SONGFLOWER_SPELL
 
--- Node match radius in normalized map units (spec §10.3: 6% of map distance).
--- The old 0.015 was 4x tighter than the reference and missed genuine picks made
--- a few yards off the stored coordinate (A5.2).
-local NODE_MATCH_RADIUS = 0.06
+-- Node match radius in NORMALIZED map units (0-1).
+--
+-- The canonical songflower addon measures plain Euclidean distance on
+-- map-PERCENT units (position x 100) and accepts 1.5 map-percent for songflowers
+-- and 2.0 for tubers/dragons — 0.015 and 0.02 normalized. Because the units are
+-- map percent rather than yards the accepted region is an ELLIPSE, not a circle:
+-- Felwood is ~3450 x 2300 yd, so 1.5% is about 52 yd east-west and 35 yd
+-- north-south.
+--
+-- A previous pass widened this to 0.06 citing the OTHER reference's looser
+-- "6% of map distance" phrasing. The songflower addon is the canonical authority
+-- for Felwood nodes and its value is the tighter 1.5%, i.e. what we had before —
+-- so this reverts. 0.06 was 4x looser than canonical and raised the false-pick
+-- rate for no gain.
+local NODE_MATCH_RADIUS = 0.015
 Timers.NODE_MATCH_RADIUS = NODE_MATCH_RADIUS
+local NODE_MATCH_RADIUS_BY_KIND = { flower = 0.015, tuber = 0.02 }
+Timers.NODE_MATCH_RADIUS_BY_KIND = NODE_MATCH_RADIUS_BY_KIND
 
--- Resolve a pick position to (kind, index, distance), or nil when nothing is in
--- range. The two co-located flower/tuber sites are separated by the NEAREST-
--- distance tie-break rather than by a tighter radius, so widening the radius
--- cannot make a flower pick land on its neighbouring tuber.
+local function radiusFor(kind, radius)
+    return radius or NODE_MATCH_RADIUS_BY_KIND[kind] or NODE_MATCH_RADIUS
+end
+
+-- Match a position against ONE node kind, using that kind's own radius. This is
+-- the shape both real detectors need: a songflower aura can only ever be a
+-- flower and a tuber loot can only ever be a tuber, so there is no cross-kind
+-- tie-break to make. Returns index, distance — or nil when out of range.
+function Timers.MatchNodeOfKind(kind, x, y, radius)
+    if not x or not y then return nil end
+    local idx, dist = Timers.NearestNode(kind, x, y)
+    if not idx or dist > radiusFor(kind, radius) then return nil end
+    return idx, dist
+end
+
+-- Cross-kind match, kept for callers that do not know the kind up front. Each
+-- kind is judged against its OWN radius and the nearest in-range candidate wins,
+-- so the co-located flower/tuber sites still separate cleanly.
 function Timers.MatchNodePick(x, y, radius)
     if not x or not y then return nil end
-    radius = radius or NODE_MATCH_RADIUS
-    local fIdx, fDist = Timers.NearestNode("flower", x, y)
-    local tIdx, tDist = Timers.NearestNode("tuber", x, y)
-    local kind, index, dist
-    if fDist and (not tDist or fDist <= tDist) then
-        kind, index, dist = "flower", fIdx, fDist
-    elseif tDist then
-        kind, index, dist = "tuber", tIdx, tDist
+    local bKind, bIdx, bDist
+    for _, kind in ipairs({ "flower", "tuber" }) do
+        local idx, dist = Timers.MatchNodeOfKind(kind, x, y, radius)
+        if idx and (not bDist or dist < bDist) then bKind, bIdx, bDist = kind, idx, dist end
     end
-    if not kind or dist > radius then return nil end
-    return kind, index, dist
+    if not bKind then return nil end
+    return bKind, bIdx, bDist
 end
+
+-- Are we standing in Felwood? Every node detector is gated on this — including
+-- the combat-log one, which fires thousands of times a second in a raid. The
+-- answer only changes on a zone transition, so it is CACHED and invalidated by
+-- the zone events rather than re-asking the map API per combat-log line.
+-- nil = not yet resolved.
+Timers._felwoodCache = nil
+
+function Timers.InvalidateFelwoodCache()
+    Timers._felwoodCache = nil
+end
+
+function Timers.InFelwood()
+    local cached = Timers._felwoodCache
+    if cached ~= nil then return cached end
+    if not (C_Map and C_Map.GetBestMapForUnit) then return false end
+    local v = (C_Map.GetBestMapForUnit("player") == Timers.FELWOOD_MAP)
+    Timers._felwoodCache = v
+    return v
+end
+
+-- The player's normalized Felwood position, or nil when not in Felwood / no map
+-- API. Another player's coordinates are never readable, so this doubles as the
+-- position proxy for a witnessed pick: we only see their aura event at all when
+-- they are close enough to share our combat log.
+local function playerFelwoodPos()
+    if not Timers.InFelwood() then return nil end
+    if not (C_Map and C_Map.GetPlayerMapPosition) then return nil end
+    local pos = C_Map.GetPlayerMapPosition(Timers.FELWOOD_MAP, "player")
+    if not pos then return nil end
+    return pos:GetXY()
+end
+Timers._playerFelwoodPos = playerFelwoodPos
 
 -- Pick detection from a successful player cast in Felwood.
 -- UNIT_SPELLCAST_SUCCEEDED(unitTarget, castGUID, spellID) — the spell id was
 -- always in the payload and always discarded, so ANY cast near a node (a mount,
--- a heal, a profession cast) started a 25-minute countdown (A5.1).
+-- a heal, a profession cast) started a 25-minute countdown (A5.1). Flower-only:
+-- see the SONGFLOWER_SPELL note above.
 local function onSpellSucceeded(event, unit, castGUID, spellID)
     if unit ~= "player" then return end
     if spellID ~= SONGFLOWER_SPELL then return end
-    if not (C_Map and C_Map.GetBestMapForUnit) then return end
-    local mapID = C_Map.GetBestMapForUnit("player")
-    if mapID ~= Timers.FELWOOD_MAP then return end
-    local pos = C_Map.GetPlayerMapPosition(mapID, "player")
-    if not pos then return end
-    local x, y = pos:GetXY()
-    local kind, index = Timers.MatchNodePick(x, y)
-    if not kind then return end
-    Timers.MarkNode(kind, index, now(), "local")
+    local x, y = playerFelwoodPos()
+    if not x then return end
+    local index = Timers.MatchNodeOfKind("flower", x, y)
+    if not index then return end
+    Timers.MarkNode("flower", index, now(), "local")
+end
+
+----------------------------------------------------------------------
+-- Detector — Whipper Root Tuber, from LOOT  (rebuild; the cast path was dead)
+--
+-- Tubers are not gathered with the songflower cast. They are LOOTED, and the
+-- canonical addon detects them by parsing loot CHAT lines, pulling the item link
+-- out and matching on item ID — an entirely different mechanism from the
+-- songflower aura. Our cast-based tuber branch could only ever fire while
+-- standing at a songflower, where the nearest-node tie-break resolves to the
+-- flower, so it was unreachable code; and because the reference never puts
+-- tubers on the wire on layered realms, `t1`..`t6` never arrive on Whitemane
+-- either. Tuber timers were therefore unreachable by BOTH paths. This is the
+-- only way one can ever exist here.
+--
+--   11951 = Whipper Root Tuber
+--   11952 = Night Dragon's Breath — same mechanism; we carry no dragon node set
+--           yet, so it is recognised and ignored rather than mis-matched onto a
+--           tuber node.
+--
+-- Gates, per the reference: must be in Felwood; both our own and other players'
+-- loot lines are parsed (the other-player variant is near-useless in practice
+-- because these are pushed rather than looted, but it costs nothing); a 5s
+-- throttle per item type; and a node whose timer is younger than the 1500s
+-- respawn is not overwritten.
+--
+-- There are no guild messages, chat notices or alerts for tubers anywhere in the
+-- reference — map/minimap markers with countdowns only — so this records
+-- silently, exactly like the flower path.
+----------------------------------------------------------------------
+
+-- Looted item id -> node kind (false = recognised but not tracked).
+local LOOT_ITEM_NODE = {
+    [11951] = "tuber",
+    [11952] = false,
+}
+Timers._lootItemNode = LOOT_ITEM_NODE
+
+local LOOT_THROTTLE = 5
+Timers.LOOT_THROTTLE = LOOT_THROTTLE
+Timers._lastLootAt = {}
+
+-- Pull every itemID out of a loot chat line's item links. One line can carry
+-- several links (the "receives loot: [a] [b]" and multiple-item variants), so
+-- all are returned, in order. Pure — the self-tests drive it directly.
+function Timers.ParseLootItemIDs(msg)
+    local out = {}
+    if type(msg) ~= "string" then return out end
+    for id in msg:gmatch("|Hitem:(%d+)") do
+        out[#out + 1] = tonumber(id)
+    end
+    return out
+end
+
+-- CHAT_MSG_LOOT handler. `msg` is the formatted loot line, self or other.
+-- Returns true when a node timer was actually started.
+function Timers.OnLootMessage(msg, t)
+    t = t or now()
+    local ids = Timers.ParseLootItemIDs(msg)
+    if #ids == 0 then return false end
+    local x, y
+    local marked = false
+    for i = 1, #ids do
+        local kind = LOOT_ITEM_NODE[ids[i]]
+        if kind and (t - (Timers._lastLootAt[kind] or 0)) >= LOOT_THROTTLE then
+            if x == nil then x, y = playerFelwoodPos() end
+            if x then
+                local index = Timers.MatchNodeOfKind(kind, x, y)
+                if index then
+                    -- Stamp the throttle on a real node match, so a loot line
+                    -- nowhere near a node cannot burn the window.
+                    Timers._lastLootAt[kind] = t
+                    if Timers.MarkNode(kind, index, t, "local",
+                                       { overwriteGuard = NODE_RESPAWN }) then
+                        marked = true
+                    end
+                end
+            end
+        end
+    end
+    return marked
+end
+
+local function onChatLoot(event, msg)
+    ns:SafeCall(Timers.OnLootMessage, msg)
+end
+
+----------------------------------------------------------------------
+-- Detector — OTHER players' songflower picks  (the group circuit)
+--
+-- The canonical addon tracks other players' picks ON BY DEFAULT, and this was
+-- the largest single coverage gap in Felwood: run the circuit in a group and a
+-- reference user finishes with ten node timers while we finished with the one or
+-- two we personally picked.
+--
+-- Mechanism: the trigger is the AURA GAIN itself, read from the COMBAT LOG —
+-- SPELL_AURA_APPLIED / SPELL_AURA_REFRESH of Songflower Serenade (15366) with a
+-- player-type destination GUID. The reference deliberately does NOT scan anyone's
+-- aura bar and does not use the unit-aura events: songflower is frequently not
+-- first in the combat log at login, and scanning bars manufactures false timers.
+-- It also means the scan is not limited to party/raid units — any nearby player
+-- who shares our combat log counts.
+--
+-- Another player's remaining duration is unreadable, so the duration check that
+-- validates our OWN pick is impossible and a presence heuristic substitutes.
+-- ALL of these must pass:
+--   1. we are in Felwood (1448)
+--   2. that player has not already been seen carrying a songflower buff — only
+--      the FIRST sighting of a given player may ever create a timer
+--   3. that player was seen BEFORE the buff event (an unseen player is assumed
+--      to be logging in with a buff they already had)
+--   4. time since last seen <= 600s
+--   5. time since last seen >= 1s — in the first second after a player appears
+--      the client fires their entire login aura set
+--   6. neither they nor we chronoboon-released in the last 1s
+--   7. global throttle: at most one witnessed pick recorded every 5s
+--   8. a node timer younger than 1440s is not overwritten by someone else's pick
+-- plus: discarded when the aura target is hostile and the zone PvP type is
+-- contested — which Felwood always is, so in practice: never credit an
+-- enemy-faction player.
+--
+-- Presence is fed from any combat-log event carrying a player GUID, plus target
+-- and mouseover. A name's last-seen stamp is only refreshed when the previous
+-- sighting was more than 180s ago — without that, someone fighting next to you
+-- would have their "time since last seen" reset every tick and would sit
+-- permanently inside the eligibility band. Every loading screen wipes all three
+-- lists; the seen list is wiped again 5s after a zone change.
+----------------------------------------------------------------------
+
+local SONGFLOWER_AURA = 15366
+Timers.SONGFLOWER_AURA = SONGFLOWER_AURA
+
+-- The chronoboon RELEASE cast. A release re-applies a stored songflower, which
+-- looks identical to a fresh pick in the combat log; both parties are suppressed
+-- for a second around one.
+local CHRONOBOON_RELEASE_SPELL = 349863
+Timers.CHRONOBOON_RELEASE_SPELL = CHRONOBOON_RELEASE_SPELL
+
+local FLOWER_SEEN_MAX         = 600    -- gate 4
+local FLOWER_SEEN_MIN         = 1      -- gate 5
+local FLOWER_PICK_THROTTLE    = 5      -- gate 7
+local FLOWER_OTHER_OVERWRITE  = 1440   -- gate 8
+local FLOWER_PRESENCE_REFRESH = 180    -- last-seen refresh floor
+local FLOWER_UNBOON_WINDOW    = 1      -- gate 6
+Timers.FLOWER_SEEN_MAX        = FLOWER_SEEN_MAX
+Timers.FLOWER_SEEN_MIN        = FLOWER_SEEN_MIN
+Timers.FLOWER_PICK_THROTTLE   = FLOWER_PICK_THROTTLE
+Timers.FLOWER_OTHER_OVERWRITE = FLOWER_OTHER_OVERWRITE
+
+Timers._felwoodSeen      = {}   -- name -> last-seen epoch
+Timers._felwoodHadFlower = {}   -- name -> true once seen carrying the buff
+Timers._felwoodUnboon    = {}   -- name -> chronoboon-release epoch
+Timers._lastFlowerPickAt = 0
+
+-- `seenOnly` wipes just the last-seen table (the 5s-after-zone-change sweep);
+-- otherwise all three lists go (the loading-screen wipe).
+function Timers.ResetFelwoodPresence(seenOnly)
+    Timers._felwoodSeen = {}
+    if seenOnly then return end
+    Timers._felwoodHadFlower = {}
+    Timers._felwoodUnboon = {}
+end
+
+local function isPlayerGUID(guid)
+    return type(guid) == "string" and guid:sub(1, 7) == "Player-"
+end
+Timers._isPlayerGUID = isPlayerGUID
+
+-- Single-bit flag test without the `bit` library, which is absent under a bare
+-- Lua 5.1 VM and optional in-game. Valid only for single-bit masks, which is all
+-- we use. 0x40 is the combat log's HOSTILE reaction bit.
+local COMBATLOG_REACTION_HOSTILE = 0x40
+local function hasFlag(flags, mask)
+    flags = tonumber(flags)
+    if not flags or flags <= 0 or not mask or mask <= 0 then return false end
+    return math.floor(flags / mask) % 2 == 1
+end
+Timers._hasFlag = hasFlag
+
+local function playerNameOf()
+    return (UnitName and UnitName("player")) or ""
+end
+
+-- Record a sighting. The stamp is only refreshed when the previous sighting was
+-- more than FLOWER_PRESENCE_REFRESH ago (see the block comment). Returns true
+-- when the stamp actually moved.
+function Timers.NoteFelwoodPresence(name, t)
+    if type(name) ~= "string" or name == "" then return false end
+    t = t or now()
+    local prev = Timers._felwoodSeen[name]
+    if prev and (t - prev) <= FLOWER_PRESENCE_REFRESH then return false end
+    Timers._felwoodSeen[name] = t
+    return true
+end
+
+-- Apply the eight-gate heuristic to one witnessed songflower aura gain.
+-- opts: { at, hostile, x, y, seenAt }. `seenAt` lets the caller pass the
+-- last-seen stamp it read BEFORE this event refreshed presence.
+-- Returns applied:boolean, reason:string.
+function Timers.OnOtherSongflower(name, opts)
+    opts = opts or {}
+    local t = opts.at or now()
+    if type(name) ~= "string" or name == "" then return false, "no name" end
+    if name == playerNameOf() then return false, "own pick" end
+    -- Hostile target in a contested zone. Felwood is always contested, so this
+    -- reduces to: never credit an enemy-faction player.
+    if opts.hostile then return false, "hostile target" end
+    if (t - (Timers._lastFlowerPickAt or 0)) < FLOWER_PICK_THROTTLE then
+        return false, "throttled"
+    end
+    if Timers._felwoodHadFlower[name] then return false, "already seen with the buff" end
+
+    local seen = opts.seenAt or Timers._felwoodSeen[name]
+    -- Flag them as a songflower carrier regardless of whether THIS event counts:
+    -- only the first sighting of a player with the buff may ever create a timer,
+    -- so a rejected first sighting still burns their one chance (that is the
+    -- point — the rejection means we cannot trust their buff's provenance).
+    Timers._felwoodHadFlower[name] = true
+
+    if not seen then return false, "not seen before the buff" end
+    local since = t - seen
+    if since < FLOWER_SEEN_MIN then return false, "seen <1s ago (login aura burst)" end
+    if since > FLOWER_SEEN_MAX then return false, "seen >600s ago" end
+
+    local me = playerNameOf()
+    if (t - (Timers._felwoodUnboon[me] or 0)) < FLOWER_UNBOON_WINDOW
+       or (t - (Timers._felwoodUnboon[name] or 0)) < FLOWER_UNBOON_WINDOW then
+        return false, "chronoboon release"
+    end
+
+    local x, y = opts.x, opts.y
+    if not x then x, y = playerFelwoodPos() end
+    if not x then return false, "no position" end
+    local index = Timers.MatchNodeOfKind("flower", x, y)
+    if not index then return false, "no node in range" end
+
+    Timers._lastFlowerPickAt = t
+    local ok = Timers.MarkNode("flower", index, t, "local",
+                               { overwriteGuard = FLOWER_OTHER_OVERWRITE })
+    return ok, ok and "recorded" or "existing node timer too fresh to overwrite"
+end
+
+-- The Felwood engine's single combat-log entry point: presence tracking,
+-- chronoboon-release notes, and the songflower witness trigger. Takes the raw
+-- CLEU fields so the self-tests drive exactly the code the game drives.
+function Timers.FelwoodCombatLog(subevent, sourceGUID, sourceName,
+                                 destGUID, destName, destFlags, spellID, t)
+    if not Timers.InFelwood() then return false end
+    t = t or now()
+
+    -- Snapshot the destination's last-seen stamp BEFORE presence noting: gate 3
+    -- asks whether they were seen before the buff EVENT, and this same event
+    -- would otherwise refresh their stamp to `t` and fail gate 5 by itself.
+    local destSeenAt = (type(destName) == "string") and Timers._felwoodSeen[destName] or nil
+
+    -- Presence: any combat-log event with a player-type source or destination.
+    if isPlayerGUID(sourceGUID) then Timers.NoteFelwoodPresence(sourceName, t) end
+    if isPlayerGUID(destGUID)   then Timers.NoteFelwoodPresence(destName, t) end
+
+    if subevent == "SPELL_CAST_SUCCESS" and spellID == CHRONOBOON_RELEASE_SPELL
+       and isPlayerGUID(sourceGUID) and type(sourceName) == "string" then
+        Timers._felwoodUnboon[sourceName] = t
+        return false
+    end
+
+    if subevent ~= "SPELL_AURA_APPLIED" and subevent ~= "SPELL_AURA_REFRESH" then
+        return false
+    end
+    if spellID ~= SONGFLOWER_AURA then return false end
+    if not isPlayerGUID(destGUID) then return false end
+
+    return (Timers.OnOtherSongflower(destName, {
+        at      = t,
+        hostile = hasFlag(destFlags, COMBATLOG_REACTION_HOSTILE),
+        seenAt  = destSeenAt,
+    }))
+end
+
+-- Target / mouseover presence. The reference establishes presence from these
+-- two in addition to the combat log.
+local function onFelwoodUnitSighting(event, unit)
+    if not Timers.InFelwood() then return end
+    local u = (event == "UPDATE_MOUSEOVER_UNIT") and "mouseover" or "target"
+    if not (UnitIsPlayer and UnitName and UnitIsPlayer(u)) then return end
+    local nm = UnitName(u)
+    if nm then Timers.NoteFelwoodPresence(nm) end
+end
+
+-- Loading screen: wipe all three lists. Zone change: wipe the seen list 5s
+-- later (people around you resolve over the first few seconds after a zone in).
+local function onFelwoodLoadingScreen()
+    Timers.InvalidateFelwoodCache()
+    Timers.ResetFelwoodPresence(false)
+end
+
+local function onFelwoodZoneChanged()
+    Timers.InvalidateFelwoodCache()
+    if C_Timer and C_Timer.After then
+        C_Timer.After(5, function() Timers.ResetFelwoodPresence(true) end)
+    else
+        Timers.ResetFelwoodPresence(true)
+    end
 end
 
 ----------------------------------------------------------------------
@@ -1965,6 +2639,10 @@ function Timers.NWBDebugDump()
         s.ingested, tostring(s.lastCmd), s.lastCmdAt, table.concat(af, " ")))
     ns:Print("  NOTE: NWB never transmits ZG/Zandalar; layered realms nest timers"
         .. " under a layers map (handled). Reassembly is AceComm's, shared-instance.")
+    ns:Print("  lastApplied keys: rend/ony/flower/tuber/log = merged;"
+        .. " rejectedPayload = drop with no stage-1 yell (whole payload dropped);"
+        .. " rejectedYell = stage-1 yell >" .. YELL_DROP_TOLERANCE .. "s from the drop;"
+        .. " nefRejected = Nefarian timer discarded (disabled on Era).")
 end
 
 -- /nexus debug pulls — pull-window self-diagnosis. For each pull buff and yell
@@ -2012,6 +2690,8 @@ Timers._onMonsterYell    = onMonsterYell
 Timers._onCombatLog      = onCombatLog
 Timers._onSpellSucceeded = onSpellSucceeded
 Timers._onQuestTurnedIn  = onQuestTurnedIn
+Timers._onChatLoot       = onChatLoot
+Timers._onFelwoodUnitSighting = onFelwoodUnitSighting
 
 ----------------------------------------------------------------------
 -- Self-tests (pure Lua; run via /dsn debug selftest)
@@ -2164,10 +2844,11 @@ local function testPullRecencyGate(fails)
         "late pop shows reduced remaining window (~window-20)", fails)
 
     -- (c) hours-old anchor -> applied + TIMER_UPDATED, but NO pull bar.
+    -- (onyA, not nefH: Nefarian no longer anchors at all on Era.)
     Timers.state = {}; cap.pull = nil; cap.timerUpdated = {}
-    local ok = Timers.Record("nefH", t - 3600, "mesh", "peer", "pop")
+    local ok = Timers.Record("onyA", t - 3600, "mesh", "peer", "pop")
     tcheck(ok == true, "stale anchor still applied", fails)
-    tcheck(cap.timerUpdated["nefH"] == true, "stale anchor fires TIMER_UPDATED", fails)
+    tcheck(cap.timerUpdated["onyA"] == true, "stale anchor fires TIMER_UPDATED", fails)
     tcheck(cap.pull == nil, "stale anchor does NOT raise PULL_DETECTED (reload fix)", fails)
 
     -- (d) explicit pullDuration is used as the fresh window (mesh/SN pull relay).
@@ -2249,17 +2930,21 @@ local function testYellTable(fails)
         "Ally Ony 'history has been made' -> 15s bar", fails)
     tcheck((Timers.state.onyA and Timers.state.onyA.lastPop or 0) > 0, "Ony-A pop recorded", fails)
 
-    -- (4) Nefarian, both factions and both Alliance announcers.
+    -- (4) Nefarian, both factions and both Alliance announcers. A Nef drop STILL
+    -- ALERTS and still bars — only its cooldown model is gone on Era, so the bar
+    -- must survive while the pop anchor must not be set.
     b = yell("NEFARIAN IS SLAIN! The Horde is victorious!", "High Overlord Saurfang")
     tcheck(#b == 1 and math.abs(b[1].dur - 15) <= 1, "Nef-H yell 1 bar is 15s", fails)
+    tcheck((Timers.state.nefH == nil) or (Timers.state.nefH.lastPop or 0) == 0,
+        "Nef-H yell bars but records NO cooldown anchor (Era)", fails)
     b = yell("People of Stormwind, the Lord of Blackrock is slain!", "Field Marshal Afrasiabi")
     tcheck(#b == 1 and math.abs(b[1].dur - 12) <= 1, "Nef-A yell 1 bar is 12s", fails)
     -- A2.5: Stonebridge was missing entirely, so Alliance lost every Nef drop
-    -- he announced.
+    -- he announced. He must still raise the bar.
     b = yell("People of Stormwind, the Lord of Blackrock is slain!", "Field Marshal Stonebridge")
     tcheck(#b == 1 and math.abs(b[1].dur - 12) <= 1, "Stonebridge Nef-A bar is 12s", fails)
-    tcheck((Timers.state.nefA and Timers.state.nefA.lastPop or 0) > 0,
-        "Stonebridge records a Nef-A pop (A2.5)", fails)
+    tcheck((Timers.state.nefA == nil) or (Timers.state.nefA.lastPop or 0) == 0,
+        "Stonebridge bars Nef-A without a cooldown anchor (Era)", fails)
 
     -- (5) Stage 2 is a COMPLETE no-op for Rend / Ony / Nef (A2.4): no bar and,
     -- critically, no second spurious pop.
@@ -2376,10 +3061,11 @@ local function testQuestHandin(fails)
 
     -- (b) A hand-in whose buff is already on cooldown is ignored ENTIRELY --
     -- no anchor, no stash, no alert (A4.2).
+    -- (7491 is the HORDE Onyxia hand-in, matching the Horde faction stubbed above.)
     reset()
     Timers.Record("onyH", now(), "local", "yeller", "pop")
     Timers._lastNotice = nil
-    local ok2, why = Timers.OnQuestHandin(7496)
+    local ok2, why = Timers.OnQuestHandin(7491)
     tcheck(ok2 == false and why == "on cooldown", "on-CD hand-in is ignored", fails)
     tcheck(Timers._lastNotice == nil, "on-CD hand-in emits no alert (A4.2)", fails)
     -- Rend likewise.
@@ -2388,10 +3074,16 @@ local function testQuestHandin(fails)
     tcheck(Timers.OnQuestHandin(4974) == false, "on-CD Rend hand-in ignored", fails)
     tcheck(Timers._handinStash.rend == nil, "on-CD Rend hand-in does not even stash", fails)
 
-    -- (c) Nef and ZG carry no cooldown and are NEVER suppressed.
+    -- (c) Nef and ZG are NEVER cooldown-suppressed. Nef's cooldown is disabled
+    -- outright on Era, so the hand-in still ALERTS but anchors nothing.
     reset()
-    Timers.Record("nefH", now(), "local", "yeller", "pop")
+    tcheck(Timers.Record("nefH", now(), "local", "yeller", "pop") == false,
+        "a Nef pop is refused outright on Era (no anchor from any source)", fails)
     tcheck(Timers.OnQuestHandin(7784) == true, "Nef hand-in never suppressed", fails)
+    tcheck(Timers._lastNotice and Timers._lastNotice.category == "questHandin",
+        "the Nef hand-in still alerts", fails)
+    tcheck((Timers.state.nefH == nil) or (Timers.state.nefH.lastPop or 0) == 0,
+        "the Nef hand-in sets no cooldown anchor", fails)
 
     -- (d) The ZG hand-in starts the 50s stage-1 pull (A4.3).
     reset()
@@ -2404,13 +3096,30 @@ local function testQuestHandin(fails)
     local okN = Timers.OnQuestHandin(12345)
     tcheck(okN == false, "an unrelated quest hand-in is ignored", fails)
 
-    -- (f) Hand-in ids map to the right FACTION (spec §10.3). These were reversed.
-    tcheck(Timers._handinQuest[7491] == "onyA" and Timers._handinQuest[7496] == "onyH",
-        "7491 -> Ony Alliance, 7496 -> Ony Horde", fails)
-    tcheck(Timers._handinQuest[7782] == "nefA" and Timers._handinQuest[7784] == "nefH",
-        "7782 -> Nef Alliance, 7784 -> Nef Horde", fails)
+    -- (f) Hand-in ids map to the right FACTION. Settled from the classic quest
+    -- database, not from either reference addon (neither carries the split).
+    tcheck(Timers._handinQuest[7491] == "onyH", "7491 'For All To See' -> Ony HORDE", fails)
+    tcheck(Timers._handinQuest[7496] == "onyA", "7496 'Celebrating Good Times' -> Ony ALLIANCE", fails)
+    tcheck(Timers._handinQuest[7782] == "nefA", "7782 -> Nef ALLIANCE (Stonebridge)", fails)
+    tcheck(Timers._handinQuest[7784] == "nefH", "7784 -> Nef HORDE (Saurfang)", fails)
     tcheck(Timers._handinQuest[4974] == "rend" and Timers._handinQuest[8183] == "zg",
         "4974 -> Rend, 8183 -> Zandalar", fails)
+
+    -- ...and the mapping is live end to end: turning in the Horde Onyxia head
+    -- anchors onyH, never onyA.
+    reset()
+    _G.UnitFactionGroup = function() return "Horde" end
+    tcheck(Timers.OnQuestHandin(7491) == true, "Ony Horde hand-in handled", fails)
+    tcheck((Timers.state.onyH and Timers.state.onyH.lastPop or 0) > 0,
+        "7491 anchors onyH", fails)
+    tcheck((Timers.state.onyA == nil) or (Timers.state.onyA.lastPop or 0) == 0,
+        "7491 does NOT touch onyA", fails)
+    reset()
+    tcheck(Timers.OnQuestHandin(7496) == true, "Ony Alliance hand-in handled", fails)
+    tcheck((Timers.state.onyA and Timers.state.onyA.lastPop or 0) > 0,
+        "7496 anchors onyA", fails)
+    tcheck((Timers.state.onyH == nil) or (Timers.state.onyH.lastPop or 0) == 0,
+        "7496 does NOT touch onyH", fails)
 
     _G.UnitFactionGroup = savedFaction
     reset()
@@ -2433,6 +3142,7 @@ local function testSongflowerPick(fails)
             return { GetXY = function() return pos.x, pos.y end }
         end,
     }
+    Timers.InvalidateFelwoodCache()
     local function standOn(node, dx, dy)
         pos.x, pos.y = node.x + (dx or 0), node.y + (dy or 0)
     end
@@ -2456,13 +3166,25 @@ local function testSongflowerPick(fails)
     Timers._onSpellSucceeded("UNIT_SPELLCAST_SUCCEEDED", "target", "Cast-3", Timers.SONGFLOWER_SPELL)
     tcheck((timers.flower[4] or 0) == 0, "another unit's 6478 cast is ignored", fails)
 
-    -- (d) Radius: a pick a real distance off the stored coordinate now lands
-    -- (0.06, not the 4x-too-tight 0.015) -- A5.2.
+    -- (d) Radius is back to the CANONICAL 1.5 map-percent (0.015) for flowers
+    -- and 2.0 (0.02) for tubers. The interim 0.06 was 4x looser than canonical.
+    tcheck(Timers.NODE_MATCH_RADIUS == 0.015, "songflower match radius is 0.015 normalized", fails)
+    tcheck(Timers.NODE_MATCH_RADIUS_BY_KIND.flower == 0.015
+       and Timers.NODE_MATCH_RADIUS_BY_KIND.tuber == 0.02,
+        "per-kind radii are flower 0.015 / tuber 0.02", fails)
+
+    -- Just inside 0.015 matches...
     timers.flower = {}
-    standOn(f4, 0.03, 0.02)   -- ~0.036 away: inside 0.06, outside the old 0.015
+    standOn(f4, 0.008, 0.008)   -- ~0.0113 away: inside 0.015
     Timers._onSpellSucceeded("UNIT_SPELLCAST_SUCCEEDED", "player", "Cast-4", Timers.SONGFLOWER_SPELL)
-    tcheck((timers.flower[4] or 0) > 0, "a pick 0.036 off the node still matches (A5.2)", fails)
-    tcheck(Timers.NODE_MATCH_RADIUS == 0.06, "node match radius is 0.06 normalized", fails)
+    tcheck((timers.flower[4] or 0) > 0, "a pick 0.011 off the node matches", fails)
+
+    -- ...and the old over-wide band (0.036) no longer does.
+    timers.flower = {}
+    standOn(f4, 0.03, 0.02)   -- ~0.036 away: was inside the interim 0.06
+    Timers._onSpellSucceeded("UNIT_SPELLCAST_SUCCEEDED", "player", "Cast-4b", Timers.SONGFLOWER_SPELL)
+    tcheck((timers.flower[4] or 0) == 0,
+        "a pick 0.036 off the node is REJECTED at the canonical radius", fails)
 
     -- Well outside the radius still matches nothing.
     timers.flower = {}
@@ -2470,8 +3192,8 @@ local function testSongflowerPick(fails)
     Timers._onSpellSucceeded("UNIT_SPELLCAST_SUCCEEDED", "player", "Cast-5", Timers.SONGFLOWER_SPELL)
     tcheck((timers.flower[4] or 0) == 0, "a cast far from every node matches nothing", fails)
 
-    -- (e) Co-located flower/tuber sites still resolve by nearest-distance, so
-    -- the wider radius cannot bleed a flower pick onto its neighbour tuber.
+    -- (e) Co-located flower/tuber sites resolve by nearest-distance, each judged
+    -- against its own radius.
     local f3, t1 = Timers.NODES.flower[3], Timers.NODES.tuber[1]
     local k1 = Timers.MatchNodePick(f3.x, f3.y)
     tcheck(k1 == "flower", "standing on flower 3 resolves to the flower", fails)
@@ -2479,7 +3201,267 @@ local function testSongflowerPick(fails)
     tcheck(k2 == "tuber" and i2 == 1, "standing on tuber 1 resolves to the tuber", fails)
     tcheck(Timers.MatchNodePick(0.9, 0.9) == nil, "far-away position matches no node", fails)
 
+    -- (f) The gather cast is SONGFLOWER-ONLY now: standing on a tuber node and
+    -- casting 6478 must mark nothing (tubers are looted, not cast).
+    timers.flower, timers.tuber = {}, {}
+    standOn(t1)
+    Timers._onSpellSucceeded("UNIT_SPELLCAST_SUCCEEDED", "player", "Cast-6", Timers.SONGFLOWER_SPELL)
+    tcheck((timers.tuber[1] or 0) == 0, "the gather cast never marks a tuber (dead path removed)", fails)
+    tcheck(Timers.MatchNodeOfKind("flower", t1.x, t1.y) == nil,
+        "a tuber-node position matches no flower within 0.015", fails)
+
     _G.C_Map = savedMap
+    Timers.InvalidateFelwoodCache()
+    timers.flower, timers.tuber = {}, {}
+end
+
+-- Tuber detection via LOOT (item 11951), the rebuilt path. The old cast-based
+-- path was unreachable and the wire never carries tubers on a layered realm, so
+-- this is the only way a tuber timer can exist on Whitemane.
+local function testTuberLoot(fails)
+    if not (ns.Store and ns.Store.GetTimers) then
+        fails[#fails + 1] = "store absent for tuber loot test"; return
+    end
+    local timers = ns.Store.GetTimers()
+    timers.flower, timers.tuber = {}, {}
+    Timers._lastLootAt = {}
+
+    -- Item-link parsing is pure and drives everything else.
+    local selfLine  = "You receive loot: |cffffffff|Hitem:11951::::::::60:::::|h[Whipper Root Tuber]|h|r."
+    local otherLine = "Someone receives loot: |cffffffff|Hitem:11951::::::::60:::::|h[Whipper Root Tuber]|h|rx2."
+    local multiLine = "You receive loot: |Hitem:2589::::::::60:::::|h[Linen Cloth]|h |Hitem:11951::::::::60:::::|h[Whipper Root Tuber]|h."
+    local ids = Timers.ParseLootItemIDs(selfLine)
+    tcheck(#ids == 1 and ids[1] == 11951, "loot line yields item 11951", fails)
+    ids = Timers.ParseLootItemIDs(multiLine)
+    tcheck(#ids == 2 and ids[1] == 2589 and ids[2] == 11951,
+        "a multi-link loot line yields every item id in order", fails)
+    tcheck(#Timers.ParseLootItemIDs("You have looted 3 copper.") == 0,
+        "a loot line with no item link yields nothing", fails)
+    tcheck(#Timers.ParseLootItemIDs(nil) == 0, "nil loot line is safe", fails)
+
+    local savedMap = _G.C_Map
+    local pos = { x = 0, y = 0 }
+    local mapID = Timers.FELWOOD_MAP
+    _G.C_Map = {
+        GetBestMapForUnit = function() return mapID end,
+        GetPlayerMapPosition = function()
+            return { GetXY = function() return pos.x, pos.y end }
+        end,
+    }
+    Timers.InvalidateFelwoodCache()
+    local t1 = Timers.NODES.tuber[1]
+    local function standOn(node, dx, dy) pos.x, pos.y = node.x + (dx or 0), node.y + (dy or 0) end
+
+    -- (a) THE fix: looting a tuber ON a tuber node starts that node's timer.
+    standOn(t1)
+    local t = now()
+    tcheck(Timers.OnLootMessage(selfLine, t) == true, "looting 11951 on tuber 1 marks it", fails)
+    tcheck((timers.tuber[1] or 0) == t, "tuber 1 timer set to the loot epoch", fails)
+
+    -- (b) 5s per-type throttle: an immediate second loot line is swallowed.
+    timers.tuber = {}
+    tcheck(Timers.OnLootMessage(selfLine, t + 1) == false, "second loot within 5s is throttled", fails)
+    tcheck((timers.tuber[1] or 0) == 0, "throttled loot marks nothing", fails)
+
+    -- (c) past the throttle, another player's loot line counts too.
+    timers.tuber = {}
+    tcheck(Timers.OnLootMessage(otherLine, t + 6) == true,
+        "another player's loot line records past the throttle", fails)
+
+    -- (d) an existing timer younger than the 1500s respawn is not overwritten.
+    Timers._lastLootAt = {}
+    timers.tuber = { [1] = t + 6 }
+    tcheck(Timers.OnLootMessage(selfLine, t + 100) == false,
+        "a node timer younger than 1500s is not overwritten", fails)
+    tcheck(timers.tuber[1] == t + 6, "the younger timer survives", fails)
+    -- ...but past the respawn it is.
+    Timers._lastLootAt = {}
+    tcheck(Timers.OnLootMessage(selfLine, t + 6 + NODE_RESPAWN + 1) == true,
+        "past the 1500s respawn the node re-marks", fails)
+
+    -- (e) not in Felwood -> nothing at all.
+    Timers._lastLootAt = {}; timers.tuber = {}
+    mapID = 1454   -- Orgrimmar
+    Timers.InvalidateFelwoodCache()
+    tcheck(Timers.OnLootMessage(selfLine, t + 2000) == false, "loot outside Felwood is ignored", fails)
+    mapID = Timers.FELWOOD_MAP
+    Timers.InvalidateFelwoodCache()
+
+    -- (f) away from every tuber node -> nothing.
+    Timers._lastLootAt = {}; timers.tuber = {}
+    standOn(t1, 0.2, 0.2)
+    tcheck(Timers.OnLootMessage(selfLine, t + 3000) == false,
+        "looting a tuber away from any node marks nothing", fails)
+
+    -- (g) Night Dragon's Breath (11952) is recognised but has no node set, so it
+    -- must never be mis-credited onto a tuber node.
+    Timers._lastLootAt = {}; timers.tuber = {}
+    standOn(t1)
+    local dragonLine = "You receive loot: |Hitem:11952::::::::60:::::|h[Night Dragon's Breath]|h."
+    tcheck(Timers.OnLootMessage(dragonLine, t + 4000) == false,
+        "item 11952 is recognised and ignored, never mapped onto a tuber", fails)
+    tcheck((timers.tuber[1] or 0) == 0, "11952 leaves the tuber nodes untouched", fails)
+
+    _G.C_Map = savedMap
+    Timers.InvalidateFelwoodCache()
+    timers.flower, timers.tuber = {}, {}
+    Timers._lastLootAt = {}
+end
+
+-- Other players' songflower picks: the eight-gate witness heuristic that turns
+-- one personally-picked timer into a whole group circuit.
+local function testOtherSongflower(fails)
+    if not (ns.Store and ns.Store.GetTimers) then
+        fails[#fails + 1] = "store absent for witness test"; return
+    end
+    local timers = ns.Store.GetTimers()
+    timers.flower, timers.tuber = {}, {}
+
+    local savedMap = _G.C_Map
+    local pos = { x = 0, y = 0 }
+    local mapID = Timers.FELWOOD_MAP
+    _G.C_Map = {
+        GetBestMapForUnit = function() return mapID end,
+        GetPlayerMapPosition = function()
+            return { GetXY = function() return pos.x, pos.y end }
+        end,
+    }
+    Timers.InvalidateFelwoodCache()
+    local f5 = Timers.NODES.flower[5]
+    pos.x, pos.y = f5.x, f5.y
+
+    local t = now()
+    local function reset()
+        Timers.ResetFelwoodPresence(false)
+        Timers._lastFlowerPickAt = 0
+        timers.flower = {}
+    end
+    local PGUID, NGUID = "Player-4395-00ABCDEF", "Creature-0-1-2-3-14392-000012AB"
+
+    -- Bit test (no `bit` library under a bare VM).
+    tcheck(Timers._hasFlag(0x40, 0x40) == true, "hostile flag detected", fails)
+    tcheck(Timers._hasFlag(0x10, 0x40) == false, "friendly flag is not hostile", fails)
+    tcheck(Timers._isPlayerGUID(PGUID) == true, "player GUID recognised", fails)
+    tcheck(Timers._isPlayerGUID(NGUID) == false, "creature GUID is not a player", fails)
+
+    -- (a) THE feature: a player seen 30s ago gains Songflower Serenade next to
+    -- us -> that node's timer starts.
+    reset()
+    Timers.NoteFelwoodPresence("Friendo", t - 30)
+    local ok = Timers.FelwoodCombatLog("SPELL_AURA_APPLIED", PGUID, "Friendo",
+                                       PGUID, "Friendo", 0x10, Timers.SONGFLOWER_AURA, t)
+    tcheck(ok == true, "a witnessed songflower gain records a pick", fails)
+    tcheck((timers.flower[5] or 0) == t, "the matched node timer is set", fails)
+
+    -- (b) gate 2: only the FIRST sighting of a player with the buff can count.
+    Timers._lastFlowerPickAt = 0
+    timers.flower = {}
+    Timers.NoteFelwoodPresence("Friendo", t - 30)
+    local ok2 = Timers.FelwoodCombatLog("SPELL_AURA_REFRESH", PGUID, "Friendo",
+                                        PGUID, "Friendo", 0x10, Timers.SONGFLOWER_AURA, t + 10)
+    tcheck(ok2 == false, "a second gain from the same player is refused", fails)
+
+    -- (c) gate 3: a player never seen before the buff is a logging-in carrier.
+    reset()
+    tcheck(Timers.OnOtherSongflower("Stranger", { at = t }) == false,
+        "an unseen player's buff is not a pick", fails)
+
+    -- (d) gate 5: seen less than 1s ago is the login aura burst.
+    reset()
+    Timers.NoteFelwoodPresence("Blinkin", t)
+    tcheck(Timers.OnOtherSongflower("Blinkin", { at = t }) == false,
+        "seen <1s ago is rejected (login aura burst)", fails)
+
+    -- (e) gate 4: seen more than 600s ago is too stale to attribute.
+    reset()
+    Timers.NoteFelwoodPresence("Ghost", t - 700)
+    tcheck(Timers.OnOtherSongflower("Ghost", { at = t }) == false,
+        "seen >600s ago is rejected", fails)
+
+    -- (f) hostile target in a contested zone is never credited.
+    reset()
+    Timers.NoteFelwoodPresence("Enemy", t - 30)
+    tcheck(Timers.FelwoodCombatLog("SPELL_AURA_APPLIED", PGUID, "Enemy",
+                                   PGUID, "Enemy", 0x40, Timers.SONGFLOWER_AURA, t) == false,
+        "a hostile aura target is discarded", fails)
+
+    -- (g) gate 6: a chronoboon release inside 1s suppresses both sides.
+    reset()
+    Timers.NoteFelwoodPresence("Booner", t - 30)
+    Timers.FelwoodCombatLog("SPELL_CAST_SUCCESS", PGUID, "Booner", PGUID, "Booner",
+                            0x10, Timers.CHRONOBOON_RELEASE_SPELL, t)
+    tcheck(Timers._felwoodUnboon["Booner"] == t, "a chronoboon release is noted", fails)
+    tcheck(Timers.OnOtherSongflower("Booner", { at = t }) == false,
+        "a pick within 1s of a chronoboon release is rejected", fails)
+
+    -- (h) gate 7: the 5s global throttle.
+    reset()
+    Timers.NoteFelwoodPresence("A", t - 30)
+    Timers.NoteFelwoodPresence("B", t - 30)
+    tcheck(Timers.OnOtherSongflower("A", { at = t }) == true, "first witnessed pick lands", fails)
+    tcheck(Timers.OnOtherSongflower("B", { at = t + 1 }) == false,
+        "a second witnessed pick within 5s is throttled", fails)
+
+    -- (i) gate 8: a node timer younger than 1440s is not overwritten by someone
+    -- else's pick — but OUR own cast (no guard) still wins outright.
+    reset()
+    timers.flower = { [5] = t - 100 }
+    Timers.NoteFelwoodPresence("Late", t - 30)
+    tcheck(Timers.OnOtherSongflower("Late", { at = t }) == false,
+        "a node timer 100s old is not overwritten by a witnessed pick", fails)
+    tcheck(timers.flower[5] == t - 100, "the fresher local timer survives", fails)
+    tcheck(Timers.MarkNode("flower", 5, t, "local") == true,
+        "our own pick has no overwrite guard and wins", fails)
+
+    -- (j) our OWN aura gain is not a witnessed pick (the cast path owns it).
+    reset()
+    tcheck(Timers.OnOtherSongflower("Tester", { at = t }) == false,
+        "our own name is never treated as another player's pick", fails)
+
+    -- (k) presence refresh floor: a sighting inside 180s does not move the stamp,
+    -- which is what keeps a player in combat next to us from staying eligible.
+    reset()
+    Timers.NoteFelwoodPresence("Sticky", t - 30)
+    tcheck(Timers.NoteFelwoodPresence("Sticky", t) == false,
+        "a re-sighting inside 180s does not refresh the stamp", fails)
+    tcheck(Timers._felwoodSeen["Sticky"] == t - 30, "the original stamp is kept", fails)
+    tcheck(Timers.NoteFelwoodPresence("Sticky", t + 200) == true,
+        "a re-sighting past 180s refreshes the stamp", fails)
+
+    -- (l) outside Felwood the whole engine is inert.
+    reset()
+    mapID = 1454
+    Timers.InvalidateFelwoodCache()
+    Timers.NoteFelwoodPresence("Friendo", t - 30)
+    tcheck(Timers.FelwoodCombatLog("SPELL_AURA_APPLIED", PGUID, "Friendo",
+                                   PGUID, "Friendo", 0x10, Timers.SONGFLOWER_AURA, t) == false,
+        "the witness engine is inert outside Felwood", fails)
+    mapID = Timers.FELWOOD_MAP
+    Timers.InvalidateFelwoodCache()
+
+    -- (m) a non-songflower aura and a non-player destination are both ignored.
+    reset()
+    Timers.NoteFelwoodPresence("Friendo", t - 30)
+    tcheck(Timers.FelwoodCombatLog("SPELL_AURA_APPLIED", PGUID, "Friendo",
+                                   PGUID, "Friendo", 0x10, 12345, t) == false,
+        "an unrelated aura is ignored", fails)
+    tcheck(Timers.FelwoodCombatLog("SPELL_AURA_APPLIED", PGUID, "Friendo",
+                                   NGUID, "Some Mob", 0x40, Timers.SONGFLOWER_AURA, t) == false,
+        "a non-player aura destination is ignored", fails)
+
+    -- (n) the loading-screen wipe clears all three lists; the zone-change sweep
+    -- clears only last-seen.
+    Timers.NoteFelwoodPresence("Wipeme", t)
+    Timers._felwoodHadFlower["Wipeme"] = true
+    Timers.ResetFelwoodPresence(true)
+    tcheck(Timers._felwoodSeen["Wipeme"] == nil, "zone sweep clears last-seen", fails)
+    tcheck(Timers._felwoodHadFlower["Wipeme"] == true, "zone sweep keeps the had-buff list", fails)
+    Timers.ResetFelwoodPresence(false)
+    tcheck(Timers._felwoodHadFlower["Wipeme"] == nil, "loading screen clears the had-buff list", fails)
+
+    _G.C_Map = savedMap
+    Timers.InvalidateFelwoodCache()
+    reset()
     timers.flower, timers.tuber = {}, {}
 end
 
@@ -2661,23 +3643,167 @@ local function testRehydrateFromStore(fails)
     logs.rend, Timers.state = {}, {}
 end
 
--- Item 40: NWB timer payload ingest — flat short keys, layered realms, word keys.
+-- NWB timer payload ingest — flat short keys, layered realms, word keys, the
+-- +/-120s yell validation, the Era Nefarian rejection, and the timer log.
 local function testNWBIngest(fails)
     local t = now()
-    Timers.state = {}
-    local a1 = Timers.IngestNWBTimers({ n = t - 100, s = t - 200, f1 = t - 50, t3 = t - 60 })
-    tcheck(a1.rend and a1.ony, "flat n/s short keys ingested", fails)
+    local timersStore = ns.Store and ns.Store.GetTimers and ns.Store.GetTimers()
+    local function reset()
+        Timers.state = {}
+        if timersStore then timersStore.flower, timersStore.tuber = {}, {} end
+    end
+
+    -- Every drop epoch must now travel with its stage-1 yell epoch:
+    --   n/o = rend drop/yell1 · s/t = ony drop/yell1 · y/z = nef drop/yell1.
+    reset()
+    local a1 = Timers.IngestNWBTimers({
+        n = t - 100, o = t - 110,
+        s = t - 200, t = t - 210,
+        f1 = t - 50, t3 = t - 60,
+    })
+    tcheck(a1.rend and a1.ony, "flat n/s short keys ingested with their yell epochs", fails)
     tcheck((a1.flower or 0) >= 1 and (a1.tuber or 0) >= 1, "flat flower/tuber ingested", fails)
-    -- Layered realm: timers nested under a layers-like map.
-    Timers.state = {}
-    local a2 = Timers.IngestNWBTimers({ layers = { [1] = { n = t - 300, f2 = t - 70 } } })
-    tcheck(a2.rend, "layered rend ingested (item 40)", fails)
+
+    -- Layered realm: timers nested under the literally-named `layers` key.
+    reset()
+    local a2 = Timers.IngestNWBTimers({ layers = { [1] = { n = t - 300, o = t - 310, f2 = t - 70 } } })
+    tcheck(a2.rend, "layered rend ingested from payload.layers", fails)
     tcheck((a2.flower or 0) >= 1, "layered flower ingested", fails)
+
     -- Word keys tolerated (un-compacted layer).
-    Timers.state = {}
-    local a3 = Timers.IngestNWBTimers({ rendTimer = t - 100, flower5 = t - 40 })
+    reset()
+    local a3 = Timers.IngestNWBTimers({ rendTimer = t - 100, o = t - 105, flower5 = t - 40 })
     tcheck(a3.rend and (a3.flower or 0) >= 1, "word keys tolerated", fails)
-    Timers.state = {}
+
+    ------------------------------------------------------------------
+    -- +/-120s yell-vs-drop validation. We used to accept anything above 1e9,
+    -- so a single malformed sender could plant a cooldown that never cleared.
+    ------------------------------------------------------------------
+
+    -- (a) a drop with NO stage-1 yell discards the WHOLE table.
+    reset()
+    local v = Timers.ValidateNWBDrops({ n = t - 100 }, t)
+    tcheck(v.ok == false, "a drop with no stage-1 yell invalidates the payload", fails)
+    local a4 = Timers.IngestNWBTimers({ n = t - 100, f1 = t - 50 })
+    tcheck(not a4.rend, "rejected payload records no rend anchor", fails)
+    tcheck((a4.rejectedPayload or 0) >= 1, "whole-payload rejection is counted", fails)
+    tcheck((a4.flower or 0) == 0, "a rejected payload's flowers are dropped too", fails)
+
+    -- (b) yell within +/-120s of the drop is ACCEPTED, on both sides.
+    reset()
+    v = Timers.ValidateNWBDrops({ n = t - 100, o = t - 100 - 119 }, t)
+    tcheck(v.ok and v.accept.rend == t - 100, "yell 119s before the drop accepted", fails)
+    v = Timers.ValidateNWBDrops({ n = t - 100, o = t - 100 + 119 }, t)
+    tcheck(v.ok and v.accept.rend == t - 100, "yell 119s after the drop accepted", fails)
+
+    -- (c) beyond +/-120s the BUFF is stripped, but the table still merges.
+    reset()
+    v = Timers.ValidateNWBDrops({ n = t - 100, o = t - 100 - 121 }, t)
+    tcheck(v.ok and v.accept.rend == nil and v.reject.rend ~= nil,
+        "yell 121s before the drop strips rend", fails)
+    v = Timers.ValidateNWBDrops({ n = t - 100, o = t - 100 + 121 }, t)
+    tcheck(v.ok and v.accept.rend == nil and v.reject.rend ~= nil,
+        "yell 121s after the drop strips rend", fails)
+    local a5 = Timers.IngestNWBTimers({ n = t - 100, o = t - 400, f1 = t - 50 })
+    tcheck(not a5.rend, "an out-of-tolerance rend is not anchored", fails)
+    tcheck((a5.rejectedYell or 0) >= 1, "per-buff yell rejection is counted", fails)
+    tcheck((a5.flower or 0) >= 1, "the rest of the table still merges", fails)
+
+    -- (d) absolute + future sanity clamps.
+    tcheck(Timers._nwbEpoch(2585912599, nil, t) == nil, "epoch above the absolute ceiling rejected", fails)
+    tcheck(Timers._nwbEpoch(t + 40000, nil, t) == nil, "epoch >30000s in the future rejected", fails)
+    tcheck(Timers._nwbEpoch(t + 20000, "rend", t) == nil, "rend epoch past its +10860 clamp rejected", fails)
+    tcheck(Timers._nwbEpoch(t + 5000, "rend", t) == t + 5000, "rend epoch inside its clamp accepted", fails)
+    tcheck(Timers._nwbEpoch(t + 2000, "node", t) == nil, "node epoch past its +1530 clamp rejected", fails)
+    tcheck(Timers._nwbEpoch("not a number", nil, t) == nil, "non-numeric epoch rejected", fails)
+
+    ------------------------------------------------------------------
+    -- Nefarian is DISABLED on Era: never anchored, inbound timers dropped.
+    ------------------------------------------------------------------
+    reset()
+    local a6 = Timers.IngestNWBTimers({ y = t - 100, z = t - 110 })
+    tcheck((a6.nefRejected or 0) >= 1, "an inbound Nef timer is explicitly rejected", fails)
+    tcheck((Timers.state.nefH == nil) or (Timers.state.nefH.lastPop or 0) == 0,
+        "no Nef cooldown anchor is computed from the wire", fails)
+    tcheck((Timers.state.nefA == nil) or (Timers.state.nefA.lastPop or 0) == 0,
+        "no Nef-A anchor either", fails)
+    tcheck(Timers.BuffStatus("nefH", t).state == "nodata",
+        "Nef reports no cooldown state at all", fails)
+    tcheck(Timers.IsCooldownDisabled("nefH") and Timers.IsCooldownDisabled("nefA"),
+        "both Nef keys are cooldown-disabled", fails)
+    tcheck(not Timers.IsCooldownDisabled("rend") and not Timers.IsCooldownDisabled("onyH"),
+        "Rend and Onyxia are still cooldown-tracked", fails)
+    -- ...but an announcer KILL still runs the 360s respawn model.
+    reset()
+    tcheck(Timers.Record("nefH", t, "local", "High Overlord Saurfang", "killed") == true,
+        "a Nef announcer kill is still recorded", fails)
+    tcheck(Timers.BuffStatus("nefH", t + 60).state == "killed",
+        "the Nef kill still reads as a respawn countdown", fails)
+
+    ------------------------------------------------------------------
+    -- Timer log (key F). The reference's PREFERRED Rend source on a layered
+    -- realm — Whitemane is layered — and we were dropping it on the floor.
+    ------------------------------------------------------------------
+    -- Entry shape: G = type, H = timestamp, I = layer id, J = who.
+    reset()
+    local key, epoch, who = Timers.ParseNWBLogEntry({ G = "r", H = t - 500, I = 1454, J = "Bob" }, t)
+    tcheck(key == "rend" and epoch == t - 500 and who == "Bob", "log type 'r' -> a Rend drop", fails)
+    -- 'q' is a HAND-IN, converted to an assumed drop at +15s.
+    key, epoch = Timers.ParseNWBLogEntry({ G = "q", H = t - 500, I = 1454, J = "Bob" }, t)
+    tcheck(key == "rend" and epoch == (t - 500) + Timers.NWB_HANDIN_LEAD,
+        "log type 'q' -> hand-in + 15s assumed drop", fails)
+    key = Timers.ParseNWBLogEntry({ G = "o", H = t - 500 }, t)
+    tcheck(key == factionKey("ony"), "log type 'o' -> a faction-resolved Onyxia drop", fails)
+    key = Timers.ParseNWBLogEntry({ G = "n", H = t - 500 }, t)
+    tcheck(key == factionKey("nef"), "log type 'n' parses as Nefarian", fails)
+    tcheck(Timers.ParseNWBLogEntry({ G = "zz", H = t - 500 }, t) == nil, "unknown log type ignored", fails)
+    tcheck(Timers.ParseNWBLogEntry({ G = "r" }, t) == nil, "log entry without a timestamp ignored", fails)
+    tcheck(Timers.ParseNWBLogEntry("not a table", t) == nil, "non-table log entry ignored", fails)
+
+    -- End to end: a log-only payload anchors Rend through the trust ladder.
+    reset()
+    local a7 = Timers.IngestNWBTimers({ F = { { G = "r", H = t - 500, I = 1454, J = "Bob" } } })
+    tcheck((a7.log or 0) == 1 and (a7.logApplied or 0) == 1, "a log entry is ingested and applied", fails)
+    tcheck(Timers.state.rend and Timers.state.rend.lastPop == t - 500,
+        "the log entry anchors the Rend cooldown", fails)
+    tcheck(Timers.state.rend.trust == "nwb", "the log entry carries nwb trust", fails)
+    tcheck(Timers.state.rend.who == "Bob", "the log entry's 'who' is attributed", fails)
+
+    -- A hand-in entry lands 15s later than its raw stamp.
+    reset()
+    Timers.IngestNWBTimers({ F = { { G = "q", H = t - 500, I = 1454, J = "Ann" } } })
+    tcheck(Timers.state.rend and Timers.state.rend.lastPop == (t - 500) + Timers.NWB_HANDIN_LEAD,
+        "a 'q' hand-in anchors at +15s", fails)
+
+    -- A Nefarian log entry is rejected with everything else Nef.
+    reset()
+    local a8 = Timers.IngestNWBTimers({ F = { { G = "n", H = t - 500 } } })
+    tcheck((a8.nefRejected or 0) >= 1, "a Nef log entry is rejected", fails)
+    tcheck((a8.logApplied or 0) == 0, "no Nef log entry is applied", fails)
+
+    -- The log rides alongside timers, and the log array is no longer mistaken
+    -- for a layer map by the fallback scan.
+    reset()
+    local a9 = Timers.IngestNWBTimers({
+        s = t - 200, t = t - 210,
+        F = { { G = "r", H = t - 600, J = "Cid" }, { G = "q", H = t - 500, J = "Dee" } },
+    })
+    tcheck(a9.ony, "the ony timer still merges alongside a log", fails)
+    tcheck((a9.log or 0) == 2, "both log entries parsed", fails)
+    -- The first entry anchors; the second is inside the Rend cooldown and is
+    -- correctly refused as a duplicate by the false-positive gate.
+    tcheck(Timers.state.rend and Timers.state.rend.lastPop == t - 600,
+        "the first log entry takes the anchor", fails)
+    tcheck((a9.logApplied or 0) == 1, "the within-cooldown duplicate is gated out", fails)
+
+    -- A log entry cannot outrank a local anchor of the same moment.
+    reset()
+    Timers.Record("rend", t - 600, "local", "Me", "pop")
+    local a10 = Timers.IngestNWBTimers({ F = { { G = "r", H = t - 590, J = "Cid" } } })
+    tcheck((a10.logApplied or 0) == 0, "a log entry cannot displace a local anchor", fails)
+    tcheck(Timers.state.rend.trust == "local", "local trust is retained", fails)
+
+    reset()
 end
 
 -- Pull-window selection + drift calibration (per-buff, per-yell-stage).
@@ -2829,6 +3955,8 @@ function Timers.RunSelfTests(verbose)
         { name = "announcer kill respawn (A3)", fn = testAnnouncerKill },
         { name = "quest hand-in (A4)", fn = testQuestHandin },
         { name = "songflower pick gate (A5)", fn = testSongflowerPick },
+        { name = "tuber loot detection", fn = testTuberLoot },
+        { name = "other-player songflower", fn = testOtherSongflower },
         { name = "pull recency gate", fn = testPullRecencyGate },
         { name = "pull windows + drift", fn = testPullWindows },
         { name = "trust upgrade",     fn = testTrustUpgrade },
@@ -2926,6 +4054,18 @@ function Timers.OnLogin()
     ns:RegisterEvent("COMBAT_LOG_EVENT_UNFILTERED", onCombatLog)
     ns:RegisterEvent("QUEST_TURNED_IN", onQuestTurnedIn)
     ns:RegisterEvent("UNIT_SPELLCAST_SUCCEEDED", onSpellSucceeded)
+    -- Whipper Root Tubers are LOOTED, not cast: the loot chat line is the trigger.
+    ns:RegisterEvent("CHAT_MSG_LOOT", onChatLoot)
+    -- Felwood presence feeds the other-player songflower heuristic. Combat log is
+    -- registered above; these two are the reference's other presence sources.
+    ns:RegisterEvent("PLAYER_TARGET_CHANGED", onFelwoodUnitSighting)
+    ns:RegisterEvent("UPDATE_MOUSEOVER_UNIT", onFelwoodUnitSighting)
+    -- Loading screen wipes all presence lists; a zone change wipes last-seen 5s later.
+    ns:RegisterEvent("PLAYER_ENTERING_WORLD", onFelwoodLoadingScreen)
+    ns:RegisterEvent("ZONE_CHANGED_NEW_AREA", onFelwoodZoneChanged)
+    -- Subzone moves do not wipe presence, but they must still invalidate the
+    -- cached "am I in Felwood" answer that gates the combat-log hot path.
+    ns:RegisterEvent("ZONE_CHANGED", function() Timers.InvalidateFelwoodCache() end)
     -- Pull auto-calibration: measure announce->drop when the buff lands on us.
     ns:RegisterEvent("UNIT_AURA", onPlayerAura)
     ns:RegisterEvent("CHAT_MSG_ADDON", function(event, prefix, msg)
