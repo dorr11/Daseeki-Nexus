@@ -140,6 +140,7 @@ function InstancesUI.RowModel(entry, nameRealm, classTag, nowE, isOpen)
     local xp = math.max(0, entry.xp or 0)
     local dur = (E and E.EntryDuration and E.EntryDuration(entry, nowE, isOpen)) or (entry.dur or 0)
     return {
+        ago       = ago,                       -- raw seconds (the compact cell layer reads this)
         agoText   = InstancesUI.AgoText(ago),
         nameRealm = nameRealm,
         classTag  = classTag,
@@ -156,6 +157,119 @@ function InstancesUI.RowModel(entry, nameRealm, classTag, nowE, isOpen)
         xpText    = (xp ~= 0) and ("+" .. xp .. " xp") or nil,
         merged    = entry.merged and true or false,
     }
+end
+
+-- ── RECENT register CELLS (owner round-15 item 1) ───────────────────────────
+-- The RECENT list now carries the numbers RowModel has always computed —
+-- duration, gold and XP — ahead of the existing "ago" cell. The panel is 364
+-- wide (344 of content) at row height 17, so the long forms RowModel produces
+-- ("1h 12m", "4g 80s", "+1500 xp", "12h 30m ago" = ~250px of numerals alone)
+-- do not fit beside a readable instance name. The cell layer below is the
+-- COMPACT register form: it keeps the magnitude and the sign, drops the
+-- secondary unit, and defers the exact figures to the row tooltip
+-- (InstancesUI.RowTooltip). RowModel's long forms are untouched — this is a
+-- presentation layer on top of them. All pure.
+
+-- Signed copper -> single-unit cell: "48g" / "-12g" / "80s" / "35c". The
+-- secondary unit is dropped (the tooltip carries the exact FormatMoney figure).
+function InstancesUI.CompactMoney(copper)
+    copper = math.floor(tonumber(copper) or 0)
+    local sign = ""
+    if copper < 0 then sign = "-"; copper = -copper end
+    if copper >= 10000 then return sign .. math.floor(copper / 10000) .. "g" end
+    if copper >= 100   then return sign .. math.floor(copper / 100) .. "s" end
+    return sign .. copper .. "c"
+end
+
+-- XP -> "+950" / "+1.5k" / "+12.4k" / "+123k". Zero (and the legacy negatives
+-- RowModel already floors at 0) render NO cell, matching RowModel.xpText.
+function InstancesUI.CompactXP(xp)
+    xp = math.floor(tonumber(xp) or 0)
+    if xp <= 0 then return nil end
+    if xp < 1000   then return "+" .. xp end
+    if xp < 100000 then return ("+%.1fk"):format(xp / 1000) end
+    return ("+%dk"):format(math.floor(xp / 1000))
+end
+
+-- Age -> "now" / "47m" / "1h12m" / "3d". The " ago" suffix is dropped: the
+-- column caption above the list says AGO, so the suffix is pure width.
+function InstancesUI.CompactAgo(sec)
+    sec = math.max(0, math.floor(sec or 0))
+    if sec < 60 then return "now" end
+    local D = ns.Dashboard
+    return (D and D.FormatDuration and D.FormatDuration(sec, "compact"))
+           or (math.floor(sec / 60) .. "m")
+end
+
+-- One RowModel -> the four right-hand register cells. `gold` always renders (a
+-- 0c run is a real result in the loot ledger); `xp` is nil-when-zero, keeping
+-- RowModel.xpText's established convention. Token per RowModel (negative gold
+-- -> danger). Pure.
+function InstancesUI.RecentCells(model)
+    model = model or {}
+    local D = ns.Dashboard
+    local dur = model.dur or 0
+    return {
+        dur       = (D and D.FormatDuration and D.FormatDuration(dur, "compact"))
+                    or model.durText or (math.floor(dur) .. "s"),
+        gold      = InstancesUI.CompactMoney(model.gold or 0),
+        goldToken = model.goldToken or "muted",
+        xp        = InstancesUI.CompactXP(model.xp or 0),
+        ago       = InstancesUI.CompactAgo(model.ago or 0),
+    }
+end
+
+-- The RECENT column budget in px. Lives HERE rather than as a panel-local so the
+-- headless suite can assert the geometry still leaves a readable instance-name
+-- flex if any column is ever re-tuned. `content` = panel width 364 (ui_cards
+-- INST_W) minus the panel's 10px padding a side.
+InstancesUI.RECENT_COLS = {
+    content = 344, name = 56, dur = 38, gold = 42, xp = 38, ago = 38,
+    gap = 5,   -- between the right-aligned numeral columns
+    pad = 6,   -- either side of the flexing instance name
+}
+
+-- px left over for the flexing, ellipsising instance name. Pure.
+function InstancesUI.InstanceFlexWidth(C)
+    C = C or InstancesUI.RECENT_COLS
+    local fixed = C.name + 2 * C.pad + C.dur + C.gold + C.xp + C.ago + 3 * C.gap
+    return C.content - fixed
+end
+
+-- The row tooltip: the EXACT figures the compact cells abbreviate, so nothing
+-- the rebuild made honest is lost to the column budget. Returns a title plus
+-- label/value pairs (frame-free). Pure.
+function InstancesUI.RowTooltip(model)
+    model = model or {}
+    local lines = {
+        { "Duration", model.durText or "" },
+        { "Gold", (model.goldText or "") .. (model.goldFromLoot and " (loot)" or " (wallet)") },
+        { "XP", model.xpText or "none" },
+        { "When", model.agoText or "" },
+    }
+    if model.merged then lines[#lines + 1] = { "Merged", "re-entry folded into this run" } end
+    return { title = model.instance or "?", character = model.name, lines = lines }
+end
+
+-- ── CAP-COUNTDOWN TICKER GATE (owner round-15 item 2) ───────────────────────
+-- The at-cap "M:SS" next-slot countdown used to freeze until something else
+-- refreshed the dashboard. The panel now runs its own 1s ticker, gated by the
+-- two predicates below so it costs nothing in the (overwhelmingly common) case
+-- where no window is at cap. The TOTAL row can never hold the ticker open:
+-- TotalModel is never atCap by construction.
+
+-- True if ANY meter model has an hour or day window at cap. Pure.
+function InstancesUI.AnyAtCap(models)
+    for _, m in ipairs(models or {}) do
+        if m and ((m.hour and m.hour.atCap) or (m.day and m.day.atCap)) then return true end
+    end
+    return false
+end
+
+-- The ticker runs ONLY while the panel is visible AND something is at cap. Pure.
+function InstancesUI.TickerShouldRun(visible, models)
+    if not visible then return false end
+    return InstancesUI.AnyAtCap(models)
 end
 
 -- Flatten every account/character's entries into one newest-first list. Pure.
@@ -297,6 +411,25 @@ local REC_H      = 17
 local REC_GAP    = 1
 local MAX_METERS = 8
 local MAX_REC    = 40
+
+-- RECENT register column budget. The panel is 364 wide (ui_cards INST_W) and
+-- pads 10 a side, so a row has 344 to spend. Right-anchored numeral columns,
+-- left-anchored identity columns, and the instance name takes what is left:
+--
+--   name 56 | 6 | instance ~105 (flex, ellipsis) | 6 | DUR 38 | GOLD 42 | XP 38 | AGO 38
+--                                                        \___ 5px gaps between numerals
+--
+-- 56 + 6 + 6 + 38+5+42+5+38+5+38 = 239 fixed, leaving ~105 for the instance
+-- name (~18 chars of the 11px condensed body face — "Blackrock Depths" fits).
+-- Both name and instance are non-wrapping and width-clamped, so anything longer
+-- ellipsises rather than colliding with the numerals. All four right columns
+-- fit in COMPACT form (InstancesUI.RecentCells); the exact figures live in the
+-- row tooltip. Captions sit on the RECENT label line, so this costs no height.
+-- The numbers themselves live in InstancesUI.RECENT_COLS (headless-asserted).
+local RC = InstancesUI.RECENT_COLS
+local COL_NAME, COL_DUR, COL_GOLD = RC.name, RC.dur, RC.gold
+local COL_XP, COL_AGO             = RC.xp, RC.ago
+local COL_GAP, COL_PAD            = RC.gap, RC.pad
 
 local function tag(frame, id)
     if ns.Audit and ns.Audit.Tag and frame then ns.Audit.Tag(frame, id) end
@@ -440,9 +573,64 @@ function InstancesPanel.Attach(host)
     end
     P._makeMeterRow = makeMeterRow
 
-    -- Recent-entries scroll list below the meters (compact: name · instance · ago).
+    -- ── Cap-countdown TICKER (owner round-15 item 2) ─────────────────────────
+    -- The at-cap "M:SS" next-slot countdown is recomputed from `nowE` on every
+    -- paint, so with no ticker of its own the panel froze the countdown until
+    -- some unrelated event refreshed the dashboard. This 1s ticker repaints ONLY
+    -- the meter rows — the recent list, the dropdown and the scroll offset are
+    -- untouched. Gating, mirroring the timers dock's hidden-pause:
+    --   * the ticker frame is a CHILD of `host`, so a hidden panel makes it
+    --     non-visible and WoW stops firing its OnUpdate entirely (the pause);
+    --   * it is Shown only while InstancesUI.AnyAtCap says a window is capped,
+    --     so an under-cap panel runs no OnUpdate at all (the stop);
+    --   * the handler re-checks InstancesUI.TickerShouldRun(IsVisible, models)
+    --     each frame, so both halves of the gate are asserted in the live path.
+    P._meterModels, P._meterCount, P._tickAccum = {}, 0, 0
+    local ticker = CreateFrame("Frame", nil, host)
+    ticker:SetSize(1, 1); ticker:SetPoint("TOPLEFT", host, "TOPLEFT", 0, 0)
+    ticker:Hide()
+    ticker:SetScript("OnUpdate", function(self, elapsed)
+        if not InstancesUI.TickerShouldRun(self:IsVisible(), P._meterModels) then return end
+        P._tickAccum = P._tickAccum + (elapsed or 0)
+        if P._tickAccum < 1 then return end
+        P._tickAccum = 0
+        ns:SafeCall(P.Tick)
+    end)
+    P._ticker = ticker
+
+    function P.SyncTicker()
+        if InstancesUI.AnyAtCap(P._meterModels) then
+            if not ticker:IsShown() then P._tickAccum = 0; ticker:Show() end
+        else
+            ticker:Hide()
+        end
+    end
+
+    -- Recent-entries scroll list below the meters (name · instance · dur · gold · xp · ago).
     local recLbl = microLabel(host, "RECENT")
     P.recLbl = recLbl
+
+    -- Column captions, riding the RECENT label line (no extra row height). They
+    -- use the SAME right-anchored chain and widths as the row cells, so the
+    -- caption sits exactly over its column. INSTANCES view only.
+    local cols = CreateFrame("Frame", nil, host)
+    cols:SetHeight(12)
+    cols:SetPoint("RIGHT", host, "RIGHT", -PAD, 0)   -- TOP set per-refresh
+    tag(cols, "instances.recentcols")
+    local function caption(text, w, anchorTo)
+        local f = fstr(cols, "microLabel", "RIGHT")
+        if anchorTo then f:SetPoint("RIGHT", anchorTo, "LEFT", -COL_GAP, 0)
+        else f:SetPoint("RIGHT", cols, "RIGHT", 0, 0) end
+        f:SetWidth(w); f:SetTextColor(UI.Color("faint")); f:SetText(text)
+        return f
+    end
+    local capAgo  = caption("AGO",  COL_AGO)
+    local capXP   = caption("XP",   COL_XP,   capAgo)
+    local capGold = caption("GOLD", COL_GOLD, capXP)
+    local capDur  = caption("DUR",  COL_DUR,  capGold)
+    cols:SetWidth(COL_AGO + COL_XP + COL_GOLD + COL_DUR + 3 * COL_GAP)
+    P.cols = cols
+
     local scroll = CreateFrame("ScrollFrame", nil, host)
     scroll:SetClipsChildren(true); scroll:EnableMouseWheel(true)
     local child = CreateFrame("Frame", nil, scroll); child:SetSize(1, 1); scroll:SetScrollChild(child)
@@ -457,14 +645,41 @@ function InstancesPanel.Attach(host)
     emptyFS:SetText("No instance entries recorded."); emptyFS:Hide()
     P._empty = emptyFS
 
+    -- One RECENT row: name · instance (flex) · DUR · GOLD · XP · AGO. The four
+    -- right columns are fixed-width and right-aligned so the numerals form hard
+    -- column edges down the list; the instance name flexes into what remains and
+    -- ellipsises. Hovering a row shows the exact (un-abbreviated) figures.
     local function makeRecRow()
         local r = CreateFrame("Frame", nil, child)
         r:SetHeight(REC_H)
-        r.name = fstr(r, "small"); r.name:SetPoint("LEFT", r, "LEFT", 0, 0); r.name:SetWordWrap(false)
-        r.ago = fstr(r, "microLabel", "RIGHT"); r.ago:SetPoint("RIGHT", r, "RIGHT", 0, 0); r.ago:SetTextColor(UI.Color("muted"))
-        r.inst = fstr(r, "small"); r.inst:SetPoint("LEFT", r.name, "RIGHT", 8, 0)
-        r.inst:SetPoint("RIGHT", r.ago, "LEFT", -8, 0); r.inst:SetWordWrap(false); r.inst:SetJustifyH("LEFT")
+        r:EnableMouse(true)   -- tooltip only; the wheel still reaches the scroll frame
+        r.name = fstr(r, "small"); r.name:SetPoint("LEFT", r, "LEFT", 0, 0)
+        r.name:SetWidth(COL_NAME); r.name:SetWordWrap(false); r.name:SetJustifyH("LEFT")
+        r.ago = fstr(r, "microLabel", "RIGHT"); r.ago:SetPoint("RIGHT", r, "RIGHT", 0, 0)
+        r.ago:SetWidth(COL_AGO); r.ago:SetWordWrap(false); r.ago:SetTextColor(UI.Color("muted"))
+        r.xp = fstr(r, "small", "RIGHT"); r.xp:SetPoint("RIGHT", r.ago, "LEFT", -COL_GAP, 0)
+        r.xp:SetWidth(COL_XP); r.xp:SetWordWrap(false)
+        r.gold = fstr(r, "small", "RIGHT"); r.gold:SetPoint("RIGHT", r.xp, "LEFT", -COL_GAP, 0)
+        r.gold:SetWidth(COL_GOLD); r.gold:SetWordWrap(false)
+        r.dur = fstr(r, "small", "RIGHT"); r.dur:SetPoint("RIGHT", r.gold, "LEFT", -COL_GAP, 0)
+        r.dur:SetWidth(COL_DUR); r.dur:SetWordWrap(false)
+        r.inst = fstr(r, "small"); r.inst:SetPoint("LEFT", r.name, "RIGHT", COL_PAD, 0)
+        r.inst:SetPoint("RIGHT", r.dur, "LEFT", -COL_PAD, 0); r.inst:SetWordWrap(false); r.inst:SetJustifyH("LEFT")
         r.inst:SetTextColor(UI.Color("muted"))
+        r:SetScript("OnEnter", function(self)
+            local tip = self._tip
+            if not (tip and GameTooltip) then return end
+            GameTooltip:SetOwner(self, "ANCHOR_RIGHT")   -- SetOwner clears the tooltip
+            GameTooltip:AddLine(tip.title, UI.Color("accent"))
+            if tip.character then GameTooltip:AddLine(tip.character, UI.Color("muted")) end
+            local tr, tg, tb = UI.Color("muted")
+            local vr, vg, vb = UI.Color("text")
+            for _, ln in ipairs(tip.lines) do
+                GameTooltip:AddDoubleLine(ln[1], ln[2], tr, tg, tb, vr, vg, vb)
+            end
+            GameTooltip:Show()
+        end)
+        r:SetScript("OnLeave", function() if GameTooltip then GameTooltip:Hide() end end)
         return r
     end
     local function getRec(i)
@@ -496,20 +711,20 @@ function InstancesPanel.Attach(host)
         end
     end
 
-    function P.Refresh()
-        local nowE = (Dashboard and Dashboard.Now and Dashboard.Now()) or (GetServerTime and GetServerTime()) or 0
+    local function nowEpoch()
+        return (Dashboard and Dashboard.Now and Dashboard.Now()) or (GetServerTime and GetServerTime()) or 0
+    end
+
+    -- Paint JUST the meter rows (one per account, numerically sorted, then the
+    -- ALL total row). Idempotent in position, so the ticker can call it without
+    -- disturbing the recent list or the scroll offset. Returns the row count;
+    -- caches the models for the ticker gate and re-syncs the ticker.
+    function P.PaintMeters(nowE)
+        nowE = nowE or nowEpoch()
         local Inst = ns.Instances
-        local data = ns.Store and ns.Store.GetData and ns.Store.GetData()
         local view = (Inst and Inst.AllAccounts and Inst.AllAccounts(nowE)) or { accounts = {}, total = {} }
-
-        -- Meta caps line.
-        local hCap = (Inst and Inst.HOURLY_CAP) or 5
-        local dCap = (Inst and Inst.DAILY_CAP) or 30
-        meta:SetText(("caps %d/hr \194\183 %d/day"):format(hCap, dCap))
-
-        -- Meter rows: one per account (numerically sorted), then the ALL total row.
         local aids = InstancesUI.SortedAccountIDs(view.accounts)
-        local n, prev = 0, nil
+        local n, prev, models = 0, nil, {}
         -- `total` = the cross-account sum: no cap, no state colour, no countdown.
         local function placeMeter(label, counts, total)
             if n >= MAX_METERS then return end
@@ -520,6 +735,7 @@ function InstancesPanel.Attach(host)
             else r:SetPoint("TOPLEFT", metersTop, "TOPLEFT", 0, 0); r:SetPoint("TOPRIGHT", metersTop, "TOPRIGHT", 0, 0) end
             local m = total and InstancesUI.TotalModel(counts)
                             or InstancesUI.MeterModel(counts, nowE, Inst)
+            models[#models + 1] = m
             r.label:SetText(label); r.label:SetTextColor(UI.Color(total and "muted" or "text"))
             r.hour:SetText(InstancesUI.MeterText("Hr", m.hour))
             r.hour:SetTextColor(UI.Color(m.hour.token))
@@ -531,6 +747,29 @@ function InstancesPanel.Attach(host)
         for _, aid in ipairs(aids) do placeMeter("Acct " .. aid, view.accounts[aid]) end
         placeMeter("All", view.total, true)
         for j = n + 1, #P._meters do P._meters[j]:Hide() end
+        P._meterModels, P._meterCount = models, n
+        P.SyncTicker()
+        return n
+    end
+
+    -- One tick: repaint the meters only. A CHANGE in the number of meter rows
+    -- moves the list below them, so that (rare) case escalates to a full Refresh.
+    function P.Tick()
+        local before = P._meterCount
+        if P.PaintMeters(nowEpoch()) ~= before then P.Refresh() end
+    end
+
+    function P.Refresh()
+        local nowE = nowEpoch()
+        local Inst = ns.Instances
+        local data = ns.Store and ns.Store.GetData and ns.Store.GetData()
+
+        -- Meta caps line.
+        local hCap = (Inst and Inst.HOURLY_CAP) or 5
+        local dCap = (Inst and Inst.DAILY_CAP) or 30
+        meta:SetText(("caps %d/hr \194\183 %d/day"):format(hCap, dCap))
+
+        local n = P.PaintMeters(nowE)
 
         -- Toggle + dropdown repaint.
         for _, seg in ipairs(P._tSegs) do seg:Apply(P.view == seg._key) end
@@ -542,6 +781,9 @@ function InstancesPanel.Attach(host)
         local isExp = (P.view == "exp")
         recLbl:SetText(isExp and "EXPERIENCE" or "RECENT")
         recLbl:ClearAllPoints(); recLbl:SetPoint("TOPLEFT", host, "TOPLEFT", PAD, -listTop)
+        -- Column captions ride the label line; they describe the INSTANCES columns only.
+        cols:ClearAllPoints(); cols:SetPoint("TOPRIGHT", host, "TOPRIGHT", -PAD, -listTop)
+        cols:SetShown(not isExp)
         scroll:ClearAllPoints()
         scroll:SetPoint("TOPLEFT", host, "TOPLEFT", PAD, -(listTop + 15))
         scroll:SetPoint("BOTTOMRIGHT", host, "BOTTOMRIGHT", -PAD, PAD)
@@ -588,7 +830,13 @@ function InstancesPanel.Attach(host)
                     r.name:SetText(model.name or "?")
                     if cr then r.name:SetTextColor(cr, cg, cb) else r.name:SetTextColor(UI.Color("text")) end
                     r.inst:SetText(model.instance)
-                    r.ago:SetText(model.agoText)
+                    -- Computed columns (owner round-15 item 1), compact form.
+                    local cells = InstancesUI.RecentCells(model)
+                    r.dur:SetText(cells.dur);  r.dur:SetTextColor(UI.Color("muted"))
+                    r.gold:SetText(cells.gold); r.gold:SetTextColor(UI.Color(cells.goldToken))
+                    r.xp:SetText(cells.xp or ""); r.xp:SetTextColor(UI.Color("muted"))
+                    r.ago:SetText(cells.ago)
+                    r._tip = InstancesUI.RowTooltip(model)
                     r:Show()
                     y = y + REC_H + REC_GAP
                 end
@@ -706,6 +954,96 @@ local function testInstancesUI(fails)
     -- A6.5 -- XP is never negative in the cell, whatever the entry carries.
     local rNeg = IU.RowModel({ t = T - 60, name = "Maraudon", xp = -38000 }, "Alt-Realm", "HUNTER", T)
     ck(rNeg.xp == 0 and rNeg.xpText == nil, "row: a legacy negative xp entry renders no cell")
+
+    -- ── round-15 item 1: the COMPACT register cells for the RECENT columns ──
+    ck(IU.CompactMoney(48000) == "4g",   "compact gold: 4g 80s -> 4g")
+    ck(IU.CompactMoney(-120000) == "-12g", "compact gold: keeps the sign")
+    ck(IU.CompactMoney(9999) == "99s",   "compact gold: sub-gold -> silver")
+    ck(IU.CompactMoney(35) == "35c",     "compact gold: sub-silver -> copper")
+    ck(IU.CompactMoney(0) == "0c",       "compact gold: a zero-loot run still renders a cell")
+    ck(IU.CompactMoney(-35) == "-35c",   "compact gold: negative copper keeps the sign")
+
+    ck(IU.CompactXP(950) == "+950",      "compact xp: under 1k is exact")
+    ck(IU.CompactXP(1500) == "+1.5k",    "compact xp: 1500 -> +1.5k")
+    ck(IU.CompactXP(12400) == "+12.4k",  "compact xp: 12400 -> +12.4k")
+    ck(IU.CompactXP(123456) == "+123k",  "compact xp: six figures drop the decimal")
+    ck(IU.CompactXP(0) == nil,           "compact xp: zero -> no cell")
+    ck(IU.CompactXP(-5) == nil,          "compact xp: negative -> no cell")
+
+    ck(IU.CompactAgo(0) == "now",        "compact ago: sub-minute -> now")
+    ck(IU.CompactAgo(59) == "now",       "compact ago: 59s -> now")
+    ck(IU.CompactAgo(2820) == "47m",     "compact ago: 47m")
+    ck(IU.CompactAgo(4320) == "1h12m",   "compact ago: compact hour+minute, no space (got " ..
+        tostring(IU.CompactAgo(4320)) .. ")")
+
+    -- Cells over a real RowModel: the numbers RowModel computes, in column form.
+    local rCells = IU.RowModel({ t = T - 4320, name = "Blackrock Depths", dur = 4320,
+                                 goldLoot = 48000, xp = 12400 }, "Alt-Realm", "ROGUE", T)
+    ck(rCells.ago == 4320, "row: exposes raw age seconds for the cell layer")
+    local cells = IU.RecentCells(rCells)
+    ck(cells.dur == "1h12m", "cells: duration compact (got " .. tostring(cells.dur) .. ")")
+    ck(cells.gold == "4g", "cells: gold compact from the LOOT total")
+    ck(cells.xp == "+12.4k", "cells: xp compact")
+    ck(cells.ago == "1h12m", "cells: ago compact")
+    ck(cells.goldToken == "muted", "cells: positive gold carries the calm token")
+    local negCells = IU.RecentCells(IU.RowModel({ t = T - 30, name = "Dire Maul", dur = 30,
+                                                  gold = -12000, xp = 0 }, "Alt-Realm", "ROGUE", T))
+    ck(negCells.goldToken == "danger", "cells: negative gold carries danger, per RowModel")
+    ck(negCells.gold == "-1g", "cells: negative gold cell")
+    ck(negCells.xp == nil, "cells: a zero-xp run renders no xp cell")
+    ck(negCells.ago == "now", "cells: a fresh run reads now")
+    local emptyCells = IU.RecentCells(nil)
+    ck(emptyCells.gold == "0c" and emptyCells.ago == "now" and emptyCells.xp == nil,
+        "cells: nil model degrades to zeroes, never errors")
+
+    -- Column budget: the four numeral columns must still leave the instance name
+    -- a readable flex inside the panel's 344px of content.
+    local RCOL = IU.RECENT_COLS
+    ck(RCOL.content == 344, "cols: budget is the 364 panel minus 10px padding a side")
+    ck(IU.InstanceFlexWidth() == 105,
+        "cols: instance name flexes to 105px (got " .. IU.InstanceFlexWidth() .. ")")
+    ck(IU.InstanceFlexWidth() >= 90,
+        "cols: the instance name keeps at least 90px -- 'Blackrock Depths' must fit")
+    local fixedSum = RCOL.name + 2 * RCOL.pad + RCOL.dur + RCOL.gold + RCOL.xp + RCOL.ago
+                     + 3 * RCOL.gap + IU.InstanceFlexWidth()
+    ck(fixedSum == RCOL.content, "cols: the columns exactly consume the content width")
+
+    -- The tooltip carries the EXACT figures the cells abbreviate.
+    local tip = IU.RowTooltip(rCells)
+    ck(tip.title == "Blackrock Depths", "tooltip: titled with the instance")
+    ck(tip.lines[1][2] == rCells.durText, "tooltip: full duration text")
+    ck(tip.lines[2][2] == "4g 80s (loot)", "tooltip: exact gold + source (got " ..
+        tostring(tip.lines[2][2]) .. ")")
+    ck(tip.lines[3][2] == "+12400 xp", "tooltip: exact xp")
+    ck(tip.lines[4][2] == rCells.agoText, "tooltip: full ago text")
+    ck(#tip.lines == 4, "tooltip: no merged line on a non-merged run")
+    local tipM = IU.RowTooltip(IU.RowModel({ t = T - 60, name = "Zul'Gurub", merged = true,
+                                             gold = 7000 }, "Alt-Realm", "ROGUE", T))
+    ck(#tipM.lines == 5 and tipM.lines[5][1] == "Merged", "tooltip: merged runs get a line")
+    ck(tipM.lines[2][2]:find("wallet") ~= nil, "tooltip: wallet-sourced gold is labelled")
+
+    -- ── round-15 item 2: the cap-countdown ticker gate ──────────────────────
+    local mOK  = IU.MeterModel({ hour = 2, day = 10 }, T, caps)
+    local mCapH = IU.MeterModel({ hour = 5, day = 10, nextHourSlotAt = T + 60 }, T, caps)
+    local mCapD = IU.MeterModel({ hour = 1, day = 30, nextDaySlotAt = T + 60 }, T, caps)
+    ck(IU.AnyAtCap({ mOK }) == false, "ticker: nothing at cap -> no ticker")
+    ck(IU.AnyAtCap({ mOK, mCapH }) == true, "ticker: an hourly cap arms the ticker")
+    ck(IU.AnyAtCap({ mOK, mCapD }) == true, "ticker: a daily cap arms the ticker")
+    ck(IU.AnyAtCap({}) == false, "ticker: no meters -> no ticker")
+    ck(IU.AnyAtCap(nil) == false, "ticker: nil model list -> no ticker")
+    -- The neutral TOTAL row must never hold the ticker open, however large the sum.
+    ck(IU.AnyAtCap({ IU.TotalModel({ hour = 99, day = 999 }) }) == false,
+        "ticker: the cross-account total never counts as at-cap")
+    ck(IU.TickerShouldRun(true,  { mCapH }) == true,  "ticker: visible + capped -> runs")
+    ck(IU.TickerShouldRun(false, { mCapH }) == false, "ticker: hidden panel -> stopped even at cap")
+    ck(IU.TickerShouldRun(true,  { mOK })   == false, "ticker: visible + under cap -> stopped")
+    ck(IU.TickerShouldRun(false, { mOK })   == false, "ticker: hidden + under cap -> stopped")
+    ck(IU.TickerShouldRun(nil,   { mCapH }) == false, "ticker: nil visibility -> stopped")
+    -- And the countdown it repaints must actually advance with the clock.
+    local t0 = IU.MeterModel({ hour = 5, nextHourSlotAt = T + 125 }, T, caps)
+    local t1 = IU.MeterModel({ hour = 5, nextHourSlotAt = T + 125 }, T + 1, caps)
+    ck(IU.MeterText("Hr", t0.hour) == "Hr 5/5 2:05", "ticker: countdown at t0")
+    ck(IU.MeterText("Hr", t1.hour) == "Hr 5/5 2:04", "ticker: countdown advances one second later")
 
     local data = { accounts = {
             ["1"] = { characters = { ["A-R"] = { classTag = "ROGUE" } }, homeless = { ["H-R"] = { classTag = "PRIEST" } } },
