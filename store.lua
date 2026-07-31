@@ -998,6 +998,10 @@ function Store.OnLogin()
     Store.MigrateItemCdEpochsAll()
     -- B4 (sender side): publishable manifest membership for our own account.
     Store.RebuildSelfSegments()
+    -- B5: retire stale twins left behind when an account re-set up under a new
+    -- AID (the "same character drawn twice, both green" bug). Strictly-older
+    -- copies only, never from a self bucket — see the B5 block for the guards.
+    Store.SweepStaleTwins()
     -- Wave N5: one-time import of legacy Bags cross-account data, then a
     -- retention sweep over the suite-namespace store.
     Store.MigrateBags()
@@ -1160,6 +1164,11 @@ function Store.WriteSelfCharacter(nameRealm, record)
     -- B4 (sender side): keep our own manifest membership honest. Cheap — it only
     -- rewrites (and only bumps the segment epoch) when membership really moved.
     Store.RebuildSelfSegments(record.lastDataUpdate)
+    -- B5: our own copy is by definition the freshest one there is, so any twin
+    -- of this character parked under an OLD account bucket (the same machine
+    -- re-set-up under a new AID) is stale and gets retired. Self buckets are
+    -- never touched by the sweep, so this can only ever remove a foreign copy.
+    Store.ReconcileStaleTwins(nameRealm, ns:GetAccountID())
     return record
 end
 
@@ -1236,6 +1245,12 @@ function Store.WriteInboundCharacter(aid, nameRealm, record, senderAID)
     end
     record._srcAID = senderAID
     bucket.characters[nameRealm] = record
+    -- B5: this write may have just created the LIVE half of a stale twin pair —
+    -- the owner re-set-up an account under a new/differently-formatted AID, so
+    -- the same Name-Realm now sits under two buckets and the roster drew it
+    -- twice. Retire the strictly-older copies (see the B5 block below for the
+    -- guards). Cheap: it only walks buckets that actually hold this name.
+    Store.ReconcileStaleTwins(nameRealm, aid)
     return true
 end
 
@@ -1692,6 +1707,166 @@ function Store.RebuildSelfSegments(nowE)
         end
     end
     return changed
+end
+
+----------------------------------------------------------------------
+-- B5 — STALE-TWIN RECONCILIATION  (owner bug: "Puucons" drawn TWICE, both green)
+--
+-- THE FAILURE. Account ids are the only thing that partitions the character
+-- graph. When an account is re-set up — a fresh install, a wiped SavedVariables,
+-- an AID that comes back in a different FORMAT — its characters start arriving
+-- under a BRAND NEW aid while the old bucket still holds a full, untouched copy
+-- of every one of them. Nothing on the wire says "these two buckets are the same
+-- machine", so the store happily keeps both: same Name-Realm, two buckets, two
+-- roster cards, and (because online exclusivity is deliberately PER-ACCOUNT —
+-- see ui_shell's ComputeOnlineWinners) each bucket elects its own online winner,
+-- so both cards light green.
+--
+-- THE RULE. A Name-Realm is one character. If it sits in bucket X and also in
+-- bucket Y with a STRICTLY OLDER ownerEpoch, the copy in Y is a leftover of the
+-- account's previous identity and is retired — characters table, homeless table,
+-- and any manifest slot that still names it (rewritten to the "X" tombstone, the
+-- same convention AdoptManifest and TrimNoroleSegment already use).
+--
+-- THE GUARDS, all tested:
+--   * NEVER a bucket flagged isSelf. Our own roster is authoritative locally and
+--     is the one thing on this machine no remote epoch may delete. If the STALE
+--     bucket is the self one (an owner who re-set up THIS account keeps the old
+--     bucket flagged self) nothing is removed and the UI-side dedup in
+--     ui_shell.GatherRoster is what stops the double card.
+--   * NEVER on an EQUAL ownerEpoch. Equal epochs are genuinely ambiguous — two
+--     copies of the same push, or an epoch that was never stamped (both 0). The
+--     display dedup covers those; deleting on a coin-flip would not.
+--   * The keeper must really hold the record. No keeper -> nothing to compare
+--     against -> no removals.
+--
+-- SELF-HEALING. Because the keeper is whichever bucket just received fresh data,
+-- the old bucket's copies age out on their own as the live account keeps pushing:
+-- one push per character retires that character's twin. The login sweep does the
+-- same pass over the whole store so a reload heals it without waiting.
+----------------------------------------------------------------------
+
+-- The copy of `nameRealm` a bucket holds, if any. The real characters table wins
+-- over the homeless table (a bucket can briefly hold both — AdoptManifest moves
+-- records between them). Returns rec, fromHomeless.
+local function bucketCopyOf(bucket, nameRealm)
+    if type(bucket) ~= "table" then return nil end
+    local rec = bucket.characters and bucket.characters[nameRealm]
+    if rec then return rec, false end
+    rec = bucket.homeless and bucket.homeless[nameRealm]
+    if rec then return rec, true end
+    return nil
+end
+
+-- Erase every trace of one character from ONE bucket. Returns true if a record
+-- was actually removed (a manifest slot alone does not count — that is bookkeeping
+-- for a character we no longer hold either way).
+local function purgeFromBucket(bucket, nameRealm)
+    if type(bucket) ~= "table" then return false end
+    local removed = false
+    if bucket.characters and bucket.characters[nameRealm] ~= nil then
+        bucket.characters[nameRealm] = nil
+        removed = true
+    end
+    if bucket.homeless and bucket.homeless[nameRealm] ~= nil then
+        bucket.homeless[nameRealm] = nil
+        removed = true
+    end
+    -- Manifest slots keep their POSITION (the list is ordered and hashed); a
+    -- vacated slot becomes the "X" tombstone rather than being spliced out.
+    for _, seg in pairs(bucket.segments or {}) do
+        if type(seg) == "table" then
+            for i = 1, #seg do
+                if seg[i] == nameRealm then seg[i] = "X" end
+            end
+        end
+    end
+    return removed
+end
+
+-- Retire every strictly-older twin of `nameRealm`, keeping the copy in `keepAID`.
+-- Returns the array of account ids it removed a copy from (empty = no-op).
+function Store.ReconcileStaleTwins(nameRealm, keepAID)
+    local removed = {}
+    if type(nameRealm) ~= "string" or nameRealm == "" then return removed end
+    local accounts = Store.data and Store.data.accounts
+    if type(accounts) ~= "table" then return removed end
+    keepAID = keepAID or ""
+
+    local keeper = accounts[keepAID]
+    local keepRec = bucketCopyOf(keeper, nameRealm)
+    if not keepRec then return removed end
+    local keepEpoch = math.floor(tonumber(keepRec.ownerEpoch) or 0)
+
+    local doomed = {}
+    for aid, bucket in pairs(accounts) do
+        if aid ~= keepAID and bucket ~= keeper and bucket.isSelf ~= true then
+            local rec = bucketCopyOf(bucket, nameRealm)
+            -- STRICTLY older only. Equal (incl. two unstamped 0s) is ambiguous.
+            if rec and (math.floor(tonumber(rec.ownerEpoch) or 0)) < keepEpoch then
+                doomed[#doomed + 1] = aid
+            end
+        end
+    end
+    table.sort(doomed)
+
+    for i = 1, #doomed do
+        if purgeFromBucket(accounts[doomed[i]], nameRealm) then
+            removed[#removed + 1] = doomed[i]
+        end
+    end
+
+    if #removed > 0 then
+        local shown = {}
+        for i = 1, #removed do shown[i] = (removed[i] ~= "" and removed[i]) or "(orphan)" end
+        ghostLog(("store: %s kept under account %s (epoch %d); retired %d stale twin(s) from %s")
+            :format(nameRealm, (keepAID ~= "" and keepAID) or "(orphan)",
+                    keepEpoch, #removed, table.concat(shown, ", ")))
+    end
+    return removed
+end
+
+-- Whole-store pass: for every Name-Realm held by more than one bucket, keep the
+-- newest-ownerEpoch copy and retire the strictly-older ones. Run at login so a
+-- reload heals an existing duplicate without waiting for the live account's next
+-- push. Returns the number of copies removed.
+--
+-- The keeper choice among EQUAL top epochs is irrelevant to the outcome —
+-- ReconcileStaleTwins only ever removes STRICTLY older copies, so every bucket at
+-- the maximum epoch survives regardless of which of them is nominated. The
+-- tiebreak below exists purely so the debug log reads the same way twice.
+function Store.SweepStaleTwins()
+    local accounts = Store.data and Store.data.accounts
+    if type(accounts) ~= "table" then return 0 end
+
+    local best = {}     -- nameRealm -> { aid = , epoch = , aids = set, n = count }
+    local function note(aid, tbl)
+        for nameRealm, rec in pairs(tbl or {}) do
+            local e = math.floor(tonumber(rec.ownerEpoch) or 0)
+            local b = best[nameRealm]
+            if not b then
+                b = { aid = aid, epoch = e, aids = {}, n = 0 }
+                best[nameRealm] = b
+            elseif e > b.epoch or (e == b.epoch and tostring(aid) < tostring(b.aid)) then
+                b.aid, b.epoch = aid, e
+            end
+            -- Distinct BUCKETS holding the name (a bucket that lists it in both
+            -- characters and homeless is still one bucket, not a duplicate).
+            if not b.aids[aid] then b.aids[aid] = true; b.n = b.n + 1 end
+        end
+    end
+    for aid, bucket in pairs(accounts) do
+        note(aid, bucket.characters)
+        note(aid, bucket.homeless)
+    end
+
+    local n = 0
+    for nameRealm, b in pairs(best) do
+        if b.n > 1 then
+            n = n + #Store.ReconcileStaleTwins(nameRealm, b.aid)
+        end
+    end
+    return n
 end
 
 ----------------------------------------------------------------------
@@ -3191,6 +3366,141 @@ local function testManifestGhostCleanup(fails)
     Store._ghostLog        = savedLog
 end
 
+----------------------------------------------------------------------
+-- B5 — stale-twin reconciliation
+----------------------------------------------------------------------
+local function testStaleTwins(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local T = 1700000000
+    local OLD = T - 14 * 86400        -- the owner's two-week-old imported bucket
+
+    local savedAccounts = Store.data.accounts
+    local savedLog      = Store._ghostLog
+    local savedGetAID   = ns.GetAccountID
+
+    local function rec(epoch, level)
+        return { level = level or 60, ownerEpoch = epoch }
+    end
+    local function bucket(chars, homeless, isSelf, segs)
+        return { isSelf = isSelf or false, characters = chars or {}, homeless = homeless or {},
+                 segments = segs or { sixties = {}, summoners = {}, norole = {} },
+                 segmentHashes = {} }
+    end
+
+    -- ---- THE OWNER'S CASE ---------------------------------------------------
+    -- Puucons under the stale imported bucket 3 AND under the account that just
+    -- re-joined the mesh under a new aid. The stale copy is retired.
+    Store._ghostLog = {}
+    Store.data.accounts = {
+        ["3"]  = bucket({ ["Puucons-R"] = rec(OLD) }, nil, false,
+                        { sixties = { "Puucons-R", "Other-R" }, summoners = {}, norole = {} }),
+        ["11"] = bucket({ ["Puucons-R"] = rec(T) }),
+    }
+    local gone = Store.ReconcileStaleTwins("Puucons-R", "11")
+    ck(#gone == 1 and gone[1] == "3", "the strictly-older twin's account is reported")
+    ck(Store.data.accounts["3"].characters["Puucons-R"] == nil, "THE FIX: the stale copy is removed")
+    ck(Store.data.accounts["11"].characters["Puucons-R"] ~= nil, "the live copy is kept")
+    ck(Store.data.accounts["3"].segments.sixties[1] == "X",
+        "the vacated manifest slot becomes the 'X' tombstone")
+    ck(Store.data.accounts["3"].segments.sixties[2] == "Other-R",
+        "...and the rest of the ordered list keeps its positions")
+    ck(#Store._ghostLog == 1, "the removal is written to the debug log (B4 pattern)")
+
+    -- ---- GUARD: never from a bucket flagged isSelf --------------------------
+    Store.data.accounts = {
+        ["3"]  = bucket({ ["Mine-R"] = rec(OLD) }, nil, true),
+        ["11"] = bucket({ ["Mine-R"] = rec(T) }),
+    }
+    ck(#Store.ReconcileStaleTwins("Mine-R", "11") == 0, "a self bucket is never reconciled away")
+    ck(Store.data.accounts["3"].characters["Mine-R"] ~= nil,
+        "...our own copy survives however stale it looks (UI dedup covers the display)")
+
+    -- ---- GUARD: equal epochs are ambiguous, so nothing moves ----------------
+    Store.data.accounts = {
+        ["3"]  = bucket({ ["Twin-R"] = rec(T) }),
+        ["11"] = bucket({ ["Twin-R"] = rec(T) }),
+    }
+    ck(#Store.ReconcileStaleTwins("Twin-R", "11") == 0, "equal ownerEpoch -> no removal")
+    ck(Store.data.accounts["3"].characters["Twin-R"] ~= nil, "...both copies stay")
+    -- Two UNSTAMPED records are equal at 0 and must not annihilate each other.
+    Store.data.accounts = {
+        ["3"]  = bucket({ ["Bare-R"] = {} }),
+        ["11"] = bucket({ ["Bare-R"] = {} }),
+    }
+    ck(#Store.ReconcileStaleTwins("Bare-R", "11") == 0, "two unstamped (epoch 0) copies -> no removal")
+
+    -- ---- GUARD: a NEWER twin is never removed -------------------------------
+    Store.data.accounts = {
+        ["3"]  = bucket({ ["Fresh-R"] = rec(T) }),
+        ["11"] = bucket({ ["Fresh-R"] = rec(OLD) }),
+    }
+    ck(#Store.ReconcileStaleTwins("Fresh-R", "11") == 0, "keeping the OLDER copy removes nothing")
+    ck(Store.data.accounts["3"].characters["Fresh-R"] ~= nil, "...the newer copy is untouched")
+
+    -- ---- the homeless table is cleaned too ----------------------------------
+    Store.data.accounts = {
+        ["3"]  = bucket(nil, { ["Drift-R"] = rec(OLD) }),
+        ["11"] = bucket({ ["Drift-R"] = rec(T) }),
+    }
+    ck(#Store.ReconcileStaleTwins("Drift-R", "11") == 1, "a stale HOMELESS twin is retired")
+    ck(Store.data.accounts["3"].homeless["Drift-R"] == nil, "...and leaves the homeless table")
+
+    -- ---- malformed / no-op input --------------------------------------------
+    Store.data.accounts = { ["11"] = bucket({ ["Solo-R"] = rec(T) }) }
+    ck(#Store.ReconcileStaleTwins("Solo-R", "11") == 0, "a character held once is a no-op")
+    ck(#Store.ReconcileStaleTwins("Solo-R", "99") == 0, "an unknown keeper removes nothing")
+    ck(#Store.ReconcileStaleTwins(nil, "11") == 0, "nil nameRealm refused")
+    ck(#Store.ReconcileStaleTwins("", "11") == 0, "empty nameRealm refused")
+
+    -- ---- THE LOGIN SWEEP: whole store, newest wins --------------------------
+    Store.data.accounts = {
+        ["3"]  = bucket({ ["Puucons-R"] = rec(OLD), ["Alt-R"] = rec(OLD), ["Only3-R"] = rec(OLD) }),
+        ["11"] = bucket({ ["Puucons-R"] = rec(T),   ["Alt-R"] = rec(T) }),
+        ["12"] = bucket({ ["Puucons-R"] = rec(T) }),          -- equal to the max -> survives
+    }
+    local n = Store.SweepStaleTwins()
+    ck(n == 2, "the sweep retires exactly the two strictly-older copies (got " .. tostring(n) .. ")")
+    ck(Store.data.accounts["3"].characters["Puucons-R"] == nil, "sweep: stale Puucons gone")
+    ck(Store.data.accounts["3"].characters["Alt-R"] == nil, "sweep: stale Alt gone")
+    ck(Store.data.accounts["3"].characters["Only3-R"] ~= nil,
+        "sweep: a character held by ONE bucket is never touched")
+    ck(Store.data.accounts["11"].characters["Puucons-R"] ~= nil
+       and Store.data.accounts["12"].characters["Puucons-R"] ~= nil,
+        "sweep: every copy AT the maximum epoch survives (equal is ambiguous)")
+    ck(Store.SweepStaleTwins() == 0, "the sweep is idempotent — a second pass removes nothing")
+
+    -- ---- the WRITE PATHS call it (this is what makes the fix self-healing) --
+    -- Inbound: the live account pushes a fresh Puucons; the stale bucket's copy
+    -- is physically gone by the time the write returns.
+    ns.GetAccountID = function() return "1" end
+    Store.data.accounts = {
+        ["1"]  = bucket({}, nil, true),
+        ["3"]  = bucket({ ["Puucons-R"] = rec(OLD) }),
+        ["11"] = bucket({}),
+    }
+    local inbound = Store.NewCharacterRecord("Puucons-R")
+    inbound.ownerEpoch = T
+    ck(Store.WriteInboundCharacter("11", "Puucons-R", inbound, "11") == true, "the inbound write lands")
+    ck(Store.data.accounts["3"].characters["Puucons-R"] == nil,
+        "WriteInboundCharacter reconciles: the stale twin is gone after the live push")
+
+    -- Self: writing our own character retires a foreign stale twin of it.
+    Store.data.accounts = {
+        ["1"] = bucket({}, nil, true),
+        ["3"] = bucket({ ["Tester-R"] = rec(OLD) }),
+    }
+    local mine = Store.NewCharacterRecord("Tester-R")
+    mine.ownerEpoch = T
+    Store.WriteSelfCharacter("Tester-R", mine)
+    ck(Store.data.accounts["3"].characters["Tester-R"] == nil,
+        "WriteSelfCharacter reconciles a foreign stale twin of our own character")
+    ck(Store.data.accounts["1"].characters["Tester-R"] ~= nil, "...and our copy is the one kept")
+
+    ns.GetAccountID     = savedGetAID
+    Store.data.accounts = savedAccounts
+    Store._ghostLog     = savedLog
+end
+
 function Store.RunSelfTests(verbose)
     local suites = {
         { name = "defaults",        fn = testDefaults },
@@ -3204,6 +3514,7 @@ function Store.RunSelfTests(verbose)
         { name = "dmf cooldown",    fn = testDMFCooldown },
         { name = "item cd epochs (A9.1)",   fn = testItemCdEpochs },
         { name = "manifest ghost cleanup (B4)", fn = testManifestGhostCleanup },
+        { name = "stale-twin reconciliation (B5)", fn = testStaleTwins },
     }
     local allPass = true
     for _, suite in ipairs(suites) do

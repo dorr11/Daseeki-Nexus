@@ -863,7 +863,110 @@ end
 ----------------------------------------------------------------------
 -- Roster query — gather character records for a faction across all accounts.
 -- Returns an array of { nameRealm, aid, rec, online } entries.
+--
+-- CROSS-BUCKET DEDUP (owner bug: "Puucons" drew TWICE, both green, the day his
+-- third account joined the mesh).
+--
+-- Account buckets are the only partition of the character graph, so when an
+-- account is re-set up under a new / differently-formatted AID its characters
+-- start arriving under a brand new bucket while the old bucket keeps a complete,
+-- untouched copy of every one of them. This walk used to emit ONE ENTRY PER
+-- BUCKET, so the same Name-Realm produced two cards — and because online
+-- exclusivity is deliberately per-account (ComputeOnlineWinners, above), each
+-- bucket elected its own winner and BOTH cards lit green. The machinery already
+-- DETECTED the case (charAID[name] == false means "this name spans >1 aid"); it
+-- just had nowhere to act on it.
+--
+-- A Name-Realm is ONE character, so the roster shows ONE card for it. Which copy
+-- that card carries is decided by Dashboard.RosterWinner's tiebreak chain
+-- (newest ownerEpoch -> newest lastDataUpdate -> real bucket over homeless ->
+-- lowest numeric aid). The entry carries the WINNING copy's own aid, so online
+-- exclusivity and the detail pane both stay attributed to the right account.
+--
+-- The losing copies are NOT deleted here. Deletion is a STORE decision with its
+-- own guards (Store.ReconcileStaleTwins / SweepStaleTwins, B5); the UI layer only
+-- decides what to draw, so a display rule can never destroy data.
 ----------------------------------------------------------------------
+
+-- PURE. Account-id ordering for the final tiebreak: real numeric ids ascending,
+-- then anything non-numeric (including the "" orphan bucket) lexicographically.
+-- Numbers first so "lowest numeric AID" means what it says even when a
+-- differently-FORMATTED id (the very thing that caused this bug) is in the mix.
+function Dashboard.AIDLess(a, b)
+    a, b = a or "", b or ""
+    if a == b then return false end
+    local na, nb = tonumber(a), tonumber(b)
+    if na and nb then return na < nb end
+    if na then return true end          -- numeric beats non-numeric
+    if nb then return false end
+    return a < b
+end
+
+-- PURE. Is candidate `a` a better copy of a character than candidate `b`?
+-- A candidate is { aid = , rec = , homeless = bool }.
+--   1. newest ownerEpoch          (the owner's own stamp — the real evidence)
+--   2. newest lastDataUpdate      (when the epochs are unstamped/equal)
+--   3. a real account bucket beats homeless / the "" orphan bucket
+--   4. lowest numeric aid         (pure determinism — no data left to judge on)
+function Dashboard.RosterCandidateBetter(a, b)
+    if not b then return true end
+    if not a then return false end
+    local ra, rb = a.rec or {}, b.rec or {}
+
+    local ea, eb = tonumber(ra.ownerEpoch) or 0, tonumber(rb.ownerEpoch) or 0
+    if ea ~= eb then return ea > eb end
+
+    local ua, ub = tonumber(ra.lastDataUpdate) or 0, tonumber(rb.lastDataUpdate) or 0
+    if ua ~= ub then return ua > ub end
+
+    -- "Homeless" for ranking means "has no real home": the per-bucket homeless
+    -- table OR the "" orphan bucket, which is exactly the same claim (a record
+    -- we hold without a confirmed place to put it).
+    local ha = (a.homeless or (a.aid or "") == "") and 1 or 0
+    local hb = (b.homeless or (b.aid or "") == "") and 1 or 0
+    if ha ~= hb then return ha < hb end
+
+    return Dashboard.AIDLess(a.aid, b.aid)
+end
+
+-- PURE. Fold an array of candidates for ONE Name-Realm down to the winner.
+function Dashboard.RosterWinner(candidates)
+    local best
+    for _, c in ipairs(candidates or {}) do
+        if Dashboard.RosterCandidateBetter(c, best) then best = c end
+    end
+    return best
+end
+
+-- Every copy of `nameRealm` the store holds, as candidates. Unfiltered — this is
+-- the identity question ("which bucket owns this character"), not a view.
+function Dashboard.RosterCandidates(nameRealm)
+    local out = {}
+    if type(nameRealm) ~= "string" or nameRealm == "" then return out end
+    local data = ns.Store and ns.Store.GetData and ns.Store.GetData()
+    if not data or not data.accounts then return out end
+    for aid, bucket in pairs(data.accounts) do
+        local rec = bucket.characters and bucket.characters[nameRealm]
+        if rec then
+            out[#out + 1] = { nameRealm = nameRealm, aid = aid, rec = rec, homeless = false }
+        else
+            rec = bucket.homeless and bucket.homeless[nameRealm]
+            if rec then
+                out[#out + 1] = { nameRealm = nameRealm, aid = aid, rec = rec, homeless = true }
+            end
+        end
+    end
+    return out
+end
+
+-- THE shared answer to "which stored copy IS this character". Returns rec, aid
+-- (nil when we hold no copy). Detail.Resolve delegates here so the detail pane
+-- can never disagree with the card the owner just clicked.
+function Dashboard.ResolveRosterOwner(nameRealm)
+    local best = Dashboard.RosterWinner(Dashboard.RosterCandidates(nameRealm))
+    if not best then return nil end
+    return best.rec, best.aid
+end
 
 function Dashboard.GatherRoster(faction, opts)
     opts = opts or {}
@@ -873,25 +976,43 @@ function Dashboard.GatherRoster(faction, opts)
     -- Per-account online exclusivity is recomputed over the WHOLE store BEFORE
     -- the faction/level filters run (see the block above IsOnline for why).
     Dashboard.RefreshOnlineWinners()
+
+    -- Pass 1: collect the surviving copies per Name-Realm. The filters run per
+    -- COPY on purpose — a stale twin that fails the level/faction gate must not
+    -- suppress the live copy that passes it.
+    local bestOf, names = {}, {}
     for aid, bucket in pairs(data.accounts) do
-        local function consider(nameRealm, rec)
+        local function consider(nameRealm, rec, homeless)
             if not rec then return end
             if opts.faction ~= false and faction and rec.faction and rec.faction ~= faction then
                 return
             end
             if opts.minLevel and (rec.level or 0) < opts.minLevel then return end
             if opts.warlockOnly and rec.classTag ~= "WARLOCK" then return end
-            out[#out + 1] = {
-                nameRealm = nameRealm,
-                aid       = aid,
-                rec       = rec,
-                online    = Dashboard.IsOnline(rec, nameRealm, aid),
-            }
+            local cand = { nameRealm = nameRealm, aid = aid, rec = rec, homeless = homeless }
+            local held = bestOf[nameRealm]
+            if not held then names[#names + 1] = nameRealm end
+            if Dashboard.RosterCandidateBetter(cand, held) then bestOf[nameRealm] = cand end
         end
-        for nameRealm, rec in pairs(bucket.characters or {}) do consider(nameRealm, rec) end
+        for nameRealm, rec in pairs(bucket.characters or {}) do consider(nameRealm, rec, false) end
         if opts.includeHomeless then
-            for nameRealm, rec in pairs(bucket.homeless or {}) do consider(nameRealm, rec) end
+            for nameRealm, rec in pairs(bucket.homeless or {}) do consider(nameRealm, rec, true) end
         end
+    end
+
+    -- Pass 2: emit one entry per name, carrying the WINNER's aid so IsOnline
+    -- resolves exclusivity against the account that actually owns the character.
+    -- Sorted by name so the array handed downstream is deterministic (the card
+    -- list re-sorts it, but a stable input keeps equal-rank ties from shuffling).
+    table.sort(names)
+    for i = 1, #names do
+        local c = bestOf[names[i]]
+        out[#out + 1] = {
+            nameRealm = c.nameRealm,
+            aid       = c.aid,
+            rec       = c.rec,
+            online    = Dashboard.IsOnline(c.rec, c.nameRealm, c.aid),
+        }
     end
     return out
 end
@@ -1627,6 +1748,123 @@ local function testAuraDisplayDecay(fails)
     ck(cell and cell.source == BOON, "returns the raw cell alongside the remaining")
 end
 
+-- CROSS-BUCKET ROSTER DEDUP (owner bug: one character, two cards, both green,
+-- after a third account joined the mesh under a new AID). Exercises the pure
+-- tiebreak chain, the GatherRoster fold, and the Detail.Resolve agreement that
+-- keeps the clicked card and the detail pane on the same record.
+local function testRosterDedup(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local T = 1700000000
+
+    -- ---- the pure aid ordering ---------------------------------------------
+    ck(Dashboard.AIDLess("2", "10") == true,  "aid order is NUMERIC: 2 < 10 (not '10' < '2')")
+    ck(Dashboard.AIDLess("10", "2") == false, "...and not the other way round")
+    ck(Dashboard.AIDLess("3", "3") == false,  "an aid does not beat itself")
+    ck(Dashboard.AIDLess("3", "abc") == true, "a numeric aid beats a non-numeric one")
+    ck(Dashboard.AIDLess("abc", "3") == false, "...and never loses that way round")
+    ck(Dashboard.AIDLess("3", "") == true,    "a real aid beats the orphan bucket")
+    ck(Dashboard.AIDLess("abc", "abd") == true, "two non-numeric aids compare as strings")
+
+    -- ---- the pure tiebreak chain, one rung at a time ------------------------
+    local function cand(aid, ownerEpoch, upd, homeless)
+        return { nameRealm = "Puucons-R", aid = aid, homeless = homeless or false,
+                 rec = { ownerEpoch = ownerEpoch, lastDataUpdate = upd or 0 } }
+    end
+    local old, live = cand("3", T - 14 * 86400, T - 14 * 86400), cand("7", T, T)
+    ck(Dashboard.RosterWinner({ old, live }).aid == "7", "rung 1: newest ownerEpoch wins")
+    ck(Dashboard.RosterWinner({ live, old }).aid == "7", "...regardless of scan order")
+    ck(Dashboard.RosterWinner({ cand("3", T, T - 500), cand("7", T, T) }).aid == "7",
+        "rung 2: equal ownerEpoch -> newest lastDataUpdate wins")
+    ck(Dashboard.RosterWinner({ cand("3", T, T, true), cand("7", T, T, false) }).aid == "7",
+        "rung 3: equal epochs -> a real account bucket beats homeless")
+    ck(Dashboard.RosterWinner({ cand("3", T, T), cand("7", T, T, true) }).aid == "3",
+        "...and the homeless copy loses whichever aid it sits under")
+    ck(Dashboard.RosterWinner({ cand("", T, T), cand("7", T, T) }).aid == "7",
+        "rung 3: the '' orphan bucket ranks as homeless too")
+    ck(Dashboard.RosterWinner({ cand("7", T, T), cand("3", T, T) }).aid == "3",
+        "rung 4: everything equal -> lowest numeric aid (determinism)")
+    ck(Dashboard.RosterWinner({}) == nil, "no candidates -> no winner")
+    -- Unstamped records (ownerEpoch absent) must not error or win by accident.
+    ck(Dashboard.RosterWinner({ { aid = "9", rec = {} }, cand("3", T, T) }).aid == "3",
+        "an unstamped copy loses to a stamped one")
+
+    -- ---- GatherRoster over a real two-bucket store --------------------------
+    local savedAccounts = ns.Store and ns.Store.data and ns.Store.data.accounts
+    local savedPeers    = ns.Mesh and ns.Mesh.peers
+    local savedWinners  = Dashboard._onlineWinners
+    if ns.Mesh then ns.Mesh.peers = {} end
+
+    local function rec(opts)
+        return { nameRealm = opts.name, faction = "Alliance", level = opts.level or 60,
+                 classTag = opts.class or "WARRIOR",
+                 ownerEpoch = opts.epoch or 0, lastDataUpdate = opts.upd or 0,
+                 lastSeen = opts.seen or 0 }
+    end
+    local function bucket(chars, homeless, isSelf)
+        return { isSelf = isSelf or false, characters = chars or {}, homeless = homeless or {},
+                 segments = { sixties = {}, summoners = {}, norole = {} }, segmentHashes = {} }
+    end
+
+    -- THE OWNER'S CASE: "Puucons" under the two-week-old bucket 3 AND under the
+    -- account that just re-joined under a new aid, both with a fresh lastSeen.
+    ns.Store.data.accounts = {
+        ["3"]  = bucket({ ["Puucons-R"] = rec{ name = "Puucons-R", epoch = T - 14 * 86400,
+                                               upd = T - 14 * 86400, seen = now(), level = 58 } }),
+        ["11"] = bucket({ ["Puucons-R"] = rec{ name = "Puucons-R", epoch = T, upd = T,
+                                               seen = now(), level = 60 },
+                          ["Sibling-R"] = rec{ name = "Sibling-R", epoch = T, upd = T, seen = 0 } }),
+    }
+    local roster = Dashboard.GatherRoster("Alliance", { includeHomeless = true })
+    local seen = {}
+    for _, e in ipairs(roster) do seen[e.nameRealm] = (seen[e.nameRealm] or 0) + 1 end
+    ck(seen["Puucons-R"] == 1, "THE BUG: one character across two buckets -> ONE roster entry")
+    ck(seen["Sibling-R"] == 1, "a character held by only one bucket is untouched")
+    ck(#roster == 2, "the roster is exactly the two distinct characters")
+    local pu
+    for _, e in ipairs(roster) do if e.nameRealm == "Puucons-R" then pu = e end end
+    ck(pu and pu.aid == "11", "the surviving entry carries the WINNING bucket's aid")
+    ck(pu and pu.rec.level == 60, "...and the winning bucket's RECORD (the fresh one)")
+    ck(pu and pu.online == true, "...and is online exactly once (both used to be green)")
+
+    -- Detail.Resolve must land on that same record — the clicked card and the
+    -- detail pane cannot disagree.
+    if ns.Detail and ns.Detail.Resolve then
+        local dRec, dAid = ns.Detail.Resolve("Puucons-R")
+        ck(dRec == (pu and pu.rec), "Detail.Resolve returns the SAME record the roster picked")
+        ck(dAid == "11", "Detail.Resolve returns the same aid too")
+        ck(ns.Detail.Resolve("Nobody-R") == nil, "Detail.Resolve on an unheld name -> nil")
+    end
+    local rRec, rAid = Dashboard.ResolveRosterOwner("Puucons-R")
+    ck(rRec == (pu and pu.rec) and rAid == "11", "ResolveRosterOwner agrees with the roster")
+    ck(Dashboard.ResolveRosterOwner("Nobody-R") == nil, "ResolveRosterOwner on an unheld name -> nil")
+
+    -- A view FILTER must not let a stale twin suppress the live copy: the old
+    -- bucket's level-58 record fails the 60s gate, the live level-60 one passes.
+    local sixties = Dashboard.GatherRoster("Alliance", { minLevel = 60, includeHomeless = true })
+    local n60 = 0
+    for _, e in ipairs(sixties) do if e.nameRealm == "Puucons-R" then n60 = n60 + 1 end end
+    ck(n60 == 1, "the live copy still passes a filter its stale twin fails")
+
+    -- Homeless-vs-account preference through the real gather path.
+    ns.Store.data.accounts = {
+        ["4"] = bucket(nil, { ["Drifter-R"] = rec{ name = "Drifter-R", epoch = T, upd = T } }),
+        ["5"] = bucket({ ["Drifter-R"] = rec{ name = "Drifter-R", epoch = T, upd = T } }),
+    }
+    local hr = Dashboard.GatherRoster("Alliance", { includeHomeless = true })
+    ck(#hr == 1 and hr[1].aid == "5", "homeless vs real bucket at equal epochs -> the real bucket")
+
+    -- ...but with includeHomeless off, a name that ONLY exists homeless is absent
+    -- (unchanged behaviour — the dedup must not smuggle homeless records in).
+    ns.Store.data.accounts = {
+        ["4"] = bucket(nil, { ["Drifter-R"] = rec{ name = "Drifter-R", epoch = T, upd = T } }),
+    }
+    ck(#Dashboard.GatherRoster("Alliance", {}) == 0, "includeHomeless=false still hides homeless records")
+
+    ns.Store.data.accounts = savedAccounts
+    if ns.Mesh then ns.Mesh.peers = savedPeers end
+    Dashboard._onlineWinners = savedWinners
+end
+
 if ns.RegisterSelfTest then
     ns:RegisterSelfTest("dashboard", function(verbose)
         local cases = {
@@ -1636,6 +1874,7 @@ if ns.RegisterSelfTest then
             { name = "dmf schedule", fn = testDMFSchedule },
             { name = "online exclusivity", fn = testOnlineExclusivity },
             { name = "mesh presence + 15s window (A1.1/A1.2)", fn = testMeshPresence },
+            { name = "cross-bucket roster dedup", fn = testRosterDedup },
         }
         local allPass = true
         for _, c in ipairs(cases) do

@@ -210,7 +210,23 @@ function Detail.RowStatus(s, isDMF)
 end
 
 -- Resolve a character record by nameRealm across all account buckets.
+--
+-- Delegates to the SAME winner pick the roster uses (ui_shell's
+-- ResolveRosterOwner). It used to return the first `pairs()` hit, which is a
+-- lottery the moment one Name-Realm sits under two account buckets — the state
+-- an account re-set-up under a new AID leaves behind. Clicking the (single,
+-- deduped) card could then open a two-week-old copy of the character while the
+-- card beside it showed the live one. One winner, both surfaces.
+--
+-- The scan below survives as the fallback for a host where ns.Dashboard has not
+-- loaded (this file is reachable from the headless suites before the shell is).
 function Detail.Resolve(nameRealm)
+    local D = ns.Dashboard
+    if D and D.ResolveRosterOwner then
+        local rec, aid = D.ResolveRosterOwner(nameRealm)
+        if rec then return rec, aid end
+        return nil
+    end
     local data = ns.Store and ns.Store.GetData and ns.Store.GetData()
     if not data or not data.accounts then return nil end
     for aid, bucket in pairs(data.accounts) do
