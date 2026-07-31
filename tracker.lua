@@ -1525,6 +1525,315 @@ local function captureRaidLockouts(rec)
 end
 
 ----------------------------------------------------------------------
+-- RAID ATTUNEMENT (personal, Classic Era)
+--
+-- The roster/detail views grey a raid's lockout text for a character that
+-- cannot actually zone in. Only FOUR Classic Era raids have a PERSONAL
+-- attunement; the other three are ungated per-character and therefore always
+-- read as attuned:
+--
+--   MC    Attunement to the Core          — one neutral quest
+--   BWL   Blackhand's Command             — one neutral quest (UBRS)
+--   Ony   Drakefire Amulet chain          — FACTION-SPLIT: two different final
+--                                           quests, one per faction
+--   Naxx  The Dread Citadel - Naxxramas   — THREE quest IDs sharing ONE name,
+--                                           gated by Argent Dawn rep tier
+--                                           (Honored / Revered / Exalted).
+--                                           ANY ONE completed = attuned; the
+--                                           name is identical across all three,
+--                                           so ONLY the id distinguishes them.
+--
+--   ZG    no personal attunement — walk in with a group.
+--   AQ20  no personal attunement.
+--   AQ40  no personal attunement. AQ access is gated at the REALM level (the
+--         War Effort + "Bang a Gong!" / Scarab Gong), not per character, and
+--         the Scepter of the Shifting Sands chain is optional. Nothing about
+--         AQ is a per-character flag, so it must never grey a card.
+--
+-- QUEST IDS — every id below was web-verified against Wowhead Classic before
+-- shipping (page fetched, quest name read back). Do NOT "correct" these from
+-- memory; re-verify against the cited URL instead.
+--
+--   7487  Attunement to the Core                  https://www.wowhead.com/classic/quest=7487
+--   7761  Blackhand's Command                     https://www.wowhead.com/classic/quest=7761
+--   6502  Drakefire Amulet             (ALLIANCE) https://www.wowhead.com/classic/quest=6502
+--   6602  Blood of the Black Dragon Champion
+--                                         (HORDE) https://www.wowhead.com/classic/quest=6602
+--   9121  The Dread Citadel - Naxxramas (Honored) https://www.wowhead.com/classic/quest=9121
+--   9122  The Dread Citadel - Naxxramas (Revered) https://www.wowhead.com/classic/quest=9122
+--   9123  The Dread Citadel - Naxxramas (Exalted) https://www.wowhead.com/classic/quest=9123
+--
+-- Cross-checked against warcraft.wiki.gg "Instance attunement (Classic)", which
+-- lists MC / Onyxia / BWL / Naxxramas as the ONLY vanilla raid attunements:
+--   https://warcraft.wiki.gg/wiki/Instance_attunement_(Classic)
+-- ZG/AQ20/AQ40 negative confirmed by Blizzard's own AQ announcement (no
+-- attunement or key for either AQ raid):
+--   https://news.blizzard.com/en-us/world-of-warcraft/23493335/explore-the-temple-of-ahn-qiraj-and-ruins-of-ahn-qiraj
+--
+-- FACTION SPLIT is implemented as a UNION, not a faction branch: a Horde
+-- character can never have completed 6502 and an Alliance character can never
+-- have completed 6602, so "either one complete" is exactly equivalent to the
+-- per-faction test — and it stays correct without depending on a faction field
+-- that may not be captured yet on a cold record.
+----------------------------------------------------------------------
+
+-- PURE: raidKey -> the quest ids that grant it. ANY ONE complete = attuned.
+local ATTUNE_QUESTS = {
+    MC   = { 7487 },
+    BWL  = { 7761 },
+    Ony  = { 6502, 6602 },              -- Alliance final, Horde final
+    Naxx = { 9121, 9122, 9123 },        -- Honored, Revered, Exalted
+}
+
+-- PURE: raids with NO personal attunement — always attuned, never greyed.
+local ATTUNE_ALWAYS = { ZG = true, AQ20 = true, AQ40 = true }
+
+Tracker.ATTUNE_QUESTS = ATTUNE_QUESTS
+Tracker.ATTUNE_ALWAYS = ATTUNE_ALWAYS
+
+-- The Daseeki.Sync namespace key this data rides cross-account on.
+local ATTUNE_NS = "attune"
+Tracker.ATTUNE_NS = ATTUNE_NS
+
+-- Attunements only ever flip false->true, so re-probing hot is pure waste.
+Tracker.ATTUNE_RECHECK_INTERVAL = 60    -- seconds between unforced re-probes
+Tracker._attuneCheckedAt = nil          -- Store.Now() of the last probe
+Tracker._attuneForce     = false        -- set by QUEST_TURNED_IN / entering world
+
+-- Probe one quest id. Returns true/false, or NIL when the API is unavailable —
+-- nil must never be coerced to false, or a cold client would grey every raid.
+--
+-- API (catalog-verified, build 1.15.9.68808):
+--   C_QuestLog.IsQuestFlaggedCompleted(questID:number) -> isCompleted:bool
+-- The 1.15.9 catalog lists NO bare `IsQuestFlaggedCompleted` global, so the
+-- C_QuestLog namespace is the only supported spelling; the global branch below
+-- is defensive belt-and-braces for a build that still exposes the old alias.
+local function questCompleted(questID)
+    local fn = C_QuestLog and C_QuestLog.IsQuestFlaggedCompleted
+    if type(fn) == "function" then
+        local ok, res = pcall(fn, questID)
+        if ok then return res and true or false end
+    end
+    local g = rawget(_G, "IsQuestFlaggedCompleted")
+    if type(g) == "function" then
+        local ok, res = pcall(g, questID)
+        if ok then return res and true or false end
+    end
+    return nil
+end
+Tracker._questCompleted = questCompleted
+
+-- PURE: build the full { [raidKey] = bool } matrix from a completion probe.
+-- `probe(questID)` returns true/false/nil. Returns nil (NOT a table of falses)
+-- when the probe could not answer a single gated quest — the caller must then
+-- leave whatever it already had alone.
+function Tracker.AttunementFlags(probe)
+    if type(probe) ~= "function" then return nil end
+    local out, answered = {}, false
+    for _, key in ipairs(ns.Store.RAID_KEYS) do
+        if ATTUNE_ALWAYS[key] then
+            out[key] = true
+        else
+            local ids = ATTUNE_QUESTS[key]
+            local val = false
+            if ids then
+                for _, id in ipairs(ids) do
+                    local done = probe(id)
+                    if done ~= nil then answered = true end
+                    if done == true then val = true; break end
+                end
+            end
+            out[key] = val
+        end
+    end
+    if not answered then return nil end
+    return out
+end
+
+-- PURE: fold a previous matrix into a fresh one. Attunement is MONOTONIC — it
+-- can only ever go false->true — so a stored `true` is never allowed to regress
+-- to false. This is what protects the record from a probe taken before the
+-- client's completed-quest cache has warmed up after login.
+function Tracker.MergeAttunements(prev, fresh)
+    if type(fresh) ~= "table" then return nil end
+    if type(prev) == "table" then
+        for k, v in pairs(prev) do
+            if v == true then fresh[k] = true end
+        end
+    end
+    return fresh
+end
+
+-- PURE: do two matrices differ? Drives the MarkDirty decision.
+local function attuneChanged(a, b)
+    if type(a) ~= "table" then return type(b) == "table" end
+    if type(b) ~= "table" then return true end
+    for k, v in pairs(a) do if b[k] ~= v then return true end end
+    for k, v in pairs(b) do if a[k] ~= v then return true end end
+    return false
+end
+Tracker._attuneChanged = attuneChanged
+
+-- Our own account's payload for the "attune" namespace:
+--   { [nameRealm] = { [raidKey] = bool } } for every character WE own.
+-- Only records that actually carry a matrix are published, so a character that
+-- has not logged in since the update stays absent (reads as nil = unknown) and
+-- is never greyed on a peer's screen.
+function Tracker.AttunePayload()
+    local out = {}
+    local S = ns.Store
+    local bucket = S and S.GetSelfAccount and S.GetSelfAccount(false)
+    if not bucket then return out end
+    for _, tbl in ipairs({ bucket.characters, bucket.homeless }) do
+        if type(tbl) == "table" then
+            for nameRealm, rec in pairs(tbl) do
+                if type(rec) == "table" and type(rec.attunements) == "table" then
+                    out[nameRealm] = rec.attunements
+                end
+            end
+        end
+    end
+    return out
+end
+
+-- Hand our payload to the mesh. Defensive lookup: Daseeki.Sync is created in
+-- syncns.lua, which loads AFTER this file.
+local function markAttuneDirty()
+    local Sync = _G and _G.Daseeki and _G.Daseeki.Sync
+    if Sync and Sync.MarkDirty then Sync.MarkDirty(ATTUNE_NS) end
+end
+Tracker._markAttuneDirty = markAttuneDirty
+
+----------------------------------------------------------------------
+-- Cross-account read index.
+--
+-- A namespace payload must NOT be written into peer character records: those
+-- records are owned by the mesh's character graph and are wholesale-replaced by
+-- Store.WriteInboundCharacter on every state push, so anything we merged in
+-- would be silently erased. (This is the same reason the Bags syncBridge keeps
+-- its data in the namespace and reads it through Daseeki.Sync rather than
+-- decorating records.) We therefore keep a lazily-rebuilt nameRealm -> flags
+-- index projected FROM the namespace, and consult it only as the fallback for a
+-- record that carries no matrix of its own.
+--
+-- Two accounts advertising the SAME character (a machine re-set-up under a new
+-- account id, before Store.ReconcileStaleTwins retires the old copy) are folded
+-- with OR rather than last-writer-wins: attunement is monotonic, so the
+-- attuned answer is the true one and the fold is order-independent.
+----------------------------------------------------------------------
+
+Tracker._attuneIndex      = nil
+Tracker._attuneIndexDirty = true
+
+function Tracker.InvalidateAttuneIndex()
+    Tracker._attuneIndexDirty = true
+end
+
+function Tracker.AttuneIndex()
+    if Tracker._attuneIndex and not Tracker._attuneIndexDirty then
+        return Tracker._attuneIndex
+    end
+    local idx = {}
+    local S = ns.Store
+    if S and S.SyncNSAll then
+        for _, entry in pairs(S.SyncNSAll(ATTUNE_NS)) do
+            local data = entry and entry.data
+            if type(data) == "table" then
+                for nameRealm, flags in pairs(data) do
+                    if type(nameRealm) == "string" and type(flags) == "table" then
+                        local cur = idx[nameRealm]
+                        if not cur then
+                            cur = {}
+                            idx[nameRealm] = cur
+                        end
+                        for k, v in pairs(flags) do
+                            if v == true then cur[k] = true
+                            elseif cur[k] == nil then cur[k] = false end
+                        end
+                    end
+                end
+            end
+        end
+    end
+    Tracker._attuneIndex      = idx
+    Tracker._attuneIndexDirty = false
+    return idx
+end
+
+-- A peer account's payload arrived (or was replayed from the cache at login).
+-- Nothing to merge: the namespace store already holds it, we just drop the
+-- projected index so the next read rebuilds.
+function Tracker.OnRemoteAttune(_ownerKey, _data)
+    Tracker.InvalidateAttuneIndex()
+end
+
+----------------------------------------------------------------------
+-- Store.RaidAttuned — the READ API the detail/roster views consume.
+--
+-- ADDITIVE FUNCTION INJECTION: this is attached to the ns.Store table from
+-- tracker.lua rather than declared in store.lua. store.lua is owned elsewhere
+-- and its migration block must not be touched; the attunement feature is
+-- otherwise entirely self-contained in this file plus the syncns namespace
+-- registration. tracker.lua loads after store.lua in the .toc, so ns.Store
+-- always exists here. If this ever moves into store.lua proper, delete the
+-- injection below and nothing else changes — the signature is identical.
+--
+--   Store.RaidAttuned(rec, raidKey) -> true | false | nil
+--     true   attuned (or the raid has no personal attunement at all)
+--     false  definitively NOT attuned -> the caller greys the lockout text
+--     nil    NO DATA — an old peer that has not updated, or a record written
+--            before this feature shipped. Callers treat nil as attuned, so a
+--            mid-rollout mesh never greys a character it simply cannot see.
+----------------------------------------------------------------------
+
+if ns.Store then
+    function ns.Store.RaidAttuned(rec, raidKey)
+        if type(raidKey) ~= "string" then return nil end
+        -- Ungated raids answer true unconditionally — even for a nil record.
+        if ATTUNE_ALWAYS[raidKey] then return true end
+        if not ATTUNE_QUESTS[raidKey] then return nil end   -- not a tracked raid
+        if type(rec) ~= "table" then return nil end
+        local a = rec.attunements
+        if type(a) == "table" and a[raidKey] ~= nil then
+            return a[raidKey] and true or false
+        end
+        -- Cross-account fallback: the "attune" namespace projection.
+        local nameRealm = rec.nameRealm
+        if type(nameRealm) == "string" and nameRealm ~= "" then
+            local flags = Tracker.AttuneIndex()[nameRealm]
+            if type(flags) == "table" and flags[raidKey] ~= nil then
+                return flags[raidKey] and true or false
+            end
+        end
+        return nil
+    end
+end
+
+-- Capture THIS character's attunement matrix onto its record. Throttled: an
+-- unforced call inside ATTUNE_RECHECK_INTERVAL of the last probe is a no-op,
+-- because attunements cannot change without a quest turn-in (which forces).
+-- Returns true when the stored matrix actually changed.
+local function captureAttunements(rec, force)
+    local now = ns.Store.Now()
+    local prev = rec.attunements
+    if not force and type(prev) == "table" then
+        local at = Tracker._attuneCheckedAt
+        if at and (now - at) < Tracker.ATTUNE_RECHECK_INTERVAL then return false end
+    end
+    local fresh = Tracker.AttunementFlags(questCompleted)
+    if not fresh then return false end          -- API cold: keep what we had
+    Tracker._attuneCheckedAt = now
+    local merged = Tracker.MergeAttunements(prev, fresh)
+    if not attuneChanged(prev, merged) then
+        rec.attunements = merged
+        return false
+    end
+    rec.attunements = merged
+    return true
+end
+Tracker._captureAttunements = captureAttunements
+
+----------------------------------------------------------------------
 -- Full capture + debounce
 ----------------------------------------------------------------------
 
@@ -1590,6 +1899,18 @@ function Tracker.Capture(force)
     captureAuras(rec)
     captureDMF(rec)            -- A8: must follow captureAuras (reads the DMF slot)
     captureRaidLockouts(rec)
+
+    -- Personal raid attunement. Throttled internally; a pending force (quest
+    -- turn-in / entering the world) bypasses the throttle exactly once.
+    local attuneForce = Tracker._attuneForce and true or false
+    Tracker._attuneForce = false
+    if captureAttunements(rec, attuneForce) then
+        -- The matrix moved: republish our account's payload so every peer
+        -- (and every other account of ours) sees the new flag. The namespace
+        -- push is debounced by the mesh, so a burst costs one propagation.
+        Tracker.InvalidateAttuneIndex()
+        markAttuneDirty()
+    end
 
     rec.lastSeen = ns.Store.Now()
     rec.lastDataUpdate = rec.lastSeen
@@ -1657,6 +1978,10 @@ function Tracker.OnLogin()
         -- live world. Open the partial-scan grace windows.
         Tracker._leavingWorld = false
         Tracker._enteredWorldAt = (GetTime and GetTime()) or 0
+        -- Attunement: re-probe unthrottled on the far side of every loading
+        -- screen. The completed-quest cache is one of the things that is cold
+        -- right after login, so the FIRST honest read is often this one.
+        Tracker._attuneForce = true
         -- A10.1 / spec §9.4: a FORCED push 1.0s after entering the world, once
         -- the aura and bag APIs have warmed up. This is the push that re-seeds
         -- every peer after a /reload or a zone change, and it must bypass the
@@ -1775,6 +2100,22 @@ function Tracker.OnLogin()
             Tracker.RequestCapture()
         end)
     end
+
+    -- Attunement: a quest hand-in is the ONLY way an attunement can flip, so it
+    -- is the one event that must force an unthrottled re-probe. We register our
+    -- OWN handler rather than extending the world-buff detector in timers.lua —
+    -- ns:RegisterEvent appends to a per-event handler list, so both run.
+    -- QUEST_TURNED_IN(questID, xpReward, moneyReward) — signature already relied
+    -- on by timers.lua's hand-in detector.
+    ns:RegisterEvent("QUEST_TURNED_IN", function()
+        Tracker._attuneForce = true
+        Tracker.RequestCapture()
+    end)
+
+    -- Attunement: force the first probe of the session, and seed the namespace
+    -- projection from whatever cross-account data the store already holds.
+    Tracker._attuneForce = true
+    Tracker.InvalidateAttuneIndex()
 
     -- First snapshot once the world is ready.
     Tracker.RequestCapture()
@@ -2926,6 +3267,251 @@ local function testDMFCapture(fails)
     if not ok then fails[#fails + 1] = "error in DMF capture fixtures: " .. tostring(err) end
 end
 
+----------------------------------------------------------------------
+-- RAID ATTUNEMENT — quest-flag matrix, monotonic merge, capture throttle,
+-- the cross-account index, and the Store.RaidAttuned tri-state.
+--
+-- The three facts most worth guarding here, because getting any of them wrong
+-- greys a raid the owner CAN enter (or fails to grey one they cannot):
+--   1. Naxx is ANY-OF-THREE ids that share one quest NAME — only the id tells
+--      the rep tiers apart, so a name-based implementation would silently pass
+--      a test written against names.
+--   2. Ony is faction-split — EITHER final quest attunes, and neither faction
+--      can ever hold the other's.
+--   3. ZG / AQ20 / AQ40 have NO personal attunement and must answer true
+--      unconditionally — including for a nil record, and even if a corrupt
+--      record claims false.
+----------------------------------------------------------------------
+local function testAttunement(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+
+    -- A probe factory: only the listed ids read as completed.
+    local function probeFor(list)
+        local done = {}
+        for _, id in ipairs(list or {}) do done[id] = true end
+        return function(id) return done[id] == true end
+    end
+
+    -- ---- 1) the full matrix, nothing completed ----------------------------
+    local none = Tracker.AttunementFlags(probeFor({}))
+    ck(type(none) == "table", "flags: a probe that answers returns a table")
+    ck(none.MC == false and none.BWL == false, "flags: MC/BWL false when unquested")
+    ck(none.Ony == false and none.Naxx == false, "flags: Ony/Naxx false when unquested")
+    ck(none.ZG == true and none.AQ20 == true and none.AQ40 == true,
+       "flags: ZG/AQ20/AQ40 are ALWAYS true (no personal attunement exists)")
+    -- Every RAID_KEYS key is present -- the matrix mirrors the lockout keys.
+    for _, k in ipairs(ns.Store.RAID_KEYS) do
+        ck(none[k] ~= nil, "flags: RAID_KEYS key '" .. k .. "' present in the matrix")
+    end
+
+    -- ---- 2) single-quest raids -------------------------------------------
+    ck(Tracker.AttunementFlags(probeFor({ 7487 })).MC == true, "MC: 7487 attunes")
+    ck(Tracker.AttunementFlags(probeFor({ 7487 })).BWL == false, "MC quest does not attune BWL")
+    ck(Tracker.AttunementFlags(probeFor({ 7761 })).BWL == true, "BWL: 7761 attunes")
+    ck(Tracker.AttunementFlags(probeFor({ 7761 })).MC == false, "BWL quest does not attune MC")
+
+    -- ---- 3) Onyxia FACTION SPLIT: either final quest attunes ---------------
+    ck(Tracker.AttunementFlags(probeFor({ 6502 })).Ony == true,
+       "Ony: 6502 (ALLIANCE Drakefire Amulet) attunes")
+    ck(Tracker.AttunementFlags(probeFor({ 6602 })).Ony == true,
+       "Ony: 6602 (HORDE Blood of the Black Dragon Champion) attunes")
+    ck(Tracker.AttunementFlags(probeFor({ 6502, 6602 })).Ony == true,
+       "Ony: both ids complete still attunes")
+    ck(Tracker.AttunementFlags(probeFor({ 6403 })).Ony == false,
+       "Ony: 6403 (The Great Masquerade, MID-chain) does NOT attune")
+    ck(Tracker.AttunementFlags(probeFor({ 6501 })).Ony == false,
+       "Ony: 6501 (The Dragon's Eye, mid-chain) does NOT attune")
+
+    -- ---- 4) Naxxramas ANY-OF-THREE by Argent Dawn rep tier ----------------
+    ck(Tracker.AttunementFlags(probeFor({ 9121 })).Naxx == true, "Naxx: 9121 (Honored) attunes")
+    ck(Tracker.AttunementFlags(probeFor({ 9122 })).Naxx == true, "Naxx: 9122 (Revered) attunes")
+    ck(Tracker.AttunementFlags(probeFor({ 9123 })).Naxx == true, "Naxx: 9123 (Exalted) attunes")
+    ck(Tracker.AttunementFlags(probeFor({ 9120 })).Naxx == false, "Naxx: a neighbouring id does not attune")
+    -- All three ids are distinct and all three are actually in the table.
+    local naxx = Tracker.ATTUNE_QUESTS.Naxx
+    ck(#naxx == 3, "Naxx: exactly three rep-tier variants are tracked")
+    ck(naxx[1] ~= naxx[2] and naxx[2] ~= naxx[3] and naxx[1] ~= naxx[3],
+       "Naxx: the three variant ids are distinct")
+
+    -- ---- 5) the exact verified id set (guards a memory-based 'correction') --
+    local EXPECT = { MC = { 7487 }, BWL = { 7761 }, Ony = { 6502, 6602 },
+                     Naxx = { 9121, 9122, 9123 } }
+    for key, ids in pairs(EXPECT) do
+        local got = Tracker.ATTUNE_QUESTS[key]
+        ck(got and #got == #ids, "ids: " .. key .. " has " .. #ids .. " quest id(s)")
+        for i, id in ipairs(ids) do
+            ck(got and got[i] == id, "ids: " .. key .. "[" .. i .. "] == " .. id)
+        end
+    end
+    ck(Tracker.ATTUNE_QUESTS.ZG == nil and Tracker.ATTUNE_QUESTS.AQ20 == nil
+       and Tracker.ATTUNE_QUESTS.AQ40 == nil,
+       "ids: ZG/AQ20/AQ40 carry NO quest ids (no personal attunement)")
+
+    -- ---- 6) an API that cannot answer must yield nil, never all-false ------
+    ck(Tracker.AttunementFlags(function() return nil end) == nil,
+       "flags: a probe that answers nothing returns nil (never a table of falses)")
+    ck(Tracker.AttunementFlags(nil) == nil, "flags: a non-function probe returns nil")
+
+    -- ---- 7) monotonic merge: true never regresses -------------------------
+    local merged = Tracker.MergeAttunements({ MC = true, BWL = false },
+                                            { MC = false, BWL = true, Ony = false })
+    ck(merged.MC == true, "merge: a stored true survives a false re-probe")
+    ck(merged.BWL == true, "merge: a fresh true is adopted")
+    ck(merged.Ony == false, "merge: a key absent from prev takes the fresh value")
+    ck(Tracker.MergeAttunements(nil, { MC = true }).MC == true, "merge: nil prev is fine")
+    ck(Tracker.MergeAttunements({ MC = true }, nil) == nil, "merge: nil fresh returns nil")
+
+    -- ---- 8) change detection ---------------------------------------------
+    local CH = Tracker._attuneChanged
+    ck(CH(nil, { MC = true }) == true, "changed: nil -> table is a change")
+    ck(CH({ MC = true }, nil) == true, "changed: table -> nil is a change")
+    ck(CH({ MC = true }, { MC = true }) == false, "changed: identical matrices are equal")
+    ck(CH({ MC = true }, { MC = false }) == true, "changed: a flipped flag is a change")
+    ck(CH({ MC = true }, { MC = true, BWL = false }) == true, "changed: an added key is a change")
+    ck(CH(nil, nil) == false, "changed: nil vs nil is not a change")
+
+    -- ---- 9) Store.RaidAttuned tri-state ------------------------------------
+    local RA = ns.Store.RaidAttuned
+    ck(type(RA) == "function", "RaidAttuned: injected onto ns.Store")
+
+    -- Always-attuned raids answer true unconditionally.
+    for _, k in ipairs({ "ZG", "AQ20", "AQ40" }) do
+        ck(RA(nil, k) == true, "RaidAttuned: " .. k .. " is true even for a nil record")
+        ck(RA({ nameRealm = "X-Y" }, k) == true, "RaidAttuned: " .. k .. " true with no matrix")
+        ck(RA({ attunements = { [k] = false } }, k) == true,
+           "RaidAttuned: " .. k .. " true even if a corrupt record claims false")
+    end
+
+    local recFull = { nameRealm = "Mine-Realm",
+                      attunements = { MC = true, BWL = false, Ony = true, Naxx = false,
+                                      ZG = true, AQ20 = true, AQ40 = true } }
+    ck(RA(recFull, "MC") == true,   "RaidAttuned: MC true from the record")
+    ck(RA(recFull, "BWL") == false, "RaidAttuned: BWL false from the record")
+    ck(RA(recFull, "Ony") == true,  "RaidAttuned: Ony true from the record")
+    ck(RA(recFull, "Naxx") == false,"RaidAttuned: Naxx false from the record")
+
+    -- No data anywhere -> nil (an old peer / a pre-update record).
+    local recBare = { nameRealm = "Stranger-Realm" }
+    for _, k in ipairs({ "MC", "BWL", "Ony", "Naxx" }) do
+        ck(RA(recBare, k) == nil, "RaidAttuned: " .. k .. " is nil with no data (old peer)")
+    end
+    ck(RA(nil, "MC") == nil, "RaidAttuned: nil record -> nil for a gated raid")
+    ck(RA(recFull, "Karazhan") == nil, "RaidAttuned: an untracked raid key -> nil")
+    ck(RA(recFull, nil) == nil, "RaidAttuned: a nil raid key -> nil")
+
+    -- ---- 10) the cross-account namespace projection -----------------------
+    local S = ns.Store
+    if S and S.SyncNSPut then
+        local NSK = Tracker.ATTUNE_NS
+        local O1, O2 = "__attunetest-acct1", "__attunetest-acct2"
+        local savedIdx, savedDirty = Tracker._attuneIndex, Tracker._attuneIndexDirty
+
+        S.SyncNSPut(NSK, O1, 1, {
+            ["Peer-Realm"]  = { MC = true,  BWL = false, Ony = false, Naxx = false },
+            ["Alt-Realm"]   = { MC = false, BWL = false, Ony = false, Naxx = false },
+        }, 100)
+        Tracker.InvalidateAttuneIndex()
+
+        ck(RA({ nameRealm = "Peer-Realm" }, "MC") == true,
+           "index: a peer account's MC=true is read through the namespace")
+        ck(RA({ nameRealm = "Peer-Realm" }, "BWL") == false,
+           "index: a peer account's BWL=false greys through the namespace")
+        ck(RA({ nameRealm = "Alt-Realm" }, "Naxx") == false,
+           "index: a never-attuned alt reads false for Naxx")
+        ck(RA({ nameRealm = "Alt-Realm" }, "ZG") == true,
+           "index: ZG still true for that same never-attuned alt")
+        ck(RA({ nameRealm = "Nobody-Realm" }, "MC") == nil,
+           "index: an unknown character stays nil")
+
+        -- The record's OWN matrix wins over the namespace projection.
+        ck(RA({ nameRealm = "Peer-Realm", attunements = { MC = false } }, "MC") == false,
+           "index: the record's own matrix takes precedence over the projection")
+
+        -- Two accounts naming the same character fold with OR (monotonic).
+        S.SyncNSPut(NSK, O2, 1, { ["Peer-Realm"] = { MC = false, BWL = true } }, 101)
+        Tracker.InvalidateAttuneIndex()
+        ck(RA({ nameRealm = "Peer-Realm" }, "MC") == true,
+           "index: duplicate owners fold with OR (MC stays true)")
+        ck(RA({ nameRealm = "Peer-Realm" }, "BWL") == true,
+           "index: duplicate owners fold with OR (BWL becomes true)")
+
+        -- The index is cached until invalidated.
+        local i1 = Tracker.AttuneIndex()
+        ck(Tracker.AttuneIndex() == i1, "index: cached between reads")
+        Tracker.InvalidateAttuneIndex()
+        ck(Tracker.AttuneIndex() ~= i1, "index: rebuilt after invalidation")
+
+        -- onRemote invalidates.
+        Tracker.AttuneIndex()
+        Tracker.OnRemoteAttune(O1, {})
+        ck(Tracker._attuneIndexDirty == true, "index: OnRemoteAttune marks it dirty")
+
+        S.SyncNSDrop(NSK, O1)
+        S.SyncNSDrop(NSK, O2)
+        Tracker._attuneIndex, Tracker._attuneIndexDirty = savedIdx, savedDirty
+        Tracker.InvalidateAttuneIndex()
+    end
+
+    -- ---- 11) capture: throttle, cold-API safety, live probe ----------------
+    local savedQL   = _G.C_QuestLog
+    local savedNow  = ns.Store.Now
+    local savedAt   = Tracker._attuneCheckedAt
+    local epochNow  = 1700000000
+    local completed = {}
+    _G.C_QuestLog = { IsQuestFlaggedCompleted = function(id) return completed[id] == true end }
+    ns.Store.Now  = function() return epochNow end
+
+    local ok, err = pcall(function()
+        local cap = Tracker._captureAttunements
+        local rec = { nameRealm = "Cap-Realm" }
+
+        Tracker._attuneCheckedAt = nil
+        ck(cap(rec, false) == true, "capture: the first probe writes the matrix")
+        ck(type(rec.attunements) == "table", "capture: rec.attunements is a table")
+        ck(rec.attunements.MC == false, "capture: MC false before the quest")
+        ck(rec.attunements.ZG == true,  "capture: ZG true immediately")
+
+        -- Throttled: a completed quest is NOT picked up until the window passes.
+        completed[7487] = true
+        ck(cap(rec, false) == false, "capture: an unforced re-probe inside the window is a no-op")
+        ck(rec.attunements.MC == false, "capture: the throttled call did not re-probe")
+
+        -- Forced (a quest turn-in) bypasses the throttle immediately.
+        ck(cap(rec, true) == true, "capture: a FORCED probe bypasses the throttle")
+        ck(rec.attunements.MC == true, "capture: MC flips true after the hand-in")
+
+        -- Past the window, an unforced probe runs again.
+        completed[9122] = true
+        epochNow = epochNow + Tracker.ATTUNE_RECHECK_INTERVAL + 1
+        ck(cap(rec, false) == true, "capture: past the window an unforced probe runs")
+        ck(rec.attunements.Naxx == true, "capture: Naxx (Revered variant) picked up")
+
+        -- No change -> no dirty signal.
+        epochNow = epochNow + Tracker.ATTUNE_RECHECK_INTERVAL + 1
+        ck(cap(rec, false) == false, "capture: an unchanged matrix reports no change")
+
+        -- A COLD api must not wipe what we already knew.
+        _G.C_QuestLog = { IsQuestFlaggedCompleted = function() error("cold") end }
+        epochNow = epochNow + Tracker.ATTUNE_RECHECK_INTERVAL + 1
+        ck(cap(rec, true) == false, "capture: a cold API reports no change")
+        ck(rec.attunements.MC == true and rec.attunements.Naxx == true,
+           "capture: a cold API does NOT regress stored attunements")
+
+        -- The namespace payload only publishes records that carry a matrix.
+        local payload = Tracker.AttunePayload()
+        ck(type(payload) == "table", "payload: AttunePayload returns a table")
+        for nameRealm, flags in pairs(payload) do
+            ck(type(nameRealm) == "string" and type(flags) == "table",
+               "payload: entries are nameRealm -> flags")
+        end
+    end)
+
+    _G.C_QuestLog = savedQL
+    ns.Store.Now  = savedNow
+    Tracker._attuneCheckedAt = savedAt
+    if not ok then fails[#fails + 1] = "error in attunement fixtures: " .. tostring(err) end
+end
+
 function Tracker.RunSelfTests(verbose)
     local suites = {
         { name = "state-push change filter (A10.1)", fn = testChangeFilter },
@@ -2938,6 +3524,7 @@ function Tracker.RunSelfTests(verbose)
         { name = "boon cast lifecycle (A7.1/A7.2/A7.3/A7.4)", fn = testBoonCastLifecycle },
         { name = "boon tooltip reconciliation (A7.5)", fn = testBoonReconcile },
         { name = "DMF capture edges + debuff push (A8)", fn = testDMFCapture },
+        { name = "raid attunement (quest matrix + RaidAttuned tri-state)", fn = testAttunement },
     }
     local allPass = true
     for _, suite in ipairs(suites) do

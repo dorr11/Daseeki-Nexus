@@ -496,6 +496,56 @@ function Config._ApplyFromFile(_key, data)
 end
 
 ----------------------------------------------------------------------
+-- RAID ATTUNEMENT namespace ("attune") — cross-ACCOUNT personal attunement.
+--
+-- Nexus's own first provider namespace (Bags was the first external consumer).
+-- It exists because raid attunement is a per-character fact that the mesh's
+-- character graph does not carry: protocol.lua's binary record schema is FROZEN
+-- (no SCHEMA_VERSION bump for this feature), so the flags ride the additive
+-- namespace transport instead. That is the whole point of the N5 namespace
+-- store — new cross-account data without touching the wire schema.
+--
+--   ownerKey  the DEFAULT (this Nexus account id). Attunement is published
+--             per ACCOUNT, one payload covering every character we own, rather
+--             than per character as "bags" does: the matrix is seven booleans,
+--             so a whole account's worth is smaller than a single bags payload,
+--             and one owner entry means one rev to gate instead of N.
+--   payload   { [nameRealm] = { [raidKey] = bool } } — see Tracker.AttunePayload.
+--   onRemote  drops the projected read index; Store.RaidAttuned rebuilds it
+--             lazily on the next read. Nothing is merged into peer character
+--             records — the mesh wholesale-replaces those on every state push,
+--             so a merge would be erased (see the note in tracker.lua).
+--
+-- NO PROTOCOL BUMP, and old peers are safe by construction:
+--   * Mesh.HandleNSPayload -> Sync.ApplyInbound stores ANY namespace key it is
+--     handed, registered or not, then Sync._DeliverOne finds no spec and
+--     returns. An un-updated peer therefore CACHES our attunement payload
+--     silently and errors on nothing.
+--   * Because it cached it, Sync.OnLogin -> DeliverRemote replays that payload
+--     to the consumer the moment that peer does update — no re-sync needed.
+--   * Mesh.DiffNamespaceHashes iterates the REMOTE hash map, so an old peer
+--     still pulls "attune" from us (its local hash reads "0"), and a new peer
+--     pulls whatever an old peer relayed. Every path is rev-gated.
+----------------------------------------------------------------------
+
+local ATTUNE_SYNC_KEY = "attune"
+
+local function attuneProvide()
+    local T = ns.Tracker
+    if not (T and T.AttunePayload) then return nil end
+    return T.AttunePayload()
+end
+
+local function attuneOnRemote(ownerKey, data)
+    local T = ns.Tracker
+    if T and T.OnRemoteAttune then T.OnRemoteAttune(ownerKey, data) end
+end
+
+Sync._AttuneProvide  = attuneProvide
+Sync._AttuneOnRemote = attuneOnRemote
+Sync.ATTUNE_KEY      = ATTUNE_SYNC_KEY
+
+----------------------------------------------------------------------
 -- Wiring: subscribe to the mesh settings bus + login hooks
 ----------------------------------------------------------------------
 
@@ -512,6 +562,11 @@ local function wire()
     installConfigChannel()
     -- Offline catch-up namespace.
     Daseeki.Sync.RegisterNamespace(CONFIG_SYNC_KEY, { onRemote = Config._ApplyFromFile })
+    -- Cross-account raid attunement (account-granular provider namespace).
+    Daseeki.Sync.RegisterNamespace(ATTUNE_SYNC_KEY, {
+        provide  = attuneProvide,
+        onRemote = attuneOnRemote,
+    })
     -- Inbound live transport over the settings-sync frame family.
     if ns.On then ns:On("MESH_SETTINGS_RECEIVED", onMeshSettings) end
     -- Login: run the file-mirror apply pass once the world is up.
@@ -752,8 +807,117 @@ local function bridgeCompatTest(verbose)
     return pass
 end
 
+----------------------------------------------------------------------
+-- Self-test: the "attune" namespace round-trip.
+--
+-- Asserts the namespace is really registered as a PROVIDER (so it is advertised
+-- in the heartbeat rev-hash bundle and answered on a pull), that a peer's
+-- payload lands through ApplyInbound -> onRemote and becomes readable through
+-- Store.RaidAttuned, that rev-gating is last-writer-wins, and — the
+-- back-compat claim the whole no-protocol-bump design rests on — that an
+-- UNREGISTERED namespace key is cached without error, which is exactly what an
+-- un-updated peer does with our attunement payload.
+----------------------------------------------------------------------
+
+local function attuneSelfTest(verbose)
+    local pass = true
+    local function check(name, cond)
+        if not cond then
+            pass = false
+            if verbose and ns.Print then ns:Print("  attune selftest FAIL: " .. name) end
+        end
+    end
+
+    local KEY = ATTUNE_SYNC_KEY
+    check("attune namespace registered", Sync._namespaces[KEY] ~= nil)
+    check("attune is a PROVIDER namespace", Sync.IsProviderNamespace(KEY) == true)
+    check("attune advertises a rev hash", Sync.AllNamespaceHashes()[KEY] ~= nil)
+    local isProvider = false
+    for _, k in ipairs(Sync.ProviderKeys()) do if k == KEY then isProvider = true end end
+    check("attune is in ProviderKeys (answered on a pull)", isProvider)
+
+    -- provide() is wired to the tracker and returns a table (possibly empty).
+    local okp, payload = Sync._Provide(KEY)
+    check("provide() succeeds", okp == true)
+    check("provide() returns a table", type(payload) == "table")
+
+    local S = ns.Store
+    local T = ns.Tracker
+    if not (S and S.SyncNSPut and T and T.AttuneIndex) then
+        if verbose and ns.Print then ns:Print("  attune selftest SKIP (store/tracker unavailable)") end
+        return pass
+    end
+
+    local OWNER = "__attunens-peer"
+    local savedIdx, savedDirty = T._attuneIndex, T._attuneIndexDirty
+    S.SyncNSDrop(KEY, OWNER)
+
+    -- A peer account's payload arrives from the mesh.
+    check("peer rev1 applies", Sync.ApplyInbound(KEY, OWNER, 1, {
+        ["Attuned-Realm"]   = { MC = true,  BWL = true,  Ony = true,  Naxx = true },
+        ["Unattuned-Realm"] = { MC = false, BWL = false, Ony = false, Naxx = false },
+    }, 500) == "applied")
+    check("onRemote invalidated the index", T._attuneIndexDirty == true)
+
+    -- ...and is readable through the public tri-state API.
+    local RA = S.RaidAttuned
+    check("peer attuned char reads true (MC)",  RA({ nameRealm = "Attuned-Realm" }, "MC") == true)
+    check("peer attuned char reads true (Naxx)", RA({ nameRealm = "Attuned-Realm" }, "Naxx") == true)
+    check("peer unattuned char reads FALSE (MC)", RA({ nameRealm = "Unattuned-Realm" }, "MC") == false)
+    check("peer unattuned char reads FALSE (Ony)", RA({ nameRealm = "Unattuned-Realm" }, "Ony") == false)
+    check("ungated raid still true for the unattuned char",
+          RA({ nameRealm = "Unattuned-Realm" }, "AQ40") == true)
+    check("a character nobody published stays nil",
+          RA({ nameRealm = "Absent-Realm" }, "MC") == nil)
+
+    -- Rev-gating: a stale rev is rejected, a higher rev wins and re-projects.
+    check("peer stale rev rejected", Sync.ApplyInbound(KEY, OWNER, 1, {
+        ["Unattuned-Realm"] = { MC = true } }, 501) == "stale")
+    check("stale rev did not change the read",
+          RA({ nameRealm = "Unattuned-Realm" }, "MC") == false)
+    check("peer rev2 applies", Sync.ApplyInbound(KEY, OWNER, 2, {
+        ["Unattuned-Realm"] = { MC = true, BWL = false, Ony = false, Naxx = false },
+    }, 502) == "applied")
+    check("the newly attuned char now reads true",
+          RA({ nameRealm = "Unattuned-Realm" }, "MC") == true)
+    check("a char dropped from the newer payload goes back to nil",
+          RA({ nameRealm = "Attuned-Realm" }, "MC") == nil)
+
+    -- The merged Get() view exposes the peer owner alongside our own.
+    local view = Sync.Get(KEY)
+    check("Get() merges the peer owner", type(view[OWNER]) == "table")
+    check("Get() includes our own owner key", view[Sync.LocalOwnerKey(KEY)] ~= nil)
+
+    -- BACK-COMPAT: an un-updated peer receives an unknown namespace key. It has
+    -- no spec, so _DeliverOne no-ops -- it must CACHE without erroring, which is
+    -- what lets it replay the payload to its consumer once it does update.
+    local UNK = "__attunens-unknownkey"
+    check("unknown namespace is not a provider", Sync.IsProviderNamespace(UNK) == false)
+    local okUnk, resUnk = pcall(Sync.ApplyInbound, UNK, "someone", 1, { a = 1 }, 503)
+    check("unknown namespace applies without error", okUnk == true and resUnk == "applied")
+    check("unknown namespace payload was cached",
+          (S.SyncNSGetData(UNK, "someone") or {}).a == 1)
+    check("unknown namespace not advertised in our hashes", Sync.AllNamespaceHashes()[UNK] == nil)
+    S.SyncNS()[UNK] = nil
+
+    S.SyncNSDrop(KEY, OWNER)
+    T._attuneIndex, T._attuneIndexDirty = savedIdx, savedDirty
+    T.InvalidateAttuneIndex()
+
+    if verbose and ns.Print then
+        ns:Print(pass and "  attune selftest: PASS" or "  attune selftest: FAIL")
+    end
+    return pass
+end
+
+Sync._AttuneSelfTest = attuneSelfTest
+
 if ns.RegisterSelfTest then
-    ns:RegisterSelfTest("syncns", selfTest)
+    ns:RegisterSelfTest("syncns", function(verbose)
+        local a = selfTest(verbose)
+        local b = attuneSelfTest(verbose)
+        return a and b
+    end)
     ns:RegisterSelfTest("sync", syncSelfTest)
     ns:RegisterSelfTest("syncbridge", bridgeCompatTest)
 end
