@@ -30,10 +30,12 @@ ns.Dashboard = Dashboard
 -- 268 (3px of air above its footer), and BOTTOM_H governs the instances panel too. Growing
 -- the window is the only funding source that squeezes nothing — the dock, the instances
 -- panel and every other metric are untouched. The window is fixed-size (not resizable), so
--- this is purely 23 more pixels of content. Arithmetic:
---     body = 643 - HEADER_H 34 = 609 = DETAIL_H 315 + GUTTER 10 + BOTTOM_H 268 + 2*MARGIN 16
-local DEFAULT_W, DEFAULT_H = 1120, 643
-local MIN_W, MIN_H = 1120, 643
+-- this is purely more pixels of content. ROUND-20 grows it again, 643 -> 661 (+18), to
+-- STACK the raid-lockout block (eyebrow on its own line above the keys) — same funding
+-- rule, same reason: the dock is still at its floor, so BOTTOM_H cannot pay. Arithmetic:
+--     body = 648 - HEADER_H 34 = 614 = DETAIL_H 320 + GUTTER 10 + BOTTOM_H 268 + 2*MARGIN 16
+local DEFAULT_W, DEFAULT_H = 1120, 648
+local MIN_W, MIN_H = 1120, 648
 local HEADER_H = 34    -- round-13: tab strip removed, so the titlebar tightens (was 44);
                        -- the reclaimed 10px goes to the body (DETAIL_H grows to match)
 local TAB_H    = 34    -- retained constant (unused by the fixed layout)

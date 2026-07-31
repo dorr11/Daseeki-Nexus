@@ -29,9 +29,11 @@ ns.Detail = Detail
 ----------------------------------------------------------------------
 -- Layout tokens (whole-px; mockup values).
 ----------------------------------------------------------------------
-local PAD_V     = 12
+local PAD_V     = 10          -- round-20b: 12 -> 10, compressing the header band upward
 local PAD_H     = 14
-local HEADER_H  = 40          -- header band height (name row + border-bottom)
+local HEADER_H  = 31          -- header band height. ROUND-20b: was 40 but the code rendered
+                              -- HEADER_H-6 (34) — the mismatch my round-18 alignment modelled
+                              -- wrongly. Now literal: SetHeight(HEADER_H), no hidden -6.
 local COL_R_W   = 214         -- right column fixed width (mockup dgrid 1fr / 214px)
 local COL_GAP   = 14
 -- Buff display (owner round-3 verdict): a LABELED ROW LIST (return to the pre-rebuild
@@ -48,8 +50,15 @@ local BUFF_ROW_H  = 18        -- buff row height (round-4: 18 so all 10 slots fi
 local BUFF_ROW_GAP = 2        -- ROUND-19: restored 1 -> 2 (pitch 19 -> 20). Round-17 had cut
                               -- this to buy the header-rule padding, under protest; the
                               -- round-19 pane growth repays that debt. 10*18+9*2 = 198px.
-local LOCK_H      = 13        -- round-19: the bottom-left RAID LOCKOUTS line
-local LOCK_GAP    = 6         -- ...and the air between it and the buff list
+-- ROUND-20 (owner): the bottom-left RAID LOCKOUTS block is STACKED — eyebrow on its own
+-- line, the seven raid keys on the line below — instead of round-19's single inline row.
+-- Block = LOCK_LBL_H + LOCK_LBL_GAP + LOCK_H = 31, plus LOCK_GAP above it = 37 (was 19),
+-- so it costs +18, funded by the window growing 643 -> 661 on the same rule as round-19.
+local LOCK_H      = 13        -- the raid-keys line
+local LOCK_LBL_H  = 12        -- the "RAID LOCKOUTS" eyebrow line
+local LOCK_LBL_GAP = 6        -- eyebrow -> keys (matches round-13's +6 header breathing room)
+local LOCK_GAP    = 6         -- air between the buff list and the block
+local LOCK_BLOCK  = LOCK_LBL_H + LOCK_LBL_GAP + LOCK_H   -- 31
 local NOTE_H      = 66        -- round-19: NOTE grew into the space RAID LOCKOUTS vacated
                               -- in the right column (22 -> 66, multi-line)
 -- Round-17 (owner, yellow arrow): the header's bottom hairline was OVERLAPPING the column
@@ -223,14 +232,14 @@ end
 -- ROUND-19: the limit now also reserves the bottom-left RAID LOCKOUTS line, so `fits`
 -- means "the 10-row list AND the lockout line both clear the bottom pad".
 function Detail.BuffListFit(paneH, rows)
-    paneH = paneH or 315          -- detail.pane height (LAYOUT_SPEC, round-19)
+    paneH = paneH or 320          -- detail.pane height (LAYOUT_SPEC, round-20)
     rows  = rows or 10            -- all 10 aura slots applicable = the worst case
     local listTop = -Detail.GridTop() + BUFF_TOP
     local listH   = rows * BUFF_ROW_H + (rows - 1) * BUFF_ROW_GAP
-    local limit   = paneH - PAD_V - (LOCK_H + LOCK_GAP)   -- lockout line is reserved
+    local limit   = paneH - PAD_V - (LOCK_BLOCK + LOCK_GAP)  -- stacked lockout block reserved
     return {
         listTop = listTop, listH = listH, limit = limit,
-        lockH   = LOCK_H + LOCK_GAP,
+        lockH   = LOCK_BLOCK + LOCK_GAP,
         bottom  = listTop + listH,
         slack   = limit - (listTop + listH),
         fits    = (listTop + listH) <= limit,
@@ -450,7 +459,7 @@ function Detail.Attach(parent)
     local header = CreateFrame("Frame", nil, parent)
     header:SetPoint("TOPLEFT", parent, "TOPLEFT", PAD_H, -PAD_V)
     header:SetPoint("TOPRIGHT", parent, "TOPRIGHT", -PAD_H, -PAD_V)
-    header:SetHeight(HEADER_H - 6)
+    header:SetHeight(HEADER_H)
     tag(header, "detail.header")
     D.header = header
 
@@ -496,7 +505,7 @@ function Detail.Attach(parent)
     buffRows:SetPoint("TOPLEFT", leftCol, "TOPLEFT", 0, -BUFF_TOP)
     -- Round-19: the list now stops above the bottom-left RAID LOCKOUTS line (offset by
     -- creation-order-independent arithmetic rather than anchoring to a later-built frame).
-    buffRows:SetPoint("BOTTOMRIGHT", leftCol, "BOTTOMRIGHT", 0, LOCK_H + LOCK_GAP)
+    buffRows:SetPoint("BOTTOMRIGHT", leftCol, "BOTTOMRIGHT", 0, LOCK_BLOCK + LOCK_GAP)
     tag(buffRows, "detail.buffrows")
     D.buffRows = buffRows
 
@@ -576,14 +585,16 @@ function Detail.Attach(parent)
     -- The three-state ink (round-17: locked danger / attuned ok / not-attuned faint) and
     -- TALLY_ORDER are unchanged; only the home moved. This is what freed the right column
     -- for the NOTE box to grow.
-    local raidLbl = microLabel(leftCol, "RAID LOCKOUTS")
-    raidLbl:SetPoint("BOTTOMLEFT", leftCol, "BOTTOMLEFT", 0, 0)
-    tag(raidLbl, "detail.raidlabel")
+    -- ROUND-20: STACKED — the keys sit on the column's bottom line and the eyebrow rides
+    -- directly above them ("the header should be above the raids").
     local tallyFS = fstr(leftCol, "numeral")
-    tallyFS:SetPoint("LEFT", raidLbl, "RIGHT", 10, 0)
+    tallyFS:SetPoint("BOTTOMLEFT", leftCol, "BOTTOMLEFT", 0, 0)
     tallyFS:SetPoint("RIGHT", leftCol, "RIGHT", 0, 0)
     tallyFS:SetJustifyH("LEFT"); tallyFS:SetWordWrap(false)
     D.tallyFS = tallyFS
+    local raidLbl = microLabel(leftCol, "RAID LOCKOUTS")
+    raidLbl:SetPoint("BOTTOMLEFT", tallyFS, "TOPLEFT", 0, LOCK_LBL_GAP)
+    tag(raidLbl, "detail.raidlabel")
 
     -- NOTE block — PINNED TO THE PANE BOTTOM (owner round-4 item 2): the editbox sits
     -- flush at the right column's bottom (just above the dock divider), the label rides
@@ -930,30 +941,34 @@ local function testDetailGeometry(fails)
     local function ck(c, m) if not c then fails[#fails + 1] = m end end
     -- ROUND-18: the hairline was raised 2px to line up with the first card's top rail, so
     -- the grid follows: PAD_V 12 + HEADER_H 40 + HRULE_GAP 4 + GRID_GAP 6.
-    ck(Detail.GridTop() == -62, "grid top -62 (below the hairline, +6 clear air)")
-    local ruleY = -(12 + 40 + 4)
+    ck(Detail.GridTop() == -51, "grid top -51 (below the hairline, +6 clear air)")
+    local ruleY = -(10 + 31 + 4)
     ck(Detail.GridTop() < ruleY, "eyebrows start BELOW the rule (the round-17 bug)")
     ck(ruleY - Detail.GridTop() == 6, "exactly 6px of air between rule and eyebrow")
 
     -- CROSS-PANEL ALIGNMENT (round-18 item 3): the detail hairline and the cards list top
     -- must share a screen Y. Both panels hang off the same body top rail (MARGIN), so the
     -- two offsets have to match exactly. cards side = CHIP_H(44) + LIST_PAD(12).
-    ck(Detail.HeaderRuleOffset() == 56,
-        "detail rule sits 56 below the panel top (got " .. tostring(Detail.HeaderRuleOffset()) .. ")")
-    ck(Detail.HeaderRuleOffset() == 44 + 12,
-        "...which is exactly CHIP_H + LIST_PAD, i.e. the first card's top rail")
+    ck(Detail.HeaderRuleOffset() == 45,
+        "detail rule sits 45 below the panel top (got " .. tostring(Detail.HeaderRuleOffset()) .. ")")
+    ck(Detail.HeaderRuleOffset() == 1 + 44,
+        "...which is exactly the cards chip-bar RULE offset (1 + CHIP_H) — the owner reference")
 
     -- ROUND-19: pane grew 292 -> 315 (window 620 -> 643), the 2px row gap is restored, and
     -- the bottom-left RAID LOCKOUTS line is reserved out of the usable height.
-    local f = Detail.BuffListFit(315, 10)
+    -- ROUND-20: the lockout block STACKED (eyebrow above the keys), so it reserves 37 not
+    -- 19, and the pane grew 315 -> 333 (window 643 -> 661) to pay the +18.
+    local f = Detail.BuffListFit(320, 10)
     ck(f.listH == 198, "10 rows at the RESTORED pitch 20 = 198px (got " .. tostring(f.listH) .. ")")
-    ck(f.listTop == 86, "list starts at 86 (62 grid + 24 eyebrow offset)")
-    ck(f.lockH == 19, "lockout line reserves 19px (13 line + 6 gap)")
-    ck(f.limit == 284, "usable bottom is 284 (315 pane - 12 pad - 19 lockout)")
-    ck(f.fits == true, "10 rows AND the lockout line fit the 315px pane")
+    ck(f.listTop == 75, "list starts at 75 (51 grid + 24 eyebrow offset)")
+    ck(f.lockH == 37, "stacked lockout block reserves 37px (12 label + 6 + 13 keys + 6 gap)")
+    ck(f.limit == 273, "usable bottom is 273 (320 pane - 10 pad - 37 lockout block)")
+    ck(f.fits == true, "10 rows AND the stacked lockout block fit the 320px pane")
     ck(f.slack == 0, "the pane is sized EXACTLY (0 slack, got " .. tostring(f.slack) .. ")")
-    -- 315 is the minimum that works: one px less and the 10th row collides with lockouts.
-    ck(Detail.BuffListFit(314, 10).fits == false, "314 would NOT fit — 315 is the true minimum")
+    -- 333 is the minimum that works: one px less and the 10th row collides with lockouts.
+    ck(Detail.BuffListFit(319, 10).fits == false, "319 would NOT fit — 320 is the true minimum")
+    -- Stacking cost exactly +18 over round-19's inline row; that is the window growth.
+    ck(f.lockH - 19 == 18, "stacking cost +18px, which is the 643 -> 661 window growth")
     -- And the debt really is repaid: the old 1px gap is no longer what makes it fit.
     ck(198 - (10 * 18 + 9 * 1) == 9, "restoring the gap cost 9px, funded by the +23 growth")
 end

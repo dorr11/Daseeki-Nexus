@@ -42,7 +42,7 @@ local MARGIN     = 8        -- window edge -> outer panels (tight left margin, i
 local GUTTER     = 10       -- base-colored gap between panels
 local CARDS_W    = 352      -- cards panel width (shifted left; right side gains room)
 local RIGHT_X    = MARGIN + CARDS_W + GUTTER   -- 370: left edge of the right cluster
-local DETAIL_H   = 315      -- detail panel height (upper right). Round-13: +10 absorbing the
+local DETAIL_H   = 320      -- detail panel height (upper right). Round-13: +10 absorbing the
                             -- reclaimed header space (HEADER_H 44->34). ROUND-19: 292 -> 315
                             -- (+23), funded by the window growing 620 -> 643, to seat RAID
                             -- LOCKOUTS bottom-left and restore the 2px buff-row gap:
@@ -971,6 +971,8 @@ Dashboard.RegisterTab("characters", function(host)
     local chipRule = UI.Hairline(cardsP, { token = "borderLite" })
     chipRule:SetPoint("BOTTOMLEFT", chipbar, "BOTTOMLEFT", 0, 0)
     chipRule:SetPoint("BOTTOMRIGHT", chipbar, "BOTTOMRIGHT", 0, 0)
+    tag(chipRule, "cards.chiprule")   -- round-20b: the owner-drawn reference line; the
+                                      -- detail header rule is pinned to this Y in LAYOUT_SPEC
 
     -- Filter SEGMENTED control (one housing, 60S | ONLINE | SUMMONERS), left side.
     local filterSeg = makeFilterSegmented(chipbar, pane)
