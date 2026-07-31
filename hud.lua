@@ -50,6 +50,28 @@ function HUD._PartitionFrozen(list)
     return m, s
 end
 
+-- ── A12.1 — alert dedup windows, PER CATEGORY ────────────────────────────────
+-- Declared up here (above the DaseekiUI guard, like the group logic) so the
+-- policy is pure, headless-testable and cannot be skipped when Core is absent.
+-- The dispatcher below consumes HUD.DedupWindow.
+--
+--   * pull timers     -> 10s  (a real pull genuinely re-announces)
+--   * every other cat -> 60s  (quest hand-in, NPC died / respawned, CD warning,
+--     CD expired, buff gain). With local + mesh + third-party + boss-mod ingest
+--     the same event arrived up to 4x inside the old flat 3s window and alerted
+--     for every one of them.
+--   * Battle Shout is EXEMPT from dedup entirely — it is a short, repeatedly
+--     recast raid buff and suppressing repeats would hide real re-applications.
+local DEDUP_WINDOWS = { pullTimer = 10 }
+local DEDUP_DEFAULT = 60          -- seconds, every other category
+local DEDUP_EXEMPT  = { battleShout = true }
+
+-- PURE: the dedup window in seconds for a (buff, category) pair. 0 = exempt.
+function HUD.DedupWindow(buffKey, eventType)
+    if DEDUP_EXEMPT[buffKey] then return 0 end
+    return DEDUP_WINDOWS[eventType] or DEDUP_DEFAULT
+end
+
 -- Group-jump regression suite (headless — no DaseekiUI needed).
 ns:RegisterSelfTest("hudgroups", function(verbose)
     local pass = true
@@ -70,6 +92,24 @@ ns:RegisterSelfTest("hudgroups", function(verbose)
     local z = { key = "onyH", rem = 999, zoneRelevant = true }
     HUD._AssignGroups({ z }, threshold)
     check(z.group == "main", "zone-relevant -> main")
+
+    -- A12.1: per-category alert dedup windows. Pull timers 10s, everything else
+    -- 60s, Battle Shout exempt (0). The old flat 3s let the same event through
+    -- up to 4x when local + mesh + third-party + boss-mod all reported it.
+    check(HUD.DedupWindow("rend", "pullTimer") == 10, "pullTimer dedup window is 10s")
+    check(HUD.DedupWindow("zg", "pullTimer") == 10,
+        "pullTimer dedup is per-CATEGORY, not per-buff")
+    local others = { "questHandin", "npcDied", "npcRespawned",
+                     "cdWarning", "cdExpired", "buffGain" }
+    for i = 1, #others do
+        check(HUD.DedupWindow("ony", others[i]) == 60, others[i] .. " dedup window is 60s")
+    end
+    check(HUD.DedupWindow("ony", "somethingNew") == 60, "unknown category defaults to 60s")
+    -- Battle Shout is exempt in EVERY category, pull timers included.
+    check(HUD.DedupWindow("battleShout", "buffGain") == 0, "Battle Shout exempt (buffGain)")
+    check(HUD.DedupWindow("battleShout", "pullTimer") == 0, "Battle Shout exempt (pullTimer)")
+    check(HUD.DedupWindow("battleShout", "cdWarning") == 0, "Battle Shout exempt (cdWarning)")
+
     if verbose then ns:Print("  hudgroups selftest " .. (pass and "PASS" or "FAIL")) end
     return pass
 end)
@@ -307,7 +347,8 @@ end
 -- callbacks) and HUD.TestAlert (owner Test buttons; bypasses dedup + raid).
 ----------------------------------------------------------------------
 
-local DEDUP_WINDOW = 3            -- seconds
+-- A12.1: the per-category dedup windows live above the DaseekiUI guard (see
+-- HUD.DedupWindow near the top of this file) so they stay headless-testable.
 local lastAlertAt = {}           -- "buff:event" -> frameClock
 
 -- alerts matrix lookup (EVENT-MAJOR now — item 14): alerts[eventType][buffKey].
@@ -333,10 +374,11 @@ local function dispatch(buffKey, eventType, message, opts)
     local row = alertRow(buffKey, eventType)
     local test = opts.test == true
 
-    if not test then
+    local window = HUD.DedupWindow(buffKey, eventType)
+    if not test and window > 0 then
         local dkey = buffKey .. ":" .. eventType
         local t = frameClock()
-        if lastAlertAt[dkey] and (t - lastAlertAt[dkey]) < DEDUP_WINDOW then
+        if lastAlertAt[dkey] and (t - lastAlertAt[dkey]) < window then
             return   -- deduped
         end
         lastAlertAt[dkey] = t

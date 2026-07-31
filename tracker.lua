@@ -942,7 +942,52 @@ end
 -- Full capture + debounce
 ----------------------------------------------------------------------
 
-function Tracker.Capture()
+----------------------------------------------------------------------
+-- A10.1 — the state-push CHANGE FILTER lives here.
+--
+-- Capture is bound to UNIT_AURA, BAG_UPDATE_DELAYED, BAG_UPDATE_COOLDOWN,
+-- resting, flags, XP and exhaustion. Firing STATE_CHANGED unconditionally at
+-- the end of every capture meant a raid produced a continuous stream of full
+-- state whispers to every peer plus two backup relays, saturating the 8-token /
+-- 1-per-second bucket and starving the heartbeat behind it — which is what made
+-- live peers read OFFLINE. We now fire ONLY when the record's content hash
+-- (Mesh.StateHash: volatile epochs excluded, aura durations rounded to the
+-- minute) differs from the last one we pushed.
+--
+-- FORCED pushes bypass the filter entirely (spec §9.4 forces on logout, on
+-- entering the world, and on boon/unboon casts):
+--   * PLAYER_LEAVING_WORLD / PLAYER_LOGOUT  -- the final state must always land
+--   * 1.0s after PLAYER_ENTERING_WORLD      -- spec §9.4
+--   * every FORCE_REFRESH_INTERVAL of quiet -- OURS, see below.
+--
+-- OURS: the reference has no periodic forced push at all (§9.4 lists only the
+-- event-driven forces). A max-quiet refresh is cheap insurance that a peer whose
+-- direct send was dropped, or who joined the mesh while we were idle, still
+-- converges without waiting for the next real state change. 5 minutes is well
+-- inside the dashboard's 30-minute stale flag and costs at most one whisper per
+-- peer per 5 minutes.
+----------------------------------------------------------------------
+
+Tracker.FORCE_REFRESH_INTERVAL = 300   -- OURS: max quiet before a forced push
+Tracker._lastPushHash = nil            -- content hash of the last fired state
+Tracker._lastPushAt   = 0              -- Store.Now() of that fire
+
+-- PURE-ish decision: should this capture fire STATE_CHANGED?
+-- Returns fire(bool), hash(string|nil). A nil hash (no Mesh yet, or a hasher
+-- that refused the record) always fires — the filter must never be able to
+-- silence the mesh through an error path.
+function Tracker.ShouldPush(rec, nowT, force)
+    local Mesh = ns.Mesh
+    local hash = Mesh and Mesh.StateHash and Mesh.StateHash(rec) or nil
+    if force or not hash then return true, hash end
+    if hash ~= Tracker._lastPushHash then return true, hash end
+    if (nowT - (Tracker._lastPushAt or 0)) >= Tracker.FORCE_REFRESH_INTERVAL then
+        return true, hash
+    end
+    return false, hash
+end
+
+function Tracker.Capture(force)
     if not ns.state.loggedIn then return end
     local nameRealm = selfNameRealm()
     local rec = ns.Store.EnsureSelfCharacter(nameRealm)
@@ -964,17 +1009,32 @@ function Tracker.Capture()
 
     ns.Store.WriteSelfCharacter(nameRealm, rec)
 
+    -- A10.1 change filter: the record is ALWAYS written to the store above (the
+    -- local dashboard stays live); only the MESH signal is gated.
+    local fire, hash = Tracker.ShouldPush(rec, rec.lastSeen, force)
+    if not fire then
+        Tracker._capturesFiltered = (Tracker._capturesFiltered or 0) + 1
+        return
+    end
+    Tracker._lastPushHash = hash
+    Tracker._lastPushAt   = rec.lastSeen
+
     -- Local signal for the mesh layer (wave N2). No network I/O here.
-    ns:Fire("STATE_CHANGED", nameRealm, rec)
+    ns:Fire("STATE_CHANGED", nameRealm, rec, force and true or nil)
 end
 
--- Coalesce bursty events into one capture on the next frame tick.
-function Tracker.RequestCapture()
+-- Coalesce bursty events into one capture on the next frame tick. A forced
+-- request wins the coalesce: if a plain capture is already queued, the force
+-- flag is promoted onto it rather than dropped.
+function Tracker.RequestCapture(force)
+    if force then Tracker._forcePending = true end
     if Tracker._captureQueued then return end
     Tracker._captureQueued = true
     C_Timer.After(0, function()
         Tracker._captureQueued = false
-        ns:SafeCall(Tracker.Capture)
+        local f = Tracker._forcePending
+        Tracker._forcePending = nil
+        ns:SafeCall(Tracker.Capture, f)
     end)
 end
 
@@ -1000,6 +1060,13 @@ function Tracker.OnLogin()
         -- live world. Open the partial-scan grace windows.
         Tracker._leavingWorld = false
         Tracker._enteredWorldAt = (GetTime and GetTime()) or 0
+        -- A10.1 / spec §9.4: a FORCED push 1.0s after entering the world, once
+        -- the aura and bag APIs have warmed up. This is the push that re-seeds
+        -- every peer after a /reload or a zone change, and it must bypass the
+        -- change filter (our pre-loading-screen hash is very often identical).
+        if C_Timer and C_Timer.After then
+            C_Timer.After(1.0, function() ns:SafeCall(Tracker.Capture, true) end)
+        end
     end)
 
     ns:RegisterEvent("PLAYER_LEAVING_WORLD", function()
@@ -1007,12 +1074,15 @@ function Tracker.OnLogin()
         -- Capture SYNCHRONOUSLY, not via RequestCapture: C_Timer.After(0) is not
         -- guaranteed another frame during teardown, and the mesh's final state
         -- push must carry the frozen (real) buffs rather than a cold-API scan.
-        ns:SafeCall(Tracker.Capture)
+        -- FORCED: the teardown capture preserves slots verbatim, so its hash is
+        -- usually identical to the last one — the filter would eat the final
+        -- push that the whole logout-flush path depends on.
+        ns:SafeCall(Tracker.Capture, true)
     end)
 
     ns:RegisterEvent("PLAYER_LOGOUT", function()
         Tracker._loggingOut = true
-        ns:SafeCall(Tracker.Capture)
+        ns:SafeCall(Tracker.Capture, true)
     end)
 
     local capEvents = {
@@ -1638,8 +1708,155 @@ local function testTeardownLatch(fails)
     if not ok then fails[#fails + 1] = "error in latch fixtures: " .. tostring(err) end
 end
 
+-- A10.1 — the change filter, end to end through the real Tracker.Capture.
+-- Counts actual STATE_CHANGED fires, so it proves the MESH signal is gated and
+-- (just as important) that the local store write is NOT.
+local function testChangeFilter(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+
+    local saved = {
+        auras = _G.C_UnitAuras, cont = _G.C_Container, item = _G.C_Item,
+        map = _G.C_Map, getTime = _G.GetTime,
+        resting = _G.IsResting, pvp = _G.UnitIsPVP, ffa = _G.UnitIsPVPFreeForAll,
+        inInst = _G.IsInInstance, saved = _G.GetNumSavedInstances,
+        now = ns.Store.Now, settings = ns.Store.GetSettings,
+        ensure = ns.Store.EnsureSelfCharacter, write = ns.Store.WriteSelfCharacter,
+        loggedIn = ns.state.loggedIn,
+        sub = _G.GetSubZoneText, mini = _G.GetMinimapZoneText,
+    }
+    local savedLatch = {
+        Tracker._leavingWorld, Tracker._loggingOut, Tracker._enteredWorldAt,
+        Tracker._auraCapturedAt, Tracker._cdCapturedAt,
+        Tracker._lastPushHash, Tracker._lastPushAt,
+    }
+
+    local FRAME, EPOCH = 20000, 1700000000
+    local frameNow, epochNow = FRAME, EPOCH
+    _G.GetTime   = function() return frameNow end
+    ns.Store.Now = function() return epochNow end
+    ns.state.loggedIn = true
+
+    local auraList = {}
+    _G.C_UnitAuras = { GetBuffDataByIndex = function(_, i) return auraList[i] end }
+    _G.C_Container = { GetItemCooldown = function() return 0, 0, 1 end }
+    _G.C_Item = { GetItemCount = function() return 0 end }
+    _G.C_Map  = { GetBestMapForUnit = function() return nil end,
+                  GetPlayerMapPosition = function() return nil end }
+    _G.IsResting = function() return true end
+    _G.UnitIsPVP = function() return false end
+    _G.UnitIsPVPFreeForAll = function() return false end
+    _G.IsInInstance = function() return false, "none" end
+    _G.GetNumSavedInstances = function() return 0 end
+    _G.GetSubZoneText     = function() return "" end
+    _G.GetMinimapZoneText = function() return "" end
+    ns.Store.GetSettings = function() return { coordinateOverrides = {} } end
+
+    -- One durable record the capture path writes into, so consecutive captures
+    -- see the previous values exactly as they do in game.
+    local rec = {}
+    local writes = 0
+    ns.Store.EnsureSelfCharacter = function() return rec end
+    ns.Store.WriteSelfCharacter  = function() writes = writes + 1 end
+
+    -- Count STATE_CHANGED fires and remember the force flag. `counting` gates
+    -- the closure: ns has no unsubscribe, so the listener stays registered for
+    -- the session and must go inert the moment this suite finishes.
+    local fires, lastForce, counting = 0, nil, true
+    ns:On("STATE_CHANGED", function(_, _, force)
+        if not counting then return end
+        fires = fires + 1
+        lastForce = force
+    end)
+
+    local ok, err = pcall(function()
+        Tracker._leavingWorld, Tracker._loggingOut = false, false
+        Tracker._enteredWorldAt = frameNow - 60
+        Tracker._auraCapturedAt, Tracker._cdCapturedAt = nil, nil
+        Tracker._lastPushHash, Tracker._lastPushAt = nil, 0
+
+        -- Songflower Serenade: a real slot with a readable duration we control.
+        local function setAura(rem)
+            auraList = { { name = "Songflower Serenade", spellId = 15366,
+                           expirationTime = frameNow + rem } }
+        end
+
+        -- 1) FIRST capture always pushes (no prior hash).
+        --    1795s remaining == minute bucket 29 (not on a boundary, so the
+        --    10s tick in case 3 stays inside the same bucket).
+        setAura(1795)
+        Tracker.Capture()
+        ck(fires == 1, "first capture must push (got " .. fires .. ")")
+        ck(writes == 1, "first capture must write the store")
+
+        -- 2) IDENTICAL capture -> NO push, but the store is still written.
+        Tracker.Capture()
+        ck(fires == 1, "identical capture pushed anyway (fires=" .. fires .. ")")
+        ck(writes == 2, "identical capture must still write the store locally")
+
+        -- 3) VOLATILE-ONLY change: the clock moved 10s, so lastSeen /
+        --    lastDataUpdate / ownerEpoch all moved and the aura ticked 10s —
+        --    but not across a minute boundary (1795 -> 1785, both bucket 29).
+        --    Must NOT push.
+        epochNow = epochNow + 10
+        frameNow = frameNow + 10
+        setAura(1785)
+        Tracker.Capture()
+        ck(fires == 1, "volatile-only change pushed (fires=" .. fires .. ")")
+
+        -- 4) One aura MINUTE-BOUNDARY change -> push (bucket 29 -> 28).
+        setAura(1739)
+        Tracker.Capture()
+        ck(fires == 2, "aura minute boundary did not push (fires=" .. fires .. ")")
+
+        -- 5) A real content change (resting flips) -> push.
+        _G.IsResting = function() return false end
+        Tracker.Capture()
+        ck(fires == 3, "resting flip did not push (fires=" .. fires .. ")")
+
+        -- 6) FORCED capture pushes even though nothing changed, and the force
+        --    flag reaches the subscriber so Mesh.PushState skips ITS filter too.
+        lastForce = nil
+        Tracker.Capture(true)
+        ck(fires == 4, "forced capture was filtered (fires=" .. fires .. ")")
+        ck(lastForce == true, "force flag did not reach STATE_CHANGED")
+
+        -- 7) Unforced again right after -> filtered.
+        Tracker.Capture()
+        ck(fires == 4, "post-force identical capture pushed (fires=" .. fires .. ")")
+
+        -- 8) MAX-QUIET refresh (OURS, 5 min): nothing changed, but the last push
+        --    is FORCE_REFRESH_INTERVAL old, so we push anyway.
+        epochNow = epochNow + Tracker.FORCE_REFRESH_INTERVAL
+        frameNow = frameNow + Tracker.FORCE_REFRESH_INTERVAL
+        setAura(1739)                      -- unchanged content: same minute bucket
+        Tracker.Capture()
+        ck(fires == 5, "max-quiet forced refresh did not fire (fires=" .. fires .. ")")
+
+        -- 9) And it re-arms: immediately after, the filter is active again.
+        Tracker.Capture()
+        ck(fires == 5, "filter did not re-arm after the quiet refresh")
+    end)
+
+    counting = false   -- the listener is permanent; make it a no-op from here.
+
+    _G.C_UnitAuras, _G.C_Container, _G.C_Item, _G.C_Map = saved.auras, saved.cont, saved.item, saved.map
+    _G.GetTime, _G.IsResting = saved.getTime, saved.resting
+    _G.UnitIsPVP, _G.UnitIsPVPFreeForAll = saved.pvp, saved.ffa
+    _G.IsInInstance, _G.GetNumSavedInstances = saved.inInst, saved.saved
+    _G.GetSubZoneText, _G.GetMinimapZoneText = saved.sub, saved.mini
+    ns.Store.Now, ns.Store.GetSettings = saved.now, saved.settings
+    ns.Store.EnsureSelfCharacter, ns.Store.WriteSelfCharacter = saved.ensure, saved.write
+    ns.state.loggedIn = saved.loggedIn
+    Tracker._leavingWorld, Tracker._loggingOut, Tracker._enteredWorldAt = savedLatch[1], savedLatch[2], savedLatch[3]
+    Tracker._auraCapturedAt, Tracker._cdCapturedAt = savedLatch[4], savedLatch[5]
+    Tracker._lastPushHash, Tracker._lastPushAt = savedLatch[6], savedLatch[7]
+
+    if not ok then fails[#fails + 1] = "error in change-filter fixtures: " .. tostring(err) end
+end
+
 function Tracker.RunSelfTests(verbose)
     local suites = {
+        { name = "state-push change filter (A10.1)", fn = testChangeFilter },
         { name = "boon parsing", fn = testBoonParsing },
         { name = "boon block (owner 7-line fixture)", fn = testBoonBlock },
         { name = "live aura matching (apostrophe matrix)", fn = testLiveAuraMatching },
