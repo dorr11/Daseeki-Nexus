@@ -133,6 +133,19 @@ function Dashboard.WBRowContent(st, imminent)
     return "No data", "faint", false, ""
 end
 
+-- Round-16c: the songflower cell's HOVER state line. The grid cells are ~63px wide, so
+-- long node names ("North of Emerald Sanctuary") can never fit the caption and always
+-- ellipsize — the hover is where the full name and state are actually readable. Returns
+-- the state sentence + its theme token. Pure, so the timersui suite covers it headless.
+function Dashboard.SongflowerTipState(st)
+    local state = st and st.state
+    if state == "up" then return "Up", "ok" end
+    if state == "down" then
+        return "Respawning \226\128\148 " .. Dashboard.ShortDur(st.remaining), "warn"
+    end
+    return "No data", "faint"
+end
+
 -- ── DMF readout ink + copy (round-16b addendum) ──────────────────────────────
 -- The bottom-left Darkmoon readout drops its "Darkmoon:" word prefix in favour of the
 -- DMF BUFF ICON, and the remaining caption reads in the buff's own family hue (arcane
@@ -392,6 +405,19 @@ function TimersDock.Attach(parent)
         cell.nm:SetText(nodes[i].label or ("Node " .. i))
         cell.st = fstr(cell, "numeral"); cell.st:SetPoint("BOTTOMLEFT", cell, "BOTTOMLEFT", 6, 6)
         cell._nodeKey = "flower" .. i
+        -- Round-16c: hover reveals the FULL node name + live state. The caption above is
+        -- width-capped (~53px) so long names always ellipsize; this is where they read.
+        cell._label = nodes[i].label or ("Node " .. i)
+        cell:EnableMouse(true)
+        cell:SetScript("OnEnter", function(self)
+            local st = ns.Timers and ns.Timers.GetNodeState and ns.Timers.GetNodeState(self._nodeKey)
+            local line, tok = Dashboard.SongflowerTipState(st)
+            GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+            GameTooltip:AddLine(self._label, UI.Color("text"))
+            GameTooltip:AddLine(line, UI.Color(tok))
+            GameTooltip:Show()
+        end)
+        cell:SetScript("OnLeave", function() GameTooltip:Hide() end)
         D._sfCells[i] = cell
     end
 
@@ -412,27 +438,40 @@ function TimersDock.Attach(parent)
     -- Icon buttons (glyph + tooltip) in the dock's bottom-right corner. Refresh (right)
     -- pulls fresh timer data via the existing request path; Broadcast (left) pushes our
     -- snapshot to the mesh (60s throttle). The old text Broadcast button is removed.
+    -- Round-16c: the two dock buttons now carry OUR OWN glyph masks (textures/icon-*.tga,
+    -- white-on-transparent) instead of borrowed game icons, so they tint with theme tokens
+    -- like every other control: `muted` at rest, `accent` on hover. The glyphs are authored
+    -- with their own margin, so no TexCoord crop (the old 0.1-0.9 trim existed only to cut
+    -- a game icon's baked-in border). Size/tooltips/behavior are unchanged.
     local function iconButton(iconTex, tip, onClick)
         local b = CreateFrame("Button", nil, parent, "BackdropTemplate")
         b:SetSize(22, 22)
+        local ic = b:CreateTexture(nil, "ARTWORK")
+        ic:SetPoint("TOPLEFT", b, "TOPLEFT", 2, -2); ic:SetPoint("BOTTOMRIGHT", b, "BOTTOMRIGHT", -2, 2)
+        ic:SetTexture(iconTex)
+        b.icon = ic
         UI.Skin(b, function(self)
             self:SetBackdrop(UI.FLAT_BACKDROP)
             self:SetBackdropColor(UI.Color("inset"))
             self:SetBackdropBorderColor(UI.Color("borderLite"))
+            -- re-tint on ThemeChanged, honouring whichever state the cursor left us in
+            self.icon:SetVertexColor(UI.Color(self._hot and "accent" or "muted"))
         end)
-        local ic = b:CreateTexture(nil, "ARTWORK")
-        ic:SetPoint("TOPLEFT", b, "TOPLEFT", 2, -2); ic:SetPoint("BOTTOMRIGHT", b, "BOTTOMRIGHT", -2, 2)
-        ic:SetTexCoord(0.1, 0.9, 0.1, 0.9); ic:SetTexture(iconTex)
-        b.icon = ic
         b:SetScript("OnEnter", function(self)
+            self._hot = true
+            self.icon:SetVertexColor(UI.Color("accent"))
             GameTooltip:SetOwner(self, "ANCHOR_LEFT"); GameTooltip:AddLine(tip, UI.Color("text")); GameTooltip:Show()
         end)
-        b:SetScript("OnLeave", function() GameTooltip:Hide() end)
+        b:SetScript("OnLeave", function(self)
+            self._hot = nil
+            self.icon:SetVertexColor(UI.Color("muted"))
+            GameTooltip:Hide()
+        end)
         b:SetScript("OnClick", onClick)
         return b
     end
     -- Refresh (circular-arrows / time glyph) — pull fresh timer data.
-    local refreshBtn = iconButton("Interface\\Icons\\Spell_Nature_TimeStop", "Refresh timer data", function()
+    local refreshBtn = iconButton("Interface\\AddOns\\Daseeki-Nexus\\textures\\icon-refresh", "Refresh timer data", function()
         if ns.Timers and ns.Timers.RequestTimerData then
             ns:SafeCall(ns.Timers.RequestTimerData); ns:Print("requesting timer data from the mesh...")
         else
@@ -441,7 +480,7 @@ function TimersDock.Attach(parent)
     end)
     refreshBtn:SetPoint("BOTTOMRIGHT", parent, "BOTTOMRIGHT", -PAD_H, PAD_V)
     -- Broadcast (signal/horn glyph) — push our snapshot to the mesh (60s throttle).
-    local bcast = iconButton("Interface\\Icons\\INV_Misc_Horn_02", "Broadcast timers to the mesh (60s)", function()
+    local bcast = iconButton("Interface\\AddOns\\Daseeki-Nexus\\textures\\icon-broadcast", "Broadcast timers to the mesh (60s)", function()
         local t = GetTime()
         if D._lastBcast and (t - D._lastBcast) < 60 then ns:Print("broadcast throttled (60s)."); return end
         if ns.Mesh and ns.Mesh.BroadcastTimers and ns.Timers then
@@ -606,6 +645,21 @@ local function testCellContent(fails)
     ck(t == "UP?" and c == "ok", "up -> 'UP?' / ok green")
 end
 
+-- Round-16c: the songflower cell hover state line (the full name lives beside it).
+local function testSongflowerTip(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local line, tok = Dashboard.SongflowerTipState({ state = "up" })
+    ck(line == "Up" and tok == "ok", "up -> 'Up' / ok")
+    line, tok = Dashboard.SongflowerTipState({ state = "down", remaining = 13 * 60 })
+    ck(line == "Respawning \226\128\148 13m" and tok == "warn", "down -> 'Respawning — 13m' / warn")
+    line = Dashboard.SongflowerTipState({ state = "down", remaining = 45 })
+    ck(line == "Respawning \226\128\148 45s", "down under a minute -> seconds")
+    line, tok = Dashboard.SongflowerTipState({ state = "unknown" })
+    ck(line == "No data" and tok == "faint", "unknown -> 'No data' / faint")
+    line, tok = Dashboard.SongflowerTipState(nil)
+    ck(line == "No data" and tok == "faint", "nil state -> 'No data' / faint (no error)")
+end
+
 -- Round-16b addendum: the DMF readout's caption prefix + family-hue ink. Pure.
 local function testDMFReadout(fails)
     local function ck(c, m) if not c then fails[#fails + 1] = m end end
@@ -692,6 +746,7 @@ if ns.RegisterSelfTest then
         local fails = {}
         local ok = pcall(function()
             testGridLayout(fails); testCellContent(fails); testWBRow(fails); testDMFReadout(fails)
+            testSongflowerTip(fails)
         end)
         local passed = ok and #fails == 0
         if verbose and ns and ns.Print then
