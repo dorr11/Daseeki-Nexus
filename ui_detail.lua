@@ -40,8 +40,17 @@ local COL_GAP   = 14
 -- (that's the compact CARD strip, §5b). The name carries buff IDENTITY; the status
 -- column carries STATE color (Missing / duration / Boon / DMF parenthetical).
 local BUFF_ICON   = 16        -- row icon edge (cropped/framed)
-local BUFF_ROW_H  = 18        -- buff row height (round-4: 18 so all 10 slots fit the
-local BUFF_ROW_GAP = 2        -- shorter 284 pane — pitch 20, 10 rows = 200px)
+local BUFF_ROW_H  = 18        -- buff row height (round-4: 18 so all 10 slots fit the pane)
+local BUFF_ROW_GAP = 1        -- round-17: 2 -> 1 (pitch 20 -> 19). The 10-row list needs
+                              -- 10*18+9*1 = 189px; this is the 6px reclaimed to pay for
+                              -- GRID_GAP below (the pane was down to 6px of slack).
+-- Round-17 (owner, yellow arrow): the header's bottom hairline was OVERLAPPING the column
+-- eyebrows. The rule sits HRULE_GAP below the header band, but the grid started at the
+-- header's bottom edge (gridTop = -(PAD_V+HEADER_H)), i.e. 6px ABOVE the rule — so the
+-- 1px line drew straight through "WORLD BUFFS · N/N HELD". The grid now starts BELOW the
+-- rule with GRID_GAP of clear air, matching round-13's +6 feel under each column header.
+local HRULE_GAP  = 6          -- header band bottom -> the 1px hairline
+local GRID_GAP   = 6          -- hairline -> the column eyebrow labels (round-17)
 local BUFF_TOP    = 24        -- list top offset below the eyebrow label (round-13: 18->24,
                              -- +6 breathing room under the WORLD BUFFS header, even w/ CD/RAID)
 local TILE_RIM  = "borderLite"   -- neutral held/boon icon rim (pop pass — visible edge)
@@ -65,7 +74,8 @@ local BUFF_HUE = {
 }
 
 -- Open-page raid tally order + labels (BRAND_SPEC §7 L3: MC BWL ZG AQ40 Naxx Ony AQ20;
--- keys match Store.RAID_KEYS). Locked = cream ("text"), open = faint. No raid diamonds.
+-- keys match Store.RAID_KEYS). Round-17: locked = danger red, open+attuned = ok green,
+-- not attuned = faint grey (see Detail.TallyToken). No raid diamonds.
 local TALLY_ORDER = { "MC", "BWL", "ZG", "AQ40", "Naxx", "Ony", "AQ20" }
 
 local function Dash() return ns.Dashboard end
@@ -173,6 +183,48 @@ function Detail.BuffTileState(slot, rec, faction, e)
              tint = tok, durText = nil, durTok = tok, fullText = nil, spellID = meta.spellID }
 end
 
+-- Round-17 PURE geometry. GridTop is the y-offset (negative, from the pane top) where the
+-- two-column grid — and therefore each column's eyebrow label — begins: below the header
+-- band, below the hairline, plus GRID_GAP of clear air.
+function Detail.GridTop()
+    return -(PAD_V + HEADER_H + HRULE_GAP + GRID_GAP)
+end
+
+-- PURE fit check for the left column's 10-row buff list inside a `paneH`-tall pane. The
+-- pane is tight, so this is what proves the round-17 padding is actually affordable:
+--   listTop    = |GridTop| + BUFF_TOP                  (rows start below the eyebrow)
+--   listH      = n*BUFF_ROW_H + (n-1)*BUFF_ROW_GAP     (no trailing gap)
+--   limit      = paneH - PAD_V                         (bottom padding)
+-- Returns the measurements + `fits` and the leftover slack.
+function Detail.BuffListFit(paneH, rows)
+    paneH = paneH or 292          -- detail.pane height (LAYOUT_SPEC)
+    rows  = rows or 10            -- all 10 aura slots applicable = the worst case
+    local listTop = -Detail.GridTop() + BUFF_TOP
+    local listH   = rows * BUFF_ROW_H + (rows - 1) * BUFF_ROW_GAP
+    local limit   = paneH - PAD_V
+    return {
+        listTop = listTop, listH = listH, limit = limit,
+        bottom  = listTop + listH,
+        slack   = limit - (listTop + listH),
+        fits    = (listTop + listH) <= limit,
+    }
+end
+
+-- Round-17 addendum (owner): the raid tally's THREE-STATE ink.
+--   LOCKED (expiry > now) ....... danger  (red — you are saved)
+--   OPEN + attuned .............. ok      (green — you can go)
+--   OPEN + NOT attuned .......... faint   (grey — not attuned yet)
+-- `attuned` comes from the sibling's ns.Store.RaidAttuned(rec, key) -> true/false/nil.
+-- CONTRACT: nil means UNKNOWN and is treated as ATTUNED, so remote characters with no
+-- attunement data render exactly as they do today and are never spuriously greyed; only an
+-- explicit `false` greys a raid. LOCKED wins over attunement — a live lockout is the more
+-- actionable fact, and it is how the owner's rule is ordered. Pure.
+function Detail.TallyToken(isLocked, attuned)
+    if isLocked then return "danger" end
+    if attuned == false then return "faint" end
+    return "ok"
+end
+
 -- Raid tally rows + counts. locked when expiry > now.
 --   -> list { {key, full, locked, remaining} }, lockedN, openN
 function Detail.RaidTally(rec, e)
@@ -183,10 +235,17 @@ function Detail.RaidTally(rec, e)
         local expiry = rec.raidLockouts and rec.raidLockouts[key]
         local isLocked = expiry and expiry > e or false
         if isLocked then locked = locked + 1 else open = open + 1 end
+        -- Attunement (round-17 addendum) comes from the sibling-owned Store API. Guarded so
+        -- this round merges before that API lands: absent API -> nil -> treated as attuned.
+        local S = ns.Store
+        local attuned
+        if S and S.RaidAttuned then attuned = S.RaidAttuned(rec, key) end
         out[#out + 1] = {
             key = key,
             full = (D and D.RAID_FULLNAME and D.RAID_FULLNAME[key]) or key,
             locked = isLocked,
+            attuned = attuned,
+            token = Detail.TallyToken(isLocked, attuned),
             remaining = isLocked and (expiry - e) or 0,
         }
     end
@@ -376,11 +435,13 @@ function Detail.Attach(parent)
 
     -- Header bottom hairline (one sharp rule, §9 UI.Hairline). Pop pass: borderLite.
     local hrule = UI.Hairline(parent, { token = "borderLite" })
-    hrule:SetPoint("TOPLEFT", header, "BOTTOMLEFT", 0, -6)
-    hrule:SetPoint("TOPRIGHT", header, "BOTTOMRIGHT", 0, -6)
+    hrule:SetPoint("TOPLEFT", header, "BOTTOMLEFT", 0, -HRULE_GAP)
+    hrule:SetPoint("TOPRIGHT", header, "BOTTOMRIGHT", 0, -HRULE_GAP)
 
     -- ── Two-column grid below the header ────────────────────────────────────
-    local gridTop = -(PAD_V + HEADER_H)
+    -- Round-17: start the grid BELOW the hairline (+GRID_GAP), not at the header's bottom
+    -- edge — the rule used to cut through the eyebrow labels. See Detail.GridTop.
+    local gridTop = Detail.GridTop()
     -- Left column (1fr): buff grid.
     local leftCol = CreateFrame("Frame", nil, parent)
     leftCol:SetPoint("TOPLEFT", parent, "TOPLEFT", PAD_H, gridTop)
@@ -588,7 +649,8 @@ function Detail.Attach(parent)
         local list = Detail.RaidTally(rec, e)
         local parts = {}
         for _, r in ipairs(list) do
-            parts[#parts + 1] = Dd.Colored(r.key, r.locked and "text" or "faint")
+            -- Round-17 addendum: green available / red locked / grey not-attuned.
+            parts[#parts + 1] = Dd.Colored(r.key, r.token)
         end
         tallyFS:SetText(table.concat(parts, "  "))
 
@@ -762,12 +824,63 @@ local function testCaptionCompact(fails)
 end
 
 local function testRaidTally(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
     local e = 1000000
     local rec = { raidLockouts = { MC = e + 3600, BWL = e - 10, Ony = e + 7200 } }
     local list, locked, open = Detail.RaidTally(rec, e)
     if #list ~= #TALLY_ORDER then fails[#fails + 1] = "tally should list all 7 raids" end
     if locked ~= 2 then fails[#fails + 1] = "expected 2 locked (MC, Ony), got " .. locked end
     if open ~= 5 then fails[#fails + 1] = "expected 5 open, got " .. open end
+
+    -- Round-17 addendum: the three-state ink rule (pure).
+    ck(Detail.TallyToken(true,  true)  == "danger", "locked + attuned -> danger (red)")
+    ck(Detail.TallyToken(true,  false) == "danger", "locked wins over not-attuned")
+    ck(Detail.TallyToken(true,  nil)   == "danger", "locked + unknown -> danger")
+    ck(Detail.TallyToken(false, true)  == "ok",     "open + attuned -> ok (green)")
+    ck(Detail.TallyToken(false, false) == "faint",  "open + NOT attuned -> faint (grey)")
+    -- The contract that keeps remote characters rendering as they do today:
+    ck(Detail.TallyToken(false, nil)   == "ok",     "open + UNKNOWN(nil) -> ok, never grey")
+
+    -- Absent Store API (this round merges before the sibling's lands) = the nil path:
+    -- every open raid must stay green, nothing greys.
+    local savedStore = ns.Store
+    ns.Store = {}
+    local l2 = Detail.RaidTally(rec, e)
+    for _, r in ipairs(l2) do
+        ck(r.token == (r.locked and "danger" or "ok"),
+            "no RaidAttuned API -> " .. r.key .. " falls back to locked/open colours")
+    end
+    -- With the API present, an explicit false greys ONLY that raid.
+    ns.Store = { RaidAttuned = function(_, key) if key == "Naxx" then return false end return true end }
+    local l3 = Detail.RaidTally(rec, e)
+    for _, r in ipairs(l3) do
+        if r.key == "Naxx" then ck(r.token == "faint", "Naxx not attuned -> faint")
+        elseif r.locked then ck(r.token == "danger", r.key .. " locked -> danger")
+        else ck(r.token == "ok", r.key .. " open + attuned -> ok") end
+    end
+    ns.Store = savedStore
+end
+
+-- Round-17: the header-rule padding must not push the 10-row buff list out of the pane.
+local function testDetailGeometry(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    -- Grid now starts BELOW the hairline: PAD_V 12 + HEADER_H 40 + HRULE_GAP 6 + GRID_GAP 6.
+    ck(Detail.GridTop() == -64, "grid top -64 (below the hairline, +6 clear air)")
+    -- The hairline itself sits at -(PAD_V + HEADER_H + HRULE_GAP) = -58, so the eyebrow
+    -- labels now begin a clear GRID_GAP below it instead of being crossed by it.
+    local ruleY = -(12 + 40 + 6)
+    ck(Detail.GridTop() < ruleY, "eyebrows start BELOW the rule (the round-17 bug)")
+    ck(ruleY - Detail.GridTop() == 6, "exactly 6px of air between rule and eyebrow")
+
+    local f = Detail.BuffListFit(292, 10)
+    ck(f.listH == 189, "10 rows at pitch 19 = 189px (got " .. tostring(f.listH) .. ")")
+    ck(f.listTop == 88, "list starts at 88 (64 grid + 24 eyebrow offset)")
+    ck(f.limit == 280, "usable bottom is 280 (292 pane - 12 pad)")
+    ck(f.fits == true, "the 10-row list still fits the 292px pane")
+    ck(f.slack == 3, "3px slack remains (got " .. tostring(f.slack) .. ")")
+    -- Proves the reclaim was REQUIRED: at the old 2px row gap the list would overflow.
+    local wide = 10 * 18 + 9 * 2                    -- 198 = the pre-round-17 list height
+    ck(f.listTop + wide > f.limit, "at the OLD 2px gap the list would overflow the pane")
 end
 
 -- Row-list STATUS matrix (owner round-3): map a BuffTileState result -> (text, tok).
@@ -836,6 +949,7 @@ if ns.RegisterSelfTest then
             { name = "buff display matrix", fn = testBuffMatrix },
             { name = "caption compact",     fn = testCaptionCompact },
             { name = "raid tally",          fn = testRaidTally },
+            { name = "pane geometry",       fn = testDetailGeometry },
             { name = "row status",          fn = testRowStatus },
             { name = "color fns (rgb)",     fn = testColorFns },
             { name = "item icon path",      fn = testItemIconTex },
