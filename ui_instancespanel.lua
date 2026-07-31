@@ -74,6 +74,31 @@ function InstancesUI.MeterModel(counts, nowE, caps)
     return model
 end
 
+-- The cross-account TOTAL row. Deliberately NOT a MeterModel: the server enforces
+-- the 5/hr and 30/day limits PER ACCOUNT, so a sum across accounts has no cap to
+-- be measured against. Feeding it through MeterModel made the row read
+-- "Hr 9/5" in the danger token permanently the moment a second account was
+-- active -- a red meter that means nothing. The total renders as a bare count,
+-- neutral token, no cap denominator and no countdown. Pure.
+function InstancesUI.TotalModel(total)
+    total = total or {}
+    return {
+        neutral = true,
+        hour = { count = total.hour or 0, cap = nil, state = "none", token = "muted", atCap = false },
+        day  = { count = total.day  or 0, cap = nil, state = "none", token = "muted", atCap = false },
+    }
+end
+
+-- Meter row text for either model shape: "Hr 3/5" for a capped account row,
+-- "Hr 9" for the uncapped total. Pure.
+function InstancesUI.MeterText(label, cell)
+    cell = cell or {}
+    local txt = cell.cap and ("%s %d/%d"):format(label, cell.count or 0, cell.cap)
+                        or  ("%s %d"):format(label, cell.count or 0)
+    if cell.countdown then txt = txt .. " " .. InstancesUI.FormatMSS(cell.countdown) end
+    return txt
+end
+
 -- Signed copper -> "Ng Ms" / "Ms Nc" / "Nc" (compact register cell). Pure.
 function InstancesUI.FormatMoney(copper)
     copper = math.floor(tonumber(copper) or 0)
@@ -97,13 +122,23 @@ function InstancesUI.AgoText(sec)
 end
 
 -- Assemble one register-row model from an entry + resolved class. Pure.
-function InstancesUI.RowModel(entry, nameRealm, classTag, nowE)
+-- Duration comes from Instances.EntryDuration, which prefers the PERSISTED exit
+-- epoch: a run that spanned a /reload, relog, logout or disconnect used to have
+-- no closing sample at all and reported 0s forever.
+-- Gold prefers the loot-only accumulator over the wallet delta (the delta counts
+-- repairs, vendor sales, reagents and mail, so a profitable Blackrock Depths run
+-- reads negative); the delta remains the fallback for entries that predate the
+-- accumulator. XP is the level-up-safe chat total and is never negative.
+function InstancesUI.RowModel(entry, nameRealm, classTag, nowE, isOpen)
     entry = entry or {}
     local D = ns.Dashboard
+    local E = ns.Instances
     local ago = (nowE or 0) - (entry.t or 0)
     if ago < 0 then ago = 0 end
-    local gold = entry.gold or 0
-    local xp = entry.xp or 0
+    local loot = entry.goldLoot or 0
+    local gold = (loot ~= 0) and loot or (entry.gold or 0)
+    local xp = math.max(0, entry.xp or 0)
+    local dur = (E and E.EntryDuration and E.EntryDuration(entry, nowE, isOpen)) or (entry.dur or 0)
     return {
         agoText   = InstancesUI.AgoText(ago),
         nameRealm = nameRealm,
@@ -111,12 +146,14 @@ function InstancesUI.RowModel(entry, nameRealm, classTag, nowE)
         name      = (D and D.ShortName and D.ShortName(nameRealm))
                     or (nameRealm and nameRealm:match("^([^%-]+)")) or nameRealm,
         instance  = entry.name or "?",
-        durText   = (D and D.FormatDuration and D.FormatDuration(entry.dur or 0)) or (math.floor(entry.dur or 0) .. "s"),
+        dur       = dur,
+        durText   = (D and D.FormatDuration and D.FormatDuration(dur)) or (math.floor(dur) .. "s"),
         gold      = gold,
+        goldFromLoot = (loot ~= 0),
         goldText  = InstancesUI.FormatMoney(gold),
         goldToken = (gold < 0) and "danger" or "muted",
         xp        = xp,
-        xpText    = (xp ~= 0) and ((xp > 0 and "+" or "") .. xp .. " xp") or nil,
+        xpText    = (xp ~= 0) and ("+" .. xp .. " xp") or nil,
         merged    = entry.merged and true or false,
     }
 end
@@ -473,26 +510,26 @@ function InstancesPanel.Attach(host)
         -- Meter rows: one per account (numerically sorted), then the ALL total row.
         local aids = InstancesUI.SortedAccountIDs(view.accounts)
         local n, prev = 0, nil
-        local function placeMeter(label, counts)
+        -- `total` = the cross-account sum: no cap, no state colour, no countdown.
+        local function placeMeter(label, counts, total)
             if n >= MAX_METERS then return end
             n = n + 1
             local r = getMeter(n)
             r:ClearAllPoints()
             if prev then r:SetPoint("TOPLEFT", prev, "BOTTOMLEFT", 0, -METER_GAP); r:SetPoint("TOPRIGHT", prev, "BOTTOMRIGHT", 0, -METER_GAP)
             else r:SetPoint("TOPLEFT", metersTop, "TOPLEFT", 0, 0); r:SetPoint("TOPRIGHT", metersTop, "TOPRIGHT", 0, 0) end
-            local m = InstancesUI.MeterModel(counts, nowE, Inst)
-            r.label:SetText(label); r.label:SetTextColor(UI.Color("text"))
-            local hTxt = ("Hr %d/%d"):format(m.hour.count, m.hour.cap)
-            if m.hour.countdown then hTxt = hTxt .. " " .. InstancesUI.FormatMSS(m.hour.countdown) end
-            r.hour:SetText(hTxt); r.hour:SetTextColor(UI.Color(m.hour.token))
-            local dTxt = ("Day %d/%d"):format(m.day.count, m.day.cap)
-            if m.day.countdown then dTxt = dTxt .. " " .. InstancesUI.FormatMSS(m.day.countdown) end
-            r.day:SetText(dTxt); r.day:SetTextColor(UI.Color(m.day.token))
+            local m = total and InstancesUI.TotalModel(counts)
+                            or InstancesUI.MeterModel(counts, nowE, Inst)
+            r.label:SetText(label); r.label:SetTextColor(UI.Color(total and "muted" or "text"))
+            r.hour:SetText(InstancesUI.MeterText("Hr", m.hour))
+            r.hour:SetTextColor(UI.Color(m.hour.token))
+            r.day:SetText(InstancesUI.MeterText("Day", m.day))
+            r.day:SetTextColor(UI.Color(m.day.token))
             r:Show()
             prev = r
         end
         for _, aid in ipairs(aids) do placeMeter("Acct " .. aid, view.accounts[aid]) end
-        placeMeter("All", view.total)
+        placeMeter("All", view.total, true)
         for j = n + 1, #P._meters do P._meters[j]:Hide() end
 
         -- Toggle + dropdown repaint.
@@ -599,6 +636,30 @@ local function testInstancesUI(fails)
     local m4 = IU.MeterModel({ hour = 3, day = 30, nextDaySlotAt = T + 60 }, T, caps)
     ck(m4.day.atCap == true and m4.day.countdown == 60, "model: daily cap countdown")
 
+    -- A6.2 -- the cross-account TOTAL row has no cap semantics. Two accounts at
+    -- 5/5 each sum to 9-10 in an hour; run through MeterModel that reads as a
+    -- permanent red "Hr 9/5". TotalModel must stay neutral.
+    local tm = IU.TotalModel({ hour = 9, day = 41 })
+    ck(tm.neutral == true, "total: flagged neutral")
+    ck(tm.hour.count == 9 and tm.day.count == 41, "total: carries the raw sums")
+    ck(tm.hour.cap == nil and tm.day.cap == nil, "total: no cap denominator")
+    ck(tm.hour.token == "muted" and tm.day.token == "muted",
+        "total: neutral token even far over a per-account cap")
+    ck(tm.hour.atCap == false and tm.day.atCap == false, "total: never reads at-cap")
+    ck(tm.hour.countdown == nil and tm.day.countdown == nil, "total: no countdown")
+    local overCap = IU.MeterModel({ hour = 9 }, T, caps)
+    ck(overCap.hour.token == "danger" and tm.hour.token == "muted",
+        "total: same count that reddens an ACCOUNT row stays calm on the total")
+    local tm0 = IU.TotalModel(nil)
+    ck(tm0.hour.count == 0 and tm0.day.count == 0, "total: nil counts -> zeroes")
+
+    -- Meter row text: capped rows keep the denominator, the total drops it.
+    ck(IU.MeterText("Hr", { count = 3, cap = 5 }) == "Hr 3/5", "meter text: account row")
+    ck(IU.MeterText("Hr", { count = 9 }) == "Hr 9", "meter text: total row has no denominator")
+    ck(IU.MeterText("Hr", { count = 5, cap = 5, countdown = 293 }) == "Hr 5/5 4:53",
+        "meter text: countdown appended at cap")
+    ck(IU.MeterText("Day", tm.day) == "Day 41", "meter text: total day row")
+
     ck(IU.NextSlotSeconds(T + 125, T) == 125, "next-slot seconds")
     ck(IU.NextSlotSeconds(T - 10, T) == 0, "past slot clamps to 0")
     ck(IU.NextSlotSeconds(nil, T) == nil, "no slot time -> nil")
@@ -622,6 +683,29 @@ local function testInstancesUI(fails)
     ck(rM.goldToken == "danger", "row: negative gold reads danger")
     ck(rM.xpText == nil, "row: zero xp -> no xp cell")
     ck(rM.agoText == "just now", "row: sub-60s -> just now")
+
+    -- A6.3 -- a run that spanned a relog has no in-memory dur, only the PERSISTED
+    -- exit epoch. It used to render 0s forever.
+    local rRelog = IU.RowModel({ t = T - 5000, name = "Stratholme", dur = 0, exitT = T - 3200 }, "Alt-Realm", "PALADIN", T)
+    ck(rRelog.dur == 1800, "row: duration recovered from the persisted exit epoch (got " .. rRelog.dur .. ")")
+    local rNoExit = IU.RowModel({ t = T - 900, name = "Scholomance", dur = 0 }, "Alt-Realm", "PRIEST", T)
+    ck(rNoExit.dur == 900, "row: bounded now-entry fallback for an unclosed run")
+    local rAncient = IU.RowModel({ t = T - 400000, name = "Old", dur = 0 }, "Alt-Realm", "PRIEST", T)
+    ck(rAncient.dur == 0, "row: an ancient unclosed run reports 0, not days")
+    local rOpen = IU.RowModel({ t = T - 300, name = "Live", dur = 0 }, "Alt-Realm", "DRUID", T, true)
+    ck(rOpen.dur == 300, "row: the live open run reports elapsed")
+
+    -- A6.4 -- gold prefers the loot-only total; the wallet delta is the fallback.
+    local rLoot = IU.RowModel({ t = T - 60, name = "Blackrock Depths", goldLoot = 48000, gold = -12000 }, "Alt-Realm", "ROGUE", T)
+    ck(rLoot.gold == 48000, "row: loot total beats the wallet delta")
+    ck(rLoot.goldFromLoot == true, "row: flagged as loot-sourced")
+    ck(rLoot.goldToken == "muted", "row: a profitable run that repaired no longer reads danger")
+    local rWallet = IU.RowModel({ t = T - 60, name = "Dire Maul", goldLoot = 0, gold = 7000 }, "Alt-Realm", "ROGUE", T)
+    ck(rWallet.gold == 7000 and rWallet.goldFromLoot == false, "row: falls back to the wallet delta")
+
+    -- A6.5 -- XP is never negative in the cell, whatever the entry carries.
+    local rNeg = IU.RowModel({ t = T - 60, name = "Maraudon", xp = -38000 }, "Alt-Realm", "HUNTER", T)
+    ck(rNeg.xp == 0 and rNeg.xpText == nil, "row: a legacy negative xp entry renders no cell")
 
     local data = { accounts = {
             ["1"] = { characters = { ["A-R"] = { classTag = "ROGUE" } }, homeless = { ["H-R"] = { classTag = "PRIEST" } } },
