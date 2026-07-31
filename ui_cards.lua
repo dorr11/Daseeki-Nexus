@@ -54,8 +54,18 @@ local CARD_H     = 84       -- card height
 local CARD_GAP   = 6        -- gap between cards
 local CARD_PAD_H = 9        -- card horizontal padding (round-11 item 4: 11 -> 9, one step tighter)
 local CARD_PAD_V = 7        -- card vertical padding   (round-11 item 4: 9 -> 7, one step tighter)
-local TILE       = 18       -- buff strip tile edge
+-- Round-16 (owner: "increase the scale of the world buff icons"). The strip's 10 tiles
+-- share the card's BOTTOM band with the hearth icon + its countdown text, so the binding
+-- constraint is WIDTH, not height — the card never needed to grow. 22 is the largest edge
+-- that keeps the full 10-tile run clear of the countdown (24 overruns it); see the pure,
+-- headless-tested Cards.StripGeometry. Border stays 1px: on a 22px tile a 2px edge would
+-- read HEAVIER than the original (~33% of the tile vs 21% at 18/1px), so 1px preserves the
+-- §5b state-border weight; the 1px icon inset grows the visible art 16 -> 20px.
+local TILE       = 22       -- buff strip tile edge (round-16: 18 -> 22)
 local TILE_GAP   = 3
+local STRIP_TILES = 10      -- tiles in the buff strip (pool size)
+local CD_TEXT_W   = 34      -- reserve for the bottom-band countdown text ("1h05m") to the
+                            -- LEFT of the hearth icon — the strip must stop before it
 -- Round-15 item 1: the card's TOP-RIGHT corner now carries the freshness ("41m") text,
 -- so the right icon column shifts DOWN below it and compresses one step (20 -> 16, the
 -- same item-icon edge the detail pane uses) — three 16px icons + the ago band fit the
@@ -405,6 +415,28 @@ function Cards.ColumnGeometry(nSlots, iconSize)
     }
 end
 
+-- Round-16: PURE geometry for the bottom buff strip. The strip is bottom-left anchored and
+-- shares the card's bottom band with the right column's LAST slot (hearth) and that icon's
+-- countdown text, so the strip must stop before the text's left edge (`keepOut`). Returns
+-- the run width, its right edge, the keep-out limit, whether it fits, and the strip's top
+-- y-offset (negative, from the card top) so the vertical rhythm can be checked too.
+function Cards.StripGeometry(tileSize, gap, cardW)
+    tileSize = tileSize or TILE
+    gap      = gap or TILE_GAP
+    cardW    = cardW or (CARDS_W - 2 * LIST_PAD)      -- card list inner width (328)
+    local width = STRIP_TILES * tileSize + (STRIP_TILES - 1) * gap
+    local right = CARD_PAD_H + width
+    -- countdown text sits 4px left of the column icon, which is CARD_PAD_H off the edge.
+    local keepOut = cardW - CARD_PAD_H - CD_ICON - 4 - CD_TEXT_W
+    return {
+        width   = width,
+        right   = right,
+        keepOut = keepOut,
+        fits    = (right <= keepOut),
+        top     = -(CARD_H - CARD_PAD_V - tileSize),
+    }
+end
+
 -- Round-11 item 5: pure cd-icon state from remaining seconds.
 --   ready (rem <= 0) -> { border = "ok",     cd = nil }              (green border)
 --   on CD (rem > 0)  -> { border = "danger", cd = "<compact>" }      (red border + text)
@@ -606,9 +638,11 @@ local function makeCard(parent, pane)
     card.loc = fstr(card, "small"); card.loc:SetPoint("TOPLEFT", card.dot, "BOTTOMLEFT", 0, -11)
     card.loc:SetWordWrap(false)
 
-    -- Row 3: buff-icon strip (real-icon tiles; §5a lit/desat + state border).
+    -- Row 3: buff-icon strip (real-icon tiles; §5a lit/desat + state border). Round-16:
+    -- tiles scaled up to TILE (22) — the run still clears the bottom-band countdown text
+    -- (Cards.StripGeometry, headless-tested); crop + state-border language unchanged.
     card.tiles = {}
-    for i = 1, 10 do
+    for i = 1, STRIP_TILES do
         local t = CreateFrame("Frame", nil, card, "BackdropTemplate")
         t:SetSize(TILE, TILE)
         if i == 1 then t:SetPoint("BOTTOMLEFT", card, "BOTTOMLEFT", CARD_PAD_H, CARD_PAD_V)
@@ -1404,6 +1438,35 @@ local function testCardCorner(fails)
     ck(Cards.ColumnGeometry(3, 20).fits == false, "old 20px ladder would NOT fit with the ago band")
 end
 
+-- Round-16: the scaled-up buff strip must still clear the bottom-band countdown text, and
+-- the round-15 ladder must be UNAFFECTED (the strip grew in width/height, not the card).
+local function testStripGeometry(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+
+    local s = Cards.StripGeometry()                     -- live config (TILE 22 / gap 3)
+    ck(s.width == 247, "10 tiles + 9 gaps = 247 wide (got " .. tostring(s.width) .. ")")
+    ck(s.right == 256, "strip right edge 256")
+    ck(s.keepOut == 265, "countdown keep-out starts at 265")
+    ck(s.fits == true, "scaled strip clears the bottom-band countdown text")
+    ck(s.top == -55, "strip top -55 (bottom-anchored, 22 tall)")
+
+    -- The owner asked for 22-24; 24 is the size we REJECTED — prove why (it overruns).
+    ck(Cards.StripGeometry(24, 3).fits == false, "24px tiles would overrun the countdown text")
+    ck(Cards.StripGeometry(23, 3).fits == false, "23px tiles would overrun too — 22 is the max")
+    -- The pre-round-16 size obviously fit; the new one is genuinely bigger.
+    ck(Cards.StripGeometry(18, 3).fits == true, "old 18px strip fit (sanity)")
+    ck(s.width > Cards.StripGeometry(18, 3).width, "strip is meaningfully wider than before")
+
+    -- Ladder intact: nothing the column depends on changed, so round-15's math still holds.
+    local g = Cards.ColumnGeometry(3)
+    ck(g.fits == true and g.slots[3] == -61 and g.bottom == 77,
+        "round-15 icon ladder unchanged by the strip scale-up")
+    -- Strip and the last ladder slot SHARE the bottom band vertically — they must be
+    -- separated HORIZONTALLY, which is exactly what keepOut guarantees.
+    ck(s.top > g.slots[3] - 1, "strip and hearth slot share the bottom band (expected)")
+    ck(s.right < s.keepOut, "...so horizontal separation is what keeps them apart")
+end
+
 if ns.RegisterSelfTest then
     ns:RegisterSelfTest("cards", function(verbose)
         local cases = {
@@ -1416,6 +1479,7 @@ if ns.RegisterSelfTest then
             { name = "on-accent label",   fn = testOnAccentTextColor },
             { name = "hover peek",        fn = testPeek },
             { name = "card corner",       fn = testCardCorner },
+            { name = "strip geometry",    fn = testStripGeometry },
         }
         local allPass = true
         for _, c in ipairs(cases) do
