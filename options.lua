@@ -293,15 +293,86 @@ local function FS() return ns.Store and ns.Store.GetFactionSettings and ns.Store
 -- Per-page refresher registries (called on faction toggle / section show).
 -- `alerts` is the split-off event matrix page (was folded into `timers`); `wizard`
 -- serves the first-run setup dialog's live get/set widgets.
+-- `meshLive` is a SUBSET of `mesh`: only the rows that track state which changes
+-- on its own (peer online/last-seen, account count, tombstone expiry). The 2s
+-- live ticker repaints that subset instead of the whole Mesh page, so the
+-- credential fields, checkboxes and status lines are simply never in the
+-- ticker's path (cheaper, and one less way to stomp on a field being edited).
 local refreshers = { auras = {}, automation = {}, mesh = {}, general = {}, timers = {},
-                     alerts = {}, blacklist = {}, wizard = {}, instances = {}, help = {} }
+                     alerts = {}, blacklist = {}, wizard = {}, instances = {}, help = {},
+                     meshLive = {} }
 local function register(page, fn) local l = refreshers[page]; l[#l + 1] = fn end
+-- Register a live Mesh row on BOTH lists: the ticker refreshes it every 2s, and a
+-- normal refreshPage("mesh") still covers it like any other row.
+local function registerLive(fn) register("mesh", fn); register("meshLive", fn) end
 local function refreshPage(page)
     local l = refreshers[page]
     for i = 1, #l do
         local ok, err = pcall(l[i])
         if not ok then geterrorhandler()(err) end
     end
+end
+
+----------------------------------------------------------------------
+-- Edit-focus guard (live-refresh clobber fix)
+--
+-- Every page refresher repaints its widgets from the store, and the Mesh page
+-- runs a 2s live ticker on top of that. A repaint that SetText()s an editbox the
+-- user is CURRENTLY typing in wipes the in-progress input. On the masked
+-- Channel/Token fields it read as the field "nulling out" mid-word, because the
+-- mask of a still-empty stored value is the empty string.
+--
+-- Rule: never SetText an editbox that owns keyboard focus. The test is made per
+-- call against HasFocus() and NOTHING is remembered between calls -- so the
+-- instant focus goes away (Enter commits, Escape reverts, clicking away
+-- abandons) the very next refresh paints the stored value again, exactly as
+-- before this fix.
+----------------------------------------------------------------------
+
+-- Resolve a widget to its EditBox: accepts a raw EditBox or a DaseekiUI editbox
+-- host frame (which carries the real box on .editBox). Returns nil for anything
+-- that is not an editbox (labels, checkboxes, tables) so callers stay honest.
+local function editBoxOf(w)
+    if type(w) ~= "table" then return nil end
+    local eb = w.editBox or w
+    if type(eb) ~= "table" or type(eb.HasFocus) ~= "function" then return nil end
+    return eb
+end
+
+-- True only while the user is actually typing in this widget.
+local function isEditing(w)
+    local eb = editBoxOf(w)
+    return (eb and eb:HasFocus()) and true or false
+end
+
+-- Make a widget's own .Refresh focus-safe wherever it is called from: page
+-- refreshers, the live ticker, and the DaseekiUI builder's own OnShow. Idempotent.
+-- The unguarded repaint stays reachable as .RefreshForce for the few explicit
+-- user actions that must repaint right now (see forceRepaint).
+local function guardEdit(w)
+    if type(w) ~= "table" or type(w.Refresh) ~= "function" or w._focusGuarded then return w end
+    local raw = w.Refresh
+    w._focusGuarded = true
+    w.RefreshForce = raw
+    w.Refresh = function(...)
+        if isEditing(w) then return end
+        return raw(...)
+    end
+    return w
+end
+
+-- Repaint a field NOW, on an explicit user action (reveal toggle, Reset button).
+-- If the field is mid-edit, `commit ~= false` runs the box's own Enter handler
+-- first so the keystrokes are SAVED rather than painted over; commit == false
+-- drops them (that is what "Reset to default" means).
+local function forceRepaint(w, commit)
+    local eb = editBoxOf(w)
+    if eb and eb:HasFocus() then
+        local onEnter = (commit ~= false) and eb.GetScript and eb:GetScript("OnEnterPressed")
+        if onEnter then onEnter(eb) else eb:ClearFocus() end
+    end
+    local fn = type(w) == "table" and (w.RefreshForce or w.Refresh)
+    if fn then fn() end
 end
 
 -- Icon for an aura spell (cosmetic; guarded, question-mark fallback).
@@ -461,6 +532,7 @@ local function buildTextArea(flow, opts)
 
     host.editBox = box
     host.Refresh = function() box:SetText(opts.get and (opts.get() or "") or "") end
+    guardEdit(host)   -- never repaint the buffer out from under a typist
     host.arrange = function(width)
         host:SetWidth(width); host:SetHeight(height)
         -- Fill the viewport; the multiline editbox scrolls its own content natively
@@ -722,6 +794,12 @@ function buildCoordPane(flow)
     end)
 
     local rebuild   -- forward
+    -- Focus-guarded cell paint: a rebuild fires whenever ANY cell commits (and on
+    -- Here / Del / Add), which would otherwise rewrite the sibling cell the user
+    -- has just clicked into and is typing in.
+    local function paintCell(cell, text)
+        if not isEditing(cell) then cell:SetText(text) end
+    end
     local function makeCell(row, x, w)
         local box = CreateFrame("EditBox", nil, row, "BackdropTemplate")
         box:SetSize(w, 22); box:SetPoint("LEFT", row, "LEFT", x, 0)
@@ -755,10 +833,10 @@ function buildCoordPane(flow)
             end
             local idx = i
             row.num:SetText(tostring(idx))
-            row.name:SetText(rules[idx].label or "")
-            row.x:SetText(fmt(cx(rules[idx])))
-            row.y:SetText(fmt(cy(rules[idx])))
-            row.tol:SetText(fmt(tolOf(rules[idx])))
+            paintCell(row.name, rules[idx].label or "")
+            paintCell(row.x,   fmt(cx(rules[idx])))
+            paintCell(row.y,   fmt(cy(rules[idx])))
+            paintCell(row.tol, fmt(tolOf(rules[idx])))
             local function bindText(box, apply)
                 box:SetScript("OnEnterPressed", function(self) apply(self:GetText()); self:ClearFocus(); rebuild() end)
                 box:SetScript("OnEditFocusLost", function(self) apply(self:GetText()); rebuild() end)
@@ -858,10 +936,12 @@ function buildClassColors(flow)
         })
         box._fillWidth = false
         box.editBox:SetMaxLetters(6)
+        guardEdit(box)
         row:Button({ text = "Reset", width = 66, variant = "quiet", pin = "right", onClick = function()
             local db = DB(); if not db then return end
             db.classColors[class] = DEFAULTS[class]
-            if box.Refresh then box.Refresh() end
+            -- Explicit reset: discard any half-typed hex, then repaint the default.
+            forceRepaint(box, false)
             paint()
         end })
         register("general", function() if box.Refresh then box.Refresh() end; paint() end)
@@ -925,11 +1005,17 @@ local function buildMesh(flow)
             end,
         })
         box._fillWidth = false
+        -- THE reported bug: this field is masked, so a live-ticker repaint mid-typing
+        -- painted the mask of the still-unsaved value ("" -> the field emptied itself
+        -- as you typed). Guarded, the box is left alone until focus leaves it.
+        guardEdit(box)
         local eyeBtn
         eyeBtn = row:Button({ text = "Show", width = 48, variant = "quiet", onClick = function()
             revealed.on = not revealed.on
             eyeBtn._label:SetText(revealed.on and "Hide" or "Show")
-            if box.Refresh then box.Refresh() end
+            -- Reveal/hide must repaint even while focused; commit first so toggling
+            -- mid-edit saves what you typed instead of discarding it.
+            forceRepaint(box)
         end })
         status = row:Label("")
         register("mesh", function()
@@ -986,6 +1072,7 @@ local function buildMesh(flow)
         end,
     })
     acctBox._fillWidth = false
+    guardEdit(acctBox)   -- same page, same 2s ticker: same guard
     acctStatus = acctRow:Label("")
     flow:Hint("1-2 digits (e.g., 1, 02). Must be different on each account.")
 
@@ -1113,7 +1200,7 @@ local function buildMesh(flow)
     -- (Section description intentionally omitted — owner crossed out the
     -- "Account-wide. Local management only…" line; header + table remain.)
     local capLabel = acc:AddRow():Label("Mesh capacity: 1 / " .. MESH_CAP)
-    register("mesh", function()
+    registerLive(function()
         capLabel._label:SetText("Mesh capacity: " .. math.min(MESH_CAP, math.max(1, knownAccountCount())) .. " / " .. MESH_CAP)
     end)
 
@@ -1157,7 +1244,7 @@ local function buildWizardContent(flow)
     local s1 = flow:AddRow({ vAlign = "center" })
     s1:Label("Account ID")
     local s1status
-    local s1box = s1:EditBox({
+    local s1box = s1:EditBox({   -- guarded below; the wizard re-refreshes on every set
         width = 70,
         get = function() return ns:GetAccountID() end,
         set = function(v)
@@ -1170,6 +1257,7 @@ local function buildWizardContent(flow)
         end,
     })
     s1box._fillWidth = false
+    guardEdit(s1box)
     s1status = s1:Label("")
     register("wizard", function()
         if s1box.Refresh then s1box.Refresh() end
@@ -1384,7 +1472,7 @@ function buildAccountsTable(flow)
         if i == 0 then child:SetHeight(1) end
     end
     host._rebuild = rebuild
-    register("mesh", rebuild)
+    registerLive(rebuild)   -- peer online / last-seen move on their own: ticker row
     UI.Skin(host, rebuild)
     flow.pane:AddBlock(host, host.arrange, 10, 0)
 end
@@ -1446,7 +1534,7 @@ function buildTombstonesTable(flow)
         host._empty:SetShown(i == 0)
     end
     host._rebuild = rebuild
-    register("mesh", rebuild)
+    registerLive(rebuild)   -- expiry countdown ticks on its own: ticker row
     UI.Skin(host, rebuild)
     flow.pane:AddBlock(host, host.arrange, 10, 0)
 end
@@ -1513,6 +1601,7 @@ local function buildAuras(flow)
             set = function(v) local t = thr(); if t then t.minimum = (tonumber(v) or 0) * 60 end end,
         })
         mBox._fillWidth = false
+        guardEdit(nBox); guardEdit(mBox)
         register("auras", function() if nBox.Refresh then nBox.Refresh() end; if mBox.Refresh then mBox.Refresh() end end)
     end
 
@@ -1687,6 +1776,7 @@ local function buildAutomation(flow)
         set = function(v) local fs = FS(); if fs then fs.autoGroup.inviteKeyword = tostring(v or ""):gsub("%s", "") end end,
     })
     kwBox._fillWidth = false
+    guardEdit(kwBox)
     register("automation", function() if kwBox.Refresh then kwBox.Refresh() end end)
 
     -- ── Invite whitelist (Enable toggle + inline editor, round-3 items 35 / 29) ──
@@ -1746,6 +1836,7 @@ local function buildAutomation(flow)
         end,
     })
     winBox._fillWidth = false
+    guardEdit(winBox)
     win:Label("(5-3600)", { muted = true })
     register("automation", function() if winBox.Refresh then winBox.Refresh() end end)
 
@@ -2233,8 +2324,11 @@ local function buildBlacklist(flow)
     pz:Hint("Permanently remove all stored data for another account. You cannot purge your own account.")
     local paRow = pz:AddRow({ vAlign = "center" })
     paRow:Label("Account ID")
+    -- get() is a constant "" (this is an input, not a mirror of stored state), so any
+    -- repaint while focused would blank what the owner just typed. Guarded like the rest.
     local paBox = paRow:EditBox({ width = 60, get = function() return "" end })
     paBox._fillWidth = false
+    guardEdit(paBox)
     paRow:Button({ text = "Purge Account", width = 130, variant = "danger", onClick = function()
         local aid = tostring(paBox.editBox:GetText() or ""):gsub("%s", "")
         if aid == "" then return end
@@ -2259,6 +2353,7 @@ local function buildBlacklist(flow)
     pcRow:Label("Character")
     local pcBox = pcRow:EditBox({ width = 160, get = function() return "" end })
     pcBox._fillWidth = false
+    guardEdit(pcBox)
     pcRow:Button({ text = "Purge Character", width = 140, variant = "danger", onClick = function()
         local nr = tostring(pcBox.editBox:GetText() or ""):gsub("^%s+", ""):gsub("%s+$", "")
         if nr == "" then return end
@@ -2318,7 +2413,11 @@ local function ensureLiveTicker()
     liveTicker = C_Timer.NewTicker(2, function()
         local pane = Options._meshPane
         if pane and pane.IsVisible and pane:IsVisible() then
-            refreshPage("mesh")
+            -- Live rows ONLY (accounts table, tombstones, capacity readout). The
+            -- ticker exists for those; repainting the whole page every 2s also
+            -- rewrote the credential fields, which is what ate in-progress typing.
+            -- The editboxes keep their HasFocus guard regardless -- belt and braces.
+            refreshPage("meshLive")
         end
     end)
 end
@@ -2449,6 +2548,90 @@ function Options.Register()
         },
     })
 end
+
+----------------------------------------------------------------------
+-- Self-tests — edit-focus guard (pure; no frames, no SavedVariables)
+--
+-- The guard is the only logic in this file that can silently eat owner input, so
+-- it is pinned headlessly: a table with a stubbed HasFocus() is all guardEdit /
+-- isEditing / forceRepaint ever touch.
+----------------------------------------------------------------------
+ns:RegisterSelfTest("options", function(verbose)
+    local pass = true
+    local function ck(c, m) if not c then pass = false; if verbose then ns:Print("  FAIL options/" .. m) end end end
+
+    -- Minimal EditBox stand-in (host frame + .editBox, like DaseekiUI's builder).
+    local function fakeBox(stored)
+        local eb = { text = "", focus = false, _scripts = {} }
+        function eb:HasFocus()      return self.focus end
+        function eb:SetText(t)      self.text = t end
+        function eb:GetText()       return self.text end
+        function eb:ClearFocus()    self.focus = false end
+        function eb:GetScript(n)    return self._scripts[n] end
+        local host = { editBox = eb }
+        host.Refresh = function() eb:SetText(stored()) end
+        return host, eb
+    end
+
+    local value = "SECRET"
+    local host, eb = fakeBox(function() return value end)
+    guardEdit(host)
+
+    host.Refresh()
+    ck(eb.text == "SECRET", "unfocused refresh paints the stored value")
+
+    -- Typing: focus + local edits, then live-ticker refreshes must not touch it.
+    eb.focus = true
+    eb:SetText("MyTwentyCharChannel!")
+    host.Refresh()
+    ck(eb.text == "MyTwentyCharChannel!", "focused refresh leaves typed text alone")
+    for _ = 1, 6 do host.Refresh() end          -- >4s of 2s ticks
+    ck(eb.text == "MyTwentyCharChannel!", "repeated ticks still leave it alone")
+
+    -- Focus lost without committing: no sticky state, next refresh paints normally.
+    eb.focus = false
+    host.Refresh()
+    ck(eb.text == "SECRET", "focus lost -> next refresh repaints stored value")
+
+    -- Guarding twice must not double-wrap or wedge the field.
+    guardEdit(host); host.Refresh()
+    ck(eb.text == "SECRET" and host._focusGuarded == true, "guardEdit is idempotent")
+
+    -- RefreshForce is the deliberate escape hatch and ignores focus.
+    eb.focus = true; eb:SetText("typed")
+    host.RefreshForce()
+    ck(eb.text == "SECRET", "RefreshForce repaints even while focused")
+
+    -- forceRepaint() commits through the box's own Enter handler, then repaints.
+    eb._scripts.OnEnterPressed = function(self) value = self:GetText(); self:ClearFocus() end
+    eb.focus = true; eb:SetText("Committed")
+    forceRepaint(host)
+    ck(value == "Committed" and eb.text == "Committed" and eb.focus == false,
+       "forceRepaint commits typing before repainting")
+
+    -- forceRepaint(w, false) is the Reset path: discard, do not save.
+    eb.focus = true; eb:SetText("Discarded")
+    forceRepaint(host, false)
+    ck(value == "Committed" and eb.text == "Committed" and eb.focus == false,
+       "forceRepaint(w, false) discards typing")
+
+    -- Non-editbox widgets share the refresher lists; they must never look "edited".
+    ck(isEditing(nil) == false and isEditing({}) == false and isEditing({ _label = {} }) == false,
+       "isEditing is false for labels / checkboxes / nil")
+
+    -- Raw EditBoxes (the coordinate-row cells) work without a host wrapper.
+    local _, raw = fakeBox(function() return "" end)
+    raw.focus = true;  ck(isEditing(raw) == true,  "raw editbox recognised while focused")
+    raw.focus = false; ck(isEditing(raw) == false, "raw editbox recognised while idle")
+
+    -- The 2s ticker repaints the live subset, which must exist and stay a strict
+    -- subset of the Mesh page's refreshers.
+    ck(type(refreshers.meshLive) == "table", "meshLive registry exists")
+    ck(#refreshers.meshLive <= #refreshers.mesh, "meshLive is a subset of mesh")
+
+    if verbose and pass then ns:Print("  PASS options/editbox-focus-guard") end
+    return pass
+end)
 
 -- Register once Core + Store are both ready.
 ns:On("STORE_READY", function()
