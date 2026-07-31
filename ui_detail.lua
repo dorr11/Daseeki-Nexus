@@ -657,20 +657,28 @@ function Detail.Attach(parent)
         -- Telemetry (chrono / hearth item icons + colored state value). The icon desats
         -- while on cooldown (mirrors the card stack); the tooltip carries the state.
         -- A9.1: derived from the stored START EPOCH, via the one shared helper.
+        -- ROUND-17b (owner): the chrono row is a pure Displacer-COOLDOWN indicator. Being
+        -- booned no longer replaces the readout ("BOON") nor recolours anything — the row
+        -- reads Ready / countdown exactly like the hearth row, the icon rim goes green when
+        -- the item is off cooldown and red while it is on cooldown (mirroring the card
+        -- icons), and the BOON detail moves into the tooltip line.
         local chronoRem = Dd.ItemCdRemaining(rec, "chronoboon", e)
-        if rec.chronoboonActive then
-            chronoVal:SetText("BOON"); chronoVal:SetTextColor(UI.Color((rec.boonCount or 0) == 0 and "danger" or "ok"))
-            D.chronoIcon.icon:SetDesaturated(false)
-            D.chronoIcon._state = ("Booned \194\183 %d in bags"):format(rec.boonCount or 0); D.chronoIcon._stateTok = "ok"
-        elseif chronoRem > 0 then
+        local chronoOnCd = chronoRem > 0
+        if chronoOnCd then
             chronoVal:SetText(Dd.FormatDuration(chronoRem)); chronoVal:SetTextColor(UI.Color("warn"))
             D.chronoIcon.icon:SetDesaturated(true)
-            D.chronoIcon._state = "Cooldown " .. Dd.FormatDuration(chronoRem); D.chronoIcon._stateTok = "warn"
         else
             chronoVal:SetText("Ready"); chronoVal:SetTextColor(UI.Color("ok"))
             D.chronoIcon.icon:SetDesaturated(false)
-            D.chronoIcon._state = "Ready"; D.chronoIcon._stateTok = "ok"
         end
+        D.chronoIcon:SetBackdropBorderColor(UI.Color(chronoOnCd and "danger" or "ok"))
+        local cBits = {}
+        if rec.chronoboonActive then cBits[#cBits + 1] = "Booned" end
+        if chronoOnCd then cBits[#cBits + 1] = "Cooldown " .. Dd.FormatDuration(chronoRem)
+        else cBits[#cBits + 1] = ("%d in bags"):format(rec.boonCount or 0) end
+        D.chronoIcon._state = table.concat(cBits, " \194\183 ")
+        D.chronoIcon._stateTok = chronoOnCd and "warn" or (rec.chronoboonActive and "ok" or "muted")
+
         local hearthRem = Dd.ItemCdRemaining(rec, "hearthstone", e)
         if hearthRem > 0 then
             hearthVal:SetText(Dd.FormatDuration(hearthRem)); hearthVal:SetTextColor(UI.Color("warn"))
@@ -681,6 +689,9 @@ function Detail.Attach(parent)
             D.hearthIcon.icon:SetDesaturated(false)
             D.hearthIcon._state = "Ready"; D.hearthIcon._stateTok = "ok"
         end
+        -- Same green/red cooldown rim as the chrono icon above (and the card icons), so the
+        -- two telemetry rows read with one language instead of one rimmed and one static.
+        D.hearthIcon:SetBackdropBorderColor(UI.Color(hearthRem > 0 and "danger" or "ok"))
 
         -- Note.
         if not noteBox:HasFocus() then noteBox:SetText(noteGet(entry.nameRealm) or "") end

@@ -440,8 +440,11 @@ end
 -- Round-11 item 5: pure cd-icon state from remaining seconds.
 --   ready (rem <= 0) -> { border = "ok",     cd = nil }              (green border)
 --   on CD (rem > 0)  -> { border = "danger", cd = "<compact>" }      (red border + text)
--- The caller overrides chrono's special BOONED state (accent border, no countdown). The
--- compact countdown reuses the shared decayed-remaining formatter (e.g. "12m", "1h05m").
+-- ROUND-17b (owner): this is now the WHOLE rule for the chrono icon — the old BOONED
+-- override (accent border) is GONE. The chrono icon is a pure Displacer-COOLDOWN
+-- indicator: green when the item is off cooldown, red while it is on cooldown, never
+-- keyed to whether the character is currently booned. Booned state lives in the tooltip.
+-- The compact countdown reuses the shared decayed-remaining formatter ("12m", "1h05m").
 function Cards.CdIconState(rem)
     if rem and rem > 0 then
         return { border = "danger", cd = Dashboard.FormatDuration(rem, "compact") }
@@ -734,23 +737,24 @@ local function makeCard(parent, pane)
         self.chrono:SetBackdrop(UI.FLAT_BACKDROP); self.chrono:SetBackdropColor(UI.Color("inset"))
         -- A9.1: derived from the stored START EPOCH, via the one shared helper.
         local chronoRem = Dashboard.ItemCdRemaining(rec, "chronoboon", nowE)
+        -- Round-17b: the border/desat/countdown track the ITEM COOLDOWN only — being
+        -- booned no longer recolours the icon. Boon state is reported in the tooltip.
         local cSt = Cards.CdIconState(chronoRem)
-        if rec.chronoboonActive then
-            self.chrono.icon:SetDesaturated(false)
-            self.chrono:SetBackdropBorderColor(UI.Color("accent"))
-            self.chrono.cd:Hide()
-            self.chrono._tip = { "Chronoboon Displacer", "Booned", "accent" }
-        elseif chronoRem > 0 then
-            self.chrono.icon:SetDesaturated(true)
-            self.chrono:SetBackdropBorderColor(UI.Color(cSt.border))       -- danger
+        local onCd = chronoRem > 0
+        self.chrono.icon:SetDesaturated(onCd)
+        self.chrono:SetBackdropBorderColor(UI.Color(cSt.border))   -- ok ready / danger on CD
+        if cSt.cd then
             self.chrono.cd:SetText(cSt.cd); self.chrono.cd:SetTextColor(UI.Color("danger")); self.chrono.cd:Show()
-            self.chrono._tip = { "Chronoboon Displacer", "CD " .. Dashboard.FormatDuration(chronoRem), "danger" }
         else
-            self.chrono.icon:SetDesaturated(false)
-            self.chrono:SetBackdropBorderColor(UI.Color(cSt.border))       -- ok (green, ready)
             self.chrono.cd:Hide()
-            self.chrono._tip = { "Chronoboon Displacer", ("%d in bags"):format(rec.boonCount or 0), "muted" }
         end
+        -- Tooltip keeps the boon detail ("Booned · N in bags" when booned and ready).
+        local cBits = {}
+        if rec.chronoboonActive then cBits[#cBits + 1] = "Booned" end
+        if onCd then cBits[#cBits + 1] = "CD " .. Dashboard.FormatDuration(chronoRem)
+        else cBits[#cBits + 1] = ("%d in bags"):format(rec.boonCount or 0) end
+        self.chrono._tip = { "Chronoboon Displacer", table.concat(cBits, " \194\183 "),
+                             onCd and "danger" or (rec.chronoboonActive and "accent" or "muted") }
         local hearthRem = Dashboard.ItemCdRemaining(rec, "hearthstone", nowE)
         local hSt = Cards.CdIconState(hearthRem)
         self.hearth:SetBackdrop(UI.FLAT_BACKDROP); self.hearth:SetBackdropColor(UI.Color("inset"))
@@ -1364,6 +1368,19 @@ local function testCdIconState(fails)
     ck(onCd.border == "danger", "on CD -> danger border")
     ck(onCd.cd == Dashboard.FormatDuration(720, "compact"), "on CD -> compact countdown text")
     ck(onCd.cd == "12m", "720s -> '12m' compact")
+
+    -- ROUND-17b: the chrono icon is a PURE cooldown indicator. CdIconState is the whole
+    -- rule now, so the same remaining seconds must yield the same border no matter what
+    -- the character's boon state is — there is no longer any accent/booned branch, and the
+    -- only two borders this function can ever return are ok and danger.
+    ck(Cards.CdIconState(0).border == "ok",     "off CD -> GREEN regardless of boon state")
+    ck(Cards.CdIconState(1).border == "danger", "1s left -> RED (still on CD)")
+    ck(Cards.CdIconState(-5).border == "ok",    "negative remaining -> treated as ready")
+    for _, rem in ipairs({ -5, 0, 1, 720, 86400 }) do
+        local b = Cards.CdIconState(rem).border
+        ck(b == "ok" or b == "danger", "border is only ever ok/danger (rem=" .. rem .. ", got " .. b .. ")")
+        ck(b ~= "accent", "no accent/BOONED border survives (rem=" .. rem .. ")")
+    end
 end
 
 -- Round-11 addendum: on-accent label contrast branch (fixes red-on-red selected chip).

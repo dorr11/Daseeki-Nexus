@@ -84,15 +84,25 @@ end
 
 -- Map a node state ({ state = "up"/"down"/"unknown", remaining = n }) to hero-cell
 -- content. Returns (heroText, heroColorToken, captionColorToken). Pure.
+-- ROUND-17b: the engine's new EXPIRED and STALE states used to fall through the bare else
+-- and render as "UP?", which claimed a flower was up when it was not.
+--   unknown / stale -> em-dash, faint   (stale = the up-window lapsed; we no longer know)
+--   down            -> ShortDur remaining (amber under a minute)
+--   expired         -> "-M:SS" counting through the expired window, warn
+--   up              -> "UP?"
+-- `remaining` for `expired` is time SINCE the window opened; abs() so either sign
+-- convention renders the same negative-looking counter.
 function Dashboard.SongflowerCellContent(st)
-    if not st or st.state == "unknown" then
+    local state = st and st.state
+    if not st or state == "unknown" or state == "stale" then
         return "\226\128\148", "faint", "faint"   -- em-dash, no data
-    elseif st.state == "down" then
+    elseif state == "down" then
         local rem = st.remaining or 0
         return Dashboard.ShortDur(rem), (rem < 60) and "warn" or "text", "muted"
-    else
-        return "UP?", "ok", "muted"
+    elseif state == "expired" then
+        return "-" .. Dashboard.FormatMSS(math.abs(st.remaining or 0)), "warn", "muted"
     end
+    return "UP?", "ok", "muted"
 end
 
 -- World-buff rows. Onyxia rows carry a faction crest; `title` names the pop-log.
@@ -142,6 +152,11 @@ function Dashboard.SongflowerTipState(st)
     if state == "up" then return "Up", "ok" end
     if state == "down" then
         return "Respawning \226\128\148 " .. Dashboard.ShortDur(st.remaining), "warn"
+    end
+    -- Round-17b: mirror the cell's expired counter so the hover never says "No data"
+    -- while the cell is showing "-M:SS". `stale` legitimately falls through to No data.
+    if state == "expired" then
+        return "Expired \226\128\148 " .. Dashboard.FormatMSS(math.abs(st.remaining or 0)), "warn"
     end
     return "No data", "faint"
 end
@@ -643,6 +658,28 @@ local function testCellContent(fails)
     ck(select(2, Dashboard.SongflowerCellContent({ state = "down", remaining = 59 })) == "warn", "59s is amber")
     t, c = Dashboard.SongflowerCellContent({ state = "up" })
     ck(t == "UP?" and c == "ok", "up -> 'UP?' / ok green")
+
+    -- ROUND-17b: the engine's expired/stale states used to fall through to "UP?", which
+    -- claimed a flower was up when it was not. They now render distinctly.
+    t, c, cap = Dashboard.SongflowerCellContent({ state = "expired", remaining = 125 })
+    ck(t == "-2:05" and c == "warn" and cap == "muted", "expired -> '-2:05' / warn")
+    t = Dashboard.SongflowerCellContent({ state = "expired", remaining = -125 })
+    ck(t == "-2:05", "expired renders the same for either remaining sign convention")
+    t = Dashboard.SongflowerCellContent({ state = "expired", remaining = 0 })
+    ck(t == "-0:00", "expired at the window edge -> '-0:00'")
+    t, c, cap = Dashboard.SongflowerCellContent({ state = "stale" })
+    ck(t == EMDASH and c == "faint" and cap == "faint", "stale -> em-dash / faint (like unknown)")
+    -- Regression guard: neither new state may read as UP.
+    for _, s in ipairs({ "expired", "stale" }) do
+        ck(Dashboard.SongflowerCellContent({ state = s, remaining = 60 }) ~= "UP?",
+            s .. " must NOT render as 'UP?'")
+    end
+
+    -- The hover mirrors the cell rather than saying "No data" over a live counter.
+    local line, tok = Dashboard.SongflowerTipState({ state = "expired", remaining = 125 })
+    ck(line == "Expired \226\128\148 2:05" and tok == "warn", "expired hover -> 'Expired — 2:05'")
+    line, tok = Dashboard.SongflowerTipState({ state = "stale" })
+    ck(line == "No data" and tok == "faint", "stale hover -> 'No data'")
 end
 
 -- Round-16c: the songflower cell hover state line (the full name lives beside it).

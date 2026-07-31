@@ -2170,15 +2170,18 @@ local function buildTimers(flow)
     -- ── Songflower display ───────────────────────────────────────────────────────
     -- Drives the songflower UP?/minus display state machine (timers.lua NodeState).
     local sf = flow:AddSection("Songflower Display")
-    sf:Hint("Minus-timer counts the respawn; UP? window shows after respawn (0 = always).")
-    -- Ranges/defaults are final (minus 5:00-50:00 default 25:00; UP? 0-60:00 default
-    -- "always"). The 0="always" sentinel is intentional. Labels below carry the range.
+    sf:Hint("UP? window shows after respawn (0 = always).")
+    -- ROUND-17b: this slider used to write felwood.flowerMinusDuration, which the engine
+    -- stopped consuming as a respawn length (the respawn is fixed) — the control was inert.
+    -- It now drives felwood.flowerExpiredWindow, the live key timers.lua reads (default
+    -- 300, clamped 0-900). UP? keeps its own 0="always" sentinel below.
     local sfMinus = sf:Slider({
-        label = "Minus-timer duration — (5:00-50:00) default 25:00", width = 300, min = 300, max = 3000, step = 30,
-        get = function() local ts = TS(); return ts and ts.felwood.flowerMinusDuration or 1500 end,
-        set = function(v) local ts = TS(); if ts then ts.felwood.flowerMinusDuration = v end end,
+        label = "Expired window — (0-15:00) default 5:00", width = 300, min = 0, max = 900, step = 30,
+        get = function() local ts = TS(); return ts and ts.felwood.flowerExpiredWindow or 300 end,
+        set = function(v) local ts = TS(); if ts then ts.felwood.flowerExpiredWindow = v end end,
         format = function(v) v = math.floor(v); return ("%d:%02d"):format(math.floor(v / 60), v % 60) end,
     })
+    sf:Hint("How long a respawned flower shows a negative counter before going quiet.")
     local sfUp = sf:Slider({
         label = "UP? duration — (0-60:00) default always", width = 300, min = 0, max = 3600, step = 30,
         get = function() local ts = TS(); return ts and ts.felwood.flowerUpDuration or 0 end,
