@@ -655,16 +655,27 @@ end
 -- read (firewall); this mapping was derived solely from the SHAPE of the owner's
 -- own SavedVariables data files.
 --
--- OBSERVED NIT SHAPE (from the owner's real SV):
+-- OBSERVED NIT SHAPE (field names CONFIRMED against the owner's real SV; counts
+-- below are from that file, 644 entries total):
 --   NITdatabase.global[<realm>].instances = { <run>, ... }   (array, newest…oldest)
 --   <run> = {
 --     playerName    = "Artaeum",             -- character (no realm; realm is the key)
 --     instanceName  = "Blackwing Lair",      -- display name
 --     instanceID    = 469,                    -- stable numeric id  (our mapID)
+--     type          = "raid",                 -- "bg" | "party" | "raid"  (304 records;
+--                                             --   79 are "bg". THE primary pvp filter.
+--                                             --   Older records omit it -- hence the
+--                                             --   instance-id set + structural sniff.)
 --     enteredTime   = 1660972435,             -- entry epoch        (our t)
---     leftTime      = 1660983242,             -- exit epoch         (dur = left-entered)
---     enteredMoney  = 20301778, leftMoney = 137816,   -- copper (gold = left-entered)
---     enteredXP     = 0,        leftXP    = 0,         -- (xp = left-entered)
+--     leftTime      = 1660983242,             -- exit epoch         (our exitT)
+--     enteredMoney  = 20301778, leftMoney = 137816,   -- copper wallet snapshots
+--     rawMoneyCount = 41250,                  -- LOOT-ONLY copper (565 records) -- the
+--                                             --   honest gold figure; preferred.
+--     enteredXP     = 0,        leftXP    = 0,         -- xp snapshots (ding-poisoned)
+--     xpFromChat    = 12500,                  -- chat XP accumulator (641 records) --
+--                                             --   level-up safe; preferred.
+--     GUID, GUIDSource,                       -- serial provenance:
+--                                             --   "combatLog" | "mouseover" | "target"
 --     zoneID, difficultyID, class, mobCount, group, rep, ...   -- carried, unused
 --   }
 --
@@ -701,46 +712,63 @@ local PVP_INSTANCE_IDS = {
 }
 Import.PVP_INSTANCE_IDS = PVP_INSTANCE_IDS
 
--- Run-type values that must never reach a cap meter.
+-- Run-type values, as they actually appear in the owner's file: the `type` field
+-- reads "bg" | "party" | "raid". The wider word set is kept so a record written
+-- by another client flavour (arena/scenario/delve) is also excluded.
 local NONCOUNTED_TYPE_WORDS = {
-    pvp = true, arena = true, battleground = true, bg = true,
+    bg = true, pvp = true, arena = true, battleground = true,
     scenario = true, delve = true,
 }
--- Candidate keys for the run's stored type / pvp flag. The exact key name could
--- not be confirmed under the clean-room firewall (the only copy of the source
--- record lives in a path we are not permitted to read), so the type check is
--- deliberately TOLERANT: it accepts any of these, and the id list above plus the
--- structural signature below carry the filter on their own if none is present.
+-- Values that positively confirm a slot-billing run. When one of these is
+-- present the record is settled and the weaker heuristics below are SKIPPED --
+-- an explicit "party" must never be second-guessed by a structural sniff.
+local COUNTED_TYPE_WORDS = { party = true, raid = true }
+
+-- `type` is the confirmed, primary signal (present on the newer records; the
+-- older ones predate it, which is what the id set and the structural signature
+-- below are for). The extra key names cost nothing and cover a record written by
+-- a different version.
 local TYPE_KEYS = { "type", "instanceType", "iType", "runType", "instType" }
 local PVP_FLAG_KEYS = { "pvp", "isPvP", "isPvp", "isPVP", "pvpFlag" }
 
 -- Classify one source run: "counted" (a dungeon/raid that bills a slot),
 -- "pvp" (battleground/arena/scenario/delve -- store-but-never-count), or
 -- "invalid" (unusable: no entry epoch or no instance name). Pure.
+--
+-- Signal order is deliberate: the explicit stored type first (ground truth),
+-- then the instance-id set, then a pvp flag, and only then the structural
+-- signature -- which is a sniff, and must never override a record that told us
+-- plainly what it is.
 function Import.ClassifyNITRun(run)
     if type(run) ~= "table" then return "invalid" end
     local t = tonumber(run.enteredTime)
     local name = run.instanceName
     if not t or t <= 0 or type(name) ~= "string" or name == "" then return "invalid" end
 
-    -- 1. Instance id against the public battleground/arena set. Confirmed key,
-    --    exact test -- this is the load-bearing signal.
+    -- 1. The stored run type. PRIMARY: on the records that carry it this is the
+    --    whole answer, in both directions.
+    for i = 1, #TYPE_KEYS do
+        local v = run[TYPE_KEYS[i]]
+        if type(v) == "string" then
+            local w = v:lower()
+            if NONCOUNTED_TYPE_WORDS[w] then return "pvp", "type" end
+            if COUNTED_TYPE_WORDS[w] then return "counted", "type" end
+        end
+    end
+
+    -- 2. Instance id against the public battleground/arena set -- carries the
+    --    older records that predate the type field.
     local id = tonumber(run.instanceID)
     if id and PVP_INSTANCE_IDS[id] then return "pvp", "id" end
 
-    -- 2. A stored type / pvp flag, if the record carries one under any of the
-    --    plausible key names.
-    for i = 1, #TYPE_KEYS do
-        local v = run[TYPE_KEYS[i]]
-        if type(v) == "string" and NONCOUNTED_TYPE_WORDS[v:lower()] then return "pvp", "type" end
-    end
+    -- 3. A pvp flag, if this record version carries one.
     for i = 1, #PVP_FLAG_KEYS do
         local v = run[PVP_FLAG_KEYS[i]]
         if v == true or v == 1 then return "pvp", "flag" end
         if type(v) == "string" and NONCOUNTED_TYPE_WORDS[v:lower()] then return "pvp", "flag" end
     end
 
-    -- 3. The structural signature of a PvP record: difficulty id absent AND both
+    -- 4. The structural signature of a PvP record: difficulty id absent AND both
     --    wallet snapshots stripped. All three keys are confirmed, and a genuine
     --    dungeon record carries all three; requiring all three to be missing at
     --    once -- on a record that is otherwise well-formed (it has an instance
@@ -762,16 +790,19 @@ function Import._NITNameRealm(playerName, realm)
     return playerName .. "-" .. r
 end
 
--- Candidate keys for the two accumulators the source record keeps ALONGSIDE its
--- snapshots: loot-only coin, and chat-parsed XP. The reader they came from
--- prefers both over the snapshot deltas, precisely because the wallet delta
--- includes repairs/vendors/mail and the XP delta goes NEGATIVE across a ding.
--- Key names are unconfirmed (see the note on TYPE_KEYS), so this is a tolerant
--- scan with the snapshot delta as the fallback; Import.RunInstances reports how
--- many records actually used the preferred field so the owner can tell whether
--- these names matched anything at all.
-local LOOT_COIN_KEYS = { "moneyLooted", "lootedMoney", "moneyLoot", "goldLooted", "coinLooted", "lootedGold" }
-local CHAT_XP_KEYS   = { "xpGained", "gainedXP", "xpFromChat", "chatXP", "totalXP", "xp" }
+-- The two accumulators the source record keeps ALONGSIDE its snapshots: the
+-- loot-only coin total and the chat-parsed XP total. Both are preferred over the
+-- snapshot deltas, precisely because the wallet delta includes repairs, vendor
+-- sales, reagents and mail, and the XP delta goes NEGATIVE across a ding.
+--
+-- These key names are CONFIRMED against the owner's own data file: `xpFromChat`
+-- appears on 641 of 644 entries, `rawMoneyCount` on 565. They are deliberately
+-- the only names checked -- an earlier tolerant scan guessed at half a dozen
+-- plausible alternatives, and a wrong guess that happens to hit a numeric field
+-- is far worse than falling through to the snapshot fallback. Records without
+-- the key still get the fallback path below.
+local LOOT_COIN_KEYS = { "rawMoneyCount" }
+local CHAT_XP_KEYS   = { "xpFromChat" }
 
 local function firstNumericField(run, keys)
     for i = 1, #keys do
@@ -1270,22 +1301,30 @@ local function selfTest(verbose)
     ------------------------------------------------------------------
     -- NIT instance-run import: shape mapping, attribution, idempotency.
     ------------------------------------------------------------------
+    -- Fixture built on the REAL field names from the owner's SavedVariables:
+    -- `type` ("bg"/"party"/"raid"), `xpFromChat`, `rawMoneyCount`, alongside the
+    -- older records that carry none of them.
     local ORPHAN = (ns.Instances and ns.Instances.ORPHAN_AID) or "orphan"
     local nitFixture = {
         global = {
             ["Jom Gabbar"] = { instances = {
+                -- Newer records: `type` present and authoritative.
                 { playerName = "Artaeum", instanceName = "Blackwing Lair", instanceID = 469,
-                  difficultyID = 1, enteredTime = 1000, leftTime = 4600,
+                  type = "raid", difficultyID = 1, enteredTime = 1000, leftTime = 4600,
                   enteredMoney = 500, leftMoney = 1500,
-                  enteredXP = 0, leftXP = 0, mobCount = 900 },
+                  enteredXP = 0, leftXP = 0, mobCount = 900,
+                  rawMoneyCount = 41250, xpFromChat = 0,
+                  GUID = "Creature-0-3151-469-4821-11583-000082EA3F", GUIDSource = "mouseover" },
                 { playerName = "Artaeum", instanceName = "Molten Core", instanceID = 409,
-                  difficultyID = 1, enteredTime = 5000, leftTime = 8600,
-                  enteredMoney = 2000, leftMoney = 1000 }, -- spent gold (repaired in MC)
-                -- Battlegrounds: present in the source array, must NEVER count.
+                  type = "raid", difficultyID = 1, enteredTime = 5000, leftTime = 8600,
+                  enteredMoney = 2000, leftMoney = 1000,   -- repaired in MC: wallet went DOWN
+                  rawMoneyCount = 63000, GUIDSource = "target" },
+                -- Battlegrounds, flagged by `type` -- must NEVER count.
                 { playerName = "Artaeum", instanceName = "Warsong Gulch", instanceID = 489,
-                  enteredTime = 6000, leftTime = 7000 },
+                  type = "bg", enteredTime = 6000, leftTime = 7000 },
                 { playerName = "Artaeum", instanceName = "Alterac Valley", instanceID = 30,
-                  enteredTime = 6100, leftTime = 9100 },
+                  type = "bg", enteredTime = 6100, leftTime = 9100 },
+                -- An OLDER bg record with no `type` at all: the id set must catch it.
                 { playerName = "Artaeum", instanceName = "Arathi Basin", instanceID = 529,
                   enteredTime = 6200, leftTime = 7200 },
                 { playerName = "", instanceName = "Bad", enteredTime = 9000 },  -- no player -> unusable
@@ -1293,9 +1332,10 @@ local function selfTest(verbose)
             } },
             ["Whitemane"] = { instances = {
                 { playerName = "Stranger", instanceName = "Scholomance", instanceID = 289,
-                  difficultyID = 1, enteredTime = 2000, leftTime = 3000,
+                  type = "party", difficultyID = 1, enteredTime = 2000, leftTime = 3000,
                   enteredMoney = 10, leftMoney = 60,
-                  enteredXP = 900, leftXP = 100 },  -- LEVELLED UP mid-run: delta is negative
+                  enteredXP = 900, leftXP = 100,   -- LEVELLED UP mid-run: delta is negative
+                  xpFromChat = 14200, rawMoneyCount = 8300 },
             } },
         },
     }
@@ -1310,8 +1350,13 @@ local function selfTest(verbose)
 
     -- A5.1 -- the top-severity importer defect: battlegrounds are phantom slots.
     check("nit skips all 3 battlegrounds", counts.pvpSkipped == 3)
-    check("nit bg skip attributed to the id list", counts.pvpBy.id == 3)
+    check("nit two bgs skipped by the confirmed `type` field", counts.pvpBy.type == 2)
+    check("nit the type-less legacy bg skipped by the id set", counts.pvpBy.id == 1)
     check("nit no bg run reached the ledger", counts.perAccount["2"] == 2)
+
+    -- The confirmed accumulators were found on the records that carry them.
+    check("nit found rawMoneyCount on 3 runs", counts.lootFieldHits == 3)
+    check("nit found xpFromChat on 2 runs", counts.xpFieldHits == 2)
 
     -- A5.4 -- orphans must NOT pile onto the local account's meter.
     check("nit orphan does NOT land on local acct 1", mapped["1"] == nil)
@@ -1330,23 +1375,50 @@ local function selfTest(verbose)
     check("nit dur = left-entered", bwl and bwl.dur == 3600)
     check("nit exitT<-leftTime", bwl and bwl.exitT == 4600)
     check("nit gold = left-entered (copper)", bwl and bwl.gold == 1000)
-    check("nit goldLoot defaults to 0 when absent", bwl and bwl.goldLoot == 0)
+    check("nit goldLoot <- rawMoneyCount", bwl and bwl.goldLoot == 41250)
     check("nit merged=false", bwl and bwl.merged == false)
     local mc = jg and jg.entries[2]
-    check("nit negative wallet gold survives (spent in-run)", mc and mc.gold == -1000)
+    check("nit negative wallet gold survives (repaired in-run)", mc and mc.gold == -1000)
+    check("nit loot total is positive on that same run", mc and mc.goldLoot == 63000)
 
-    -- A5.3 -- the XP delta goes negative across a ding; imported XP never does.
-    check("nit xp clamped at 0 across a level-up", wm and wm.entries[1].xp == 0)
+    -- A5.3 -- the XP snapshot delta goes negative across a ding (900 -> 100).
+    -- xpFromChat is the level-up-safe figure and must win outright.
+    check("nit xp <- xpFromChat, not the negative delta", wm and wm.entries[1].xp == 14200)
+    check("nit goldLoot <- rawMoneyCount on the orphan run", wm and wm.entries[1].goldLoot == 8300)
 
-    -- Preferred accumulators win over the snapshot deltas when present.
-    local pref = Import._MapInstanceEntry({
-        instanceName = "Stratholme", instanceID = 329, difficultyID = 1,
-        enteredTime = 100, leftTime = 700, enteredMoney = 0, leftMoney = -5000,
-        enteredXP = 500, leftXP = 100, xpGained = 7400, moneyLooted = 31234,
+    -- A record with NO xpFromChat and a ding-poisoned delta still clamps at 0.
+    local legacyDing = Import._MapInstanceEntry({
+        instanceName = "Maraudon", instanceID = 349, type = "party", difficultyID = 1,
+        enteredTime = 100, leftTime = 700, enteredMoney = 0, leftMoney = 0,
+        enteredXP = 40000, leftXP = 1200,
     })
-    check("nit prefers the loot-coin total", pref and pref.goldLoot == 31234)
-    check("nit prefers the chat-XP total", pref and pref.xp == 7400)
+    check("nit legacy record without xpFromChat clamps a negative delta", legacyDing and legacyDing.xp == 0)
+    check("nit legacy record without rawMoneyCount gets goldLoot 0", legacyDing and legacyDing.goldLoot == 0)
+
+    -- The confirmed accumulators beat the snapshots even when the snapshots exist.
+    local pref = Import._MapInstanceEntry({
+        instanceName = "Stratholme", instanceID = 329, type = "party", difficultyID = 1,
+        enteredTime = 100, leftTime = 700, enteredMoney = 0, leftMoney = -5000,
+        enteredXP = 500, leftXP = 100, xpFromChat = 7400, rawMoneyCount = 31234,
+    })
+    check("nit prefers rawMoneyCount", pref and pref.goldLoot == 31234)
+    check("nit prefers xpFromChat", pref and pref.xp == 7400)
     check("nit still keeps the wallet delta alongside", pref and pref.gold == -5000)
+
+    -- The confirmed `type` values, in both directions.
+    check("nit type=bg -> pvp", Import.ClassifyNITRun({
+        instanceName = "Warsong Gulch", instanceID = 489, enteredTime = 1, type = "bg" }) == "pvp")
+    check("nit type=party -> counted", Import.ClassifyNITRun({
+        instanceName = "Deadmines", instanceID = 36, enteredTime = 1, type = "party" }) == "counted")
+    check("nit type=raid -> counted", Import.ClassifyNITRun({
+        instanceName = "Molten Core", instanceID = 409, enteredTime = 1, type = "raid" }) == "counted")
+    -- An explicit type must OUTRANK the structural sniff: this record has no
+    -- difficultyID and no wallet snapshots, which alone would read as PvP.
+    check("nit explicit type=party beats the structural sniff", Import.ClassifyNITRun({
+        instanceName = "Deadmines", instanceID = 36, enteredTime = 1, type = "party" }) == "counted")
+    local _, why = Import.ClassifyNITRun({
+        instanceName = "Deadmines", instanceID = 36, enteredTime = 1, type = "party" })
+    check("nit reports `type` as the deciding signal", why == "type")
 
     -- The tolerant type/flag signals, independent of the id list.
     check("nit classifies a type word", Import.ClassifyNITRun({

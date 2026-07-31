@@ -22,11 +22,12 @@
 --                                entry.mapID per the design schema)
 --   GetMoney()                -> copper:number         (global; capability-guarded)
 --   CombatLogGetCurrentEventInfo() -> timestamp, subEvent, hideCaster, sourceGUID, ...
+--   UnitGUID(unit)            -> guid:WOWGUID          (global; capability-guarded)
 -- Events (all catalog-verified under Event.* in wow-api-catalog/latest):
 --   PLAYER_ENTERING_WORLD, PLAYER_LEAVING_WORLD, PLAYER_LOGOUT,
 --   UNIT_SPELLCAST_START / UNIT_SPELLCAST_SUCCEEDED (unitTarget, castGUID, spellID),
---   COMBAT_LOG_EVENT_UNFILTERED, CHAT_MSG_COMBAT_XP_GAIN, CHAT_MSG_MONEY,
---   CHAT_MSG_SYSTEM.
+--   COMBAT_LOG_EVENT_UNFILTERED, UPDATE_MOUSEOVER_UNIT, PLAYER_TARGET_CHANGED,
+--   CHAT_MSG_COMBAT_XP_GAIN, CHAT_MSG_MONEY, CHAT_MSG_SYSTEM.
 -- Every live call is guarded with a presence check so the module loads and its
 -- pure self-tests run headless with none of these globals present.
 
@@ -54,11 +55,14 @@ Instances.RING_CAP     = RING_CAP
 Instances.HOUR         = HOUR
 Instances.DAY          = DAY
 
--- Combat-log-sourced GUIDs are ignored for the first N seconds after entering, so
--- a mob we were fighting on the way in cannot stamp the new record with the OLD
--- instance's serial (spec §2.1).
-local CL_SERIAL_SUPPRESS = 2
-Instances.CL_SERIAL_SUPPRESS = CL_SERIAL_SUPPRESS
+-- Deferred serial sources (combat log, mouseover, target) are ignored for the
+-- first N seconds after entering, so a mob we were fighting -- or still had
+-- targeted or moused over -- on the way in cannot stamp the new record with the
+-- OLD instance's serial (spec §2.1). The cast watcher is exempt: a cast event
+-- arriving after entry is by definition from a unit in the new instance.
+local SERIAL_SUPPRESS = 2
+Instances.SERIAL_SUPPRESS = SERIAL_SUPPRESS
+Instances.CL_SERIAL_SUPPRESS = SERIAL_SUPPRESS   -- retained name
 
 -- Unclosed-run duration fallback bound (spec §3.3): beyond this an unclosed run
 -- reports zero rather than an absurd elapsed.
@@ -89,7 +93,12 @@ map. Two runs share it iff they are physically the same live instance. That is
 precisely the quantity the 5-per-hour rule is enforced on.
 
   On entry we create the record (counted immediately) and ARM a one-shot serial
-  watcher. The first usable GUID yields a serial, and:
+  watcher across FOUR sources -- a cast GUID, a combat-log source GUID, the
+  mouseover unit, and the target unit. Whichever fires first wins and disarms the
+  rest. Breadth matters because the merge is retroactive: until a serial lands
+  the meter reads one too high, so the cheapest early signal is the best one, and
+  on the owner's own historical data mouseover was the single most productive
+  source by a wide margin. The first usable GUID yields a serial, and:
 
     * if the PREVIOUS record already carries that same serial AND the new record
       carries none yet -> MERGE: fold the new record's takings into the previous
@@ -676,17 +685,40 @@ function Instances._onSpellcast(unitTarget, castGUID)
     Instances._observeSerial(castGUID, "cast")
 end
 
+-- True once the post-entry suppression window has elapsed. Guards every serial
+-- source that can carry a stale unit across a loading screen.
+local function pastSuppression()
+    local entryAt = Instances._entryAt
+    return not entryAt or (now() - entryAt) >= SERIAL_SUPPRESS
+end
+
 -- COMBAT_LOG_EVENT_UNFILTERED -> read via CombatLogGetCurrentEventInfo().
--- Suppressed for the first CL_SERIAL_SUPPRESS seconds after entry so a mob we
--- were still fighting cannot stamp the new record with the old serial.
 function Instances._onCombatLog()
     if not Instances._serialArmed then return end
     if not CombatLogGetCurrentEventInfo then return end
-    local entryAt = Instances._entryAt
-    if entryAt and (now() - entryAt) < CL_SERIAL_SUPPRESS then return end
+    if not pastSuppression() then return end
     local _, subEvent, _, sourceGUID = CombatLogGetCurrentEventInfo()
     if not CL_SERIAL_EVENTS[subEvent or ""] then return end
     Instances._observeSerial(sourceGUID, "combatlog")
+end
+
+-- UPDATE_MOUSEOVER_UNIT / PLAYER_TARGET_CHANGED -> UnitGUID("mouseover"/"target").
+--
+-- These are the CHEAPEST and, on the owner's own historical data, the MOST
+-- PRODUCTIVE serial sources: across that file mouseover supplied the serial 208
+-- times and target 5, against 195 from the combat log. A player who walks in and
+-- simply moves the cursor over the first mob resolves the merge immediately --
+-- well before anything casts or swings, which matters because the merge is
+-- retroactive and the meter reads one too high until it fires.
+--
+-- Same Creature-GUID field-5 parsing, same one-shot latch, same post-entry
+-- suppression: a unit still targeted or moused over from BEFORE the loading
+-- screen would otherwise stamp the new record with the old instance's serial.
+function Instances._onUnitSerial(unit)
+    if not Instances._serialArmed then return end
+    if not UnitGUID then return end
+    if not pastSuppression() then return end
+    Instances._observeSerial(UnitGUID(unit), unit)
 end
 
 ----------------------------------------------------------------------
@@ -802,6 +834,8 @@ Instances._Handlers = {
     UNIT_SPELLCAST_START     = function(unit, castGUID) Instances._onSpellcast(unit, castGUID) end,
     UNIT_SPELLCAST_SUCCEEDED = function(unit, castGUID) Instances._onSpellcast(unit, castGUID) end,
     COMBAT_LOG_EVENT_UNFILTERED = function() Instances._onCombatLog() end,
+    UPDATE_MOUSEOVER_UNIT    = function() Instances._onUnitSerial("mouseover") end,
+    PLAYER_TARGET_CHANGED    = function() Instances._onUnitSerial("target") end,
     CHAT_MSG_COMBAT_XP_GAIN  = function(text) Instances._onXPGain(text) end,
     CHAT_MSG_MONEY           = function(text) Instances._onMoney(text) end,
     CHAT_MSG_SYSTEM          = function(text) Instances._onSystemMessage(text) end,
@@ -892,7 +926,7 @@ local function newSimClient()
         IsInInstance = G.IsInInstance, GetInstanceInfo = G.GetInstanceInfo,
         GetMoney = G.GetMoney, UnitName = G.UnitName, GetRealmName = G.GetRealmName,
         CombatLogGetCurrentEventInfo = G.CombatLogGetCurrentEventInfo,
-        C_Timer = G.C_Timer,
+        UnitGUID = G.UnitGUID, C_Timer = G.C_Timer,
     }
     local savedNow, savedData, savedGet = Store.Now, Store.data, ns.GetAccountID
     local savedDB = Store.db
@@ -907,6 +941,7 @@ local function newSimClient()
         return sim.name, sim.itype, 1, "Normal", 5, 0, false, sim.instanceID
     end
     G.GetMoney = function() return sim.money end
+    G.UnitGUID = function(unit) return sim.unitGUID and sim.unitGUID[unit] or nil end
     G.UnitName = function() return "Tester" end
     G.GetRealmName = function() return "Sim Realm" end
     G.C_Timer = nil   -- print immediately in tests rather than deferring 0.2 s
@@ -937,9 +972,34 @@ local function newSimClient()
     end
     function sim.enter(name, instanceID, itype) sim.zoneTo(true, name, instanceID, itype or "party") end
     function sim.leave() sim.zoneTo(false, nil, nil, "none") end
+    sim.unitGUID = {}
+    local function creatureGUID(serial, npcID)
+        return ("Creature-0-3151-%d-%d-%d-000082EA3F"):format(sim.instanceID or 0, serial, npcID or 11583)
+    end
+    sim.creatureGUID = creatureGUID
     function sim.cast(serial)
         sim.fire("UNIT_SPELLCAST_SUCCEEDED", "boss1",
             ("Cast-0-3299-%d-%d-52057-000229B4B7"):format(sim.instanceID or 0, serial))
+    end
+    -- Move the cursor over a mob (the owner's most productive serial source).
+    function sim.mouseover(serial, npcID)
+        sim.unitGUID.mouseover = serial and creatureGUID(serial, npcID) or nil
+        sim.fire("UPDATE_MOUSEOVER_UNIT")
+    end
+    function sim.target(serial, npcID)
+        sim.unitGUID.target = serial and creatureGUID(serial, npcID) or nil
+        sim.fire("PLAYER_TARGET_CHANGED")
+    end
+    -- Mouse over a party member: a Player GUID carries no usable serial.
+    function sim.mouseoverPlayer()
+        sim.unitGUID.mouseover = "Player-3299-0AB4C1D2"
+        sim.fire("UPDATE_MOUSEOVER_UNIT")
+    end
+    function sim.combatLog(serial, subEvent)
+        G.CombatLogGetCurrentEventInfo = function()
+            return sim.clock, subEvent or "SWING_DAMAGE", false, creatureGUID(serial)
+        end
+        sim.fire("COMBAT_LOG_EVENT_UNFILTERED")
     end
     function sim.entries()
         local acct = Store.data.instances["1"] or {}
@@ -1075,6 +1135,101 @@ local function testLiveSerialMerge(fails)
     end)
     sim.restore()
     if not ok then fails[#fails + 1] = "live serial merge sim errored: " .. tostring(err) end
+end
+
+-- Mouseover / target / combat-log serial sources. On the owner's own historical
+-- data mouseover supplied the serial 208 times and target 5, against 195 from the
+-- combat log -- so these are the sources that actually resolve the merge in play.
+local function testUnitSerialSources(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+
+    -- 1. Mouseover alone resolves a corpse-run merge: no cast, no combat.
+    local sim = newSimClient()
+    local ok, err = pcall(function()
+        sim.enter("Scarlet Monastery", 189)
+        sim.clock = sim.clock + 5           -- past the 2 s suppression window
+        sim.mouseover(6100)
+        ck(sim.entries()[1].serial == 6100, "mouseover stamps the serial")
+        ck(sim.entries()[1].mergeSource == nil, "first entry commits, does not merge")
+        sim.clock = sim.clock + 400
+        sim.leave()
+        sim.clock = sim.clock + 120
+        sim.enter("Scarlet Monastery", 189)  -- corpse run back into the SAME instance
+        ck(sim.counts().hour == 2, "re-entry counted until a serial proves otherwise")
+        sim.clock = sim.clock + 5
+        sim.mouseover(6100)
+        ck(sim.entries()[2].merged == true, "mouseover alone merges the corpse run")
+        ck(sim.counts().hour == 1, "no slot consumed (got " .. sim.counts().hour .. ")")
+        ck(sim.entries()[1].mergeSource == "mouseover", "merge source recorded as mouseover")
+    end)
+    sim.restore()
+    if not ok then fails[#fails + 1] = "mouseover sim errored: " .. tostring(err) end
+
+    -- 2. Target works the same way, and a reset+rerun still bills a slot.
+    local sim2 = newSimClient()
+    local ok2, err2 = pcall(function()
+        sim2.enter("Stratholme", 329)
+        sim2.clock = sim2.clock + 5
+        sim2.target(7100)
+        ck(sim2.entries()[1].serial == 7100, "target stamps the serial")
+        sim2.clock = sim2.clock + 600
+        sim2.leave()
+        sim2.clock = sim2.clock + 60
+        sim2.enter("Stratholme", 329)
+        sim2.clock = sim2.clock + 5
+        sim2.target(7101)                    -- /reset made a NEW instance
+        ck(sim2.entries()[2].merged == false, "target: reset+rerun is NOT merged")
+        ck(sim2.counts().hour == 2, "target: farm rerun burns a slot")
+    end)
+    sim2.restore()
+    if not ok2 then fails[#fails + 1] = "target sim errored: " .. tostring(err2) end
+
+    -- 3. Suppression + rejection rules.
+    local sim3 = newSimClient()
+    local ok3, err3 = pcall(function()
+        sim3.enter("Blackrock Depths", 230)
+        -- Still inside the 2 s window: a unit held over from before the loading
+        -- screen must NOT stamp the new record.
+        sim3.clock = sim3.clock + 1
+        sim3.mouseover(999)
+        ck(sim3.entries()[1].serial == nil, "stale mouseover suppressed for 2 s after entry")
+        sim3.target(999)
+        ck(sim3.entries()[1].serial == nil, "stale target suppressed for 2 s after entry")
+        sim3.combatLog(999)
+        ck(sim3.entries()[1].serial == nil, "stale combat log suppressed for 2 s after entry")
+        -- Past the window, a PLAYER GUID still carries nothing usable.
+        sim3.clock = sim3.clock + 5
+        sim3.mouseoverPlayer()
+        ck(sim3.entries()[1].serial == nil, "a party member's Player GUID is ignored")
+        ck(Instances._serialArmed == true, "…and the watcher stays armed for a real mob")
+        -- An empty mouseover (cursor over nothing) is a no-op.
+        sim3.mouseover(nil)
+        ck(sim3.entries()[1].serial == nil, "empty mouseover is a no-op")
+        ck(Instances._serialArmed == true, "…and does not disarm the watcher")
+        -- The real thing lands.
+        sim3.mouseover(8200)
+        ck(sim3.entries()[1].serial == 8200, "a real creature GUID past the window commits")
+        ck(Instances._serialArmed == false, "watcher disarms after the first usable serial")
+        -- One-shot: later sources cannot overwrite it.
+        sim3.target(8299)
+        sim3.combatLog(8299)
+        ck(sim3.entries()[1].serial == 8200, "one-shot: later sources cannot overwrite the serial")
+    end)
+    sim3.restore()
+    if not ok3 then fails[#fails + 1] = "suppression sim errored: " .. tostring(err3) end
+
+    -- 4. The combat-log path still works, and only on damage sub-events.
+    local sim4 = newSimClient()
+    local ok4, err4 = pcall(function()
+        sim4.enter("Zul'Gurub", 309)
+        sim4.clock = sim4.clock + 5
+        sim4.combatLog(5000, "SPELL_AURA_APPLIED")     -- not a damage event
+        ck(sim4.entries()[1].serial == nil, "combat log ignores non-damage sub-events")
+        sim4.combatLog(5000, "SPELL_DAMAGE")
+        ck(sim4.entries()[1].serial == 5000, "combat log commits on a damage sub-event")
+    end)
+    sim4.restore()
+    if not ok4 then fails[#fails + 1] = "combat-log sim errored: " .. tostring(err4) end
 end
 
 -- Instance -> instance zoning closes the prior run and opens a new one.
@@ -1432,6 +1587,7 @@ function Instances.RunSelfTests(verbose)
         { name = "GUID instance serial",          fn = testGUIDSerial },
         { name = "serial merge decision",         fn = testApplySerial },
         { name = "live serial merge (real order)", fn = testLiveSerialMerge },
+        { name = "mouseover/target/CL sources",    fn = testUnitSerialSources },
         { name = "instance->instance boundary",   fn = testInstanceToInstance },
         { name = "xp accumulator + gold",         fn = testXPAndGold },
         { name = "exit-epoch persistence",        fn = testExitEpochPersistence },
