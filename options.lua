@@ -52,21 +52,44 @@ local AURA_DEFS = {
 
 -- The full ten summon-trigger buffs (round-3 item 23). Rendered as "ABBR - Full
 -- Name" rows with spell icons. FFF is the seasonal buff (no stable spellID here —
--- cosmetic question-mark fallback). The engine owns the authoritative trigger set
--- (anticipated ns.Store.SUMMON_TRIGGER_BUFFS); this catalog is the UI's label/icon
--- source and the pre-merge fallback ordering.
+-- cosmetic question-mark fallback).
+--
+-- KEY NAMESPACE — DO NOT "TIDY" THESE INTO THE AURA KEYS. The auto-summon
+-- trigger keys are the ones auto.lua's Auto.SUMMON_TRIGGER_BUFFS defines, and
+-- they are named after the BUFF, not its source. They are deliberately NOT the
+-- aura/threshold keys used by AURA_DEFS and Store.AURA_THRESHOLD_SEEDS:
+--     Ony      -> "dragonslayer"   (NOT "ony")
+--     ZG       -> "zandalar"       (NOT "zg")
+--     Rend     -> "warchief"       (NOT "rend")
+--     DMT AP   -> "fengus"         (NOT "dmtAP")
+--     DMT SP   -> "slipkik"        (NOT "dmtSP")
+--     DMT Stam -> "moldar"         (NOT "dmtStam")
+-- (dmf / songflower / battleShout / fff are spelled the same in both spaces,
+-- which is exactly why the mismatch below was not obvious.)
+--
+-- These six carried the AURA keys until this batch, so ticking "Ony", "ZG",
+-- "Rend" or any DMT box wrote a key Auto.ScanTriggerBuffs never reads — the box
+-- appeared to work and did nothing. Store.SUMMON_TRIGGER_SEEDS seeds the engine
+-- keys, so the seeded set would have rendered half-unticked against the old
+-- table. The store's seeder also treats a triggers table holding ONLY these dead
+-- keys as unseeded, so an install carrying the stale ticks still gets the
+-- spec'd set (see Store.SeedAutoSummonDefaults).
 local TRIGGER_DEFS = {
-    { key = "dmf",        abbr = "DMF",      name = "Sayge's Dark Fortune",  spellID = 23768 },
-    { key = "ony",        abbr = "Ony",      name = "Rallying Cry of the Dragonslayer", spellID = 22888 },
-    { key = "zg",         abbr = "ZG",       name = "Spirit of Zandalar",    spellID = 24425 },
-    { key = "dmtAP",      abbr = "DMT AP",   name = "Fengus' Ferocity",      spellID = 22817 },
-    { key = "dmtSP",      abbr = "DMT SP",   name = "Slip'kik's Savvy",      spellID = 22820 },
-    { key = "dmtStam",    abbr = "DMT Stam", name = "Mol'dar's Moxie",       spellID = 22818 },
-    { key = "songflower", abbr = "SF",       name = "Songflower Serenade",   spellID = 15366 },
-    { key = "rend",       abbr = "Rend",     name = "Warchief's Blessing",   spellID = 16609 },
-    { key = "battleShout", abbr = "BS",      name = "Battle Shout",          spellID = 6673  },
-    { key = "fff",        abbr = "FFF",      name = "Fervor of the Fallen (seasonal)", spellID = nil },
+    { key = "dmf",         abbr = "DMF",      name = "Sayge's Dark Fortune",  spellID = 23768 },
+    { key = "dragonslayer", abbr = "Ony",     name = "Rallying Cry of the Dragonslayer", spellID = 22888 },
+    { key = "zandalar",    abbr = "ZG",       name = "Spirit of Zandalar",    spellID = 24425 },
+    { key = "fengus",      abbr = "DMT AP",   name = "Fengus' Ferocity",      spellID = 22817 },
+    { key = "slipkik",     abbr = "DMT SP",   name = "Slip'kik's Savvy",      spellID = 22820 },
+    { key = "moldar",      abbr = "DMT Stam", name = "Mol'dar's Moxie",       spellID = 22818 },
+    { key = "songflower",  abbr = "SF",       name = "Songflower Serenade",   spellID = 15366 },
+    { key = "warchief",    abbr = "Rend",     name = "Warchief's Blessing",   spellID = 16609 },
+    { key = "battleShout", abbr = "BS",       name = "Battle Shout",          spellID = 6673  },
+    { key = "fff",         abbr = "FFF",      name = "Fervor of the Fallen (seasonal)", spellID = nil },
 }
+-- Exposed so the store selftest can assert the UI offers a checkbox for every
+-- key the engine reads. Without that assertion the aura-key mismatch above is
+-- invisible to every headless gate: the boxes render, they just do nothing.
+Options.TRIGGER_DEFS = TRIGGER_DEFS
 
 -- Classes for the Rend rule cycler (all nine) and the Battle Shout cycler
 -- (melee/hunter only, per spec §2).
@@ -1728,18 +1751,36 @@ local function buildAutomation(flow)
 
     -- Buff triggers sub-group (round-3 item 23): all ten trigger buffs, each as an
     -- icon + "ABBR - Full Name" checkbox row (two per row for compactness).
-    -- ENGINE DEPENDENCY: the authoritative set is ns.Store.SUMMON_TRIGGER_BUFFS;
-    -- TRIGGER_DEFS is the UI label/icon source and the pre-merge ordering fallback.
+    -- ENGINE DEPENDENCY: the authoritative key set is ns.Store.SUMMON_TRIGGER_KEYS
+    -- (the store's mirror of auto.lua's Auto.SUMMON_TRIGGER_BUFFS). This used to
+    -- read ns.Store.SUMMON_TRIGGER_BUFFS, which no file ever defined -- so the
+    -- merge below was dead and the fallback ran every time. That hid the fact
+    -- that TRIGGER_DEFS was keyed by AURA keys; both are fixed in this batch, and
+    -- a store selftest now asserts the two key sets match exactly.
+    --
+    -- TRIGGER_DEFS supplies labels/icons AND the owner-approved display ORDER, so
+    -- the engine list is used only to confirm membership: keys are rendered in
+    -- TRIGGER_DEFS order, with any engine key missing from it appended.
     local bt = flow:AddSection("Buff Triggers")
     bt:Hint("Accept a pending summon when one of these buffs is freshly gained.")
-    local triggerKeys = ns.Store and ns.Store.SUMMON_TRIGGER_BUFFS
+    local triggerKeys = ns.Store and ns.Store.SUMMON_TRIGGER_KEYS
     local function trigMeta(key)
         for _, d in ipairs(TRIGGER_DEFS) do if d.key == key then return d end end
         return { key = key, abbr = key, name = key, spellID = nil }
     end
     local trigList = {}
     if type(triggerKeys) == "table" and #triggerKeys > 0 then
-        for _, k in ipairs(triggerKeys) do trigList[#trigList + 1] = trigMeta(k) end
+        -- Engine-authoritative membership, TRIGGER_DEFS display order.
+        local want, taken = {}, {}
+        for _, k in ipairs(triggerKeys) do want[k] = true end
+        for _, d in ipairs(TRIGGER_DEFS) do
+            if want[d.key] then trigList[#trigList + 1] = d; taken[d.key] = true end
+        end
+        -- Anything the engine knows and the UI catalog does not: append it rather
+        -- than silently drop it (a visible raw-key row is a loud bug report).
+        for _, k in ipairs(triggerKeys) do
+            if not taken[k] then trigList[#trigList + 1] = trigMeta(k) end
+        end
     else
         trigList = TRIGGER_DEFS
     end

@@ -392,6 +392,34 @@ Store.SUMMON_TRIGGER_SEEDS = {
     "warchief", "battleShout", "fff",
 }
 
+-- All TEN live trigger keys, mirroring Auto.SUMMON_TRIGGER_BUFFS (auto.lua owns
+-- the catalog; this is the store's copy so seeding does not depend on load
+-- order). Used to tell a real trigger from a DEAD one: options.lua shipped the
+-- six aura keys ("ony"/"zg"/"rend"/"dmtAP"/"dmtSP"/"dmtStam") on its trigger
+-- checkboxes, so an install from before this batch can hold ticks that
+-- Auto.ScanTriggerBuffs never reads. A store selftest asserts this list matches
+-- the catalog exactly, so the two cannot drift.
+Store.SUMMON_TRIGGER_KEYS = {
+    "dmf", "dragonslayer", "zandalar", "songflower", "warchief",
+    "battleShout", "fff", "fengus", "moldar", "slipkik",
+}
+
+-- Does this triggers table hold at least one key the engine actually reads?
+-- A table that is empty -- OR that holds nothing but dead pre-batch aura keys --
+-- counts as unseeded, because in both cases the owner has zero working triggers
+-- and seeding is purely additive. Any LIVE key means the owner has a real,
+-- working selection, and we never merge into it.
+local function triggersUnseeded(t)
+    if type(t) ~= "table" then return true end
+    local live = {}
+    for _, k in ipairs(Store.SUMMON_TRIGGER_KEYS) do live[k] = true end
+    for k, v in pairs(t) do
+        if v and live[k] then return false end
+    end
+    return true
+end
+Store._triggersUnseeded = triggersUnseeded
+
 -- Spec §13 fresh-buff window, in seconds. Seeded only when the key is ABSENT;
 -- the defaults tree already carries it for both factions, so in practice this
 -- only rescues a hand-edited or partially-migrated SavedVariables file.
@@ -404,9 +432,13 @@ Store.SUMMON_FRESH_WINDOW_SEED = 19
 -- faction:
 --   * `autoSummon.defaultsApplied` already true -> do nothing at all. This is
 --     what keeps an unchecked trigger unchecked forever.
---   * triggers table completely empty -> install the seven spec'd ON triggers.
---     Non-empty (the owner has already ticked or unticked something) -> left
---     EXACTLY as-is; we never merge into a table the owner has touched.
+--   * triggers table holding no LIVE trigger -> install the seven spec'd ON
+--     triggers. "No live trigger" means empty, or holding nothing but the dead
+--     aura keys options.lua wrote before this batch (see triggersUnseeded).
+--     Any working trigger present -> left EXACTLY as-is; we never merge into a
+--     table the owner has a real selection in. Dead keys are left in place
+--     rather than deleted, per the no-destructive-migrations rule; they are
+--     inert and the UI no longer offers a way to make more.
 --   * freshBuffWindow absent -> install 19. An existing value is never touched.
 --   * Then stamp defaultsApplied = true so this never runs again.
 --
@@ -430,7 +462,7 @@ function Store.SeedAutoSummonDefaults(db)
         local as = type(fs) == "table" and fs.autoSummon or nil
         if type(as) == "table" and not as.defaultsApplied then
             if type(as.triggers) ~= "table" then as.triggers = {} end
-            if next(as.triggers) == nil then
+            if triggersUnseeded(as.triggers) then
                 for _, key in ipairs(Store.SUMMON_TRIGGER_SEEDS) do
                     as.triggers[key] = true
                 end
@@ -2073,6 +2105,39 @@ local function testAutoSummonSeeds(fails)
         "legacy edited: the untouched faction still seeds normally")
 
     ------------------------------------------------------------------
+    -- 4b. Pre-batch install whose ticks are all DEAD aura keys. options.lua
+    --     used to write "ony"/"zg"/"rend"/"dmtAP"/... on its trigger boxes, and
+    --     Auto.ScanTriggerBuffs never reads those -- so the owner has zero
+    --     WORKING triggers and seeding is still purely additive.
+    ------------------------------------------------------------------
+    ck(triggersUnseeded({}) == true, "dead-key: an empty table is unseeded")
+    ck(triggersUnseeded({ ony = true, zg = true, rend = true }) == true,
+        "dead-key: only stale aura keys reads as unseeded")
+    ck(triggersUnseeded({ dragonslayer = true }) == false,
+        "dead-key: one live trigger means the owner has a real selection")
+    ck(triggersUnseeded({ dragonslayer = false }) == true,
+        "dead-key: a falsy live key does not count as a selection")
+    ck(triggersUnseeded("nope") == true, "dead-key: a non-table reads as unseeded")
+
+    local db4 = { factionSettings = buildFactionSettings() }
+    local A4 = db4.factionSettings.Alliance.autoSummon
+    A4.triggers = { ony = true, rend = true, dmtAP = true }   -- pre-batch ticks
+    Store.SeedAutoSummonDefaults(db4)
+    ck(A4.triggers.dragonslayer == true, "dead-key install: live Ony trigger seeded")
+    ck(A4.triggers.warchief == true, "dead-key install: live Rend trigger seeded")
+    ck(A4.triggers.fengus == nil, "dead-key install: DMT stays off (seed set is the 7)")
+    -- Dead keys are inert; we do NOT delete them (no destructive migrations).
+    ck(A4.triggers.ony == true, "dead-key install: stale key left in place, not deleted")
+
+    -- A genuinely-configured install is still never merged into.
+    local db5 = { factionSettings = buildFactionSettings() }
+    local A5 = db5.factionSettings.Alliance.autoSummon
+    A5.triggers = { ony = true, dragonslayer = true }   -- stale AND live
+    Store.SeedAutoSummonDefaults(db5)
+    ck(A5.triggers.zandalar == nil,
+        "a live trigger present -> seeding skipped even alongside stale keys")
+
+    ------------------------------------------------------------------
     -- 5. Robustness: bad input must not throw.
     ------------------------------------------------------------------
     Store.SeedAutoSummonDefaults(nil)
@@ -2092,9 +2157,33 @@ local function testAutoSummonSeeds(fails)
         for _, k in ipairs(Store.SUMMON_TRIGGER_SEEDS) do
             ck(known[k] == true, "seed key '" .. k .. "' exists in Auto.SUMMON_TRIGGER_BUFFS")
         end
-        local nCat = 0
-        for _ in pairs(known) do nCat = nCat + 1 end
-        ck(nCat == 10, "catalog still has 10 triggers (7 seeded on + 3 DMT off)")
+        -- SUMMON_TRIGGER_KEYS must mirror the catalog EXACTLY, both directions:
+        -- a key missing here would be misread as dead and could let the seeder
+        -- overwrite a real selection.
+        local mine = {}
+        for _, k in ipairs(Store.SUMMON_TRIGGER_KEYS) do
+            mine[k] = true
+            ck(known[k] == true, "SUMMON_TRIGGER_KEYS '" .. k .. "' exists in the catalog")
+        end
+        for k in pairs(known) do
+            ck(mine[k] == true, "catalog key '" .. k .. "' is present in SUMMON_TRIGGER_KEYS")
+        end
+        ck(#Store.SUMMON_TRIGGER_KEYS == 10, "10 trigger keys (7 seeded on + 3 DMT off)")
+        ck(#Store.SUMMON_TRIGGER_SEEDS == 7, "7 triggers seeded ON per spec §13")
+    end
+
+    ------------------------------------------------------------------
+    -- 7. The options UI must offer a checkbox for every seeded trigger, keyed
+    --    the way the engine reads it. This is the exact defect this batch fixed:
+    --    options.lua's TRIGGER_DEFS carried the AURA keys, so six of the ten
+    --    boxes wrote settings Auto.ScanTriggerBuffs never looked at.
+    ------------------------------------------------------------------
+    if ns.Options and type(ns.Options.TRIGGER_DEFS) == "table" then
+        local ui = {}
+        for _, d in ipairs(ns.Options.TRIGGER_DEFS) do ui[d.key] = true end
+        for _, k in ipairs(Store.SUMMON_TRIGGER_KEYS) do
+            ck(ui[k] == true, "options TRIGGER_DEFS offers a checkbox for '" .. k .. "'")
+        end
     end
 end
 
