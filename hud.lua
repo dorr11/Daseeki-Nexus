@@ -28,6 +28,40 @@ ns.HUD = HUD
 -- FROZEN and only recomputed at a STRUCTURAL event (a new bar spawns, or a bar
 -- expires): HUD._AssignGroups does that recompute; reflow reads frozen groups.
 
+-- Buffs whose stage-1 pop raises MORE THAN ONE bar — one per landing zone — so
+-- bar identity has to be buff+variant or the second fire lands on the first
+-- bar's refresh path and overwrites its window. Rend is the only one today
+-- (Orgrimmar 6s + Barrens 17s off a single Thrall yell; Herald is 6s/6s).
+-- Zone names are stored lowercased and mirror timers.lua's REND_BARS[].zone.
+-- Lives up here (rather than beside BUFF_META) so the headless suite below can
+-- exercise barKeyOf without DaseekiUI.
+local VARIANT_ZONES = {
+    rend = { ["orgrimmar"] = true, ["barrens"] = true },
+}
+HUD.VARIANT_ZONES = VARIANT_ZONES
+
+-- Bar identity. Plain buffKey, EXCEPT a multi-zone buff fired for one of its
+-- own known variant zones -> "buff:zone", so both landings render at once.
+-- A nil/unknown zone (e.g. the /demo path) falls back to the plain key.
+local function barKeyOf(buffKey, zone)
+    local variants = VARIANT_ZONES[buffKey]
+    if not variants then return buffKey end
+    local z = (type(zone) == "string") and zone:lower() or nil
+    if z and variants[z] then return buffKey .. ":" .. z end
+    return buffKey
+end
+HUD._BarKeyOf = barKeyOf
+
+-- Does the player's current zone sit in a bar's variant zone? The engine emits
+-- the landing NAME ("Barrens") while GetRealZoneText returns the full localized
+-- zone ("The Barrens"), so containment — not equality — is the honest compare.
+local function zoneMatches(playerZone, variantZone)
+    if not playerZone or not variantZone or variantZone == "" then return false end
+    if playerZone == variantZone then return true end
+    return playerZone:find(variantZone, 1, true) ~= nil
+end
+HUD._ZoneMatches = zoneMatches
+
 -- Recompute each entry's group from live state. Mutates entry.group; returns a
 -- key->group map. `list` = array of { key=, rem=, zoneRelevant=bool }.
 function HUD._AssignGroups(list, threshold)
@@ -70,6 +104,28 @@ ns:RegisterSelfTest("hudgroups", function(verbose)
     local z = { key = "onyH", rem = 999, zoneRelevant = true }
     HUD._AssignGroups({ z }, threshold)
     check(z.group == "main", "zone-relevant -> main")
+
+    -- Bar identity = buff + variant zone.
+    check(barKeyOf("rend", "Orgrimmar") == "rend:orgrimmar", "barKeyOf rend/Orgrimmar")
+    check(barKeyOf("rend", "Barrens") == "rend:barrens", "barKeyOf rend/Barrens")
+    check(barKeyOf("rend", nil) == "rend", "barKeyOf rend/nil -> plain key")
+    check(barKeyOf("rend", "Silithus") == "rend", "barKeyOf rend/unknown zone -> plain key")
+    check(barKeyOf("zg", "Orgrimmar") == "zg", "barKeyOf non-variant buff ignores zone")
+    check(zoneMatches("the barrens", "barrens"), "player 'The Barrens' matches 'Barrens'")
+    check(not zoneMatches("orgrimmar", "barrens"), "Orgrimmar does not match Barrens")
+
+    -- Two concurrent Rend bars: distinct keys, and only the bar for the PLAYER's
+    -- own landing zone is forced main — the other waits on the expand threshold.
+    local rOrg = { key = barKeyOf("rend", "Orgrimmar"), rem = 6,  zoneRelevant = true }
+    local rBar = { key = barKeyOf("rend", "Barrens"),   rem = 17, zoneRelevant = false }
+    check(rOrg.key ~= rBar.key, "two Rend variants key apart (no collapse)")
+    HUD._AssignGroups({ rOrg, rBar }, threshold)
+    check(rOrg.group == "main" and rBar.group == "small", "Org player: Org main, Barrens small")
+    -- Same pop seen from the Barrens: relevance flips, both bars still exist.
+    local oOrg = { key = barKeyOf("rend", "Orgrimmar"), rem = 40, zoneRelevant = false }
+    local oBar = { key = barKeyOf("rend", "Barrens"),   rem = 17, zoneRelevant = true }
+    HUD._AssignGroups({ oOrg, oBar }, threshold)
+    check(oBar.group == "main" and oOrg.group == "small", "Barrens player: Barrens main, Org small")
     if verbose then ns:Print("  hudgroups selftest " .. (pass and "PASS" or "FAIL")) end
     return pass
 end)
@@ -153,7 +209,10 @@ local MAX_BARS            = 8
 ----------------------------------------------------------------------
 
 local BUFF_META = {
-    rend        = { label = "Rend",       icon = "Interface\\Icons\\Ability_Warrior_WarCry",        zones = { ["orgrimmar"] = true } },
+    -- Rend lands in BOTH Orgrimmar and the Barrens (see VARIANT_ZONES above);
+    -- the Barrens entry was missing, so a Barrens waiter's non-variant Rend bar
+    -- (e.g. the /demo bar) never classified "main".
+    rend        = { label = "Rend",       icon = "Interface\\Icons\\Ability_Warrior_WarCry",        zones = { ["orgrimmar"] = true, ["barrens"] = true } },
     onyH        = { label = "Horde Ony",  icon = "Interface\\Icons\\INV_Misc_Head_Dragon_01",       zones = { ["orgrimmar"] = true } },
     onyA        = { label = "Ally Ony",   icon = "Interface\\Icons\\INV_Misc_Head_Dragon_01",       zones = { ["stormwind city"] = true } },
     nefH        = { label = "Horde Nef",  icon = "Interface\\Icons\\INV_Misc_Head_Dragon_Black",    zones = { ["orgrimmar"] = true } },
@@ -169,10 +228,19 @@ HUD.BUFF_META = BUFF_META
 
 local function buffLabel(k) local m = BUFF_META[k]; return m and m.label or tostring(k) end
 local function buffIcon(k)  local m = BUFF_META[k]; return m and m.icon or "Interface\\Icons\\INV_Misc_QuestionMark" end
+-- Zone relevance for a NON-variant bar: the player's real zone against the
+-- buff's BUFF_META zone set. Exact hit first; otherwise fall back to the
+-- containment compare, because a landing name can be a substring of the real
+-- zone text ("barrens" vs. GetRealZoneText's "The Barrens").
 local function zoneRelevant(k)
     local m = BUFF_META[k]
     if not m or not m.zones then return false end
-    return m.zones[zoneNow()] == true
+    local here = zoneNow()
+    if m.zones[here] == true then return true end
+    for z, on in pairs(m.zones) do
+        if on == true and zoneMatches(here, z) then return true end
+    end
+    return false
 end
 
 ----------------------------------------------------------------------
@@ -389,7 +457,10 @@ end
 --
 -- A bar is built on UI.MakeStatusBar (Core kit): interpolated drain fill + a
 -- spark riding the fill edge (the HUD's only continuous motion, §8), an icon,
--- a buff label and a numeral countdown. Bars group into Main (large; centered)
+-- a buff label and a numeral countdown. A bar's identity is buff+variant zone
+-- (barKeyOf), so a multi-zone pop such as Rend renders BOTH landings side by side
+-- rather than the second fire overwriting the first.
+-- Bars group into Main (large; centered)
 -- and Small (idle; top-right), ≤8 total, with FROZEN group assignment (no mid-
 -- pull jumps — see HUD._AssignGroups above). Colours keep the owner-approved
 -- traffic language: green (ok) -> amber (warn, under expand threshold) -> red
@@ -400,9 +471,12 @@ end
 -- a just-expired key is blocked from restarting for 60s.
 ----------------------------------------------------------------------
 
-local bars = {}              -- buffKey -> bar frame (outer)
+-- Every table below is keyed by BAR key (barKeyOf: buffKey, or "buff:zone" for a
+-- multi-zone buff's variant landing) — never by buffKey — so Rend's Orgrimmar and
+-- Barrens bars coexist instead of the second fire overwriting the first.
+local bars = {}              -- barKey -> bar frame (outer)
 local barOrder = {}          -- insertion order (for cap eviction: oldest first)
-local recentlyExpired = {}   -- buffKey -> frameClock of expiry
+local recentlyExpired = {}   -- barKey -> frameClock of expiry
 local mainGroup, smallGroup  -- container frames
 
 local function expandThreshold()
@@ -475,9 +549,13 @@ end
 -- UI.MakeStatusBar fill (interpolation + spark + numeral countdown). Icon and
 -- label are children of the STATUS BAR (drawn above the fill), so they never sit
 -- behind the drain. The countdown is the kit's own text FS (numeral, right).
+-- `buffKey` is the BUFF (not the bar key): it drives icon/label/alert routing and
+-- is stashed on the frame as bar._buffKey. onPullDetected additionally stamps
+-- bar._variantZone on a variant bar.
 local function createBar(buffKey)
     local bar = CreateFrame("Frame", nil, UIParent)
     bar:SetSize(220, 18)
+    bar._buffKey = buffKey
 
     local bg = UI.FlatFrame(bar, "inset", "border")
     bg:SetAllPoints(bar)
@@ -550,6 +628,14 @@ local function paintBar(bar, remaining, duration)
     applyBarVisual(sb)          -- apply the (possibly brightened) fill hue
 end
 
+-- Per-bar zone relevance: a VARIANT bar is relevant only when the player stands
+-- in that bar's OWN landing zone (an Orgrimmar waiter must not see the Barrens
+-- bar promoted, and vice versa). A non-variant bar keeps the BUFF_META check.
+local function barZoneRelevant(bar)
+    if bar._variantZone then return zoneMatches(zoneNow(), bar._variantZone) end
+    return zoneRelevant(bar._buffKey)
+end
+
 -- Recompute every bar's FROZEN group. Called ONLY at a structural event (a new
 -- bar spawns, or a bar expires) — never on the periodic tick — so a bar never
 -- jumps groups mid-countdown when the expand threshold is crossed. Delegates to
@@ -563,7 +649,7 @@ local function assignGroups()
             list[#list + 1] = {
                 key = k,
                 rem = (b._endTime or 0) - frameClock(),
-                zoneRelevant = zoneRelevant(k),
+                zoneRelevant = barZoneRelevant(b),
                 bar = b,
             }
         end
@@ -650,8 +736,17 @@ local function ensureTicker()
     end)
 end
 
--- trust -> confirmation chat notice (spec §3).
+-- trust -> confirmation chat notice (spec §3). Keyed by BUFF, not by bar: one pop
+-- that raises two variant bars is still one pop, so the notice dedups on the
+-- dispatcher's window instead of printing once per bar. The dedup key carries
+-- trust + confirmed, so a genuine trust UPGRADE still speaks.
+local lastTrustNoticeAt = {}   -- "buff:trust:confirmed" -> frameClock
 local function trustNotice(buffKey, trust, confirmed)
+    local t = frameClock()
+    local dkey = buffKey .. ":" .. tostring(trust) .. ":" .. tostring(confirmed == true)
+    local prev = lastTrustNoticeAt[dkey]
+    if prev and (t - prev) < DEDUP_WINDOW then return end
+    lastTrustNoticeAt[dkey] = t
     local label = buffLabel(buffKey)
     if trust == "dbm" and not confirmed then
         ns:Print("|cffff9f40[Intercepted DBM]|r " .. label .. " — no local or NWB confirmation.")
@@ -660,13 +755,19 @@ local function trustNotice(buffKey, trust, confirmed)
     end
 end
 
--- PULL_DETECTED(buffKey, duration, trust, zone) handler.
+-- PULL_DETECTED(buffKey, duration, trust, zone) handler. `zone` carries the
+-- LANDING zone, which is what splits a multi-zone buff into two bars: identity
+-- below is the bar key, not the buff key (Rend fires twice per pop).
 local function onPullDetected(buffKey, duration, trust, zone)
     if not BUFF_META[buffKey] and buffKey ~= "battleShout" then return end
     ensureGroups(); ensureTicker()
 
-    -- 60s recently-expired restart block.
-    local exp = recentlyExpired[buffKey]
+    local barKey = barKeyOf(buffKey, zone)
+    local variantZone = (barKey ~= buffKey) and lower(zone) or nil
+
+    -- 60s recently-expired restart block — per BAR, so Orgrimmar's 6s bar
+    -- expiring never blocks the Barrens bar from the same pop.
+    local exp = recentlyExpired[barKey]
     if exp and (frameClock() - exp) < RECENT_EXPIRE_BLOCK then
         return
     end
@@ -674,7 +775,7 @@ local function onPullDetected(buffKey, duration, trust, zone)
     duration = (duration and duration > 0) and duration or DEFAULT_PULL_WINDOW
 
     local isNew = false
-    local bar = bars[buffKey]
+    local bar = bars[barKey]
     if bar then
         -- Existing bar: refresh window + possible trust upgrade. NOT a structural
         -- event → group stays frozen (no jump), only the fill range refreshes.
@@ -691,16 +792,20 @@ local function onPullDetected(buffKey, duration, trust, zone)
         isNew = true
         evictIfNeeded()
         bar = createBar(buffKey)
+        bar._variantZone = variantZone
         bar._icon:SetTexture(buffIcon(buffKey))
-        bar._label:SetText(buffLabel(buffKey))
+        -- Variant bars name their landing so two Rend bars read apart.
+        bar._label:SetText(variantZone
+            and (buffLabel(buffKey) .. " (" .. zone .. ")")
+            or  buffLabel(buffKey))
         bar._endTime = frameClock() + duration
         bar._duration = duration
         bar._trust = trust
         bar._sb:SetBarRange(0, duration)
         bar._sb:SetBarValue(duration, true)   -- start full (no drain-in pop)
         bar:Show()
-        bars[buffKey] = bar
-        barOrder[#barOrder + 1] = buffKey
+        bars[barKey] = bar
+        barOrder[#barOrder + 1] = barKey
         trustNotice(buffKey, trust, false)
     end
 
@@ -708,7 +813,9 @@ local function onPullDetected(buffKey, duration, trust, zone)
     -- regroup point). A plain refresh keeps every bar's frozen group.
     if isNew then ns:SafeCall(assignGroups) end
 
-    -- Route a pull-timer alert through the dispatcher.
+    -- Route a pull-timer alert through the dispatcher. Deliberately keyed by
+    -- BUFF, not bar: the dispatcher's 3s dedup collapses Rend's two fires into a
+    -- single "Rend incoming!" banner — two bars, one alert.
     HUD.Alert(buffKey, "pullTimer", buffLabel(buffKey) .. " incoming!")
     ns:SafeCall(reflow)
 end
@@ -1072,7 +1179,8 @@ local function registerCommands()
             -- fabricate a demo pull bar for visual checks
             local k = args:match("(%S+)") or "rend"
             if not BUFF_META[k] then k = "rend" end
-            onPullDetected(k, 30, "local", zoneNow())
+            -- No zone: the demo wants ONE plain-keyed bar, not a variant pair.
+            onPullDetected(k, 30, "local", nil)
             ns:Print("demo pull bar: " .. buffLabel(k))
         end
     end)
@@ -1096,6 +1204,8 @@ local function runSelfTests(verbose)
     check(soundKeyForEvent("pullTimer") ~= nil, "event sound resolves")
     check(#CANCEL_AURAS == 10, "10 cancel auras (added Battle Shout + FFF)")
     check(buffLabel("dmf") == "DMF" and buffLabel("fff") == "FFF", "dmf/fff BUFF_META present")
+    check(BUFF_META.rend.zones["barrens"] == true, "rend zone meta covers the Barrens")
+    check(barKeyOf("rend", "Barrens") == "rend:barrens", "variant bars key by buff+zone")
     if verbose then ns:Print("  hud selftest " .. (pass and "PASS" or "FAIL")) end
     return pass
 end

@@ -699,16 +699,15 @@ local function consumeHandinStash(buffKey, t)
 end
 Timers._consumeHandinStash = consumeHandinStash
 
--- Raise Rend's TWO stage-1 bars (Orgrimmar + Barrens). hud.lua keys bars by
--- buffKey, so the two fires collapse into one bar there; we therefore emit the
--- bar for the player's OWN zone LAST so that is the one they end up seeing.
+-- Raise Rend's TWO stage-1 bars (Orgrimmar + Barrens). hud.lua now keys bars by
+-- buff + landing zone, so both bars live concurrently and emit ORDER carries no
+-- meaning — the old fire-the-player's-own-zone-LAST reorder (which existed only
+-- to pick a winner out of a single-bar collapse) is gone. Fixed order: the
+-- REND_BARS row order, Orgrimmar then Barrens.
 local function raiseRendBars(npcKey, epoch, trust)
     local bars = REND_BARS[REND_NPC_VARIANT[npcKey] or "thrall"]
-    local first, second = bars[1], bars[2]
-    local zone = (GetRealZoneText and GetRealZoneText() or ""):lower()
-    if zone:find("orgrimmar", 1, true) then first, second = bars[2], bars[1] end
-    raisePull("rend", epoch, first.seconds,  trust, first.zone,  1)
-    raisePull("rend", epoch, second.seconds, trust, second.zone, 1)
+    raisePull("rend", epoch, bars[1].seconds, trust, bars[1].zone, 1)
+    raisePull("rend", epoch, bars[2].seconds, trust, bars[2].zone, 1)
 end
 Timers._raiseRendBars = raiseRendBars
 
