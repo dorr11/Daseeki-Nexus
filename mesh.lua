@@ -52,6 +52,54 @@ Mesh.PEER_SWEEP_INTERVAL = 5        -- A1.3: sweep cadence (spec §2.3)
 Mesh.RELAY_MAX_AGE   = 10           -- A10.8: drop relays older than 10s (spec §9.4)
 Mesh.CHUNK_DATA_MAX  = 230          -- payload bytes/chunk (255 - envelope room)
 
+-- Logout presence hygiene (see §Logout flush).
+--
+-- ui_shell.lua's roster reads a remote character as ONLINE from two independent
+-- sources: (1) live mesh presence — Mesh.peers[aid].online plus p.name — and,
+-- when the mesh has nothing to say, (2) a lastSeen-recency fallback with a 15s
+-- window. A logging-out character used to trip BOTH: its final STATE whisper
+-- carried a lastSeen stamped microseconds earlier (fallback reads green for the
+-- whole window), and any inbound frame from it re-flipped p.online true even
+-- after the channel-leave notice had marked it stale (mesh presence reads green
+-- until the 30s silence sweep). These two tunables kill both paths.
+Mesh.PRESENCE_ONLINE_WINDOW = 15    -- MIRRORS ui_shell.lua ONLINE_WINDOW. Read-only
+                                    -- here: mesh never sets the display policy, it
+                                    -- only has to backdate PAST it. ui_shell pins
+                                    -- its own value at 15 in its self-test.
+Mesh.LOGOUT_LASTSEEN_BACKDATE = Mesh.PRESENCE_ONLINE_WINDOW + 1
+                                    -- seconds to backdate the lastSeen we ENCODE in
+                                    -- the logout flush, so the receiver's recency
+                                    -- fallback is already expired when it lands
+Mesh.PRESENCE_STALE_HOLD = 30       -- after a leave/logout latch, refuse to clear it
+                                    -- from RAW inbound traffic for this long. Sized to
+                                    -- PEER_TIMEOUT: past it the silence sweep owns the
+                                    -- peer anyway. An identified frame (heartbeat /
+                                    -- discovery -> NotePeer) still re-admits instantly,
+                                    -- so a genuine relog re-greens without waiting.
+
+-- A10.7 / spec §9.5 — per-target send cooldowns. Divergence detection fires on
+-- EVERY heartbeat from EVERY peer, so an N-peer mesh with a churning hash could
+-- re-send the same manifest/segment/timer payload to the same target several
+-- times a second. These are the reference's numbers.
+Mesh.MANIFEST_COOLDOWN   = 5    -- spec §9.5: "one manifest per target per 5 s"
+Mesh.SEGMENT_COOLDOWN    = 60   -- spec §9.5: homeless/segment per account+target 60 s
+Mesh.TIMERSYNC_COOLDOWN  = 30   -- spec §9.5: timer-state whisper per target 30 s
+Mesh.SETTINGS_COOLDOWN   = 10   -- LOCAL (not spec): settings/blacklist are BUTTON-driven
+                                -- and fan out to every peer, so mashing the button is
+                                -- the only way to storm them. Modest per-target gate.
+Mesh.SEND_COOLDOWN_PRUNE = 4    -- prune send-cooldown entries older than N x their window
+
+-- Bookkeeping TTLs: the maps below are keyed by unbounded strings (sync ids,
+-- sender names) and had no removal path at all.
+Mesh.ACK_WAIT_TTL = 300         -- drop an un-ACKed settings sync after 5 min
+Mesh.INSEQ_TTL    = 3600        -- drop a seq high-water for a non-peer after 1 h
+
+-- B5 split-brain: two clients can both believe they are the guild broadcaster
+-- (election races a roster change), and both then relay the SAME snapshot. A
+-- small random defer plus same-payload cancellation makes the loser drop its
+-- copy instead of doubling the guild traffic.
+Mesh.BCAST_JITTER_MAX = 4       -- seconds; actual defer is uniform in [0, MAX]
+
 -- Bucket cap / refill per prefix (spec: cap 8, refill 1/s).
 Mesh.BUCKET_CAP    = 8
 Mesh.BUCKET_REFILL = 1
@@ -84,6 +132,16 @@ local OP = {
     INSTANCES  = "i",   -- account instance-ledger sync (additive; see §Instances sync)
     NSPAYLOAD  = "y",   -- suite-namespace payload push (Daseeki.Sync v2, wave N5)
     NSREQ      = "u",   -- suite-namespace pull request (heartbeat rev-hash mismatch)
+    LOGOUT     = "l",   -- ADDITIVE: "I am logging out" presence notice (empty payload).
+                        -- IGNORE-SAFE ON OLD PEERS: Mesh.ParseFrame does not validate
+                        -- the op field, and Mesh.Dispatch is an if/elseif chain with NO
+                        -- else branch — an unrecognised op falls off the end silently
+                        -- (no error, no print, no telemetry). A pre-LOGOUT build
+                        -- therefore treats this exactly as it treats any other frame it
+                        -- has no handler for: dedup it, stamp the sender's liveness,
+                        -- drop it. Same PROTO_VERSION, same frame layout, no
+                        -- SCHEMA_VERSION involvement (the payload is empty, so
+                        -- protocol.lua is not on this path at all).
 }
 Mesh.OP = OP
 
@@ -393,6 +451,7 @@ Mesh._reasm = {}         -- [sender.."\1"..prefix.."\1"..seq] = { parts, total, 
 Mesh._fail = {}          -- [target] = { count, skipUntil }
 Mesh._sched = {}         -- [prefix] = { bucket, queue, rr }
 Mesh._ackWait = {}       -- [syncId] = { [target]=true } pending ACKs
+Mesh._ackWaitAt = {}     -- [syncId] = ts the wait set was opened (TTL sweep)
 Mesh._sessionId = 0      -- randomised at login to prefix message ids
 Mesh._timerCodec = nil   -- N2b handoff codec (see §Timer handoff)
 Mesh._timerHandler = nil -- N2b handoff receive callback
@@ -426,6 +485,12 @@ Mesh._pushSuppressed = 0    -- telemetry: change-filter suppressions (debug)
 Mesh._relayAgeDrops  = 0    -- telemetry: relays dropped by the 10s age gate
 Mesh._pingCooldowns  = {}   -- [name] = ts we last whisper-pinged that name
 Mesh._lastRosterSweep = 0   -- ts of the last full roster sweep (debug telemetry)
+Mesh._sendCooldowns  = {}   -- [kind\1target(\1scope)] = ts of the last such send (A10.7)
+Mesh._sendGated      = 0    -- telemetry: sends suppressed by a per-target cooldown
+
+-- B5 guard state for the guild-broadcaster relay (see Mesh.BroadcastTimers).
+Mesh._bcastPending    = nil -- { hash = <payload hash>, at = ts } while a defer is armed
+Mesh._bcastCancelled  = 0   -- telemetry: deferred broadcasts dropped as duplicates
 
 -- Join-retry tunables: verify GetChannelName after each attempt on a backoff.
 -- Channel joins routinely fail in the first seconds after login, so we issue
@@ -578,8 +643,16 @@ function Mesh.NotePeer(aid, name, now)
     p.online = true
     -- A peer that answers again clears both offline latches (timeout sweep and
     -- channel-leave notice), exactly as the reference re-admits on any inbound.
+    --
+    -- NotePeer is only reached from an IDENTIFIED frame — one carrying an account
+    -- ID (heartbeat / discovery / manifest). A logging-out client does not emit
+    -- those after its leave notice, but a client that logged back IN emits them
+    -- immediately, so this path deliberately ignores PRESENCE_STALE_HOLD: a real
+    -- relog re-greens at once. The hold lives on the UNidentified raw-receive path
+    -- (TouchPeerByName), which is the one the logout flush trips.
     p.timedOut = nil
     p.presenceStale = nil
+    p.presenceStaleAt = nil
     return p
 end
 
@@ -618,15 +691,39 @@ end
 -- harmless while nothing ever expired a peer — with the 30s sweep above it is
 -- not, so every raw receive now stamps a KNOWN peer by name. (Admitting an
 -- UNKNOWN sender still requires an account ID; discovery handles that.)
+--
+-- ...with ONE exception, added with the logout-pip fix. "Evidence of life
+-- outranks a stale latch" is only true when the evidence is NEWER than the
+-- latch, and on the logout path it is not: LogoutFlush whispers a fan of final
+-- STATE frames at the very moment the client drops the presence channel, so
+-- those frames routinely LAND AFTER the channel-leave notice that marked the
+-- peer stale. Re-greening on them repainted the pip for the rest of the
+-- PEER_TIMEOUT window for a character that is provably gone. So a latch set
+-- within the last PRESENCE_STALE_HOLD seconds REFUSES to be cleared by raw
+-- inbound traffic. Liveness is still stamped (lastSeen is honest data and drives
+-- the "seen Ns ago" column); only the online flip is withheld.
+function Mesh.StaleLatchHolds(p, t)
+    if not p or not p.presenceStale then return false end
+    local at = p.presenceStaleAt
+    if not at then return false end   -- legacy latch with no stamp: no hold
+    return (t - at) < (Mesh.PRESENCE_STALE_HOLD or 0)
+end
+
 function Mesh.TouchPeerByName(name, t)
     if not name or name == "" then return nil end
     t = t or (Store and Store.Now and Store.Now()) or 0
     for _, p in pairs(Mesh.peers) do
         if type(p) == "table" and p.name == name then
             p.lastSeen = t
+            if Mesh.StaleLatchHolds(p, t) then
+                -- In-flight residue from a peer that just announced it is going
+                -- away. Keep the liveness stamp, keep the latch.
+                return p
+            end
             p.online = true          -- evidence of life outranks a stale latch
             p.timedOut = nil
             p.presenceStale = nil
+            p.presenceStaleAt = nil
             return p
         end
     end
@@ -680,6 +777,65 @@ function Mesh.TimerSeen(dedupKey, t)
     return false
 end
 
+-- TTL sweep for the settings/blacklist ACK wait sets.
+--
+-- _ackWait[syncId] is opened by SyncSettings and emptied one target at a time by
+-- handleAck. A peer that never answers (crashed, dropped the whisper, dropped the
+-- chunked payload) left its target key — and therefore the whole parent entry —
+-- in the table for the rest of the session. handleAck now drops the parent as
+-- soon as its member set empties; this is the backstop for the sets that NEVER
+-- empty. `_ackWaitAt` carries the open time; an entry with no stamp (defensively:
+-- one opened by some other path) is stamped on first sight rather than dropped,
+-- so it gets a full TTL rather than being nuked mid-flight.
+function Mesh.PruneAckWait(t)
+    t = t or now()
+    local dropped = 0
+    for syncId in pairs(Mesh._ackWait) do
+        local at = Mesh._ackWaitAt[syncId]
+        if not at then
+            Mesh._ackWaitAt[syncId] = t
+        elseif (t - at) > Mesh.ACK_WAIT_TTL then
+            Mesh._ackWait[syncId] = nil
+            Mesh._ackWaitAt[syncId] = nil
+            dropped = dropped + 1
+        end
+    end
+    -- Drop orphan stamps whose wait set is already gone.
+    for syncId in pairs(Mesh._ackWaitAt) do
+        if not Mesh._ackWait[syncId] then Mesh._ackWaitAt[syncId] = nil end
+    end
+    return dropped
+end
+
+-- TTL sweep for the per-(sender,prefix) sequence high-water marks.
+--
+-- _inSeq is keyed by "<sender>\1<prefix>" and had no removal path: every stranger
+-- who ever whispered us a sequenced frame (guild-fallback broadcasts reach
+-- non-peers too) kept a record forever. Drop a record only when BOTH hold: its
+-- sender is not a peer we currently track, AND it has not been consulted for
+-- INSEQ_TTL. Keeping current peers unconditionally is what stops a prune from
+-- resetting a live sender's high-water and re-opening the replay window.
+function Mesh.PruneInSeq(t)
+    t = t or now()
+    local peerNames = {}
+    for _, p in pairs(Mesh.peers) do
+        if type(p) == "table" and p.name then peerNames[p.name] = true end
+    end
+    local dropped = 0
+    for key, rec in pairs(Mesh._inSeq) do
+        if type(rec) == "table" then
+            local sender = key:match("^([^\1]*)") or key
+            if not rec.t then
+                rec.t = t                      -- pre-existing record: start its clock
+            elseif not peerNames[sender] and (t - rec.t) > Mesh.INSEQ_TTL then
+                Mesh._inSeq[key] = nil
+                dropped = dropped + 1
+            end
+        end
+    end
+    return dropped
+end
+
 -- Prune expired dedup entries (called from the drain ticker occasionally).
 function Mesh.PruneDedup(t)
     t = t or now()
@@ -692,6 +848,8 @@ function Mesh.PruneDedup(t)
     for k, exp in pairs(Mesh._nsReqSeen) do
         if exp <= t then Mesh._nsReqSeen[k] = nil end
     end
+    Mesh.PruneAckWait(t)
+    Mesh.PruneInSeq(t)
 end
 
 -- Extract the session component of a message id. MakeMessageId() builds
@@ -721,7 +879,10 @@ Mesh._SessionOfMsgId = sessionOfMsgId   -- exposed for the seq self-tests
 -- low seqs are NOT stale-dropped against the previous session's high-water. This
 -- is the core reload wedge fix — without it a reloaded sender's STATE/HEARTBEAT
 -- frames are silently dropped until its counter climbs past the old mark.
-function Mesh.FreshSeq(sender, seq, sess)
+--
+-- `t` is optional and used only for bookkeeping: every consultation restamps
+-- rec.t so Mesh.PruneInSeq can tell a live conversation from an abandoned one.
+function Mesh.FreshSeq(sender, seq, sess, t)
     seq = tonumber(seq) or 0
     if seq == 0 then return true end   -- unsequenced ops (ping/ack) always pass
     sess = sess or "?"
@@ -734,6 +895,7 @@ function Mesh.FreshSeq(sender, seq, sess)
         rec.sess = sess
         rec.last = 0
     end
+    rec.t = t or now()
     if seq <= rec.last then return false end
     rec.last = seq
     return true
@@ -1396,8 +1558,35 @@ local function handleAck(f, sender)
         if ack.kind == "settings" then
             Mesh.SendBlacklist(sender)
         end
+        -- Every target answered: drop the parent entry. Without this the syncId
+        -- key (and its now-empty member table) survived for the whole session,
+        -- one per press of the sync button. Mesh.PruneAckWait is the backstop for
+        -- the sets that never empty because a target never answers.
+        local empty = true
+        for _ in pairs(wait) do empty = false break end
+        if empty then
+            Mesh._ackWait[syncId] = nil
+            Mesh._ackWaitAt[syncId] = nil
+        end
     end
 end
+
+-- ADDITIVE op (see OP.LOGOUT): the sender is leaving. Latch its peer entry
+-- offline NOW instead of waiting for either the channel-leave notice — which
+-- never arrives at all for a peer we know only through the guild fallback — or
+-- the 30s silence sweep. The latch is timestamped, so the final STATE whispers
+-- still in flight behind this notice cannot re-green the pip (see
+-- Mesh.StaleLatchHolds).
+--
+-- Note the ordering this relies on: onChatMsgAddon stamps liveness
+-- (TouchPeerByName) BEFORE dispatching, so the touch caused by this very frame
+-- happens first and is then overridden here. That is the correct order — the
+-- touch is about the transport, the latch is about intent.
+local function handleLogout(f, sender)
+    Mesh.MarkPresenceStale(sender, now())
+end
+Mesh._handleAck    = handleAck      -- exposed for the ack-wait self-test
+Mesh._handleLogout = handleLogout   -- exposed for the logout-latch self-test
 
 local function handleTimer(f, sender, isRelay)
     -- Decode via the N2b-registered codec (falls back to Pack/Unpack).
@@ -1452,7 +1641,12 @@ function Mesh.Dispatch(prefix, frame, sender)
         if Mesh._handleTimerSnap then Mesh._handleTimerSnap(f, sender) end
     elseif op == OP.NSPAYLOAD then  Mesh.HandleNSPayload(f, sender)
     elseif op == OP.NSREQ then      Mesh.HandleNSReq(f, sender)
+    elseif op == OP.LOGOUT then     handleLogout(f, sender)
     end
+    -- NOTE (wire compatibility): there is deliberately NO `else` arm. An op this
+    -- build does not know is dropped in silence — no error, no print, no counter.
+    -- That is the property every additive op relies on to stay safe for peers
+    -- running an older build, and it must not be "improved" into a warning.
 end
 
 ----------------------------------------------------------------------
@@ -1595,13 +1789,68 @@ function Mesh.SelectRosterPings(roster, selfName, knownNames, cooldowns, nowT, c
     return out
 end
 
+----------------------------------------------------------------------
+-- A10.7 / spec §9.5 — per-target send cooldowns
+--
+-- Heartbeat-driven divergence detection is edge-triggered on a HASH COMPARE, and
+-- the hash of a busy account changes constantly, so "we diverge -> answer with a
+-- manifest/segment" fires on essentially every heartbeat from every peer. With
+-- 8 peers heartbeating every ~20s that is a steady drip of redundant bulk sends
+-- to the SAME target; the reference caps each kind per target. Settings and
+-- blacklist are not on that path at all — they are button-driven — but they fan
+-- out to every peer, so they get a modest gate of their own against mashing.
+--
+-- The key namespaces by KIND and TARGET, plus an optional scope (account+area)
+-- where the spec's limit is per-account rather than per-target.
+----------------------------------------------------------------------
+
+function Mesh.SendCooldownKey(kind, target, scope)
+    return tostring(kind) .. "\1" .. tostring(target or "*")
+        .. (scope and ("\1" .. tostring(scope)) or "")
+end
+
+-- PURE: may `key` be sent at nowT given `cooldowns` and a window? Mirrors
+-- Mesh.ShouldPingName exactly (same shape, same semantics, different map).
+function Mesh.ShouldSendTo(key, cooldowns, nowT, win)
+    if not key or key == "" then return false end
+    if not win or win <= 0 then return true end
+    local last = cooldowns and cooldowns[key]
+    if last and (nowT - last) < win then return false end
+    return true
+end
+
+-- Impure convenience used by the senders: check the live map and, when the send
+-- is allowed, stamp it. Returns true if the caller may proceed. `t` is injectable
+-- for the self-tests.
+function Mesh.SendGate(kind, target, scope, win, t)
+    t = t or now()
+    local key = Mesh.SendCooldownKey(kind, target, scope)
+    if not Mesh.ShouldSendTo(key, Mesh._sendCooldowns, t, win) then
+        Mesh._sendGated = (Mesh._sendGated or 0) + 1
+        return false
+    end
+    Mesh._sendCooldowns[key] = t
+    return true
+end
+
 -- Prune cooldown entries older than a few windows so the map can't grow forever.
 local function pruneCooldowns(t)
     local horizon = (Mesh.ROSTER_PING_COOLDOWN or 30) * 4
     for name, ts in pairs(Mesh._pingCooldowns) do
         if (t - (ts or 0)) > horizon then Mesh._pingCooldowns[name] = nil end
     end
+    -- Send cooldowns are keyed by kind+target(+scope) and so grow with every peer
+    -- and every account we ever answer. Age them out against the LONGEST window
+    -- in play (times a safety factor): dropping an entry only ever re-permits a
+    -- send, and by then the window has long expired anyway.
+    local sendHorizon = math.max(Mesh.MANIFEST_COOLDOWN or 0, Mesh.SEGMENT_COOLDOWN or 0,
+                                 Mesh.TIMERSYNC_COOLDOWN or 0, Mesh.SETTINGS_COOLDOWN or 0)
+                        * (Mesh.SEND_COOLDOWN_PRUNE or 4)
+    for key, ts in pairs(Mesh._sendCooldowns) do
+        if (t - (ts or 0)) > sendHorizon then Mesh._sendCooldowns[key] = nil end
+    end
 end
+Mesh.PruneCooldowns = pruneCooldowns   -- exposed for the self-tests
 
 -- Live roster sweep: resolve our channel, enumerate the roster, whisper a
 -- discovery ping to every eligible member, and record the sweep time.
@@ -1648,7 +1897,11 @@ function Mesh.RequestSync(target, aid, area)
     })
 end
 
+-- Spec §9.5: "Manifest sends are rate-limited to one per target per 5 s."
+-- The gate is FIRST so a suppressed send costs nothing but a table lookup.
 function Mesh.SendManifest(target, aid, area)
+    if not Mesh.SendGate("manifest", target, tostring(aid) .. "\2" .. tostring(area),
+                         Mesh.MANIFEST_COOLDOWN) then return end
     local bucket = Store.GetAccount(aid, false)
     if not bucket then return end
     local seg = bucket.segments[area]
@@ -1664,7 +1917,11 @@ function Mesh.SendManifest(target, aid, area)
     })
 end
 
+-- Spec §9.5: bulk segment / homeless data is capped per ACCOUNT + TARGET at 60 s
+-- (it is the expensive one — a full segment is the whole character set).
 function Mesh.SendSegment(target, aid, area)
+    if not Mesh.SendGate("segment", target, tostring(aid) .. "\2" .. tostring(area),
+                         Mesh.SEGMENT_COOLDOWN) then return end
     local bucket = Store.GetAccount(aid, false)
     if not bucket then return end
     local seg = bucket.segments[area] or {}
@@ -1703,7 +1960,9 @@ end
 -- the registered provider (Timers.GetSnapshot) so the reply routes through the
 -- receiver's Timers.ApplySnapshot; falls back to the legacy raw-store payload
 -- when no provider is registered (provider-less build stays functional).
+-- Spec §9.5: the timer-hash mismatch reply is capped at one per target per 30 s.
 function Mesh.SendTimers(target)
+    if not Mesh.SendGate("timersync", target, nil, Mesh.TIMERSYNC_COOLDOWN) then return end
     local snap
     if Mesh._snapProvider then
         snap = Mesh._snapProvider()
@@ -1864,10 +2123,18 @@ function Mesh.SyncSettings()
     }
     local payload = Mesh.Pack(blob)
     if not payload then return end
-    Mesh._ackWait[syncId] = {}
+    local t = now()
+    local wait, sent = {}, 0
     for aid, p in pairs(Mesh.peers) do
-        if p.online and p.name then
-            Mesh._ackWait[syncId][p.name] = true
+        -- Anti-mash gate (local policy, not spec): this is a BUTTON that fans a
+        -- multi-chunk payload out to every peer at once, so an impatient double-
+        -- press used to be an N-peer duplicate broadcast. A gated target is
+        -- skipped entirely — it is NOT added to the ACK wait set, because we
+        -- never sent it anything to acknowledge.
+        if p.online and p.name
+           and Mesh.SendGate("settings", p.name, nil, Mesh.SETTINGS_COOLDOWN, t) then
+            wait[p.name] = true
+            sent = sent + 1
             local seq = Mesh._outSeq + 1
             local frame = Mesh.BuildFrame(OP.SETTINGS, payload, { seq = seq })
             Mesh.Enqueue(Protocol.PREFIX.SYNC, frame, {
@@ -1875,10 +2142,18 @@ function Mesh.SyncSettings()
             })
         end
     end
+    -- Only open a wait set we actually populated: an empty one would sit in
+    -- _ackWait until the TTL sweep with nothing that could ever clear it.
+    if sent == 0 then return nil end
+    Mesh._ackWait[syncId] = wait
+    Mesh._ackWaitAt[syncId] = t
     return syncId
 end
 
 function Mesh.SendBlacklist(target)
+    -- Anti-mash gate (local policy, not spec): the blacklist push is both a
+    -- button action and an auto-chain off every settings ACK.
+    if not Mesh.SendGate("blacklist", target, nil, Mesh.SETTINGS_COOLDOWN) then return end
     local db = Store.GetSettings()
     local syncId = "bl-" .. toBase36(Mesh._outSeq + 1)
     local blob = { syncId = syncId, kind = "blacklist",
@@ -1965,6 +2240,10 @@ end
 
 -- Inbound merged snapshot (request reply or guild-broadcaster relay).
 local function handleTimerSnap(f, sender)
+    -- B5: if we have a broadcast of this EXACT payload armed but not yet sent,
+    -- somebody beat us to it — drop ours rather than doubling the guild traffic.
+    -- Checked on the raw payload bytes before decode, so it costs nothing.
+    Mesh.CancelPendingBroadcast(Mesh.BroadcastPayloadHash(f.payload))
     local snap = Mesh.Unpack(f.payload)
     if type(snap) ~= "table" then return end
     if Mesh._snapHandler then
@@ -1999,12 +2278,47 @@ function Mesh.RequestTimers()
     return sent
 end
 
+----------------------------------------------------------------------
 -- Guild-broadcaster relay of a merged snapshot (the <=1/min rate gate and the
 -- broadcaster election both live in the timers layer; this only transports).
-function Mesh.BroadcastTimers(snap)
-    if not Mesh.IsEnabled() then return end
-    if type(snap) ~= "table" then return end
-    local payload = Mesh.Pack(snap)
+--
+-- B5 SPLIT-BRAIN JITTER
+-- ---------------------
+-- The election picks the lowest account id among online peers, but each client
+-- evaluates it against ITS OWN roster. Two clients whose rosters disagree for a
+-- moment — a peer mid-timeout on one and still live on the other — both elect
+-- themselves and both relay the same snapshot to the same guild. The dedup window
+-- stops the RECEIVERS double-applying it, but the traffic is already spent, and
+-- on a full guild that is two multi-chunk payloads where one would do.
+--
+-- Fix, entirely on the transport side: defer the send by a uniform random 0-4s
+-- and drop it if an identical payload arrives from anyone else while we wait.
+-- The loser of the race sees the winner's copy and cancels. Deferring is free
+-- here — the caller already rate-limits itself to once a minute, and a world-buff
+-- snapshot is not latency-sensitive at second granularity.
+----------------------------------------------------------------------
+
+-- Content hash of a packed snapshot. Same rolling hash the segment/state hashes
+-- use, so "identical payload" means identical BYTES, not merely equal-looking
+-- tables — two independently packed copies of the same snapshot serialize
+-- identically, which is what makes the comparison sound.
+function Mesh.BroadcastPayloadHash(payload)
+    return fnv1a(payload or "")
+end
+
+-- Drop an armed broadcast whose payload hash matches. Returns true if it fired.
+function Mesh.CancelPendingBroadcast(hash)
+    local pend = Mesh._bcastPending
+    if pend and hash and pend.hash == hash then
+        Mesh._bcastPending = nil
+        Mesh._bcastCancelled = (Mesh._bcastCancelled or 0) + 1
+        return true
+    end
+    return false
+end
+
+-- The actual transport (what BroadcastTimers used to do inline).
+function Mesh.SendTimerSnapshot(payload)
     if not payload then return end
     local seq = Mesh._outSeq + 1
     local frame = Mesh.BuildFrame(OP.TIMER_SNAP, payload, { seq = seq })
@@ -2018,6 +2332,42 @@ function Mesh.BroadcastTimers(snap)
                 { op = "sync", chatType = "WHISPER", target = p.name, seq = seq })
         end
     end
+end
+
+-- Fire the armed broadcast, unless it was cancelled or superseded while waiting.
+-- Returns true if anything went on the wire.
+function Mesh.FlushPendingBroadcast(hash)
+    local pend = Mesh._bcastPending
+    if not pend then return false end                    -- cancelled by an inbound copy
+    if hash and pend.hash ~= hash then return false end  -- superseded by a newer snapshot
+    Mesh._bcastPending = nil
+    Mesh.SendTimerSnapshot(pend.payload)
+    return true
+end
+
+function Mesh.BroadcastTimers(snap)
+    if not Mesh.IsEnabled() then return false end
+    if type(snap) ~= "table" then return false end
+    local payload = Mesh.Pack(snap)
+    if not payload then return false end
+    local hash = Mesh.BroadcastPayloadHash(payload)
+    -- Re-asked to broadcast a payload we already have armed: that IS the
+    -- duplicate. Keep the armed one, drop this request.
+    if Mesh._bcastPending and Mesh._bcastPending.hash == hash then
+        Mesh._bcastCancelled = (Mesh._bcastCancelled or 0) + 1
+        return false
+    end
+    Mesh._bcastPending = { hash = hash, payload = payload, at = now() }
+    local jitter = (math.random and (math.random() * (Mesh.BCAST_JITTER_MAX or 0))) or 0
+    if C_Timer and C_Timer.After and jitter > 0 then
+        C_Timer.After(jitter, function()
+            ns:SafeCall(Mesh.FlushPendingBroadcast, hash)
+        end)
+    else
+        -- No scheduler (headless / jitter disabled): behave exactly as before.
+        Mesh.FlushPendingBroadcast(hash)
+    end
+    return true
 end
 
 -- Online mesh peers as broadcaster-election rows. The timers layer picks the
@@ -2125,14 +2475,51 @@ end
 
 ----------------------------------------------------------------------
 -- Logout flush (final state push, most-recently-seen peer first, wide budget)
+--
+-- THE GREEN-PIP BUG THIS SOLVES
+-- -----------------------------
+-- The flush exists so peers get our final numbers (boons, cooldowns, lockouts)
+-- before we vanish. But the record it shipped had just had `lastSeen` stamped to
+-- "now" by the tracker, and the receiver stores the record WHOLESALE. On the
+-- receiving client the logged-out character therefore read ONLINE from both of
+-- ui_shell's sources:
+--   * the lastSeen recency fallback, for the full 15s ONLINE_WINDOW; and
+--   * live mesh presence, because these whispers land around (often after) the
+--     channel-leave notice and every raw receive re-flipped p.online true —
+--     stretching the green pip to 30-35s.
+-- Two changes close both, and neither touches the frame layout or the schema:
+--   1. the record we ENCODE is a copy whose lastSeen is backdated past the
+--      receiver's presence window, so the recency fallback is born expired.
+--      ownerEpoch and lastDataUpdate are left alone, so the store's owner-wins
+--      epoch guard (Store.WriteInboundCharacter) still accepts the record and
+--      "last updated" reporting stays truthful;
+--   2. a LOGOUT notice op precedes the fan-out, latching the peer offline on the
+--      receiver so the STATE frames behind it cannot re-green it.
 ----------------------------------------------------------------------
+
+-- PURE: the record to put on the wire at logout. Shallow copy — Protocol.
+-- EncodeCharacter reads top-level fields plus nested tables by reference, and
+-- the live Store record must NOT be mutated (it is what we reload from).
+function Mesh.LogoutRecord(rec, t)
+    if type(rec) ~= "table" then return rec end
+    local out = {}
+    for k, v in pairs(rec) do out[k] = v end
+    local backdated = (t or now()) - (Mesh.LOGOUT_LASTSEEN_BACKDATE or 0)
+    if backdated < 0 then backdated = 0 end
+    -- Only ever move lastSeen BACKWARDS: a record that is already older than the
+    -- window is left exactly as it is.
+    if (out.lastSeen or 0) > backdated then out.lastSeen = backdated end
+    return out
+end
 
 function Mesh.LogoutFlush()
     if not Mesh.IsEnabled() then return end
     local nameRealm = selfNameRealm()
     local rec = Store.GetCharacter and Store.GetCharacter(nameRealm)
     if not rec then return end
-    local payload = Protocol.EncodeCharacter(rec)
+    local t = now()
+    local payload = Protocol.EncodeCharacter(Mesh.LogoutRecord(rec, t))
+    if not payload then return end
 
     -- Order peers by most-recently-seen first.
     local ordered = {}
@@ -2143,7 +2530,20 @@ function Mesh.LogoutFlush()
         return (a.lastSeen or 0) > (b.lastSeen or 0)
     end)
 
-    -- Expanded budget on logout: whisper ALL peers directly, most-recent first.
+    -- Pass 1: the LOGOUT notice, to every peer, BEFORE any state. Same prefix and
+    -- priority as the state fan-out, and the scheduler is FIFO within a priority,
+    -- so all notices are on the wire ahead of all state frames. Unsequenced
+    -- (seq 0) so Mesh.FreshSeq can never stale-drop the one frame whose whole job
+    -- is to arrive. Peers running a build without OP.LOGOUT ignore it silently.
+    for i = 1, #ordered do
+        local frame = Mesh.BuildFrame(OP.LOGOUT, "", { seq = 0 })
+        Mesh.Enqueue(Protocol.PREFIX.STATE, frame, {
+            op = "state", chatType = "WHISPER", target = ordered[i].name, seq = 0,
+        })
+    end
+
+    -- Pass 2: expanded budget on logout — whisper ALL peers directly, most-recent
+    -- first, with the backdated record.
     for i = 1, #ordered do
         local seq = Mesh._outSeq + 1
         local frame = Mesh.BuildFrame(OP.STATE, payload, { seq = seq, relayTo = "" })
@@ -2430,14 +2830,22 @@ function Mesh.OnChannelLeaveNotice(playerName, channelBaseName)
 end
 
 -- Flag every peer matching `name` as offline (presence gone). Best-effort name
--- match against the peer table; the heartbeat path re-flips it online on return.
-function Mesh.MarkPresenceStale(name)
+-- match against the peer table; the heartbeat path (NotePeer) re-flips it online
+-- on return. `presenceStaleAt` stamps WHEN the latch was set so TouchPeerByName
+-- can refuse to clear it from frames that were already in flight when it landed
+-- (see Mesh.StaleLatchHolds). Returns the number of peer entries latched.
+function Mesh.MarkPresenceStale(name, t)
+    t = t or now()
+    local n = 0
     for _, p in pairs(Mesh.peers) do
         if p.name == name then
             p.online = false
             p.presenceStale = true
+            p.presenceStaleAt = t
+            n = n + 1
         end
     end
+    return n
 end
 
 ----------------------------------------------------------------------
@@ -2620,7 +3028,14 @@ local function debugMesh()
     for aid, p in pairs(Mesh.peers) do
         n = n + 1
         local why = p.timedOut and " (30s-timeout)"
-            or (p.presenceStale and " (channel-leave)") or ""
+            or (p.presenceStale and " (left/logout)") or ""
+        -- Show whether the stale latch is still HOLDING: that is the difference
+        -- between "this pip is grey and will stay grey" and "the next frame from
+        -- them re-greens it", which is the whole logout-pip question.
+        if p.presenceStale and Mesh.StaleLatchHolds(p, now()) then
+            why = why .. string.format(" holding %.0fs",
+                (p.presenceStaleAt or 0) + Mesh.PRESENCE_STALE_HOLD - now())
+        end
         ns:Print(string.format("  peer %s (%s) online=%s%s lastSeen=%s silent=%ss",
             aid, p.name or "?", tostring(p.online), why,
             tostring(p.lastSeen or 0), tostring(now() - (p.lastSeen or 0))))
@@ -2638,7 +3053,15 @@ local function debugMesh()
     end
     local seen = 0
     for _ in pairs(Mesh._seenIds) do seen = seen + 1 end
-    ns:Print("  dedup entries: " .. seen)
+    -- Bookkeeping-map sizes: these three used to grow without bound, so their
+    -- counts are the cheapest proof the sweeps are running.
+    local inSeqN, ackN, cdN = 0, 0, 0
+    for _ in pairs(Mesh._inSeq) do inSeqN = inSeqN + 1 end
+    for _ in pairs(Mesh._ackWait) do ackN = ackN + 1 end
+    for _ in pairs(Mesh._sendCooldowns) do cdN = cdN + 1 end
+    ns:Print(string.format(
+        "  maps: dedup=%d inSeq=%d ackWait=%d sendCooldowns=%d | sendsGated=%d bcastCancelled=%d",
+        seen, inSeqN, ackN, cdN, Mesh._sendGated or 0, Mesh._bcastCancelled or 0))
 end
 
 ----------------------------------------------------------------------
@@ -3443,8 +3866,370 @@ local function testPushSuppressor()
     return true
 end
 
+----------------------------------------------------------------------
+-- Mesh-hygiene batch self-tests
+----------------------------------------------------------------------
+
+-- LOGOUT RE-STAMP: the record we put on the wire at logout must decode with a
+-- lastSeen that is ALREADY outside the receiver's presence window, so the
+-- roster's recency fallback reads the character offline the instant it lands.
+local function testLogoutRestamp()
+    local T = 1785000500
+    local src = {
+        nameRealm = "Daseeki-Faerlina", classTag = "WARLOCK", faction = "Horde",
+        level = 60, boonCount = 3, shardCount = 12,
+        lastSeen = T, lastDataUpdate = T, ownerEpoch = T,
+    }
+    local out = Mesh.LogoutRecord(src, T)
+    -- 1) the SOURCE record is untouched (it is what we reload from).
+    if src.lastSeen ~= T then return false, "LogoutRecord mutated the live record" end
+    -- 2) backdated past the window the roster uses.
+    if out.lastSeen >= T - Mesh.PRESENCE_ONLINE_WINDOW then
+        return false, "lastSeen not backdated past PRESENCE_ONLINE_WINDOW"
+    end
+    -- 3) the epoch fields the store's owner-wins guard reads are NOT backdated,
+    --    or the receiver would reject the final push as stale.
+    if out.ownerEpoch ~= T or out.lastDataUpdate ~= T then
+        return false, "logout copy disturbed ownerEpoch/lastDataUpdate"
+    end
+    -- 4) end-to-end through the real codec: what a peer DECODES is out of window.
+    local bytes = Protocol.EncodeCharacter(out)
+    if not bytes then return false, "logout record failed to encode" end
+    local dec = Protocol.DecodeCharacter(bytes)
+    if not dec then return false, "logout record failed to decode" end
+    if (T - (dec.lastSeen or 0)) <= Mesh.PRESENCE_ONLINE_WINDOW then
+        return false, "DECODED lastSeen still inside the online window"
+    end
+    if dec.ownerEpoch ~= T then return false, "decoded ownerEpoch not preserved" end
+    -- 5) monotonic: an already-stale record is not dragged further back.
+    local old = Mesh.LogoutRecord({ lastSeen = T - 9999 }, T)
+    if old.lastSeen ~= T - 9999 then return false, "already-old lastSeen was moved" end
+    -- 6) non-table input is passed through, never indexed.
+    if Mesh.LogoutRecord(nil, T) ~= nil then return false, "LogoutRecord(nil) not nil" end
+    return true
+end
+
+-- STALE LATCH: a presence latch set moments ago must survive raw inbound frames
+-- (the logout flush lands AFTER the leave notice), but must not outlive its hold,
+-- and must never block a genuine relog announcing itself through NotePeer.
+local function testStaleLatch()
+    local saved = Mesh.peers
+    Mesh.peers = { ["7"] = { aid = "7", name = "Shalk-R", online = true, lastSeen = 100 } }
+    local ok, why = true, nil
+    local p = Mesh.peers["7"]
+    local T = 1000
+
+    Mesh.MarkPresenceStale("Shalk-R", T)
+    if p.online ~= false or p.presenceStale ~= true then
+        ok, why = false, "leave notice did not latch the peer offline"
+    end
+    if ok and p.presenceStaleAt ~= T then ok, why = false, "latch was not timestamped" end
+
+    -- In-flight STATE whisper arriving 5s later: liveness stamped, latch HELD.
+    if ok then
+        Mesh.TouchPeerByName("Shalk-R", T + 5)
+        if p.online ~= false then ok, why = false, "in-flight frame re-greened a latched peer" end
+        if ok and p.lastSeen ~= T + 5 then ok, why = false, "liveness stamp was withheld" end
+        if ok and p.presenceStale ~= true then ok, why = false, "latch flag was cleared" end
+    end
+    -- Right at the boundary the hold is still in force...
+    if ok then
+        Mesh.TouchPeerByName("Shalk-R", T + Mesh.PRESENCE_STALE_HOLD - 1)
+        if p.online ~= false then ok, why = false, "hold expired early" end
+    end
+    -- ...and past it the normal "evidence of life" rule resumes.
+    if ok then
+        Mesh.TouchPeerByName("Shalk-R", T + Mesh.PRESENCE_STALE_HOLD + 1)
+        if p.online ~= true then ok, why = false, "peer never recovered after the hold" end
+        if ok and p.presenceStaleAt ~= nil then ok, why = false, "stale stamp not cleared" end
+    end
+    -- A relog inside the hold window: an IDENTIFIED frame (NotePeer) re-admits at
+    -- once, so a /reload never costs the owner a grey pip.
+    if ok then
+        Mesh.MarkPresenceStale("Shalk-R", T + 100)
+        Mesh.NotePeer("7", "Shalk-R", T + 101)
+        if p.online ~= true then ok, why = false, "NotePeer did not re-admit inside the hold" end
+        if ok and p.presenceStale then ok, why = false, "NotePeer left the latch set" end
+    end
+    -- The LOGOUT op latches without any channel-leave notice at all (the case a
+    -- guild-fallback peer could never hit before).
+    if ok then
+        p.online, p.presenceStale, p.presenceStaleAt = true, nil, nil
+        Mesh._handleLogout({ payload = "" }, "Shalk-R")
+        if p.online ~= false or not p.presenceStale then
+            ok, why = false, "LOGOUT op did not latch the peer offline"
+        end
+    end
+    -- A legacy latch with no timestamp must NOT hold (old saved state).
+    if ok then
+        if Mesh.StaleLatchHolds({ presenceStale = true }, T) then
+            ok, why = false, "untimestamped latch wrongly held"
+        end
+    end
+    Mesh.peers = saved
+    return ok, why
+end
+
+-- UNKNOWN OP: the property the additive LOGOUT op depends on. A frame carrying
+-- an op this build has no handler for must be swallowed in total silence.
+local function testUnknownOpIgnored()
+    local savedPeers = Mesh.peers
+    Mesh.peers = {}
+    local frame = Mesh.BuildFrame("\255", "whatever", { seq = 0 })
+    local okCall, err = pcall(Mesh.Dispatch, Protocol.PREFIX.STATE, frame, "Stranger-R")
+    Mesh.peers = savedPeers
+    if not okCall then return false, "unknown op errored: " .. tostring(err) end
+    -- Frame layout is unchanged: an old peer still parses our LOGOUT frame fine,
+    -- it simply has no arm for the op.
+    local lf = Mesh.BuildFrame(Mesh.OP.LOGOUT, "", { seq = 0 })
+    local parsed = Mesh.ParseFrame(lf)
+    if not parsed then return false, "LOGOUT frame does not parse" end
+    if parsed.version ~= Mesh.PROTO_VERSION then return false, "LOGOUT frame changed the version byte" end
+    if parsed.op ~= "l" then return false, "LOGOUT op code drifted" end
+    if parsed.payload ~= "" then return false, "LOGOUT payload is not empty" end
+    return true
+end
+
+-- PER-TARGET COOLDOWNS (A10.7 / spec §9.5): one send per target per window, for
+-- each kind, with the spec's numbers — plus the prune that keeps the map bounded.
+local function testSendCooldowns()
+    -- Spec numbers, pinned.
+    if Mesh.MANIFEST_COOLDOWN ~= 5 then return false, "manifest cooldown must be 5s" end
+    if Mesh.SEGMENT_COOLDOWN ~= 60 then return false, "segment cooldown must be 60s" end
+    if Mesh.TIMERSYNC_COOLDOWN ~= 30 then return false, "timer-sync cooldown must be 30s" end
+
+    local savedCd, savedEnq = Mesh._sendCooldowns, Mesh.Enqueue
+    local savedPeers, savedGet = Mesh.peers, Store.GetAccount
+    Mesh._sendCooldowns = {}
+    local ok, why = true, nil
+
+    -- PURE gate: first send allowed, repeat inside the window refused, and the
+    -- window is exclusive at its edge.
+    local cds, K = {}, Mesh.SendCooldownKey("manifest", "Bob-R", "9\2sixties")
+    if not Mesh.ShouldSendTo(K, cds, 100, 5) then ok, why = false, "first send refused" end
+    cds[K] = 100
+    if ok and Mesh.ShouldSendTo(K, cds, 104, 5) then ok, why = false, "repeat inside window allowed" end
+    if ok and not Mesh.ShouldSendTo(K, cds, 105, 5) then ok, why = false, "send refused at window edge" end
+    -- Different target / different account+area are independent keys.
+    if ok and not Mesh.ShouldSendTo(Mesh.SendCooldownKey("manifest", "Amy-R", "9\2sixties"), cds, 101, 5) then
+        ok, why = false, "cooldown leaked across targets"
+    end
+    if ok and not Mesh.ShouldSendTo(Mesh.SendCooldownKey("manifest", "Bob-R", "9\2summoners"), cds, 101, 5) then
+        ok, why = false, "cooldown leaked across segments"
+    end
+
+    -- SendGate stamps on success and refuses (and counts) on the repeat.
+    if ok then
+        local gated = Mesh._sendGated or 0
+        if not Mesh.SendGate("timersync", "Bob-R", nil, 30, 200) then ok, why = false, "gate refused a first send" end
+        if ok and Mesh.SendGate("timersync", "Bob-R", nil, 30, 210) then ok, why = false, "gate allowed a repeat" end
+        if ok and (Mesh._sendGated or 0) ~= gated + 1 then ok, why = false, "gate telemetry did not advance" end
+        if ok and Mesh.SendGate("timersync", "Bob-R", nil, 30, 231) ~= true then
+            ok, why = false, "gate never reopened"
+        end
+    end
+
+    -- The senders actually consult it. Count enqueues with the real functions.
+    if ok then
+        local sends = 0
+        Mesh.Enqueue = function() sends = sends + 1 end
+        Mesh.peers = {}
+        -- Blacklist: button-mash guard. Two back-to-back calls, one send.
+        Mesh._sendCooldowns = {}
+        Mesh.SendBlacklist("Bob-R")
+        Mesh.SendBlacklist("Bob-R")
+        if sends ~= 1 then ok, why = false, "SendBlacklist fanned out twice (" .. sends .. ")" end
+        -- Timer snapshot reply: same shape, 30s window.
+        if ok then
+            sends = 0
+            Mesh._sendCooldowns = {}
+            Mesh.SendTimers("Bob-R")
+            Mesh.SendTimers("Bob-R")
+            if sends ~= 1 then ok, why = false, "SendTimers replied twice (" .. sends .. ")" end
+        end
+        -- Manifest: gate runs BEFORE any store work, so a suppressed send is free.
+        if ok then
+            sends = 0
+            local looked = 0
+            Store.GetAccount = function() looked = looked + 1 return nil end
+            Mesh._sendCooldowns = {}
+            Mesh.SendManifest("Bob-R", "9", "sixties")
+            Mesh.SendManifest("Bob-R", "9", "sixties")
+            if looked ~= 1 then ok, why = false, "gated manifest still hit the store" end
+            if ok then
+                Mesh.SendSegment("Bob-R", "9", "sixties")
+                Mesh.SendSegment("Bob-R", "9", "sixties")
+                if looked ~= 2 then ok, why = false, "gated segment still hit the store" end
+            end
+        end
+        Store.GetAccount = savedGet
+        Mesh.Enqueue = savedEnq
+        Mesh.peers = savedPeers
+    end
+
+    -- Prune drops entries older than the horizon and keeps fresh ones. (Ping
+    -- cooldowns are parked too: PruneCooldowns sweeps both maps, and a self-test
+    -- run in-game must not disturb the live roster-ping throttle.)
+    if ok then
+        local horizon = 60 * (Mesh.SEND_COOLDOWN_PRUNE or 4)
+        local savedPing = Mesh._pingCooldowns
+        Mesh._pingCooldowns = {}
+        Mesh._sendCooldowns = { old = 0, fresh = horizon }
+        Mesh.PruneCooldowns(horizon + 1)
+        Mesh._pingCooldowns = savedPing
+        if Mesh._sendCooldowns.old ~= nil then ok, why = false, "stale cooldown not pruned" end
+        if ok and Mesh._sendCooldowns.fresh == nil then ok, why = false, "live cooldown was pruned" end
+    end
+
+    Mesh._sendCooldowns, Mesh.Enqueue = savedCd, savedEnq
+    Mesh.peers, Store.GetAccount = savedPeers, savedGet
+    return ok, why
+end
+
+-- _ackWait must not accumulate: the parent entry goes when its member set
+-- empties, and a set that never empties expires on a TTL.
+local function testAckWaitCleanup()
+    local savedWait, savedAt = Mesh._ackWait, Mesh._ackWaitAt
+    local savedUnpack, savedBL = Mesh.Unpack, Mesh.SendBlacklist
+    Mesh._ackWait, Mesh._ackWaitAt = {}, {}
+    Mesh.SendBlacklist = function() end     -- suppress the auto-chain
+    local ok, why = true, nil
+
+    -- Two targets outstanding; the parent survives the first ACK and goes on the last.
+    Mesh._ackWait["s1"] = { ["A-R"] = true, ["B-R"] = true }
+    Mesh._ackWaitAt["s1"] = 500
+    Mesh.Unpack = function() return { syncId = "s1", kind = "settings" } end
+    Mesh._handleAck({ payload = "w" }, "A-R")
+    if not Mesh._ackWait["s1"] then ok, why = false, "parent dropped while a target was outstanding" end
+    if ok then
+        Mesh._handleAck({ payload = "w" }, "B-R")
+        if Mesh._ackWait["s1"] ~= nil then ok, why = false, "emptied wait set was not dropped" end
+        if ok and Mesh._ackWaitAt["s1"] ~= nil then ok, why = false, "wait timestamp leaked" end
+    end
+
+    -- TTL backstop for the set that never empties (a peer that never answers).
+    if ok then
+        Mesh._ackWait["s2"] = { ["Ghost-R"] = true }
+        Mesh._ackWaitAt["s2"] = 1000
+        Mesh.PruneAckWait(1000 + Mesh.ACK_WAIT_TTL - 1)
+        if not Mesh._ackWait["s2"] then ok, why = false, "wait set expired before its TTL" end
+        if ok then
+            Mesh.PruneAckWait(1000 + Mesh.ACK_WAIT_TTL + 1)
+            if Mesh._ackWait["s2"] ~= nil then ok, why = false, "wait set outlived its TTL" end
+            if ok and Mesh._ackWaitAt["s2"] ~= nil then ok, why = false, "orphan timestamp survived" end
+        end
+    end
+    -- An entry with no timestamp is ADOPTED (given a full TTL), never nuked.
+    if ok then
+        Mesh._ackWait["s3"] = { ["C-R"] = true }
+        Mesh.PruneAckWait(2000)
+        if not Mesh._ackWait["s3"] then ok, why = false, "untimestamped wait set was nuked" end
+        if ok and Mesh._ackWaitAt["s3"] ~= 2000 then ok, why = false, "untimestamped set was not adopted" end
+    end
+
+    Mesh._ackWait, Mesh._ackWaitAt = savedWait, savedAt
+    Mesh.Unpack, Mesh.SendBlacklist = savedUnpack, savedBL
+    return ok, why
+end
+
+-- _inSeq must not accumulate a record per stranger who ever whispered us, but
+-- must never drop a CURRENT peer's high-water (that would re-open replay).
+local function testInSeqPrune()
+    local savedSeq, savedPeers = Mesh._inSeq, Mesh.peers
+    Mesh._inSeq = {}
+    Mesh.peers = { ["3"] = { aid = "3", name = "Live-R", online = true } }
+    local ok, why = true, nil
+    local T = 10000
+
+    Mesh.FreshSeq("Live-R\1DSKN1", 5, "aa", T)
+    Mesh.FreshSeq("Gone-R\1DSKN1", 5, "bb", T)
+    Mesh.FreshSeq("Recent-R\1DSKN1", 5, "cc", T)
+    if Mesh._inSeq["Live-R\1DSKN1"].t ~= T then ok, why = false, "FreshSeq did not stamp the record" end
+
+    -- Well past the TTL for the two non-peers; the live peer is exempt.
+    if ok then
+        Mesh._inSeq["Recent-R\1DSKN1"].t = T + Mesh.INSEQ_TTL   -- consulted recently
+        local dropped = Mesh.PruneInSeq(T + Mesh.INSEQ_TTL + 1)
+        if Mesh._inSeq["Live-R\1DSKN1"] == nil then ok, why = false, "pruned a current peer's high-water" end
+        if ok and Mesh._inSeq["Gone-R\1DSKN1"] ~= nil then ok, why = false, "stale stranger not pruned" end
+        if ok and Mesh._inSeq["Recent-R\1DSKN1"] == nil then ok, why = false, "recently used record pruned" end
+        if ok and dropped ~= 1 then ok, why = false, "prune count wrong: " .. tostring(dropped) end
+    end
+    -- The high-water still rejects a replay after the prune.
+    if ok then
+        if Mesh.FreshSeq("Live-R\1DSKN1", 4, "aa", T + 1) then
+            ok, why = false, "replay accepted after prune"
+        end
+    end
+    -- Records created before this build carry no stamp: adopt, don't drop.
+    if ok then
+        Mesh._inSeq["Legacy-R\1DSKN1"] = { sess = "zz", last = 9 }
+        Mesh.PruneInSeq(T + 5)
+        if Mesh._inSeq["Legacy-R\1DSKN1"] == nil then ok, why = false, "unstamped record was nuked" end
+    end
+
+    Mesh._inSeq, Mesh.peers = savedSeq, savedPeers
+    return ok, why
+end
+
+-- B5: a deferred guild broadcast is dropped when the identical payload shows up
+-- from another self-elected broadcaster while we are still waiting.
+local function testBroadcastJitter()
+    local savedPending, savedSend = Mesh._bcastPending, Mesh.SendTimerSnapshot
+    local sent = 0
+    Mesh.SendTimerSnapshot = function() sent = sent + 1 end
+    local ok, why = true, nil
+    local h = Mesh.BroadcastPayloadHash("packed-snapshot")
+
+    if Mesh.BroadcastPayloadHash("packed-snapshot") ~= h then
+        ok, why = false, "payload hash is not stable"
+    end
+    if ok and Mesh.BroadcastPayloadHash("other-snapshot") == h then
+        ok, why = false, "payload hash does not separate payloads"
+    end
+    -- Armed, then the winner's copy arrives: we cancel and send nothing.
+    if ok then
+        local cancels = Mesh._bcastCancelled or 0
+        Mesh._bcastPending = { hash = h, payload = "packed-snapshot", at = 0 }
+        if not Mesh.CancelPendingBroadcast(h) then ok, why = false, "matching payload did not cancel" end
+        if ok and Mesh._bcastPending ~= nil then ok, why = false, "cancelled broadcast still armed" end
+        if ok and (Mesh._bcastCancelled or 0) ~= cancels + 1 then
+            ok, why = false, "cancel telemetry did not advance"
+        end
+        if ok and Mesh.FlushPendingBroadcast(h) then ok, why = false, "cancelled broadcast still fired" end
+        if ok and sent ~= 0 then ok, why = false, "cancelled broadcast reached the wire" end
+    end
+    -- A DIFFERENT payload must not cancel ours.
+    if ok then
+        Mesh._bcastPending = { hash = h, payload = "packed-snapshot", at = 0 }
+        if Mesh.CancelPendingBroadcast(Mesh.BroadcastPayloadHash("other-snapshot")) then
+            ok, why = false, "an unrelated payload cancelled our broadcast"
+        end
+        if ok and not Mesh.FlushPendingBroadcast(h) then ok, why = false, "armed broadcast did not fire" end
+        if ok and sent ~= 1 then ok, why = false, "flush did not reach the transport" end
+        if ok and Mesh._bcastPending ~= nil then ok, why = false, "pending slot not released after send" end
+    end
+    -- A stale timer for a superseded payload must not fire the new one.
+    if ok then
+        Mesh._bcastPending = { hash = Mesh.BroadcastPayloadHash("newer"), payload = "newer", at = 0 }
+        if Mesh.FlushPendingBroadcast(h) then ok, why = false, "stale timer fired a superseded payload" end
+        if ok and sent ~= 1 then ok, why = false, "superseded payload was sent" end
+    end
+    if ok and (Mesh.BCAST_JITTER_MAX or 0) <= 0 then ok, why = false, "jitter window is disabled" end
+
+    Mesh._bcastPending, Mesh.SendTimerSnapshot = savedPending, savedSend
+    return ok, why
+end
+
 function Mesh.RunSelfTests(verbose)
     local suite = {
+        { name = "logout re-stamp",     fn = testLogoutRestamp },
+        { name = "presence stale latch", fn = testStaleLatch },
+        { name = "unknown op ignored",  fn = testUnknownOpIgnored },
+        { name = "per-target cooldowns", fn = testSendCooldowns },
+        { name = "ack-wait cleanup",    fn = testAckWaitCleanup },
+        { name = "inSeq prune",         fn = testInSeqPrune },
+        { name = "broadcast jitter",    fn = testBroadcastJitter },
         { name = "state content hash", fn = testStateHash },
         { name = "push suppressor",    fn = testPushSuppressor },
         { name = "peer timeout sweep", fn = testPeerSweep },
