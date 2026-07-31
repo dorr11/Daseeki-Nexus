@@ -1862,17 +1862,43 @@ local function buildTimers(flow)
     local UI = DaseekiUI
 
     -- ── Raid overrides ─────────────────────────────────────────────────────────
+    -- Five independent toggles (A12.2 adds "Bars"; A12.3 raised the four channel
+    -- defaults to all-on). The first four silence an alert CHANNEL; "Bars" is not
+    -- a channel — it suppresses pull-bar creation only, so a raid can be visually
+    -- empty while chat/screen alerts still land, or vice versa.
+    --
+    -- Every one of the five DEFAULTS ON, so an absent stored key must read
+    -- CHECKED here — matching HUD.SuppressBarsInRaid / HUD.RaidChannelSuppressed,
+    -- which apply the same absent-means-on rule at the gate. Reading a raw nil as
+    -- unchecked would show the owner the opposite of what the HUD is doing.
     local ro = flow:AddSection("Raid Overrides")
-    ro:Hint("Suppress these alert channels while inside a raid instance.")
+    ro:Hint("While inside a raid instance, suppress these alert channels — and, "
+        .. "independently, the pull-timer bars.")
     local rr = ro:AddRow({ vAlign = "center" })
     local function roCheck(label, key)
         register("timers", rr:Checkbox({
             label = label,
-            get = function() local ts = TS(); return ts and ts.raidDisable[key] end,
-            set = function(v) local ts = TS(); if ts then ts.raidDisable[key] = v and true or false end end,
+            -- Explicit ifs: `(type(rd)=="table") and rd[key] or nil` would
+            -- collapse a stored FALSE to nil and re-check a box the owner
+            -- deliberately cleared. Mirrors HUD._RaidFlag exactly.
+            get = function()
+                local ts = TS()
+                if not ts then return true end
+                local rd = ts.raidDisable
+                if type(rd) ~= "table" then return true end
+                local v = rd[key]
+                if v == nil then return true end   -- absent = ON (A12.2 / A12.3)
+                return v == true
+            end,
+            set = function(v)
+                local ts = TS(); if not ts then return end
+                if type(ts.raidDisable) ~= "table" then ts.raidDisable = {} end
+                ts.raidDisable[key] = v and true or false
+            end,
         }).Refresh)
     end
-    roCheck("Screen", "notify"); roCheck("Chat", "chat"); roCheck("Flash", "flash"); roCheck("Sound", "sound")
+    roCheck("Screen", "notify"); roCheck("Chat", "chat"); roCheck("Flash", "flash")
+    roCheck("Sound", "sound");   roCheck("Bars", "bars")
 
     -- (The event×channel Alert Matrix + Sound channel moved to their own "Alerts"
     -- page — see buildAlerts. This page keeps raid overrides, pull-bar geometry

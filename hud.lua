@@ -106,6 +106,254 @@ function HUD.DedupWindow(buffKey, eventType)
     return DEDUP_WINDOWS[eventType] or DEDUP_DEFAULT
 end
 
+-- Frame clock. Declared up here (rather than with the other below-guard helpers)
+-- because the A12.4 / A13.3 policy below is headless-testable and needs it.
+local function frameClock() return (GetTime and GetTime()) or 0 end
+
+-- ── A12.2 + A12.3 — the raid override block, all FIVE toggles ─────────────────
+-- Spec §11: inside a raid instance the reference suppresses notify / chat /
+-- flash / sound AND, on a fifth independent toggle, the pull-timer BARS. Every
+-- one of the five defaults ON — a raid is the one place this addon should be
+-- silent and empty.
+--
+-- A12.2 adds the fifth toggle (`bars`); A12.3 (owner decision) flips the four
+-- channel defaults from the store's mixed notify/flash-on, chat/sound-off to
+-- all-on. Both read an ABSENT key as `true`, which matters twice: the gate is
+-- already correct on a settings table the LOGIN seed has not reached yet, and
+-- on an SV file written before these defaults changed.
+--
+-- The `bars` toggle is deliberately NOT an alert channel: RaidChannelSuppressed
+-- always answers false for it, so no alert can ever be silenced by the bar
+-- toggle, and suppressing bars in a raid never suppresses the chat/screen line.
+local RAID_SUPPRESS_CHANNELS = { "notify", "chat", "flash", "sound" }
+
+-- PURE: read one raid-override flag, absent = ON.
+-- Written as explicit ifs on purpose: the idiomatic
+-- `(type(t)=="table") and t[k] or nil` collapses a stored FALSE to nil, which
+-- would turn every explicit opt-out back into the default-ON. Do not "tidy".
+local function raidFlag(raidDisable, key)
+    if type(raidDisable) ~= "table" then return true end
+    local v = raidDisable[key]
+    if v == nil then return true end          -- DEFAULT ON (A12.2 / A12.3)
+    return v == true
+end
+HUD._RaidFlag = raidFlag
+
+function HUD.SuppressBarsInRaid(raidDisable, inRaid)
+    if not inRaid then return false end
+    return raidFlag(raidDisable, "bars")
+end
+
+function HUD.RaidChannelSuppressed(raidDisable, inRaid, channel)
+    if not inRaid or channel == "bars" then return false end
+    return raidFlag(raidDisable, channel)
+end
+
+-- ── A12.5 — CD warning / CD expired are SILENT by default ─────────────────────
+-- Spec §11: "CD warning and CD expired default to no sound." The store seeds
+-- EVERY alert row with its event's default tone, so those two rows shipped
+-- audible. This is an additive, sticky, run-once correction:
+--   * a row with no stored sound (nil / "" / false) is seeded "None";
+--   * a row still holding the exact tone the store shipped for that event is
+--     treated as never-chosen and corrected to "None". Without that clause a
+--     fresh install could never be silent, because Store.Init writes its default
+--     before anything else can run. It is the same "only rewrite values still
+--     equal to the old default" rule store.lua's songflower migration uses;
+--   * ANY other value is an owner choice and is left alone;
+--   * the sticky flag makes it run exactly once, so an owner who later picks the
+--     old default keeps it forever.
+local SILENT_CD_EVENTS = { "cdWarning", "cdExpired" }
+local LEGACY_CD_SOUND  = { cdWarning = "AuctionWindowOpen", cdExpired = "ReadyCheck" }
+local SILENT_SOUND     = "None"
+
+-- A12.3 — the raid CHANNEL defaults the store shipped before the owner's flip.
+-- Same never-chosen test as the sounds: a stored value still equal to the tone/
+-- flag the store wrote is treated as never-chosen; anything else is an owner
+-- choice and survives.
+local LEGACY_RAID_DISABLE = { notify = true, chat = false, flash = true, sound = false }
+
+-- PURE: may we overwrite this stored value with the new default? True when the
+-- slot is empty, or still holds exactly what the store originally shipped.
+--
+-- The `cur == legacy` clause is load-bearing and is the one place this pass can
+-- overrule an owner: Store.Init writes its defaults at ADDON_LOADED, before any
+-- module can run, so a strictly-absent test would make BOTH A12.3 and A12.5
+-- no-ops on every install that has ever logged in — including fresh ones. The
+-- residual: an owner who deliberately chose the value the store already shipped
+-- is indistinguishable from one who never touched it, and is re-defaulted once.
+-- The sticky flags below mean "once" is literal — a re-pick after this pass is
+-- permanent. This mirrors store.lua's MigrateSongflowerDefaults rule.
+local function seedable(cur, legacy)
+    return cur == nil or cur == "" or cur == legacy
+end
+HUD._Seedable = seedable
+
+-- Seed the additive alert defaults into `ts` (timerSettings) in place.
+-- Returns rawSeeded, cdSeeded — whether each one-shot pass actually ran.
+function HUD.SeedAlertDefaults(ts)
+    if type(ts) ~= "table" then return false, false end
+    if type(ts.raidDisable) ~= "table" then ts.raidDisable = {} end
+    local rd = ts.raidDisable
+
+    -- A12.2 — additive SV: publish the fifth raid toggle at its spec default so
+    -- the settings checkbox and the bar gate read one stored value. Idempotent,
+    -- so it is safe on every login.
+    if rd.bars == nil then rd.bars = true end
+
+    -- A12.3 — one-shot: raise the four channel overrides to all-suppressed.
+    local raidSeeded = false
+    if not ts.raidSuppressSeeded then
+        ts.raidSuppressSeeded = true
+        raidSeeded = true
+        for i = 1, #RAID_SUPPRESS_CHANNELS do
+            local ch = RAID_SUPPRESS_CHANNELS[i]
+            if seedable(rd[ch], LEGACY_RAID_DISABLE[ch]) then rd[ch] = true end
+        end
+    end
+
+    -- A12.5 — one-shot: silence the CD warning / CD expired rows.
+    if ts.silentCDSeeded then return raidSeeded, false end
+    ts.silentCDSeeded = true
+
+    local alerts = ts.alerts
+    for _, evt in ipairs(SILENT_CD_EVENTS) do
+        local legacy = LEGACY_CD_SOUND[evt]
+        local rows = (type(alerts) == "table") and alerts[evt] or nil
+        if type(rows) == "table" then
+            for _, row in pairs(rows) do
+                if type(row) == "table" and seedable(row.sound, legacy) then
+                    row.sound = SILENT_SOUND
+                end
+            end
+        end
+        local sk = ts.soundKeys
+        if type(sk) == "table" and seedable(sk[evt], legacy) then
+            sk[evt] = SILENT_SOUND
+        end
+    end
+    return raidSeeded, true
+end
+
+-- ── A12.4 — Ony vs Nef buff-gain disambiguation ───────────────────────────────
+-- Rallying Cry of the Dragonslayer is the SAME aura for Onyxia and Nefarian, so
+-- a gain in that slot cannot name its own source. Spec §11 resolves it by which
+-- announcer yelled most recently inside 30s, and — critically — fires NO alert
+-- when neither yelled recently, because guessing would file a Nef kill on the
+-- Ony rows and corrupt the reading of both.
+--
+-- HOW THE EPOCHS ARE SOURCED (a real, recorded limitation): timers.lua keeps no
+-- per-announcer yell epoch and fires no yell event. Its only yell-derived
+-- outputs are PULL_DETECTED(buffKey, remaining, trust, zone) and the direct
+-- ns.HUD.Alert() calls from its own notify(). We therefore maintain the epochs
+-- HERE, off the alert-side triggers we already receive, keyed by the
+-- announcer-specific buff key (onyH/onyA vs nefH/nefA) — which is the only
+-- channel that carries announcer identity. Consequences, deliberately accepted:
+--   * a pull relayed by mesh / NWB / DBM also stamps the epoch. That is right —
+--     it is still evidence that announcer yelled — but the stamp is RECEIPT
+--     time, not the yell's own server epoch;
+--   * both the stamp and the comparison run on frameClock(), so the 30s window
+--     is internally consistent and immune to server-clock drift.
+local ANNOUNCER_FAMILY   = { onyH = "ony", onyA = "ony", nefH = "nef", nefA = "nef" }
+local GAIN_ATTRIB_WINDOW = 30
+
+-- Slot keys whose buff-gain is ambiguous between Ony and Nef. The tracker files
+-- this aura under its Ony slot, so onyH/onyA arrive here needing resolution too.
+local AMBIGUOUS_GAIN = {
+    ony = true, onyH = true, onyA = true, rallyingCry = true, rallyingcry = true,
+}
+
+local FAMILY_KEY_BY_FACTION = {
+    ony = { Horde = "onyH", Alliance = "onyA" },
+    nef = { Horde = "nefH", Alliance = "nefA" },
+}
+
+HUD._yellEpochs = {}   -- family -> frameClock of the most recent announcer report
+HUD._yellKeys   = {}   -- family -> the announcer-specific buff key last seen
+
+-- PURE. `epochs` = { ony = <t>, nef = <t> }, either may be nil.
+-- Returns the winning family, or nil when neither is inside the window.
+-- Nef wins an exact tie (it is the buff whose NAME belongs to the other boss,
+-- so an unqualified "Rallying Cry" defaults away from the misleading label).
+function HUD.PickYellFamily(epochs, t, window)
+    window = window or GAIN_ATTRIB_WINDOW
+    epochs = epochs or {}
+    local best, bestAt
+    local order = { "nef", "ony" }
+    for i = 1, #order do
+        local fam = order[i]
+        local at  = epochs[fam]
+        if type(at) == "number" then
+            local age = t - at
+            if age >= 0 and age <= window and (not bestAt or at > bestAt) then
+                best, bestAt = fam, at
+            end
+        end
+    end
+    return best
+end
+
+-- Record that an announcer for `buffKey` just reported. No-op for other buffs.
+function HUD.NoteAnnouncerYell(buffKey, t)
+    local fam = ANNOUNCER_FAMILY[buffKey]
+    if not fam then return false end
+    HUD._yellEpochs[fam] = t or frameClock()
+    HUD._yellKeys[fam]   = buffKey
+    return true
+end
+
+-- Which alert row a buff-gain should fire on. nil = SUPPRESS (spec §11).
+-- Unambiguous keys pass straight through untouched.
+function HUD.ResolveGainKey(buffKey, t)
+    if not AMBIGUOUS_GAIN[buffKey] then return buffKey end
+    local fam = HUD.PickYellFamily(HUD._yellEpochs, t or frameClock(), GAIN_ATTRIB_WINDOW)
+    if not fam then return nil end
+    local key = HUD._yellKeys[fam]
+    if key then return key end
+    -- Family known but not the announcer's own key (only reachable if the epoch
+    -- table was seeded without a key): fall back to our own faction's row.
+    local faction = UnitFactionGroup and UnitFactionGroup("player")
+    return (FAMILY_KEY_BY_FACTION[fam] or {})[faction or ""] or nil
+end
+
+-- ── A13.3 — trust-ladder replacement of a LIVE bar ─────────────────────────────
+-- TRUST_RANK is owned by timers.lua (local > mesh > sn > nwb > dbm); we read it
+-- live so the ladder stays single-sourced, and keep a mirror only for the
+-- headless case where Timers has not loaded.
+local TRUST_FALLBACK     = { ["local"] = 5, mesh = 4, sn = 3, nwb = 2, dbm = 1 }
+local TRUST_LABEL        = { ["local"] = "local", mesh = "mesh", sn = "SN", nwb = "NWB", dbm = "DBM" }
+local TRUST_NOTICE_DELAY = 3   -- seconds; spec §10.7 confirm/warn line
+
+local function trustRank(t)
+    local tbl = (ns.Timers and ns.Timers.TRUST_RANK) or TRUST_FALLBACK
+    return tbl[t or ""] or 0
+end
+HUD._TrustRank = trustRank
+
+-- PURE: what a report at `newTrust` does to a live bar currently at `curTrust`.
+--   "upgrade" — strictly higher trust: REWRITE the live window in place, then
+--               print the confirm line ~3s later
+--   "refresh" — equal trust, or an untagged report: plain window refresh
+--   "ignore"  — strictly lower trust NEVER displaces a higher-trust window
+function HUD.TrustAction(curTrust, newTrust)
+    if newTrust == nil then return "refresh" end
+    local a, b = trustRank(curTrust), trustRank(newTrust)
+    if b > a then return "upgrade" end
+    if b < a then return "ignore" end
+    return "refresh"
+end
+
+-- PURE: the deferred notice a bar should print. nil = stay quiet.
+-- More than one distinct source seen = corroborated, so the green confirm line
+-- wins even for a bar that started life on the boss-mod addon. A lone boss-mod
+-- bar warns; a lone anything-else bar says nothing.
+function HUD.TrustNoticeFor(trust, sources)
+    local n = 0
+    for _ in pairs(sources or {}) do n = n + 1 end
+    if n > 1 then return "confirm" end
+    if trust == "dbm" then return "warn" end
+    return nil
+end
+
 -- Group-jump regression suite (headless — no DaseekiUI needed).
 ns:RegisterSelfTest("hudgroups", function(verbose)
     local pass = true
@@ -166,6 +414,148 @@ ns:RegisterSelfTest("hudgroups", function(verbose)
     check(HUD.DedupWindow("battleShout", "pullTimer") == 0, "Battle Shout exempt (pullTimer)")
     check(HUD.DedupWindow("battleShout", "cdWarning") == 0, "Battle Shout exempt (cdWarning)")
 
+    -- ── A12.2 / A12.3 — the five raid overrides ──────────────────────────────
+    -- All five default ON, so an ABSENT key must read suppressed.
+    check(HUD.SuppressBarsInRaid({}, true), "bars: absent key defaults ON in raid")
+    check(HUD.SuppressBarsInRaid(nil, true), "bars: absent BLOCK defaults ON in raid")
+    check(not HUD.SuppressBarsInRaid({}, false), "bars: never suppressed outside a raid")
+    check(not HUD.SuppressBarsInRaid({ bars = false }, true),
+        "bars: an explicit opt-out is honoured in raid")
+    check(HUD.SuppressBarsInRaid({ bars = true }, true), "bars: explicit ON in raid")
+
+    for _, ch in ipairs({ "notify", "chat", "flash", "sound" }) do
+        check(HUD.RaidChannelSuppressed({}, true, ch), ch .. ": absent key defaults ON (A12.3)")
+        check(not HUD.RaidChannelSuppressed({}, false, ch), ch .. ": untouched outside a raid")
+        check(not HUD.RaidChannelSuppressed({ [ch] = false }, true, ch),
+            ch .. ": explicit opt-out honoured")
+    end
+    -- The bar toggle is NOT a channel: it can never silence an alert. This is
+    -- the "no bars in raid, but chat/screen alerts still fire" guarantee.
+    check(not HUD.RaidChannelSuppressed({ bars = true }, true, "bars"),
+        "bars is not an alert channel")
+    local barsOnlyRaid = { bars = true, notify = false, chat = false, flash = false, sound = false }
+    check(HUD.SuppressBarsInRaid(barsOnlyRaid, true), "bars-only config: bars suppressed")
+    for _, ch in ipairs({ "notify", "chat", "flash", "sound" }) do
+        check(not HUD.RaidChannelSuppressed(barsOnlyRaid, true, ch),
+            "bars-only config: " .. ch .. " still fires")
+    end
+
+    -- ── A12.3 / A12.5 — additive seeding, never clobbering a real choice ─────
+    -- A table shaped exactly like what Store.Init writes on a fresh install.
+    local function freshTS()
+        return {
+            raidDisable = { notify = true, chat = false, flash = true, sound = false },
+            soundKeys   = { pullTimer = "RaidWarning", cdWarning = "AuctionWindowOpen" },
+            alerts = {
+                cdWarning = { rend = { sound = "AuctionWindowOpen" }, onyH = { sound = "AuctionWindowOpen" } },
+                cdExpired = { rend = { sound = "ReadyCheck" },        onyH = { sound = "ReadyCheck" } },
+                pullTimer = { rend = { sound = "RaidWarning" } },
+            },
+        }
+    end
+
+    local ts = freshTS()
+    local raidSeeded, cdSeeded = HUD.SeedAlertDefaults(ts)
+    check(raidSeeded and cdSeeded, "fresh install: both seed passes run")
+    check(ts.raidDisable.bars == true, "A12.2: bars seeded ON")
+    check(ts.raidDisable.notify == true and ts.raidDisable.chat == true
+        and ts.raidDisable.flash == true and ts.raidDisable.sound == true,
+        "A12.3: all four channels raised to suppressed")
+    check(ts.alerts.cdWarning.rend.sound == "None"
+        and ts.alerts.cdWarning.onyH.sound == "None",
+        "A12.5: cdWarning rows silent on a fresh install")
+    check(ts.alerts.cdExpired.rend.sound == "None"
+        and ts.alerts.cdExpired.onyH.sound == "None",
+        "A12.5: cdExpired rows silent on a fresh install")
+    check(ts.soundKeys.cdWarning == "None", "A12.5: soundKeys fallback silenced too")
+    check(ts.alerts.pullTimer.rend.sound == "RaidWarning",
+        "A12.5: other events keep their tone")
+
+    -- Second run is inert: the sticky flags make both passes run exactly once.
+    ts.alerts.cdWarning.rend.sound = "ReadyCheck"   -- owner re-picks a tone later
+    ts.raidDisable.chat = false                     -- and re-opens chat in raid
+    local raid2, cd2 = HUD.SeedAlertDefaults(ts)
+    check(not raid2 and not cd2, "seeding is one-shot (sticky flags)")
+    check(ts.alerts.cdWarning.rend.sound == "ReadyCheck",
+        "a post-seed sound choice is permanent")
+    check(ts.raidDisable.chat == false, "a post-seed raid choice is permanent")
+
+    -- An owner choice that DIFFERS from what the store shipped survives the very
+    -- first pass — that is the whole point of the never-chosen test.
+    local chosen = freshTS()
+    chosen.alerts.cdWarning.rend.sound = "MapPing"   -- deliberately picked
+    chosen.raidDisable.notify = false                -- deliberately kept on-screen
+    HUD.SeedAlertDefaults(chosen)
+    check(chosen.alerts.cdWarning.rend.sound == "MapPing",
+        "an explicit sound choice is never overwritten")
+    check(chosen.raidDisable.notify == false,
+        "an explicit raid-channel choice is never overwritten")
+    check(chosen.alerts.cdWarning.onyH.sound == "None",
+        "untouched sibling rows are still silenced")
+    check(chosen.raidDisable.sound == true, "untouched sibling channels still raised")
+
+    -- ── A12.4 — Ony vs Nef buff-gain attribution ─────────────────────────────
+    local NOW = 1000
+    check(HUD.PickYellFamily({ nef = NOW - 5 }, NOW) == "nef", "Nef yell 5s ago wins")
+    check(HUD.PickYellFamily({ ony = NOW - 5 }, NOW) == "ony", "Ony yell 5s ago wins")
+    check(HUD.PickYellFamily({ nef = NOW - 29 }, NOW) == "nef", "29s is inside the window")
+    check(HUD.PickYellFamily({ nef = NOW - 30 }, NOW) == "nef", "30s is inclusive")
+    check(HUD.PickYellFamily({ nef = NOW - 31 }, NOW) == nil, "31s is outside the window")
+    check(HUD.PickYellFamily({}, NOW) == nil, "no yell at all -> no attribution")
+    -- Most recent wins; an exact tie goes to Nef.
+    check(HUD.PickYellFamily({ nef = NOW - 5, ony = NOW - 20 }, NOW) == "nef",
+        "newer Nef beats older Ony")
+    check(HUD.PickYellFamily({ nef = NOW - 20, ony = NOW - 5 }, NOW) == "ony",
+        "newer Ony beats older Nef")
+    check(HUD.PickYellFamily({ nef = NOW, ony = NOW }, NOW) == "nef", "exact tie -> Nef")
+    -- A stale Nef must not shadow a live Ony.
+    check(HUD.PickYellFamily({ nef = NOW - 90, ony = NOW - 10 }, NOW) == "ony",
+        "expired Nef does not shadow a live Ony")
+
+    wipe(HUD._yellEpochs); wipe(HUD._yellKeys)
+    check(HUD.ResolveGainKey("onyH", NOW) == nil,
+        "ambiguous gain with NO recent yell fires nothing (spec §11)")
+    check(HUD.ResolveGainKey("rend", NOW) == "rend", "unambiguous key passes through")
+    check(HUD.ResolveGainKey("zg", NOW) == "zg", "zg passes through")
+    -- A Nef kill-yell, then the Rallying Cry lands: it must file on NEF's row.
+    HUD.NoteAnnouncerYell("nefH", NOW - 4)
+    check(HUD.ResolveGainKey("onyH", NOW) == "nefH",
+        "Rallying Cry within 30s of a Nef yell -> Nef row")
+    check(HUD.ResolveGainKey("ony", NOW) == "nefH", "slot alias resolves too")
+    -- Same yell, but the gain arrives too late to be attributable.
+    check(HUD.ResolveGainKey("onyH", NOW + 40) == nil,
+        "same gain outside 30s -> no alert rather than a guess")
+    -- Ony yells afterwards: attribution flips back.
+    HUD.NoteAnnouncerYell("onyA", NOW - 1)
+    check(HUD.ResolveGainKey("onyH", NOW) == "onyA",
+        "a newer Ony yell reclaims the gain (and keeps its own faction key)")
+    check(HUD.NoteAnnouncerYell("rend", NOW) == false, "non-announcer buffs stamp nothing")
+    wipe(HUD._yellEpochs); wipe(HUD._yellKeys)
+
+    -- ── A13.3 — trust ladder ─────────────────────────────────────────────────
+    local ladder = { "dbm", "nwb", "sn", "mesh", "local" }
+    for i = 1, #ladder do
+        for j = 1, #ladder do
+            local expect = (j > i) and "upgrade" or (j < i) and "ignore" or "refresh"
+            check(HUD.TrustAction(ladder[i], ladder[j]) == expect,
+                ladder[j] .. " onto " .. ladder[i] .. " -> " .. expect)
+        end
+    end
+    check(HUD.TrustAction("dbm", nil) == "refresh", "an untagged report just refreshes")
+    check(HUD.TrustAction(nil, "dbm") == "upgrade", "any trust beats an untrusted bar")
+    check(HUD._TrustRank("local") > HUD._TrustRank("mesh"), "local outranks mesh")
+    check(HUD._TrustRank("nwb") > HUD._TrustRank("dbm"), "nwb outranks dbm")
+    check(HUD._TrustRank("nonsense") == 0, "an unknown trust ranks bottom")
+
+    check(HUD.TrustNoticeFor("dbm", { dbm = true }) == "warn",
+        "a lone boss-mod bar warns")
+    check(HUD.TrustNoticeFor("local", { dbm = true, ["local"] = true }) == "confirm",
+        "a corroborated bar confirms")
+    check(HUD.TrustNoticeFor("local", { ["local"] = true }) == nil,
+        "a lone trusted bar says nothing")
+    check(HUD.TrustNoticeFor("dbm", { dbm = true, nwb = true }) == "confirm",
+        "even a still-dbm bar confirms once a second source agrees")
+
     if verbose then ns:Print("  hudgroups selftest " .. (pass and "PASS" or "FAIL")) end
     return pass
 end)
@@ -185,7 +575,8 @@ end
 -- Local helpers
 ----------------------------------------------------------------------
 
-local function frameClock() return (GetTime and GetTime()) or 0 end
+-- frameClock() is declared above the DaseekiUI guard (the A12.4 / A13.3 policy
+-- needs it headless); only `lower` is local to this section.
 local function lower(s) return s and s:lower() or "" end
 
 -- Pull-bar traffic-light "warn" amber. Core now ships a `warn` theme token, so
@@ -336,8 +727,11 @@ local DEFAULT_EVENT_SOUND = {
     pullTimer    = "RaidWarning",
     npcDied      = "TellMessage",
     npcRespawned = "TellMessage",
-    cdWarning    = "AuctionWindowOpen",
-    cdExpired    = "ReadyCheck",
+    -- A12.5: CD warning / CD expired are SILENT by default (spec §11). This is
+    -- the last-resort fallback used when neither the alert row nor ts.soundKeys
+    -- names a tone; the stored-value seeding lives in HUD.SeedAlertDefaults.
+    cdWarning    = "None",
+    cdExpired    = "None",
     buffGain     = "CheckboxOn",
 }
 local function soundKeyForEvent(eventType)
@@ -429,11 +823,13 @@ local function alertRow(buffKey, eventType)
     return row or {}
 end
 
+-- Live wrappers over the pure A12.2/A12.3 policy above.
 local function raidDisabled(channel)
-    if not inRaidInstance() then return false end
-    local ts = timerSettings()
-    local rd = ts.raidDisable or {}
-    return rd[channel] == true
+    return HUD.RaidChannelSuppressed(timerSettings().raidDisable, inRaidInstance(), channel)
+end
+
+local function barsSuppressed()
+    return HUD.SuppressBarsInRaid(timerSettings().raidDisable, inRaidInstance())
 end
 
 -- Core dispatch. opts: { test=bool } bypasses dedup + raid suppression.
@@ -778,22 +1174,67 @@ local function ensureTicker()
     end)
 end
 
--- trust -> confirmation chat notice (spec §3). Keyed by BUFF, not by bar: one pop
--- that raises two variant bars is still one pop, so the notice dedups on the
+-- trust -> confirmation chat notice (spec §10.7). Keyed by BUFF, not by bar: one
+-- pop that raises two variant bars is still one pop, so the notice dedups on the
 -- dispatcher's window instead of printing once per bar. The dedup key carries
--- trust + confirmed, so a genuine trust UPGRADE still speaks.
-local lastTrustNoticeAt = {}   -- "buff:trust:confirmed" -> frameClock
-local function trustNotice(buffKey, trust, confirmed)
+-- trust + notice kind, so a genuine trust UPGRADE still speaks.
+local lastTrustNoticeAt = {}   -- "buff:trust:kind" -> frameClock
+local function trustNotice(buffKey, trust, kind, sources)
     local t = frameClock()
-    local dkey = buffKey .. ":" .. tostring(trust) .. ":" .. tostring(confirmed == true)
+    local dkey = buffKey .. ":" .. tostring(trust) .. ":" .. tostring(kind)
     local prev = lastTrustNoticeAt[dkey]
     if prev and (t - prev) < HUD.DedupWindow(buffKey, "pullTimer") then return end
     lastTrustNoticeAt[dkey] = t
     local label = buffLabel(buffKey)
-    if trust == "dbm" and not confirmed then
+    if kind == "warn" then
         ns:Print("|cffff9f40[Intercepted DBM]|r " .. label .. " — no local or NWB confirmation.")
-    elseif confirmed then
-        ns:Print("|cff82bf6b[Timer confirmed]|r " .. label .. ".")
+    elseif kind == "confirm" then
+        local who = (sources and #sources > 0) and (" — confirmed by " .. table.concat(sources, " + ")) or ""
+        ns:Print("|cff82bf6b[Timer confirmed]|r " .. label .. who .. ".")
+    end
+end
+
+-- A13.3 — every distinct source that has reported this bar, so the deferred
+-- notice can tell "boss-mod guess" from "boss-mod guess, corroborated".
+local function noteSource(bar, trust)
+    if not trust then return end
+    bar._sources = bar._sources or {}
+    bar._sources[trust] = true
+end
+
+local function barSourceLabels(bar)
+    local out = {}
+    for t in pairs(bar._sources or {}) do out[#out + 1] = TRUST_LABEL[t] or t end
+    table.sort(out)
+    return out
+end
+
+-- Emit the bar's confirm/warn line from its state AT THE TIME IT FIRES — which
+-- is the whole point of the 3s delay: a boss-mod bar that a local witness
+-- upgrades in the meantime reports "confirmed", not "no confirmation".
+local function emitTrustNotice(barKey, buffKey)
+    local bar = bars[barKey]
+    if not bar then return end
+    bar._noticePending = false
+    local kind = HUD.TrustNoticeFor(bar._trust, bar._sources)
+    if not kind then return end
+    trustNotice(buffKey, bar._trust, kind, barSourceLabels(bar))
+end
+
+-- Schedule the ~3s notice. One pending notice per bar: if an upgrade lands while
+-- one is already in flight it simply reports the upgraded state, so a bar never
+-- prints twice for a single pop. An upgrade arriving AFTER the notice fired
+-- schedules a fresh one — that is the "rewrote a live bar, say so" line.
+local function scheduleTrustNotice(barKey, buffKey)
+    local bar = bars[barKey]
+    if not bar or bar._noticePending then return end
+    bar._noticePending = true
+    if C_Timer and C_Timer.After then
+        C_Timer.After(TRUST_NOTICE_DELAY, function()
+            ns:SafeCall(emitTrustNotice, barKey, buffKey)
+        end)
+    else
+        ns:SafeCall(emitTrustNotice, barKey, buffKey)
     end
 end
 
@@ -802,10 +1243,35 @@ end
 -- below is the bar key, not the buff key (Rend fires twice per pop).
 local function onPullDetected(buffKey, duration, trust, zone)
     if not BUFF_META[buffKey] and buffKey ~= "battleShout" then return end
-    ensureGroups(); ensureTicker()
+
+    -- A12.4: a pull report for an Ony/Nef announcer IS the evidence that that
+    -- announcer yelled. Stamp it first, before any path can return early, so the
+    -- 30s buff-gain attribution window is armed even when the bar is suppressed
+    -- (in a raid) or blocked (recently expired).
+    HUD.NoteAnnouncerYell(buffKey, frameClock())
+
+    -- Route a pull-timer alert through the dispatcher. Deliberately keyed by
+    -- BUFF, not bar: the dispatcher's dedup collapses Rend's two fires into a
+    -- single "Rend incoming!" banner — two bars, one alert. Hoisted above the
+    -- bar work so A12.2's raid bar suppression cannot take the alert with it.
+    local function fireAlert()
+        HUD.Alert(buffKey, "pullTimer", buffLabel(buffKey) .. " incoming!")
+    end
 
     local barKey = barKeyOf(buffKey, zone)
     local variantZone = (barKey ~= buffKey) and lower(zone) or nil
+    local bar = bars[barKey]
+
+    -- A12.2 — in a raid instance, with the fifth override on (the default), we
+    -- create NO new bar. Alerts still fire per their own four toggles. A bar
+    -- already live (raised before we zoned in) keeps ticking and keeps its trust
+    -- arbitration: this gates creation, not existence.
+    if not bar and barsSuppressed() then
+        fireAlert()
+        return
+    end
+
+    ensureGroups(); ensureTicker()
 
     -- 60s recently-expired restart block — per BAR, so Orgrimmar's 6s bar
     -- expiring never blocks the Barrens bar from the same pop.
@@ -817,19 +1283,39 @@ local function onPullDetected(buffKey, duration, trust, zone)
     duration = (duration and duration > 0) and duration or DEFAULT_PULL_WINDOW
 
     local isNew = false
-    local bar = bars[barKey]
     if bar then
-        -- Existing bar: refresh window + possible trust upgrade. NOT a structural
-        -- event → group stays frozen (no jump), only the fill range refreshes.
-        local wasTrust = bar._trust
-        bar._endTime = frameClock() + duration
-        bar._duration = duration
-        bar._sb:SetBarRange(0, duration)
-        bar._sb:SetBarValue(duration, true)   -- refill to full immediately
-        if trust and trust ~= wasTrust then
+        -- A13.3 — trust arbitration on a LIVE bar. Every report is recorded as a
+        -- source (corroboration counts even when it does not move the window),
+        -- then the ladder decides what happens to the window itself.
+        local action = HUD.TrustAction(bar._trust, trust)
+        noteSource(bar, trust)
+
+        if action == "upgrade" then
+            -- REWRITE IN PLACE. `duration` here is PULL_DETECTED's `remaining`,
+            -- which timers.lua already computed as (spec window − elapsed since
+            -- the higher-trust source's event epoch) — so adopting it IS the
+            -- recompute-from-the-better-epoch the spec asks for, and it is why a
+            -- late-but-truer report legitimately SHORTENS a bar.
+            -- The full window stays the fill range (widened only if this source
+            -- knows of more time than we did) so the drain reads honestly instead
+            -- of snapping back to full.
             bar._trust = trust
-            trustNotice(buffKey, trust, true)
+            bar._endTime = frameClock() + duration
+            if duration > (bar._duration or 0) then bar._duration = duration end
+            bar._sb:SetBarRange(0, bar._duration)
+            bar._sb:SetBarValue(duration, true)
+            scheduleTrustNotice(barKey, buffKey)
+        elseif action == "refresh" then
+            -- Same trust (or an untagged report): the historical plain refresh.
+            -- NOT a structural event → group stays frozen (no mid-pull jump).
+            bar._endTime = frameClock() + duration
+            bar._duration = duration
+            bar._sb:SetBarRange(0, duration)
+            bar._sb:SetBarValue(duration, true)   -- refill to full immediately
         end
+        -- action == "ignore": a LOWER-trust report never displaces a higher-trust
+        -- window. It still counted as a source above, so it can still turn a
+        -- lone boss-mod bar's warning into a confirmation.
     else
         isNew = true
         evictIfNeeded()
@@ -848,18 +1334,61 @@ local function onPullDetected(buffKey, duration, trust, zone)
         bar:Show()
         bars[barKey] = bar
         barOrder[#barOrder + 1] = barKey
-        trustNotice(buffKey, trust, false)
+        noteSource(bar, trust)
+        scheduleTrustNotice(barKey, buffKey)
     end
 
     -- A new bar spawning is a STRUCTURAL event → re-partition groups (spec-allowed
     -- regroup point). A plain refresh keeps every bar's frozen group.
     if isNew then ns:SafeCall(assignGroups) end
 
-    -- Route a pull-timer alert through the dispatcher. Deliberately keyed by
-    -- BUFF, not bar: the dispatcher's 3s dedup collapses Rend's two fires into a
-    -- single "Rend incoming!" banner — two bars, one alert.
-    HUD.Alert(buffKey, "pullTimer", buffLabel(buffKey) .. " incoming!")
+    fireAlert()
     ns:SafeCall(reflow)
+end
+HUD._OnPullDetected = onPullDetected
+
+-- Public: fire a buff-gain alert, resolving the ambiguous Rallying Cry slot to
+-- whichever announcer actually yelled (A12.4). Returns false when the gain was
+-- suppressed because neither Ony nor Nef yelled inside the 30s window.
+function HUD.BuffGainAlert(buffKey, message)
+    local key = HUD.ResolveGainKey(buffKey, frameClock())
+    if not key then return false end
+    HUD.Alert(key, "buffGain", message or (buffLabel(key) .. " gained."))
+    return true
+end
+
+-- Test seam: a live bar's arbitration state, or nil when no such bar exists.
+-- `remaining` is derived rather than stored so a test reads what the ticker
+-- would paint.
+function HUD._BarInfo(barKey)
+    local b = bars[barKey]
+    if not b then return nil end
+    local sources = {}
+    for t in pairs(b._sources or {}) do sources[#sources + 1] = t end
+    table.sort(sources)
+    return {
+        trust     = b._trust,
+        duration  = b._duration,
+        remaining = (b._endTime or 0) - frameClock(),
+        variant   = b._variantZone,
+        sources   = sources,
+        pending   = b._noticePending == true,
+    }
+end
+
+-- Test seam: how many bars are live right now.
+function HUD._BarCount() return #barOrder end
+
+-- Test/reset seam: wipe every piece of live bar + alert state. Used by the
+-- headless suites and by the resetui path.
+function HUD._ResetBarState()
+    for k, b in pairs(bars) do b:Hide(); bars[k] = nil end
+    wipe(barOrder)
+    wipe(recentlyExpired)
+    wipe(lastAlertAt)
+    wipe(lastTrustNoticeAt)
+    wipe(HUD._yellEpochs)
+    wipe(HUD._yellKeys)
 end
 
 -- Public: clear all bars (resetui path / debug).
@@ -1196,6 +1725,15 @@ local function wireCallbacks()
         ns:SafeCall(onPullDetected, buffKey, duration, trust, zone)
     end)
 
+    -- BUFF_GAIN(buffKey, message) — the A12.4 seam. Nothing fires this yet:
+    -- aura capture lives in tracker.lua, which today only feeds the record. When
+    -- it grows a settled before/after gain comparison it emits here and the
+    -- Ony-vs-Nef attribution is already correct, including the spec's "neither
+    -- announcer yelled recently -> stay silent" case.
+    ns:On("BUFF_GAIN", function(buffKey, message)
+        ns:SafeCall(HUD.BuffGainAlert, buffKey, message)
+    end)
+
     -- CD_WARNING(buffKey, kind) kind ∈ "5min"/"1min"/"ready".
     ns:On("CD_WARNING", function(buffKey, kind)
         local eventType = (kind == "ready") and "cdExpired" or "cdWarning"
@@ -1252,11 +1790,144 @@ local function runSelfTests(verbose)
     return pass
 end
 
+-- ── Integration suite: raid bar suppression + trust-ladder replacement ────────
+-- Drives the REAL PULL_DETECTED handler against the REAL alert dispatcher and
+-- the REAL live settings table, so it catches wiring the pure suite above
+-- cannot. Registered below the DaseekiUI guard because it builds actual bars.
+--
+-- Everything it mutates (IsInInstance, ns.Print, timerSettings.alerts /
+-- .raidDisable) is saved and restored, and the bar/alert state is reset between
+-- cases so no case can inherit another's dedup timestamps.
+ns:RegisterSelfTest("hudalerts", function(verbose)
+    -- Failures are COLLECTED, not printed: this suite hijacks ns.Print to
+    -- observe the chat channel, so printing a failure mid-run would both hide it
+    -- and pollute the very buffer the next assertion counts.
+    local fails = {}
+    local function check(c, m) if not c then fails[#fails + 1] = m end end
+    local function near(a, b) return math.abs((a or -999) - b) < 0.01 end
+
+    local ts          = timerSettings()
+    local savedRD     = ts.raidDisable
+    local savedAlerts = ts.alerts
+    local savedInst   = _G.IsInInstance
+    local savedPrint  = ns.Print
+
+    local lines = {}
+    ns.Print = function(_, msg) lines[#lines + 1] = tostring(msg) end
+    local function setRaid(on)
+        _G.IsInInstance = function()
+            if on then return true, "raid" end
+            return false, "none"
+        end
+    end
+    local function chatRow() return { notify = false, chat = true, flash = false, sound = "None" } end
+
+    -- Chat-only rows make every alert observable as exactly one captured line.
+    ts.alerts = {
+        pullTimer = { rend = chatRow(), onyH = chatRow(), nefH = chatRow() },
+        buffGain  = { onyH = chatRow(), onyA = chatRow(), nefH = chatRow(), nefA = chatRow() },
+    }
+    -- The owner has deliberately re-opened CHAT in raid but left bars suppressed:
+    -- the exact config that proves the two are independent.
+    ts.raidDisable = { notify = true, chat = false, flash = true, sound = true, bars = true }
+
+    -- (1) A12.2 — in a raid, no bar is created, but the alert still fires.
+    HUD._ResetBarState(); setRaid(true); lines = {}
+    HUD._OnPullDetected("rend", 17, "local", "Barrens")
+    check(HUD._BarCount() == 0, "raid: pull creates NO bar")
+    check(#lines == 1 and lines[1]:find("Rend", 1, true) ~= nil,
+        "raid: the chat alert still fires")
+
+    -- Opting bars back in inside a raid restores the bar.
+    HUD._ResetBarState(); ts.raidDisable.bars = false; lines = {}
+    HUD._OnPullDetected("rend", 17, "local", "Barrens")
+    check(HUD._BarCount() == 1, "raid + bars opt-in: bar created")
+    ts.raidDisable.bars = true
+
+    -- (2) A13.3 — a boss-mod bar, then a local witness REWRITES it in place.
+    HUD._ResetBarState(); setRaid(false); lines = {}
+    HUD._OnPullDetected("rend", 17, "dbm", "Barrens")
+    local info = HUD._BarInfo("rend:barrens")
+    check(info ~= nil and info.trust == "dbm", "dbm bar created at dbm trust")
+    check(HUD._BarCount() == 1, "one bar")
+
+    -- The local witness saw the yell later than dbm guessed, so the honest
+    -- remaining is SHORTER. A replacement must be free to shorten a bar.
+    HUD._OnPullDetected("rend", 6, "local", "Barrens")
+    info = HUD._BarInfo("rend:barrens")
+    check(HUD._BarCount() == 1, "replacement is IN PLACE — no second bar")
+    check(info.trust == "local", "higher trust takes the bar over")
+    check(near(info.remaining, 6), "window recomputed from the higher-trust epoch")
+    check(info.duration == 17, "fill range keeps the full spec window")
+    check(#info.sources == 2, "both sources recorded")
+    check(info.pending, "a confirm/warn notice is scheduled")
+    check(HUD.TrustNoticeFor(info.trust, info.sources) == "confirm",
+        "the scheduled notice is the green confirm line")
+
+    -- (3) A13.3 — a LOWER-trust report never displaces the live window.
+    HUD._OnPullDetected("rend", 40, "nwb", "Barrens")
+    info = HUD._BarInfo("rend:barrens")
+    check(info.trust == "local", "lower trust does not take the bar")
+    check(near(info.remaining, 6), "lower trust does not extend the window")
+    check(#info.sources == 3, "but it still counts as corroboration")
+
+    -- (4) Equal trust is the historical plain refresh.
+    HUD._OnPullDetected("rend", 12, "local", "Barrens")
+    info = HUD._BarInfo("rend:barrens")
+    check(near(info.remaining, 12), "equal trust refreshes the window")
+
+    -- (5) Variant isolation — a zone-variant Rend bar replaces only its own.
+    HUD._ResetBarState(); lines = {}
+    HUD._OnPullDetected("rend", 6,  "dbm", "Orgrimmar")
+    HUD._OnPullDetected("rend", 17, "dbm", "Barrens")
+    check(HUD._BarCount() == 2, "one pop, two variant bars")
+    HUD._OnPullDetected("rend", 5, "local", "Orgrimmar")
+    local org, barrens = HUD._BarInfo("rend:orgrimmar"), HUD._BarInfo("rend:barrens")
+    check(HUD._BarCount() == 2, "still two bars after the upgrade")
+    check(org.trust == "local" and near(org.remaining, 5), "the Orgrimmar variant upgraded")
+    check(barrens.trust == "dbm" and near(barrens.remaining, 17),
+        "the Barrens variant is untouched by its sibling's upgrade")
+    check(#barrens.sources == 1 and barrens.sources[1] == "dbm",
+        "sources do not leak across variants")
+
+    -- (6) A12.4 — buff-gain attribution end to end through the dispatcher.
+    HUD._ResetBarState(); lines = {}
+    check(HUD.BuffGainAlert("onyH", "Rallying Cry.") == false,
+        "no announcer yelled -> the gain is suppressed")
+    check(#lines == 0, "a suppressed gain prints nothing at all")
+
+    -- A Nef pull is what stamps the Nef announcer epoch.
+    HUD._OnPullDetected("nefH", 15, "local", "Orgrimmar")
+    lines = {}
+    check(HUD.BuffGainAlert("onyH", "Rallying Cry.") == true,
+        "after a Nef yell the gain fires")
+    check(#lines == 1, "and fires exactly once")
+
+    -- Restore everything this suite touched.
+    ts.raidDisable  = savedRD
+    ts.alerts       = savedAlerts
+    _G.IsInInstance = savedInst
+    ns.Print        = savedPrint
+    HUD._ResetBarState()
+
+    local pass = #fails == 0
+    if verbose then
+        for i = 1, #fails do ns:Print("  FAIL: " .. fails[i]) end
+        ns:Print("  hudalerts selftest " .. (pass and "PASS" or "FAIL"))
+    end
+    return pass
+end)
+
 registerCommands()
 wireCallbacks()
 ns:RegisterSelfTest("hud", runSelfTests)
 
 ns:On("LOGIN", function()
+    -- A12.2 / A12.3 / A12.5 — additive SV seeds. Runs at LOGIN (PLAYER_LOGIN),
+    -- which is strictly after Store.Init's ADDON_LOADED applyDefaults pass, so
+    -- the store has already written whatever it was going to write and we are
+    -- correcting a known-final table rather than racing it.
+    ns:SafeCall(function() HUD.SeedAlertDefaults(timerSettings()) end)
     ns:SafeCall(ensureGroups)
     ns:SafeCall(ensureTicker)
     -- Pre-build the secure Cancel Buffs popup while guaranteed out of combat.
