@@ -671,9 +671,88 @@ end
 -- Each run -> our instances entry { t, name, mapID, dur, gold, xp, merged=false },
 -- keyed under Name-Realm (realm whitespace stripped, matching tracker.lua's
 -- selfNameRealm). Characters the store already knows are attributed to their
--- account; unknown characters (orphans) go under the local account id. Idempotent
--- via Instances.MergeEntryList ((nameRealm,t) dedup + the existing 60-ring cap).
+-- account; unknown characters go to the ORPHAN bucket, which counts against NO
+-- meter. Idempotent via Instances.MergeEntryList ((nameRealm,t) dedup + the
+-- existing 60-ring cap).
+--
+-- BATTLEGROUND / ARENA RUNS ARE SKIPPED. The source array stores them alongside
+-- dungeon and raid runs, and the reader they came from excludes them from every
+-- cap computation. Our live capture already excludes them (COUNTED_TYPES); the
+-- importer must apply the same rule or every WSG/AB/AV the owner ever ran becomes
+-- a phantom instance slot in the hour and day meters -- and can evict a real
+-- dungeon entry out of the 60-entry ring.
 ----------------------------------------------------------------------
+
+-- Battleground and arena instance ids (public, stable game constants). Classic
+-- Era only ever produces the first three; the rest are carried so a TBC/Wrath
+-- era file imports correctly too.
+local PVP_INSTANCE_IDS = {
+    [30] = true,   -- Alterac Valley
+    [489] = true,  -- Warsong Gulch
+    [529] = true,  -- Arathi Basin
+    [566] = true,  -- Eye of the Storm
+    [607] = true,  -- Strand of the Ancients
+    [628] = true,  -- Isle of Conquest
+    [559] = true,  -- Nagrand Arena
+    [562] = true,  -- Blade's Edge Arena
+    [572] = true,  -- Ruins of Lordaeron
+    [617] = true,  -- Dalaran Sewers
+    [618] = true,  -- Ring of Valor
+}
+Import.PVP_INSTANCE_IDS = PVP_INSTANCE_IDS
+
+-- Run-type values that must never reach a cap meter.
+local NONCOUNTED_TYPE_WORDS = {
+    pvp = true, arena = true, battleground = true, bg = true,
+    scenario = true, delve = true,
+}
+-- Candidate keys for the run's stored type / pvp flag. The exact key name could
+-- not be confirmed under the clean-room firewall (the only copy of the source
+-- record lives in a path we are not permitted to read), so the type check is
+-- deliberately TOLERANT: it accepts any of these, and the id list above plus the
+-- structural signature below carry the filter on their own if none is present.
+local TYPE_KEYS = { "type", "instanceType", "iType", "runType", "instType" }
+local PVP_FLAG_KEYS = { "pvp", "isPvP", "isPvp", "isPVP", "pvpFlag" }
+
+-- Classify one source run: "counted" (a dungeon/raid that bills a slot),
+-- "pvp" (battleground/arena/scenario/delve -- store-but-never-count), or
+-- "invalid" (unusable: no entry epoch or no instance name). Pure.
+function Import.ClassifyNITRun(run)
+    if type(run) ~= "table" then return "invalid" end
+    local t = tonumber(run.enteredTime)
+    local name = run.instanceName
+    if not t or t <= 0 or type(name) ~= "string" or name == "" then return "invalid" end
+
+    -- 1. Instance id against the public battleground/arena set. Confirmed key,
+    --    exact test -- this is the load-bearing signal.
+    local id = tonumber(run.instanceID)
+    if id and PVP_INSTANCE_IDS[id] then return "pvp", "id" end
+
+    -- 2. A stored type / pvp flag, if the record carries one under any of the
+    --    plausible key names.
+    for i = 1, #TYPE_KEYS do
+        local v = run[TYPE_KEYS[i]]
+        if type(v) == "string" and NONCOUNTED_TYPE_WORDS[v:lower()] then return "pvp", "type" end
+    end
+    for i = 1, #PVP_FLAG_KEYS do
+        local v = run[PVP_FLAG_KEYS[i]]
+        if v == true or v == 1 then return "pvp", "flag" end
+        if type(v) == "string" and NONCOUNTED_TYPE_WORDS[v:lower()] then return "pvp", "flag" end
+    end
+
+    -- 3. The structural signature of a PvP record: difficulty id absent AND both
+    --    wallet snapshots stripped. All three keys are confirmed, and a genuine
+    --    dungeon record carries all three; requiring all three to be missing at
+    --    once -- on a record that is otherwise well-formed (it has an instance
+    --    id) -- keeps this from stealing real runs out of the meter. A record
+    --    with no instance id is malformed, not PvP, and is left to the mapper to
+    --    reject so it lands in the honest "unusable" bucket.
+    if id and run.difficultyID == nil and run.enteredMoney == nil and run.leftMoney == nil then
+        return "pvp", "stripped"
+    end
+
+    return "counted"
+end
 
 -- Build our canonical Name-Realm from a NIT playerName + its realm bucket key.
 -- Realm whitespace is stripped to match tracker.lua's selfNameRealm().
@@ -683,36 +762,89 @@ function Import._NITNameRealm(playerName, realm)
     return playerName .. "-" .. r
 end
 
--- Map ONE NIT run record -> our instances entry, or nil if unusable (no entry
--- time or no instance name). Gold/XP are stored raw deltas (gold may be negative
--- when the run spent more than it earned), mirroring instances.lua's live capture.
+-- Candidate keys for the two accumulators the source record keeps ALONGSIDE its
+-- snapshots: loot-only coin, and chat-parsed XP. The reader they came from
+-- prefers both over the snapshot deltas, precisely because the wallet delta
+-- includes repairs/vendors/mail and the XP delta goes NEGATIVE across a ding.
+-- Key names are unconfirmed (see the note on TYPE_KEYS), so this is a tolerant
+-- scan with the snapshot delta as the fallback; Import.RunInstances reports how
+-- many records actually used the preferred field so the owner can tell whether
+-- these names matched anything at all.
+local LOOT_COIN_KEYS = { "moneyLooted", "lootedMoney", "moneyLoot", "goldLooted", "coinLooted", "lootedGold" }
+local CHAT_XP_KEYS   = { "xpGained", "gainedXP", "xpFromChat", "chatXP", "totalXP", "xp" }
+
+local function firstNumericField(run, keys)
+    for i = 1, #keys do
+        local v = tonumber(run[keys[i]])
+        if v and v >= 0 then return v, keys[i] end
+    end
+    return nil
+end
+
+-- Map ONE source run record -> our instances entry, or nil if unusable.
+-- Returns (entry, usedLootField, usedXPField) so the caller can report how often
+-- the preferred accumulators were found.
 function Import._MapInstanceEntry(run)
     if type(run) ~= "table" then return nil end
+    if Import.ClassifyNITRun(run) ~= "counted" then return nil end
     local t = tonumber(run.enteredTime)
     local name = run.instanceName
-    if not t or t <= 0 or type(name) ~= "string" or name == "" then return nil end
     local left = tonumber(run.leftTime)
     local dur = (left and left > t) and (left - t) or 0
+
+    -- Gold: keep the wallet delta (it is what the file reliably has) AND the
+    -- loot-only total when the record carries one. Mirrors the live capture,
+    -- which now populates both fields.
     local gold = 0
     local em, lm = tonumber(run.enteredMoney), tonumber(run.leftMoney)
     if em and lm then gold = lm - em end
-    local xp = 0
-    local ex, lx = tonumber(run.enteredXP), tonumber(run.leftXP)
-    if ex and lx then xp = lx - ex end
-    return { t = t, name = name, mapID = tonumber(run.instanceID), dur = dur, gold = gold, xp = xp, merged = false }
+    local goldLoot, lootKey = firstNumericField(run, LOOT_COIN_KEYS)
+
+    -- XP: prefer the chat accumulator. The snapshot delta is level-up-poisoned,
+    -- so when it is all we have it is CLAMPED at zero -- a run containing a ding
+    -- imports as 0 rather than as a large negative number. The true figure is
+    -- not recoverable from two snapshots that straddle a reset.
+    local xp, xpKey = firstNumericField(run, CHAT_XP_KEYS)
+    if not xp then
+        local ex, lx = tonumber(run.enteredXP), tonumber(run.leftXP)
+        if ex and lx then xp = math.max(0, lx - ex) else xp = 0 end
+    end
+
+    local entry = {
+        t = t, name = name, mapID = tonumber(run.instanceID),
+        dur = dur, gold = gold, xp = xp, merged = false,
+        goldLoot = goldLoot or 0,
+    }
+    -- Historical exit epoch, so the register can recompute a duration on demand
+    -- exactly as it does for live runs. Zero means the run was never closed.
+    if left and left > t then entry.exitT = left end
+    return entry, (lootKey ~= nil), (xpKey ~= nil)
 end
 
 -- PURE core: NITdatabase -> our per-account/per-character instances partial + counts.
 --   ownerIndex = { [nameRealm] = aid }  (accounts the store already knows a char under)
---   selfAID    = local account id (orphans land here)
+--   selfAID    = local account id (used only for the summary line)
 -- Returns (mapped, counts):
 --   mapped = { [aid] = { [nameRealm] = { entries = { entry, ... } } } }
---   counts = { runs, skipped, chars, attributed, orphaned, perAccount = {[aid]=n} }
+--   counts = { runs, skipped, pvpSkipped, pvpBy, chars, attributed, orphaned,
+--              lootFieldHits, xpFieldHits, perAccount = {[aid]=n} }
+--
+-- ATTRIBUTION: a character the store already knows goes to ITS account. A
+-- character nobody claims goes to the ORPHAN bucket, NOT to the local account.
+-- Dumping unattributable alts onto the local account's meter inflates exactly
+-- the number that must never be wrong; the orphan bucket keeps the runs visible
+-- in the register while counting against nothing.
 function Import._MapNITData(nitDB, ownerIndex, selfAID)
     ownerIndex = ownerIndex or {}
     selfAID = selfAID or ""
+    local orphanAID = (ns.Instances and ns.Instances.ORPHAN_AID) or "orphan"
     local mapped, charSet = {}, {}
-    local counts = { runs = 0, skipped = 0, chars = 0, attributed = 0, orphaned = 0, perAccount = {} }
+    local counts = {
+        runs = 0, skipped = 0, pvpSkipped = 0, chars = 0,
+        attributed = 0, orphaned = 0, lootFieldHits = 0, xpFieldHits = 0,
+        pvpBy = { id = 0, type = 0, flag = 0, stripped = 0 },
+        perAccount = {}, orphanAID = orphanAID,
+    }
     local g = (type(nitDB) == "table") and nitDB.global
     if type(g) ~= "table" then return mapped, counts end
     for realm, realmData in pairs(g) do
@@ -720,21 +852,29 @@ function Import._MapNITData(nitDB, ownerIndex, selfAID)
         if type(runs) == "table" then
             for i = 1, #runs do
                 local run = runs[i]
-                local entry = Import._MapInstanceEntry(run)
-                local nameRealm = entry and Import._NITNameRealm(run.playerName, realm)
-                if entry and nameRealm then
-                    local known = ownerIndex[nameRealm]
-                    local aid = known or selfAID
-                    local acct = mapped[aid]; if not acct then acct = {}; mapped[aid] = acct end
-                    local crec = acct[nameRealm]; if not crec then crec = { entries = {} }; acct[nameRealm] = crec end
-                    crec.entries[#crec.entries + 1] = entry
-                    counts.runs = counts.runs + 1
-                    counts.perAccount[aid] = (counts.perAccount[aid] or 0) + 1
-                    if known then counts.attributed = counts.attributed + 1
-                    else counts.orphaned = counts.orphaned + 1 end
-                    if not charSet[nameRealm] then charSet[nameRealm] = true; counts.chars = counts.chars + 1 end
-                elseif run ~= nil then
-                    counts.skipped = counts.skipped + 1
+                local kind, why = Import.ClassifyNITRun(run)
+                if kind == "pvp" then
+                    counts.pvpSkipped = counts.pvpSkipped + 1
+                    counts.pvpBy[why] = (counts.pvpBy[why] or 0) + 1
+                else
+                    local entry, lootHit, xpHit = Import._MapInstanceEntry(run)
+                    local nameRealm = entry and Import._NITNameRealm(run.playerName, realm)
+                    if entry and nameRealm then
+                        local known = ownerIndex[nameRealm]
+                        local aid = known or orphanAID
+                        local acct = mapped[aid]; if not acct then acct = {}; mapped[aid] = acct end
+                        local crec = acct[nameRealm]; if not crec then crec = { entries = {} }; acct[nameRealm] = crec end
+                        crec.entries[#crec.entries + 1] = entry
+                        counts.runs = counts.runs + 1
+                        counts.perAccount[aid] = (counts.perAccount[aid] or 0) + 1
+                        if lootHit then counts.lootFieldHits = counts.lootFieldHits + 1 end
+                        if xpHit then counts.xpFieldHits = counts.xpFieldHits + 1 end
+                        if known then counts.attributed = counts.attributed + 1
+                        else counts.orphaned = counts.orphaned + 1 end
+                        if not charSet[nameRealm] then charSet[nameRealm] = true; counts.chars = counts.chars + 1 end
+                    elseif run ~= nil then
+                        counts.skipped = counts.skipped + 1
+                    end
                 end
             end
         end
@@ -799,18 +939,28 @@ end
 
 -- Ordered summary lines for the NIT counts table (mirrors summaryLines' style).
 local function instanceSummaryLines(counts, selfAID)
+    local by = counts.pvpBy or {}
+    local orphanAID = counts.orphanAID or "orphan"
     local lines = {
-        string.format("instances: runs=%d mapped, characters=%d, skipped=%d",
+        string.format("instances: runs=%d mapped, characters=%d, unusable=%d",
             counts.runs or 0, counts.chars or 0, counts.skipped or 0),
-        string.format("attribution: %d to known accounts, %d orphaned to local account \"%s\"",
-            counts.attributed or 0, counts.orphaned or 0, (selfAID ~= "" and selfAID) or "(unset)"),
+        string.format("pvp filter: %d battleground/arena runs skipped (by id=%d, type=%d, flag=%d, stripped-fields=%d)",
+            counts.pvpSkipped or 0, by.id or 0, by.type or 0, by.flag or 0, by.stripped or 0),
+        string.format("attribution: %d to known accounts, %d to the ORPHAN bucket \"%s\" (counts against NO meter)",
+            counts.attributed or 0, counts.orphaned or 0, orphanAID),
+        string.format("field preference: %d runs had a loot-coin total, %d had a chat-XP total (0 means those keys are absent -- snapshot fallback used)",
+            counts.lootFieldHits or 0, counts.xpFieldHits or 0),
     }
+    if (counts.orphaned or 0) > 0 then
+        lines[#lines + 1] = "NOTE: populate the account index for those characters and re-run to attribute them."
+    end
     local aids = {}
     for aid in pairs(counts.perAccount or {}) do aids[#aids + 1] = aid end
     table.sort(aids)
     for _, aid in ipairs(aids) do
-        lines[#lines + 1] = string.format("  acct %s: %d runs",
-            (aid ~= "" and aid) or "(unset)", counts.perAccount[aid])
+        lines[#lines + 1] = string.format("  %s: %d runs",
+            (aid == orphanAID and "ORPHAN") or ("acct " .. ((aid ~= "" and aid) or "(unset)")),
+            counts.perAccount[aid])
     end
     return lines
 end
@@ -1120,21 +1270,32 @@ local function selfTest(verbose)
     ------------------------------------------------------------------
     -- NIT instance-run import: shape mapping, attribution, idempotency.
     ------------------------------------------------------------------
+    local ORPHAN = (ns.Instances and ns.Instances.ORPHAN_AID) or "orphan"
     local nitFixture = {
         global = {
             ["Jom Gabbar"] = { instances = {
                 { playerName = "Artaeum", instanceName = "Blackwing Lair", instanceID = 469,
-                  enteredTime = 1000, leftTime = 4600, enteredMoney = 500, leftMoney = 1500,
+                  difficultyID = 1, enteredTime = 1000, leftTime = 4600,
+                  enteredMoney = 500, leftMoney = 1500,
                   enteredXP = 0, leftXP = 0, mobCount = 900 },
                 { playerName = "Artaeum", instanceName = "Molten Core", instanceID = 409,
-                  enteredTime = 5000, leftTime = 8600, enteredMoney = 2000, leftMoney = 1000 }, -- spent gold
-                { playerName = "", instanceName = "Bad", enteredTime = 9000 },  -- no player -> skip
-                { instanceName = "NoTime", enteredTime = 0 },                   -- no entry time -> skip
+                  difficultyID = 1, enteredTime = 5000, leftTime = 8600,
+                  enteredMoney = 2000, leftMoney = 1000 }, -- spent gold (repaired in MC)
+                -- Battlegrounds: present in the source array, must NEVER count.
+                { playerName = "Artaeum", instanceName = "Warsong Gulch", instanceID = 489,
+                  enteredTime = 6000, leftTime = 7000 },
+                { playerName = "Artaeum", instanceName = "Alterac Valley", instanceID = 30,
+                  enteredTime = 6100, leftTime = 9100 },
+                { playerName = "Artaeum", instanceName = "Arathi Basin", instanceID = 529,
+                  enteredTime = 6200, leftTime = 7200 },
+                { playerName = "", instanceName = "Bad", enteredTime = 9000 },  -- no player -> unusable
+                { instanceName = "NoTime", enteredTime = 0 },                   -- no entry time -> unusable
             } },
             ["Whitemane"] = { instances = {
                 { playerName = "Stranger", instanceName = "Scholomance", instanceID = 289,
-                  enteredTime = 2000, leftTime = 3000, enteredMoney = 10, leftMoney = 60,
-                  enteredXP = 100, leftXP = 900 },  -- xp gain 800
+                  difficultyID = 1, enteredTime = 2000, leftTime = 3000,
+                  enteredMoney = 10, leftMoney = 60,
+                  enteredXP = 900, leftXP = 100 },  -- LEVELLED UP mid-run: delta is negative
             } },
         },
     }
@@ -1144,27 +1305,91 @@ local function selfTest(verbose)
     check("nit skipped invalid runs", counts.skipped == 2)
     check("nit distinct characters", counts.chars == 2)
     check("nit attributed to known acct", counts.attributed == 2)
-    check("nit orphaned to self", counts.orphaned == 1)
+    check("nit orphaned count", counts.orphaned == 1)
     check("nit per-account: acct 2 = 2 runs", counts.perAccount["2"] == 2)
-    check("nit per-account: self 1 = 1 run", counts.perAccount["1"] == 1)
+
+    -- A5.1 -- the top-severity importer defect: battlegrounds are phantom slots.
+    check("nit skips all 3 battlegrounds", counts.pvpSkipped == 3)
+    check("nit bg skip attributed to the id list", counts.pvpBy.id == 3)
+    check("nit no bg run reached the ledger", counts.perAccount["2"] == 2)
+
+    -- A5.4 -- orphans must NOT pile onto the local account's meter.
+    check("nit orphan does NOT land on local acct 1", mapped["1"] == nil)
+    check("nit orphan lands in the orphan bucket", mapped[ORPHAN] ~= nil)
+    check("nit orphan per-account is the orphan bucket", counts.perAccount[ORPHAN] == 1)
 
     local jg = mapped["2"] and mapped["2"]["Artaeum-JomGabbar"]
     check("nit known char under acct 2", jg and #jg.entries == 2)
-    local wm = mapped["1"] and mapped["1"]["Stranger-Whitemane"]
-    check("nit orphan under self acct 1", wm and #wm.entries == 1)
+    local wm = mapped[ORPHAN] and mapped[ORPHAN]["Stranger-Whitemane"]
+    check("nit orphan char under the orphan bucket", wm and #wm.entries == 1)
 
     local bwl = jg and jg.entries[1]
     check("nit t<-enteredTime", bwl and bwl.t == 1000)
     check("nit name<-instanceName", bwl and bwl.name == "Blackwing Lair")
     check("nit mapID<-instanceID", bwl and bwl.mapID == 469)
     check("nit dur = left-entered", bwl and bwl.dur == 3600)
+    check("nit exitT<-leftTime", bwl and bwl.exitT == 4600)
     check("nit gold = left-entered (copper)", bwl and bwl.gold == 1000)
+    check("nit goldLoot defaults to 0 when absent", bwl and bwl.goldLoot == 0)
     check("nit merged=false", bwl and bwl.merged == false)
     local mc = jg and jg.entries[2]
-    check("nit negative gold (spent in-run)", mc and mc.gold == -1000)
-    check("nit xp = left-entered", wm and wm.entries[1].xp == 800)
+    check("nit negative wallet gold survives (spent in-run)", mc and mc.gold == -1000)
+
+    -- A5.3 -- the XP delta goes negative across a ding; imported XP never does.
+    check("nit xp clamped at 0 across a level-up", wm and wm.entries[1].xp == 0)
+
+    -- Preferred accumulators win over the snapshot deltas when present.
+    local pref = Import._MapInstanceEntry({
+        instanceName = "Stratholme", instanceID = 329, difficultyID = 1,
+        enteredTime = 100, leftTime = 700, enteredMoney = 0, leftMoney = -5000,
+        enteredXP = 500, leftXP = 100, xpGained = 7400, moneyLooted = 31234,
+    })
+    check("nit prefers the loot-coin total", pref and pref.goldLoot == 31234)
+    check("nit prefers the chat-XP total", pref and pref.xp == 7400)
+    check("nit still keeps the wallet delta alongside", pref and pref.gold == -5000)
+
+    -- The tolerant type/flag signals, independent of the id list.
+    check("nit classifies a type word", Import.ClassifyNITRun({
+        instanceName = "Somewhere", instanceID = 9999, enteredTime = 1,
+        difficultyID = 1, enteredMoney = 0, leftMoney = 0, type = "arena" }) == "pvp")
+    check("nit classifies a pvp flag", Import.ClassifyNITRun({
+        instanceName = "Somewhere", instanceID = 9999, enteredTime = 1,
+        difficultyID = 1, enteredMoney = 0, leftMoney = 0, pvp = true }) == "pvp")
+    check("nit classifies the stripped-field signature", Import.ClassifyNITRun({
+        instanceName = "Somewhere", instanceID = 9999, enteredTime = 1 }) == "pvp")
+    check("nit does NOT call an id-less record pvp", Import.ClassifyNITRun({
+        instanceName = "Somewhere", enteredTime = 1 }) == "counted")
+    check("nit keeps a normal dungeon", Import.ClassifyNITRun({
+        instanceName = "Deadmines", instanceID = 36, enteredTime = 1,
+        difficultyID = 1, enteredMoney = 0, leftMoney = 0 }) == "counted")
+    check("nit rejects an unusable record", Import.ClassifyNITRun({ instanceName = "X" }) == "invalid")
+    -- Zul'Gurub and AQ20 genuinely DO bill a slot -- they must not be filtered.
+    check("nit keeps Zul'Gurub (309)", Import.ClassifyNITRun({
+        instanceName = "Zul'Gurub", instanceID = 309, enteredTime = 1,
+        difficultyID = 1, enteredMoney = 0, leftMoney = 0 }) == "counted")
+
     check("nit nameRealm strips realm spaces", Import._NITNameRealm("Artaeum", "Jom Gabbar") == "Artaeum-JomGabbar")
     check("nit nameRealm nil on empty player", Import._NITNameRealm("", "Jom Gabbar") == nil)
+
+    -- Orphaned runs must not reach any cap meter once applied.
+    if ns.Instances and ns.Instances.WindowCounts then
+        local Store = ns.Store
+        local savedData, savedGet = Store.data, ns.GetAccountID
+        ns.GetAccountID = function() return "1" end
+        Store.data = { instances = {} }
+        Import._ApplyInstances(mapped)
+        local orphanCounts = ns.Instances.WindowCounts(ORPHAN, 2500)
+        check("applied orphan runs count against no meter",
+            orphanCounts.hour == 0 and orphanCounts.day == 0)
+        local view = ns.Instances.AllAccounts(2500)
+        check("orphan bucket absent from the cross-account view", view.accounts[ORPHAN] == nil)
+        -- At t=2500 acct 2 has exactly one in-window run (t=1000; t=5000 is in the
+        -- future and rejected) and the orphan has one (t=2000). The total must see
+        -- only acct 2's -- had the orphan landed on a meter it would read 2.
+        check("acct 2 has its one in-window run", view.accounts["2"].day == 1)
+        check("orphan runs excluded from the aggregate total", view.total.day == 1)
+        Store.data, ns.GetAccountID = savedData, savedGet
+    end
 
     -- Idempotency via the apply path's dedup+cap (Instances.MergeEntryList): a
     -- re-import of the same mapped list adds ZERO on the second pass.
