@@ -56,7 +56,14 @@ local CARD_PAD_H = 9        -- card horizontal padding (round-11 item 4: 11 -> 9
 local CARD_PAD_V = 7        -- card vertical padding   (round-11 item 4: 9 -> 7, one step tighter)
 local TILE       = 18       -- buff strip tile edge
 local TILE_GAP   = 3
-local CD_ICON    = 20       -- chrono/hearth cooldown icon edge (round-6 C: 15 -> 20, padded)
+-- Round-15 item 1: the card's TOP-RIGHT corner now carries the freshness ("41m") text,
+-- so the right icon column shifts DOWN below it and compresses one step (20 -> 16, the
+-- same item-icon edge the detail pane uses) — three 16px icons + the ago band fit the
+-- 84px card exactly. See Cards.ColumnGeometry for the arithmetic (headless-tested).
+local CD_ICON    = 16       -- chrono/hearth/shard icon edge (round-15: 20 -> 16 to clear the ago text)
+local AGO_H      = 12       -- top-right freshness band height
+local AGO_GAP    = 4        -- gap under the ago band before the first icon
+local ICON_GAP   = 3        -- vertical gap between stacked column icons (never touching)
 
 local STALE_AGE = 30 * 60
 
@@ -66,7 +73,7 @@ local STALE_AGE = 30 * 60
 local SCOPE_DEFS = {
     { key = "all",       label = "All",       tip = "Every tracked character." },
     { key = "60s",       label = "60s",       tip = "Level 60 characters." },
-    { key = "summoners", label = "Summoners", tip = "Warlocks." },
+    { key = "summoners", label = "Summoners", tip = "Warlocks below level 60." },
 }
 local MOD_DEFS = {
     { key = "online", label = "Online",      tip = "Currently online." },
@@ -84,7 +91,7 @@ local MOD_CHIPS = { "online", "needs" }   -- (round-6: retained-but-unused; see 
 local FILTER_DEFS = {
     { key = "60s",       label = "60s",       tip = "Level 60 characters." },
     { key = "online",    label = "Online",    tip = "Currently online." },
-    { key = "summoners", label = "Summoners", tip = "Warlocks." },
+    { key = "summoners", label = "Summoners", tip = "Warlocks below level 60." },
 }
 
 ----------------------------------------------------------------------
@@ -171,7 +178,12 @@ end
 function Cards.InScope(entry, scope)
     local rec = entry and entry.rec
     if scope == "60s" then return ((rec and rec.level) or 0) >= 60 end
-    if scope == "summoners" then return rec and rec.classTag == "WARLOCK" or false end
+    -- Round-15 item 2 (A14.1): Summoners = warlocks NOT yet 60. A level-60 warlock is a
+    -- main-roster character and belongs to the 60s scope only, so it drops out of
+    -- Summoners (which exists to find the low-level alts you summon WITH).
+    if scope == "summoners" then
+        return (rec and rec.classTag == "WARLOCK" and ((rec.level or 0) < 60)) or false
+    end
     return true
 end
 
@@ -249,7 +261,7 @@ end
 --   nil         -> all characters
 --   "60s"       -> level 60+
 --   "online"    -> currently online
---   "summoners" -> warlocks
+--   "summoners" -> warlocks below level 60 (A14.1)
 function Cards.FilterMatch(entry, filter)
     if not filter then return true end
     if filter == "online" then return entry.online and true or false end
@@ -349,14 +361,48 @@ function Cards.AgoText(rec, nowE)
     return txt, (age > STALE_AGE)
 end
 
--- Freshness ink cools with staleness (visual wear-as-meaning).
-local function freshToken(rec, nowE)
+-- Freshness ink cools with staleness (visual wear-as-meaning). Round-15 item 1: this was
+-- authored but never wired (dead) — it now colors the card's top-right ago text, giving
+-- the cards the staleness signal they lacked. PUBLIC + headless-tested. Steps: <10m fresh
+-- ("muted"), 10m..STALE_AGE cooling ("faint"), beyond stale / no data ("idle").
+function Cards.FreshToken(rec, nowE)
     local upd = (rec and rec.lastDataUpdate) or 0
     if upd <= 0 then return "faint" end
     local age = nowE - upd
     if age < 10 * 60 then return "muted" end
     if age < STALE_AGE then return "faint" end
     return "idle"
+end
+
+-- Round-15 item 3: soul-shard count reads its supply at a glance (SN's 40/20 rule) —
+-- ok >= 40, warn >= 20, danger below. Pure; returns a THEME TOKEN name.
+function Cards.ShardToken(n)
+    n = tonumber(n) or 0
+    if n >= 40 then return "ok" end
+    if n >= 20 then return "warn" end
+    return "danger"
+end
+
+-- Round-15 item 1: PURE geometry for the card's right-edge column. The card is a fixed
+-- CARD_H tall with CARD_PAD_V top/bottom; the top-right ago band takes AGO_H (+AGO_GAP),
+-- and the remaining space holds a 3-slot icon ladder (CD_ICON tall, ICON_GAP apart).
+-- Returns y-offsets measured DOWN from the card's TOP (negative, ready for SetPoint) plus
+-- the column's bottom extent and whether it fits inside the bottom pad.
+--   warlock      -> slots 1/2/3 = shard / chrono / hearth
+--   non-warlock  -> slots 1/3   = chrono / hearth (wide gap, round-11 intent preserved)
+function Cards.ColumnGeometry(nSlots, iconSize)
+    nSlots = nSlots or 3
+    iconSize = iconSize or CD_ICON
+    local first = CARD_PAD_V + AGO_H + AGO_GAP        -- first icon's top inset
+    local slots = {}
+    for i = 1, nSlots do slots[i] = -(first + (i - 1) * (iconSize + ICON_GAP)) end
+    local bottom = first + nSlots * iconSize + (nSlots - 1) * ICON_GAP
+    return {
+        agoY   = -CARD_PAD_V,
+        slots  = slots,
+        bottom = bottom,
+        fits   = (bottom <= CARD_H - CARD_PAD_V),
+    }
 end
 
 -- Round-11 item 5: pure cd-icon state from remaining seconds.
@@ -514,13 +560,22 @@ local function makeCard(parent, pane)
         f:SetScript("OnLeave", function() GameTooltip:Hide() end)
         return f
     end
-    card.hearth = cdIcon(CD_ICON)              -- BOTTOM of the column
-    card.hearth:SetPoint("BOTTOMRIGHT", card, "BOTTOMRIGHT", -CARD_PAD_H, CARD_PAD_V)
-    card.chrono = cdIcon(CD_ICON)              -- CENTRE (warlock) / TOP (non-warlock); set in Populate
-    -- Soul shard (warlocks) at the TOP of the same distributed column; count to its LEFT.
+    -- Round-15 item 1: FRESHNESS text in the TOP-RIGHT corner ("41m"), colored by
+    -- Cards.FreshToken so the ink cools as the data ages. The icon ladder below is
+    -- positioned from the shared pure geometry so the corner text always sits clear.
+    local geo = Cards.ColumnGeometry(3)
+    card.ago = fstr(card, "microLabel", "RIGHT")
+    card.ago:SetPoint("TOPRIGHT", card, "TOPRIGHT", -CARD_PAD_H, geo.agoY)
+    card.ago:SetWordWrap(false)
+
+    card.hearth = cdIcon(CD_ICON)              -- slot 3 (BOTTOM) for every class
+    card.hearth:SetPoint("TOPRIGHT", card, "TOPRIGHT", -CARD_PAD_H, geo.slots[3])
+    card.chrono = cdIcon(CD_ICON)              -- slot 2 (warlock) / slot 1 (non-warlock); set in Populate
+    card._slotY = geo.slots
+    -- Soul shard (warlocks) in slot 1, under the ago text; count to its LEFT.
     card.shard = card:CreateTexture(nil, "ARTWORK")
     card.shard:SetSize(CD_ICON, CD_ICON); card.shard:SetTexCoord(0.08, 0.92, 0.08, 0.92)
-    card.shard:SetPoint("TOPRIGHT", card, "TOPRIGHT", -CARD_PAD_H, -CARD_PAD_V)
+    card.shard:SetPoint("TOPRIGHT", card, "TOPRIGHT", -CARD_PAD_H, geo.slots[1])
     card.shardCount = fstr(card, "numeral", "RIGHT")
     card.shardCount:SetPoint("RIGHT", card.shard, "LEFT", -4, 0)
     card.shard:Hide(); card.shardCount:Hide()
@@ -618,6 +673,10 @@ local function makeCard(parent, pane)
         else
             self.loc:SetText("Unknown"); self.loc:SetTextColor(UI.Color("danger"))
         end
+        -- Round-15 item 1: top-right FRESHNESS ("41m"), ink cooling with age (the card's
+        -- staleness signal). Em-dash when the record has never reported.
+        self.ago:SetText((Cards.AgoText(rec, nowE)))
+        self.ago:SetTextColor(UI.Color(Cards.FreshToken(rec, nowE)))
         -- PvP-flagged crest inline in the name/acct cluster.
         if rec.pvpFlagged and rec.faction then
             self.pvp:Show()
@@ -632,14 +691,12 @@ local function makeCard(parent, pane)
         -- overrides to an accent border (active/held, not merely ready).
         self.chrono.icon:SetTexture(Dashboard.ItemIcon(184937))   -- Chronoboon Displacer
         self.hearth.icon:SetTexture(Dashboard.ItemIcon(6948))     -- Hearthstone
-        -- Distribute the icon column by class (round-11 item 4): warlock -> chrono in the
-        -- vertical CENTRE (shard top, hearth bottom); non-warlock -> chrono at the TOP.
+        -- Distribute the icon column by class (round-11 item 4; round-15: the ladder now
+        -- starts BELOW the top-right ago text). Warlock -> chrono in slot 2 (shard slot 1,
+        -- hearth slot 3); non-warlock -> chrono in slot 1, hearth slot 3 (wide gap).
         self.chrono:ClearAllPoints()
-        if rec.classTag == "WARLOCK" then
-            self.chrono:SetPoint("RIGHT", self, "RIGHT", -CARD_PAD_H, 0)
-        else
-            self.chrono:SetPoint("TOPRIGHT", self, "TOPRIGHT", -CARD_PAD_H, -CARD_PAD_V)
-        end
+        local slotY = self._slotY[(rec.classTag == "WARLOCK") and 2 or 1]
+        self.chrono:SetPoint("TOPRIGHT", self, "TOPRIGHT", -CARD_PAD_H, slotY)
         self.chrono:SetBackdrop(UI.FLAT_BACKDROP); self.chrono:SetBackdropColor(UI.Color("inset"))
         local chronoRem = Dashboard.DecayRemaining(rec.itemCooldown, rec.lastDataUpdate, nowE)
         local cSt = Cards.CdIconState(chronoRem)
@@ -697,8 +754,10 @@ local function makeCard(parent, pane)
         -- Warlock soul-shard corner (round-6 D): shard icon + count, warlocks only.
         if rec.classTag == "WARLOCK" then
             self.shard:SetTexture(Dashboard.ItemIcon(6265, "Interface\\Icons\\INV_Misc_Gem_Amethyst_02"))
+            -- Round-15 item 3 (A14.2): the count reads its supply — ok >= 40, warn >= 20,
+            -- danger below (SN's 40/20 rule) instead of a flat muted number.
             self.shardCount:SetText(tostring(rec.shardCount or 0))
-            self.shardCount:SetTextColor(UI.Color("muted"))
+            self.shardCount:SetTextColor(UI.Color(Cards.ShardToken(rec.shardCount)))
             self.shard:Show(); self.shardCount:Show()
         else
             self.shard:Hide(); self.shardCount:Hide()
@@ -1034,10 +1093,12 @@ local function testCardsLogic(fails)
     ck(Cards.IsLocked({ raidLockouts = { MC = NOW + 100 } }, NOW) == true, "future lockout -> locked")
     ck(Cards.IsLocked({ raidLockouts = { MC = NOW - 100 } }, NOW) == false, "expired lockout -> unlocked")
 
-    -- Scope filter incl. the Summoners = warlock rule.
+    -- Scope filter incl. the round-15 Summoners rule = WARLOCK **and level < 60** (A14.1).
     local wlock = mkEntry("Lock-R", "1", { class = "WARLOCK", level = 60 })
+    local wlock50 = mkEntry("Lok50-R", "1", { class = "WARLOCK", level = 50 })
     local war50 = mkEntry("War-R", "1", { class = "WARRIOR", level = 50 })
-    ck(Cards.InScope(wlock, "summoners") == true, "warlock in summoners scope")
+    ck(Cards.InScope(wlock50, "summoners") == true, "sub-60 warlock in summoners scope")
+    ck(Cards.InScope(wlock, "summoners") == false, "level-60 warlock EXCLUDED from summoners (A14.1)")
     ck(Cards.InScope(war50, "summoners") == false, "warrior not in summoners scope")
     ck(Cards.InScope(war50, "60s") == false, "level 50 not in 60s scope")
     ck(Cards.InScope(wlock, "60s") == true, "level 60 in 60s scope")
@@ -1052,7 +1113,9 @@ local function testCardsLogic(fails)
     local list, counts = Cards.ComputeView(entries, "all", {}, NOW)
     ck(#list == 4, "all scope, no mods -> 4 rows (got " .. #list .. ")")
     ck(counts.scope.all == 4, "all count 4")
-    ck(counts.scope.summoners == 2, "summoners (warlock) count 2")
+    -- A14.1: Aaa is a level-60 warlock (mkEntry defaults level 60) so it NO LONGER counts
+    -- as a summoner; only the level-50 warlock Ccc does.
+    ck(counts.scope.summoners == 1, "summoners (sub-60 warlocks) count 1 — Ccc only")
     ck(counts.scope["60s"] == 3, "60s count 3 (one level-50)")
     ck(counts.mod.online == 2, "online count 2")
     ck(counts.mod.stale == 2, "stale count 2 (Bbb + Ddd)")
@@ -1061,7 +1124,7 @@ local function testCardsLogic(fails)
     local l2 = Cards.ComputeView(entries, "all", { online = true, locked = true }, NOW)
     ck(#l2 == 1 and l2[1].nameRealm == "Aaa-R", "online+locked -> only Aaa")
     local _, c3 = Cards.ComputeView(entries, "summoners", {}, NOW)
-    ck(c3.mod.online == 1, "within summoners scope, online count 1 (Aaa)")
+    ck(c3.mod.online == 0, "within summoners scope, online count 0 (Ccc is offline; 60 Aaa excluded)")
 
     -- Sort determinism (round-9): ONLINE first (self, then acct asc, then name asc);
     -- then OFFLINE by last-updated DESC (newest first), name asc as the tiebreak.
@@ -1132,12 +1195,13 @@ local function testFilter(fails)
     ck(Cards.FilterMatch(entries[2], "online") == false, "online: offline char excluded")
     ck(Cards.FilterMatch(entries[3], "60s") == false, "60s: level 50 excluded")
     ck(Cards.FilterMatch(entries[1], "60s") == true, "60s: level 60 matches")
-    ck(Cards.FilterMatch(entries[1], "summoners") == true, "summoners: warlock matches")
+    ck(Cards.FilterMatch(entries[3], "summoners") == true, "summoners: sub-60 warlock matches")
+    ck(Cards.FilterMatch(entries[1], "summoners") == false, "summoners: level-60 warlock excluded (A14.1)")
     ck(Cards.FilterMatch(entries[2], "summoners") == false, "summoners: mage excluded")
     -- FilterView: none active -> ALL; each key filters exclusively; result is sorted.
     ck(#Cards.FilterView(entries, nil) == 3, "no filter -> all 3 (deselect-to-all)")
     ck(#Cards.FilterView(entries, "online") == 1, "online -> 1")
-    ck(#Cards.FilterView(entries, "summoners") == 2, "summoners -> 2 warlocks")
+    ck(#Cards.FilterView(entries, "summoners") == 1, "summoners -> 1 (only the sub-60 warlock)")
     ck(#Cards.FilterView(entries, "60s") == 2, "60s -> 2 level-60s")
     local sorted = Cards.FilterView(entries, nil)
     ck(sorted[1].nameRealm == "Aaa-R", "FilterView returns SortEntries order (online acct1 first)")
@@ -1300,6 +1364,45 @@ local function testPeek(fails)
     ck(L2.online == false, "peek: offline flag")
 end
 
+-- Round-15: card freshness ink, shard-supply ink, and the right-column geometry math.
+local function testCardCorner(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local NOW = 1000000
+
+    -- FreshToken cooling steps (this function existed but was DEAD before round-15).
+    ck(Cards.FreshToken({ lastDataUpdate = NOW - 60 }, NOW) == "muted", "1m -> muted (fresh)")
+    ck(Cards.FreshToken({ lastDataUpdate = NOW - 9 * 60 }, NOW) == "muted", "9m -> still fresh")
+    ck(Cards.FreshToken({ lastDataUpdate = NOW - 11 * 60 }, NOW) == "faint", "11m -> cooling (faint)")
+    ck(Cards.FreshToken({ lastDataUpdate = NOW - 29 * 60 }, NOW) == "faint", "29m -> still cooling")
+    ck(Cards.FreshToken({ lastDataUpdate = NOW - 31 * 60 }, NOW) == "idle", "31m -> stale (idle)")
+    ck(Cards.FreshToken({ lastDataUpdate = 0 }, NOW) == "faint", "no data -> faint")
+    -- The corner text itself comes from AgoText (already covered) — spot-check the pair.
+    ck(Cards.AgoText({ lastDataUpdate = NOW - 41 * 60 }, NOW) == "41m", "corner text '41m'")
+
+    -- ShardToken thresholds (SN 40/20).
+    ck(Cards.ShardToken(40) == "ok", "40 shards -> ok")
+    ck(Cards.ShardToken(60) == "ok", "60 shards -> ok")
+    ck(Cards.ShardToken(39) == "warn", "39 shards -> warn")
+    ck(Cards.ShardToken(20) == "warn", "20 shards -> warn")
+    ck(Cards.ShardToken(19) == "danger", "19 shards -> danger")
+    ck(Cards.ShardToken(0) == "danger", "0 shards -> danger")
+    ck(Cards.ShardToken(nil) == "danger", "nil shards -> danger")
+
+    -- Column geometry: the ago band + a 3-icon ladder must FIT the 84px card, and the
+    -- slots must be ordered top->bottom with a real gap (never touching).
+    local g = Cards.ColumnGeometry(3)
+    ck(g.fits == true, "3-icon ladder + ago band fits the card")
+    ck(g.agoY == -7, "ago sits at the top pad (-7)")
+    ck(g.slots[1] == -23, "slot 1 clears the ago band (-23)")
+    ck(g.slots[2] == -42 and g.slots[3] == -61, "slots 2/3 step by icon+gap")
+    ck(g.bottom == 77, "ladder ends exactly on the bottom pad (84-7)")
+    for i = 2, 3 do
+        ck((g.slots[i - 1] - g.slots[i]) >= 16 + 1, "slot " .. i .. " does not touch the one above")
+    end
+    -- Proves the compression was REQUIRED: the old 20px icons would overflow the card.
+    ck(Cards.ColumnGeometry(3, 20).fits == false, "old 20px ladder would NOT fit with the ago band")
+end
+
 if ns.RegisterSelfTest then
     ns:RegisterSelfTest("cards", function(verbose)
         local cases = {
@@ -1311,6 +1414,7 @@ if ns.RegisterSelfTest then
             { name = "cd icon state",     fn = testCdIconState },
             { name = "on-accent label",   fn = testOnAccentTextColor },
             { name = "hover peek",        fn = testPeek },
+            { name = "card corner",       fn = testCardCorner },
         }
         local allPass = true
         for _, c in ipairs(cases) do
