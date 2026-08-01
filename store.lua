@@ -1222,6 +1222,88 @@ function Store.EnsureSelfCharacter(nameRealm)
     return rec
 end
 
+----------------------------------------------------------------------
+-- NON-WIRE FIELD CARRY-FORWARD (the inbound write is a REPLACE, not a merge)
+--
+-- Store.WriteInboundCharacter swaps the whole record table in. That is correct
+-- for everything the wire carries — the owner is authoritative and MUST be able
+-- to clear a field by sending it empty — but it silently destroyed the fields
+-- the BINARY schema does not carry. A record adopted over the SEGMENT path
+-- (whole Lua tables, so it carries everything) had those fields wiped by the
+-- very next STATE push seconds later.
+--
+-- The list is EXPLICIT, never a blanket merge: a blanket merge would resurrect
+-- exactly the values the wire is trying to clear. Adding a field to the binary
+-- schema means DELETING it from this list.
+--
+-- ENUMERATED, and why each one is here:
+--
+--   attunements                        Tracker's per-character raid attunement
+--                                      matrix. Not in the binary schema at all;
+--                                      rides the SEGMENT path and the "attune"
+--                                      namespace. Monotonic (attunement is never
+--                                      lost), so carrying it forward can only
+--                                      ever preserve truth.
+--   dmfCooldown.remainingOnlineSecs    A8.1 online-time cooldown accounting.
+--   dmfCooldown.lastTickEpoch          Protocol.DecodeCharacter rebuilds
+--                                      rec.dmfCooldown as `{ offlineSince = u32 }`,
+--                                      so a STATE push drops both of these and the
+--                                      detail pane fell from a real countdown back
+--                                      to a bare "on CD". Carried ONLY while the
+--                                      incoming record still says the cooldown is
+--                                      active — a wire-borne `dmfCooldownActive =
+--                                      false` is the owner clearing it, and that
+--                                      clear must win.
+--
+-- DELIBERATELY NOT CARRIED (checked, and each is here for a reason):
+--
+--   notes            NOT a record field. Store.SetNote persists to
+--                    Store.data.notes[nameRealm] (store.lua ~2533), a sibling
+--                    table the character graph never touches — so notes were
+--                    never at risk from the wholesale replace.
+--   chronoboonCDStart / hearthstoneCDStart / itemCooldown / hearthstoneCD
+--                    Wire-derived by design. Store.AdoptWireCooldowns runs on the
+--                    INCOMING record just above and re-anchors these onto our own
+--                    clock (A9.1). Carrying the old ones forward would defeat the
+--                    entire epoch-conversion boundary and freeze a cooldown that
+--                    the owner has since used or cleared.
+--   _srcAID          Bookkeeping this function stamps itself on the line below.
+--   _instanceType    Written by Tracker's capture (tracker.lua ~878) and read by
+--                    NOTHING in the addon — dead. Carrying it would preserve a
+--                    field with no reader; flagged for deletion instead.
+--
+-- PURE given its two arguments. Mutates `incoming` only; `existing` is read-only.
+----------------------------------------------------------------------
+Store.NON_WIRE_CARRY = { "attunements" }
+Store.NON_WIRE_CARRY_DMF = { "remainingOnlineSecs", "lastTickEpoch" }
+
+function Store.CarryNonWireFields(existing, incoming)
+    if type(existing) ~= "table" or type(incoming) ~= "table" then return incoming end
+
+    -- Top-level fields the binary schema does not carry at all.
+    for i = 1, #Store.NON_WIRE_CARRY do
+        local k = Store.NON_WIRE_CARRY[i]
+        if incoming[k] == nil and existing[k] ~= nil then
+            incoming[k] = existing[k]
+        end
+    end
+
+    -- The DMF cooldown sub-table: only the two additive keys, and only while the
+    -- incoming record still claims the cooldown is running.
+    if incoming.dmfCooldownActive then
+        local old = existing.dmfCooldown
+        if type(old) == "table" then
+            local new = incoming.dmfCooldown
+            if type(new) ~= "table" then new = {}; incoming.dmfCooldown = new end
+            for i = 1, #Store.NON_WIRE_CARRY_DMF do
+                local k = Store.NON_WIRE_CARRY_DMF[i]
+                if new[k] == nil and old[k] ~= nil then new[k] = old[k] end
+            end
+        end
+    end
+    return incoming
+end
+
 -- Inbound (relayed) write helper. Enforces self-immunity and the
 -- owner/epoch tiebreaker. `senderAID` (optional) is the account ID of the
 -- mesh peer that relayed this record; when two inbound writes carry an EQUAL
@@ -1281,6 +1363,10 @@ function Store.WriteInboundCharacter(aid, nameRealm, record, senderAID)
         end
     end
     record._srcAID = senderAID
+    -- The swap below REPLACES the record. Carry the explicitly-enumerated fields
+    -- the wire does not represent (see Store.CarryNonWireFields) so a STATE push
+    -- cannot destroy data that only the SEGMENT path or the local tick maintains.
+    Store.CarryNonWireFields(existing, record)
     bucket.characters[nameRealm] = record
     -- B5: this write may have just created the LIVE half of a stale twin pair —
     -- the owner re-set-up an account under a new/differently-formatted AID, so
@@ -3033,6 +3119,89 @@ local function testInboundNameGuard(fails)
     Store._droppedNamelessInbound = savedCount
 end
 
+-- Non-wire fields must SURVIVE an inbound replace, while everything the wire
+-- carries must still be authoritatively overwritten (including being cleared).
+-- Drives the real Store.WriteInboundCharacter, not the helper in isolation, so
+-- the carry is proven to happen on the actual write path.
+local function testNonWireCarryForward(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local AID = "43"
+    local savedAcct = Store.data and Store.data.accounts and Store.data.accounts[AID]
+
+    -- Seed the "already adopted over the SEGMENT path" copy: it carries the
+    -- non-wire fields a whole-table record brings with it.
+    local seeded = Store.NewCharacterRecord("Peer-Realm")
+    seeded.ownerEpoch = 100
+    seeded.level      = 60
+    seeded.location   = "Orgrimmar"
+    seeded.attunements = { MC = true, Ony = false }
+    seeded.dmfCooldownActive = true
+    seeded.dmfCooldown = { offlineSince = 0, remainingOnlineSecs = 9000, lastTickEpoch = 555 }
+    ck(Store.WriteInboundCharacter(AID, "Peer-Realm", seeded, AID) == true,
+        "seed write applied")
+
+    -- Now a STATE push: a freshly decoded binary record. It has NO attunements
+    -- and a dmfCooldown rebuilt as { offlineSince } only — exactly what
+    -- Protocol.DecodeCharacter produces.
+    local push = Store.NewCharacterRecord("Peer-Realm")
+    push.ownerEpoch = 200
+    push.level      = 60
+    push.location   = "Blackrock Depths"
+    push.attunements = nil
+    push.dmfCooldownActive = true
+    push.dmfCooldown = { offlineSince = 0 }
+    ck(Store.WriteInboundCharacter(AID, "Peer-Realm", push, AID) == true,
+        "state push applied")
+
+    local held = Store.GetCharacter("Peer-Realm", AID)
+    ck(held ~= nil, "record still present after the push")
+    -- Non-wire fields survived.
+    ck(held and type(held.attunements) == "table" and held.attunements.MC == true,
+        "attunements survived the inbound replace")
+    ck(held and held.attunements and held.attunements.Ony == false,
+        "a FALSE attunement flag survives too (not just truthy ones)")
+    ck(held and held.dmfCooldown and held.dmfCooldown.remainingOnlineSecs == 9000,
+        "dmfCooldown.remainingOnlineSecs survived")
+    ck(held and held.dmfCooldown and held.dmfCooldown.lastTickEpoch == 555,
+        "dmfCooldown.lastTickEpoch survived")
+    -- Wire fields were still authoritatively replaced.
+    ck(held and held.location == "Blackrock Depths",
+        "wire field still wins (location replaced)")
+    ck(held and held.ownerEpoch == 200, "wire epoch still wins")
+
+    -- The wire must be able to CLEAR: an incoming record that carries its own
+    -- attunement matrix replaces ours rather than being merged into it, and a
+    -- wire-borne dmfCooldownActive=false drops the stale online-time accounting.
+    local push2 = Store.NewCharacterRecord("Peer-Realm")
+    push2.ownerEpoch  = 300
+    push2.attunements = { MC = false }
+    push2.dmfCooldownActive = false
+    push2.dmfCooldown = { offlineSince = 0 }
+    ck(Store.WriteInboundCharacter(AID, "Peer-Realm", push2, AID) == true,
+        "clearing push applied")
+    held = Store.GetCharacter("Peer-Realm", AID)
+    ck(held and held.attunements and held.attunements.MC == false,
+        "an incoming matrix REPLACES ours (no blanket merge)")
+    ck(held and held.attunements and held.attunements.Ony == nil,
+        "the old matrix is not merged underneath the incoming one")
+    ck(held and held.dmfCooldown and held.dmfCooldown.remainingOnlineSecs == nil,
+        "a wire-borne cooldown CLEAR is not undone by the carry-forward")
+
+    -- Notes are not record fields at all — prove the write path leaves them be.
+    Store.SetNote("Peer-Realm", "carry me")
+    local push3 = Store.NewCharacterRecord("Peer-Realm")
+    push3.ownerEpoch = 400
+    Store.WriteInboundCharacter(AID, "Peer-Realm", push3, AID)
+    ck(Store.GetNote("Peer-Realm") == "carry me",
+        "notes live outside the record and are untouched by an inbound write")
+    Store.SetNote("Peer-Realm", "")
+
+    -- The helper itself is a no-op on junk arguments.
+    ck(Store.CarryNonWireFields(nil, nil) == nil, "helper tolerates nil arguments")
+
+    if Store.data and Store.data.accounts then Store.data.accounts[AID] = savedAcct end
+end
+
 -- Rested% derivation matrix: 0, partial, exactly-capped, over-cap, level-60,
 -- and missing/malformed fields. Pure — asserts Store.RestedPercent semantics.
 local function testRestedPercent(fails)
@@ -3572,6 +3741,7 @@ function Store.RunSelfTests(verbose)
         { name = "songflower migration", fn = testSongflowerMigration },
         { name = "notes",           fn = testNotes },
         { name = "inbound name guard", fn = testInboundNameGuard },
+        { name = "non-wire carry-forward", fn = testNonWireCarryForward },
         { name = "rested percent",  fn = testRestedPercent },
         { name = "dmf cooldown",    fn = testDMFCooldown },
         { name = "item cd epochs (A9.1)",   fn = testItemCdEpochs },

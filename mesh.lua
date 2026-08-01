@@ -216,9 +216,36 @@ Mesh.Fnv1a = fnv1a
 ----------------------------------------------------------------------
 
 -- Hash an ordered segment list ("X" tombstone slots included) to a short id.
-function Mesh.HashSegment(list)
+--
+-- `records` (optional, spec §9.6) is the account's nameRealm -> record map. When
+-- supplied, each name is folded together with a COARSE CONTENT FINGERPRINT of
+-- its record (Mesh.SegmentRecordFingerprint) instead of being hashed by name
+-- alone.
+--
+-- WHY: hashing names only meant the heartbeat's segment hashes answered exactly
+-- one question — "do we hold the same SET of characters?" — and nothing else.
+-- Two accounts agreed on the hash while one of them held a copy of a character
+-- that was hours out of date, so a STATE push that got dropped (a full token
+-- bucket, a whisper lost to a zone change, a peer that was offline for the one
+-- push that mattered) was never noticed and never healed. Folding the content in
+-- makes a stale copy DIVERGE, which trips the segment resync that already
+-- exists, is already rate-limited (Mesh.SEGMENT_COOLDOWN / MANIFEST_COOLDOWN,
+-- per account+area+target) and already carries whole records.
+--
+-- Omitting `records` keeps the historic names-only behaviour, which is what the
+-- pure list-ordering tests exercise.
+function Mesh.HashSegment(list, records)
     if not list or #list == 0 then return "0" end
-    return fnv1a(joinList(list, "\30"))
+    if type(records) ~= "table" then
+        return fnv1a(joinList(list, "\30"))
+    end
+    local parts = {}
+    for i = 1, #list do
+        local nameRealm = list[i]
+        parts[i] = tostring(nameRealm) .. "\28"
+            .. Mesh.SegmentRecordFingerprint(records[nameRealm])
+    end
+    return fnv1a(joinList(parts, "\30"))
 end
 
 -- Hash a set (unordered map of key->truthy) deterministically by sorting keys.
@@ -347,6 +374,93 @@ function Mesh.StateHash(rec)
     return fnv1a(Mesh.StateHashInput(rec))
 end
 
+----------------------------------------------------------------------
+-- SEGMENT CONTENT FINGERPRINT (spec §9.6) — the input to Mesh.HashSegment.
+--
+-- THE GOVERNING INVARIANT, and it is not optional:
+--
+--     every field in here must be (a) transmitted VERBATIM by the binary STATE
+--     schema, and (b) already part of Mesh.StateHashInput.
+--
+-- (a) makes the owner's copy and our copy byte-identical, so equal data hashes
+-- equal. (b) means any change that moves this fingerprint ALSO moves the push
+-- filter's hash, so the owner pushes and the two sides re-converge. Break either
+-- half and the hashes diverge on data that is actually in sync — which is a
+-- permanent resync loop, not a one-off.
+--
+-- Coarsening (same divisors as the push filter, deliberately): aura durations
+-- DIV 60, raid lockout expiries DIV 300. A buff ticking down inside its own
+-- minute cannot churn the heartbeat.
+--
+-- EXCLUDED, each for a specific reason:
+--
+--   itemCooldown / hearthstoneCD   The ONE family of fields the RECEIVER
+--     (the legacy remaining-seconds  rewrites. Store.AdoptWireCooldowns re-anchors
+--      mirrors)                     them onto our clock at receive time, while
+--                                   the owner refreshes its own on every capture.
+--                                   Ours is frozen at last receipt, theirs keeps
+--                                   moving, so they fall into different DIV-300
+--                                   buckets purely with the passage of time —
+--                                   guaranteed false divergence, worst on exactly
+--                                   the parked characters this is meant to help.
+--                                   The cooldown's meaningful transitions are
+--                                   still covered, by the PRESENCE bits below.
+--   chronoboonCDStart /             Derived, not transmitted: our epoch is the
+--   hearthstoneCDStart              owner's plus transit, so a DIV-300 bucket
+--                                   boundary can fall between them. Reduced to a
+--                                   0/non-0 presence bit, which both sides always
+--                                   agree on and which is what actually changes
+--                                   when a cooldown starts or ends.
+--   xp / xpMax / restedXP           On the wire, but deliberately NOT in
+--                                   StateHashInput (they tick constantly while
+--                                   questing and would defeat the push filter).
+--                                   Including them here would diverge without any
+--                                   push to re-converge. Fails invariant (b).
+--   lastSeen / lastDataUpdate /     Pure clock. Volatile by definition.
+--   ownerEpoch
+--   attunements / dmfCooldown       Not in the binary schema. Fails invariant (a):
+--   sub-fields                      a peer holding only STATE-pushed data would
+--                                   never match one that got a segment.
+----------------------------------------------------------------------
+function Mesh.SegmentRecordFingerprint(rec)
+    if type(rec) ~= "table" then return "-" end
+    local parts = {
+        hashBool(rec.chronoboonActive),
+        hashBool(rec.dmfInBoon),
+        hashBool(rec.dmfCooldownActive),
+        hashBool(rec.pvpFlagged),
+        hashBool(rec.isResting),
+        hashBool(rec.inInstance),
+        hashBool(rec.soulstoneReady),
+        tostring(rec.classTag or ""),
+        tostring(rec.faction or ""),
+        tostring(rec.location or ""),
+        tostring(rec.level or 0),
+        tostring(rec.shardCount or 0),
+        tostring(rec.boonCount or 0),
+        -- Cooldown PRESENCE only (see the exclusion note above).
+        hashBool((tonumber(rec.chronoboonCDStart) or 0) > 0),
+        hashBool((tonumber(rec.hearthstoneCDStart) or 0) > 0),
+    }
+    local keys = (Store and Store.RAID_KEYS) or {}
+    for i = 1, #keys do
+        local expiry = rec.raidLockouts and rec.raidLockouts[keys[i]]
+        parts[#parts + 1] = hashCoarse(expiry, Mesh.CD_COARSE)
+    end
+    local auras = rec.auraStates or {}
+    for i = 1, 10 do
+        local a = auras[i]
+        if a then
+            parts[#parts + 1] = i .. ":" .. tostring(a.source or 0)
+                .. ":" .. tostring(a.option or 0)
+                .. ":" .. hashCoarse(a.duration, Mesh.AURA_COARSE)
+        else
+            parts[#parts + 1] = i .. ":-"
+        end
+    end
+    return joinList(parts, "\31")
+end
+
 -- A10.9 — PURE: direct-send budget from the LIVE state-prefix token count.
 -- Spec §9.4: "whispers directly to as many targets as it has tokens for". We
 -- keep DIRECT_BUDGET (4) as the FLOOR so a momentarily-drained bucket can never
@@ -359,12 +473,20 @@ function Mesh.DirectBudget(tokens)
 end
 
 -- Compute the hash bundle we advertise for an account bucket.
+-- Both sides compute this over the SAME account's data — the owner over its own
+-- bucket in SendHeartbeat, the receiver over its local copy in handleHeartbeat —
+-- so folding record content into the segment hashes (spec §9.6) makes a stale
+-- local copy trip Mesh.DiffHashes and pull a fresh segment.
+--
+-- `homeless` stays a name-set hash: it is keyed by an unordered map rather than
+-- an ordered segment list, and spec §9.6 scopes the fingerprint to segments.
 function Mesh.AccountHashes(bucket)
-    local seg = bucket and bucket.segments or {}
+    local seg  = bucket and bucket.segments or {}
+    local recs = bucket and bucket.characters or nil
     return {
-        sixties   = Mesh.HashSegment(seg.sixties),
-        summoners = Mesh.HashSegment(seg.summoners),
-        norole    = Mesh.HashSegment(seg.norole),
+        sixties   = Mesh.HashSegment(seg.sixties, recs),
+        summoners = Mesh.HashSegment(seg.summoners, recs),
+        norole    = Mesh.HashSegment(seg.norole, recs),
         homeless  = Mesh.HashSet(bucket and bucket.homeless),
     }
 end
@@ -567,6 +689,76 @@ function Mesh.IsSelfSender(sender)
     return sender == bare
 end
 
+----------------------------------------------------------------------
+-- CANONICAL PEER NAMES
+--
+-- `Mesh.peers[aid].name` is not just a debug label: Dashboard.MeshPresence
+-- (ui_shell.lua) publishes it as { [accountID] = nameRealm } and the roster
+-- exclusivity pass matches it against the Name-Realm KEYS of the character
+-- records. So a peer whose stored name is the bare "Erro" can never match the
+-- record "Erro-Whitemane" — that account wins nothing, every one of its
+-- characters renders OFFLINE, and its buff durations freeze on screen.
+--
+-- The NotePeer call sites used to feed the RAW CHAT_MSG_ADDON sender straight
+-- in. That field is bare for some paths (the IsSelfSender comment above
+-- documents exactly that) while the discovery and heartbeat payloads were
+-- already carrying the sender's own canonical Name-Realm — and we threw it away.
+--
+-- So: prefer the payload's self-declared name, fall back to normalizing the
+-- transport sender. The payload is only trusted when its SHORT name agrees with
+-- the sender, which is the one thing the transport can vouch for — a peer cannot
+-- use its own heartbeat to claim to be somebody else.
+----------------------------------------------------------------------
+
+-- Our own realm, whitespace-stripped, exactly as selfNameRealm builds it.
+local function selfRealm()
+    local realm = (GetRealmName and GetRealmName()) or ""
+    return (realm:gsub("%s+", ""))
+end
+Mesh.SelfRealm = selfRealm
+
+-- PURE-ish: a bare "Name" becomes "Name-<our realm>". Anything already carrying
+-- a realm (or arriving when we cannot resolve our own realm) is returned as-is.
+-- Character names cannot contain a hyphen in WoW, so the first "-" is always the
+-- name/realm separator.
+function Mesh.NormalizeSender(sender)
+    if type(sender) ~= "string" or sender == "" then return nil end
+    if sender:find("-", 1, true) then return sender end
+    local realm = selfRealm()
+    if realm == "" then return sender end
+    return sender .. "-" .. realm
+end
+
+-- PURE-ish: the name to store for a peer, given the transport sender and the
+-- canonical name its payload advertised (discovery `d.name`, heartbeat
+-- `hb.online[1]`). `payloadName` may be nil — manifests carry no name field.
+function Mesh.CanonicalPeerName(sender, payloadName)
+    local norm = Mesh.NormalizeSender(sender)
+    if type(payloadName) == "string" and payloadName ~= ""
+       and payloadName:find("-", 1, true) then
+        if norm == nil then return payloadName end       -- no sender to check against
+        local claimed = payloadName:match("^([^%-]+)")
+        local actual  = norm:match("^([^%-]+)")
+        if claimed and actual and claimed == actual then
+            return payloadName                            -- agrees with the sender
+        end
+    end
+    return norm
+end
+
+-- Does this peer entry refer to `name`? Compared CANONICALLY, so a bare sender
+-- and its Name-Realm form are recognised as the same peer. Required now that
+-- p.name is canonical: CHAT_MSG_CHANNEL_LEAVE hands us a bare player name, and
+-- a raw `p.name == name` test would silently stop latching peers offline.
+function Mesh.PeerNameMatches(p, name)
+    if type(p) ~= "table" then return false end
+    local pn = p.name
+    if type(pn) ~= "string" or pn == "" then return false end
+    if type(name) ~= "string" or name == "" then return false end
+    if pn == name then return true end
+    return Mesh.NormalizeSender(pn) == Mesh.NormalizeSender(name)
+end
+
 function Mesh.MeshSettings()
     local db = Store and Store.GetSettings and Store.GetSettings()
     return db and db.mesh or nil
@@ -713,7 +905,7 @@ function Mesh.TouchPeerByName(name, t)
     if not name or name == "" then return nil end
     t = t or (Store and Store.Now and Store.Now()) or 0
     for _, p in pairs(Mesh.peers) do
-        if type(p) == "table" and p.name == name then
+        if Mesh.PeerNameMatches(p, name) then
             p.lastSeen = t
             if Mesh.StaleLatchHolds(p, t) then
                 -- In-flight residue from a peer that just announced it is going
@@ -1075,7 +1267,7 @@ function Mesh.Enqueue(prefix, frame, meta)
     -- (rawSend guards the wire; this guards the scheduler.)
     if Mesh.IsForbiddenTxPrefix(prefix) then
         Mesh._forbiddenTxBlocked = (Mesh._forbiddenTxBlocked or 0) + 1
-        return
+        return false
     end
     meta = meta or {}
     local seq = meta.seq or Mesh._outSeq
@@ -1093,6 +1285,9 @@ function Mesh.Enqueue(prefix, frame, meta)
             big      = big,
         })
     end
+    -- Additive: true = the frame is queued for the drain ticker. Callers that
+    -- need a delivery count (Mesh.PushState) treat this as "confirmed enqueue".
+    return true
 end
 
 -- Drain one message per prefix per tick, honouring buckets, target skips and
@@ -1232,9 +1427,15 @@ end
 -- record) is ignored so it can never be pushed to peers or crash the encoder.
 -- `force` (spec §9.4) bypasses the change filter: teardown/logout, the 1s
 -- post-entering-world push, and the max-quiet refresh all set it.
-function Mesh.OnStateChanged(nameRealm, record, force)
+-- `receipt` (optional) is a caller-owned table the transport stamps with
+-- `sent = <targets whispered>`. ns:Fire discards listener return values and
+-- ns:SafeCall returns pcall's own (ok, err), so a mutable receipt is the only
+-- way a delivery count can travel from here back to Tracker.Capture — see the
+-- hash-after-send note on Tracker.Capture. A receipt left UNSTAMPED means "no
+-- transport was listening at all", which the tracker treats as "don't judge".
+function Mesh.OnStateChanged(nameRealm, record, force, receipt)
     if not Mesh.IsSelfRecord(nameRealm, record) then return end
-    ns:SafeCall(Mesh.PushState, nameRealm, record, force)
+    ns:SafeCall(Mesh.PushState, nameRealm, record, force, receipt)
 end
 
 -- PURE: stable key for a set of target account IDs. A newly-discovered peer
@@ -1269,10 +1470,34 @@ function Mesh.WireRecord(rec, t)
     return out
 end
 
-function Mesh.PushState(nameRealm, record, force)
-    if not Mesh.IsEnabled() then return end
+-- RETURNS the number of targets this call actually whispered the state to.
+--
+-- That number is the whole point: Tracker.Capture used to stamp its
+-- "last pushed" hash BEFORE firing STATE_CHANGED, so a change captured while we
+-- knew zero peers was recorded as delivered and the change filter then
+-- suppressed it forever. The state only escaped when something ELSE changed —
+-- which is why a peer logging in mid-session saw a frozen character.
+--
+-- Nothing whispered => 0 => the tracker rolls its stamp back and retries on the
+-- next capture (and the new 30s safety ticker guarantees there IS a next one).
+-- Every early return below is therefore a 0: mesh off, nothing encodable, no
+-- peers, all sends deduped.
+--
+-- The ONE case that is emphatically not 0 is the payload-hash suppressor: that
+-- path means this exact state has ALREADY been delivered to this exact peer set,
+-- so it reports the count of the push it is standing in for. Returning 0 there
+-- would roll the stamp back on a successful delivery and re-fire STATE_CHANGED
+-- on every capture forever, defeating the A10.1 change filter.
+function Mesh.PushState(nameRealm, record, force, receipt)
+    local function report(n)
+        n = n or 0
+        if type(receipt) == "table" then receipt.sent = n end
+        Mesh._lastPushSent = n
+        return n
+    end
+    if not Mesh.IsEnabled() then return report(0) end
     local payload = Protocol.EncodeCharacter(Mesh.WireRecord(record, now()))
-    if not payload then return end   -- nothing encodable (nil/foreign record)
+    if not payload then return report(0) end   -- nothing encodable (nil/foreign record)
     local ids = onlinePeerIDs()
     -- A10.9: adapt the direct-send budget to the live token count.
     local sched = Mesh._sched[Protocol.PREFIX.STATE]
@@ -1286,11 +1511,12 @@ function Mesh.PushState(nameRealm, record, force)
     local prev    = Mesh._lastPush[key]
     if not force and hash and prev and hash == prev.hash and peerKey == prev.peers then
         Mesh._pushSuppressed = (Mesh._pushSuppressed or 0) + 1
-        return
+        -- Already delivered to exactly this peer set: report that delivery, not 0.
+        return report(prev.sent or 0)
     end
-    Mesh._lastPush[key] = { hash = hash, peers = peerKey }
 
     local sent = {}    -- guard against double-whispering a backup
+    local delivered = 0
     local function sendDirect(aid, delegated)
         local name = Mesh.NameForAID(aid)
         if not name or sent[name] then return end
@@ -1298,9 +1524,13 @@ function Mesh.PushState(nameRealm, record, force)
         local relayTo = delegated and buildRelayTo(delegated) or ""
         local seq = Mesh._outSeq + 1
         local frame = Mesh.BuildFrame(OP.STATE, payload, { seq = seq, relayTo = relayTo })
-        Mesh.Enqueue(Protocol.PREFIX.STATE, frame, {
+        -- Count CONFIRMED ENQUEUE only. Mesh.Enqueue refuses a forbidden prefix,
+        -- and a target we cannot name never reaches the queue at all.
+        if Mesh.Enqueue(Protocol.PREFIX.STATE, frame, {
             op = "state", chatType = "WHISPER", target = name, seq = seq,
-        })
+        }) then
+            delivered = delivered + 1
+        end
         local p = Mesh.peers[aid]; if p then p.lastPush = now() end
     end
 
@@ -1312,6 +1542,15 @@ function Mesh.PushState(nameRealm, record, force)
     for i = 1, #plan.backups do
         sendDirect(plan.backups[i], nil)
     end
+
+    -- Record the suppressor key ONLY once something actually went out. A push
+    -- that reached nobody must not arm the suppressor against its own retry.
+    if delivered > 0 then
+        Mesh._lastPush[key] = { hash = hash, peers = peerKey, sent = delivered }
+    else
+        Mesh._lastPush[key] = nil
+    end
+    return report(delivered)
 end
 
 ----------------------------------------------------------------------
@@ -1367,9 +1606,35 @@ end
 -- Map a Name-Realm sender to its account ID via the peer table (best effort).
 local function aidForName(name)
     for aid, p in pairs(Mesh.peers) do
-        if p.name == name then return aid end
+        if Mesh.PeerNameMatches(p, name) then return aid end
     end
     return nil
+end
+
+----------------------------------------------------------------------
+-- THE REPAINT PUMP
+--
+-- THE REGRESSION this closes: every inbound path wrote peer data into the store
+-- and then told NOBODY. The dashboard, the cards and the detail pane all repaint
+-- off the callback bus (ui_shell subscribes onEngineChange to STATE_CHANGED and
+-- STORE_REFRESHED), and STATE_CHANGED only ever fires for our OWN record, from
+-- Tracker.Capture. So a remote character's buffs updated in the SavedVariables
+-- and sat there: the open dashboard kept drawing the copy it had, durations
+-- froze, and only a local capture (or reopening the window) ever surfaced the
+-- new data.
+--
+-- STORE_REFRESHED is the args-free "bulk store changed" signal ui_shell, timers
+-- and the importer already share, so this needs no new plumbing. The mesh
+-- IGNORES it by design — it subscribes only to STATE_CHANGED, which is
+-- self-record-guarded — so firing it from a receive handler can never loop back
+-- out as another push. (Verified: mesh.lua's own testStoreRefreshedIgnored.)
+--
+-- Fired at most ONCE per received frame, never per record, so a bulk segment
+-- adoption is one repaint rather than one per character.
+----------------------------------------------------------------------
+function Mesh.NoteStoreChanged()
+    Mesh._storeRefreshFires = (Mesh._storeRefreshFires or 0) + 1
+    ns:Fire("STORE_REFRESHED")
 end
 
 local function handleState(f, sender, isRelay)
@@ -1378,7 +1643,13 @@ local function handleState(f, sender, isRelay)
     local ownerAID = aidForName(rec.nameRealm) or aidForName(sender) or ""
     -- Owner-wins / epoch / lowest-account-ID tiebreak lives in the store.
     local senderAID = aidForName(sender)
-    Store.WriteInboundCharacter(ownerAID, rec.nameRealm, rec, senderAID)
+    -- A true return means the record really changed — an older/losing push is
+    -- rejected and must NOT cost a repaint. Store.WriteInboundCharacter also
+    -- runs the B5 stale-twin reconciliation internally, so a twin retired by
+    -- this write is covered by the same signal.
+    if Store.WriteInboundCharacter(ownerAID, rec.nameRealm, rec, senderAID) then
+        Mesh.NoteStoreChanged()
+    end
     -- One-hop forward for genuine (non-relay) pushes carrying a relayTo list.
     -- A10.8: a stale payload is DROPPED, not forwarded — a slow relay must not
     -- resurrect state that the owner has already superseded.
@@ -1443,7 +1714,12 @@ local function handleHeartbeat(f, sender)
     if not hb or not hb.aid then return end
     -- Two accounts sharing an ID: warn + drop (never admit as a peer).
     if Mesh.CheckAccountConflict(hb.aid, sender, now()) then return end
-    local p = Mesh.NotePeer(hb.aid, sender, now())
+    -- hb.online[1] is the sender's OWN canonical Name-Realm: a WoW account has
+    -- exactly one character logged in, and SendHeartbeat stamps selfNameRealm()
+    -- there (see the comment on Mesh.SendHeartbeat). Prefer it over the raw
+    -- CHAT_MSG_ADDON sender, which is bare on some paths.
+    local p = Mesh.NotePeer(hb.aid,
+        Mesh.CanonicalPeerName(sender, hb.online and hb.online[1]), now())
     if not p then return end
     p.hashes = hb.hashes or {}
     p.timerHash = hb.timerHash
@@ -1486,7 +1762,11 @@ local function handleDiscovery(f, sender, isPing)
     -- payload is a small packed { aid, name }
     local d = Mesh.Unpack(f.payload)
     local aid = d and d.aid
-    if aid then Mesh.NotePeer(aid, sender, now()) end
+    -- The discovery payload carries the sender's canonical Name-Realm (`d.name`,
+    -- stamped by Mesh.SendDiscovery). It used to be decoded and discarded.
+    if aid then
+        Mesh.NotePeer(aid, Mesh.CanonicalPeerName(sender, d and d.name), now())
+    end
     if isPing then
         Mesh._disco.lastPingRecv = now()
         -- respond with a PONG whisper announcing ourselves
@@ -1523,17 +1803,29 @@ end
 local function handleManifest(f, sender)
     local man = Mesh.Unpack(f.payload)
     if not man or not man.aid then return end
-    Mesh.NotePeer(man.aid, sender, now())
-    Store.AdoptManifest(man.aid, man.area, man.list, man.epoch, man.hash)
+    -- Manifests carry no name field, so all we can do is normalize the sender.
+    Mesh.NotePeer(man.aid, Mesh.CanonicalPeerName(sender, nil), now())
+    -- B4 ghost cleanup removes characters and adopts homeless ones. That is a
+    -- roster change the dashboard has no other way to hear about, so pump the
+    -- repaint whenever the adoption actually moved something.
+    local applied, info = Store.AdoptManifest(man.aid, man.area, man.list, man.epoch, man.hash)
+    if applied and info and (#(info.deleted or {}) > 0 or #(info.adopted or {}) > 0) then
+        Mesh.NoteStoreChanged()
+    end
 end
 
 local function handleSegment(f, sender)
     local seg = Mesh.Unpack(f.payload)
     if not seg or not seg.aid or not seg.records then return end
     local senderAID = aidForName(sender)
+    local adopted = 0
     for nameRealm, rec in pairs(seg.records) do
-        Store.WriteInboundCharacter(seg.aid, nameRealm, rec, senderAID)
+        if Store.WriteInboundCharacter(seg.aid, nameRealm, rec, senderAID) then
+            adopted = adopted + 1
+        end
     end
+    -- One repaint for the whole segment, not one per character.
+    if adopted > 0 then Mesh.NoteStoreChanged() end
 end
 
 -- Inbound instance ledger for an account. The dedup + ring-cap + self-immunity
@@ -1930,7 +2222,9 @@ function Mesh.SendManifest(target, aid, area)
     local seg = bucket.segments[area]
     local payload = Mesh.Pack({
         aid = aid, area = area, list = seg,
-        hash = Mesh.HashSegment(seg),
+        -- Same content-folded hash the heartbeat advertises, so the manifest's
+        -- advisory hash cannot disagree with Mesh.AccountHashes for one account.
+        hash = Mesh.HashSegment(seg, bucket.characters),
         epoch = (bucket.segmentHashes[area] and bucket.segmentHashes[area].epoch) or 0,
     })
     if not payload then return end
@@ -2863,7 +3157,7 @@ function Mesh.MarkPresenceStale(name, t)
     t = t or now()
     local n = 0
     for _, p in pairs(Mesh.peers) do
-        if p.name == name then
+        if Mesh.PeerNameMatches(p, name) then
             p.online = false
             p.presenceStale = true
             p.presenceStaleAt = t
@@ -2946,8 +3240,8 @@ function Mesh.OnLogin()
     end)
 
     -- Push live state changes onto the mesh (self-record-guarded).
-    ns:On("STATE_CHANGED", function(nameRealm, record, force)
-        Mesh.OnStateChanged(nameRealm, record, force)
+    ns:On("STATE_CHANGED", function(nameRealm, record, force, receipt)
+        Mesh.OnStateChanged(nameRealm, record, force, receipt)
     end)
 
     -- Final flush on the way out.
@@ -4028,6 +4322,363 @@ local function testPushSuppressor()
 end
 
 ----------------------------------------------------------------------
+-- THE REPAINT PUMP: inbound data must announce itself.
+--
+-- Drives real frames through Mesh.Dispatch and counts STORE_REFRESHED fires.
+-- This is the regression test for "remote characters' buffs never update".
+----------------------------------------------------------------------
+local function testInboundRepaintPump()
+    local T = 1785000500
+    local savedAccounts = Store.data.accounts
+    local savedPeers    = Mesh.peers
+    local savedAID      = ns.GetAccountID
+    local savedSeen, savedFresh = Mesh.SeenBefore, Mesh.FreshSeq
+
+    ns.GetAccountID = function() return "1" end
+    Mesh.peers = { ["9"] = { aid = "9", name = "Peer-R", online = true, lastSeen = T } }
+    Store.data.accounts = {
+        ["9"] = { isSelf = false, characters = {}, homeless = {},
+                  segments = { sixties = {}, summoners = {}, norole = {} },
+                  segmentHashes = {} },
+    }
+    -- Every test frame is hand-built, so bypass the replay/freshness guards.
+    Mesh.SeenBefore = function() return false end
+    Mesh.FreshSeq   = function() return true end
+
+    local fires = 0
+    ns:On("STORE_REFRESHED", function() fires = fires + 1 end)
+
+    local function stateFrame(nameRealm, epoch)
+        local rec = Store.NewCharacterRecord(nameRealm)
+        rec.level = 60
+        rec.ownerEpoch, rec.lastDataUpdate, rec.lastSeen = epoch, epoch, epoch
+        return Mesh.BuildFrame(OP.STATE, Protocol.EncodeCharacter(rec), { seq = 1 })
+    end
+
+    local ok, why = true, nil
+    local function ck(c, m) if ok and not c then ok, why = false, m end end
+
+    -- 1) An accepted inbound STATE push fires exactly one repaint.
+    pcall(Mesh.Dispatch, Protocol.PREFIX.STATE, stateFrame("Peer-R", T), "Peer-R")
+    ck(fires == 1, "an accepted inbound STATE push did not fire STORE_REFRESHED")
+    ck(Store.data.accounts["9"].characters["Peer-R"] ~= nil, "inbound record was not stored")
+
+    -- 2) A LOSING push (older epoch) is rejected, so it must NOT cost a repaint.
+    fires = 0
+    pcall(Mesh.Dispatch, Protocol.PREFIX.STATE, stateFrame("Peer-R", T - 500), "Peer-R")
+    ck(fires == 0, "a rejected (stale-epoch) push still fired a repaint")
+
+    -- 3) A SEGMENT adoption fires ONCE for the whole batch, not once per record.
+    fires = 0
+    local recs = {}
+    for _, nm in ipairs({ "Alt1-R", "Alt2-R", "Alt3-R" }) do
+        local r = Store.NewCharacterRecord(nm)
+        r.level, r.ownerEpoch, r.lastDataUpdate = 60, T + 10, T + 10
+        recs[nm] = r
+    end
+    local segPayload = Mesh.Pack({ aid = "9", area = "sixties", records = recs })
+    if segPayload then
+        pcall(Mesh.Dispatch, Protocol.PREFIX.SYNC,
+            Mesh.BuildFrame(OP.SEGMENT, segPayload, { seq = 2 }), "Peer-R")
+    end
+    ck(fires == 1, "a 3-record segment fired " .. fires .. " repaints (expected exactly 1)")
+    ck(Store.data.accounts["9"].characters["Alt2-R"] ~= nil, "segment records were not adopted")
+
+    -- 4) A segment that adopts NOTHING (every record loses on epoch) is silent.
+    fires = 0
+    local stale = {}
+    for _, nm in ipairs({ "Alt1-R", "Alt2-R" }) do
+        local r = Store.NewCharacterRecord(nm)
+        r.level, r.ownerEpoch, r.lastDataUpdate = 60, T - 900, T - 900
+        stale[nm] = r
+    end
+    local stalePayload = Mesh.Pack({ aid = "9", area = "sixties", records = stale })
+    if stalePayload then
+        pcall(Mesh.Dispatch, Protocol.PREFIX.SYNC,
+            Mesh.BuildFrame(OP.SEGMENT, stalePayload, { seq = 3 }), "Peer-R")
+    end
+    ck(fires == 0, "a segment that adopted nothing still fired a repaint")
+
+    Store.data.accounts = savedAccounts
+    Mesh.peers          = savedPeers
+    ns.GetAccountID     = savedAID
+    Mesh.SeenBefore, Mesh.FreshSeq = savedSeen, savedFresh
+    return ok, why
+end
+
+----------------------------------------------------------------------
+-- HASH-AFTER-SEND: Mesh.PushState must report how many targets it reached.
+----------------------------------------------------------------------
+local function testPushDeliveryCount()
+    local savedPeers    = Mesh.peers
+    local savedEnabled  = Mesh.IsEnabled
+    local savedAID      = ns.GetAccountID
+    local savedLastPush = Mesh._lastPush
+    local savedNameFor  = Mesh.NameForAID
+    local savedEnqueue  = Mesh.Enqueue
+
+    ns.GetAccountID = function() return "1" end
+    Mesh.IsEnabled  = function() return true end
+    Mesh._lastPush  = {}
+    local enqueued = 0
+    Mesh.Enqueue = function() enqueued = enqueued + 1 return true end
+    Mesh.NameForAID = function(aid)
+        local p = Mesh.peers[aid]; return p and p.name or nil
+    end
+
+    local ok, why = true, nil
+    local function ck(c, m) if ok and not c then ok, why = false, m end end
+
+    local rec = Store.NewCharacterRecord("Me-R")
+    rec.level = 60
+
+    -- 1) ZERO known peers -> zero targets. This is the case that used to stamp
+    --    the tracker's hash as delivered and suppress the change forever.
+    Mesh.peers = {}
+    local receipt = {}
+    local n = Mesh.PushState("Me-R", rec, false, receipt)
+    ck(n == 0, "a push with no peers reported " .. tostring(n) .. " targets (expected 0)")
+    ck(receipt.sent == 0, "the receipt was not stamped with 0")
+
+    -- 2) A peer appears -> the same unchanged record must still go out. The
+    --    suppressor must NOT have been armed by the zero-target attempt.
+    Mesh.peers = { ["2"] = { aid = "2", name = "Peer-R", online = true } }
+    enqueued, receipt = 0, {}
+    n = Mesh.PushState("Me-R", rec, false, receipt)
+    ck(n >= 1, "an unchanged record did not re-push when a peer appeared (got " .. tostring(n) .. ")")
+    ck(receipt.sent == n, "receipt disagrees with the return value")
+    ck(enqueued == n, "reported count does not match confirmed enqueues")
+    local firstCount = n
+
+    -- 3) Re-pushing the SAME state to the SAME peer set is suppressed — but it
+    --    must report the delivery it stands in for, never 0, or the tracker
+    --    would roll back a stamp for state the peer already has.
+    receipt = {}
+    n = Mesh.PushState("Me-R", rec, false, receipt)
+    ck(n == firstCount, "the suppressed path reported " .. tostring(n) ..
+        " (expected the standing delivery count " .. tostring(firstCount) .. ")")
+
+    -- 4) Mesh disabled -> 0 targets.
+    Mesh.IsEnabled = function() return false end
+    receipt = {}
+    n = Mesh.PushState("Me-R", rec, false, receipt)
+    ck(n == 0, "a push with the mesh disabled reported " .. tostring(n))
+    Mesh.IsEnabled = function() return true end
+
+    -- 5) A record the encoder refuses is 0, not nil.
+    receipt = {}
+    n = Mesh.PushState("Me-R", nil, false, receipt)
+    ck(n == 0, "an unencodable record reported " .. tostring(n))
+
+    -- 6) Mesh.Enqueue confirms the queue-up (the count's definition of "sent").
+    Mesh.Enqueue = savedEnqueue
+    ck(Mesh.Enqueue(Protocol.PREFIX.STATE,
+        Mesh.BuildFrame(OP.STATE, "x", { seq = 1 }),
+        { op = "state", chatType = "WHISPER", target = "Peer-R", seq = 1 }) == true,
+        "Mesh.Enqueue did not confirm a legitimate enqueue")
+
+    Mesh.peers, Mesh.IsEnabled = savedPeers, savedEnabled
+    ns.GetAccountID, Mesh._lastPush = savedAID, savedLastPush
+    Mesh.NameForAID, Mesh.Enqueue = savedNameFor, savedEnqueue
+    return ok, why
+end
+
+----------------------------------------------------------------------
+-- SEGMENT CONTENT FINGERPRINT (spec §9.6).
+----------------------------------------------------------------------
+local function testSegmentFingerprint()
+    local ok, why = true, nil
+    local function ck(c, m) if ok and not c then ok, why = false, m end end
+
+    local list = { "A-R", "B-R" }
+    local function mk()
+        local a = Store.NewCharacterRecord("A-R")
+        a.level, a.location = 60, "Orgrimmar"
+        -- 3610 sits INSIDE the DIV-60 bucket 60 (not on its boundary), so the
+        -- tick/minute cases below are unambiguous.
+        a.auraStates = { [1] = { duration = 3610, option = 1, source = 0 } }
+        a.raidLockouts = { MC = 1785200000 }
+        local b = Store.NewCharacterRecord("B-R")
+        b.level = 60
+        return { ["A-R"] = a, ["B-R"] = b }
+    end
+
+    -- Backwards compatible: no records -> the historic names-only hash.
+    ck(Mesh.HashSegment(list) == Mesh.HashSegment({ "A-R", "B-R" }),
+        "names-only hashing changed")
+    ck(Mesh.HashSegment(list) ~= Mesh.HashSegment(list, mk()),
+        "passing records did not change the hash at all")
+    ck(Mesh.HashSegment(nil, mk()) == "0", "empty list must still hash to 0")
+
+    -- Deterministic: identical content hashes identically.
+    ck(Mesh.HashSegment(list, mk()) == Mesh.HashSegment(list, mk()),
+        "the fingerprint is not deterministic")
+
+    -- STABLE across the volatile fields — this is the anti-resync-loop property.
+    -- Each of these changes on the owner WITHOUT a state push, so folding any of
+    -- them in would diverge the two copies permanently.
+    local volatile = mk()
+    volatile["A-R"].lastSeen       = 999999999
+    volatile["A-R"].lastDataUpdate = 999999999
+    volatile["A-R"].ownerEpoch     = 999999999
+    volatile["A-R"].xp             = 123456
+    volatile["A-R"].xpMax          = 999999
+    volatile["A-R"].restedXP       = 54321
+    volatile["A-R"].itemCooldown   = 3599     -- receiver-rewritten mirror
+    volatile["A-R"].hearthstoneCD  = 1234     -- receiver-rewritten mirror
+    volatile["A-R"]._srcAID        = "7"
+    ck(Mesh.HashSegment(list, mk()) == Mesh.HashSegment(list, volatile),
+        "the fingerprint moved on a volatile/receiver-rewritten field")
+
+    -- Sub-minute aura decay must NOT move it (3610 and 3601 are both bucket 60).
+    local tick = mk()
+    tick["A-R"].auraStates[1].duration = 3601
+    ck(Mesh.HashSegment(list, mk()) == Mesh.HashSegment(list, tick),
+        "a sub-minute aura tick moved the fingerprint")
+
+    -- ...but crossing a minute boundary MUST, so a lost push is detectable
+    -- (3610 -> bucket 60, 3599 -> bucket 59).
+    local minute = mk()
+    minute["A-R"].auraStates[1].duration = 3599
+    ck(Mesh.HashSegment(list, mk()) ~= Mesh.HashSegment(list, minute),
+        "an aura MINUTE change did not move the fingerprint")
+
+    -- Meaningful content changes move it.
+    local flag = mk(); flag["A-R"].chronoboonActive = true
+    ck(Mesh.HashSegment(list, mk()) ~= Mesh.HashSegment(list, flag),
+        "a key flag did not move the fingerprint")
+    local loc = mk(); loc["A-R"].location = "Blackrock Depths"
+    ck(Mesh.HashSegment(list, mk()) ~= Mesh.HashSegment(list, loc),
+        "location did not move the fingerprint")
+    local lock = mk(); lock["A-R"].raidLockouts.MC = 1785200000 + 3600
+    ck(Mesh.HashSegment(list, mk()) ~= Mesh.HashSegment(list, lock),
+        "a raid lockout hour did not move the fingerprint")
+    local cd = mk(); cd["A-R"].chronoboonCDStart = 1785000000
+    ck(Mesh.HashSegment(list, mk()) ~= Mesh.HashSegment(list, cd),
+        "a cooldown starting did not move the fingerprint")
+    -- ...but a cooldown DRIFTING (same presence, different epoch) does not,
+    -- because our synthesized epoch is the owner's plus transit.
+    local cd2 = mk(); cd2["A-R"].chronoboonCDStart = 1785000000
+    local cd3 = mk(); cd3["A-R"].chronoboonCDStart = 1785000004
+    ck(Mesh.HashSegment(list, cd2) == Mesh.HashSegment(list, cd3),
+        "cooldown epoch transit jitter moved the fingerprint")
+
+    -- A missing record is distinguishable from a present one.
+    local partial = mk(); partial["B-R"] = nil
+    ck(Mesh.HashSegment(list, mk()) ~= Mesh.HashSegment(list, partial),
+        "a missing record hashed the same as a present one")
+
+    -- DiffHashes semantics are UNCHANGED: still a per-area string comparison
+    -- over exactly the four area names, absent reading as "0".
+    local d = Mesh.DiffHashes({ sixties = "a", summoners = "b", norole = "c", homeless = "d" },
+                              { sixties = "a", summoners = "Z", norole = "c", homeless = "d" })
+    ck(#d == 1 and d[1] == "summoners", "DiffHashes no longer isolates the differing area")
+    ck(#Mesh.DiffHashes({}, {}) == 0, "DiffHashes on two empty bundles must be empty")
+    ck(#Mesh.DiffHashes({ sixties = "a" }, {}) == 1,
+        "DiffHashes: an absent remote area must read as '0' and differ")
+    ck(#Mesh.DiffHashes(nil, nil) == 0, "DiffHashes must tolerate nil bundles")
+
+    -- AccountHashes feeds the records through (both sides of the heartbeat).
+    local bucket = { segments = { sixties = list, summoners = {}, norole = {} },
+                     characters = mk(), homeless = {} }
+    local h1 = Mesh.AccountHashes(bucket)
+    bucket.characters["A-R"].level = 59
+    local h2 = Mesh.AccountHashes(bucket)
+    ck(h1.sixties ~= h2.sixties, "AccountHashes is not folding record content in")
+    ck(h1.homeless == h2.homeless, "the homeless set hash must be unaffected")
+    return ok, why
+end
+
+----------------------------------------------------------------------
+-- CANONICAL PEER NAMES: p.name must be a Name-Realm, or MeshPresence cannot
+-- match it against a record key and every remote character reads offline.
+----------------------------------------------------------------------
+local function testCanonicalPeerNames()
+    local ok, why = true, nil
+    local function ck(c, m) if ok and not c then ok, why = false, m end end
+    local savedRealm = _G.GetRealmName
+    _G.GetRealmName = function() return "Whitemane" end
+
+    -- Bare sender normalization (the IsSelfSender comment documents bare senders
+    -- as real, so this is not a hypothetical).
+    ck(Mesh.NormalizeSender("Erro") == "Erro-Whitemane", "bare sender not normalized")
+    ck(Mesh.NormalizeSender("Erro-Faerlina") == "Erro-Faerlina",
+        "an explicit realm must be preserved")
+    ck(Mesh.NormalizeSender("") == nil, "empty sender must be nil")
+    ck(Mesh.NormalizeSender(nil) == nil, "nil sender must be nil")
+
+    -- A realm with a space is stripped, matching selfNameRealm's own gsub.
+    _G.GetRealmName = function() return "Blade's Edge" end
+    ck(Mesh.NormalizeSender("Erro") == "Erro-Blade'sEdge", "realm whitespace not stripped")
+    _G.GetRealmName = function() return "Whitemane" end
+
+    -- The payload's canonical name is PREFERRED over a bare sender.
+    ck(Mesh.CanonicalPeerName("Erro", "Erro-Whitemane") == "Erro-Whitemane",
+        "the payload's canonical name was not preferred")
+    -- ...and over a cross-realm sender that agrees on the short name.
+    ck(Mesh.CanonicalPeerName("Puunyx", "Puunyx-Faerlina") == "Puunyx-Faerlina",
+        "a cross-realm payload name was not preferred")
+    -- A payload name that DISAGREES with the sender is refused: a peer cannot
+    -- use its own heartbeat to claim to be another character.
+    ck(Mesh.CanonicalPeerName("Erro", "Someoneelse-Whitemane") == "Erro-Whitemane",
+        "a disagreeing payload name was trusted")
+    -- Junk payloads fall back to the normalized sender.
+    ck(Mesh.CanonicalPeerName("Erro", nil) == "Erro-Whitemane", "nil payload name")
+    ck(Mesh.CanonicalPeerName("Erro", "") == "Erro-Whitemane", "empty payload name")
+    ck(Mesh.CanonicalPeerName("Erro", "Erro") == "Erro-Whitemane",
+        "a bare payload name must not be taken as canonical")
+    ck(Mesh.CanonicalPeerName("Erro", 42) == "Erro-Whitemane", "non-string payload name")
+
+    -- Matching is canonical in BOTH directions, which is what keeps the
+    -- CHAT_MSG_CHANNEL_LEAVE latch (a bare player name) working now that
+    -- p.name is stored as Name-Realm.
+    local p = { name = "Erro-Whitemane" }
+    ck(Mesh.PeerNameMatches(p, "Erro"), "canonical peer did not match a bare name")
+    ck(Mesh.PeerNameMatches(p, "Erro-Whitemane"), "canonical peer did not match itself")
+    ck(not Mesh.PeerNameMatches(p, "Erro-Faerlina"), "matched a different realm")
+    ck(not Mesh.PeerNameMatches(p, "Other"), "matched a different name")
+    ck(not Mesh.PeerNameMatches({ name = "" }, "Erro"), "a nameless peer must not match")
+    ck(not Mesh.PeerNameMatches(nil, "Erro"), "a nil peer must not match")
+
+    -- End to end: a heartbeat from a BARE sender must leave a Name-Realm behind,
+    -- which is exactly what Dashboard.MeshPresence publishes.
+    local savedPeers, savedAID = Mesh.peers, ns.GetAccountID
+    local savedSeen, savedFresh = Mesh.SeenBefore, Mesh.FreshSeq
+    Mesh.peers = {}
+    ns.GetAccountID = function() return "1" end
+    Mesh.SeenBefore = function() return false end
+    Mesh.FreshSeq   = function() return true end
+    local hbPayload = Mesh.Pack({ aid = "9", hashes = {}, online = { "Erro-Whitemane" } })
+    if hbPayload then
+        pcall(Mesh.Dispatch, Protocol.PREFIX.HEARTBEAT,
+            Mesh.BuildFrame(OP.HEARTBEAT, hbPayload, { seq = 1 }), "Erro")
+    end
+    ck(Mesh.peers["9"] and Mesh.peers["9"].name == "Erro-Whitemane",
+        "a heartbeat from a bare sender did not store the canonical name (got "
+        .. tostring(Mesh.peers["9"] and Mesh.peers["9"].name) .. ")")
+
+    -- A discovery ping does the same via d.name.
+    Mesh.peers = {}
+    local dPayload = Mesh.Pack({ aid = "8", name = "Puunyx-Whitemane" })
+    if dPayload then
+        pcall(Mesh.Dispatch, Protocol.PREFIX.HEARTBEAT,
+            Mesh.BuildFrame(OP.PONG, dPayload, { seq = 2 }), "Puunyx")
+    end
+    ck(Mesh.peers["8"] and Mesh.peers["8"].name == "Puunyx-Whitemane",
+        "discovery did not store the payload's canonical name")
+
+    -- ...and the leave notice still latches that peer offline from a BARE name.
+    Mesh.MarkPresenceStale("Puunyx", 1785000500)
+    ck(Mesh.peers["8"].online == false,
+        "a bare leave notice no longer latches a canonically-named peer offline")
+
+    Mesh.peers, ns.GetAccountID = savedPeers, savedAID
+    Mesh.SeenBefore, Mesh.FreshSeq = savedSeen, savedFresh
+    _G.GetRealmName = savedRealm
+    return ok, why
+end
+
+----------------------------------------------------------------------
 -- Mesh-hygiene batch self-tests
 ----------------------------------------------------------------------
 
@@ -4393,6 +5044,10 @@ function Mesh.RunSelfTests(verbose)
         { name = "broadcast jitter",    fn = testBroadcastJitter },
         { name = "state content hash", fn = testStateHash },
         { name = "push suppressor",    fn = testPushSuppressor },
+        { name = "inbound repaint pump", fn = testInboundRepaintPump },
+        { name = "push delivery count",  fn = testPushDeliveryCount },
+        { name = "segment content fingerprint (§9.6)", fn = testSegmentFingerprint },
+        { name = "canonical peer names", fn = testCanonicalPeerNames },
         { name = "peer timeout sweep", fn = testPeerSweep },
         { name = "direct budget",      fn = testDirectBudget },
         { name = "relay age gate",     fn = testRelayAgeGate },

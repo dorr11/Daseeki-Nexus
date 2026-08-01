@@ -186,8 +186,17 @@ local function newWriter()
         v = math.floor(v or 0) % 256
         buf[#buf + 1] = string.char(v)
     end
+    -- CLAMP, not wrap. `% 65536` turned an out-of-range value into a plausible
+    -- WRONG one: 65536 became 0 and 70000 became 4464, so a bad duration or
+    -- cooldown decoded as a believable small number instead of an obvious
+    -- ceiling. Saturating at the range ends keeps the error monotonic (too big
+    -- reads as "the maximum", never as "almost none"). This is NOT a wire-format
+    -- change: the field is still exactly two big-endian bytes and every value
+    -- that was already in [0, 65535] encodes byte-identically. SCHEMA_VERSION
+    -- therefore stays put.
     function w.u16(v)
-        v = math.floor(v or 0) % 65536
+        v = math.floor(tonumber(v) or 0)
+        if v < 0 then v = 0 elseif v > 65535 then v = 65535 end
         buf[#buf + 1] = string.char(math.floor(v / 256) % 256, v % 256)
     end
     function w.u32(v)
@@ -588,6 +597,59 @@ local function testChunking()
     return true
 end
 
+-- w.u16 SATURATES instead of wrapping. Driven through the real encoder so the
+-- test also proves the change is confined to the writer: every in-range value
+-- still encodes to the same two bytes it always did, so the wire format (and
+-- SCHEMA_VERSION) is untouched.
+local function testU16Clamp()
+    local function roundTripCD(v)
+        local rec = ns.Store.NewCharacterRecord("Clamp-Realm")
+        rec.itemCooldown  = v
+        rec.hearthstoneCD = v
+        local decoded = Protocol.DecodeCharacter(Protocol.EncodeCharacter(rec))
+        if not decoded then return nil end
+        return decoded.itemCooldown, decoded.hearthstoneCD
+    end
+
+    -- Over the ceiling: saturate at 65535. The old `% 65536` wrapped 65536 to 0
+    -- ("no cooldown") and 70000 to 4464 ("74 minutes") — both plausible lies.
+    local a, b = roundTripCD(65536)
+    if a ~= 65535 or b ~= 65535 then
+        return false, "65536 should clamp to 65535, got " .. tostring(a)
+    end
+    a = roundTripCD(70000)
+    if a ~= 65535 then return false, "70000 should clamp to 65535, got " .. tostring(a) end
+
+    -- Under the floor: saturate at 0 (the old code wrapped -1 to 65535).
+    a = roundTripCD(-1)
+    if a ~= 0 then return false, "-1 should clamp to 0, got " .. tostring(a) end
+
+    -- In range: byte-identical to before, including both boundaries.
+    for _, v in ipairs({ 0, 1, 420, 3600, 65534, 65535 }) do
+        a = roundTripCD(v)
+        if a ~= v then
+            return false, "in-range " .. v .. " must round-trip unchanged, got " .. tostring(a)
+        end
+    end
+
+    -- Fractional and nil inputs still floor / default rather than erroring.
+    a = roundTripCD(1800.9)
+    if a ~= 1800 then return false, "fractional should floor, got " .. tostring(a) end
+    local rec = ns.Store.NewCharacterRecord("Clamp-Realm")
+    rec.itemCooldown = nil
+    local dec = Protocol.DecodeCharacter(Protocol.EncodeCharacter(rec))
+    if not dec or dec.itemCooldown ~= 0 then return false, "nil should encode as 0" end
+
+    -- The aura-duration u16 clamps on the same writer.
+    rec = ns.Store.NewCharacterRecord("Clamp-Realm")
+    rec.auraStates = { [2] = { duration = 99999, option = 1, source = 0 } }
+    dec = Protocol.DecodeCharacter(Protocol.EncodeCharacter(rec))
+    if not dec or not dec.auraStates[2] or dec.auraStates[2].duration ~= 65535 then
+        return false, "aura duration should clamp to 65535"
+    end
+    return true
+end
+
 -- Run every self-test. Returns overall bool; prints per-test lines when
 -- verbose (the /dsn debug selftest path). Also returns to callers so a
 -- future CI harness could consume the result table.
@@ -597,6 +659,7 @@ function Protocol.RunSelfTests(verbose)
         { name = "priority queue",   fn = testPriorityQueue },
         { name = "chunking",         fn = testChunking },
         { name = "state round-trip", fn = testRoundTrip },
+        { name = "u16 clamp",        fn = testU16Clamp },
     }
     local allPass, results = true, {}
     for _, t in ipairs(suite) do

@@ -1925,11 +1925,83 @@ function Tracker.Capture(force)
         Tracker._capturesFiltered = (Tracker._capturesFiltered or 0) + 1
         return
     end
+    -- HASH-AFTER-SEND.
+    --
+    -- The stamp below is a claim that this state has been DELIVERED — the change
+    -- filter reads it to suppress every later capture that hashes the same. It
+    -- used to be written before the push was even attempted, so a change
+    -- captured while we knew zero peers (alone at login, mesh still joining, the
+    -- peer relogging) was recorded as delivered and then suppressed forever. The
+    -- state escaped only when something ELSE about the character changed, which
+    -- is exactly the "remote character frozen until it does something" symptom.
+    --
+    -- So: stamp optimistically, fire, then roll back to the PREVIOUS stamp if the
+    -- transport reports it reached nobody. Rolling back to the previous values
+    -- (not to nil) keeps FORCE_REFRESH_INTERVAL measured from the last genuine
+    -- delivery. `receipt.sent` is left nil when no transport is subscribed at
+    -- all — a mesh-less build must keep its historic behaviour, so nil never
+    -- triggers a rollback.
+    local prevHash, prevAt = Tracker._lastPushHash, Tracker._lastPushAt
     Tracker._lastPushHash = hash
     Tracker._lastPushAt   = rec.lastSeen
 
     -- Local signal for the mesh layer (wave N2). No network I/O here.
-    ns:Fire("STATE_CHANGED", nameRealm, rec, force and true or nil)
+    local receipt = {}
+    ns:Fire("STATE_CHANGED", nameRealm, rec, force and true or nil, receipt)
+
+    if type(receipt.sent) == "number" and receipt.sent <= 0 then
+        Tracker._lastPushHash = prevHash
+        Tracker._lastPushAt   = prevAt
+        Tracker._pushRollbacks = (Tracker._pushRollbacks or 0) + 1
+    end
+end
+
+----------------------------------------------------------------------
+-- ARMED SAFETY NET (spec §4.2's periodic rescan)
+--
+-- Capture is entirely event-driven: UNIT_AURA, BAG_UPDATE_*, resting, flags, XP.
+-- A character parked in a city — the alt sitting in Orgrimmar with a world buff
+-- ticking down, which is precisely the character the roster exists to show —
+-- fires NONE of those. It never captures, so:
+--   * Tracker.FORCE_REFRESH_INTERVAL was UNREACHABLE. The 5-minute "max quiet"
+--     forced push is evaluated inside ShouldPush, and ShouldPush only runs from
+--     a capture, so the one backstop that was supposed to cover a dropped push
+--     could never fire on the characters that needed it most.
+--   * a push that reached nobody (see the hash-after-send rollback above) had
+--     nothing to retry it.
+--
+-- A 30s ticker fixes both by guaranteeing the capture path runs. It is cheap
+-- BECAUSE of the A10.1 change filter: a capture whose content hash is unchanged
+-- writes the store and returns without firing STATE_CHANGED, so a parked
+-- character costs one local record refresh per 30s and zero network traffic.
+--
+-- Guarded on both ends: nothing before login (no record to capture, and
+-- Tracker.Capture would bail anyway) and nothing during teardown (the logout
+-- flush has already sent the final forced state; another capture racing it can
+-- only re-open work the client is in the middle of tearing down).
+----------------------------------------------------------------------
+Tracker.SAFETY_RESCAN_INTERVAL = 30
+
+function Tracker.SafetyRescanTick()
+    if not (ns.state and ns.state.loggedIn) then return end
+    if Tracker.IsTeardown and Tracker.IsTeardown() then return end
+    Tracker._safetyRescans = (Tracker._safetyRescans or 0) + 1
+    ns:SafeCall(Tracker.RequestCapture)
+end
+
+function Tracker.ArmSafetyRescan()
+    if Tracker._safetyTicker then return Tracker._safetyTicker end
+    if not (C_Timer and C_Timer.NewTicker) then return nil end
+    Tracker._safetyTicker = C_Timer.NewTicker(Tracker.SAFETY_RESCAN_INTERVAL, function()
+        ns:SafeCall(Tracker.SafetyRescanTick)
+    end)
+    return Tracker._safetyTicker
+end
+
+function Tracker.DisarmSafetyRescan()
+    local t = Tracker._safetyTicker
+    if t and t.Cancel then t:Cancel() end
+    Tracker._safetyTicker = nil
 end
 
 -- Coalesce bursty events into one capture on the next frame tick. A forced
@@ -1970,6 +2042,10 @@ function Tracker.OnLogin()
     -- Ask the server for our saved-instance (lockout) data.
     if RequestRaidInfo then RequestRaidInfo() end
 
+    -- Arm the periodic rescan (spec §4.2). Idempotent, so a second OnLogin — a
+    -- /reload path, or the harness calling it twice — cannot stack tickers.
+    Tracker.ArmSafetyRescan()
+
     -- Teardown / loading-screen latch (see IsTeardown above). Registered BEFORE
     -- the generic capture events so the latch is already correct by the time the
     -- PLAYER_ENTERING_WORLD capture is queued.
@@ -2004,6 +2080,10 @@ function Tracker.OnLogin()
 
     ns:RegisterEvent("PLAYER_LOGOUT", function()
         Tracker._loggingOut = true
+        -- Stop the safety rescan BEFORE the final forced capture, so the ticker
+        -- can never queue work behind the mesh's logout flush. (SafetyRescanTick
+        -- also checks IsTeardown; this is the belt to that suspenders.)
+        Tracker.DisarmSafetyRescan()
         ns:SafeCall(Tracker.Capture, true)
     end)
 
@@ -2918,6 +2998,233 @@ local function testChangeFilter(fails)
 end
 
 ----------------------------------------------------------------------
+-- HASH-AFTER-SEND: a change that reached NO peer must be re-pushed when a
+-- peer appears, instead of being recorded as delivered and filtered forever.
+--
+-- Runs the real Tracker.Capture against a stub transport that stamps the
+-- receipt, so it exercises the exact path the mesh uses.
+----------------------------------------------------------------------
+local function testHashAfterSend(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+
+    local saved = {
+        auras = _G.C_UnitAuras, cont = _G.C_Container, item = _G.C_Item,
+        map = _G.C_Map, getTime = _G.GetTime,
+        resting = _G.IsResting, pvp = _G.UnitIsPVP, ffa = _G.UnitIsPVPFreeForAll,
+        inInst = _G.IsInInstance, savedInst = _G.GetNumSavedInstances,
+        now = ns.Store.Now, settings = ns.Store.GetSettings,
+        ensure = ns.Store.EnsureSelfCharacter, write = ns.Store.WriteSelfCharacter,
+        loggedIn = ns.state.loggedIn,
+        sub = _G.GetSubZoneText, mini = _G.GetMinimapZoneText,
+    }
+    local savedLatch = {
+        Tracker._leavingWorld, Tracker._loggingOut, Tracker._enteredWorldAt,
+        Tracker._auraCapturedAt, Tracker._cdCapturedAt,
+        Tracker._lastPushHash, Tracker._lastPushAt, Tracker._pushRollbacks,
+    }
+
+    local FRAME, EPOCH = 30000, 1700100000
+    local frameNow, epochNow = FRAME, EPOCH
+    _G.GetTime   = function() return frameNow end
+    ns.Store.Now = function() return epochNow end
+    ns.state.loggedIn = true
+
+    local auraList = {}
+    _G.C_UnitAuras = { GetBuffDataByIndex = function(_, i) return auraList[i] end }
+    _G.C_Container = { GetItemCooldown = function() return 0, 0, 1 end }
+    _G.C_Item = { GetItemCount = function() return 0 end }
+    _G.C_Map  = { GetBestMapForUnit = function() return nil end,
+                  GetPlayerMapPosition = function() return nil end }
+    _G.IsResting = function() return true end
+    _G.UnitIsPVP = function() return false end
+    _G.UnitIsPVPFreeForAll = function() return false end
+    _G.IsInInstance = function() return false, "none" end
+    _G.GetNumSavedInstances = function() return 0 end
+    _G.GetSubZoneText     = function() return "" end
+    _G.GetMinimapZoneText = function() return "" end
+    ns.Store.GetSettings = function() return { coordinateOverrides = {} } end
+
+    local rec = {}
+    ns.Store.EnsureSelfCharacter = function() return rec end
+    ns.Store.WriteSelfCharacter  = function() end
+
+    -- Stub transport: `targets` is how many peers it can reach right now, and it
+    -- stamps the receipt exactly as Mesh.PushState does.
+    local fires, targets, counting = 0, 0, true
+    ns:On("STATE_CHANGED", function(_, _, _, receipt)
+        if not counting then return end
+        fires = fires + 1
+        if type(receipt) == "table" then receipt.sent = targets end
+    end)
+
+    local ok, err = pcall(function()
+        Tracker._leavingWorld, Tracker._loggingOut = false, false
+        Tracker._enteredWorldAt = frameNow - 60
+        Tracker._auraCapturedAt, Tracker._cdCapturedAt = nil, nil
+        Tracker._lastPushHash, Tracker._lastPushAt = nil, 0
+        Tracker._pushRollbacks = 0
+
+        local function setAura(rem)
+            auraList = { { name = "Songflower Serenade", spellId = 15366,
+                           expirationTime = frameNow + rem } }
+        end
+
+        -- 1) A real change captured with ZERO peers: it fires, but the transport
+        --    reports nobody heard it, so the stamp must roll back.
+        targets = 0
+        setAura(1795)
+        Tracker.Capture()
+        ck(fires == 1, "first capture must fire (got " .. fires .. ")")
+        ck(Tracker._lastPushHash == nil,
+            "a push that reached nobody still stamped the delivered-hash")
+        ck(Tracker._pushRollbacks == 1, "the rollback was not counted")
+
+        -- 2) THE REGRESSION: with the state unchanged, the very next capture must
+        --    still try again. Before the fix this was filtered out forever.
+        Tracker.Capture()
+        ck(fires == 2, "an undelivered change was not retried (fires=" .. fires .. ")")
+
+        -- 3) A peer appears -> the push lands -> the stamp sticks.
+        targets = 2
+        Tracker.Capture()
+        ck(fires == 3, "the retry did not fire once a peer existed")
+        ck(Tracker._lastPushHash ~= nil, "a delivered push did not stamp the hash")
+        ck(Tracker._lastPushAt == epochNow, "the delivered push did not stamp the time")
+        local deliveredHash = Tracker._lastPushHash
+
+        -- 4) ...and NOW the change filter engages normally again.
+        Tracker.Capture()
+        ck(fires == 3, "an identical capture pushed after a real delivery (fires=" .. fires .. ")")
+
+        -- 5) A later undelivered push rolls back to the PREVIOUS stamp, not to
+        --    nil, so FORCE_REFRESH_INTERVAL keeps measuring from the last genuine
+        --    delivery rather than restarting.
+        targets = 0
+        _G.IsResting = function() return false end
+        epochNow = epochNow + 5
+        Tracker.Capture()
+        ck(fires == 4, "a content change did not fire")
+        ck(Tracker._lastPushHash == deliveredHash,
+            "rollback did not restore the PREVIOUS delivered hash")
+        ck(Tracker._lastPushAt == epochNow - 5,
+            "rollback did not restore the previous delivery time")
+
+        -- 6) A transport that leaves the receipt UNSTAMPED (no mesh subscribed)
+        --    must not trigger a rollback — mesh-less builds keep old behaviour.
+        counting = false
+        Tracker._lastPushHash, Tracker._lastPushAt = nil, 0
+        _G.IsResting = function() return true end
+        Tracker.Capture()
+        ck(Tracker._lastPushHash ~= nil,
+            "an unstamped receipt was treated as a failed delivery")
+        counting = true
+    end)
+
+    counting = false
+
+    _G.C_UnitAuras, _G.C_Container, _G.C_Item, _G.C_Map = saved.auras, saved.cont, saved.item, saved.map
+    _G.GetTime, _G.IsResting = saved.getTime, saved.resting
+    _G.UnitIsPVP, _G.UnitIsPVPFreeForAll = saved.pvp, saved.ffa
+    _G.IsInInstance, _G.GetNumSavedInstances = saved.inInst, saved.savedInst
+    _G.GetSubZoneText, _G.GetMinimapZoneText = saved.sub, saved.mini
+    ns.Store.Now, ns.Store.GetSettings = saved.now, saved.settings
+    ns.Store.EnsureSelfCharacter, ns.Store.WriteSelfCharacter = saved.ensure, saved.write
+    ns.state.loggedIn = saved.loggedIn
+    Tracker._leavingWorld, Tracker._loggingOut, Tracker._enteredWorldAt = savedLatch[1], savedLatch[2], savedLatch[3]
+    Tracker._auraCapturedAt, Tracker._cdCapturedAt = savedLatch[4], savedLatch[5]
+    Tracker._lastPushHash, Tracker._lastPushAt = savedLatch[6], savedLatch[7]
+    Tracker._pushRollbacks = savedLatch[8]
+
+    if not ok then fails[#fails + 1] = "error in hash-after-send fixtures: " .. tostring(err) end
+end
+
+----------------------------------------------------------------------
+-- ARMED SAFETY NET: the 30s rescan ticker (spec §4.2).
+----------------------------------------------------------------------
+local function testSafetyRescan(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+
+    local savedTimer   = _G.C_Timer
+    local savedTicker  = Tracker._safetyTicker
+    local savedLoggedIn = ns.state.loggedIn
+    local savedLatch   = { Tracker._leavingWorld, Tracker._loggingOut }
+    local savedRequest = Tracker.RequestCapture
+    local savedCount   = Tracker._safetyRescans
+
+    -- Capture the interval + callback the ticker is armed with.
+    local armed, cancels = {}, 0
+    _G.C_Timer = {
+        After = function() end,
+        NewTicker = function(interval, fn)
+            armed[#armed + 1] = { interval = interval, fn = fn }
+            return { Cancel = function() cancels = cancels + 1 end }
+        end,
+    }
+
+    local requests = 0
+    Tracker.RequestCapture = function() requests = requests + 1 end
+    Tracker._safetyTicker = nil
+    Tracker._safetyRescans = 0
+
+    local ok, err = pcall(function()
+        Tracker.ArmSafetyRescan()
+        ck(#armed == 1, "ArmSafetyRescan did not create a ticker")
+        ck(armed[1] and armed[1].interval == 30,
+            "the rescan interval is " .. tostring(armed[1] and armed[1].interval) .. ", expected 30")
+        ck(Tracker.SAFETY_RESCAN_INTERVAL == 30, "SAFETY_RESCAN_INTERVAL is not 30s")
+
+        -- Idempotent: a second arm (a /reload path) must not stack tickers.
+        Tracker.ArmSafetyRescan()
+        ck(#armed == 1, "ArmSafetyRescan stacked a second ticker")
+
+        -- Logged in and live -> the tick requests a capture.
+        ns.state.loggedIn = true
+        Tracker._leavingWorld, Tracker._loggingOut = false, false
+        armed[1].fn()
+        ck(requests == 1, "the ticker did not request a capture (requests=" .. requests .. ")")
+        ck(Tracker._safetyRescans == 1, "the rescan was not counted")
+
+        -- Guard 1: not logged in -> no capture.
+        ns.state.loggedIn = false
+        armed[1].fn()
+        ck(requests == 1, "the ticker captured while logged out")
+
+        -- Guard 2: teardown -> no capture (the logout flush owns the final state).
+        ns.state.loggedIn = true
+        Tracker._loggingOut = true
+        armed[1].fn()
+        ck(requests == 1, "the ticker captured during teardown")
+        Tracker._loggingOut = false
+
+        -- Still live afterwards.
+        armed[1].fn()
+        ck(requests == 2, "the ticker stopped working after a guarded tick")
+
+        -- Disarm cancels and allows a clean re-arm.
+        Tracker.DisarmSafetyRescan()
+        ck(cancels == 1, "DisarmSafetyRescan did not cancel the ticker")
+        ck(Tracker._safetyTicker == nil, "the ticker handle was not cleared")
+        Tracker.ArmSafetyRescan()
+        ck(#armed == 2, "could not re-arm after a disarm")
+        Tracker.DisarmSafetyRescan()
+
+        -- No C_Timer.NewTicker at all (a bare environment) must not error.
+        _G.C_Timer = { After = function() end }
+        Tracker._safetyTicker = nil
+        ck(Tracker.ArmSafetyRescan() == nil, "arming without NewTicker should return nil")
+    end)
+
+    _G.C_Timer = savedTimer
+    Tracker._safetyTicker = savedTicker
+    ns.state.loggedIn = savedLoggedIn
+    Tracker._leavingWorld, Tracker._loggingOut = savedLatch[1], savedLatch[2]
+    Tracker.RequestCapture = savedRequest
+    Tracker._safetyRescans = savedCount
+
+    if not ok then fails[#fails + 1] = "error in safety-rescan fixtures: " .. tostring(err) end
+end
+
+----------------------------------------------------------------------
 -- A7 — the chronoboon CAST lifecycle. This is the suite that proves the
 -- headline fix: booned buffs are known WITHOUT ever hovering the icon.
 ----------------------------------------------------------------------
@@ -3515,6 +3822,8 @@ end
 function Tracker.RunSelfTests(verbose)
     local suites = {
         { name = "state-push change filter (A10.1)", fn = testChangeFilter },
+        { name = "hash-after-send rollback", fn = testHashAfterSend },
+        { name = "armed safety rescan (30s)", fn = testSafetyRescan },
         { name = "boon parsing", fn = testBoonParsing },
         { name = "boon block (owner 7-line fixture)", fn = testBoonBlock },
         { name = "live aura matching (apostrophe matrix)", fn = testLiveAuraMatching },
