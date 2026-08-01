@@ -12,6 +12,20 @@
   60s per account — but until every account has reloaded there is avoidable mesh
   chatter. Reload (or relog) all of your accounts once, together, and it stops.
 
+- Fixed: **the minimap button now plays nicely with minimap button managers when
+  LibDBIcon is available.** Addons that collect and tidy minimap buttons (Leatrix
+  Plus and friends) recognise buttons registered through the standard LibDBIcon
+  library and wrap anything else — which is why hovering our button showed *their*
+  message ("This is a custom button. Please ask the addon author to use the standard
+  LibDBIcon library instead") instead of our world-buff timers, and why clicks went
+  astray. If any addon you run provides LibDBIcon, Nexus now registers its button
+  through it as "DaseekiNexus": collectors list and manage it properly, and our own
+  tooltip and full click matrix come back. Your button keeps the spot you dragged it
+  to, and the Show/Lock settings still work exactly as before. If nothing on your
+  system provides LibDBIcon, the button behaves as it always has — and in that case
+  there is no button manager to interfere with it either. Nexus does not bundle the
+  library; it simply uses one when it is already there.
+
 - Fixed: **other accounts' characters stopped updating on screen.** Every inbound
   path wrote peer data into the store and then told nothing — the dashboard, cards
   and detail pane all repaint off a callback the receive handlers never fired. So a

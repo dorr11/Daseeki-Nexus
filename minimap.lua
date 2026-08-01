@@ -1,12 +1,33 @@
 -- Daseeki Nexus — minimap.lua
--- Standard minimap-ring launcher button (owner feedback 2b): parented to the
--- Minimap and angle-anchored on the ring like every other minimap button.
--- Position is stored as an angle in settings.minimap.angle; dragging slides the
--- button around the ring; SetPoint("CENTER", Minimap, "CENTER", x, y) is derived
--- from the angle via the standard LibDBIcon-style trig (reused from
--- Daseeki-Core/minimap.lua). This is safe because our button carries NO secure
--- bindings (the Alt+Left /camp logout is intentionally omitted), so anchoring to
--- the minimap cluster never makes the frame protected.
+-- Minimap launcher button with TWO backends and one shared brain.
+--
+-- BACKEND 1 (preferred): LibDBIcon-1.0, when some other installed addon has
+-- already embedded it (BugSack, Details, WeakAuras, Questie, DBM, Bartender4 …
+-- all do). We do NOT vendor the library: LibDBIcon is GPLv2-or-later (see its
+-- upstream header / its .toc "X-License: GPLv2 or later"), and Daseeki-Nexus
+-- ships only permissive libs. So we CONSUME it opportunistically via
+-- LibStub("LibDBIcon-1.0", true) and never redistribute it.
+--   Why this matters (owner symptom 2026-07-31): minimap-button managers such as
+--   Leatrix Plus intercept unrecognised custom buttons and replace their tooltip
+--   with "This is a custom button. Please ask the addon author to use the
+--   standard LibDBIcon library instead", swallowing our tooltip and clicks.
+--   Registering through LibDBIcon puts us in the collectors' managed lists and
+--   our own tooltip/clicks survive.
+--   Note lib:Register only asserts object.icon — it does NOT require the object
+--   be registered with LibDataBroker — so the data object below is LDB-SHAPED
+--   but needs no LDB dependency of its own.
+--
+-- BACKEND 2 (fallback): the original custom ring-anchored button, unchanged.
+-- It runs only when no LibDBIcon is present anywhere in the client — and in that
+-- situation, by definition, no LibDBIcon-based button manager is loaded either,
+-- so the interception symptom that motivated this migration cannot occur on the
+-- fallback path. It stays as the clean-install path.
+--
+-- Position: the lib backend stores its angle in settings.minimap.libIcon
+-- (LibDBIcon's own db shape: minimapPos/hide/lock) and is SEEDED ONCE from the
+-- custom path's settings.minimap.angle, so the button stays exactly where the
+-- owner dragged it. settings.minimap.angle is never written by the migration —
+-- the fallback keeps its own position intact.
 --
 -- Click matrix (owner directive 2026-07-31: SN parity — the muscle memory is
 -- "left-click the ball, everyone gets invited". This is an OWNER OVERRIDE of
@@ -22,8 +43,7 @@
 --                     Toggle dashboard / Invite online / Timers dock /
 --                     Cancel Buffs / Felwood map / Lock minimap button / Settings
 --   Alt+Left        (OMITTED) /camp logout — a secure /camp macro would make
---                   this frame PROTECTED, and it is exactly that omission that
---                   keeps ring-anchoring safe. Deferred; refusal print stays.
+--                   this frame PROTECTED. Deferred; refusal print stays.
 -- Alt is tested before Shift, so any Alt+Left combination lands on the refusal.
 --
 -- Clean-room build: functional reimplementation from spec; no third-party code.
@@ -41,6 +61,14 @@ end
 
 local FELWOOD_MAP = 1448
 
+-- LibDBIcon registration name. This is the string collectors/managers display,
+-- so it is the addon's public button identity.
+local ICON_NAME = "DaseekiNexus"
+local ICON_TEXTURE = "Interface\\Icons\\INV_Misc_Net_01"
+
+local BACKEND_LIB   = "lib"
+local BACKEND_FRAME = "frame"
+
 ----------------------------------------------------------------------
 -- Settings access
 ----------------------------------------------------------------------
@@ -55,9 +83,8 @@ local function minimapCfg()
 end
 
 ----------------------------------------------------------------------
--- Ring position math (angle -> x,y offset from Minimap center). Reused from
--- Daseeki-Core/minimap.lua (LibDBIcon-compatible), so our button sits on the
--- ring identically to the Core button and respects non-round minimap shapes.
+-- Ring position math (angle -> x,y offset from Minimap center). FALLBACK PATH
+-- ONLY — when LibDBIcon is driving, the library owns positioning entirely.
 ----------------------------------------------------------------------
 
 local MINIMAP_SHAPES = {
@@ -202,9 +229,14 @@ local function openSettings()
     end
 end
 
+-- Forward declaration: toggleLock re-applies state, which needs the backend
+-- router defined further down.
+local applyState
+
 local function toggleLock()
     local cfg = minimapCfg()
     cfg.lock = not cfg.lock
+    if applyState then applyState() end
     ns:Print(cfg.lock and "minimap button locked." or "minimap button unlocked (drag to move).")
 end
 
@@ -280,9 +312,11 @@ end
 
 ----------------------------------------------------------------------
 -- Click matrix. resolveClick is PURE (no frame, no globals) so the self-test can
--- drive every modifier combination directly; OnClick only reads the live
--- modifier state and dispatches. Keeping the two apart is what makes the matrix
--- testable headlessly.
+-- drive every modifier combination directly; sharedOnClick reads the live
+-- modifier state and dispatches. BOTH backends install sharedOnClick verbatim —
+-- LibDBIcon calls it as OnClick(frame, mouseButton) and the fallback frame calls
+-- it as its OnClick script with the same signature — so the matrix below is the
+-- single source of truth for click behaviour on either path.
 ----------------------------------------------------------------------
 
 local ACTION_INVITE      = "invite"           -- + raid convert / assist per settings
@@ -314,8 +348,193 @@ local CLICK_ACTIONS = {
     end,
 }
 
+-- dryRun / explicit modifiers exist so the self-test can drive the real dispatch
+-- path without touching Blizzard's modifier globals and without firing invites.
+local function dispatchClick(self, mouseButton, dryRun, shift, alt)
+    if shift == nil then
+        shift = (IsShiftKeyDown and IsShiftKeyDown()) and true or false
+        alt   = (IsAltKeyDown   and IsAltKeyDown())   and true or false
+    end
+    local action = resolveClick(mouseButton, shift, alt)
+    if not action then return nil end
+    if not dryRun then
+        local fn = CLICK_ACTIONS[action]
+        if fn then fn(self) end
+    end
+    return action
+end
+
+-- The one handler both backends install.
+local function sharedOnClick(self, mouseButton)
+    return dispatchClick(self, mouseButton)
+end
+
 ----------------------------------------------------------------------
--- Button construction (ring-anchored to the Minimap; both dims set at creation)
+-- Tooltip. buildTooltipModel takes its settings by argument and returns a plain
+-- description of the tooltip; renderTooltip writes that model into WHATEVER
+-- tooltip frame it is handed. LibDBIcon passes its OWN tooltip frame
+-- (LibDBIconTooltip) to OnTooltipShow — not GameTooltip — so the renderer must
+-- never reach for a global tooltip. The fallback path hands it GameTooltip.
+-- Same model, same lines, both backends.
+----------------------------------------------------------------------
+
+local function buildTooltipModel(cfg)
+    cfg = cfg or minimapCfg()
+    local rendT, rendC = cdStatus("rend")
+    local onyAT, onyAC = cdStatus("onyA")
+    local onyHT, onyHC = cdStatus("onyH")
+
+    local model = {
+        { k = "line",   text  = "Daseeki Nexus",                 color = "accent" },
+        { k = "double", left = "Rend",    right = rendT, color = "muted", token = rendC },
+        { k = "double", left = "Ony (A)", right = onyAT, color = "muted", token = onyAC },
+        { k = "double", left = "Ony (H)", right = onyHT, color = "muted", token = onyHC },
+        { k = "blank" },
+        { k = "line",   text = "Left: invite online",            color = "faint" },
+        { k = "line",   text = "Shift-Left: invite, no convert", color = "faint" },
+        { k = "line",   text = "Right: toggle dashboard",        color = "faint" },
+        { k = "line",   text = "Shift-Right: menu",              color = "faint" },
+    }
+    if not cfg.lock then
+        model[#model + 1] = { k = "line", text = "Drag to move", color = "faint" }
+    end
+    return model
+end
+
+local function renderTooltip(tt, model)
+    if not tt then return end
+    model = model or buildTooltipModel()
+    for _, e in ipairs(model) do
+        if e.k == "double" then
+            tt:AddDoubleLine(e.left, e.right, UI.Color(e.color))
+        elseif e.k == "blank" then
+            tt:AddLine(" ")
+        else
+            tt:AddLine(e.text, UI.Color(e.color))
+        end
+    end
+end
+
+-- LibDBIcon's OnTooltipShow contract: it has already set the owner, anchored and
+-- cleared the frame, and it calls tt:Show() afterwards. We only add lines.
+local function sharedOnTooltipShow(tt)
+    renderTooltip(tt, buildTooltipModel())
+end
+
+----------------------------------------------------------------------
+-- BACKEND 1 — LibDBIcon
+----------------------------------------------------------------------
+
+local iconLib          -- the live LibDBIcon handle, once registered
+local backend          -- BACKEND_LIB | BACKEND_FRAME
+
+local function getIconLib()
+    if not _G.LibStub then return nil end
+    local ok, lib = pcall(LibStub, "LibDBIcon-1.0", true)
+    if ok then return lib end
+    return nil
+end
+
+-- Pure backend decision, so the self-test can assert both arms.
+local function chooseBackend(lib)
+    if lib and type(lib.Register) == "function" then return BACKEND_LIB end
+    return BACKEND_FRAME
+end
+
+-- One-time settings migration into LibDBIcon's db shape. IDEMPOTENT: minimapPos
+-- is seeded from the custom path's angle only when it has never been set, so the
+-- button lands exactly where the owner dragged it and LibDBIcon's own drag
+-- writes win thereafter. settings.minimap.angle is deliberately left untouched —
+-- the fallback path keeps its position if the lib ever disappears.
+local function migrateLibDB(cfg)
+    cfg = cfg or minimapCfg()
+    local db = cfg.libIcon
+    if type(db) ~= "table" then
+        db = {}
+        cfg.libIcon = db
+    end
+    if type(db.minimapPos) ~= "number" then
+        db.minimapPos = tonumber(cfg.angle) or DEFAULT_ANGLE
+    end
+    -- hide/lock stay slaved to the settings keys the options checkboxes write.
+    db.hide = cfg.hide and true or false
+    db.lock = cfg.lock and true or false
+    return db
+end
+
+local function buildDataObject()
+    -- LDB launcher shape, handed straight to LibDBIcon (no LibDataBroker
+    -- dependency — lib:Register only requires .icon).
+    return {
+        type          = "launcher",
+        label         = "Daseeki Nexus",
+        text          = "Daseeki Nexus",
+        icon          = ICON_TEXTURE,
+        OnClick       = sharedOnClick,
+        OnTooltipShow = sharedOnTooltipShow,
+    }
+end
+
+local function applyLibState(lib, cfg)
+    cfg = cfg or minimapCfg()
+    local db = migrateLibDB(cfg)
+    if cfg.hide then lib:Hide(ICON_NAME) else lib:Show(ICON_NAME) end
+    if cfg.lock then lib:Lock(ICON_NAME) else lib:Unlock(ICON_NAME) end
+    return db
+end
+
+local function registerWithLib(lib, cfg)
+    cfg = cfg or minimapCfg()
+    local db  = migrateLibDB(cfg)
+    local obj = buildDataObject()
+    if not (lib.IsRegistered and lib:IsRegistered(ICON_NAME)) then
+        lib:Register(ICON_NAME, obj, db)
+    end
+    applyLibState(lib, cfg)
+    return obj, db
+end
+
+-- LibDBIcon renders OnTooltipShow ONCE, on enter — it has no re-show timer, so
+-- the world-buff countdowns would freeze while the cursor rests on the button.
+-- This adds a 1s re-render that does NOT fight the library: we only hook
+-- (additively) the button's OnEnter/OnLeave and, between them, re-fill the
+-- library's own tooltip frame with ClearLines + our model. Owner, anchor and
+-- lifecycle stay entirely the library's. If the hooks are unavailable we simply
+-- accept render-on-enter.
+local ttDriver
+
+local function startTooltipTicker(lib)
+    if not (lib.GetMinimapButton and CreateFrame) then return false end
+    local btn = lib:GetMinimapButton(ICON_NAME)
+    if not (btn and type(btn.HookScript) == "function") then return false end
+
+    ttDriver = ttDriver or CreateFrame("Frame")
+    local accum = 0
+
+    btn:HookScript("OnEnter", function()
+        accum = 0
+        ttDriver:SetScript("OnUpdate", function(_, elapsed)
+            accum = accum + (elapsed or 0)
+            if accum < 1 then return end
+            accum = 0
+            local tt = lib.tooltip
+            if tt and tt.IsShown and tt:IsShown() and tt.ClearLines then
+                tt:ClearLines()
+                renderTooltip(tt, buildTooltipModel())
+                tt:Show()
+            end
+        end)
+    end)
+    btn:HookScript("OnLeave", function()
+        ttDriver:SetScript("OnUpdate", nil)
+    end)
+    return true
+end
+
+----------------------------------------------------------------------
+-- BACKEND 2 — the original custom button (clean-install fallback; behaviour
+-- unchanged. Its tooltip body now goes through the shared renderer so both
+-- backends are guaranteed to show identical lines).
 ----------------------------------------------------------------------
 
 local button
@@ -336,7 +555,7 @@ local function buildButton()
     local icon = b:CreateTexture(nil, "ARTWORK")
     icon:SetSize(19, 19)
     icon:SetPoint("CENTER", b, "CENTER", 0, 0)
-    icon:SetTexture("Interface\\Icons\\INV_Misc_Net_01")
+    icon:SetTexture(ICON_TEXTURE)
     icon:SetTexCoord(0.08, 0.92, 0.08, 0.92)
     b._icon = icon
 
@@ -379,30 +598,11 @@ local function buildButton()
         self._moving = false
     end)
 
-    b:SetScript("OnClick", function(self, mouseButton)
-        local action = resolveClick(mouseButton, IsShiftKeyDown(), IsAltKeyDown())
-        local fn = action and CLICK_ACTIONS[action]
-        if fn then fn(self) end
-    end)
+    b:SetScript("OnClick", sharedOnClick)
 
     b:SetScript("OnEnter", function(self)
         GameTooltip:SetOwner(self, "ANCHOR_LEFT")
-        GameTooltip:AddLine("Daseeki Nexus", UI.Color("accent"))
-        -- Live world-buff states.
-        local rendT, rendC = cdStatus("rend")
-        local onyAT, onyAC = cdStatus("onyA")
-        local onyHT, onyHC = cdStatus("onyH")
-        GameTooltip:AddDoubleLine("Rend",     rendT, UI.Color("muted"))
-        GameTooltip:AddDoubleLine("Ony (A)",  onyAT, UI.Color("muted"))
-        GameTooltip:AddDoubleLine("Ony (H)",  onyHT, UI.Color("muted"))
-        GameTooltip:AddLine(" ")
-        GameTooltip:AddLine("Left: invite online",             UI.Color("faint"))
-        GameTooltip:AddLine("Shift-Left: invite, no convert",  UI.Color("faint"))
-        GameTooltip:AddLine("Right: toggle dashboard",         UI.Color("faint"))
-        GameTooltip:AddLine("Shift-Right: menu",               UI.Color("faint"))
-        if not minimapCfg().lock then
-            GameTooltip:AddLine("Drag to move",              UI.Color("faint"))
-        end
+        renderTooltip(GameTooltip, buildTooltipModel())
         GameTooltip:Show()
         -- keep tooltip cooldown times live while hovered
         self._ttAccum = 0
@@ -425,10 +625,19 @@ local function buildButton()
     return b
 end
 
--- Apply saved ring angle + visibility.
-local function applyState()
-    if not button then return end
+----------------------------------------------------------------------
+-- Backend router + public API (Button.Toggle / Button.Refresh unchanged for
+-- callers; they now drive whichever backend is live).
+----------------------------------------------------------------------
+
+-- (declared local above, assigned here so toggleLock can reach it)
+function applyState()
     local cfg = minimapCfg()
+    if backend == BACKEND_LIB and iconLib then
+        ns:SafeCall(applyLibState, iconLib, cfg)
+        return
+    end
+    if not button then return end
     updatePosition(button, cfg.angle or DEFAULT_ANGLE)
     if cfg.hide then button:Hide() else button:Show() end
 end
@@ -441,13 +650,67 @@ function Button.Toggle()
     applyState()
 end
 
+-- Diagnostics / release beacon: which path is live this session.
+function Button.Backend() return backend end
+
+----------------------------------------------------------------------
+-- Settings observer. options.lua's "Show minimap button" / "Lock button
+-- position" checkboxes write DaseekiNexusDB.minimap.hide / .lock directly and
+-- call nothing back — so this module WATCHES those two keys rather than
+-- requiring an options.lua edit. Half-second poll, two boolean compares, and it
+-- only touches the backend when a value actually changed.
+----------------------------------------------------------------------
+
+local observer, lastHide, lastLock
+
+local function startSettingsObserver()
+    if not CreateFrame then return end
+    observer = observer or CreateFrame("Frame")
+    local cfg = minimapCfg()
+    lastHide = cfg.hide and true or false
+    lastLock = cfg.lock and true or false
+    local accum = 0
+    observer:SetScript("OnUpdate", function(_, elapsed)
+        accum = accum + (elapsed or 0)
+        if accum < 0.5 then return end
+        accum = 0
+        local c = minimapCfg()
+        local h = c.hide and true or false
+        local l = c.lock and true or false
+        if h ~= lastHide or l ~= lastLock then
+            lastHide, lastLock = h, l
+            applyState()
+        end
+    end)
+end
+
 ----------------------------------------------------------------------
 -- Wiring
 ----------------------------------------------------------------------
 
 ns:On("LOGIN", function()
-    if not button then button = buildButton() end
+    local lib = getIconLib()
+    local ok  = false
+
+    if chooseBackend(lib) == BACKEND_LIB then
+        ok = pcall(registerWithLib, lib, minimapCfg())
+        if ok then
+            iconLib = lib
+            backend = BACKEND_LIB
+            pcall(startTooltipTicker, lib)
+        end
+    end
+
+    if not ok then
+        -- No LibDBIcon anywhere in the client (or it refused us): run the
+        -- original custom button. No LibDBIcon also means no LibDBIcon-based
+        -- button manager is loaded, so the interception symptom cannot arise.
+        backend = BACKEND_FRAME
+        if not button then button = buildButton() end
+    end
+
     ns:SafeCall(applyState)
+    ns:SafeCall(startSettingsObserver)
 end)
 
 ns:RegisterSelfTest("minimap", function(verbose)
@@ -496,6 +759,138 @@ ns:RegisterSelfTest("minimap", function(verbose)
                            ACTION_MENU, ACTION_ALT_REFUSED }) do
         check(type(CLICK_ACTIONS[act]) == "function", "click action wired: " .. act)
     end
+
+    ------------------------------------------------------------------
+    -- Backend selection (LibDBIcon present vs absent).
+    ------------------------------------------------------------------
+    check(chooseBackend(nil) == BACKEND_FRAME,
+          "no LibDBIcon -> custom-button fallback backend")
+    check(chooseBackend({}) == BACKEND_FRAME,
+          "a LibDBIcon-shaped table without Register is not usable")
+    check(chooseBackend({ Register = function() end }) == BACKEND_LIB,
+          "LibDBIcon present -> library backend")
+
+    ------------------------------------------------------------------
+    -- Settings migration: minimap {hide, lock, angle} -> LibDBIcon db shape.
+    ------------------------------------------------------------------
+    local cfg = { angle = 137, hide = true, lock = true }
+    local db  = migrateLibDB(cfg)
+    check(db.minimapPos == 137, "migration seeds minimapPos from the dragged angle")
+    check(db.hide == true and db.lock == true, "migration passes hide/lock through")
+    check(cfg.angle == 137, "migration never destroys the fallback path's angle")
+    check(cfg.libIcon == db, "migrated db is persisted on settings.minimap.libIcon")
+    -- Idempotent: a later drag moved the lib button; re-running must not reseed.
+    db.minimapPos = 42
+    local db2 = migrateLibDB(cfg)
+    check(db2 == db and db.minimapPos == 42,
+          "re-migration keeps LibDBIcon's own position (one-time seed only)")
+    -- No stored angle at all -> the default ring slot.
+    local fresh = migrateLibDB({})
+    check(fresh.minimapPos == DEFAULT_ANGLE, "no saved angle -> DEFAULT_ANGLE")
+    check(fresh.hide == false and fresh.lock == false, "fresh db defaults to shown+unlocked")
+
+    ------------------------------------------------------------------
+    -- Registration against a fake LibDBIcon: correct name, LDB-shaped object,
+    -- migrated db handed to the lib, hide/lock routed through the lib API.
+    ------------------------------------------------------------------
+    local function fakeLib()
+        local L = { calls = {}, registered = false }
+        function L:Register(name, obj, d)
+            self.calls[#self.calls + 1] = "Register"
+            self.name, self.obj, self.db, self.registered = name, obj, d, true
+        end
+        function L:IsRegistered(name) return self.registered and self.name == name end
+        function L:Hide()   self.calls[#self.calls + 1] = "Hide";   self.hidden = true  end
+        function L:Show()   self.calls[#self.calls + 1] = "Show";   self.hidden = false end
+        function L:Lock()   self.calls[#self.calls + 1] = "Lock";   self.locked = true  end
+        function L:Unlock() self.calls[#self.calls + 1] = "Unlock"; self.locked = false end
+        return L
+    end
+
+    local L = fakeLib()
+    local scfg = { angle = 90, hide = false, lock = false }
+    local obj, rdb = registerWithLib(L, scfg)
+    check(L.registered and L.name == ICON_NAME,
+          "registers under the public button name \"" .. ICON_NAME .. "\"")
+    check(L.obj == obj and L.db == rdb, "the migrated db + data object reach the lib")
+    check(rdb.minimapPos == 90, "registration carries the migrated position")
+    check(obj.icon == ICON_TEXTURE, "data object carries our icon (lib:Register requires it)")
+    check(obj.type == "launcher", "data object is LDB launcher-shaped")
+    check(obj.OnClick == sharedOnClick, "LDB backend drives the SHARED click handler")
+    check(obj.OnTooltipShow == sharedOnTooltipShow, "LDB backend drives the SHARED tooltip")
+    check(L.hidden == false and L.locked == false, "shown+unlocked routed to the lib")
+    -- Re-register must not double-register; state still re-applies.
+    scfg.hide, scfg.lock = true, true
+    registerWithLib(L, scfg)
+    local registerCalls = 0
+    for _, c in ipairs(L.calls) do if c == "Register" then registerCalls = registerCalls + 1 end end
+    check(registerCalls == 1, "already-registered button is never registered twice")
+    check(L.hidden == true and L.locked == true,
+          "checkbox writes to minimap.hide/.lock route through lib:Hide/lib:Lock")
+
+    ------------------------------------------------------------------
+    -- Click matrix driven through the REAL dispatcher both backends install.
+    ------------------------------------------------------------------
+    local function click(btn, shift, alt) return dispatchClick(nil, btn, true, shift, alt) end
+    check(click("LeftButton",   false, false) == ACTION_INVITE,      "dispatch: Left -> invite")
+    check(click("LeftButton",   true,  false) == ACTION_INVITE_ONLY, "dispatch: Shift+Left -> invite, no convert")
+    check(click("RightButton",  false, false) == ACTION_DASHBOARD,   "dispatch: Right -> dashboard")
+    check(click("RightButton",  true,  false) == ACTION_MENU,        "dispatch: Shift+Right -> menu")
+    check(click("LeftButton",   false, true)  == ACTION_ALT_REFUSED, "dispatch: Alt+Left -> refusal")
+    check(click("MiddleButton", false, false) == nil,                "dispatch: unbound button -> nil")
+
+    ------------------------------------------------------------------
+    -- Tooltip content, rendered through the LDB OnTooltipShow callback into a
+    -- recording tooltip (proves the lib backend emits our lines into the frame
+    -- the library hands us, not GameTooltip).
+    ------------------------------------------------------------------
+    local function recorder()
+        local r = { lines = {} }
+        function r:AddLine(text) self.lines[#self.lines + 1] = { k = "line", text = text } end
+        function r:AddDoubleLine(l, rt) self.lines[#self.lines + 1] = { k = "double", left = l, right = rt } end
+        function r:ClearLines() self.lines = {} end
+        function r:Show() self.shown = true end
+        return r
+    end
+
+    local rec = recorder()
+    sharedOnTooltipShow(rec)
+    local L1 = rec.lines
+    check(L1[1] and L1[1].k == "line" and L1[1].text == "Daseeki Nexus", "tooltip header")
+    check(L1[2] and L1[2].k == "double" and L1[2].left == "Rend",    "tooltip Rend doubleline")
+    check(L1[3] and L1[3].k == "double" and L1[3].left == "Ony (A)", "tooltip Ony (A) doubleline")
+    check(L1[4] and L1[4].k == "double" and L1[4].left == "Ony (H)", "tooltip Ony (H) doubleline")
+    check(L1[5] and L1[5].k == "line" and L1[5].text == " ",         "tooltip blank separator")
+    check(L1[6] and L1[6].text == "Left: invite online",             "tooltip hint 1")
+    check(L1[7] and L1[7].text == "Shift-Left: invite, no convert",  "tooltip hint 2")
+    check(L1[8] and L1[8].text == "Right: toggle dashboard",         "tooltip hint 3")
+    check(L1[9] and L1[9].text == "Shift-Right: menu",               "tooltip hint 4")
+
+    -- Drag hint is conditional on the lock setting, on BOTH backends.
+    local unlocked = buildTooltipModel({ lock = false })
+    check(unlocked[#unlocked].text == "Drag to move", "unlocked -> \"Drag to move\" hint")
+    local locked = buildTooltipModel({ lock = true })
+    check(locked[#locked].text == "Shift-Right: menu", "locked -> no drag hint")
+    check(#unlocked == #locked + 1, "the drag hint is the only lock-dependent line")
+
+    -- The fallback path renders the SAME model through the SAME renderer, so a
+    -- recorder fed that model must match the lib path line-for-line.
+    local rec2 = recorder()
+    renderTooltip(rec2, buildTooltipModel())
+    check(#rec2.lines == #L1, "fallback renderer emits the same line count as the lib path")
+    local sameLines = true
+    for i = 1, #L1 do
+        local a, b = L1[i], rec2.lines[i]
+        if not b or a.k ~= b.k or a.text ~= b.text or a.left ~= b.left then sameLines = false end
+    end
+    check(sameLines, "both backends render identical tooltip lines")
+
+    -- ClearLines + re-render is exactly what the 1s mid-hover refresh does.
+    rec2:ClearLines()
+    check(#rec2.lines == 0, "recorder clears")
+    renderTooltip(rec2, buildTooltipModel())
+    check(#rec2.lines == #L1, "mid-hover refresh re-renders a full tooltip")
+
     if verbose then ns:Print("  minimap selftest " .. (pass and "PASS" or "FAIL")) end
     return pass
 end)
