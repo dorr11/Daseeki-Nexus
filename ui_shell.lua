@@ -99,7 +99,15 @@ end
 -- FIXED slot layout. AURA_META mirrors that slot layout exactly (index == slot)
 -- and adds presentation (name/short) plus the per-faction threshold key used to
 -- color the buff (spec §2's 9 configurable auras). Slots without a threshold
--- key (Silithyst, Boon of Blackfathom) are always optional.
+-- key (the seasonal Fire Festival Fury tail slot) are always optional.
+--
+-- ⚠ DRIFT IS A DISPLAY BUG. The tracker moved slots 9/10 off the retired
+-- Traces of Silithyst / Boon of Blackfathom and onto Battle Shout (25101) and
+-- Fire Festival Fury (29338/29846) — this table did not follow, so a warrior's
+-- Battle Shout painted as "Traces of Silithyst" on every card, tile and
+-- tooltip. The slot map is now cross-checked against the tracker's own
+-- matchers by the "aura slot map agreement" self-test below, which fails loudly
+-- the next time either side moves alone.
 --
 -- ICON SOURCE OF TRUTH (owner feedback #1 — "buff icons arent correct"): icons
 -- are NOT hardcoded Interface\Icons guesses any more. Each slot carries the
@@ -113,8 +121,12 @@ end
 -- GetFactionSettings().auraOpts.thresholds, and that the importer
 -- (import.lua AURA_SLOT_KEY) resolves SN's positional thresholds onto. Keys
 -- (exact, case-sensitive): dmf, ony, dmtAP, dmtSP, dmtStam, songflower, zg,
--- rend (+ battleShout, which has no storage slot). `spellID` values mirror
--- options.lua AURA_DEFS one-for-one; the two tail slots add their own real IDs.
+-- rend, battleShout — battleShout now DOES own a storage slot (9), so its
+-- seeded thresholds and its seeded class map both drive a real display row.
+-- `spellID` values mirror options.lua AURA_DEFS one-for-one for slots 1-8; the
+-- two tail slots carry the IDs the TRACKER matches on (25101 / 29338), not the
+-- options page's player-cast Battle Shout art id — the icon must belong to the
+-- buff that actually landed in the slot.
 ----------------------------------------------------------------------
 
 Dashboard.AURA_META = {
@@ -126,9 +138,18 @@ Dashboard.AURA_META = {
     [6]  = { key = "dmtap",     name = "Fengus' Ferocity",                 short = "AP",   thresholdKey = "dmtAP",      spellID = 22817 },
     [7]  = { key = "dmtstam",   name = "Mol'dar's Moxie",                  short = "Stam", thresholdKey = "dmtStam",    spellID = 22818 },
     [8]  = { key = "dmtsp",     name = "Slip'kik's Savvy",                 short = "SP",   thresholdKey = "dmtSP",      spellID = 22820 },
-    [9]  = { key = "silithyst", name = "Traces of Silithyst",             short = "Sili", thresholdKey = nil,          spellID = 29534 },
-    [10] = { key = "boon",      name = "Boon of Blackfathom",              short = "BFD",  thresholdKey = nil,          spellID = 430947 },
+    [9]  = { key = "battleshout",name = "Battle Shout",                    short = "BS",   thresholdKey = "battleShout",spellID = 25101,  iconSpellID = 6673  },
+    [10] = { key = "fff",       name = "Fire Festival Fury",               short = "FFF",  thresholdKey = nil,          spellID = 29338,  iconSpellID = 29846 },
 }
+
+-- `iconSpellID` is ART ONLY, never identity: the two tail slots key on the ID the
+-- TRACKER matches (25101 NPC Battle Shout / 29338 FFF), and those are the IDs the
+-- drift self-test pins. But an ID the client cannot resolve renders a question
+-- mark, and 25101 is an NPC-cast spell — so each tail slot names a second, always-
+-- loadable spell with the SAME artwork (6673 = the player Battle Shout the options
+-- page already draws; 29846 = FFF's alternate id) for AuraIcon to fall back to
+-- before it gives up. Identity stays with `spellID`; only the texture may come
+-- from `iconSpellID`.
 
 -- Explicit unknown marker (Blizzard built-in) — NOT a guess at any buff's art,
 -- just the graceful fallback when a spell/item icon cannot be resolved.
@@ -137,23 +158,28 @@ local QUESTION_ICON = "Interface\\Icons\\INV_Misc_QuestionMark"
 -- Resolve a tracked-aura slot's icon from its real spellID. Catalog-verified
 -- (build 1.15.9): C_Spell.GetSpellTexture(spellID) -> iconID, with the legacy
 -- global GetSpellTexture as a fallback. Successful lookups are cached; a nil
--- (spell not loaded / not in this client, e.g. the SoD-only Boon) is NOT cached
--- so a later refresh retries, and renders the question mark until then.
+-- (spell not loaded / not in this client) is NOT cached so a later refresh
+-- retries, and renders the question mark until then.
+--
+-- Two IDs are tried in order: the slot's identity `spellID` first, then the
+-- art-only `iconSpellID` for the tail slots whose identity id is an NPC cast the
+-- client may not hand us a texture for (see the note on AURA_META).
+-- Exposed ONLY so the self-test can evict what it faked: running /nexus selftest
+-- in-game must not leave a stub texture cached on a live slot.
 local _auraIconCache = {}
+Dashboard._auraIconCache = _auraIconCache
+local function spellTexture(id)
+    if not id then return nil end
+    if C_Spell and C_Spell.GetSpellTexture then return C_Spell.GetSpellTexture(id) end
+    if GetSpellTexture then return GetSpellTexture(id) end
+    return nil
+end
 function Dashboard.AuraIcon(slot)
     local meta = Dashboard.AURA_META[slot]
     if not meta then return QUESTION_ICON end
     local cached = _auraIconCache[slot]
     if cached then return cached end
-    local tex
-    local id = meta.spellID
-    if id then
-        if C_Spell and C_Spell.GetSpellTexture then
-            tex = C_Spell.GetSpellTexture(id)
-        elseif GetSpellTexture then
-            tex = GetSpellTexture(id)
-        end
-    end
+    local tex = spellTexture(meta.spellID) or spellTexture(meta.iconSpellID)
     if tex then _auraIconCache[slot] = tex; return tex end
     return QUESTION_ICON
 end
@@ -174,8 +200,14 @@ function Dashboard.ItemIcon(itemID, fallback)
 end
 
 -- Presentation order for the card's collapsing icon strip (spec §1): DMF, Ony,
--- ZG, DMT-AP, DMT-SP, DMT-STAM, Songflower, Rend, then the two optional tail
--- slots. Values are slot indices into AURA_META / auraStates.
+-- ZG, DMT-AP, DMT-SP, DMT-STAM, Songflower, Rend, then the two tail slots.
+-- Values are slot indices into AURA_META / auraStates.
+--
+-- The tail is still the right home for the new 9/10: Battle Shout is a 13-minute
+-- buff (vs the hours-long world buffs ahead of it) and only two classes are even
+-- ruled to want it, and FFF is seasonal — both belong AFTER the long-lived set
+-- the owner reads first, exactly where the retired tail slots sat. Rend keeps
+-- the last "real" world-buff position immediately before them.
 Dashboard.AURA_DISPLAY_ORDER = { 5, 1, 3, 6, 8, 7, 4, 2, 9, 10 }
 
 -- Default thresholds (seconds) when the hub has not been configured yet, so the
@@ -804,30 +836,38 @@ end
 -- on what a MISSING slot should look like.
 --
 -- Rules (spec §1):
---   * Rend (slot 2) and Slip'kik's Savvy / DMT SP (slot 8) are governed by
---     per-class rule maps GetFactionSettings().auraOpts.{rend,dmtSP}
+--   * Rend (slot 2), Slip'kik's Savvy / DMT SP (slot 8) and Battle Shout
+--     (slot 9) are governed by per-class rule maps
+--     GetFactionSettings().auraOpts.{rend,dmtSP,battleShout}
 --     {required|optional|ignored}[class] (see CLASS_RULED_KEYS). Ignored
 --     classes are non-applicable (hidden); optional = greyed-no-border when
 --     missing; required = danger border / red "Missing". Slip'kik defaults
---     physical classes (War/Rogue/Hunter) to ignored, casters to optional.
+--     physical classes (War/Rogue/Hunter) to ignored, casters to optional;
+--     Battle Shout ships Warrior/Rogue required and every other class ignored.
 --   * Every other threshold-bearing world buff (Ony/ZG/Songflower/DMF/DMT AP/
 --     DMT Stam) is required-by-default: applicable + "required" for everyone.
---   * The two tail slots without a threshold key (Silithyst, Boon of Blackfathom)
---     are OPTIONAL and treated as non-applicable when ABSENT, so they collapse
---     out of the strip/detail instead of littering every card with two grey
---     seasonal/PvP icons (spec §1 "seasonal-absent hidden"; style-guide prime
---     directive "clean and compact"). When PRESENT they still render normally.
+--   * The tail slot without a threshold key (the seasonal Fire Festival Fury)
+--     is OPTIONAL and treated as non-applicable when ABSENT, so it collapses
+--     out of the strip/detail instead of littering every card with a grey
+--     seasonal icon (spec §1 "seasonal-absent hidden"; style-guide prime
+--     directive "clean and compact"). When PRESENT it still renders normally.
 --     ⚠ Deviation from a literal "all others required-by-default": the tail
---     slots stay optional/collapsing — flagged for cheap owner override.
---   * Battle Shout has no storage slot here, so its class map drives no display
---     row (the engine still consumes it elsewhere).
+--     slot stays optional/collapsing — flagged for cheap owner override.
 ----------------------------------------------------------------------
 
 -- Threshold keys whose applicability is governed by a per-class
 -- required/optional/ignored map in auraOpts (keyed identically to the
 -- thresholdKey). Rend was the first; Slip'kik's Savvy (dmtSP) joins it so
 -- physical classes hide it by default while casters see it as optional.
-local CLASS_RULED_KEYS = { rend = true, dmtSP = true }
+--
+-- battleShout is the THIRD, and it is not optional bookkeeping: the moment
+-- slot 9 became Battle Shout it gained a thresholdKey, and a threshold-bearing
+-- slot is required-by-default for EVERY class. Without this entry a mage,
+-- priest, druid — every non-shout-carrier — would sprout a permanent red
+-- "Missing Battle Shout" tile. Listing it here hands the slot to the B12 seeds
+-- (Store.CLASS_RULE_SEEDS: Warrior/Rogue required, everyone else ignored), so
+-- warriors and rogues see a real requirement and nobody else sees anything.
+local CLASS_RULED_KEYS = { rend = true, dmtSP = true, battleShout = true }
 
 -- Class rule state for an aura opt map ("rend"/"battleShout"/"dmtSP") on a faction.
 function Dashboard.ClassRuleState(optKey, classTag, faction)
@@ -1553,6 +1593,130 @@ local function testAuraClassRules(fails)
     -- Regression guard: a non-class-ruled buff (ZG, slot 3) stays required.
     local a5, r5 = Dashboard.AuraRequirement(3, { classTag = "ROGUE" }, FAC)
     ck(a5 == true and r5 == "required", "ZG stays required-by-default (not class-ruled)")
+
+    -- ---- Battle Shout (slot 9) class-ruling matrix -------------------------
+    -- Slot 9 gained a thresholdKey the day it became Battle Shout, and a
+    -- threshold-bearing slot is required-by-default for EVERYONE. If
+    -- CLASS_RULED_KEYS ever loses `battleShout` again, every caster in the
+    -- roster grows a permanent red "Missing Battle Shout" tile — these four
+    -- assertions are the tripwire.
+    local BS_SLOT = 9
+    local aW, rW = Dashboard.AuraRequirement(BS_SLOT, { classTag = "WARRIOR" }, FAC)
+    ck(aW == true and rW == "required", "battleShout seeded default: Warrior is applicable+required")
+    local aR, rR = Dashboard.AuraRequirement(BS_SLOT, { classTag = "ROGUE" }, FAC)
+    ck(aR == true and rR == "required", "battleShout seeded default: Rogue is applicable+required")
+    local aM = Dashboard.AuraRequirement(BS_SLOT, { classTag = "MAGE" }, FAC)
+    ck(aM == false, "battleShout seeded default: Mage is IGNORED (no red missing tile)")
+    local aP = Dashboard.AuraRequirement(BS_SLOT, { classTag = "PRIEST" }, FAC)
+    ck(aP == false, "battleShout seeded default: Priest is IGNORED (no red missing tile)")
+    -- A classless record must not be treated as required either.
+    ck(Dashboard.AuraRequirement(BS_SLOT, {}, FAC) == false,
+       "battleShout with no classTag -> non-applicable, never required")
+end
+
+-- Self-test: AURA_META agrees with the TRACKER's slot map (drift guard).
+--
+-- THE REGRESSION THIS EXISTS FOR: the tracker moved slots 9/10 onto Battle
+-- Shout (25101) and Fire Festival Fury (29338/29846); AURA_META went on
+-- declaring Traces of Silithyst / Boon of Blackfathom. Storage and presentation
+-- live in two files, so a captured Battle Shout rendered — name, icon, tooltip,
+-- everywhere — as Silithyst. Nothing but a test can keep the two honest.
+--
+-- The tracker is owned elsewhere, so this consumes it READ-ONLY through the two
+-- matchers it already exposes for the live aura scan (Tracker.MatchBuffSlotByID
+-- / Tracker.MatchBuffSlot) — the same code the wire path runs, not a private
+-- copy of its tables. When the tracker is absent (a headless host that only
+-- loads the UI), the hardcoded pairs below still pin AURA_META on their own.
+local AURA_SLOT_EXPECTED = {
+    [1]  = { key = "ony",        spellID = 22888 },
+    [2]  = { key = "rend",       spellID = 16609 },
+    [3]  = { key = "zg",         spellID = 24425 },
+    [4]  = { key = "songflower", spellID = 15366 },
+    [5]  = { key = "dmf",        spellID = 23768 },
+    [6]  = { key = "dmtap",      spellID = 22817 },
+    [7]  = { key = "dmtstam",    spellID = 22818 },
+    [8]  = { key = "dmtsp",      spellID = 22820 },
+    [9]  = { key = "battleshout",spellID = 25101 },   -- NPC "Fallen Hero" cast
+    [10] = { key = "fff",        spellID = 29338 },   -- seasonal (alt id 29846)
+}
+
+local function testAuraSlotMap(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local META = Dashboard.AURA_META
+    ck(type(META) == "table", "AURA_META exists")
+    if type(META) ~= "table" then return end
+
+    local seenKey = {}
+    for slot = 1, 10 do
+        local meta, want = META[slot], AURA_SLOT_EXPECTED[slot]
+        if not meta then
+            ck(false, ("AURA_META[%d] is missing"):format(slot))
+        else
+            ck(meta.key == want.key,
+               ("slot %d key %q, expected %q"):format(slot, tostring(meta.key), want.key))
+            ck(meta.spellID == want.spellID,
+               ("slot %d spellID %s, expected %d"):format(slot, tostring(meta.spellID), want.spellID))
+            ck(type(meta.name) == "string" and meta.name ~= "", ("slot %d has a display name"):format(slot))
+            ck(type(meta.short) == "string" and meta.short ~= "", ("slot %d has a short label"):format(slot))
+            ck(not seenKey[meta.key], ("slot %d key %q is not unique"):format(slot, tostring(meta.key)))
+            seenKey[meta.key] = true
+        end
+    end
+    ck(META[11] == nil, "AURA_META stops at 10 (the tracker's slot budget)")
+
+    -- Cross-check against the tracker itself, both ways: the ID we paint the
+    -- icon from must land in the slot we paint it into, and the name we print
+    -- must match the prefix the tracker files that slot under.
+    local T = ns.Tracker
+    if T and T.MatchBuffSlotByID and T.MatchBuffSlot then
+        for slot = 1, 10 do
+            local meta = META[slot]
+            if meta then
+                local byID = T.MatchBuffSlotByID(meta.spellID)
+                ck(byID == slot,
+                   ("DRIFT: tracker files spellID %s in slot %s, AURA_META shows it as slot %d (%s)")
+                       :format(tostring(meta.spellID), tostring(byID), slot, tostring(meta.name)))
+                local byName = T.MatchBuffSlot(meta.name)
+                ck(byName == slot,
+                   ("DRIFT: tracker files %q in slot %s, AURA_META shows slot %d")
+                       :format(tostring(meta.name), tostring(byName), slot))
+            end
+        end
+        -- The retired tail buffs must NOT resolve any more, on either side.
+        ck(T.MatchBuffSlot("Traces of Silithyst") == nil, "retired: Silithyst has no slot")
+        ck(T.MatchBuffSlot("Boon of Blackfathom") == nil, "retired: Boon of Blackfathom has no slot")
+    else
+        ck(false, "tracker matchers unreachable — slot-map agreement unverified")
+    end
+
+    -- The display order must still be a permutation of every stored slot, or a
+    -- slot silently stops rendering (the quiet half of this class of bug).
+    local order, cover = Dashboard.AURA_DISPLAY_ORDER, {}
+    ck(type(order) == "table" and #order == 10, "AURA_DISPLAY_ORDER covers 10 slots")
+    for _, slot in ipairs(order or {}) do
+        ck(META[slot] ~= nil, ("display order references unknown slot %s"):format(tostring(slot)))
+        ck(not cover[slot], ("display order lists slot %s twice"):format(tostring(slot)))
+        cover[slot] = true
+    end
+    for slot = 1, 10 do ck(cover[slot], ("slot %d is never displayed"):format(slot)) end
+    -- BS/FFF ride at the tail (see the order's rationale).
+    ck(order and order[9] == 9 and order[10] == 10, "Battle Shout + FFF sit at the tail of the strip")
+
+    -- Icon fallback: the tail slots' identity ids are NPC / seasonal casts the
+    -- client may not resolve a texture for, so each names art-only backup id.
+    -- Proven by resolving slot 9 through a client that ONLY knows 6673.
+    ck(META[9] and META[9].iconSpellID == 6673, "Battle Shout carries the 6673 art fallback")
+    ck(META[10] and META[10].iconSpellID == 29846, "FFF carries the 29846 art fallback")
+    local savedCS    = C_Spell
+    local savedCache = Dashboard._auraIconCache and Dashboard._auraIconCache[9]
+    if Dashboard._auraIconCache then Dashboard._auraIconCache[9] = nil end
+    C_Spell = { GetSpellTexture = function(id) return (id == 6673) and "TEX:6673" or nil end }
+    local icon = Dashboard.AuraIcon(9)
+    C_Spell = savedCS
+    -- Evict the stub so a live /nexus selftest cannot poison slot 9's real icon.
+    if Dashboard._auraIconCache then Dashboard._auraIconCache[9] = savedCache end
+    ck(icon == "TEX:6673",
+       "AuraIcon(9) falls back to the art id when 25101 has no texture (got " .. tostring(icon) .. ")")
 end
 
 -- Self-test: client-side cooldown decay (Task 2). A stored remaining value ages
@@ -1919,6 +2083,7 @@ end
 if ns.RegisterSelfTest then
     ns:RegisterSelfTest("dashboard", function(verbose)
         local cases = {
+            { name = "aura slot map agreement (tracker <-> AURA_META)", fn = testAuraSlotMap },
             { name = "aura class rules", fn = testAuraClassRules },
             { name = "cooldown decay", fn = testDecayRemaining },
             { name = "aura display decay (A6.8/A7.6)", fn = testAuraDisplayDecay },

@@ -81,6 +81,12 @@ local ICON_GAP   = 3        -- vertical gap between stacked column icons (never 
 
 local STALE_AGE = 30 * 60
 
+-- Seconds between self-repaints of the cards list + open detail while the window
+-- is shown (Cards.RepaintTick / the OnUpdate at the end of the pane builder).
+-- 1s is the smallest visible unit any card prints ("45s" captions, the chrono /
+-- hearth countdowns), so anything finer would repaint for no ink change.
+local REPAINT_INTERVAL = 1
+
 -- Chip definitions. Scope is single-select; modifiers are independent toggles. The
 -- mockup renders the Online + Needs-buffs modifiers; Stale/Locked stay in the pure
 -- model (counts + filtering) for future chips but are not drawn (owner cut-watch).
@@ -466,6 +472,33 @@ end
 function Cards.OnAccentTextColor(r, g, b)
     local lum = 0.299 * (r or 0) + 0.587 * (g or 0) + 0.114 * (b or 0)
     if lum < 0.5 then return "text" else return "ground" end
+end
+
+-- 1s REPAINT TICK gating (pure half of the cards ticker below).
+--
+-- Why the pane needs a ticker at all: every duration on a card is a FUNCTION OF
+-- WALL-CLOCK (A6.8 decays an online character's stored remaining by the time
+-- since capture), but the pane only ever repainted on an engine event. With
+-- inbound traffic firing events again, ARRIVAL is covered — an idle second is
+-- not, so a remote alt's "Ony 1h20m" sat frozen on screen until the next packet.
+--
+-- Contract, mirroring the timers dock's hidden-pause pattern:
+--   * hidden  -> never fires, and the accumulator is left EXACTLY as it was, so
+--                a window closed mid-second does not bank a partial tick and
+--                does not fire the instant it reopens.
+--   * visible -> fires once per whole `interval`, carrying the remainder forward
+--                so drift cannot accumulate across a slow frame.
+-- Returns (accum, fire).
+function Cards.RepaintTick(accum, elapsed, visible, interval)
+    accum    = tonumber(accum) or 0
+    elapsed  = tonumber(elapsed) or 0
+    interval = tonumber(interval) or 1
+    if interval <= 0 then interval = 1 end        -- never modulo by zero
+    if elapsed < 0 then elapsed = 0 end
+    if not visible then return accum, false end
+    accum = accum + elapsed
+    if accum < interval then return accum, false end
+    return accum % interval, true
 end
 
 -- Struck = blacklisted / tombstoned name (rendered with a strike overlay).
@@ -1102,6 +1135,38 @@ Dashboard.RegisterTab("characters", function(host)
         if pane.dock and pane.dock.Refresh then pane.dock.Refresh() end
     end
 
+    -- ── Repaint: the CHEAP half of Refresh (clock-driven ink only) ───────────
+    -- Everything a second changes is derived from wall-clock: the A6.8 decayed
+    -- aura remainings, the chrono/hearth countdowns, the freshness "41m". None
+    -- of it needs a fresh roster gather, a re-sort, a relayout or a scroll
+    -- reset — so the ticker re-Populates the cards ALREADY on screen from the
+    -- entries they are holding, and re-Shows the open detail with the same entry
+    -- object. (Judgment call vs. calling Refresh once a second: a full Refresh
+    -- walks every account bucket, re-derives online winners, re-sorts, re-lays
+    -- out and additionally refreshes the instances panel and the dock — and the
+    -- dock already self-ticks, so that work would be done twice a second for
+    -- ink that cannot have changed. Membership/online/selection changes still
+    -- arrive as engine events and still run the full Refresh.)
+    function pane.obj.Repaint()
+        for _, c in ipairs(pane._cards) do
+            if c:IsShown() and c._entry then c:Populate(c._entry, c._sel) end
+        end
+        if pane.detail and pane.detail.Show and pane.detail._entry then
+            pane.detail:Show(pane.detail._entry)
+        end
+    end
+
+    -- ── 1s repaint ticker (pauses while the window is hidden) ────────────────
+    -- Mirrors ui_timersdock's OnUpdate: no work at all while not visible, one
+    -- repaint per whole second while it is. Gating math lives in the pure
+    -- Cards.RepaintTick so it is testable headlessly.
+    local tickAccum = 0
+    host:SetScript("OnUpdate", function(self, elapsed)
+        local fire
+        tickAccum, fire = Cards.RepaintTick(tickAccum, elapsed, self:IsVisible(), REPAINT_INTERVAL)
+        if fire then ns:SafeCall(pane.obj.Repaint) end
+    end)
+
     listScroll:SetScript("OnSizeChanged", function() pane.obj.Refresh() end)
     pane.obj.Refresh()
     return pane.obj
@@ -1274,11 +1339,25 @@ local function testSlotState(fails)
         ck(s1 == "owned" and t1 == "idle", "owned buff -> owned/idle")
         ck(s2 == "missing" and t2 == "danger", "missing required -> missing/danger")
     end
-    local boonSlot = slotOf("boon")
-    if boonSlot then
+    -- The collapsing tail slot is FFF now (Silithyst/Blackfathom retired).
+    local fffSlot = slotOf("fff")
+    ck(fffSlot ~= nil, "the seasonal tail slot exists under key \"fff\"")
+    if fffSlot then
         local absentE = { faction = "Horde", rec = { classTag = "MAGE", auraStates = {} } }
-        local s3, t3 = Cards.SlotState(absentE, boonSlot)
+        local s3, t3 = Cards.SlotState(absentE, fffSlot)
         ck(s3 == "na" and t3 == "faint", "non-applicable absent -> na/faint")
+    end
+    -- Battle Shout (slot 9) is class-ruled, NOT required-for-everyone: a mage
+    -- must collapse it, a warrior must see the red missing tile.
+    local bsSlot = slotOf("battleshout")
+    ck(bsSlot ~= nil, "Battle Shout owns a display slot")
+    if bsSlot then
+        local mageE = { faction = "Horde", rec = { classTag = "MAGE", auraStates = {} } }
+        local warE  = { faction = "Horde", rec = { classTag = "WARRIOR", auraStates = {} } }
+        local sM, tM = Cards.SlotState(mageE, bsSlot)
+        ck(sM == "na" and tM == "faint", "Battle Shout on a mage -> na/faint (no red tile)")
+        local sW, tW = Cards.SlotState(warE, bsSlot)
+        ck(sW == "missing" and tW == "danger", "Battle Shout missing on a warrior -> missing/danger")
     end
     local rendSlot = slotOf("rend")
     if rendSlot then
@@ -1330,7 +1409,7 @@ local function testStripStyle(fails)
     local D = Dashboard
     if not (D and D.AURA_META) then ck(false, "Dashboard.AURA_META unavailable"); return end
     local function slotOf(key) for s, m in pairs(D.AURA_META) do if m.key == key then return s end end end
-    local onySlot, boonSlot, rendSlot = slotOf("ony"), slotOf("boon"), slotOf("rend")
+    local onySlot, fffSlot, rendSlot = slotOf("ony"), slotOf("fff"), slotOf("rend")
 
     -- Held required -> lit (desat=false) + ok-green border.
     if onySlot then
@@ -1344,9 +1423,9 @@ local function testStripStyle(fails)
         ck(miss.shown and miss.desat == true and miss.border == "danger",
             "missing required tile -> shown + desat + danger border")
     end
-    -- Non-applicable absent tail slot -> hidden.
-    if boonSlot then
-        local na = Cards.StripTileStyle({ faction = "Horde", rec = { classTag = "MAGE", auraStates = {} } }, boonSlot)
+    -- Non-applicable absent tail slot (seasonal FFF) -> hidden.
+    if fffSlot then
+        local na = Cards.StripTileStyle({ faction = "Horde", rec = { classTag = "MAGE", auraStates = {} } }, fffSlot)
         ck(na.shown == false, "non-applicable slot -> not shown in strip")
     end
     -- Optional missing -> desaturated + warn border.
@@ -1490,6 +1569,45 @@ local function testStripGeometry(fails)
     ck(s.right < s.keepOut, "...so horizontal separation is what keeps them apart")
 end
 
+-- 1s repaint ticker GATING (the pure half; the paint itself is frame work).
+-- The bug this protects: a pane that only repaints on engine events shows frozen
+-- countdowns while idle. The bug the GATE protects against: a ticker that keeps
+-- running (or banks time) while the window is hidden, and then either burns CPU
+-- behind a closed window or dumps a burst of repaints the moment it reopens.
+local function testRepaintTick(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local T = Cards.RepaintTick
+
+    -- Hidden: never fires, and the accumulator is untouched (no banking).
+    local a, fire = T(0, 0.5, false, 1)
+    ck(a == 0 and fire == false, "hidden -> no fire, no accumulation")
+    a, fire = T(0.9, 5, false, 1)
+    ck(a == 0.9 and fire == false, "hidden for 5s -> still no fire, accumulator held at 0.9")
+    -- ...and reopening does not immediately fire off the banked remainder.
+    a, fire = T(a, 0.05, true, 1)
+    ck(fire == false and math.abs(a - 0.95) < 1e-9, "reopened -> resumes, does not fire early")
+
+    -- Visible: sub-interval accumulates, crossing the interval fires exactly once.
+    a, fire = T(0, 0.4, true, 1)
+    ck(fire == false and math.abs(a - 0.4) < 1e-9, "0.4s -> accumulate, no fire")
+    a, fire = T(a, 0.4, true, 1)
+    ck(fire == false and math.abs(a - 0.8) < 1e-9, "0.8s -> still no fire")
+    a, fire = T(a, 0.4, true, 1)
+    ck(fire == true and math.abs(a - 0.2) < 1e-9, "1.2s -> fires once, carries 0.2 forward")
+
+    -- A long frame (loading screen / lag spike) fires ONCE, not once per second.
+    a, fire = T(0, 5.25, true, 1)
+    ck(fire == true and math.abs(a - 0.25) < 1e-9, "a 5.25s frame fires once and keeps the remainder")
+
+    -- Degenerate inputs cannot wedge or divide by zero.
+    a, fire = T(nil, nil, true, nil)
+    ck(a == 0 and fire == false, "nil accum/elapsed -> safe no-op")
+    a, fire = T(0, 2, true, 0)
+    ck(fire == true and a == 0, "interval 0 is treated as 1 (no modulo by zero)")
+    a, fire = T(0.5, -3, true, 1)
+    ck(fire == false and math.abs(a - 0.5) < 1e-9, "a negative elapsed cannot rewind the accumulator")
+end
+
 if ns.RegisterSelfTest then
     ns:RegisterSelfTest("cards", function(verbose)
         local cases = {
@@ -1503,6 +1621,7 @@ if ns.RegisterSelfTest then
             { name = "hover peek",        fn = testPeek },
             { name = "card corner",       fn = testCardCorner },
             { name = "strip geometry",    fn = testStripGeometry },
+            { name = "repaint ticker gate", fn = testRepaintTick },
         }
         local allPass = true
         for _, c in ipairs(cases) do

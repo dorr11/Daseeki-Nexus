@@ -94,8 +94,8 @@ local BUFF_HUE = {
     dmtap      = { 0.851, 0.541, 0.227 },   -- Fengus — ember orange
     dmtstam    = { 0.431, 0.561, 0.839 },   -- Mol'dar — steel blue
     dmtsp      = { 0.780, 0.471, 0.690 },   -- Slip'kik — savvy magenta
-    silithyst  = { 0.788, 0.702, 0.478 },   -- Silithyst — desert tan
-    boon       = { 0.247, 0.663, 0.722 },   -- Blackfathom — deep teal
+    battleshout= { 0.780, 0.612, 0.431 },   -- Battle Shout — warrior tan (whose buff it is)
+    fff        = { 0.976, 0.478, 0.106 },   -- Fire Festival Fury — bonfire flame
 }
 
 -- Open-page raid tally order + labels (BRAND_SPEC §7 L3: MC BWL ZG AQ40 Naxx Ony AQ20;
@@ -156,16 +156,30 @@ end
 --   { shown, slot, missing, boon, calm, tint, durText, durTok, fullText, spellID }
 -- shown=false -> hide the tile (ignored class-rule / collapsing tail slot, absent).
 -- §5a: owned = full-color icon (lit); missing = desaturated icon + danger/warn edge.
-function Detail.BuffTileState(slot, rec, faction, e)
+--
+-- `online` / `aid` come from the ROSTER ENTRY the card was built from (Detail:Show
+-- passes both through). They matter: A6.8 decay is keyed on online, and the
+-- online answer for a duplicate Name-Realm is only decidable with the aid that
+-- says WHICH account's copy this is. Without them AuraRemaining fell back to
+-- Dashboard.IsOnline(rec, rec.nameRealm) with no aid, which for a Name-Realm
+-- spanning two account buckets drops to bare lastSeen recency — so the card
+-- (which had the aid) could show a decaying buff while the detail pane beside
+-- it showed the same buff frozen. One entry, one online answer, both surfaces.
+function Detail.BuffTileState(slot, rec, faction, e, online, aid)
     local D = Dash()
     local meta = D and D.AURA_META and D.AURA_META[slot]
     if not meta then return { shown = false } end
+    -- Caller did not stamp online (headless tests, a bare-string Show): resolve it
+    -- ONCE here, with the aid, instead of letting each AuraRemaining call re-guess.
+    if online == nil and rec and D and D.IsOnline then
+        online = D.IsOnline(rec, rec.nameRealm, aid)
+    end
     -- A6.8: the displayed remaining, not the raw stored number — decayed for an
     -- ONLINE character, frozen for an offline one, and ALWAYS frozen for a booned
     -- slot (A7.6). Everything below reads `remaining`, so the tile caption, the
     -- threshold colour and the "Missing" verdict can never disagree about how
     -- much time is actually left.
-    local remaining, st = D.AuraRemaining(rec, slot, e)
+    local remaining, st = D.AuraRemaining(rec, slot, e, online)
     local present = remaining > 0
     local applicable, requirement = D.AuraRequirement(slot, rec, faction)
     local isDMF = meta.key == "dmf"
@@ -674,7 +688,9 @@ function Detail.Attach(parent)
         local idx = 0
         for _, r in ipairs(D._rows) do r:Hide() end
         for _, slot in ipairs(order) do
-            local s = Detail.BuffTileState(slot, rec, faction, e)
+            -- Same online/aid the CARD used (entry.online was stamped by the roster
+            -- gather; entry.aid names the owning bucket) — see BuffTileState.
+            local s = Detail.BuffTileState(slot, rec, faction, e, online, entry.aid)
             if s.shown then
                 idx = idx + 1
                 shown = shown + 1
@@ -820,7 +836,8 @@ local function testBuffMatrix(fails)
     local BOON = (ns.Store.AURA_SOURCE and ns.Store.AURA_SOURCE.BOON) or 2
     local e = 1000000
     local function slotOf(key) for s, m in pairs(D.AURA_META) do if m.key == key then return s end end end
-    local onySlot, rendSlot, spSlot, boonSlot = slotOf("ony"), slotOf("rend"), slotOf("dmtsp"), slotOf("boon")
+    local onySlot, rendSlot, spSlot = slotOf("ony"), slotOf("rend"), slotOf("dmtsp")
+    local fffSlot = slotOf("fff")   -- the collapsing seasonal tail slot (was Blackfathom)
 
     local rec = { classTag = "WARRIOR", auraStates = { [onySlot] = { duration = 3600 } } }
     local st = Detail.BuffTileState(onySlot, rec, "Horde", e)
@@ -840,8 +857,8 @@ local function testBuffMatrix(fails)
     if st.shown then fails[#fails + 1] = "ignored class-rule slot should collapse (hidden) when absent" end
     st = Detail.BuffTileState(spSlot, { classTag = "MAGE", auraStates = {} }, "Horde", e)
     if not (st.shown and st.missing and st.tint == "warn") then fails[#fails + 1] = "optional class-rule missing -> shown+warn" end
-    st = Detail.BuffTileState(boonSlot, { classTag = "MAGE", auraStates = {} }, "Horde", e)
-    if st.shown then fails[#fails + 1] = "absent tail slot (boon) should collapse (hidden)" end
+    st = Detail.BuffTileState(fffSlot, { classTag = "MAGE", auraStates = {} }, "Horde", e)
+    if st.shown then fails[#fails + 1] = "absent tail slot (FFF) should collapse (hidden)" end
 
     -- ---- A6.8 / A7.6 through the TILE, not just the helper -----------------
     -- An ONLINE character's tile caption ages; an offline one's does not; a
@@ -884,6 +901,81 @@ local function testBuffMatrix(fails)
     end
 
     D._onlineWinners = savedWinners
+    if ns.Store then ns.Store.GetFactionSettings = savedGFS end
+end
+
+-- DETAIL / CARD AGREEMENT on a DUPLICATE Name-Realm.
+--
+-- The regression: the detail pane called AuraRemaining with no online and no
+-- aid, so it re-resolved presence from the record alone. For a Name-Realm that
+-- sits under more than one account bucket the winners table cannot attribute it
+-- (charAID[name] == false) and IsOnline drops to bare lastSeen recency — so the
+-- CARD (which carries the roster entry's online + aid) could show a live buff
+-- decaying while the DETAIL beside it showed the same buff frozen. Show() now
+-- threads the entry's own online + aid into every tile.
+local function testDetailCardAgreement(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local D = ns.Dashboard
+    if not (D and D.AURA_META and D.AuraRemaining) then
+        ck(false, "Dashboard unavailable"); return
+    end
+    local function slotOf(key) for s, m in pairs(D.AURA_META) do if m.key == key then return s end end end
+    local onySlot = slotOf("ony")
+    if not onySlot then ck(false, "ony slot missing"); return end
+
+    local savedGFS = ns.Store and ns.Store.GetFactionSettings
+    ns.Store = ns.Store or {}
+    ns.Store.GetFactionSettings = function()
+        return { auraOpts = { rend = { required = {}, optional = {} },
+                              dmtSP = { required = {}, optional = {} }, thresholds = {} } }
+    end
+    local savedWinners = D._onlineWinners
+    local savedPeers   = ns.Mesh and ns.Mesh.peers
+    if ns.Mesh then ns.Mesh.peers = {} end
+
+    -- "Dup-R" is held by accounts 1 and 2 -> unattributable by name alone
+    -- (charAID == false). Account 1's copy is the live winner.
+    D._onlineWinners = { winner = { ["1"] = "Dup-R", ["2"] = "Other-R" },
+                         charAID = { ["Dup-R"] = false } }
+
+    local T = 1700000000
+    -- lastSeen is deliberately ANCIENT so the recency fallback says OFFLINE:
+    -- only the aid-aware answer can call this character online.
+    local rec = { nameRealm = "Dup-R", classTag = "WARRIOR", faction = "Horde",
+                  lastDataUpdate = T, lastSeen = 0,
+                  auraStates = { [onySlot] = { duration = 3600, source = 0 } } }
+    local entry = { nameRealm = "Dup-R", rec = rec, aid = "1", online = true, faction = "Horde" }
+
+    -- The CARD's answer (it has always used entry.online).
+    local cardRem = D.AuraRemaining(rec, onySlot, T + 600, entry.online)
+    ck(cardRem == 3000, "card: an online duplicate-name character's buff decays 3600 -> 3000")
+
+    -- The DETAIL's answer, now threaded with the same online + aid.
+    local st = Detail.BuffTileState(onySlot, rec, entry.faction, T + 600, entry.online, entry.aid)
+    ck(st.durText == Detail.CompactDuration(cardRem),
+       "detail tile agrees with the card (" .. tostring(st.durText) ..
+       " vs " .. Detail.CompactDuration(cardRem) .. ")")
+
+    -- Even with online UNSTAMPED, the aid alone is enough to reach the same
+    -- answer — this is the path a bare-nameRealm Show() takes.
+    local stAid = Detail.BuffTileState(onySlot, rec, entry.faction, T + 600, nil, entry.aid)
+    ck(stAid.durText == Detail.CompactDuration(cardRem),
+       "detail resolves online from the aid when the caller did not stamp it")
+
+    -- And the proof that the plumbing is load-bearing: with NEITHER, the old
+    -- code path falls to recency and freezes at 3600 — the disagreement itself.
+    local stBare = Detail.BuffTileState(onySlot, rec, entry.faction, T + 600)
+    ck(stBare.durText == Detail.CompactDuration(3600),
+       "guard: with no online and no aid the answer really does freeze (the old bug)")
+
+    -- An OFFLINE entry must still freeze on both surfaces (no over-correction).
+    local offRem = D.AuraRemaining(rec, onySlot, T + 600, false)
+    local stOff  = Detail.BuffTileState(onySlot, rec, entry.faction, T + 600, false, "2")
+    ck(offRem == 3600 and stOff.durText == Detail.CompactDuration(3600),
+       "an offline entry stays frozen on both card and detail")
+
+    D._onlineWinners = savedWinners
+    if ns.Mesh then ns.Mesh.peers = savedPeers end
     if ns.Store then ns.Store.GetFactionSettings = savedGFS end
 end
 
@@ -1037,6 +1129,7 @@ if ns.RegisterSelfTest then
         local cases = {
             { name = "dmf parenthetical",   fn = testDMFParenthetical },
             { name = "buff display matrix", fn = testBuffMatrix },
+            { name = "detail/card agreement", fn = testDetailCardAgreement },
             { name = "caption compact",     fn = testCaptionCompact },
             { name = "raid tally",          fn = testRaidTally },
             { name = "pane geometry",       fn = testDetailGeometry },
