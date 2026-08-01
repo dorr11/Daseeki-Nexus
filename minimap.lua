@@ -8,18 +8,23 @@
 -- bindings (the Alt+Left /camp logout is intentionally omitted), so anchoring to
 -- the minimap cluster never makes the frame protected.
 --
--- Click matrix (owner directive: both unmodified clicks toggle the dashboard;
--- the context menu moves to Shift+Right. Mass-invite is NEVER an unmodified
--- single click, and both unmodified clicks are the SAFE default):
---   Left            toggle dashboard    (safe default)
---   Right           toggle dashboard    (restored; owner's standing expectation)
---   Shift+Left      invite online       (mass-invite -> ns.Auto.InviteOnline)
+-- Click matrix (owner directive 2026-07-31: SN parity — the muscle memory is
+-- "left-click the ball, everyone gets invited". This is an OWNER OVERRIDE of
+-- BRAND_SPEC §8's "mass-invite is NEVER an unmodified single click" law, scoped
+-- to this button only; see the dated amendment in BRAND_SPEC.md §8):
+--   Left            invite all online mesh characters, then raid-convert +
+--                   assist-all per the global toggles (ns.Auto.InviteOnline())
+--   Shift+Left      invite WITHOUT raid convert / assist-all
+--                   (ns.Auto.InviteOnline(true) — same semantic as
+--                    /nexus invite noconvert)
+--   Right           toggle dashboard
 --   Shift+Right     context menu (native dropdown):
---                     Toggle dashboard / Invite online / Timers tab /
+--                     Toggle dashboard / Invite online / Timers dock /
 --                     Cancel Buffs / Felwood map / Lock minimap button / Settings
 --   Alt+Left        (OMITTED) /camp logout — a secure /camp macro would make
 --                   this frame PROTECTED, and it is exactly that omission that
---                   keeps ring-anchoring safe. Deferred; documented deviation.
+--                   keeps ring-anchoring safe. Deferred; refusal print stays.
+-- Alt is tested before Shift, so any Alt+Left combination lands on the refusal.
 --
 -- Clean-room build: functional reimplementation from spec; no third-party code.
 
@@ -153,10 +158,12 @@ end
 -- Soft-guarded actions (parallel agents own ns.Auto / ns.UI)
 ----------------------------------------------------------------------
 
-local function inviteAll()
+-- skipConvert=true suppresses the post-invite raid convert + assist-all pass
+-- (auto.lua honours it exactly as /nexus invite noconvert does).
+local function inviteAll(skipConvert)
     -- Real engine entry point is ns.Auto.InviteOnline(skipConvert) (auto.lua).
     if ns.Auto and ns.Auto.InviteOnline then
-        ns.Auto.InviteOnline()
+        ns.Auto.InviteOnline(skipConvert and true or nil)
     else
         ns:Print("mass invite is unavailable (auto module not loaded).")
     end
@@ -272,6 +279,42 @@ local function showContextMenu(anchor)
 end
 
 ----------------------------------------------------------------------
+-- Click matrix. resolveClick is PURE (no frame, no globals) so the self-test can
+-- drive every modifier combination directly; OnClick only reads the live
+-- modifier state and dispatches. Keeping the two apart is what makes the matrix
+-- testable headlessly.
+----------------------------------------------------------------------
+
+local ACTION_INVITE      = "invite"           -- + raid convert / assist per settings
+local ACTION_INVITE_ONLY = "invite_noconvert" -- invites only, no convert / assist
+local ACTION_DASHBOARD   = "dashboard"
+local ACTION_MENU        = "menu"
+local ACTION_ALT_REFUSED = "alt_refused"
+
+local function resolveClick(mouseButton, shift, alt)
+    if mouseButton == "LeftButton" then
+        -- Alt outranks Shift: the /camp slot is refused however it is decorated.
+        if alt then return ACTION_ALT_REFUSED end
+        if shift then return ACTION_INVITE_ONLY end
+        return ACTION_INVITE
+    elseif mouseButton == "RightButton" then
+        if shift then return ACTION_MENU end
+        return ACTION_DASHBOARD
+    end
+    return nil
+end
+
+local CLICK_ACTIONS = {
+    [ACTION_INVITE]      = function() inviteAll(false) end,
+    [ACTION_INVITE_ONLY] = function() inviteAll(true) end,
+    [ACTION_DASHBOARD]   = function() toggleDashboard() end,
+    [ACTION_MENU]        = function(self) showContextMenu(self) end,
+    [ACTION_ALT_REFUSED] = function()
+        ns:Print("Alt+Left logout is disabled this build (secure-frame safety).")
+    end,
+}
+
+----------------------------------------------------------------------
 -- Button construction (ring-anchored to the Minimap; both dims set at creation)
 ----------------------------------------------------------------------
 
@@ -337,22 +380,9 @@ local function buildButton()
     end)
 
     b:SetScript("OnClick", function(self, mouseButton)
-        if mouseButton == "LeftButton" then
-            if IsAltKeyDown() then
-                -- Alt+Left logout intentionally omitted (see header).
-                ns:Print("Alt+Left logout is disabled this build (secure-frame safety).")
-            elseif IsShiftKeyDown() then
-                inviteAll()          -- mass-invite is a MODIFIED click (§8)
-            else
-                toggleDashboard()     -- safe default: unmodified click opens dashboard
-            end
-        elseif mouseButton == "RightButton" then
-            if IsShiftKeyDown() then
-                showContextMenu(self)  -- context menu is a MODIFIED right-click
-            else
-                toggleDashboard()      -- owner directive: plain right-click toggles dashboard
-            end
-        end
+        local action = resolveClick(mouseButton, IsShiftKeyDown(), IsAltKeyDown())
+        local fn = action and CLICK_ACTIONS[action]
+        if fn then fn(self) end
     end)
 
     b:SetScript("OnEnter", function(self)
@@ -366,10 +396,10 @@ local function buildButton()
         GameTooltip:AddDoubleLine("Ony (A)",  onyAT, UI.Color("muted"))
         GameTooltip:AddDoubleLine("Ony (H)",  onyHT, UI.Color("muted"))
         GameTooltip:AddLine(" ")
-        GameTooltip:AddLine("Left: toggle dashboard",        UI.Color("faint"))
-        GameTooltip:AddLine("Right: toggle dashboard",       UI.Color("faint"))
-        GameTooltip:AddLine("Shift-Left: invite online",     UI.Color("faint"))
-        GameTooltip:AddLine("Shift-Right: menu",             UI.Color("faint"))
+        GameTooltip:AddLine("Left: invite online",             UI.Color("faint"))
+        GameTooltip:AddLine("Shift-Left: invite, no convert",  UI.Color("faint"))
+        GameTooltip:AddLine("Right: toggle dashboard",         UI.Color("faint"))
+        GameTooltip:AddLine("Shift-Right: menu",               UI.Color("faint"))
         if not minimapCfg().lock then
             GameTooltip:AddLine("Drag to move",              UI.Color("faint"))
         end
@@ -443,6 +473,29 @@ ns:RegisterSelfTest("minimap", function(verbose)
     check(t == "20m" and tok == "danger", "cd at 20m -> danger")
     t, tok = statusFor({ state = "cd", remaining = 3 * 3600 })
     check(t == "3h 00m" and tok == "accent", "cd above 20m -> accent")
+
+    -- Click matrix (owner directive 2026-07-31, SN parity). Left is the invite;
+    -- the dashboard lives on right-click. Every case below is a shipped binding.
+    check(resolveClick("LeftButton",  false, false) == ACTION_INVITE,
+          "Left -> invite online (convert per settings)")
+    check(resolveClick("LeftButton",  true,  false) == ACTION_INVITE_ONLY,
+          "Shift+Left -> invite without raid convert / assist")
+    check(resolveClick("RightButton", false, false) == ACTION_DASHBOARD,
+          "Right -> toggle dashboard")
+    check(resolveClick("RightButton", true,  false) == ACTION_MENU,
+          "Shift+Right -> context menu")
+    check(resolveClick("LeftButton",  false, true) == ACTION_ALT_REFUSED,
+          "Alt+Left -> refusal print (secure-frame safety)")
+    check(resolveClick("LeftButton",  true,  true) == ACTION_ALT_REFUSED,
+          "Alt outranks Shift on the left button")
+    check(resolveClick("RightButton", false, true) == ACTION_DASHBOARD,
+          "Alt+Right is unbound -> plain right-click behavior")
+    check(resolveClick("MiddleButton", false, false) == nil,
+          "no other mouse button is bound")
+    for _, act in ipairs({ ACTION_INVITE, ACTION_INVITE_ONLY, ACTION_DASHBOARD,
+                           ACTION_MENU, ACTION_ALT_REFUSED }) do
+        check(type(CLICK_ACTIONS[act]) == "function", "click action wired: " .. act)
+    end
     if verbose then ns:Print("  minimap selftest " .. (pass and "PASS" or "FAIL")) end
     return pass
 end)
