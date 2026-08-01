@@ -873,9 +873,8 @@ local function captureFlags(rec)
     -- fills pvpExpiry from PLAYER_FLAGS_CHANGED timing in a later wave.
     if not rec.pvpFlagged then rec.pvpExpiry = 0 end
 
-    local inInstance, instanceType = IsInInstance()
+    local inInstance = IsInInstance()
     rec.inInstance = inInstance and true or false
-    rec._instanceType = instanceType
 end
 
 -- Zone / location: coordinate overrides first, then the game's zone text.

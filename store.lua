@@ -1268,9 +1268,6 @@ end
 --                    entire epoch-conversion boundary and freeze a cooldown that
 --                    the owner has since used or cleared.
 --   _srcAID          Bookkeeping this function stamps itself on the line below.
---   _instanceType    Written by Tracker's capture (tracker.lua ~878) and read by
---                    NOTHING in the addon — dead. Carrying it would preserve a
---                    field with no reader; flagged for deletion instead.
 --
 -- PURE given its two arguments. Mutates `incoming` only; `existing` is read-only.
 ----------------------------------------------------------------------
