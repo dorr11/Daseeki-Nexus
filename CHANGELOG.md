@@ -12,6 +12,23 @@
   60s per account — but until every account has reloaded there is avoidable mesh
   chatter. Reload (or relog) all of your accounts once, together, and it stops.
 
+- Fixed: **the Auras and Automation pages now open on YOUR faction instead of always
+  Alliance.** Everything on those two pages is saved per faction, and the Faction
+  toggle at the top used to reset to Alliance every single reload. So if you play
+  Horde and set a class rule — say marking Slip'kik's Savvy *required* for Shamans —
+  the click quietly landed in your **Alliance** settings, and your Horde characters
+  went on reading their own untouched rules. The buff stayed yellow (optional) on
+  the cards and in the detail pane, with nothing on screen to say why. The page now
+  opens on the faction you are actually playing, so the setting you make is the
+  setting you get. This fixes the whole family of "it didn't take" cases on those
+  pages — thresholds, class rules, gossip buff types and auto-summon triggers alike.
+
+  **One thing to do once:** any rule you set before this update was written to the
+  Alliance side, and your data has deliberately been left exactly as you saved it
+  rather than guessed at and moved. Open Nexus → Auras (it will now say Horde), and
+  re-tick the rules you want — for example Slip'kik's Savvy → Shaman → *required*.
+  It is a single click per rule, and it sticks this time.
+
 - Fixed: **the minimap button now plays nicely with minimap button managers when
   LibDBIcon is available.** Addons that collect and tidy minimap buttons (Leatrix
   Plus and friends) recognise buttons registered through the standard LibDBIcon

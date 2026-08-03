@@ -98,6 +98,28 @@ local BS_CLASSES   = { "WARRIOR", "ROGUE", "HUNTER" }
 -- Slip'kik's Savvy / DMT SP covers all 9 classes (same as Rend); defaults live
 -- in store.lua (physical = ignored, casters = optional), editable per faction.
 local SLIPKIK_CLASSES = { "WARRIOR", "PALADIN", "HUNTER", "ROGUE", "PRIEST", "SHAMAN", "MAGE", "WARLOCK", "DRUID" }
+
+-- THE class-rule grid roster: one row per class-ruled buff the Auras page draws.
+-- `optKey` is the EXACT, CASE-SENSITIVE key this page writes into
+-- GetFactionSettings().auraOpts, and it must be byte-identical to the matching
+-- AURA_META[slot].thresholdKey that ui_shell reads back through
+-- Dashboard.CLASS_RULED_KEYS / Dashboard.ClassRuleState. A case slip ("dmtsp"
+-- for "dmtSP") writes a map nothing ever reads: the owner's click appears to
+-- take, and the rule can never fire. buildAuras loops this table and the
+-- "options" suite asserts it against the display side both ways, so a fourth
+-- class-ruled buff cannot be added on one side only.
+local CLASS_RULE_GRIDS = {
+    { optKey = "rend",        classes = REND_CLASSES,
+      title = "Rend — Required Classes" },
+    { optKey = "battleShout", classes = BS_CLASSES,
+      title = "Battle Shout — Required Classes" },
+    -- Slip'kik's Savvy (DMT SP): physical damage users typically don't want it,
+    -- so it ships ignored for War/Rogue/Hunter and optional for casters.
+    { optKey = "dmtSP",       classes = SLIPKIK_CLASSES,
+      title = "Slip'kik's Savvy (DMT SP) — Required Classes" },
+}
+Options.CLASS_RULE_GRIDS = CLASS_RULE_GRIDS
+
 local CLASS_LABEL  = {
     WARRIOR = "Warrior", PALADIN = "Paladin", HUNTER = "Hunter", ROGUE = "Rogue",
     PRIEST = "Priest", SHAMAN = "Shaman", MAGE = "Mage", WARLOCK = "Warlock", DRUID = "Druid",
@@ -287,8 +309,51 @@ local function TS()  local db = DB(); return db and db.timerSettings or nil end
 
 -- Faction scope shared across the Auras + Automation pages. Only one of those
 -- pages is visible at a time; each rebuilds from this on show.
-local scope = { faction = "Alliance" }
-local function FS() return ns.Store and ns.Store.GetFactionSettings and ns.Store.GetFactionSettings(scope.faction) or nil end
+--
+-- THE TRAP THIS KILLS (owner bug, Slip'kik's Savvy): this used to be a hardcoded
+-- `{ faction = "Alliance" }`. The scope is module-local and NOT persisted, so it
+-- reset to Alliance on every reload — and the class-rule grids on the Auras page
+-- write straight into GetFactionSettings(scope.faction).auraOpts. A Horde-only
+-- owner opening Auras and ticking "Shaman = required" for Slip'kik therefore
+-- wrote SHAMAN into factionSettings.ALLIANCE.auraOpts.dmtSP.required, while
+-- every Horde card kept reading the untouched Horde map and rendered the buff
+-- amber/optional. The page silently answered a question he never asked ("what
+-- about your Alliance characters?"). Nothing in the UI said which faction table
+-- the click was landing in, and the one faction he does not play was the default.
+--
+-- The scope now OPENS ON THE PLAYER'S OWN FACTION. That kills the whole class of
+-- bug, not just the Slip'kik instance: every per-faction control on both pages
+-- (thresholds, class rules, autoGossip, autoSummon triggers) inherits it.
+--
+-- Deliberately still not persisted across reloads: with the default correct,
+-- persistence only buys "remember that I was inspecting my off-faction alts",
+-- which is worth less than a new SavedVariables key and its migration.
+local scope = { faction = nil }
+
+-- The faction the scoped pages should open on. Resolved LAZILY, not at file
+-- load: options.lua is parsed during ADDON_LOADED, and UnitFactionGroup is not
+-- reliably answerable that early. The answer is cached only once it is a real
+-- faction, so a transient nil (pre-login, or a neutral-start Pandaren-style
+-- edge case that Classic does not have but costs nothing to survive) falls back
+-- WITHOUT sticking — the next call retries and self-heals.
+local function ScopeFaction()
+    if scope.faction == "Horde" or scope.faction == "Alliance" then return scope.faction end
+    local f = UnitFactionGroup and UnitFactionGroup("player")
+    if f == "Horde" or f == "Alliance" then scope.faction = f; return f end
+    return "Alliance"   -- transient fallback; NOT cached, so it is retried
+end
+
+-- Sole writer for the scope. `nil` (or anything not a real faction) clears the
+-- cache, so the next read re-resolves from UnitFactionGroup.
+local function SetScopeFaction(v)
+    scope.faction = (v == "Horde" or v == "Alliance") and v or nil
+end
+
+-- Self-test / diagnostic hooks (see the "options" suite at the foot of this file).
+Options.ScopeFaction    = ScopeFaction
+Options.SetScopeFaction = SetScopeFaction
+
+local function FS() return ns.Store and ns.Store.GetFactionSettings and ns.Store.GetFactionSettings(ScopeFaction()) or nil end
 
 -- Per-page refresher registries (called on faction toggle / section show).
 -- `alerts` is the split-off event matrix page (was folded into `timers`); `wizard`
@@ -1548,8 +1613,8 @@ local function factionHeader(flow, page)
     row:Label("Faction")
     local seg = row:SegmentedChoice({
         choices = { { value = "Alliance", text = "Alliance" }, { value = "Horde", text = "Horde" } },
-        get = function() return scope.faction end,
-        set = function(v) scope.faction = v; refreshPage(page) end,
+        get = function() return ScopeFaction() end,
+        set = function(v) SetScopeFaction(v); refreshPage(page) end,
     })
     register(page, function() if seg.Refresh then seg.Refresh() end end)
 end
@@ -1629,11 +1694,9 @@ local function buildAuras(flow)
         .. "This setting is account-wide.")
 
     -- ── Rend / Battle Shout class rules (cycling buttons) ─────────────────────
-    buildClassRuleGrid(flow, "Rend — Required Classes", "rend", REND_CLASSES)
-    buildClassRuleGrid(flow, "Battle Shout — Required Classes", "battleShout", BS_CLASSES)
-    -- Slip'kik's Savvy (DMT SP): physical damage users typically don't want it,
-    -- so it ships ignored for War/Rogue/Hunter and optional for casters.
-    buildClassRuleGrid(flow, "Slip'kik's Savvy (DMT SP) — Required Classes", "dmtSP", SLIPKIK_CLASSES)
+    for _, g in ipairs(CLASS_RULE_GRIDS) do
+        buildClassRuleGrid(flow, g.title, g.optKey, g.classes)
+    end
 end
 
 -- A grid of cycling buttons: each class steps Required → Optional → Ignored.
@@ -1941,13 +2004,13 @@ local function buildAutomation(flow)
         local origArrange = blk.arrange
         blk.arrange = function(width)
             local reqF = CLASS_FACTION[class]
-            if reqF and reqF ~= scope.faction then row:Hide(); return 0 end
+            if reqF and reqF ~= ScopeFaction() then row:Hide(); return 0 end
             row:Show(); return origArrange(width)
         end
         blk._baseGap = blk.topGap
         register("automation", function()
             local reqF = CLASS_FACTION[class]
-            blk.topGap = (reqF and reqF ~= scope.faction) and 0 or blk._baseGap
+            blk.topGap = (reqF and reqF ~= ScopeFaction()) and 0 or blk._baseGap
             if dd.Refresh then dd.Refresh() end
         end)
     end
@@ -2642,6 +2705,114 @@ ns:RegisterSelfTest("options", function(verbose)
     -- subset of the Mesh page's refreshers.
     ck(type(refreshers.meshLive) == "table", "meshLive registry exists")
     ck(#refreshers.meshLive <= #refreshers.mesh, "meshLive is a subset of mesh")
+
+    ----------------------------------------------------------------------
+    -- Class-rule KEY PARITY (owner bug: Slip'kik's Savvy stayed amber).
+    --
+    -- The write side (this page's CLASS_RULE_GRIDS[].optKey -> auraOpts[optKey])
+    -- and the read side (ui_shell AURA_META[].thresholdKey filtered through
+    -- Dashboard.CLASS_RULED_KEYS) are two hand-maintained string tables in two
+    -- files. Both are raw table indexes, so a case slip — "dmtsp" for "dmtSP",
+    -- and slot 8's AURA_META.key really IS the lowercase "dmtsp" sitting one
+    -- field away — writes a map nothing reads. The click "takes", the pill turns
+    -- green, and the rule silently never fires. Asserted BOTH ways so neither
+    -- side can grow a fourth class-ruled buff alone.
+    ----------------------------------------------------------------------
+    local D = ns.Dashboard
+    local grids = Options.CLASS_RULE_GRIDS
+    ck(type(grids) == "table" and #grids > 0, "CLASS_RULE_GRIDS roster exists")
+    ck(type(D) == "table" and type(D.CLASS_RULED_KEYS) == "table",
+       "ui_shell exports Dashboard.CLASS_RULED_KEYS")
+
+    if type(grids) == "table" and type(D) == "table" and type(D.CLASS_RULED_KEYS) == "table" then
+        local writeKeys = {}
+        for _, g in ipairs(grids) do
+            ck(type(g.optKey) == "string" and g.optKey ~= "", "grid optKey is a non-empty string")
+            ck(type(g.classes) == "table" and #g.classes > 0,
+               ("grid %s has a class list"):format(tostring(g.optKey)))
+            writeKeys[g.optKey] = true
+        end
+        -- Every key this page WRITES must be one the display READS ...
+        for k in pairs(writeKeys) do
+            ck(D.CLASS_RULED_KEYS[k] == true,
+               ("options write-key %q is class-ruled on the display side"):format(k))
+        end
+        -- ... and every key the display class-rules must have a grid to set it.
+        for k in pairs(D.CLASS_RULED_KEYS) do
+            ck(writeKeys[k] == true,
+               ("display class-ruled key %q has an Auras-page grid"):format(k))
+        end
+        -- And each one must be a real threshold-bearing slot, spelled identically.
+        if type(D.AURA_META) == "table" then
+            local metaKeys = {}
+            for _, meta in pairs(D.AURA_META) do
+                if type(meta.thresholdKey) == "string" then metaKeys[meta.thresholdKey] = true end
+            end
+            for k in pairs(writeKeys) do
+                ck(metaKeys[k] == true,
+                   ("write-key %q matches an AURA_META thresholdKey verbatim"):format(k))
+            end
+        end
+    end
+
+    ----------------------------------------------------------------------
+    -- Faction scope defaults to the PLAYER'S OWN faction (the trap that made
+    -- the owner's Slip'kik/Shaman tick land in the Alliance table while every
+    -- Horde card read the untouched Horde one). The harness stubs
+    -- UnitFactionGroup -> "Horde", so the pre-fix behaviour ("Alliance") is a
+    -- hard failure here.
+    ----------------------------------------------------------------------
+    local realUFG = UnitFactionGroup
+    local function withFaction(f, fn)
+        _G.UnitFactionGroup = function() return f end
+        SetScopeFaction(nil)                    -- clear the cache; force re-resolve
+        fn()
+    end
+
+    withFaction("Horde", function()
+        ck(ScopeFaction() == "Horde", "scope opens on the player's own faction (Horde)")
+        -- The write target follows the scope: this is the bug, stated directly.
+        local fs = FS()
+        local hordeFS = ns.Store and ns.Store.GetFactionSettings
+                        and ns.Store.GetFactionSettings("Horde")
+        ck(fs ~= nil and fs == hordeFS,
+           "class-rule writes land in the OWN-faction settings table")
+    end)
+    withFaction("Alliance", function()
+        ck(ScopeFaction() == "Alliance", "an Alliance player opens on Alliance")
+    end)
+    -- Unresolvable faction (pre-login): fall back, but do NOT cache the fallback,
+    -- or one early call would pin the wrong faction for the whole session.
+    withFaction(nil, function()
+        ck(ScopeFaction() == "Alliance", "unresolvable faction falls back to Alliance")
+        _G.UnitFactionGroup = function() return "Horde" end
+        ck(ScopeFaction() == "Horde", "the fallback is not cached -- next call self-heals")
+    end)
+    -- An explicit toggle still wins over the default, and junk resets to default.
+    withFaction("Horde", function()
+        SetScopeFaction("Alliance")
+        ck(ScopeFaction() == "Alliance", "explicit faction toggle overrides the default")
+        SetScopeFaction("Neutral")
+        ck(ScopeFaction() == "Horde", "a bogus scope value resets to the own-faction default")
+    end)
+
+    -- End-to-end, the owner's exact click: tick Shaman = required on the Auras
+    -- page while scoped to Horde, then read it back the way a card does.
+    withFaction("Horde", function()
+        local fs = FS()
+        if fs and fs.auraOpts and fs.auraOpts.dmtSP and D and D.AuraRequirement then
+            local o = fs.auraOpts.dmtSP
+            local pReq, pOpt, pIgn = o.required.SHAMAN, o.optional.SHAMAN, o.ignored.SHAMAN
+            o.required.SHAMAN, o.optional.SHAMAN, o.ignored.SHAMAN = true, nil, nil
+            local appl, req = D.AuraRequirement(8, { classTag = "SHAMAN" }, "Horde")
+            ck(appl == true and req == "required",
+               "Slip'kik required-for-Shaman on Horde reads back as required (red)")
+            o.required.SHAMAN, o.optional.SHAMAN, o.ignored.SHAMAN = pReq, pOpt, pIgn
+        end
+    end)
+
+    _G.UnitFactionGroup = realUFG
+    SetScopeFaction(nil)                        -- leave the live session unpinned
 
     if verbose and pass then ns:Print("  PASS options/editbox-focus-guard") end
     return pass

@@ -867,7 +867,17 @@ end
 -- "Missing Battle Shout" tile. Listing it here hands the slot to the B12 seeds
 -- (Store.CLASS_RULE_SEEDS: Warrior/Rogue required, everyone else ignored), so
 -- warriors and rogues see a real requirement and nobody else sees anything.
+--
+-- CASE IS LOAD-BEARING. These are the same byte strings as
+-- AURA_META[slot].thresholdKey and as the `optKey` the options page writes
+-- (options.lua CLASS_RULE_GRIDS) — "dmtSP", not the slot's lowercase
+-- AURA_META.key "dmtsp". The lookup below is a raw table index, so a single
+-- flipped letter on either side is silent: the owner's click writes a map, the
+-- display reads a different one, and the rule can never fire. Exported so the
+-- "options" suite can assert the write-key set and this read-key set are
+-- identical strings in BOTH directions.
 local CLASS_RULED_KEYS = { rend = true, dmtSP = true, battleShout = true }
+Dashboard.CLASS_RULED_KEYS = CLASS_RULED_KEYS
 
 -- Class rule state for an aura opt map ("rend"/"battleShout"/"dmtSP") on a faction.
 function Dashboard.ClassRuleState(optKey, classTag, faction)
