@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- Fixed: **stored buffs whose time was printed in the tooltip's right-hand column, or
+  off to one side, were being missed.** Hovering a chronoboon only ever read the left
+  column of the tooltip's numbered lines. When a buff's name sat on the left and its
+  remaining time on the right — a perfectly ordinary layout — the buff was recorded as
+  "in the boon, time unknown" and the minutes were thrown away; when the whole
+  suspended-effects list was drawn as one loose block rather than as numbered lines, the
+  buffs in it were not seen at all. The hover now reads every line, both columns, and
+  every stray piece of text the tooltip is drawing. Text that appears twice is only
+  counted once, and where the same buff shows up in two places the reading that actually
+  carries a time is the one that is kept.
+
 - Fixed: **"Battle Shout (Boon)" was a state the game cannot produce.** A chronoboon
   cannot hold a Battle Shout or Fire Festival Fury — the Displacer will not take them —
   but the code that reads a chronoboon's tooltip checked all ten tracked buffs instead of

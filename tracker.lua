@@ -591,6 +591,117 @@ local function boonSnapshotsEqual(a, b)
     return true
 end
 
+-- Gather every scrap of text a tooltip is rendering into ONE block, in reading
+-- order. Spec §4.4: the read scrapes "every left/right tooltip line plus every
+-- font-string region".
+--
+-- WHY THE SCRAPE IS THAT WIDE. It used to read GameTooltipTextLeft1..NumLines
+-- and nothing else, which is exactly the shape the Supercharged Chronoboon
+-- Displacer happens to render — but it is not the only one:
+--
+--   * A duration is commonly laid out on the RIGHT FontString of the line whose
+--     LEFT holds the buff's name ("Fengus' Ferocity" | "(119m)"). Reading only
+--     the left column found the name and lost the minutes — presence without a
+--     number. (Since 03be2a5 that degrades safely rather than stealing the next
+--     buff's minutes, but the duration is still gone.)
+--   * Some renderings put the suspended-effects block in an UNNAMED font-string
+--     region that never appears in the TextLeft/TextRight enumeration at all,
+--     so the buffs were invisible to us entirely.
+--
+-- THE TWO HALVES OF ONE LINE SHARE ONE TEXT LINE, joined by a space and not by
+-- a newline. They are two columns of the same visual row, and ParseBoonBlock
+-- clamps a buff's duration search to its own segment — up to the next NEWLINE
+-- or the next tracked name (the 03be2a5 leak fix). Emitting "(119m)" on a line
+-- of its own would therefore throw the duration away the instant we collected
+-- it. Joined, the pair reads as the ordinary "Name (duration)" form the parser
+-- already handles, and the clamp still stops a duration crossing into the row
+-- below.
+--
+-- DEDUPE, TWO KINDS:
+--   * IDENTITY. The numbered TextLeft/TextRight FontStrings are themselves
+--     regions of the tooltip, so the region sweep would collect every line a
+--     second time. An object already read is skipped outright.
+--   * TEXT, in the region sweep only — so a tooltip with no right column and no
+--     extra regions produces byte-for-byte the block it produced before. A
+--     client that renders the same words twice must not hand the parser two
+--     copies: an exact repeat is dropped, and a repeat that EXTENDS what we
+--     already hold ("Fengus' Ferocity" -> "Fengus' Ferocity (119m)") REPLACES
+--     it. ParseBoonBlock reads a slot's FIRST occurrence, so without that
+--     replacement a bare-name line would shadow the region carrying the
+--     minutes and the poorer reading (0 = "present, duration unknown") would
+--     win — the highest duration must win per slot, never the lowest.
+--
+-- PURE given its arguments: `tip` defaults to GameTooltip and `lookup` to a _G
+-- read, and the self-test hands it fakes for both, so exercising it stomps no
+-- global. Returns the RAW joined block; the caller normalizes.
+function Tracker.CollectBoonTooltipText(tip, lookup)
+    tip = tip or GameTooltip
+    lookup = lookup or function(name) return _G[name] end
+    if not (tip and tip.NumLines) then return "" end
+    local lines = tonumber(tip:NumLines()) or 0
+    if lines < 1 then return "" end
+
+    local parts, normed, taken = {}, {}, {}
+
+    -- The text of one FontString, or nil for "nothing usable here". Marks the
+    -- object as read either way, which is the identity half of the dedupe.
+    local function textOf(fs)
+        if type(fs) ~= "table" or taken[fs] then return nil end
+        taken[fs] = true
+        if type(fs.GetText) ~= "function" then return nil end
+        local t = fs:GetText()
+        if type(t) ~= "string" or t == "" then return nil end
+        return t
+    end
+
+    local function append(t)
+        parts[#parts + 1]  = t
+        normed[#normed + 1] = normName(t)
+    end
+
+    -- 1) Every numbered line: left column, then right column, one text line.
+    for i = 1, lines do
+        local l = textOf(lookup("GameTooltipTextLeft" .. i))
+        local r = textOf(lookup("GameTooltipTextRight" .. i))
+        if l and r then append(l .. " " .. r)
+        elseif l      then append(l)
+        elseif r      then append(r) end
+    end
+
+    -- 2) Every font-string region we have not already read. The "not already
+    -- read" half is textOf's alone — it returns nil for an object it has
+    -- handed back once, and it is the ONLY place identity is tracked, so there
+    -- is no second copy of that rule to rot out of step with this one.
+    local function sweepRegions(...)
+        for i = 1, select("#", ...) do
+            local region = select(i, ...)
+            if type(region) == "table"
+               and type(region.GetObjectType) == "function"
+               and region:GetObjectType() == "FontString" then
+                local t = textOf(region)
+                if t then
+                    local rn, dup = normName(t), false
+                    for k = 1, #normed do
+                        local pn = normed[k]
+                        if rn == pn then
+                            dup = true break                      -- exact repeat
+                        elseif #rn > #pn and rn:sub(1, #pn) == pn then
+                            parts[k], normed[k] = t, rn           -- richer wins
+                            dup = true break
+                        elseif #pn > #rn and pn:sub(1, #rn) == rn then
+                            dup = true break                      -- already richer
+                        end
+                    end
+                    if not dup then append(t) end
+                end
+            end
+        end
+    end
+    if type(tip.GetRegions) == "function" then sweepRegions(tip:GetRegions()) end
+
+    return table.concat(parts, "\n")
+end
+
 local function scanTooltipForStoredBuffs()
     if not GameTooltip or not GameTooltip.NumLines then return end
     local lines = GameTooltip:NumLines()
@@ -605,18 +716,17 @@ local function scanTooltipForStoredBuffs()
     end
     if not isBoon then return end
 
-    -- Concatenate EVERY tooltip FontString into one normalized text block. The
-    -- live Supercharged Chronoboon Displacer packs all suspended effects into a
-    -- SINGLE FontString with embedded newlines; other clients may split them
-    -- across separate FontStrings. Joining + block-parsing handles both, so all
-    -- stored buffs resolve in one scan (fixes "only one buff booned").
-    local parts = {}
-    for i = 1, lines do
-        local fs = _G["GameTooltipTextLeft" .. i]
-        local t = fs and fs.GetText and fs:GetText()
-        if t and t ~= "" then parts[#parts + 1] = t end
-    end
-    local block = normName(table.concat(parts, "\n"))
+    -- Concatenate EVERY tooltip FontString into one normalized text block —
+    -- every LEFT line, every RIGHT line and every font-string REGION, per spec
+    -- §4.4 (see Tracker.CollectBoonTooltipText for the shapes that needs to
+    -- cover and how the two halves of a line are joined). The live Supercharged
+    -- Chronoboon Displacer packs all suspended effects into a SINGLE FontString
+    -- with embedded newlines; other clients split them across separate
+    -- FontStrings, columns or unnamed regions. Joining + block-parsing handles
+    -- all of them, so every stored buff resolves in one scan with its own
+    -- duration (fixes "only one buff booned", then "the right column's minutes
+    -- were never read").
+    local block = normName(Tracker.CollectBoonTooltipText())
 
     -- Count every stored buff present in the block (each name once). Includes the
     -- non-slot extras (Boon of Blackfathom / Spark of Inspiration) that still
@@ -3265,6 +3375,188 @@ local function testBoonScope(fails)
     ck(Tracker.ScrubNonBoonableSlots(nil) == 0, "scrub: nil is a no-op")
 end
 
+----------------------------------------------------------------------
+-- TOOLTIP SCRAPE COVERAGE (spec §4.4: "every left/right tooltip line plus every
+-- font-string region").
+--
+-- The scrape read GameTooltipTextLeft1..NumLines and nothing else. Two whole
+-- renderings were therefore unreadable:
+--
+--   1. name on the LEFT FontString, duration on the RIGHT one. We saw the buff
+--      and lost its minutes — presence without a number.
+--   2. the suspended-effects block in an UNNAMED font-string region, which the
+--      TextLeft/TextRight enumeration never mentions. We saw nothing at all.
+--
+-- Widening the scrape re-opens a question the narrow one could not raise: the
+-- numbered FontStrings ARE regions, so the sweep must not read them twice, and
+-- a duplicated buff name must never let the POORER reading win — ParseBoonBlock
+-- takes a slot's first occurrence, so a bare name collected ahead of the copy
+-- carrying the duration would pin the slot to 0. Both halves of the dedupe are
+-- asserted below, and the fixtures assert the EXACT collected block, which is
+-- what makes a broken dedupe visible at all (a stray duplicate carries no buff
+-- name, so it changes the text without changing any slot).
+--
+-- Nothing global is stomped: CollectBoonTooltipText takes the tooltip and the
+-- _G lookup as arguments, and these fixtures pass fakes.
+----------------------------------------------------------------------
+
+-- Build a fake tooltip. `rows` is an array of { leftText, rightText } (either
+-- may be nil/omitted); `extras` an array of strings rendered as ANONYMOUS
+-- font-string regions; `junk` an array of ready-made non-FontString regions.
+-- GetRegions returns the line FontStrings (in reading order) followed by the
+-- extras, exactly as a real tooltip enumerates its own children.
+local function fakeBoonTooltip(rows, extras, junk)
+    local named, regions = {}, {}
+    local function fontString(text)
+        return {
+            GetText       = function() return text end,
+            GetObjectType = function() return "FontString" end,
+        }
+    end
+    for i = 1, #rows do
+        local row = rows[i]
+        if row[1] then
+            local fs = fontString(row[1])
+            named["GameTooltipTextLeft" .. i] = fs
+            regions[#regions + 1] = fs
+        end
+        if row[2] then
+            local fs = fontString(row[2])
+            named["GameTooltipTextRight" .. i] = fs
+            regions[#regions + 1] = fs
+        end
+    end
+    for i = 1, #(extras or {}) do regions[#regions + 1] = fontString(extras[i]) end
+    for i = 1, #(junk or {})   do regions[#regions + 1] = junk[i] end
+    local tip = {
+        NumLines   = function() return #rows end,
+        GetRegions = function() return unpack(regions) end,
+    }
+    return tip, function(name) return named[name] end
+end
+
+local function testBoonScrapeCoverage(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local function collect(rows, extras, junk)
+        local tip, lookup = fakeBoonTooltip(rows, extras, junk)
+        return Tracker.CollectBoonTooltipText(tip, lookup)
+    end
+    local function parse(block) return Tracker.ParseBoonBlock(normName(block)) end
+    local function occurrences(hay, needle)
+        local n, at = 0, 1
+        while true do
+            local s = normName(hay):find(needle, at, true)
+            if not s then return n end
+            n, at = n + 1, s + 1
+        end
+    end
+
+    -- ---- 1) the duration lives on the RIGHT FontString --------------------
+    local RIGHT_ROWS = {
+        { "Chronoboon Displacement" },
+        { "World effects suspended:" },
+        { "Rallying Cry of the Dragonslayer", "(115m)" },
+        { "Fengus' Ferocity", "(119m)" },
+    }
+    local block = collect(RIGHT_ROWS)
+    ck(block == "Chronoboon Displacement\nWorld effects suspended:\n" ..
+                "Rallying Cry of the Dragonslayer (115m)\nFengus' Ferocity (119m)",
+       "right column: each line's two halves join as one 'Name (duration)' line")
+    ck(occurrences(block, "(115m)") == 1, "right column: no line is collected twice")
+    local slots = parse(block)
+    ck(slots[1] and slots[1].duration == 115 * 60,
+       "right column: slot 1 reads the RIGHT FontString's 115m, not presence-only")
+    ck(slots[6] and slots[6].duration == 119 * 60, "right column: slot 6 reads 119m")
+
+    -- The same tooltip with the right column removed is the pre-fix reading:
+    -- the names are found, the minutes are not. This is both the regression
+    -- guard for the left-only path and the proof that the right column is what
+    -- supplies the durations above.
+    local LEFT_ONLY = { { "Chronoboon Displacement" }, { "World effects suspended:" },
+                        { "Rallying Cry of the Dragonslayer" }, { "Fengus' Ferocity" } }
+    local lo = parse(collect(LEFT_ONLY))
+    ck(lo[1] and lo[1].duration == 0, "left-only: a name with no duration still reads 0")
+    ck(lo[6] and lo[6].duration == 0, "left-only: presence-only degradation preserved")
+
+    -- ---- 2) a stored buff rendered ONLY in an anonymous region -------------
+    local REGION_ROWS = { { "Chronoboon Displacement" }, { "World effects suspended:" } }
+    local rblock = collect(REGION_ROWS,
+        { "Songflower Serenade (59m)\nSpirit of Zandalar (114m)" })
+    local rs = parse(rblock)
+    ck(rs[4] and rs[4].duration == 59 * 60,
+       "region: a buff present only in an unnamed region resolves (slot 4, 59m)")
+    ck(rs[3] and rs[3].duration == 114 * 60, "region: and its neighbour (slot 3, 114m)")
+
+    -- ---- 3) dedupe: a region that repeats a line --------------------------
+    -- (a) EXACT repeat -> dropped, once and only once in the block.
+    local dupBlock = collect({ { "Chronoboon Displacement" }, { "Mol'dar's Moxie (120m)" } },
+                             { "Mol'dar's Moxie (120m)" })
+    ck(dupBlock == "Chronoboon Displacement\nMol'dar's Moxie (120m)",
+       "dedupe: an exact region repeat of a line is dropped")
+    ck(occurrences(dupBlock, "mol'dar's moxie") == 1, "dedupe: the name appears once")
+    local ds = parse(dupBlock)
+    ck(ds[7] and ds[7].duration == 120 * 60, "dedupe: the duration survives the drop")
+
+    -- (b) the region EXTENDS a bare-name line -> it replaces it, so the HIGHER
+    --     duration wins. First-occurrence parsing would otherwise pin slot 2 to
+    --     0 from the bare line and throw the region's 60m away.
+    local hiBlock = collect({ { "Chronoboon Displacement" }, { "Warchief's Blessing" } },
+                            { "Warchief's Blessing (60m)" })
+    ck(hiBlock == "Chronoboon Displacement\nWarchief's Blessing (60m)",
+       "dedupe: the richer rendering replaces the bare name, it does not follow it")
+    ck(occurrences(hiBlock, "warchief's blessing") == 1, "dedupe: still one occurrence")
+    local hs = parse(hiBlock)
+    ck(hs[2] and hs[2].duration == 60 * 60,
+       "dedupe: the highest duration wins per slot (60m, not the bare line's 0)")
+
+    -- (c) the region is POORER than what we hold -> ignored, no downgrade.
+    local poor = parse(collect({ { "Chronoboon Displacement" },
+                                 { "Spirit of Zandalar (114m)" } },
+                               { "Spirit of Zandalar" }))
+    ck(poor[3] and poor[3].duration == 114 * 60,
+       "dedupe: a bare-name region never downgrades a line that has the minutes")
+
+    -- ---- 4) the owner's 7-line fixture, left-only, unchanged ---------------
+    local OWNER = { { "Chronoboon Displacement" }, { "World effects suspended:" },
+                    { "Fengus' Ferocity (119m)" }, { "Mol'dar's Moxie (120m)" },
+                    { "Rallying Cry of the Dragonslayer (115m)" },
+                    { "Warchief's Blessing (60m)" }, { "Spirit of Zandalar (114m)" },
+                    { "Songflower Serenade (59m)" }, { "Sayge's Dark Fortune (119m)" } }
+    local os_ = parse(collect(OWNER))
+    local n = 0; for _ in pairs(os_) do n = n + 1 end
+    ck(n == 7, "regression: the owner 7-line tooltip still resolves 7 slots (got " .. n .. ")")
+    ck(os_[1] and os_[1].duration == 115 * 60, "regression: slot 1 still 115m")
+    ck(os_[5] and os_[5].duration == 119 * 60, "regression: slot 5 still 119m")
+    ck(os_[7] and os_[7].duration == 120 * 60, "regression: slot 7 still 120m")
+
+    -- ---- 5) defensive: the shapes a real tooltip hands us on a bad frame ---
+    local TEXTURE = { GetObjectType = function() return "Texture" end }
+    local NO_TEXT = { GetObjectType = function() return "FontString" end }  -- no GetText
+    local messy = collect({ { "Chronoboon Displacement" },
+                            { nil, "(115m)" },               -- right with no left
+                            { "" },                          -- empty left
+                            { "Songflower Serenade", "" },   -- empty right
+                          }, { "" }, { TEXTURE, NO_TEXT, "not a widget", 7 })
+    ck(messy == "Chronoboon Displacement\n(115m)\nSongflower Serenade",
+       "defensive: nil/empty FontStrings and non-FontString regions are skipped")
+
+    local empty = Tracker.CollectBoonTooltipText(
+        { NumLines = function() return 0 end }, function() return nil end)
+    ck(empty == "", "defensive: a zero-line tooltip collects nothing")
+    ck(Tracker.CollectBoonTooltipText({}, function() return nil end) == "",
+       "defensive: a tooltip with no NumLines collects nothing")
+    -- A tooltip with no GetRegions at all (an older client) still reads lines.
+    local noRegions = Tracker.CollectBoonTooltipText(
+        { NumLines = function() return 1 end },
+        function(name)
+            if name == "GameTooltipTextLeft1" then
+                return { GetText = function() return "Chronoboon Displacement" end }
+            end
+        end)
+    ck(noRegions == "Chronoboon Displacement",
+       "defensive: a client without GetRegions still reads the numbered lines")
+end
+
 -- MATCHING MATRIX (owner live report): a world buff whose live name renders with
 -- a typographic apostrophe (U+2019) must still land in its slot. Every BUFF_SLOTS
 -- prefix is asserted to match BOTH the ASCII-apostrophe and the U+2019 rendition
@@ -5624,6 +5916,8 @@ function Tracker.RunSelfTests(verbose)
         { name = "boon block (owner 7-line fixture)", fn = testBoonBlock },
         { name = "boon scope (unboonable slots + duration leak)", fn = testBoonScope },
         { name = "boon scope repair + inbound guard", fn = testBoonScopeRepair },
+        { name = "boon tooltip scrape coverage (left + right + regions)",
+          fn = testBoonScrapeCoverage },
         { name = "live aura matching (apostrophe matrix)", fn = testLiveAuraMatching },
         { name = "spell-ID matching (A6.4/A6.6)", fn = testSpellIDMatching },
         { name = "teardown latch + grace windows", fn = testTeardownLatch },
