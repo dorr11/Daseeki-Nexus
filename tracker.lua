@@ -1531,7 +1531,10 @@ end
 -- attunement; the other three are ungated per-character and therefore always
 -- read as attuned:
 --
---   MC    Attunement to the Core          — one neutral quest
+--   MC    Attunement to the Core          — FACTION-SPLIT: two quest ids share
+--                                           this ONE name, one per faction, both
+--                                           handed in to the same neutral NPC.
+--                                           See the LIVE BUG note below.
 --   BWL   Blackhand's Command             — one neutral quest (UBRS)
 --   Ony   Drakefire Amulet chain          — FACTION-SPLIT: two different final
 --                                           quests, one per faction
@@ -1553,7 +1556,8 @@ end
 -- shipping (page fetched, quest name read back). Do NOT "correct" these from
 -- memory; re-verify against the cited URL instead.
 --
---   7487  Attunement to the Core                  https://www.wowhead.com/classic/quest=7487
+--   7487  Attunement to the Core       (one faction) https://www.wowhead.com/classic/quest=7487
+--   7848  Attunement to the Core      (the other)   https://www.wowhead.com/classic/quest=7848
 --   7761  Blackhand's Command                     https://www.wowhead.com/classic/quest=7761
 --   6502  Drakefire Amulet             (ALLIANCE) https://www.wowhead.com/classic/quest=6502
 --   6602  Blood of the Black Dragon Champion
@@ -1574,11 +1578,35 @@ end
 -- have completed 6602, so "either one complete" is exactly equivalent to the
 -- per-faction test — and it stays correct without depending on a faction field
 -- that may not be captured yet on a cold record.
+--
+-- LIVE BUG, 2026-08-02 — "MC shows grey on characters I know are attuned".
+-- MC shipped with ONE quest id (7487) and was therefore the only gated raid
+-- whose faction split was missed. Ony's split was handled; MC's identical split
+-- was not, because both ids carry the SAME quest NAME ("Attunement to the
+-- Core") and the same neutral quest giver, so nothing about the quest looks
+-- faction-scoped from the outside — exactly the Naxx trap (one name, several
+-- ids) wearing a different hat.
+--
+-- The owner's SavedVariables proved it rather than suggesting it: across three
+-- accounts, MC read FALSE for every single character and `MC = true` did not
+-- appear anywhere, while three of those same level-60 records carried
+-- BWL/Ony/Naxx = TRUE. A matrix holding three TRUEs is proof the probe that
+-- wrote it was WARM, so MC's false in that same matrix cannot be a cold-cache
+-- artifact — it is a quest id the probe never asked about.
+--
+-- The union below is direction-agnostic ON PURPOSE. The secondary databases
+-- disagree with the live client about which id belongs to which faction
+-- (classicdb and a TrinityCore issue both map 7487->Horde / 7848->Alliance, yet
+-- the owner's affected characters are all Horde), and this project has already
+-- been bitten once by a reversed faction pair. Since no character can ever hold
+-- both ids, asking about BOTH is correct under either mapping and cannot
+-- produce a false positive — so the union is the fix, and the faction mapping
+-- is deliberately NOT relied upon anywhere in the code.
 ----------------------------------------------------------------------
 
 -- PURE: raidKey -> the quest ids that grant it. ANY ONE complete = attuned.
 local ATTUNE_QUESTS = {
-    MC   = { 7487 },
+    MC   = { 7487, 7848 },              -- one per faction, SAME quest name
     BWL  = { 7761 },
     Ony  = { 6502, 6602 },              -- Alliance final, Horde final
     Naxx = { 9121, 9122, 9123 },        -- Honored, Revered, Exalted
@@ -1598,6 +1626,46 @@ Tracker.ATTUNE_NS = ATTUNE_NS
 Tracker.ATTUNE_RECHECK_INTERVAL = 60    -- seconds between unforced re-probes
 Tracker._attuneCheckedAt = nil          -- Store.Now() of the last probe
 Tracker._attuneForce     = false        -- set by QUEST_TURNED_IN / entering world
+
+----------------------------------------------------------------------
+-- WARMTH: when is a FALSE answer trustworthy?
+--
+-- C_QuestLog.IsQuestFlaggedCompleted does not report "I don't know yet". Before
+-- the server's completed-quest data lands it answers a flat FALSE, which is
+-- indistinguishable from an honest "never completed". The old code only guarded
+-- the case where the API function was MISSING, which is not the case that
+-- happens: the function is always there at PLAYER_ENTERING_WORLD, it just lies
+-- for a moment. A probe taken in that window published an all-false matrix that
+-- greyed every gated raid on every peer's screen until the next re-probe.
+--
+-- A false is therefore believed only when one of these holds:
+--   * the SAME probe returned at least one gated TRUE. A true answer can only
+--     come from loaded data, so it proves the cache is warm, and every false
+--     beside it is honest. This covers every attuned character instantly.
+--   * OR the character has been in-world at least ATTUNE_WARM_DELAY seconds AND
+--     ATTUNE_AGREE_COUNT consecutive probes have all come back all-false. This
+--     is the only path for a character attuned to NOTHING (a fresh alt), which
+--     is a legitimate state that must eventually grey — it just has to earn it.
+--
+-- Until a false is trusted the matrix is treated as UNKNOWN: nothing is written
+-- to the record and nothing is published, so the character reads nil on every
+-- screen and renders ATTUNED. Greying a raid the owner can actually enter is
+-- the loud, confusing failure; failing to grey one for another minute is not.
+----------------------------------------------------------------------
+Tracker.ATTUNE_WARM_DELAY  = 30         -- seconds in-world before a false counts
+Tracker.ATTUNE_AGREE_COUNT = 2          -- consecutive all-false probes required
+Tracker._attuneAllFalseRuns = 0         -- consecutive all-false probes so far
+
+-- PURE: fold one all-false probe into the agreement counter.
+-- Returns trusted(bool), runs(number). Explicit state in, explicit state out —
+-- no clock and no globals, so the harness can drive it directly.
+function Tracker.TrustAllFalse(prevRuns, onlineSecs)
+    local runs = (tonumber(prevRuns) or 0) + 1
+    local secs = tonumber(onlineSecs) or 0
+    local trusted = secs >= Tracker.ATTUNE_WARM_DELAY
+                and runs >= Tracker.ATTUNE_AGREE_COUNT
+    return trusted, runs
+end
 
 -- Probe one quest id. Returns true/false, or NIL when the API is unavailable —
 -- nil must never be coerced to false, or a cold client would grey every raid.
@@ -1626,9 +1694,14 @@ Tracker._questCompleted = questCompleted
 -- `probe(questID)` returns true/false/nil. Returns nil (NOT a table of falses)
 -- when the probe could not answer a single gated quest — the caller must then
 -- leave whatever it already had alone.
+--
+-- SECOND RETURN — anyTrue: did any GATED raid probe true? The always-attuned
+-- raids (ZG/AQ20/AQ40) are true by construction and deliberately do not count.
+-- This is the warmth proof described above: a true can only come from loaded
+-- data, so it licenses the caller to believe the falses sitting beside it.
 function Tracker.AttunementFlags(probe)
     if type(probe) ~= "function" then return nil end
-    local out, answered = {}, false
+    local out, answered, anyTrue = {}, false, false
     for _, key in ipairs(ns.Store.RAID_KEYS) do
         if ATTUNE_ALWAYS[key] then
             out[key] = true
@@ -1643,10 +1716,11 @@ function Tracker.AttunementFlags(probe)
                 end
             end
             out[key] = val
+            if val then anyTrue = true end
         end
     end
     if not answered then return nil end
-    return out
+    return out, anyTrue
 end
 
 -- PURE: fold a previous matrix into a fresh one. Attunement is MONOTONIC — it
@@ -1783,6 +1857,26 @@ end
 --     nil    NO DATA — an old peer that has not updated, or a record written
 --            before this feature shipped. Callers treat nil as attuned, so a
 --            mid-rollout mesh never greys a character it simply cannot see.
+--
+-- TWO SOURCES, FOLDED WITH OR — the record's own matrix and the cross-account
+-- namespace projection. TRUE from EITHER wins; false is returned only when a
+-- source says false and none says true; nil when neither has an opinion.
+--
+-- This used to be a precedence rule (record first, namespace only as a
+-- fallback), which had a permanent-staleness hole. Store.NON_WIRE_CARRY carries
+-- `attunements` forward across every binary state push, so once a peer record
+-- picked up a matrix over the segment path it kept it FOREVER — the binary wire
+-- never refreshes it. A record holding a false from before the owner fixed
+-- their attunement therefore outranked, and permanently suppressed, the fresh
+-- TRUE arriving through the namespace: the self-heal reached the client and
+-- then lost to a cached lie.
+--
+-- OR removes the hole by construction and needs no ordering, no timestamps and
+-- no rev comparison between two transports that do not share a clock, because
+-- attunement is MONOTONIC — it only ever goes false->true, so the attuned
+-- answer is always the newer and the truer one no matter which pipe it came
+-- down. It is also exactly the fold AttuneIndex already applies ACROSS peer
+-- accounts, so both layers now obey one rule instead of two.
 ----------------------------------------------------------------------
 
 if ns.Store then
@@ -1792,20 +1886,89 @@ if ns.Store then
         if ATTUNE_ALWAYS[raidKey] then return true end
         if not ATTUNE_QUESTS[raidKey] then return nil end   -- not a tracked raid
         if type(rec) ~= "table" then return nil end
+
+        -- nil until some source has an opinion; a single TRUE short-circuits.
+        local answer = nil
+
         local a = rec.attunements
         if type(a) == "table" and a[raidKey] ~= nil then
-            return a[raidKey] and true or false
+            if a[raidKey] then return true end
+            answer = false
         end
-        -- Cross-account fallback: the "attune" namespace projection.
+
+        -- Cross-account source: the "attune" namespace projection.
         local nameRealm = rec.nameRealm
         if type(nameRealm) == "string" and nameRealm ~= "" then
             local flags = Tracker.AttuneIndex()[nameRealm]
             if type(flags) == "table" and flags[raidKey] ~= nil then
-                return flags[raidKey] and true or false
+                if flags[raidKey] then return true end
+                answer = false
             end
         end
-        return nil
+
+        return answer
     end
+end
+
+----------------------------------------------------------------------
+-- ONE-SHOT CLEANUP of the falses written by the single-id MC probe.
+--
+-- Every MC = false already sitting in a record or a published payload was
+-- produced by a probe that only ever asked about ONE of the two MC quest ids,
+-- so it is not evidence of anything — the character may well be attuned via the
+-- id we never asked about. Those falses are demoted to nil (UNKNOWN), which
+-- renders as attuned, and the next warm probe answers for real.
+--
+-- Only MC, and only false: TRUE is never touched (attunement is monotonic, and
+-- a stored true is the one thing here that was always trustworthy), and the
+-- other three raids always probed every id they have. Setting nil rather than
+-- deleting a record honours store.lua's no-destructive-migrations rule.
+--
+-- Characters we own and re-log heal on their own within a minute; this pass
+-- exists for the ones that will NOT log in again soon — without it a parked alt
+-- keeps a wrong grey indefinitely, since nothing re-probes a character that
+-- never comes online. Peers heal separately and need no migration: their copy
+-- lives in the namespace, which a newer rev replaces wholesale.
+--
+-- Idempotent via a marker key, in the same style as Store.data.itemCdEpochsMigrated.
+-- Returns the number of records touched.
+----------------------------------------------------------------------
+Tracker.ATTUNE_MC_MIGRATION_KEY = "attuneMCFactionMigrated"
+
+-- PURE given its argument: demote every MC=false in ONE account bucket to nil.
+-- Mutates the records it touches; returns how many.
+function Tracker._MigrateMCFalsesIn(bucket)
+    if type(bucket) ~= "table" then return 0 end
+    local touched = 0
+    for _, tbl in ipairs({ bucket.characters, bucket.homeless }) do
+        if type(tbl) == "table" then
+            for _, rec in pairs(tbl) do
+                if type(rec) == "table" and type(rec.attunements) == "table"
+                   and rec.attunements.MC == false then
+                    rec.attunements.MC = nil
+                    touched = touched + 1
+                end
+            end
+        end
+    end
+    return touched
+end
+
+function Tracker.MigrateMCFalses()
+    local S = ns.Store
+    local data = S and S.data
+    if type(data) ~= "table" then return 0 end
+    if data[Tracker.ATTUNE_MC_MIGRATION_KEY] then return 0 end
+
+    local touched = Tracker._MigrateMCFalsesIn(
+        S.GetSelfAccount and S.GetSelfAccount(false))
+
+    data[Tracker.ATTUNE_MC_MIGRATION_KEY] = true
+    if touched > 0 then
+        Tracker.InvalidateAttuneIndex()
+        markAttuneDirty()               -- republish: rev bump, peers re-pull
+    end
+    return touched
 end
 
 -- Capture THIS character's attunement matrix onto its record. Throttled: an
@@ -1819,9 +1982,22 @@ local function captureAttunements(rec, force)
         local at = Tracker._attuneCheckedAt
         if at and (now - at) < Tracker.ATTUNE_RECHECK_INTERVAL then return false end
     end
-    local fresh = Tracker.AttunementFlags(questCompleted)
-    if not fresh then return false end          -- API cold: keep what we had
+    local fresh, anyTrue = Tracker.AttunementFlags(questCompleted)
+    if not fresh then return false end          -- API missing: keep what we had
     Tracker._attuneCheckedAt = now
+
+    -- WARMTH GATE. An all-false probe is UNKNOWN until it earns belief; see the
+    -- ATTUNE_WARM_DELAY block above. Returning early here writes nothing and
+    -- publishes nothing, so the character reads nil (= attuned) meanwhile.
+    if anyTrue then
+        Tracker._attuneAllFalseRuns = 0         -- a true proves the cache is warm
+    else
+        local trusted, runs = Tracker.TrustAllFalse(
+            Tracker._attuneAllFalseRuns, Tracker.SinceEnteringWorld())
+        Tracker._attuneAllFalseRuns = runs
+        if not trusted then return false end
+    end
+
     local merged = Tracker.MergeAttunements(prev, fresh)
     if not attuneChanged(prev, merged) then
         rec.attunements = merged
@@ -2055,8 +2231,13 @@ function Tracker.OnLogin()
         Tracker._enteredWorldAt = (GetTime and GetTime()) or 0
         -- Attunement: re-probe unthrottled on the far side of every loading
         -- screen. The completed-quest cache is one of the things that is cold
-        -- right after login, so the FIRST honest read is often this one.
+        -- right after login, so the FIRST honest read is often this one — and
+        -- being cold again is exactly why the all-false agreement counter has to
+        -- reset here. Carrying it across a loading screen would let one stale
+        -- pre-screen probe pair up with one cold post-screen probe and "agree"
+        -- their way to a trusted all-false.
         Tracker._attuneForce = true
+        Tracker._attuneAllFalseRuns = 0
         -- A10.1 / spec §9.4: a FORCED push 1.0s after entering the world, once
         -- the aura and bag APIs have warmed up. This is the push that re-seeds
         -- every peer after a /reload or a zone change, and it must bypass the
@@ -2194,6 +2375,10 @@ function Tracker.OnLogin()
     -- Attunement: force the first probe of the session, and seed the namespace
     -- projection from whatever cross-account data the store already holds.
     Tracker._attuneForce = true
+    Tracker._attuneAllFalseRuns = 0
+    -- One-shot: demote the MC falses the single-id probe left behind (no-op
+    -- after the first run, and on a fresh install).
+    if ns.SafeCall then ns:SafeCall(Tracker.MigrateMCFalses) else Tracker.MigrateMCFalses() end
     Tracker.InvalidateAttuneIndex()
 
     -- First snapshot once the world is ready.
@@ -3611,10 +3796,31 @@ local function testAttunement(fails)
     end
 
     -- ---- 2) single-quest raids -------------------------------------------
-    ck(Tracker.AttunementFlags(probeFor({ 7487 })).MC == true, "MC: 7487 attunes")
-    ck(Tracker.AttunementFlags(probeFor({ 7487 })).BWL == false, "MC quest does not attune BWL")
     ck(Tracker.AttunementFlags(probeFor({ 7761 })).BWL == true, "BWL: 7761 attunes")
     ck(Tracker.AttunementFlags(probeFor({ 7761 })).MC == false, "BWL quest does not attune MC")
+
+    -- ---- 2b) MC FACTION SPLIT — the 2026-08-02 live bug -------------------
+    -- MC shipped with only 7487, so every character holding the OTHER faction's
+    -- id read false forever. Either id must attune, and neither may leak into
+    -- another raid's answer.
+    ck(Tracker.AttunementFlags(probeFor({ 7487 })).MC == true, "MC: 7487 attunes")
+    ck(Tracker.AttunementFlags(probeFor({ 7848 })).MC == true,
+       "MC: 7848 (the other faction's same-named quest) ALSO attunes")
+    ck(Tracker.AttunementFlags(probeFor({ 7848 })).BWL == false,
+       "MC: 7848 does not attune BWL")
+    ck(Tracker.AttunementFlags(probeFor({ 7848 })).Ony == false,
+       "MC: 7848 does not attune Ony")
+    ck(Tracker.AttunementFlags(probeFor({ 7487, 7848 })).MC == true,
+       "MC: both ids complete still attunes")
+    ck(Tracker.AttunementFlags(probeFor({ 7486 })).MC == false,
+       "MC: a neighbouring id does not attune")
+    ck(Tracker.AttunementFlags(probeFor({ 7849 })).MC == false,
+       "MC: a neighbouring id of the second variant does not attune")
+    -- The owner's live regression, replayed: a WARM probe (BWL/Ony/Naxx all
+    -- true) that only ever held the second MC id used to report MC=false.
+    local warm = Tracker.AttunementFlags(probeFor({ 7848, 7761, 6602, 9121 }))
+    ck(warm.MC == true and warm.BWL == true and warm.Ony == true and warm.Naxx == true,
+       "MC: the owner's warm all-attuned character reads true on ALL FOUR raids")
 
     -- ---- 3) Onyxia FACTION SPLIT: either final quest attunes ---------------
     ck(Tracker.AttunementFlags(probeFor({ 6502 })).Ony == true,
@@ -3640,7 +3846,7 @@ local function testAttunement(fails)
        "Naxx: the three variant ids are distinct")
 
     -- ---- 5) the exact verified id set (guards a memory-based 'correction') --
-    local EXPECT = { MC = { 7487 }, BWL = { 7761 }, Ony = { 6502, 6602 },
+    local EXPECT = { MC = { 7487, 7848 }, BWL = { 7761 }, Ony = { 6502, 6602 },
                      Naxx = { 9121, 9122, 9123 } }
     for key, ids in pairs(EXPECT) do
         local got = Tracker.ATTUNE_QUESTS[key]
@@ -3657,6 +3863,32 @@ local function testAttunement(fails)
     ck(Tracker.AttunementFlags(function() return nil end) == nil,
        "flags: a probe that answers nothing returns nil (never a table of falses)")
     ck(Tracker.AttunementFlags(nil) == nil, "flags: a non-function probe returns nil")
+
+    -- ---- 6b) WARMTH: anyTrue, and the all-false agreement counter ----------
+    -- anyTrue is the warmth proof: a gated TRUE can only come from loaded data.
+    local _, warmA = Tracker.AttunementFlags(probeFor({ 7761 }))
+    ck(warmA == true, "warmth: a gated true reports anyTrue")
+    local _, warmB = Tracker.AttunementFlags(probeFor({}))
+    ck(warmB == false, "warmth: an all-false probe reports anyTrue=false")
+    -- ZG/AQ20/AQ40 are true by construction and must NOT count as warmth,
+    -- otherwise every cold probe would license its own falses.
+    local coldFlags, coldWarm = Tracker.AttunementFlags(probeFor({}))
+    ck(coldFlags.ZG == true and coldWarm == false,
+       "warmth: the always-attuned raids do not count as a warmth proof")
+
+    local TAF = Tracker.TrustAllFalse
+    local WARM, AGREE = Tracker.ATTUNE_WARM_DELAY, Tracker.ATTUNE_AGREE_COUNT
+    ck(WARM > 0 and AGREE >= 2, "warmth: the thresholds are meaningful")
+    local t1, r1 = TAF(0, 0)
+    ck(t1 == false and r1 == 1, "trust: probe 1 at 0s online is NOT trusted")
+    local t2, r2 = TAF(r1, 1)
+    ck(t2 == false and r2 == 2, "trust: agreeing twice is not enough while still cold")
+    local t3 = TAF(0, WARM + 1)
+    ck(t3 == false, "trust: one lone probe is not enough even when warm")
+    local t4 = TAF(AGREE - 1, WARM)
+    ck(t4 == true, "trust: warm enough AND agreeing enough -> trusted")
+    ck(TAF(nil, WARM + 100) == false, "trust: a nil counter starts a fresh run")
+    ck(TAF(99, WARM - 1) == false, "trust: agreement alone never beats the warm delay")
 
     -- ---- 7) monotonic merge: true never regresses -------------------------
     local merged = Tracker.MergeAttunements({ MC = true, BWL = false },
@@ -3729,9 +3961,19 @@ local function testAttunement(fails)
         ck(RA({ nameRealm = "Nobody-Realm" }, "MC") == nil,
            "index: an unknown character stays nil")
 
-        -- The record's OWN matrix wins over the namespace projection.
-        ck(RA({ nameRealm = "Peer-Realm", attunements = { MC = false } }, "MC") == false,
-           "index: the record's own matrix takes precedence over the projection")
+        -- MONOTONIC OR across the two sources. A record false must NOT be able
+        -- to suppress a namespace true: NON_WIRE_CARRY pins `attunements` onto a
+        -- peer record forever, so precedence made a pre-heal false permanent.
+        ck(RA({ nameRealm = "Peer-Realm", attunements = { MC = false } }, "MC") == true,
+           "OR: a stale record FALSE cannot beat a fresh namespace TRUE")
+        ck(RA({ nameRealm = "Alt-Realm", attunements = { MC = true } }, "MC") == true,
+           "OR: a record TRUE wins over a namespace false")
+        ck(RA({ nameRealm = "Alt-Realm", attunements = { MC = false } }, "MC") == false,
+           "OR: false on both sides still greys")
+        ck(RA({ nameRealm = "Nobody-Realm", attunements = { BWL = false } }, "BWL") == false,
+           "OR: a record false with no namespace opinion still greys")
+        ck(RA({ nameRealm = "Alt-Realm" }, "MC") == false,
+           "OR: namespace-only false still greys")
 
         -- Two accounts naming the same character fold with OR (monotonic).
         S.SyncNSPut(NSK, O2, 1, { ["Peer-Realm"] = { MC = false, BWL = true } }, 101)
@@ -3767,41 +4009,79 @@ local function testAttunement(fails)
     _G.C_QuestLog = { IsQuestFlaggedCompleted = function(id) return completed[id] == true end }
     ns.Store.Now  = function() return epochNow end
 
+    local savedEW   = Tracker._enteredWorldAt
+    local savedRuns = Tracker._attuneAllFalseRuns
+
     local ok, err = pcall(function()
         local cap = Tracker._captureAttunements
-        local rec = { nameRealm = "Cap-Realm" }
+        local gt  = (GetTime and GetTime()) or 0
+        -- Pretend the last loading screen finished `n` seconds ago.
+        local function onlineFor(n) Tracker._enteredWorldAt = gt - n end
 
-        Tracker._attuneCheckedAt = nil
-        ck(cap(rec, false) == true, "capture: the first probe writes the matrix")
-        ck(type(rec.attunements) == "table", "capture: rec.attunements is a table")
-        ck(rec.attunements.MC == false, "capture: MC false before the quest")
+        -- ---- COLD PROBE: an all-false answer at login publishes NOTHING -----
+        -- This is the failure the owner would have seen on a first-ever login:
+        -- the API is present and answering, it is just answering false.
+        local cold = { nameRealm = "Cold-Realm" }
+        Tracker._attuneCheckedAt    = nil
+        Tracker._attuneAllFalseRuns = 0
+        onlineFor(0)
+        ck(cap(cold, true) == false, "cold: an all-false probe at login reports no change")
+        ck(cold.attunements == nil,
+           "cold: NOTHING is written -- the matrix stays UNKNOWN, never all-false")
+        ck(ns.Store.RaidAttuned(cold, "MC") == nil,
+           "cold: the character reads nil (renders ATTUNED), never greyed on a cold read")
+
+        -- A second agreeing probe still inside the warm delay is still unknown.
+        epochNow = epochNow + Tracker.ATTUNE_RECHECK_INTERVAL + 1
+        ck(cap(cold, true) == false, "cold: agreeing twice inside the warm delay is still unknown")
+        ck(cold.attunements == nil, "cold: still nothing written")
+
+        -- ---- WARM DOUBLE-AGREE: a genuinely unattuned alt earns its grey ----
+        onlineFor(Tracker.ATTUNE_WARM_DELAY + 1)
+        epochNow = epochNow + Tracker.ATTUNE_RECHECK_INTERVAL + 1
+        ck(cap(cold, true) == true, "warm: the agreeing all-false probe is finally trusted")
+        ck(type(cold.attunements) == "table", "warm: the matrix is written")
+        ck(cold.attunements.MC == false, "warm: a fresh alt really is not MC attuned")
+        ck(cold.attunements.ZG == true,  "warm: ZG true regardless")
+        ck(ns.Store.RaidAttuned(cold, "MC") == false, "warm: NOW it greys")
+
+        -- ---- ANY GATED TRUE licenses the falses at once, even at 0s online --
+        local rec = { nameRealm = "Cap-Realm" }
+        completed[7761] = true                  -- BWL only
+        Tracker._attuneCheckedAt    = nil
+        Tracker._attuneAllFalseRuns = 0
+        onlineFor(0)
+        ck(cap(rec, true) == true, "anyTrue: a probe holding a gated TRUE is trusted at once")
+        ck(rec.attunements.BWL == true, "anyTrue: BWL true")
+        ck(rec.attunements.MC == false, "anyTrue: the falses beside it are believed")
         ck(rec.attunements.ZG == true,  "capture: ZG true immediately")
 
+        -- ---- FALSE -> TRUE SELF-HEAL, via the second MC id (the live bug) ---
+        completed[7848] = true
+        epochNow = epochNow + Tracker.ATTUNE_RECHECK_INTERVAL + 1
+        ck(cap(rec, false) == true, "heal: the matrix moved -> capture reports a republish")
+        ck(rec.attunements.MC == true, "heal: MC flips false -> true through the 2nd faction id")
+        ck(ns.Store.RaidAttuned(rec, "MC") == true, "heal: the raid stops greying")
+
         -- Throttled: a completed quest is NOT picked up until the window passes.
-        completed[7487] = true
+        completed[9122] = true
         ck(cap(rec, false) == false, "capture: an unforced re-probe inside the window is a no-op")
-        ck(rec.attunements.MC == false, "capture: the throttled call did not re-probe")
+        ck(rec.attunements.Naxx == false, "capture: the throttled call did not re-probe")
 
         -- Forced (a quest turn-in) bypasses the throttle immediately.
         ck(cap(rec, true) == true, "capture: a FORCED probe bypasses the throttle")
-        ck(rec.attunements.MC == true, "capture: MC flips true after the hand-in")
-
-        -- Past the window, an unforced probe runs again.
-        completed[9122] = true
-        epochNow = epochNow + Tracker.ATTUNE_RECHECK_INTERVAL + 1
-        ck(cap(rec, false) == true, "capture: past the window an unforced probe runs")
         ck(rec.attunements.Naxx == true, "capture: Naxx (Revered variant) picked up")
 
         -- No change -> no dirty signal.
         epochNow = epochNow + Tracker.ATTUNE_RECHECK_INTERVAL + 1
         ck(cap(rec, false) == false, "capture: an unchanged matrix reports no change")
 
-        -- A COLD api must not wipe what we already knew.
+        -- A DEAD api must not wipe what we already knew.
         _G.C_QuestLog = { IsQuestFlaggedCompleted = function() error("cold") end }
         epochNow = epochNow + Tracker.ATTUNE_RECHECK_INTERVAL + 1
-        ck(cap(rec, true) == false, "capture: a cold API reports no change")
+        ck(cap(rec, true) == false, "capture: a dead API reports no change")
         ck(rec.attunements.MC == true and rec.attunements.Naxx == true,
-           "capture: a cold API does NOT regress stored attunements")
+           "capture: a dead API does NOT regress stored attunements")
 
         -- The namespace payload only publishes records that carry a matrix.
         local payload = Tracker.AttunePayload()
@@ -3812,10 +4092,52 @@ local function testAttunement(fails)
         end
     end)
 
+    Tracker._enteredWorldAt     = savedEW
+    Tracker._attuneAllFalseRuns = savedRuns
+
     _G.C_QuestLog = savedQL
     ns.Store.Now  = savedNow
     Tracker._attuneCheckedAt = savedAt
     if not ok then fails[#fails + 1] = "error in attunement fixtures: " .. tostring(err) end
+
+    -- ---- 12) the one-shot MC cleanup --------------------------------------
+    -- Demotes the falses the single-id probe left behind to UNKNOWN, so a
+    -- parked alt that will not log in again renders attuned instead of wrongly
+    -- greyed. TRUE is never touched, and no other raid key is touched.
+    local MIG = Tracker._MigrateMCFalsesIn
+    local bucket = {
+        characters = {
+            ["Stale-Realm"]  = { attunements = { MC = false, BWL = true,  Ony = false, ZG = true } },
+            ["Attuned-Realm"]= { attunements = { MC = true,  BWL = false } },
+            ["Bare-Realm"]   = { },
+        },
+        homeless = {
+            ["Parked-Realm"] = { attunements = { MC = false, Naxx = false } },
+        },
+    }
+    local n = MIG(bucket)
+    ck(n == 2, "migration: exactly the two MC=false records were touched")
+    ck(bucket.characters["Stale-Realm"].attunements.MC == nil,
+       "migration: an untrustworthy MC false becomes UNKNOWN")
+    ck(bucket.homeless["Parked-Realm"].attunements.MC == nil,
+       "migration: homeless records are migrated too")
+    ck(bucket.characters["Attuned-Realm"].attunements.MC == true,
+       "migration: a stored MC TRUE is never touched (monotonic)")
+    ck(bucket.characters["Stale-Realm"].attunements.BWL == true
+       and bucket.characters["Stale-Realm"].attunements.Ony == false
+       and bucket.characters["Stale-Realm"].attunements.ZG == true,
+       "migration: no other raid key is disturbed")
+    ck(bucket.homeless["Parked-Realm"].attunements.Naxx == false,
+       "migration: Naxx=false is left alone (its probe asked about every id)")
+    ck(bucket.characters["Bare-Realm"].attunements == nil,
+       "migration: a record with no matrix is left alone")
+    ck(MIG(bucket) == 0, "migration: idempotent -- a second pass touches nothing")
+    ck(MIG(nil) == 0, "migration: a nil bucket is a no-op")
+    -- The demoted value now reads as UNKNOWN, i.e. renders ATTUNED.
+    ck(ns.Store.RaidAttuned({ nameRealm = "Stale-Only-Realm",
+                              attunements = bucket.characters["Stale-Realm"].attunements },
+                            "MC") == nil,
+       "migration: the demoted MC reads nil -> the card renders attuned")
 end
 
 function Tracker.RunSelfTests(verbose)

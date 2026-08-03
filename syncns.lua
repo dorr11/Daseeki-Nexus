@@ -883,6 +883,40 @@ local function attuneSelfTest(verbose)
     check("a char dropped from the newer payload goes back to nil",
           RA({ nameRealm = "Attuned-Realm" }, "MC") == nil)
 
+    -- FALSE -> TRUE SELF-HEAL, end to end, against a receiving client that also
+    -- holds a stale record-level false. Store.NON_WIRE_CARRY pins `attunements`
+    -- onto a peer record and the binary wire never refreshes it, so the record
+    -- copy can be arbitrarily old. The heal must land anyway: attunement is
+    -- monotonic, so RaidAttuned ORs the two sources and TRUE wins from either.
+    S.SyncNSDrop(KEY, OWNER)
+    T.InvalidateAttuneIndex()
+    check("heal: cold-era payload applies", Sync.ApplyInbound(KEY, OWNER, 1, {
+        ["Healing-Realm"] = { MC = false, BWL = false, Ony = false, Naxx = false },
+    }, 600) == "applied")
+    local stale = { nameRealm = "Healing-Realm",
+                    attunements = { MC = false, BWL = false, Ony = false, Naxx = false } }
+    check("heal: before the heal the char greys", RA(stale, "MC") == false)
+    check("heal: a NEWER rev replaces the whole owner payload",
+          Sync.ApplyInbound(KEY, OWNER, 2, {
+              ["Healing-Realm"] = { MC = true, BWL = false, Ony = false, Naxx = false },
+          }, 601) == "applied")
+    check("heal: MC now reads TRUE even though the record still says false",
+          RA(stale, "MC") == true)
+    check("heal: a raid that is still genuinely false keeps greying",
+          RA(stale, "BWL") == false)
+
+    -- ...and the same heal arriving from a SECOND account (a re-set-up machine
+    -- publishing under a new id) also wins, via the cross-owner OR.
+    local OWNER2 = "__attunens-peer2"
+    S.SyncNSDrop(KEY, OWNER2)
+    check("heal: a second owner's TRUE applies", Sync.ApplyInbound(KEY, OWNER2, 1, {
+        ["Healing-Realm"] = { BWL = true },
+    }, 602) == "applied")
+    check("heal: BWL flips true through the cross-owner OR", RA(stale, "BWL") == true)
+    check("heal: MC is unaffected by the second owner", RA(stale, "MC") == true)
+    S.SyncNSDrop(KEY, OWNER2)
+    T.InvalidateAttuneIndex()   -- OWNER stays: the Get() checks below need it
+
     -- The merged Get() view exposes the peer owner alongside our own.
     local view = Sync.Get(KEY)
     check("Get() merges the peer owner", type(view[OWNER]) == "table")
