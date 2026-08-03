@@ -1,0 +1,14 @@
+package-as: Daseeki-Nexus
+license-output: LICENSE
+
+required-dependencies:
+  - daseeki-core
+
+ignore:
+  - README.md
+  - CHANGELOG.md
+  - DESCRIPTION.md
+  - .github
+  - _test_detail.lua
+
+manual-changelog: CHANGELOG.md

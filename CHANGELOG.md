@@ -1,6 +1,46 @@
 # Changelog
 
-## Unreleased
+## 1.0.0 — 2026-08-03
+
+First public release. Daseeki Nexus is a cross-account character dashboard for WoW
+Classic Era: every character on every account you play appears as a card, and the cards
+stay current live over a lightweight sync mesh between your own accounts.
+
+### What you get
+- **Character cards** for the whole roster — world buffs held with time remaining
+  (including what is stored in a chronoboon), raid lockouts and attunements coloured by
+  available / locked / unattuned, hearth, chronoboon and Darkmoon cooldowns, rest and XP,
+  gold, and a free-form notes box on every character.
+- **World buff timers** for Onyxia, Nefarian, Rend, Zandalar, Songflower and friends, fed
+  by the same community timer mesh NovaWorldBuffs uses — so your timers agree with
+  everyone else's on the server — plus a timers dock on the dashboard.
+- **Felwood map pins** for songflowers, tubers and dragons, with readable countdown chips
+  on the world map and minimap.
+- **Instance log** with per-character visit history and live 5-per-hour / 30-per-day cap
+  tracking, so you know before you zone in whether the next run will lock you out.
+- **Buff rules per class** — mark which world buffs a class actually wants (a mage does
+  not need Fengus' Ferocity); the held counts and the "missing" flags respect your rules.
+- **Online and Summoners tabs** — who is logged in across your accounts, and who is
+  positioned to summon.
+- **Minimap button** — left-click invites all your online characters to a group,
+  right-click opens the dashboard.
+- **Importers** for ShadowNetwork and Nova Instance Tracker data, so you start with your
+  existing history instead of from zero.
+- **Cross-account inventory and gold**, the system of record behind Daseeki Bags'
+  cross-character tooltips and totals.
+
+### Requires
+- **Daseeki Core** — the suite's shared options hub and UI foundation.
+- Multi-account sync needs the one-time pairing on the Setup page (generate credentials
+  on your first account, paste the bundle on the others). Single-account use works fine
+  without it.
+
+---
+
+<!-- Everything below this line is the pre-1.0 internal development log, kept for
+     reference. It is not a record of public releases. -->
+
+## Pre-1.0 development log
 
 - Added: **a LICENSE file — Daseeki Nexus ships All Rights Reserved**, matching the rest of the suite; the embedded LibStub, LibSerialize and LibDeflate keep their own upstream licenses.
 

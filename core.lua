@@ -10,7 +10,10 @@ local ADDON, ns = ...
 
 ns.ADDON      = ADDON
 ns.DISPLAY    = "Daseeki Nexus"
-ns.VERSION    = "0.1.0-n1"
+ns.VERSION    = "1.0.0"      -- addon version; keep in step with the .toc.
+                             -- NOT a wire version: Protocol.SCHEMA_VERSION and
+                             -- Sync.VERSION are the mesh/sync schema numbers and
+                             -- move only when the wire format changes.
 ns.CHAT_TAG   = "|cff4fc3f7Daseeki Nexus|r"
 
 ----------------------------------------------------------------------

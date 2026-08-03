@@ -1,0 +1,28 @@
+# CurseForge Description — Daseeki Nexus
+
+<!-- Canonical CurseForge project description. Update here first, then paste to
+     https://www.curseforge.com/wow/addons/daseeki-nexus (project 1638357).
+     Last synced: 2026-08-03 (v1.0.0). -->
+
+Daseeki Nexus is a cross-account character dashboard for WoW Classic Era. Every character on every account you run appears as a card — world buffs held (including what's stored in a chronoboon), raid lockouts and attunements, rest and XP, gold, cooldowns, and notes — kept current live over a lightweight sync mesh between your accounts.
+
+## Features
+- **Character cards** for your whole roster across accounts: world buffs with time remaining (boon-stored included), raid lockout status colored by available/locked/unattuned, hearth/chronoboon/Darkmoon cooldowns, rest %, gold, and a free-form notes box
+- **World buff timers** — Onyxia, Nefarian, Rend, Zandalar, Songflower and friends, fed by the same community timer mesh NovaWorldBuffs uses, so your timers agree with everyone else's
+- **Felwood map pins** for songflowers, tubers, and dragons with readable countdown chips, plus a timers dock on the dashboard
+- **Instance log** with per-character visit history and live 5-per-hour / 30-per-day cap tracking
+- **Buff rules per class** — mark which world buffs each class actually wants (a mage doesn't need Fengus' Ferocity) and the held-count and "missing" flags respect it
+- **Online & Summoners tabs** — see who's logged in across your accounts and who can summon
+- **Minimap button**: left-click invites all your online characters to a group, right-click opens the dashboard
+- **Importers** for ShadowNetwork and Nova Instance Tracker data, so you start with your history instead of from zero
+- Cross-account **inventory & gold** module (system of record for Daseeki Bags' tooltips and totals)
+
+## Chat Commands
+- `/nexus` — toggle the dashboard
+- `/nexus help` — full command list
+
+## Requires
+- **Daseeki Core** (required) — the suite's shared UI foundation
+- Multi-account sync requires the one-time Setup page pairing (generate credentials on your first account, paste the bundle on the others — the Setup guide walks you through it). Single-account use works fine without it.
+
+DISCLAIMER: I originally developed these addons for my own personal use, and am listing them on CurseForge to allow some friends to test/report bugs. The 'Daseeki' suite of addons is still very much a WIP, so please keep that in mind when downloading.

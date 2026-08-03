@@ -1,13 +1,13 @@
-## Interface: 11509
+## Interface: 11507, 11508, 11509
 ## Title: Daseeki Nexus
 ## Notes: Cross-account character dashboard, world-buff timers, and mesh coordination for the Daseeki suite.
 ## Author: Daseeki
 ## X-License: All Rights Reserved
-## Version: 0.1.0-n1
+## X-Curse-Project-ID: 1638357
+## Version: 1.0.0
 ## SavedVariables: DaseekiNexusDB, DaseekiNexusData
 ## Dependencies: Daseeki-Core
 ## IconTexture: Interface\Icons\INV_Misc_Net_01
-# ## X-Curse-Project-ID: 000000  (placeholder — set at first CurseForge release)
 
 # Embedded libraries (vendored; see libs/*/ for upstream license headers).
 libs/LibStub/LibStub.lua
