@@ -78,6 +78,137 @@ local function overwriteMerge(dst, src)
 end
 Import._OverwriteMerge = overwriteMerge
 
+-- Backfill-merge: copy a key from `src` onto `dst` ONLY where `dst` has no value
+-- yet. A scalar the user already set is never overwritten; tables are descended
+-- so a half-populated sub-table still gets its absent leaves filled. This is the
+-- DEFAULT settings-apply mode for an import (AT-RISK-2 fix): ShadowNetwork fills
+-- the gaps in a fresh Nexus profile but never stomps a preference the user has
+-- since chosen in Nexus. Idempotent.
+local function backfillMerge(dst, src)
+    for k, v in pairs(src) do
+        if type(v) == "table" then
+            if type(dst[k]) ~= "table" then
+                -- Absent -> take a copy; a user-set SCALAR here is left alone.
+                if dst[k] == nil then dst[k] = deepCopy(v) end
+            else
+                backfillMerge(dst[k], v)
+            end
+        elseif dst[k] == nil then
+            dst[k] = v
+        end
+    end
+    return dst
+end
+Import._BackfillMerge = backfillMerge
+
+-- Count how many scalar leaves backfillMerge WOULD fill, without touching dst.
+-- Drives the confirm-dialog / dry-run "settings: N backfilled" line.
+local function countBackfill(dst, src)
+    local n = 0
+    for k, v in pairs(src) do
+        if type(v) == "table" then
+            if type(dst[k]) == "table" then
+                n = n + countBackfill(dst[k], v)
+            elseif dst[k] == nil then
+                n = n + countBackfill({}, v)   -- whole absent sub-table: count its leaves
+            end
+        elseif dst[k] == nil then
+            n = n + 1
+        end
+    end
+    return n
+end
+Import._CountBackfill = countBackfill
+
+-- Floor an ownerEpoch the way the store's own owner-wins tiebreak does
+-- (store.lua WriteInboundCharacter :1456).
+local function recEpoch(rec)
+    return math.floor(tonumber(rec and rec.ownerEpoch) or 0)
+end
+
+-- Per-account, per-character MERGE of an imported account graph into the live
+-- one, newest-wins (AT-RISK-2 fix; models the timers-merge path below + the NIT
+-- importer). Mirrors Store.WriteInboundCharacter's rule: an imported record
+-- REPLACES the local one only when its ownerEpoch is STRICTLY newer; an equal or
+-- older epoch keeps what we hold (an import is second-hand -- exactly the legacy
+-- 3-arg WriteInboundCharacter case where ties are rejected). A character the
+-- import never names is NEVER touched: a Nexus-native alt, or a record adopted
+-- from a mesh peer, survives an import that predates it. Account buckets the
+-- import omits are likewise left intact. Account-level fields (isSelf, segments,
+-- segmentHashes) are BACKFILLED, never overwritten -- they rebuild live.
+--
+-- `dst`/`inc` are Store.data.accounts-shaped ({ [aid] = bucket }). Returns
+-- counts { acctsAdded, charsAdded, charsUpdated, charsKept }. Writes only `dst`.
+local function mergeAccounts(dst, inc)
+    local c = { acctsAdded = 0, charsAdded = 0, charsUpdated = 0, charsKept = 0 }
+    for aid, incAcct in pairs(inc) do
+        if type(incAcct) == "table" then
+            local dstAcct = dst[aid]
+            if type(dstAcct) ~= "table" then
+                dst[aid] = deepCopy(incAcct)                 -- whole new account
+                c.acctsAdded = c.acctsAdded + 1
+                if type(incAcct.characters) == "table" then
+                    for _ in pairs(incAcct.characters) do c.charsAdded = c.charsAdded + 1 end
+                end
+            else
+                -- Backfill the account's non-character fields (never overwrite).
+                for k, v in pairs(incAcct) do
+                    if k ~= "characters" then
+                        if type(v) == "table" then
+                            if type(dstAcct[k]) ~= "table" then
+                                if dstAcct[k] == nil then dstAcct[k] = deepCopy(v) end
+                            else
+                                backfillMerge(dstAcct[k], v)
+                            end
+                        elseif dstAcct[k] == nil then
+                            dstAcct[k] = v
+                        end
+                    end
+                end
+                dstAcct.characters = dstAcct.characters or {}
+                if type(incAcct.characters) == "table" then
+                    for nameRealm, incRec in pairs(incAcct.characters) do
+                        local existing = dstAcct.characters[nameRealm]
+                        if type(existing) ~= "table" then
+                            dstAcct.characters[nameRealm] = deepCopy(incRec)
+                            c.charsAdded = c.charsAdded + 1
+                        elseif recEpoch(incRec) > recEpoch(existing) then
+                            dstAcct.characters[nameRealm] = deepCopy(incRec)
+                            c.charsUpdated = c.charsUpdated + 1
+                        else
+                            c.charsKept = c.charsKept + 1
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return c
+end
+Import._MergeAccounts = mergeAccounts
+
+-- Preview the account merge without applying: returns the same counts table
+-- mergeAccounts would, computed against a throwaway copy of `dst`.
+function Import._DiffAccounts(dst, inc)
+    return mergeAccounts(deepCopy(dst or {}), inc or {})
+end
+
+-- Best-available wall-clock epoch (in-game `time()`, harness `os.time`).
+local function nowEpoch()
+    if ns.Timers and ns.Timers._now then return ns.Timers._now() end
+    if type(time) == "function" then return time() end
+    return (os and os.time and os.time()) or 0
+end
+
+-- Format a marker epoch for the "already imported <date>" notice. Nil-safe.
+local function fmtDate(epoch)
+    epoch = tonumber(epoch)
+    if not epoch then return "?" end
+    if type(date) == "function" then return date("%Y-%m-%d", epoch) end
+    if os and os.date then return os.date("%Y-%m-%d", epoch) end
+    return tostring(epoch)
+end
+
 -- {r,g,b} floats (0..1) -> "RRGGBB" upper-hex. Nil-safe.
 local function rgbToHex(c)
     if type(c) ~= "table" then return nil end
@@ -1302,19 +1433,91 @@ local function summaryLines(sc, dc)
 end
 Import._SummaryLines = summaryLines
 
--- Apply the mapped partials into the live Store (settings + data). Overwrite-
--- merges so re-import is idempotent. Never touches the SN globals.
-function Import._Apply(settingsPartial, dataPartial)
+-- Compute what a (non-dry) apply WOULD do, without touching the store. Reads the
+-- live account graph + settings and diffs the mapped partials against them.
+-- Returns { charsAdd, charsUpdate, charsKeep, acctsAdd, settingsBackfill,
+--           alreadyImported, importedAt } — the numbers the confirm dialog names.
+function Import.PlanApply(settingsPartial, dataPartial)
+    local Store = ns.Store
+    local plan = { charsAdd = 0, charsUpdate = 0, charsKeep = 0, acctsAdd = 0, settingsBackfill = 0 }
+    local db   = Store and Store.GetSettings and Store.GetSettings()
+    local data = Store and Store.GetData and Store.GetData()
+    if data then
+        local d = Import._DiffAccounts(data.accounts or {}, (dataPartial and dataPartial.accounts) or {})
+        plan.charsAdd, plan.charsUpdate, plan.charsKeep, plan.acctsAdd =
+            d.charsAdded, d.charsUpdated, d.charsKept, d.acctsAdded
+    end
+    if db then
+        plan.settingsBackfill = countBackfill(db, settingsPartial or {})
+        local m = db.snImported
+        if type(m) == "table" then
+            plan.alreadyImported = true
+            plan.importedAt = m.at
+        end
+    end
+    return plan
+end
+
+-- Human-readable plan lines for chat + the confirm dialog. Kept to <=3 short
+-- lines so they fit the DaseekiUI.Confirm body (fixed-height modal).
+function Import.PlanLines(plan, opts)
+    opts = opts or {}
+    plan = plan or {}
+    local lines = {}
+    if opts.replace then
+        lines[#lines + 1] = "REPLACE (advanced/destructive): the character graph is swapped for ShadowNetwork's."
+        lines[#lines + 1] = "Nexus-native records NOT in the import are DISCARDED; settings are overwritten."
+        return lines
+    end
+    lines[#lines + 1] = string.format("characters: +%d new, ~%d updated, %d kept as-is (merge, newest-wins).",
+        plan.charsAdd or 0, plan.charsUpdate or 0, plan.charsKeep or 0)
+    lines[#lines + 1] = string.format("settings: %d backfilled (values you already set in Nexus are kept).",
+        plan.settingsBackfill or 0)
+    if plan.alreadyImported then
+        lines[#lines + 1] = string.format("note: already imported %s -- this MERGES the above into your current data.",
+            fmtDate(plan.importedAt))
+    end
+    return lines
+end
+
+-- Apply the mapped partials into the live Store (settings + data). Idempotent
+-- and NON-DESTRUCTIVE by default (AT-RISK-2 fix). Never touches the SN globals.
+--   opts.replace => advanced wholesale path (old behaviour): settings overwritten,
+--                   account graph swapped for ShadowNetwork's. Destructive; only
+--                   reached via the clearly-labelled "Replace" confirm.
+function Import._Apply(settingsPartial, dataPartial, opts)
+    opts = opts or {}
     local Store = ns.Store
     if not (Store and Store.GetSettings and Store.GetData) then return false end
     local db   = Store.GetSettings()
     local data = Store.GetData()
     if not (db and data) then return false end
 
-    overwriteMerge(db, settingsPartial)
+    -- Settings. DEFAULT = BACKFILL: fill only keys the user has not set in Nexus;
+    -- never overwrite a live preference. REPLACE restores the old wholesale copy.
+    if opts.replace then
+        overwriteMerge(db, settingsPartial)
+    else
+        backfillMerge(db, settingsPartial)
+    end
 
-    -- Data: overwrite the account graph, manualLocations, tombstones.
-    data.accounts = dataPartial.accounts
+    -- Character graph. DEFAULT = per-account/per-character newest-wins MERGE: an
+    -- imported record only displaces a local one it is strictly newer than, and a
+    -- record the import never names (a Nexus-native alt, a mesh-adopted peer
+    -- record) is left untouched. REPLACE is the old wholesale swap that discards
+    -- anything ShadowNetwork does not carry.
+    data.accounts = data.accounts or {}
+    if opts.replace then
+        data.accounts = dataPartial.accounts or {}
+        Import._lastMergeCounts = { acctsAdded = 0, charsAdded = 0, charsUpdated = 0, charsKept = 0, replaced = true }
+    else
+        Import._lastMergeCounts = mergeAccounts(data.accounts, dataPartial.accounts or {})
+    end
+
+    -- manualLocations + tombstones are additive: an overwrite-merge unions SN's
+    -- into ours without dropping either. Safe under both paths.
+    data.manualLocations = data.manualLocations or {}
+    data.deletedAIDs     = data.deletedAIDs or {}
     overwriteMerge(data.manualLocations, dataPartial.manualLocations)
     overwriteMerge(data.deletedAIDs, dataPartial.deletedAIDs)
 
@@ -1374,8 +1577,12 @@ function Import._Apply(settingsPartial, dataPartial)
 end
 
 -- Run the import. `dryRun` truthy => compute + print counts, apply nothing.
--- Returns (ok, summaryTable) where summaryTable = { settings=..., data=... }.
-function Import.Run(dryRun)
+-- `opts.replace` => advanced wholesale replace (destructive) instead of merge.
+-- The non-dry apply is expected to be reached THROUGH Import.PromptAndRun's
+-- confirm gate; calling Run(false) directly still applies (used by the accept
+-- handler). Returns (ok, { settings, data, plan }).
+function Import.Run(dryRun, opts)
+    opts = opts or {}
     local db, data = snGlobals()
     if not (type(db) == "table" or type(data) == "table") then
         if ns.Print then ns:Print("import: no ShadowNetwork SavedVariables found (is it still installed + enabled?).") end
@@ -1384,29 +1591,105 @@ function Import.Run(dryRun)
 
     local settingsPartial, sc = Import._MapSettings(db or {})
     local dataPartial, dc = Import._MapData(data or {})
+    local plan = Import.PlanApply(settingsPartial, dataPartial)
 
     if ns.Print then
-        ns:Print(dryRun and "import DRY-RUN (nothing applied):" or "import applied:")
+        ns:Print(dryRun and "import DRY-RUN (nothing applied):"
+            or (opts.replace and "import applied (REPLACE):" or "import applied:"))
         local lines = summaryLines(sc, dc)
         for i = 1, #lines do ns:Print("  " .. lines[i]) end
+        local pls = Import.PlanLines(plan, opts)
+        for i = 1, #pls do ns:Print("  " .. pls[i]) end
     end
 
-    if not dryRun then
-        local ok = Import._Apply(settingsPartial, dataPartial)
-        if not ok then
-            if ns.Print then ns:Print("import: store not ready; nothing applied.") end
-            return false, { settings = sc, data = dc }
+    if dryRun then
+        return true, { settings = sc, data = dc, plan = plan }
+    end
+
+    local ok = Import._Apply(settingsPartial, dataPartial, { replace = opts.replace })
+    if not ok then
+        if ns.Print then ns:Print("import: store not ready; nothing applied.") end
+        return false, { settings = sc, data = dc, plan = plan }
+    end
+
+    -- Provenance marker (AT-RISK-2 fix): record that + when an SN import ran and
+    -- how much it applied, so a SECOND run warns and re-previews rather than
+    -- silently re-merging. Lives in a NON-synced settings key — Mesh.SyncSettings
+    -- pushes an explicit allowlist and snImported is not on it.
+    local applied = (plan.charsAdd or 0) + (plan.charsUpdate or 0)
+    local settingsFilled = plan.settingsBackfill or 0
+    local sdb = ns.Store and ns.Store.GetSettings and ns.Store.GetSettings()
+    if sdb then
+        local prior = (type(sdb.snImported) == "table" and sdb.snImported.runs) or 0
+        sdb.snImported = {
+            at = nowEpoch(),
+            chars = applied,
+            settings = settingsFilled,
+            replace = opts.replace or nil,
+            runs = prior + 1,
+        }
+    end
+
+    -- Announce a bulk data refresh so live views repaint. This is a DEDICATED,
+    -- args-free signal — NOT STATE_CHANGED, whose (nameRealm, record) contract the
+    -- mesh relies on to push our own live character. The mesh ignores
+    -- STORE_REFRESHED (imported other-account data must never be broadcast as
+    -- ours); the dashboard/HUD subscribe to repaint.
+    if ns.Fire then ns:Fire("STORE_REFRESHED") end
+
+    -- Honesty (fix 3): only nudge toward disabling SN when the import ACTUALLY
+    -- pulled something in. A no-op re-run must not imply data moved.
+    if ns.Print then
+        if applied > 0 or settingsFilled > 0 then
+            ns:Print("import complete. Keep ShadowNetwork installed until you've confirmed everything carried over, then you can disable it.")
+        else
+            ns:Print("import complete — nothing new to carry over (already up to date).")
         end
-        -- Announce a bulk data refresh so live views repaint. This is a
-        -- DEDICATED, args-free signal — NOT STATE_CHANGED, whose (nameRealm,
-        -- record) contract the mesh relies on to push our own live character.
-        -- The mesh ignores STORE_REFRESHED (imported other-account data must
-        -- never be broadcast as ours); the dashboard/HUD subscribe to repaint.
-        if ns.Fire then ns:Fire("STORE_REFRESHED") end
-        if ns.Print then ns:Print("import complete. Consider disabling ShadowNetwork now.") end
     end
 
-    return true, { settings = sc, data = dc }
+    return true, { settings = sc, data = dc, plan = plan }
+end
+
+-- WoW-facing: preview the SN import, then gate the apply behind a
+-- DaseekiUI.Confirm naming exactly what it will do, with the dry-run summary
+-- counts shown IN the dialog. `replace` => advanced wholesale path. This is the
+-- entry the /nexus import slash command drives for a non-dry run.
+function Import.PromptAndRun(replace)
+    local sndb, sndata = snGlobals()
+    if not (type(sndb) == "table" or type(sndata) == "table") then
+        if ns.Print then ns:Print("import: ShadowNetwork is not loaded -- nothing to import.") end
+        return
+    end
+    local settingsPartial = Import._MapSettings(sndb or {})
+    local dataPartial     = Import._MapData(sndata or {})
+    local plan      = Import.PlanApply(settingsPartial, dataPartial)
+    local planLines = Import.PlanLines(plan, { replace = replace })
+
+    -- Echo the plan in chat first: this doubles as the dry-run preview the second
+    -- run is meant to offer, and survives even if the modal is unavailable.
+    if ns.Print then
+        ns:Print(replace and "import REPLACE -- review before confirming:" or "import -- review before confirming:")
+        for i = 1, #planLines do ns:Print("  " .. planLines[i]) end
+    end
+
+    local UI = DaseekiUI
+    if not (UI and UI.Confirm) then
+        -- No modal (should not happen in-game; Core is a hard dependency). Refuse
+        -- the silent apply and point at the explicit dry preview.
+        if ns.Print then ns:Print("import: confirmation dialog unavailable (needs Daseeki Core) -- nothing applied. Use /nexus import dry to preview.") end
+        return
+    end
+
+    local body = table.concat(planLines, "\n")
+    UI.Confirm({
+        title      = replace and "Replace from ShadowNetwork" or "Import from ShadowNetwork",
+        text       = body,
+        acceptText = replace and "Replace" or "Import",
+        danger     = (replace or plan.alreadyImported) and true or nil,
+        onAccept   = function()
+            Import.Run(false, { replace = replace })
+        end,
+    })
 end
 
 ----------------------------------------------------------------------
@@ -1430,14 +1713,23 @@ if ns.RegisterSubcommand then
             return
         end
 
-        -- `/nexus import [dry]` — ShadowNetwork settings + data (default).
+        -- `/nexus import [dry|replace]` — ShadowNetwork settings + data (default).
         if not Import.IsAvailable() then
             ns:Print("import: ShadowNetwork is not loaded — nothing to import.")
             return
         end
+        if rest == "replace" then
+            -- Advanced/destructive wholesale replace, behind its own danger confirm.
+            Import.PromptAndRun(true)
+            return
+        end
         local dry = (rest == "dry" or rest == "dryrun" or rest == "preview")
-        Import.Run(dry)
-    end, "import from ShadowNetwork; 'import instances' pulls NovaInstanceTracker runs ('dry' previews either)")
+        if dry then
+            Import.Run(true)          -- preview only, no confirm, no marker
+        else
+            Import.PromptAndRun(false) -- non-destructive merge, behind a confirm
+        end
+    end, "import from ShadowNetwork (merge, confirmed); 'dry' previews, 'replace' wholesale-replaces, 'instances' pulls NovaInstanceTracker runs")
 end
 
 ----------------------------------------------------------------------
@@ -1910,6 +2202,104 @@ local function selfTest(verbose)
         check("non-node timer fields still replace", ns.Store.GetTimers().lastWeeklyResetAt == 7)
 
         data.timers = savedTimers
+    end
+
+    ------------------------------------------------------------------
+    -- AT-RISK-2 fix: non-destructive apply (merge, backfill, marker).
+    ------------------------------------------------------------------
+    do
+        -- MERGE, not replace: a Nexus-native record the import never names must
+        -- survive, and newest-wins governs every overlap.
+        local dst = {
+            ["1"] = {
+                isSelf = true,
+                segments = { sixties = { "Both-R" } },
+                characters = {
+                    ["Native-R"] = { nameRealm = "Native-R", ownerEpoch = 500, level = 60 }, -- import omits -> survives
+                    ["Both-R"]   = { nameRealm = "Both-R",   ownerEpoch = 900, level = 60 }, -- ours fresher -> kept
+                    ["Stale-R"]  = { nameRealm = "Stale-R",  ownerEpoch = 100, level = 55 }, -- ours older  -> updated
+                },
+            },
+        }
+        local inc = {
+            ["1"] = {
+                segments = { summoners = { "New-R" } },
+                characters = {
+                    ["Both-R"]  = { nameRealm = "Both-R",  ownerEpoch = 800, level = 60 }, -- OLDER -> rejected
+                    ["Stale-R"] = { nameRealm = "Stale-R", ownerEpoch = 700, level = 60 }, -- NEWER -> wins
+                    ["New-R"]   = { nameRealm = "New-R",   ownerEpoch = 300, level = 40 }, -- unseen -> added
+                },
+            },
+            ["2"] = { characters = { ["Alt-S"] = { nameRealm = "Alt-S", ownerEpoch = 10, level = 60 } } }, -- new account
+        }
+
+        -- Diff (the dry-run preview) BEFORE applying; must not mutate dst.
+        local d = Import._DiffAccounts(dst, inc)
+        check("diff: chars added", d.charsAdded == 2)      -- New-R + Alt-S
+        check("diff: chars updated", d.charsUpdated == 1)  -- Stale-R
+        check("diff: chars kept", d.charsKept == 1)        -- Both-R
+        check("diff: accounts added", d.acctsAdded == 1)   -- acct "2"
+        check("diff did not mutate dst", dst["1"].characters["New-R"] == nil and dst["2"] == nil)
+
+        local c = Import._MergeAccounts(dst, inc)
+        check("merge counts match the diff",
+            c.charsAdded == 2 and c.charsUpdated == 1 and c.charsKept == 1 and c.acctsAdded == 1)
+        check("Nexus-native record survives an omitting import", dst["1"].characters["Native-R"] ~= nil)
+        check("newest-wins: our fresher record kept on overlap", dst["1"].characters["Both-R"].ownerEpoch == 900)
+        check("newest-wins: a strictly-newer import wins", dst["1"].characters["Stale-R"].ownerEpoch == 700)
+        check("unseen import record is added", dst["1"].characters["New-R"] ~= nil)
+        check("whole new account is adopted", dst["2"] and dst["2"].characters["Alt-S"] ~= nil)
+        check("account segments backfilled, not overwritten",
+            dst["1"].segments.sixties[1] == "Both-R" and dst["1"].segments.summoners[1] == "New-R")
+        check("account isSelf preserved through merge", dst["1"].isSelf == true)
+
+        -- Idempotent: a second identical merge changes nothing.
+        local c2 = Import._MergeAccounts(dst, inc)
+        check("merge idempotent: re-run adds/updates 0", c2.charsAdded == 0 and c2.charsUpdated == 0)
+
+        -- SETTINGS: backfill fills absent keys only; replace overwrites.
+        local sb = { a = "user", nested = { keep = "mine" } }
+        local n = Import._CountBackfill(sb, { a = "sn", b = "sn", nested = { keep = "sn", add = "sn" } })
+        check("countBackfill counts only absent leaves", n == 2) -- b + nested.add
+        Import._BackfillMerge(sb, { a = "sn", b = "sn", nested = { keep = "sn", add = "sn" } })
+        check("backfill keeps a user-set scalar", sb.a == "user")
+        check("backfill fills an absent scalar", sb.b == "sn")
+        check("backfill keeps a user-set nested value", sb.nested.keep == "mine")
+        check("backfill fills an absent nested value", sb.nested.add == "sn")
+        Import._BackfillMerge(sb, { a = "sn", b = "sn", nested = { keep = "sn", add = "sn" } })
+        check("backfill idempotent (no change on re-run)", sb.a == "user" and sb.nested.keep == "mine")
+
+        -- REPLACE path still overwrites a user-set value (advanced/destructive).
+        local sr = { a = "user" }
+        Import._OverwriteMerge(sr, { a = "sn" })
+        check("replace path overwrites a user-set value", sr.a == "sn")
+    end
+
+    -- Marker + second-run warning + dry-run summary shape, via the live Store.
+    if ns.Store and ns.Store.GetSettings and ns.Store.GetData then
+        local sdb = ns.Store.GetSettings()
+        local savedMarker = sdb.snImported
+        sdb.snImported = nil
+
+        local plan1 = Import.PlanApply({}, { accounts = {} })
+        check("dry-run plan exposes the count fields",
+            plan1.charsAdd ~= nil and plan1.charsUpdate ~= nil and plan1.charsKeep ~= nil
+            and plan1.settingsBackfill ~= nil)
+        check("first-run plan is not flagged already-imported", not plan1.alreadyImported)
+
+        sdb.snImported = { at = 1700000000, chars = 5, runs = 1 }
+        local plan2 = Import.PlanApply({}, { accounts = {} })
+        check("second-run plan flags already-imported", plan2.alreadyImported == true)
+        check("second-run plan carries the marker timestamp", plan2.importedAt == 1700000000)
+
+        local joined = table.concat(Import.PlanLines(plan2, {}), " | ")
+        check("plan lines warn on a second run", joined:find("already imported") ~= nil)
+        check("plan lines describe the merge (newest-wins)", joined:find("newest%-wins") ~= nil)
+
+        local rjoined = table.concat(Import.PlanLines(plan2, { replace = true }), " | ")
+        check("replace plan lines flag the discard", rjoined:find("DISCARDED") ~= nil)
+
+        sdb.snImported = savedMarker
     end
 
     if verbose and ns.Print then

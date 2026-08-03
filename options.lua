@@ -1434,7 +1434,7 @@ local function buildWizardContent(flow)
             refreshPage("wizard"); refreshPage("mesh")
         end,
     }).Refresh)
-    flow:Hint("Coming from ShadowNetwork? /nexus import copies everything — channel, token, characters and settings.")
+    flow:Hint("Coming from ShadowNetwork? /nexus import merges its channel, token, characters and settings in — it shows a confirmation with a summary first, and any Nexus settings you've already set are kept.")
 end
 
 -- Build (once) and show the movable ESC-closable wizard frame.
@@ -2560,7 +2560,7 @@ local function buildHelp(flow)
     g:Hint("2.  On each account, open Settings \226\134\146 Mesh & Accounts and set a unique Account ID (1\226\128\1512 digits, different on each account).")
     g:Hint("3.  On the same Mesh & Accounts page, set the SAME Channel name (16+ letters/numbers, case sensitive) AND the SAME Token (6 letters/numbers) on every account \226\128\148 generate the credentials there, or paste a setup bundle to copy the same Channel and Token to another account.")
     g:Hint("4.  Enable the mesh, then log out and back in once on each account \226\128\148 characters appear across your accounts within seconds.")
-    g:Hint("5.  Migrating from another world-buff addon? Run /nexus import to carry over ShadowNetwork's settings, Channel, Token and data, and /nexus import instances for NovaInstanceTracker's instance runs (see Troubleshooting).")
+    g:Hint("5.  Migrating from another world-buff addon? Run /nexus import to merge ShadowNetwork's settings, Channel, Token and data — it shows a confirmation with a summary of what it will add or update before applying — and /nexus import instances for NovaInstanceTracker's instance runs (see Troubleshooting).")
     g:Hint("Prefer it guided? Settings \226\134\146 Mesh & Accounts has a Setup guide button that walks steps 2\226\128\1514 in a three-step dialog with a live done/needed status on each step.")
     g:Hint("Open this hub any time from the dashboard's Settings button, or with /nexus settings.")
 
@@ -2605,7 +2605,7 @@ local function buildHelp(flow)
     tr:Hint("Other accounts not showing? The Channel AND Token must match byte-for-byte on every account \226\128\148 both are case sensitive and together act as your mesh password. Correct any mismatch in Settings \226\134\146 Mesh & Accounts, then /reload.")
     tr:Hint("Characters under the wrong account? Two accounts are sharing an Account ID. Give each account its own unique ID in Settings \226\134\146 Mesh & Accounts.")
     tr:Hint("Copying settings to a new account? Set it up with the same Channel + Token, then use Sync Settings to Mesh in Settings \226\134\146 Mesh & Accounts, or /nexus syncsettings (you confirm the target account IDs first).")
-    tr:Hint("Coming from ShadowNetwork? Run /nexus import \226\128\148 it carries over your settings, Channel, Token and stored data. It only works while ShadowNetwork is still installed and loaded.")
+    tr:Hint("Coming from ShadowNetwork? Run /nexus import \226\128\148 it merges your settings, Channel, Token and stored data, showing a confirmation with a summary first. It only works while ShadowNetwork is still installed and loaded, so keep ShadowNetwork installed until you've seen that import confirmation and checked everything carried over before disabling it.")
 
     local ac = flow:AddSection("Accounts & Tombstones")
     ac:Hint("Deleting an account is local only \226\128\148 it hides that account on THIS client and leaves a 14-day tombstone that blocks it from re-appearing.")
