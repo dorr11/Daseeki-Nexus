@@ -438,12 +438,19 @@ function TimersDock.Attach(parent)
     -- The anti-overlap rule below stays anyway, belt-and-braces for odd counts/font scales.
     local sfHdr = microLabel(parent, "FELWOOD")
     sfHdr:SetPoint("TOPLEFT", wbRows, "BOTTOMLEFT", 0, -10)
+    -- ROUND-21b HOTFIX — ANCHOR CYCLE. This meta used to take its baseline FROM the header
+    -- (SetPoint("TOP", sfHdr, "TOP")) while round-21's anti-collision rule made the header
+    -- depend on the meta (SetPoint("RIGHT", sfMeta, "LEFT")). That is a mutual dependency,
+    -- and WoW rejects the closing call outright:
+    --     Action[SetPoint] failed because[Cannot anchor to a region dependent on it]
+    -- The WB pair above never crashed only because ITS meta anchors solely to `parent`.
+    -- Fix: hang BOTH off the same stable ancestor (wbRows' bottom edge, which is where the
+    -- header already sat), so the baseline still matches but the meta no longer references
+    -- the header. The header -> meta edge then stays one-way and the graph is acyclic.
+    -- wbRows' right edge is already parent-right minus PAD_H, so the X is unchanged too.
     local sfMeta = fstr(parent, "microLabel", "RIGHT")
-    sfMeta:SetPoint("TOPRIGHT", parent, "TOPRIGHT", -PAD_H, 0)
-    -- keep the meta baseline aligned with the SF header.
-    sfMeta:SetPoint("TOP", sfHdr, "TOP", 0, 0)
-    -- Same flex rule as the WB header above — this is the pair the owner caught colliding
-    -- ("SONGFLOWOOD up · 0 respawning"): the eyebrow truncates before it can reach the meta.
+    sfMeta:SetPoint("TOPRIGHT", wbRows, "BOTTOMRIGHT", 0, -10)
+    -- Flex rule (round-21): the eyebrow truncates before it can reach the meta.
     sfHdr:SetPoint("RIGHT", sfMeta, "LEFT", -8, 0)
     sfHdr:SetWordWrap(false)
     sfMeta:SetTextColor(UI.Color("muted"))   -- pop pass
