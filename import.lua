@@ -383,8 +383,15 @@ end
 --
 -- SN stores up to 15 slots of {name,x,y,tolerance}; empties are padded with
 -- name="". We import only the named entries, converting the point+tolerance
--- into our min/max box. SN carries no zone, so `zone` is left "" (the pins/
--- location matcher treats an empty zone as unscoped; the user can re-pick).
+-- into our min/max box. SN carries no zone, so the rule is UNSCOPED — it
+-- matches on coordinates alone in any zone, and the user can re-pick a zone
+-- later.
+--
+-- `zone` is emitted as nil (field omitted), NOT "". An empty string is the
+-- shape that made every imported override dead in the tracker matcher, which
+-- read `not o.zone` (false for "") and so scoped each rule to a zone named "".
+-- The matchers now read empty/whitespace as unscoped too, so old SavedVariables
+-- still resolve; nil is simply the honest way to say "no scope" going forward.
 ----------------------------------------------------------------------
 
 function Import._MapCoordinateOverrides(arr)
@@ -397,7 +404,7 @@ function Import._MapCoordinateOverrides(arr)
             out[#out + 1] = {
                 name  = e.name,
                 label = e.name,
-                zone  = "",
+                zone  = nil,   -- unscoped: matches on coordinates in any zone
                 minX  = (e.x or 0) - tol,
                 maxX  = (e.x or 0) + tol,
                 minY  = (e.y or 0) - tol,
@@ -1461,6 +1468,17 @@ local function selfTest(verbose)
     check("coord count skips empties", #co == 1)
     check("coord box minX", math.abs(co[1].minX - 0.48) < 1e-9)
     check("coord label", co[1].label == "Rend North")
+    -- SN carries no zone: the rule must be UNSCOPED (nil), never "" — the empty
+    -- string is the shape the tracker matcher used to treat as a real zone name,
+    -- which made every imported override dead. The matcher now reads "" as
+    -- unscoped too, but the producer emits the honest nil.
+    check("coord zone is nil (unscoped), not the dead empty string", co[1].zone == nil)
+    -- The produced rule must actually resolve through the capture-path matcher.
+    if ns.Tracker and ns.Tracker._OverrideZoneMatches then
+        check("coord rule matches any zone via the tracker scope predicate",
+              ns.Tracker._OverrideZoneMatches(co[1].zone, "Orgrimmar") == true
+              and ns.Tracker._OverrideZoneMatches(co[1].zone, "Mulgore") == true)
+    end
 
     -- rgb->hex.
     check("rgb->hex", Import._RgbToHex({ 0.2, 0.8, 0.2 }) == "33CC33")

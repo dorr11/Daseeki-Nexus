@@ -936,6 +936,28 @@ local function captureLocation(rec)
     end
 end
 
+-- SHARED SEMANTIC (see HUD._RendOverrideHit, which matches the same stored
+-- rules): an override rule's `zone` is a SCOPE, and an absent scope means
+-- "anywhere". A rule is unscoped when zone is nil, empty, or whitespace-only;
+-- otherwise it must equal the current real zone.
+--
+-- This used to read `(not o.zone or o.zone == zone)`, which is a live bug for
+-- the zone="" shape both producers emit: `not ""` is false in Lua and "" never
+-- equals a real zone name, so EVERY unscoped rule was dead here while the HUD
+-- happily matched it — the two matchers disagreed about identical stored data.
+-- Producers now normalize "" to nil (import.lua), but the lenient read stays:
+-- SavedVariables written by older builds still carry "", and the options
+-- "Add Location" path stores "" for a rule the user left unscoped.
+--
+-- Pure and non-string-safe by design: a corrupt `zone` of any non-string type
+-- is treated as scoped-and-non-matching rather than erroring on the ticker.
+function Tracker._OverrideZoneMatches(oz, zone)
+    if oz == nil then return true end
+    if type(oz) ~= "string" then return false end
+    if oz:match("^%s*$") ~= nil then return true end
+    return oz == zone
+end
+
 -- Match the current map + player position against configured coordinate
 -- override boxes. Returns the label or nil.
 function Tracker.ResolveCoordinateOverride()
@@ -953,7 +975,7 @@ function Tracker.ResolveCoordinateOverride()
 
     for i = 1, #overrides do
         local o = overrides[i]
-        if (not o.zone or o.zone == zone)
+        if Tracker._OverrideZoneMatches(o.zone, zone)
             and x >= (o.minX or 0) and x <= (o.maxX or 1)
             and y >= (o.minY or 0) and y <= (o.maxY or 1) then
             return o.label or o.name
@@ -4206,6 +4228,138 @@ local function testAttunement(fails)
        "migration: the demoted MC reads nil -> the card renders attuned")
 end
 
+----------------------------------------------------------------------
+-- COORDINATE OVERRIDE ZONE SCOPING
+--
+-- The live bug this guards: `(not o.zone or o.zone == zone)` scoped an
+-- UNSCOPED rule (zone = "") to a zone literally named "" — `not ""` is false
+-- in Lua — so it could never match anywhere. Both producers emit that shape
+-- (the SN import, and the options "Add Location" path), which meant every
+-- imported location override and every hand-added unscoped rule was silently
+-- dead, while HUD._RendOverrideHit — reading the SAME stored rules with the
+-- lenient form — matched them. The two matchers must agree.
+----------------------------------------------------------------------
+local function testCoordinateOverride(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+
+    -- ---- 1) the pure scope predicate --------------------------------------
+    local M = Tracker._OverrideZoneMatches
+    ck(M(nil, "Orgrimmar") == true,        "scope: nil zone is unscoped -> matches")
+    ck(M("", "Orgrimmar") == true,         "scope: EMPTY zone is unscoped -> matches (the bug)")
+    ck(M("   ", "Orgrimmar") == true,      "scope: whitespace-only zone is unscoped -> matches")
+    ck(M("\t\n", "Orgrimmar") == true,     "scope: tab/newline zone is unscoped -> matches")
+    ck(M("", "") == true,                  "scope: empty rule vs empty zone text still matches")
+    ck(M("Orgrimmar", "Orgrimmar") == true,  "scope: exact zone matches its own zone")
+    ck(M("Orgrimmar", "Durotar") == false,   "scope: a scoped rule does NOT match another zone")
+    ck(M("Orgrimmar", "") == false,          "scope: scoped rule does not match empty zone text")
+    -- Defensive: corrupt SavedVariables must not error on the capture path.
+    ck(M(42, "Orgrimmar") == false,        "scope: a numeric zone is rejected, not errored on")
+    ck(M({}, "Orgrimmar") == false,        "scope: a table zone is rejected, not errored on")
+    ck(M(true, "Orgrimmar") == false,      "scope: a boolean zone is rejected, not errored on")
+
+    -- ---- 2) end-to-end through ResolveCoordinateOverride -------------------
+    local savedZone, savedMap = _G.GetRealZoneText, _G.C_Map
+    local savedGS = ns.Store and ns.Store.GetSettings
+
+    local zoneText, px, py = "Orgrimmar", 0.5, 0.5
+    local overrides = {}
+    _G.GetRealZoneText = function() return zoneText end
+    ns.Store.GetSettings = function() return { coordinateOverrides = overrides } end
+    _G.C_Map = {
+        GetBestMapForUnit = function() return 1454 end,
+        GetPlayerMapPosition = function()
+            return { GetXY = function() return px, py end }
+        end,
+    }
+
+    local BOX = { minX = 0.4, maxX = 0.6, minY = 0.4, maxY = 0.6 }
+    local function rule(zone)
+        return { label = "Staging", zone = zone,
+                 minX = BOX.minX, maxX = BOX.maxX, minY = BOX.minY, maxY = BOX.maxY }
+    end
+
+    local ok, err = pcall(function()
+
+    -- An unscoped rule fires in ANY zone — that is the whole point of no scope.
+    overrides = { rule(nil) }
+    zoneText = "Orgrimmar"
+    ck(Tracker.ResolveCoordinateOverride() == "Staging", "nil-zone rule fires in Orgrimmar")
+    zoneText = "Mulgore"
+    ck(Tracker.ResolveCoordinateOverride() == "Staging", "nil-zone rule fires in Mulgore too")
+
+    -- The regression itself: the "" shape stored by the options path.
+    overrides = { rule("") }
+    zoneText = "Orgrimmar"
+    ck(Tracker.ResolveCoordinateOverride() == "Staging", 'EMPTY-zone rule fires (was dead everywhere)')
+    zoneText = "Un'Goro Crater"
+    ck(Tracker.ResolveCoordinateOverride() == "Staging", 'EMPTY-zone rule fires in a second zone')
+
+    overrides = { rule("  ") }
+    ck(Tracker.ResolveCoordinateOverride() == "Staging", "whitespace-zone rule is unscoped and fires")
+
+    -- A zone-scoped rule still REQUIRES its zone — leniency must not leak.
+    overrides = { rule("Orgrimmar") }
+    zoneText = "Orgrimmar"
+    ck(Tracker.ResolveCoordinateOverride() == "Staging", "scoped rule fires inside its own zone")
+    zoneText = "Durotar"
+    ck(Tracker.ResolveCoordinateOverride() == nil, "scoped rule stays silent in another zone")
+
+    -- Unscoped is a ZONE waiver, not a BOX waiver: coordinates still gate.
+    overrides = { rule("") }
+    zoneText = "Orgrimmar"
+    px, py = 0.9, 0.9
+    ck(Tracker.ResolveCoordinateOverride() == nil, "unscoped rule still requires the coordinate box")
+    px, py = 0.5, 0.5
+
+    -- A corrupt rule is skipped, and does not stop a good later rule matching.
+    overrides = { rule(42), rule(nil) }
+    ck(Tracker.ResolveCoordinateOverride() == "Staging",
+       "a corrupt-zone rule is skipped without erroring, later rule still wins")
+
+    -- ---- 3) the SN import fixture now RESOLVES -----------------------------
+    -- Producer + matcher checked together: what the import writes must be
+    -- something the capture path can actually match.
+    if ns.Import and ns.Import._MapCoordinateOverrides then
+        local imported = ns.Import._MapCoordinateOverrides({
+            { name = "Rend North", x = 0.5, y = 0.47, tolerance = 0.02 },
+            { name = "", x = 0, y = 0, tolerance = 0.08 },
+        })
+        ck(#imported == 1, "import fixture: one named override survives")
+        ck(imported[1].zone == nil, "import fixture: zone is nil (unscoped), not the dead \"\"")
+        overrides = imported
+        px, py = 0.5, 0.47
+        zoneText = "Orgrimmar"
+        ck(Tracker.ResolveCoordinateOverride() == "Rend North",
+           "import fixture: the imported override RESOLVES at its point")
+        zoneText = "Blasted Lands"
+        ck(Tracker.ResolveCoordinateOverride() == "Rend North",
+           "import fixture: unscoped, so it resolves in any zone")
+        px, py = 0.5, 0.53   -- outside the +/-0.02 tolerance box
+        ck(Tracker.ResolveCoordinateOverride() == nil,
+           "import fixture: outside the tolerance box it does not fire")
+    end
+
+    -- ---- 4) agreement with the HUD matcher ---------------------------------
+    -- HUD._RendOverrideHit reads the same rules with the lenient form. Where it
+    -- is loaded, the two must answer alike for every zone shape.
+    if ns.HUD and ns.HUD._RendOverrideHit then
+        local rendBox = { { name = "Rend North Staging", zone = "",
+                            minX = 0.4, maxX = 0.6, minY = 0.4, maxY = 0.6 } }
+        overrides = rendBox
+        px, py, zoneText = 0.5, 0.5, "Mulgore"
+        local hudHit = ns.HUD._RendOverrideHit(rendBox, zoneText, px, py)
+        local trkHit = Tracker.ResolveCoordinateOverride() ~= nil
+        ck(hudHit == trkHit,
+           "matchers agree on an empty-zone rule (HUD and tracker read one store)")
+    end
+
+    end)
+
+    _G.GetRealZoneText, _G.C_Map = savedZone, savedMap
+    if ns.Store then ns.Store.GetSettings = savedGS end
+    if not ok then fails[#fails + 1] = "error in coordinate-override fixtures: " .. tostring(err) end
+end
+
 function Tracker.RunSelfTests(verbose)
     local suites = {
         { name = "state-push change filter (A10.1)", fn = testChangeFilter },
@@ -4221,6 +4375,7 @@ function Tracker.RunSelfTests(verbose)
         { name = "boon tooltip reconciliation (A7.5)", fn = testBoonReconcile },
         { name = "DMF capture edges + debuff push (A8)", fn = testDMFCapture },
         { name = "raid attunement (quest matrix + RaidAttuned tri-state)", fn = testAttunement },
+        { name = "coordinate override zone scoping", fn = testCoordinateOverride },
     }
     local allPass = true
     for _, suite in ipairs(suites) do
