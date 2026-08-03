@@ -510,8 +510,15 @@ end
 -- hover tooltip, so no information is lost, and their 80px + 2 gaps go to the INSTANCE
 -- name, which is the column that was actually truncating dungeon names.
 --   flex = 344 - (name 56 + 2*pad 6 + dur 38 + ago 38 + gap 5) = 195   (was 105)
+-- ROUND-27 addendum (owner: "reduce the dead space between Instance and Dur"): the CHAR
+-- column widens 56 -> 70 so a realistic character name fits UN-ELLIPSIZED. Measured at the
+-- row's `small` font (11pt, ~0.52em average advance): "Konditioner" (11 chars) needs ~63px
+-- and was being cut at 56; 70 seats a 12-character name (~69px). INSTANCE starts further
+-- right and its FLEX shrinks 195 -> 181 accordingly, which is what closes the gulf before
+-- DUR — the flex column was absorbing all the slack. Still far above the 90px floor the
+-- suite asserts for "Blackrock Depths".
 InstancesUI.RECENT_COLS = {
-    content = 344, name = 56, dur = 38, ago = 38,
+    content = 344, name = 70, dur = 38, ago = 38,
     gold = 42, xp = 38,        -- retained for the TOOLTIP figures, not rendered as columns
     gap = 5,   -- between the right-aligned numeral columns
     pad = 6,   -- either side of the flexing instance name
@@ -1712,9 +1719,12 @@ local function testInstancesUI(fails)
     -- GOLD and XP left the rows; their width goes to the flexing instance name.
     ck(IU.InstanceFlexWidth() == 344 - (RCOL.name + 2 * RCOL.pad + RCOL.dur + RCOL.ago + RCOL.gap),
         "cols: flex = content - (name + pads + dur + ago + one gap)")
-    ck(IU.InstanceFlexWidth() == 195,
-        "cols: instance flexes to 195px (was 105) -- got " .. IU.InstanceFlexWidth())
-    ck(IU.InstanceFlexWidth() > 105, "cols: dropping GOLD/XP genuinely widened the name")
+    -- ROUND-27: CHAR widened 56 -> 70 to seat a 12-char name, so the flex gives back 14px
+    -- (195 -> 181) — that reclaimed slack is what closes the Instance/DUR gulf.
+    ck(RCOL.name == 70, "cols: CHAR is 70 wide (fits ~12 chars at the row font)")
+    ck(IU.InstanceFlexWidth() == 181,
+        "cols: instance flexes to 181px -- got " .. IU.InstanceFlexWidth())
+    ck(IU.InstanceFlexWidth() > 105, "cols: still far wider than the pre-round-25b 105")
     -- The figures are NOT lost: RecentCells still computes them for the row tooltip.
     local keptCells = IU.RecentCells(IU.RowModel({ t = T - 60, name = "Deadmines", dur = 600,
         gold = 48000, xp = 12400 }, "Alt-Realm", "ROGUE", T))

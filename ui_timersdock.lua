@@ -95,13 +95,29 @@ end
 --   unknown / stale -> "No data", faint          (and so does anything unrecognised)
 -- `remaining` for `expired` is time SINCE the window opened; abs() so either sign
 -- convention renders the same negative-looking counter.
+-- ROUND-27 (owner): the respawn countdown's colour answers "how soon can I route there",
+-- so SOONER = GREENER — the inverse of a warning ramp, which is why it replaces the old
+-- "amber under a minute" rule rather than extending it.
+--     < 5min   ok      green   — worth heading there now
+--     < 15min  warn    yellow  — worth planning around
+--   >= 15min   danger  red     — not worth routing to yet
+-- Boundaries are INCLUSIVE-below (300 is already "warn", 900 already "danger") so the two
+-- named thresholds read exactly as the owner stated them. Pure.
+local SF_SOON, SF_SOONISH = 5 * 60, 15 * 60
+function Dashboard.SongflowerCountdownToken(remaining)
+    local rem = tonumber(remaining) or 0
+    if rem < SF_SOON then return "ok" end
+    if rem < SF_SOONISH then return "warn" end
+    return "danger"
+end
+
 function Dashboard.SongflowerCellContent(st)
     local state = st and st.state
     if state == "up" then
         return "Up", "ok", "muted"
     elseif state == "down" then
-        local rem = st.remaining or 0
-        return Dashboard.ShortDur(rem), (rem < 60) and "warn" or "text", "muted"
+        return Dashboard.ShortDur(st.remaining or 0),
+               Dashboard.SongflowerCountdownToken(st.remaining), "muted"
     elseif state == "expired" then
         return "-" .. Dashboard.FormatMSS(math.abs(st.remaining or 0)), "warn", "muted"
     end
@@ -456,6 +472,42 @@ function TimersDock.Attach(parent)
     sfMeta:SetTextColor(UI.Color("muted"))   -- pop pass
     D.sfMeta = sfMeta
 
+    -- ROUND-27 (owner): the FELWOOD eyebrow opens the world map at Felwood.
+    -- MECHANISM MIRRORED from minimap.lua's context-menu item, deliberately not reinvented:
+    -- show the map if hidden (ToggleWorldMap, falling back to ShowUIPanel) then SetMapID.
+    -- minimap.lua keeps its copy file-local and that file is not in this round's grant, so
+    -- this is a mirror rather than a shared call — but it reads the map id from the ALREADY
+    -- SHARED ns.Timers.FELWOOD_MAP instead of a second literal, so only the four lines of
+    -- panel-showing logic are duplicated. Worth consolidating into one exported helper when
+    -- minimap.lua is next open; flagged in the report.
+    -- A FontString takes no mouse input, so a hit frame tracks the eyebrow's text extents.
+    -- It covers ONLY the eyebrow — the meta count line stays non-interactive.
+    local sfHit = CreateFrame("Button", nil, parent)
+    sfHit:SetPoint("TOPLEFT", sfHdr, "TOPLEFT", -2, 2)
+    sfHit:SetPoint("BOTTOMRIGHT", sfHdr, "BOTTOMRIGHT", 2, -2)
+    sfHit:EnableMouse(true)
+    sfHit:SetScript("OnEnter", function(self)
+        sfHdr:SetTextColor(UI.Color("accent"))
+        GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+        GameTooltip:AddLine("Open Felwood map", UI.Color("text"))
+        GameTooltip:Show()
+    end)
+    sfHit:SetScript("OnLeave", function()
+        sfHdr:SetTextColor(UI.Color("muted"))
+        GameTooltip:Hide()
+    end)
+    sfHit:SetScript("OnClick", function()
+        if not WorldMapFrame then return end
+        if not WorldMapFrame:IsShown() then
+            if ToggleWorldMap then ToggleWorldMap()
+            elseif ShowUIPanel then ShowUIPanel(WorldMapFrame) end
+        end
+        local id = (ns.Timers and ns.Timers.FELWOOD_MAP) or 1448
+        if WorldMapFrame.SetMapID then WorldMapFrame:SetMapID(id) end
+    end)
+    tag(sfHit, "dock.felwoodlink")
+    D.sfHit = sfHit
+
     local sfGrid = CreateFrame("Frame", nil, parent)
     sfGrid:SetPoint("TOPLEFT", sfHdr, "BOTTOMLEFT", 0, -6)
     sfGrid:SetPoint("RIGHT", parent, "RIGHT", -PAD_H, 0)
@@ -480,7 +532,11 @@ function TimersDock.Attach(parent)
         -- and 9pt would fall under the 720p legibility floor for a muted-tint label. The
         -- status line below (cell.st) keeps its numeral size. SizedFont so it tracks the
         -- font picker instead of freezing a face.
-        if Dashboard.SizedFont then Dashboard.SizedFont(cell.nm, "microLabel", -1) end
+        -- ROUND-27 (owner): one more step down — -2 from the microLabel base, so 11pt -> 9pt.
+        -- This overrides my round-21 hesitation about a 720p legibility floor: it is the
+        -- owner's display and his call, and the node name is a secondary caption whose full
+        -- text is on the cell hover anyway. The STATUS line (cell.st, numeral) is unchanged.
+        if Dashboard.SizedFont then Dashboard.SizedFont(cell.nm, "microLabel", -2) end
         -- Round-16b addendum 2 (owner: "the names are getting cut off"): the numeric
         -- prefix is dropped so the full node name gets the cell width. Node indices are
         -- unaffected everywhere else (pop log / slash output still name them by number).
@@ -739,12 +795,22 @@ local function testCellContent(fails)
     ck(t == "No data" and c == "faint" and cap == "faint", "no state -> 'No data' / faint")
     t, c = Dashboard.SongflowerCellContent({ state = "unknown" })
     ck(t == "No data" and c == "faint", "unknown -> 'No data' / faint")
+    -- ROUND-27: the countdown colour is a ROUTING signal — sooner = greener.
+    --   < 5min ok · < 15min warn · >= 15min danger   (replaces the old amber-under-a-minute)
+    local tok = Dashboard.SongflowerCountdownToken
+    ck(tok(0) == "ok" and tok(45) == "ok" and tok(299) == "ok", "under 5min -> ok green")
+    ck(tok(300) == "warn", "exactly 5min -> warn (boundary is inclusive-below)")
+    ck(tok(600) == "warn" and tok(899) == "warn", "5-15min -> warn yellow")
+    ck(tok(900) == "danger", "exactly 15min -> danger")
+    ck(tok(18 * 60) == "danger" and tok(3600) == "danger", "15min+ -> danger red")
+    ck(tok(nil) == "ok", "nil remaining -> ok (treated as 0, no error)")
+    -- ...and the cell wires the token through, text unchanged.
     t, c, cap = Dashboard.SongflowerCellContent({ state = "down", remaining = 18 * 60 })
-    ck(t == "18m" and c == "text" and cap == "muted", "down >60s -> '18m' / cream / muted")
+    ck(t == "18m" and c == "danger" and cap == "muted", "down 18m -> '18m' / danger / muted")
     t, c = Dashboard.SongflowerCellContent({ state = "down", remaining = 45 })
-    ck(t == "45s" and c == "warn", "down <60s -> '45s' / warn (amber)")
-    ck(select(2, Dashboard.SongflowerCellContent({ state = "down", remaining = 60 })) == "text", "60s boundary is cream")
-    ck(select(2, Dashboard.SongflowerCellContent({ state = "down", remaining = 59 })) == "warn", "59s is amber")
+    ck(t == "45s" and c == "ok", "down 45s -> '45s' / ok (routable now)")
+    t, c = Dashboard.SongflowerCellContent({ state = "down", remaining = 10 * 60 })
+    ck(t == "10m" and c == "warn", "down 10m -> '10m' / warn")
     t, c = Dashboard.SongflowerCellContent({ state = "up" })
     ck(t == "Up" and c == "ok", "CONFIRMED up -> 'Up' / ok green (the only green state)")
 
