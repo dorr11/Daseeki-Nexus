@@ -2433,8 +2433,13 @@ function Mesh.SyncSettings()
     local blob = {
         syncId = syncId, kind = "settings",
         -- Sync the propagatable settings surface (not identity/mesh secrets).
-        classColors         = db.classColors,
-        coordinateOverrides = db.coordinateOverrides,
+        --
+        -- SETTINGS REWORK: classColors and coordinateOverrides are NO LONGER SENT.
+        -- Both are retired features (the palette is fixed; custom locations are
+        -- tombstoned by Store.RetireLocations), so shipping them would be a way
+        -- for one account to push retired records at another. auraRules — the one
+        -- global class-rule table — takes their place as the buff configuration.
+        auraRules           = db.auraRules,
         factionSettings     = db.factionSettings,
         timerSettings       = db.timerSettings,
     }

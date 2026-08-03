@@ -328,8 +328,16 @@ function Detail.BuffTileState(slot, rec, faction, e, online, aid)
                      durText = Detail.CompactDuration(remaining), durTok = "ok",
                      fullText = full .. " (Boon)", spellID = meta.spellID }
         end
-        local th  = D.GetThreshold(faction, meta.thresholdKey)
-        local tok = D.AuraColorToken(remaining, th)    -- ok / warn / danger
+        -- SETTINGS-REWORK ITEM 4: buff-time colour is a FIXED backend rule keyed
+        -- off the buff's full duration (2h -> yellow under 90m, 1h -> under 55m,
+        -- Battle Shout -> under 12m; green otherwise, never red for a buff that
+        -- is present). BuffTimeToken returns nil for a slot with no
+        -- full-duration class — only the seasonal tail slot today — and that one
+        -- keeps the legacy green/amber/red threshold path.
+        local tok = D.BuffTimeToken and D.BuffTimeToken(meta.thresholdKey, remaining)
+        if not tok then
+            tok = D.AuraColorToken(remaining, D.GetThreshold(faction, meta.thresholdKey))
+        end
         return { shown = true, slot = slot, missing = false, boon = false,
                  calm = (tok == "ok"), tint = tok,
                  durText = Detail.CompactDuration(remaining), durTok = tok,
@@ -1093,14 +1101,15 @@ end
 local function testBuffMatrix(fails)
     local D = ns.Dashboard
     if not (D and D.AURA_META) then fails[#fails + 1] = "Dashboard.AURA_META unavailable"; return end
-    local savedGFS = ns.Store and ns.Store.GetFactionSettings
+    -- SETTINGS-REWORK ITEM 6: class rules are read from the ONE global table
+    -- (Store.GetAuraRules), not from a faction block, so the stub moved with it.
+    local savedGAR = ns.Store and ns.Store.GetAuraRules
     ns.Store = ns.Store or {}
-    ns.Store.GetFactionSettings = function()
-        return { auraOpts = {
+    ns.Store.GetAuraRules = function()
+        return {
             rend  = { required = { WARRIOR = true }, optional = {} },
             dmtSP = { required = {}, optional = { MAGE = true } },
-            thresholds = {},
-        } }
+        }
     end
     local BOON = (ns.Store.AURA_SOURCE and ns.Store.AURA_SOURCE.BOON) or 2
     local e = 1000000
@@ -1108,9 +1117,20 @@ local function testBuffMatrix(fails)
     local onySlot, rendSlot, spSlot = slotOf("ony"), slotOf("rend"), slotOf("dmtsp")
     local fffSlot = slotOf("fff")   -- the collapsing seasonal tail slot (was Blackfathom)
 
-    local rec = { classTag = "WARRIOR", auraStates = { [onySlot] = { duration = 3600 } } }
+    -- SETTINGS-REWORK ITEM 4: "healthy" is now measured by the FIXED rule, not by
+    -- an editable threshold pair. Ony is a 2h buff, so healthy means >= 90 min —
+    -- 100 minutes here. (This case used to pass 3600s, which the old configurable
+    -- Horde threshold called healthy and the fixed rule correctly calls yellow.)
+    local rec = { classTag = "WARRIOR", auraStates = { [onySlot] = { duration = 6000 } } }
     local st = Detail.BuffTileState(onySlot, rec, "Horde", e)
     if not (st.shown and st.calm and not st.missing) then fails[#fails + 1] = "owned healthy buff should be shown+calm" end
+
+    -- ...and the same buff one minute under the cutoff is yellow, never red.
+    rec.auraStates[onySlot] = { duration = 89 * 60 }
+    st = Detail.BuffTileState(onySlot, rec, "Horde", e)
+    if not (st.shown and not st.missing and st.durTok ~= "danger" and st.calm == false) then
+        fails[#fails + 1] = "2h buff just under 90m -> shown, not calm, and NOT danger"
+    end
 
     rec.auraStates[onySlot] = { duration = 1200, source = BOON }
     st = Detail.BuffTileState(onySlot, rec, "Horde", e)
@@ -1170,7 +1190,7 @@ local function testBuffMatrix(fails)
     end
 
     D._onlineWinners = savedWinners
-    if ns.Store then ns.Store.GetFactionSettings = savedGFS end
+    if ns.Store then ns.Store.GetAuraRules = savedGAR end
 end
 
 -- DETAIL / CARD AGREEMENT on a DUPLICATE Name-Realm.
@@ -1192,11 +1212,11 @@ local function testDetailCardAgreement(fails)
     local onySlot = slotOf("ony")
     if not onySlot then ck(false, "ony slot missing"); return end
 
-    local savedGFS = ns.Store and ns.Store.GetFactionSettings
+    local savedGAR = ns.Store and ns.Store.GetAuraRules
     ns.Store = ns.Store or {}
-    ns.Store.GetFactionSettings = function()
-        return { auraOpts = { rend = { required = {}, optional = {} },
-                              dmtSP = { required = {}, optional = {} }, thresholds = {} } }
+    ns.Store.GetAuraRules = function()
+        return { rend = { required = {}, optional = {} },
+                 dmtSP = { required = {}, optional = {} } }
     end
     local savedWinners = D._onlineWinners
     local savedPeers   = ns.Mesh and ns.Mesh.peers
@@ -1245,7 +1265,7 @@ local function testDetailCardAgreement(fails)
 
     D._onlineWinners = savedWinners
     if ns.Mesh then ns.Mesh.peers = savedPeers end
-    if ns.Store then ns.Store.GetFactionSettings = savedGFS end
+    if ns.Store then ns.Store.GetAuraRules = savedGAR end
 end
 
 local function testCaptionCompact(fails)
@@ -1487,16 +1507,18 @@ local function testColorFns(fails)
     local a, b, c = Detail.Lighten(0.5, 0.4, 0.9, 0.12)
     ck(type(a) == "number" and type(b) == "number" and type(c) == "number",
         ("Lighten must return 3 numbers, got %s/%s/%s"):format(type(a), type(b), type(c)))
-    -- BrightClass with a RESOLVABLE class color (stub the settings so ClassColor never
-    -- reaches its UI.Color fallback) must return 3 numbers — the exact crash path.
-    local savedGS = ns.Store and ns.Store.GetSettings
-    ns.Store = ns.Store or {}
-    ns.Store.GetSettings = function() return { classColors = { WARRIOR = "c69b6d" } } end
+    -- BrightClass with a RESOLVABLE class color must return 3 numbers — the exact
+    -- crash path. SETTINGS-REWORK ITEM 1: ClassColor no longer reads
+    -- SavedVariables at all, so there is nothing left to stub — it resolves from
+    -- Store.DEFAULT_CLASS_COLORS. That the palette is ALWAYS resolvable is now
+    -- part of the contract, so assert it here rather than faking it.
+    ck(type(ns.Store) == "table" and type(ns.Store.DEFAULT_CLASS_COLORS) == "table"
+        and ns.Store.DEFAULT_CLASS_COLORS.WARRIOR ~= nil,
+        "Store.DEFAULT_CLASS_COLORS is the unconditional class palette")
     local r, g, bl = Detail.BrightClass("WARRIOR")
     ck(type(r) == "number" and type(g) == "number" and type(bl) == "number",
         ("BrightClass must return 3 numbers (no and-chain truncation), got %s/%s/%s")
         :format(type(r), type(g), type(bl)))
-    ns.Store.GetSettings = savedGS
 end
 
 -- The COOLDOWNS item-icon path must route through ns.Dashboard (round-5 hotfix guard).

@@ -125,6 +125,10 @@ local FILTER_DEFS = {
     { key = "online",    label = "Online",    tip = "Currently online." },
     { key = "summoners", label = "Summoners", tip = "Warlocks below level 60." },
 }
+-- Exported so the "cards" suite can assert Cards.DEFAULT_FILTER (item 7) names a
+-- segment that actually exists — a default pointing at a key with no chip would
+-- open the roster on a filter the owner cannot see or clear.
+Cards.FILTER_DEFS = FILTER_DEFS
 
 ----------------------------------------------------------------------
 -- PURE roster logic (no UI — exercised headless by the "cards" self-test).
@@ -318,6 +322,31 @@ end
 function Cards.NextFilter(current, clicked)
     if current == clicked then return nil end
     return clicked
+end
+
+----------------------------------------------------------------------
+-- OWNER (settings rework, item 7): "make the '60s' filter default to selected".
+--
+-- The filter trio is SESSION state — `pane.filter` is initialised when the
+-- characters tab is built and is deliberately NOT persisted (only
+-- `ui.selectedCharacter` is). So there is no stored value to heal and no
+-- match-by-value migration to write: the fresh default IS the whole behaviour,
+-- and it changes from nil ("show everything") to "60s".
+--
+-- Why that is the right default rather than a preference: the roster's reason to
+-- exist is the level-60 world-buff view, and every other surface (the card strip,
+-- the buff tally, the missing-buff counts) is built around 60s. Opening on ALL
+-- put a screenful of low-level alts between the owner and the characters he
+-- actually reads. Clicking 60S still clears back to ALL exactly as before —
+-- NextFilter is untouched — so nothing is taken away, only the starting point
+-- moves. Kept as a named constant + a pure accessor so the default flows through
+-- one testable seam instead of a literal buried in the tab factory.
+----------------------------------------------------------------------
+Cards.DEFAULT_FILTER = "60s"
+
+-- The filter a freshly-built characters tab opens on.
+function Cards.InitialFilter()
+    return Cards.DEFAULT_FILTER
 end
 
 -- The SELECTION state machine (pure): given the currently-visible sorted list and
@@ -1074,7 +1103,8 @@ end
 -- The "characters" screen — the whole control-panel body.
 ----------------------------------------------------------------------
 Dashboard.RegisterTab("characters", function(host)
-    local pane = { filter = nil, _cards = {}, selected = nil, obj = {} }
+    -- Item 7: opens on 60s (Cards.InitialFilter), not on "show everything".
+    local pane = { filter = Cards.InitialFilter(), _cards = {}, selected = nil, obj = {} }
     Cards._pane = pane
 
     -- Restore persisted selection (additive, optional).
@@ -1388,8 +1418,9 @@ local function testCardsLogic(fails)
        "card: dmtAP is non-applicable for a mage (not Missing, not in the tally)")
     ck(Dashboard.AuraRequirement(AP_SLOT, bare.rec, "Alliance") == true,
        "card: dmtAP IS applicable for a warrior")
-    local ap = ns.Store and ns.Store.GetFactionSettings
-               and ns.Store.GetFactionSettings("Alliance").auraOpts.dmtAP
+    -- SETTINGS-REWORK ITEM 6: one global rule table, no faction argument.
+    local ap = ns.Store and ns.Store.GetAuraRules and ns.Store.GetAuraRules()
+    ap = ap and ap.dmtAP
     if ap then
         local pReq, pIgn = ap.required.MAGE, ap.ignored.MAGE
         ap.ignored.MAGE = nil; ap.required.MAGE = true
@@ -1462,6 +1493,28 @@ local function testFilter(fails)
     ck(Cards.NextFilter("60s", "60s") == nil, "click the ACTIVE segment -> CLEAR (nil = all)")
     ck(Cards.NextFilter("60s", "online") == "online", "click another segment -> switch exclusively")
     ck(Cards.NextFilter("online", "online") == nil, "re-click online -> clear")
+
+    ------------------------------------------------------------------
+    -- OWNER (settings rework, item 7): the roster OPENS on 60s.
+    --
+    -- The filter is session state, not a saved preference, so the default IS the
+    -- behaviour — and a default is exactly the kind of thing a later refactor
+    -- resets to nil without anyone noticing until the dashboard is full of
+    -- level-12 alts again. Pinned through the one seam that sets it.
+    ------------------------------------------------------------------
+    ck(Cards.DEFAULT_FILTER == "60s", "item 7: the shipped default filter is 60s")
+    ck(Cards.InitialFilter() == "60s", "item 7: a fresh characters tab opens on 60s")
+    -- It has to be a REAL filter key, or the tab opens on a filter that matches
+    -- nothing and the card list is simply empty.
+    local keys = {}
+    for _, def in ipairs(Cards.FILTER_DEFS or {}) do keys[def.key] = true end
+    ck(next(keys) == nil or keys[Cards.DEFAULT_FILTER] == true,
+       "item 7: the default names one of the real filter segments")
+    ck(#Cards.FilterView(entries, Cards.InitialFilter()) == 2,
+       "item 7: opening on the default shows the two level-60s, not all three")
+    -- Nothing is taken away: clicking the active 60S segment still clears to ALL.
+    ck(Cards.NextFilter(Cards.InitialFilter(), "60s") == nil,
+       "item 7: 60S is still de-selectable back to ALL")
 end
 
 local function testSlotState(fails)
@@ -1500,15 +1553,16 @@ local function testSlotState(fails)
     end
     local rendSlot = slotOf("rend")
     if rendSlot then
-        local savedGFS = ns.Store and ns.Store.GetFactionSettings
+        -- SETTINGS-REWORK ITEM 6: one global rule table, no faction block.
+        local savedGAR = ns.Store and ns.Store.GetAuraRules
         ns.Store = ns.Store or {}
-        ns.Store.GetFactionSettings = function()
-            return { auraOpts = { rend = { required = {}, optional = { MAGE = true } }, thresholds = {} } }
+        ns.Store.GetAuraRules = function()
+            return { rend = { required = {}, optional = { MAGE = true } } }
         end
         local mageE = { faction = "Horde", rec = { classTag = "MAGE", auraStates = {} } }
         local s4, t4 = Cards.SlotState(mageE, rendSlot)
         ck(s4 == "warn" and t4 == "warn", "optional missing -> warn/warn")
-        ns.Store.GetFactionSettings = savedGFS
+        ns.Store.GetAuraRules = savedGAR
     end
 
     -- ---- A6.8 / A7.6 on the card strip -----------------------------------
@@ -1569,15 +1623,15 @@ local function testStripStyle(fails)
     end
     -- Optional missing -> desaturated + warn border.
     if rendSlot then
-        local savedGFS = ns.Store and ns.Store.GetFactionSettings
+        local savedGAR = ns.Store and ns.Store.GetAuraRules
         ns.Store = ns.Store or {}
-        ns.Store.GetFactionSettings = function()
-            return { auraOpts = { rend = { required = {}, optional = { MAGE = true } }, thresholds = {} } }
+        ns.Store.GetAuraRules = function()
+            return { rend = { required = {}, optional = { MAGE = true } } }
         end
         local opt = Cards.StripTileStyle({ faction = "Horde", rec = { classTag = "MAGE", auraStates = {} } }, rendSlot)
         ck(opt.shown and opt.desat == true and opt.border == "warn",
             "optional missing tile -> shown + desat + warn border")
-        ns.Store.GetFactionSettings = savedGFS
+        ns.Store.GetAuraRules = savedGAR
     end
 end
 

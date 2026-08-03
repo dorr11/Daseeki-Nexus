@@ -2,6 +2,51 @@
 
 ## Unreleased
 
+- Changed: **Settings is smaller.** Four things you were being asked to configure have
+  been decided for you, because there was only ever one sensible answer and keeping the
+  controls meant keeping the ways they could be set wrong.
+
+  - **Custom locations are gone.** The Locations table on the General page — the
+    numbered coordinate boxes with Add Location / Here / Del — is removed, and the
+    records themselves are retired, not just hidden. Each one leaves a marker behind, so
+    a copy arriving later from another account, a ShadowNetwork re-import, or a restored
+    settings file is removed again instead of quietly coming back. Your location data
+    now comes from where your characters actually are. If you had ever typed a location
+    override onto a character by hand, that text was already copied into that
+    character's Note and stays there.
+  - **Class colours are fixed.** The nine hex fields are gone; names are painted from
+    the standard palette everywhere. Anything you had customised is kept in your
+    settings file rather than deleted, in case this ever needs reversing.
+  - **Buff duration thresholds are gone.** Eighteen numbers replaced by three facts: a
+    2-hour buff turns yellow with less than 90 minutes left, a 1-hour buff with less
+    than 55, and the 15-minute NPC Battle Shout with less than 12. Above that they are
+    green. A buff you *have* is never red any more — red now means one thing, "missing",
+    instead of two.
+  - **The Tombstones list is gone from Settings.** Only the list: deleting an account
+    still blocks it from re-appearing for 14 days, exactly as before. There was nothing
+    on that screen to do except watch a countdown.
+
+- Changed: **buff class rules are one set now, not one per faction.** Whether your
+  rogues want Battle Shout is a fact about rogues, so the Horde/Alliance switch on that
+  page is gone and there is a single list. Your existing Horde configuration becomes the
+  shared one; paladin rules are taken from your Alliance side, since a Horde table has
+  never had a real paladin setting in it. Both old lists are kept untouched in your
+  settings file. This is also the end of an old trap — a tick could previously land in
+  the faction you do not play and appear to do nothing.
+
+- Changed: **"Mesh & Accounts" is now "Setup", and its three identity fields sit on one
+  row.** Account ID, Channel and Token each have their label above their box instead of
+  three stacked rows with a hint under each — they are one job, so they read as one
+  block. Show/Hide, validation and the setup bundle all work as before, and the fields
+  still refuse to be overwritten while you are typing in them.
+
+- Changed: **the buff rules page is called "Buffs"**, and its class grids run in the
+  order you use them: Battle Shout, Rend, Slip'kik's Savvy, Fengus' Ferocity.
+
+- Changed: **the character list opens on 60s.** The roster exists for the level-60
+  world-buff view, so it now starts there instead of showing every alt. Clicking the
+  active 60S chip still clears back to everything.
+
 - Fixed: **the on-screen alert banner ignored your chosen font.** The big centred
   warning (pull timers, quest hand-ins, cooldown alerts) was hardcoded to the game's
   default face while every other piece of Nexus type follows the font you pick in

@@ -11,11 +11,22 @@
 --     ns.HUD.TestAlert(buffKey, eventKey)   -- fire one test alert through the
 --                                              dispatcher for a matrix cell
 --
--- Section map (spec's 9 sub-tabs → 7 scannable pages, style-guide consolidation):
---   General          = General + Locations + Colors
---   Mesh & Accounts  = Mesh (Generate credentials · Copy/Paste setup bundle ·
---                      Setup guide wizard) + Accounts + Tombstones
---   Auras            = per-faction thresholds + Rend/Battle-Shout class rules
+-- Section map (spec's 9 sub-tabs → 7 scannable pages, style-guide consolidation).
+-- SETTINGS REWORK (owner, six directives) reshaped four of these:
+--   General          = General + Data Management. The custom-LOCATIONS editor and
+--                      the class-COLORS editor are both retired (item 1): the
+--                      records are tombstoned by a one-time store migration and
+--                      the palette is fixed, so there is nothing left to edit.
+--   Setup            = was "Mesh & Accounts" (item 2). The Mesh section is now
+--                      "Setup" and the three identity fields (Account / Channel /
+--                      Token) sit on ONE three-column row, label over input.
+--                      The Tombstones table is gone from the UI (item 3) — the
+--                      tombstone MECHANISM is untouched and still backs mesh
+--                      deletes and the location retirement above.
+--   Buffs            = was "Auras" (item 4). Duration thresholds are gone; buff
+--                      time colour is a fixed backend rule. The class-rule grids
+--                      run Battle Shout → Rend → Slip'kik → Fengus (item 5) and
+--                      write ONE global table with no faction toggle (item 6).
 --   Automation       = Auto (Group / Accept Summon / Gossip / Quest / Interact)
 --   Timers           = Raid overrides + pull-bar geometry + Felwood pins/songflower
 --   Alerts           = event×channel alert matrix + sound channel
@@ -35,20 +46,12 @@ ns.Options = Options
 
 local QUESTION = "Interface\\Icons\\INV_Misc_QuestionMark"
 
--- The nine configurable world-buff auras (spec §2). FFF is excluded per spec.
--- Labels use the reference's "ABBR (Source)" format (round-3 item 31). spellID
--- drives the row icon only (cosmetic — GetSpellTexture, guarded).
-local AURA_DEFS = {
-    { key = "dmf",      label = "DMF (Sayge's Fortune)",  spellID = 23768 },  -- Sayge's Dark Fortune
-    { key = "ony",      label = "Ony (Rallying Cry)",     spellID = 22888 },  -- Rallying Cry
-    { key = "dmtAP",    label = "DMT AP (Fengus' Ferocity)", spellID = 22817 },  -- Fengus' Ferocity
-    { key = "dmtSP",    label = "DMT SP (Slip'kik's Savvy)", spellID = 22820 },  -- Slip'kik's Savvy
-    { key = "dmtStam",  label = "DMT Stam (Mol'dar's Moxie)", spellID = 22818 },  -- Mol'dar's Moxie
-    { key = "songflower", label = "SF (Songflower Serenade)", spellID = 15366 },  -- Songflower Serenade
-    { key = "zg",       label = "ZG (Spirit of Zandalar)", spellID = 24425 },  -- Spirit of Zandalar
-    { key = "rend",     label = "Rend (Warchief's)",      spellID = 16609 },  -- Warchief's Blessing
-    { key = "battleShout", label = "BS (NPC)",            spellID = 6673  },  -- Battle Shout (NPC)
-}
+-- (AURA_DEFS — the nine-row editable duration-threshold table — is RETIRED.
+-- SETTINGS-REWORK ITEM 4: buff-time colour is a fixed backend rule keyed off each
+-- buff's full duration (2h -> yellow under 90m · 1h -> under 55m · the 15-minute
+-- NPC Battle Shout -> under 12m), stated once in ui_shell.lua's
+-- Dashboard.BUFF_TIME_RULE and not user-editable. The nine normal/minimum pairs
+-- they used to edit are parked + cleared by Store.RetireAuraThresholds.)
 
 -- The full ten summon-trigger buffs (round-3 item 23). Rendered as "ABBR - Full
 -- Name" rows with spell icons. FFF is the seasonal buff (no stable spellID here —
@@ -57,7 +60,7 @@ local AURA_DEFS = {
 -- KEY NAMESPACE — DO NOT "TIDY" THESE INTO THE AURA KEYS. The auto-summon
 -- trigger keys are the ones auto.lua's Auto.SUMMON_TRIGGER_BUFFS defines, and
 -- they are named after the BUFF, not its source. They are deliberately NOT the
--- aura/threshold keys used by AURA_DEFS and Store.AURA_THRESHOLD_SEEDS:
+-- aura keys used by Store.AURA_THRESHOLD_SEEDS / Store.CLASS_RULE_SEEDS:
 --     Ony      -> "dragonslayer"   (NOT "ony")
 --     ZG       -> "zandalar"       (NOT "zg")
 --     Rend     -> "warchief"       (NOT "rend")
@@ -106,20 +109,25 @@ local SLIPKIK_CLASSES = { "WARRIOR", "PALADIN", "HUNTER", "ROGUE", "PRIEST", "SH
 -- required-for-everyone.
 local FENGUS_CLASSES  = { "WARRIOR", "PALADIN", "HUNTER", "ROGUE", "PRIEST", "SHAMAN", "MAGE", "WARLOCK", "DRUID" }
 
--- THE class-rule grid roster: one row per class-ruled buff the Auras page draws.
--- `optKey` is the EXACT, CASE-SENSITIVE key this page writes into
--- GetFactionSettings().auraOpts, and it must be byte-identical to the matching
--- AURA_META[slot].thresholdKey that ui_shell reads back through
+-- THE class-rule grid roster: one row per class-ruled buff the Buffs page draws.
+-- `optKey` is the EXACT, CASE-SENSITIVE key this page writes into the ONE GLOBAL
+-- rule table (Store.GetAuraRules — settings-rework item 6; it used to be the
+-- per-faction GetFactionSettings().auraOpts), and it must be byte-identical to
+-- the matching AURA_META[slot].thresholdKey that ui_shell reads back through
 -- Dashboard.CLASS_RULED_KEYS / Dashboard.ClassRuleState. A case slip ("dmtsp"
 -- for "dmtSP") writes a map nothing ever reads: the owner's click appears to
--- take, and the rule can never fire. buildAuras loops this table and the
--- "options" suite asserts it against the display side both ways, so a fourth
+-- take, and the rule can never fire. buildBuffs loops this table and the
+-- "options" suite asserts it against the display side both ways, so a fifth
 -- class-ruled buff cannot be added on one side only.
+--
+-- SETTINGS-REWORK ITEM 5 — the ORDER here is the owner's, and it is pinned by
+-- the "options" suite against Store.AURA_RULE_KEYS so the two cannot drift:
+--     Battle Shout · Rend · Slip'kik (dmtSP) · Fengus (dmtAP)
 local CLASS_RULE_GRIDS = {
-    { optKey = "rend",        classes = REND_CLASSES,
-      title = "Rend — Required Classes" },
     { optKey = "battleShout", classes = BS_CLASSES,
       title = "Battle Shout — Required Classes" },
+    { optKey = "rend",        classes = REND_CLASSES,
+      title = "Rend — Required Classes" },
     -- Slip'kik's Savvy (DMT SP): physical damage users typically don't want it,
     -- so it ships ignored for War/Rogue/Hunter and optional for casters.
     { optKey = "dmtSP",       classes = SLIPKIK_CLASSES,
@@ -367,6 +375,11 @@ Options.SetScopeFaction = SetScopeFaction
 
 local function FS() return ns.Store and ns.Store.GetFactionSettings and ns.Store.GetFactionSettings(ScopeFaction()) or nil end
 
+-- SETTINGS-REWORK ITEM 6 — the ONE global class-rule table. Every grid on the
+-- Buffs page reads and writes through here; there is no faction in the path any
+-- more, so a tick can no longer land in the faction the owner does not play.
+local function RULES() return ns.Store and ns.Store.GetAuraRules and ns.Store.GetAuraRules() or nil end
+
 -- Per-page refresher registries (called on faction toggle / section show).
 -- `alerts` is the split-off event matrix page (was folded into `timers`); `wizard`
 -- serves the first-run setup dialog's live get/set widgets.
@@ -469,16 +482,25 @@ local function hexToRGB(hex)
     local b = tonumber(hex:sub(5, 6), 16) or 128
     return r / 255, g / 255, b / 255
 end
-local function sanitizeHex(s)
-    s = tostring(s or ""):gsub("[^0-9A-Fa-f]", ""):upper()
-    return s:sub(1, 6)
-end
+-- (sanitizeHex retired with the class-color editor — settings-rework item 1.
+-- It existed only to clean up hex typed into those nine fields.)
 
--- Class color r,g,b — matches the rest of the suite (Dashboard.ClassColor): the
--- user's classColors override first, then Blizzard's RAID_CLASS_COLORS.
+-- Class color r,g,b.
+--
+-- SETTINGS-REWORK ITEM 1: the "Colors" section is gone and the palette is not
+-- user-editable, so this delegates to the ONE suite-wide resolver
+-- (Dashboard.ClassColor -> Store.DEFAULT_CLASS_COLORS). It used to carry its own
+-- copy of the override lookup, which is exactly how a settings page and the
+-- dashboard end up painting the same character two different colours. The local
+-- fallbacks below only matter if ui_shell has not loaded yet.
 local function classColor(class)
-    local db = DB()
-    local hex = db and db.classColors and db.classColors[class]
+    local D = ns.Dashboard
+    if D and D.ClassColor then
+        local r, g, b = D.ClassColor(class)
+        if r then return r, g, b end
+    end
+    local palette = ns.Store and ns.Store.DEFAULT_CLASS_COLORS
+    local hex = type(palette) == "table" and palette[class]
     if type(hex) == "string" and #hex >= 6 then return hexToRGB(hex) end
     local c = RAID_CLASS_COLORS and RAID_CLASS_COLORS[class]
     if c then return c.r, c.g, c.b end
@@ -626,17 +648,21 @@ local function buildTextArea(flow, opts)
 end
 
 -- Forward declarations (kept local so nothing leaks into _G).
-local buildCoordPane, buildClassColors, buildClassRuleGrid
-local buildAccountsTable, buildTombstonesTable
+local buildClassRuleGrid
+local buildAccountsTable
 
 ----------------------------------------------------------------------
--- 1. GENERAL  (General + Locations + Colors)
+-- 1. GENERAL  (General + Data Management)
+--
+-- SETTINGS-REWORK ITEM 1 removed two whole sections from this page:
+--   * "Locations" — the numbered coordinate-override table with its Add
+--     Location / Here / Del / Reset controls. The records themselves are
+--     tombstoned and cleared by Store.RetireLocations; the zone-override MATCHER
+--     in tracker.lua stays and simply reads an empty list.
+--   * "Colors"    — the nine class-color hex fields. The palette is fixed now
+--     (Store.DEFAULT_CLASS_COLORS) and the stored overrides are parked +
+--     cleared by Store.RetireClassColors.
 ----------------------------------------------------------------------
-
--- Coordinate-override list state (two-pane list+editor, style-guide rule 10).
-local coord = { selected = nil }
-
-local function coordList() local db = DB(); return db and db.coordinateOverrides or {} end
 
 local function buildGeneral(flow)
     local UI = DaseekiUI
@@ -711,9 +737,11 @@ local function buildGeneral(flow)
             if (not myFaction) or rec.faction == myFaction or rec.faction == nil then
                 if (rec.level or 0) >= 60 then
                     total = total + 1
+                    -- SETTINGS-REWORK ITEM 1: the manual-location override is
+                    -- retired (tombstoned + cleared), so "usable location" is now
+                    -- exactly "the tracker captured one".
                     local loc = rec.location
-                    local manual = ns.Store.GetManualLocation and ns.Store.GetManualLocation(rec.nameRealm)
-                    if (not loc or loc == "") and (not manual or manual == "") then missing = missing + 1 end
+                    if not loc or loc == "" then missing = missing + 1 end
                 end
             end
         end
@@ -732,11 +760,15 @@ local function buildGeneral(flow)
 
     -- ── Data management ───────────────────────────────────────────────────────
     local dm = flow:AddSection("Data Management")
-    dm:Hint("Local operation — excludes aura thresholds, Paladins/Shamans, and the Auto-Invite Whitelist.")
+    dm:Hint("Local operation — excludes Paladin/Shaman gossip rows and the Auto-Invite Whitelist.")
     local dmRow = dm:AddRow()
     dmRow:Button({ text = "Export Settings", width = 140, onClick = function()
         local db = DB(); if not db then return end
-        local blob = { classColors = db.classColors, coordinateOverrides = db.coordinateOverrides,
+        -- SETTINGS-REWORK: class colors and coordinate overrides are retired, so
+        -- they are no longer exported (an export carrying them would be a way to
+        -- re-import the very records the migration just tombstoned). The global
+        -- class-rule table takes their place — it IS the buff configuration now.
+        local blob = { auraRules = db.auraRules,
                        factionSettings = db.factionSettings, timerSettings = db.timerSettings }
         local str
         if ns.Mesh and ns.Mesh.Pack then str = ns.Mesh.Pack(blob) end
@@ -749,13 +781,20 @@ local function buildGeneral(flow)
             if not blob then ns:Print("import failed: unreadable string."); return end
             UI.Confirm({
                 title = "Import Settings",
-                text = "Overwrite class colors, coordinate overrides, faction settings and timer settings with the imported values?",
+                text = "Overwrite buff class rules, faction settings and timer settings with the imported values?",
                 acceptText = "Import", danger = true,
                 onAccept = function()
-                    if blob.classColors then db.classColors = blob.classColors end
-                    if blob.coordinateOverrides then db.coordinateOverrides = blob.coordinateOverrides end
+                    -- Deliberately NOT restored: classColors / coordinateOverrides.
+                    -- An older export still carries them; accepting those keys
+                    -- would resurrect retired records from a file the tombstone
+                    -- ledger never sees. They are dropped, silently and on purpose.
+                    if blob.auraRules then db.auraRules = blob.auraRules end
                     if blob.factionSettings then db.factionSettings = blob.factionSettings end
                     if blob.timerSettings then db.timerSettings = blob.timerSettings end
+                    -- An imported settings blob predates the merge on the SENDING
+                    -- side too, so re-run the additive back-fill: a rule key the
+                    -- import did not carry must not come back as a nil map.
+                    if ns.Store and ns.Store.SeedAuraRules then ns.Store.SeedAuraRules(db) end
                     ns:Print("settings imported.")
                     refreshPage("general")
                 end,
@@ -770,7 +809,7 @@ local function buildGeneral(flow)
     cf:Button({ text = "Copy Horde → Alliance", width = 180, onClick = function()
         Options.CopyFaction("Horde", "Alliance")
     end })
-    dm:Hint("Cross-faction copy excludes aura thresholds, Paladin/Shaman rows and the invite whitelist.")
+    dm:Hint("Cross-faction copy covers AUTOMATION only. Buff class rules are global now — one set for both factions — so there is nothing to copy there. Paladin/Shaman gossip rows and the invite whitelist are preserved on the target.")
 
     -- Mesh status line above the Sync button (round-3 item 16).
     local meshStatus = dm:AddRow():Label("")
@@ -803,26 +842,27 @@ local function buildGeneral(flow)
         })
     end })
 
-    -- ── Locations (numbered coordinate-override table) ───────────────────────
-    local loc = flow:AddSection("Locations")
-    buildCoordPane(loc)
-
-    -- ── Class colors ──────────────────────────────────────────────────────────
-    local col = flow:AddSection("Colors")
-    col:Hint("Customize class colors used for character names across every Nexus roster and list.")
-    buildClassColors(col)
+    -- (The "Locations" and "Colors" sections used to sit here — settings-rework
+    -- item 1 retired both. Nothing replaces them: locations are tombstoned and
+    -- the class palette is fixed.)
 end
 
 -- Copy one faction's automation block to the other, excluding the spec's
--- non-copyable fields (aura thresholds, Paladin/Shaman gossip rows, whitelist).
+-- non-copyable fields (Paladin/Shaman gossip rows, whitelist).
+--
+-- SETTINGS-REWORK ITEM 6: this no longer copies the class-rule maps. It cannot —
+-- there is only ONE set of them now, shared by both factions, so "copy Alliance's
+-- rend rule to Horde" is a no-op by construction. Copying the (parked, unread)
+-- per-faction auraOpts would be worse than a no-op: it would look like it did
+-- something while the display kept reading the global table.
 function Options.CopyFaction(from, to)
     local db = DB(); if not db then return end
     local src, dst = db.factionSettings[from], db.factionSettings[to]
     if not src or not dst then return end
     DaseekiUI.Confirm({
         title = "Copy " .. from .. " → " .. to,
-        text = "Overwrite " .. to .. " automation settings from " .. from ..
-               "? (Aura thresholds, Paladin/Shaman gossip rows and the invite whitelist are preserved.)",
+        text = "Overwrite " .. to .. " AUTOMATION settings from " .. from ..
+               "? (Buff class rules are global and unaffected; Paladin/Shaman gossip rows and the invite whitelist are preserved.)",
         acceptText = "Copy", danger = true,
         onAccept = function()
             -- Deep-ish copy of the copyable sub-blocks.
@@ -842,246 +882,46 @@ function Options.CopyFaction(from, to)
             dst.autoGossip.dmf.buffType.PALADIN = keepPal
             dst.autoGossip.dmf.buffType.SHAMAN = keepSha
             dst.autoQuest = clone(src.autoQuest)
-            -- auraOpts.thresholds preserved; Rend/BS rules copy (they are class rules,
-            -- not thresholds).
-            dst.auraOpts.rend = clone(src.auraOpts.rend)
-            dst.auraOpts.battleShout = clone(src.auraOpts.battleShout)
-            dst.auraOpts.dmtSP = clone(src.auraOpts.dmtSP)
-            ns:Print(from .. " → " .. to .. " copied.")
+            -- auraOpts is NOT copied (see the header): the class rules that used
+            -- to live there are global now, and the parked table has no readers.
+            ns:Print(from .. " → " .. to .. " automation copied.")
             refreshPage("general")
         end,
     })
 end
 
--- Numbered coordinate-override table (round-3 item 15): header row
--- (# · Name · X · Y · Tolerance) over up to 15 rows, each with a per-row "Here",
--- plus Reset to Defaults. The store keeps box-bounds (minX/maxX/minY/maxY); the UI
--- presents centre X/Y + a symmetric Tolerance and converts to bounds on save.
-local COORD_CAP = 15
--- Column x-offsets (shared by header + rows; measured from the block's left edge).
-local CC = { num = 4, name = 28, x = 188, y = 262, tol = 336, here = 410, del = 462 }
-local CW = { name = 152, x = 66, y = 66, tol = 66, here = 46, del = 58 }
-
-function buildCoordPane(flow)
-    local UI = DaseekiUI
-
-    -- Hint with the reference's colored tolerance callouts (round-3 item 15).
-    flow:Hint("Relabels a character's location when they stand near a point. Coordinates accurate to 6 decimals. " ..
-        "Default tolerance |cff69ccf00.02|r (custom) / |cffffd100.08|r (normal).")
-
-    local function fmt(v) return string.format("%.6f", v or 0) end
-    local function cx(r)  return ((r.minX or 0) + (r.maxX or 0)) / 2 end
-    local function cy(r)  return ((r.minY or 0) + (r.maxY or 0)) / 2 end
-    local function tolOf(r) return math.abs((r.maxX or 0) - (r.minX or 0)) / 2 end
-    local function setCX(r, n)  local t = tolOf(r); r.minX = n - t; r.maxX = n + t end
-    local function setCY(r, n)  local t = tolOf(r); r.minY = n - t; r.maxY = n + t end
-    local function setTolR(r, t) local X, Y = cx(r), cy(r); r.minX = X - t; r.maxX = X + t; r.minY = Y - t; r.maxY = Y + t end
-
-    local host = CreateFrame("Frame", nil, flow.pane.child)
-    host._rows = {}
-    local ROW_H, HDR_H = 28, 22
-
-    -- Header fontstrings (aligned to the same column offsets as data rows).
-    local function mkHdr(text, x, w)
-        local fs = host:CreateFontString(nil, "OVERLAY"); fs:SetFontObject(UI.fonts.small)
-        fs:SetPoint("TOPLEFT", host, "TOPLEFT", x, -3); if w then fs:SetWidth(w) end
-        fs:SetText(text); return fs
-    end
-    local h1 = mkHdr("#", CC.num, 20)
-    local h2 = mkHdr("Name", CC.name, CW.name)
-    local h3 = mkHdr("X", CC.x, CW.x)
-    local h4 = mkHdr("Y", CC.y, CW.y)
-    local h5 = mkHdr("Tolerance", CC.tol, CW.tol)
-    UI.Skin(host, function()
-        for _, fs in ipairs({ h1, h2, h3, h4, h5 }) do fs:SetTextColor(UI.Color("muted")) end
-    end)
-
-    local rebuild   -- forward
-    -- Focus-guarded cell paint: a rebuild fires whenever ANY cell commits (and on
-    -- Here / Del / Add), which would otherwise rewrite the sibling cell the user
-    -- has just clicked into and is typing in.
-    local function paintCell(cell, text)
-        if not isEditing(cell) then cell:SetText(text) end
-    end
-    local function makeCell(row, x, w)
-        local box = CreateFrame("EditBox", nil, row, "BackdropTemplate")
-        box:SetSize(w, 22); box:SetPoint("LEFT", row, "LEFT", x, 0)
-        box:SetAutoFocus(false); box:SetFontObject(UI.fonts.body); box:SetTextInsets(6, 6, 0, 0)
-        UI.Skin(box, function(self)
-            self:SetBackdrop(UI.FLAT_BACKDROP)
-            self:SetBackdropColor(UI.Color("inset")); self:SetBackdropBorderColor(UI.Color("controlBorder"))
-        end)
-        return box
-    end
-
-    rebuild = function()
-        local rules = coordList()
-        for _, r in ipairs(host._rows) do r:Hide() end
-        for i = 1, #rules do
-            local row = host._rows[i]
-            if not row then
-                row = CreateFrame("Frame", nil, host); row:SetHeight(ROW_H)
-                row.num = row:CreateFontString(nil, "OVERLAY"); row.num:SetFontObject(UI.fonts.body)
-                row.num:SetPoint("LEFT", row, "LEFT", CC.num, 0); row.num:SetWidth(20)
-                row.name = makeCell(row, CC.name, CW.name)
-                row.x    = makeCell(row, CC.x,   CW.x)
-                row.y    = makeCell(row, CC.y,   CW.y)
-                row.tol  = makeCell(row, CC.tol, CW.tol)
-                row.here = UI.MakeButton(row, { text = "Here", width = CW.here, height = 22, variant = "quiet" })
-                row.here:ClearAllPoints(); row.here:SetPoint("LEFT", row, "LEFT", CC.here, 0)
-                row.del  = UI.MakeButton(row, { text = "Del", width = CW.del, height = 22, variant = "danger" })
-                row.del:ClearAllPoints(); row.del:SetPoint("LEFT", row, "LEFT", CC.del, 0)
-                UI.Skin(row, function() row.num:SetTextColor(UI.Color("muted")) end)
-                host._rows[i] = row
-            end
-            local idx = i
-            row.num:SetText(tostring(idx))
-            paintCell(row.name, rules[idx].label or "")
-            paintCell(row.x,   fmt(cx(rules[idx])))
-            paintCell(row.y,   fmt(cy(rules[idx])))
-            paintCell(row.tol, fmt(tolOf(rules[idx])))
-            local function bindText(box, apply)
-                box:SetScript("OnEnterPressed", function(self) apply(self:GetText()); self:ClearFocus(); rebuild() end)
-                box:SetScript("OnEditFocusLost", function(self) apply(self:GetText()); rebuild() end)
-                box:SetScript("OnEscapePressed", function(self) rebuild(); self:ClearFocus() end)
-            end
-            bindText(row.name, function(t) local r = coordList()[idx]; if r then r.label = t end end)
-            bindText(row.x,   function(t) local r = coordList()[idx]; local n = tonumber(t); if r and n then setCX(r, n) end end)
-            bindText(row.y,   function(t) local r = coordList()[idx]; local n = tonumber(t); if r and n then setCY(r, n) end end)
-            bindText(row.tol, function(t) local r = coordList()[idx]; local n = tonumber(t); if r and n then setTolR(r, n) end end)
-            row.here:SetScript("OnClick", function()
-                local r = coordList()[idx]; if not r then return end
-                local mapID = C_Map and C_Map.GetBestMapForUnit and C_Map.GetBestMapForUnit("player")
-                local pos = mapID and C_Map.GetPlayerMapPosition and C_Map.GetPlayerMapPosition(mapID, "player")
-                if not pos then ns:Print("could not read your position here."); return end
-                local px, py = pos:GetXY()
-                setCX(r, px); setCY(r, py); if tolOf(r) <= 0 then setTolR(r, 0.02) end
-                local info = mapID and C_Map.GetMapInfo and C_Map.GetMapInfo(mapID)
-                if info and info.name then r.zone = info.name; if (r.label or "") == "" then r.label = info.name end end
-                rebuild()
-            end)
-            row.del:SetScript("OnClick", function()
-                table.remove(coordList(), idx); rebuild()
-            end)
-            row:ClearAllPoints()
-            row:SetPoint("TOPLEFT", host, "TOPLEFT", 0, -(HDR_H + (i - 1) * ROW_H))
-            row:SetPoint("TOPRIGHT", host, "TOPRIGHT", 0, -(HDR_H + (i - 1) * ROW_H))
-            row:Show()
-        end
-        if flow.pane and flow.pane.Layout then flow.pane:Layout() end
-    end
-
-    host.arrange = function(width)
-        local n = #coordList()
-        local h = HDR_H + math.max(1, n) * ROW_H
-        host:SetWidth(width); host:SetHeight(h)
-        return h
-    end
-    coord._rebuild = rebuild
-    register("general", rebuild)
-    UI.Skin(host, function() end)
-    flow.pane:AddBlock(host, host.arrange, 8, 0)
-    rebuild()
-
-    -- Add row + Reset to Defaults (round-3 item 15).
-    local act = flow:AddRow()
-    act:Button({ text = "Add Location", width = 130, onClick = function()
-        local rules = coordList()
-        if #rules >= COORD_CAP then ns:Print("location limit is " .. COORD_CAP .. "."); return end
-        -- A new rule is born UNSCOPED, so `zone` is omitted (nil) rather than "".
-        -- An empty string is not "no zone" to the coordinate matcher — it
-        -- compares unequal to every real zone name, so a rule stored that way
-        -- could never match anywhere, in any zone. The per-row "Here" button
-        -- stamps a real zone when the user wants the rule scoped to one.
-        rules[#rules + 1] = { name = "", label = "New Location",
-                              minX = 0, maxX = 0.02, minY = 0, maxY = 0.02 }
-        rebuild()
-    end })
-    act:Button({ text = "Reset to Defaults", width = 160, variant = "danger", onClick = function()
-        UI.Confirm({ title = "Reset Locations", danger = true,
-            text = "Restore the default location rules? Your custom rules are removed.",
-            acceptText = "Reset",
-            onAccept = function()
-                local db = DB(); if not db then return end
-                -- A17.3: this button used to carry its OWN literal copy of the
-                -- seeds, so it re-installed the oversized boxes the store had
-                -- just been taught to shrink — "Reset to Defaults" was the one
-                -- way to reintroduce the bug. Ask the store for the defaults
-                -- instead; one definition, no drift. (Fallback keeps the button
-                -- working if the export is ever absent.)
-                if ns.Store and type(ns.Store.DefaultCoordinateOverrides) == "function" then
-                    db.coordinateOverrides = ns.Store.DefaultCoordinateOverrides()
-                else
-                    db.coordinateOverrides = {}
-                end
-                rebuild()
-            end })
-    end })
-end
-
--- Class-color rows: swatch + class name + hex editbox, plus Reset All.
-function buildClassColors(flow)
-    local UI = DaseekiUI
-    local DEFAULTS = {
-        WARRIOR = "C79C6E", PALADIN = "F58CBA", HUNTER = "ABD473", ROGUE = "FFF569",
-        PRIEST = "FFFFFF", SHAMAN = "0070DE", MAGE = "69CCF0", WARLOCK = "9482C9", DRUID = "FF7D0A",
-    }
-    for _, class in ipairs(REND_CLASSES) do
-        local row = flow:AddRow({ vAlign = "center" })
-        -- swatch
-        local sw = UI.FlatFrame(row, "panel", "border")
-        sw:SetSize(18, 18); sw.uiWidth, sw.uiHeight = 18, 18
-        row._items[#row._items + 1] = { w = sw }
-        -- Class name rendered in its own (live) color (round-3 item 17).
-        local nameLbl = row:Label(CLASS_LABEL[class] or class); nameLbl.uiWidth = 90; nameLbl._label:SetWidth(90)
-        local function paint()
-            local db = DB(); local hex = db and db.classColors[class] or DEFAULTS[class]
-            sw:SetBackdropColor(hexToRGB(hex))
-            nameLbl._label:SetTextColor(hexToRGB(hex))
-        end
-        local box = row:EditBox({
-            width = 90,
-            get = function() local db = DB(); return db and (db.classColors[class] or DEFAULTS[class]) or "" end,
-            set = function(v)
-                local db = DB(); if not db then return end
-                db.classColors[class] = sanitizeHex(v)
-                paint()
-            end,
-        })
-        box._fillWidth = false
-        box.editBox:SetMaxLetters(6)
-        guardEdit(box)
-        row:Button({ text = "Reset", width = 66, variant = "quiet", pin = "right", onClick = function()
-            local db = DB(); if not db then return end
-            db.classColors[class] = DEFAULTS[class]
-            -- Explicit reset: discard any half-typed hex, then repaint the default.
-            forceRepaint(box, false)
-            paint()
-        end })
-        register("general", function() if box.Refresh then box.Refresh() end; paint() end)
-        UI.Skin(sw, paint)
-    end
-    flow:AddRow():Button({ text = "Reset All Colors", width = 160, variant = "danger", onClick = function()
-        UI.Confirm({ title = "Reset Class Colors", danger = true,
-            text = "Restore all class colors to the Blizzard palette?", acceptText = "Reset",
-            onAccept = function()
-                local db = DB(); if not db then return end
-                for k, v in pairs(DEFAULTS) do db.classColors[k] = v end
-                refreshPage("general")
-            end })
-    end })
-end
 
 ----------------------------------------------------------------------
--- 2. MESH & ACCOUNTS
+-- 2. SETUP  (was "Mesh & Accounts" — settings-rework item 2)
+--
+-- The page is "Setup" and its lead section is "Setup". The three fields that
+-- actually constitute setting an account up — Account ID, Channel, Token — now
+-- sit on ONE row as three columns, each with its label ABOVE its input, instead
+-- of three stacked label-left rows with a hint under each. They are one decision
+-- ("identify this account and point it at the mesh"), so they read as one block.
+--
+-- THE TYPING BUG THIS MUST NOT REGRESS: the Channel and Token boxes are MASKED,
+-- and the Setup page runs a 2s live ticker. A repaint that SetText()s a box the
+-- user is mid-word in wipes the input — and because the mask of a still-unsaved
+-- value is the empty string, it read as the field "nulling itself out as you
+-- type". Every paint below therefore goes through `isEditing()` first (the same
+-- guard `guardEdit` installs on the flow-API widgets), the boxes are registered
+-- on the NON-live "mesh" refresher list only, and the one path that must repaint
+-- a focused box on purpose — the Show/Hide reveal — commits the keystrokes
+-- through the box's own OnEnterPressed before painting (forceRepaint).
 ----------------------------------------------------------------------
+
+-- Geometry for the three-column identity block.
+local ID_LBL_H, ID_GAP, ID_BOX_H = 15, 3, 22
+local ID_COL_GAP = 12          -- horizontal air between columns
+local ID_EYE_W   = 48          -- Show/Hide button width (Channel + Token only)
 
 local function buildMesh(flow)
     local UI = DaseekiUI
     local DS = _G.DaseekiSuite
 
-    flow:AddSection("Mesh")
-    flow:Hint("Your accounts meet on a private hidden channel. Set the same channel and token on every account, then enable.")
+    flow:AddSection("Setup")
+    flow:Hint("Your accounts meet on a private hidden channel. Give this account its own ID, then set the SAME channel and token on every account and enable the mesh.")
 
     -- Read helpers for the two credential fields. ENGINE DEPENDENCY (round-3 item
     -- 38): mesh.channel is added by the engine agent; defensive `or ""` fallback
@@ -1097,46 +937,17 @@ local function buildMesh(flow)
         return #c >= 16 and c:match("^%w+$") and #t == 6 and t:match("^%w+$") and true or false
     end
 
-    -- Reusable masked credential field (label + masked editbox + Show/Hide + status).
-    local function maskedField(labelText, width, getRaw, setRaw, validate)
-        local row = flow:AddRow({ vAlign = "center" })
-        local lbl = row:Label(labelText); lbl.uiWidth = 64; lbl._label:SetWidth(64)
-        local revealed = { on = false }
-        local status
-        local box
-        box = row:EditBox({
-            width = width,
-            get = function()
-                local t = getRaw()
-                if revealed.on then return t end
-                return (t ~= "" and string.rep("*", #t)) or ""
-            end,
-            set = function(v)
-                v = tostring(v or ""):gsub("%s", "")
-                if v:match("^%*+$") then return end   -- ignore edits to the mask
-                setRaw(v)
-                if status then status._label:SetText(validate(v)) end
-            end,
-        })
-        box._fillWidth = false
-        -- THE reported bug: this field is masked, so a live-ticker repaint mid-typing
-        -- painted the mask of the still-unsaved value ("" -> the field emptied itself
-        -- as you typed). Guarded, the box is left alone until focus leaves it.
-        guardEdit(box)
-        local eyeBtn
-        eyeBtn = row:Button({ text = "Show", width = 48, variant = "quiet", onClick = function()
-            revealed.on = not revealed.on
-            eyeBtn._label:SetText(revealed.on and "Hide" or "Show")
-            -- Reveal/hide must repaint even while focused; commit first so toggling
-            -- mid-edit saves what you typed instead of discarding it.
-            forceRepaint(box)
-        end })
-        status = row:Label("")
-        register("mesh", function()
-            if box.Refresh then box.Refresh() end
-            status._label:SetText(validate(getRaw()))
-        end)
-        return box
+    -- Validators, hoisted out of the field builders so the "Setup" column specs
+    -- below stay declarative.
+    local function validateChannel(v)
+        if v == "" then return "" end
+        if #v >= 16 and v:match("^%w+$") then return "|cff66dd66valid|r" end
+        return "|cffddaa44needs 16+|r"
+    end
+    local function validateToken(v)
+        if v == "" then return "" end
+        if #v == 6 and v:match("^%w+$") then return "|cff66dd66valid|r" end
+        return "|cffddaa44needs 6|r"
     end
 
     -- Enable toggle leads the section — it is the master switch (owner task 2a).
@@ -1166,47 +977,175 @@ local function buildMesh(flow)
         end,
     }).Refresh)
 
-    -- Account ID leads the credential group — the mesh keys off this identity, so it
-    -- sits directly above the channel/token (relocated here from General per owner).
-    local acctRow = flow:AddRow({ vAlign = "center" })
-    -- Inline-left "Account ID" label on the same 64px column as the Channel/Token
-    -- fields below (style law: no naked inputs). Owner round-1 density note.
-    local acctLbl = acctRow:Label("Account ID"); acctLbl.uiWidth = 64; acctLbl._label:SetWidth(64)
-    local acctStatus
-    local acctBox = acctRow:EditBox({
-        width = 70,
-        get = function() return ns:GetAccountID() end,
-        set = function(v)
-            v = tostring(v or ""):gsub("%s", "")
-            local ok, err = ns:SetAccountID(v)
-            if acctStatus then
-                if ok then acctStatus._label:SetText("|cff66dd66saved|r")
-                else acctStatus._label:SetText("|cffdd6666" .. (err or "invalid") .. "|r") end
+    ------------------------------------------------------------------
+    -- THE IDENTITY ROW (settings-rework item 2): Account ID · Channel · Token,
+    -- three equal columns, label over input, on one block.
+    --
+    -- Hand-built rather than composed from flow rows because the flow API lays
+    -- items out LEFT-TO-RIGHT on a single baseline — it has no "stack a label
+    -- above an input" primitive — and three of those stacks have to share one
+    -- row's width and re-divide it when the pane resizes. Same construction the
+    -- coordinate table used (raw EditBox + UI.Skin + pane:AddBlock with an
+    -- arrange callback), so it inherits the panel's theming and width plumbing.
+    ------------------------------------------------------------------
+    local idCols = {
+        {   key   = "account",
+            label = "Account ID",
+            masked = false,
+            get   = function() return ns:GetAccountID() end,
+            -- The Account ID is not a free-text field: SetAccountID validates and
+            -- MIGRATES local data, so the status text is its answer, not ours.
+            set   = function(self, v)
+                v = tostring(v or ""):gsub("%s", "")
+                local ok, err = ns:SetAccountID(v)
+                self.status:SetText(ok and "|cff66dd66saved|r"
+                                       or ("|cffdd6666" .. (err or "invalid") .. "|r"))
+            end,
+            statusOf = function() return "" end,   -- only speaks when you edit it
+            maxLetters = 2,
+            hint  = "1-2 digits, unique per account",
+        },
+        {   key   = "channel",
+            label = "Channel",
+            masked = true,
+            raw   = chanRaw,
+            get   = function(self)
+                local t = chanRaw()
+                if self.revealed then return t end
+                return (t ~= "" and string.rep("*", #t)) or ""
+            end,
+            set   = function(self, v)
+                v = tostring(v or ""):gsub("%s", "")
+                if v:match("^%*+$") then return end   -- an edit to the MASK is not an edit
+                local db = DB(); if db then db.mesh.channel = v end
+                self.status:SetText(validateChannel(v))
+            end,
+            statusOf = function() return validateChannel(chanRaw()) end,
+            maxLetters = 0,
+            hint  = "16+ alphanumeric, case sensitive",
+        },
+        {   key   = "token",
+            label = "Token",
+            masked = true,
+            raw   = tokRaw,
+            get   = function(self)
+                local t = tokRaw()
+                if self.revealed then return t end
+                return (t ~= "" and string.rep("*", #t)) or ""
+            end,
+            set   = function(self, v)
+                v = tostring(v or ""):gsub("%s", "")
+                if v:match("^%*+$") then return end
+                local db = DB(); if db then db.mesh.token = v end
+                self.status:SetText(validateToken(v))
+            end,
+            statusOf = function() return validateToken(tokRaw()) end,
+            maxLetters = 6,
+            hint  = "exactly 6 alphanumeric",
+        },
+    }
+
+    do
+        local host = CreateFrame("Frame", nil, flow.pane.child)
+        local ROW_H = ID_LBL_H + ID_GAP + ID_BOX_H
+
+        for _, col in ipairs(idCols) do
+            col.revealed = false
+
+            col.lbl = host:CreateFontString(nil, "OVERLAY")
+            col.lbl:SetFontObject(UI.fonts.small)
+            col.lbl:SetJustifyH("LEFT")
+            col.lbl:SetText(col.label)
+
+            col.status = host:CreateFontString(nil, "OVERLAY")
+            col.status:SetFontObject(UI.fonts.small)
+            col.status:SetJustifyH("RIGHT")
+            col.status:SetText("")
+
+            local box = CreateFrame("EditBox", nil, host, "BackdropTemplate")
+            box:SetHeight(ID_BOX_H)
+            box:SetAutoFocus(false)
+            box:SetFontObject(UI.fonts.body)
+            box:SetTextInsets(6, 6, 0, 0)
+            if col.maxLetters and col.maxLetters > 0 then box:SetMaxLetters(col.maxLetters) end
+            col.box = box
+
+            -- The focus-safe paint. THIS is the anti-regression guard: a repaint
+            -- never SetText()s a box that currently owns keyboard focus, so the
+            -- masked Channel/Token fields cannot empty themselves mid-word.
+            local function paint()
+                if not isEditing(box) then box:SetText(col.get(col) or "") end
             end
-        end,
-    })
-    acctBox._fillWidth = false
-    guardEdit(acctBox)   -- same page, same 2s ticker: same guard
-    acctStatus = acctRow:Label("")
-    flow:Hint("1-2 digits (e.g., 1, 02). Must be different on each account.")
+            box.Refresh = function()
+                paint()
+                col.status:SetText(col.statusOf(col) or "")
+            end
+            guardEdit(box)   -- installs RefreshForce + the focus wrapper
 
-    maskedField("Channel", 200, chanRaw,
-        function(v) local db = DB(); if db then db.mesh.channel = v end end,
-        function(v)
-            if v == "" then return "" end
-            if #v >= 16 and v:match("^%w+$") then return "|cff66dd66valid|r" end
-            return "|cffddaa44needs 16+ alphanumerics|r"
-        end)
-    flow:Hint("16+ alphanumeric, case sensitive, same on all accounts.")
+            box:SetScript("OnEnterPressed", function(self) col.set(col, self:GetText()); self:ClearFocus() end)
+            box:SetScript("OnEditFocusLost", function(self) col.set(col, self:GetText()); paint() end)
+            box:SetScript("OnEscapePressed", function(self) self:ClearFocus(); paint() end)
 
-    maskedField("Token", 160, tokRaw,
-        function(v) local db = DB(); if db then db.mesh.token = v end end,
-        function(v)
-            if v == "" then return "" end
-            if #v == 6 and v:match("^%w+$") then return "|cff66dd66valid|r" end
-            return "|cffddaa44needs 6 alphanumerics|r"
+            if col.masked then
+                col.eyeBtn = UI.MakeButton(host, { text = "Show", width = ID_EYE_W,
+                                                   height = ID_BOX_H, variant = "quiet" })
+                col.eyeBtn:SetScript("OnClick", function(self)
+                    col.revealed = not col.revealed
+                    if self._label then self._label:SetText(col.revealed and "Hide" or "Show") end
+                    -- Reveal must repaint even while focused, so commit the
+                    -- keystrokes through the box's own Enter handler FIRST —
+                    -- toggling mid-word saves what you typed instead of eating it.
+                    forceRepaint(box)
+                end)
+            end
+
+            UI.Skin(box, function(self)
+                self:SetBackdrop(UI.FLAT_BACKDROP)
+                self:SetBackdropColor(UI.Color("inset"))
+                self:SetBackdropBorderColor(UI.Color("controlBorder"))
+            end)
+            register("mesh", box.Refresh)   -- "mesh", NOT "meshLive": the 2s ticker
+                                            -- must never come near these fields
+        end
+
+        UI.Skin(host, function()
+            for _, col in ipairs(idCols) do
+                col.lbl:SetTextColor(UI.Color("muted"))
+                col.status:SetTextColor(UI.Color("muted"))
+            end
         end)
-    flow:Hint("Exactly 6 alphanumeric, same on all accounts.")
+
+        host.arrange = function(width)
+            host:SetWidth(width); host:SetHeight(ROW_H)
+            local colW = math.max(60, math.floor((width - ID_COL_GAP * 2) / 3))
+            for i, col in ipairs(idCols) do
+                local x = (i - 1) * (colW + ID_COL_GAP)
+                col.lbl:ClearAllPoints()
+                col.lbl:SetPoint("TOPLEFT", host, "TOPLEFT", x, 0)
+                col.status:ClearAllPoints()
+                col.status:SetPoint("TOPRIGHT", host, "TOPLEFT", x + colW, 0)
+                col.status:SetWidth(math.max(10, colW - 80))
+
+                local boxW = colW - (col.masked and (ID_EYE_W + 4) or 0)
+                col.box:ClearAllPoints()
+                col.box:SetPoint("TOPLEFT", host, "TOPLEFT", x, -(ID_LBL_H + ID_GAP))
+                col.box:SetWidth(math.max(30, boxW))
+                if col.eyeBtn then
+                    col.eyeBtn:ClearAllPoints()
+                    col.eyeBtn:SetPoint("TOPLEFT", host, "TOPLEFT", x + boxW + 4, -(ID_LBL_H + ID_GAP))
+                end
+            end
+            return ROW_H
+        end
+
+        flow.pane:AddBlock(host, host.arrange, 8, 0)
+        for _, col in ipairs(idCols) do if col.box.Refresh then col.box.Refresh() end end
+        Options._identityCols = idCols   -- self-test / diagnostic handle
+    end
+
+    -- ONE hint under the whole block instead of three stacked ones (the fields
+    -- are now side by side, so their rules read best side by side too).
+    flow:Hint("Account ID: 1-2 digits, DIFFERENT on every account.  ·  Channel: 16+ letters/numbers, case sensitive.  ·  Token: exactly 6 letters/numbers.  Channel and Token must be IDENTICAL on every account.")
 
     -- Not-configured status line beneath the credentials (round-3 item 38).
     local cfgStatus = flow:AddRow():Label("")
@@ -1334,10 +1273,14 @@ local function buildMesh(flow)
     end
     buildAccountsTable(acc)
 
-    -- ── Tombstones (round-3 item 32) ──────────────────────────────────────────
-    local tomb = flow:AddSection("Tombstones")
-    tomb:Hint("Deleted accounts are hidden here and blocked from re-adding until the tombstone expires.")
-    buildTombstonesTable(tomb)
+    -- SETTINGS-REWORK ITEM 3: the "Tombstones" section is gone from settings.
+    -- UI ONLY. The tombstone MECHANISM is fully intact and load-bearing:
+    -- Store.TombstoneAccount / IsTombstoned / SweepTombstones still back every
+    -- mesh account delete (the Remove button in the Accounts table above writes
+    -- one), the manifest-apply path still refuses a tombstoned account's data,
+    -- and settings-rework item 1 relies on the same idea for retired locations.
+    -- What is removed is the read-only expiry TABLE — a list the owner never
+    -- acted on, ticking a countdown on a 14-day timer.
 end
 
 ----------------------------------------------------------------------
@@ -1590,71 +1533,13 @@ function buildAccountsTable(flow)
     UI.Skin(host, rebuild)
     flow.pane:AddBlock(host, host.arrange, 10, 0)
 end
-
-function buildTombstonesTable(flow)
-    local UI = DaseekiUI
-    local ROW_H, VIEW_H = 28, 120
-    local host = makeTable(flow.pane.child, nil, ROW_H, VIEW_H)
-    local TTL = 14 * 86400
-
-    local function rebuild()
-        local child = host._child
-        for _, r in ipairs(host._rows) do r:Hide() end
-        local data = ns.Store and ns.Store.GetData and ns.Store.GetData()
-        local deleted = (data and data.deletedAIDs) or {}
-        local list = {}
-        for aid, epoch in pairs(deleted) do list[#list + 1] = { aid = aid, epoch = epoch } end
-        table.sort(list, function(a, b) return (tonumber(a.aid) or 0) < (tonumber(b.aid) or 0) end)
-        local now = (ns.Store and ns.Store.Now and ns.Store.Now()) or 0
-        local i = 0
-        for _, entry in ipairs(list) do
-            i = i + 1
-            local row = host._rows[i]
-            if not row then
-                row = CreateFrame("Frame", nil, child); row:SetHeight(ROW_H)
-                row.bg = row:CreateTexture(nil, "BACKGROUND"); row.bg:SetAllPoints()
-                row.aid = row:CreateFontString(nil, "OVERLAY"); row.aid:SetFontObject(UI.fonts.body)
-                row.aid:SetPoint("LEFT", row, "LEFT", 8, 0); row.aid:SetWidth(60)
-                row.exp = row:CreateFontString(nil, "OVERLAY"); row.exp:SetFontObject(UI.fonts.small)
-                row.exp:SetPoint("LEFT", row, "LEFT", 72, 0); row.exp:SetWidth(160)
-                row.rm = UI.MakeButton(row, { text = "Remove", width = 70, height = 20, variant = "quiet" })
-                row.rm:ClearAllPoints(); row.rm:SetPoint("RIGHT", row, "RIGHT", -6, 0)
-                UI.Skin(row, function() row.bg:SetColorTexture(UI.Color(i % 2 == 0 and "raised" or "panel", 0.6))
-                    row.exp:SetTextColor(UI.Color("muted")); row.aid:SetTextColor(UI.Color("text")) end)
-                host._rows[i] = row
-            end
-            row:ClearAllPoints()
-            row:SetPoint("TOPLEFT", child, "TOPLEFT", 0, -(i - 1) * ROW_H)
-            row:SetPoint("TOPRIGHT", child, "TOPRIGHT", 0, -(i - 1) * ROW_H)
-            local rem = (entry.epoch + TTL) - now
-            row.aid:SetText("#" .. entry.aid)
-            row.exp:SetText(rem > 0 and ("expires in " .. agoLabel(now - rem):gsub(" ago", "")) or "expired")
-            local aid = entry.aid
-            row.rm:SetScript("OnClick", function()
-                local d = ns.Store and ns.Store.GetData and ns.Store.GetData()
-                if d and d.deletedAIDs then d.deletedAIDs[aid] = nil end
-                rebuild()
-            end)
-            row:Show()
-        end
-        child:SetHeight(math.max(1, i * ROW_H)); if i == 0 then child:SetHeight(1) end
-        -- Empty state (round-3 item 32).
-        if not host._empty then
-            host._empty = child:CreateFontString(nil, "OVERLAY"); host._empty:SetFontObject(UI.fonts.small)
-            host._empty:SetPoint("TOPLEFT", child, "TOPLEFT", 8, -6)
-            UI.Skin(host._empty, function(self) self:SetTextColor(UI.Color("muted")) end)
-        end
-        host._empty:SetText("(No active tombstones.)")
-        host._empty:SetShown(i == 0)
-    end
-    host._rebuild = rebuild
-    registerLive(rebuild)   -- expiry countdown ticks on its own: ticker row
-    UI.Skin(host, rebuild)
-    flow.pane:AddBlock(host, host.arrange, 10, 0)
-end
-
 ----------------------------------------------------------------------
--- Faction toggle header (shared by Auras + Automation)
+-- Faction toggle header.
+--
+-- SETTINGS-REWORK ITEM 6: the Buffs page no longer has one. Class rules are a
+-- single global set, so a faction toggle there would be a control that changes
+-- nothing — the worst kind. Automation is still genuinely per-faction (gossip
+-- picks, summon triggers, invite whitelist) and keeps it.
 ----------------------------------------------------------------------
 
 local function factionHeader(flow, page)
@@ -1669,59 +1554,27 @@ local function factionHeader(flow, page)
 end
 
 ----------------------------------------------------------------------
--- 3. AURAS  (per-faction thresholds + Rend / Battle Shout class rules)
+-- 3. BUFFS  (was "Auras" — settings-rework item 4)
+--
+-- What this page is NOT any more:
+--   * It has no Duration Thresholds table (item 4). Buff-time colour is a fixed
+--     backend rule — 2h buffs go yellow under 90 minutes, 1h buffs under 55, the
+--     15-minute NPC Battle Shout under 12, green above — stated once in
+--     ui_shell.lua's Dashboard.BUFF_TIME_RULE. Eighteen editable numbers whose
+--     only job was to reproduce those three facts are gone.
+--   * It has no faction toggle (item 6). One global class-rule set.
+--
+-- What it still is: the DMF announce switch, and the four class-rule grids in
+-- the owner's order — Battle Shout, Rend, Slip'kik, Fengus (item 5).
 ----------------------------------------------------------------------
 
-local function buildAuras(flow)
+local function buildBuffs(flow)
     local UI = DaseekiUI
-    flow:Hint("These settings/information are saved per faction.")
-    factionHeader(flow, "auras")
-
-    -- ── Threshold table (Aura · Normal · Minimum, in minutes) ────────────────
-    flow:AddSection("Duration Thresholds")
-    flow:Hint("Minutes remaining below which a buff turns yellow (Normal) then red (Minimum).")
-
-    -- Column header row — each cell sized so the two muted numeric headers sit
-    -- EXACTLY over their editboxes. Data row is icon(18) + gap(8) + name(168) +
-    -- gap + nBox(82) + gap + mBox(82); the "Aura" header spans icon+gap+name = 194.
-    local hdr = flow:AddRow()
-    local hAura = hdr:Label("Aura"); hAura.uiWidth = 194; hAura:SetWidth(194)
-    local hNorm = hdr:Label("Normal (min)", { muted = true }); hNorm.uiWidth = 82; hNorm:SetWidth(82)
-    local hMin  = hdr:Label("Minimum (min)", { muted = true }); hMin.uiWidth = 82; hMin:SetWidth(82)
-
-    for _, def in ipairs(AURA_DEFS) do
-        local row = flow:AddRow({ vAlign = "center" })
-        -- icon
-        local ico = CreateFrame("Frame", nil, row); ico:SetSize(18, 18)
-        ico.uiWidth, ico.uiHeight = 18, 18
-        local tex = ico:CreateTexture(nil, "ARTWORK"); tex:SetAllPoints()
-        tex:SetTexCoord(0.08, 0.92, 0.08, 0.92); tex:SetTexture(auraIcon(def.spellID))
-        row._items[#row._items + 1] = { w = ico }
-        local lbl = row:Label(def.label); lbl.uiWidth = 168; lbl:SetWidth(168)
-        local function thr()
-            local fs = FS(); if not fs then return nil end
-            fs.auraOpts.thresholds[def.key] = fs.auraOpts.thresholds[def.key] or {}
-            return fs.auraOpts.thresholds[def.key]
-        end
-        local nBox = row:EditBox({
-            width = 82, numeric = true,
-            get = function() local t = thr(); local v = t and t.normal; return v and tostring(math.floor(v / 60)) or "" end,
-            set = function(v) local t = thr(); if t then t.normal = (tonumber(v) or 0) * 60 end end,
-        })
-        nBox._fillWidth = false
-        local mBox = row:EditBox({
-            width = 82, numeric = true,
-            get = function() local t = thr(); local v = t and t.minimum; return v and tostring(math.floor(v / 60)) or "" end,
-            set = function(v) local t = thr(); if t then t.minimum = (tonumber(v) or 0) * 60 end end,
-        })
-        mBox._fillWidth = false
-        guardEdit(nBox); guardEdit(mBox)
-        register("auras", function() if nBox.Refresh then nBox.Refresh() end; if mBox.Refresh then mBox.Refresh() end end)
-    end
+    flow:Hint("Buff rules apply to every character on every account, on both factions.")
 
     -- ── Darkmoon Faire cooldown announcement ─────────────────────────────────
-    -- Sits directly under the threshold table so it reads with the DMF row at
-    -- the top of it. Wires the existing DaseekiNexusDB.dmfPushAnnounce, which
+    -- Leads the page now that the threshold table it used to sit under is gone.
+    -- Wires the existing DaseekiNexusDB.dmfPushAnnounce, which
     -- tracker.lua reads through Tracker.DMFPushAnnounceEnabled when the debuff
     -- bar pushes the hidden DMF cooldown aura off (spec §5 / A8.4).
     --
@@ -1742,14 +1595,17 @@ local function buildAuras(flow)
         .. "and in RAID or PARTY when grouped, so everyone knows their fortune is back up. "
         .. "This setting is account-wide.")
 
-    -- ── Rend / Battle Shout class rules (cycling buttons) ─────────────────────
+    -- ── Class-rule grids, in the owner's order (item 5) ───────────────────────
     for _, g in ipairs(CLASS_RULE_GRIDS) do
         buildClassRuleGrid(flow, g.title, g.optKey, g.classes)
     end
 end
 
 -- A grid of cycling buttons: each class steps Required → Optional → Ignored.
--- State lives in FS().auraOpts[optKey].{required,optional,ignored}[class].
+-- SETTINGS-REWORK ITEM 6: state lives in the ONE global table,
+-- Store.GetAuraRules()[optKey].{required,optional,ignored}[class] — it used to
+-- be GetFactionSettings(scope).auraOpts[optKey], which is precisely how a tick
+-- could land in the faction the owner does not play.
 function buildClassRuleGrid(flow, title, optKey, classes)
     local UI = DaseekiUI
     flow:AddSection(title)
@@ -1758,19 +1614,19 @@ function buildClassRuleGrid(flow, title, optKey, classes)
     local STATES = { "required", "optional", "ignored" }
     -- Lowercase colored pill text (round-3 item 31).
     local STATE_LABEL = { required = "required", optional = "optional", ignored = "ignored" }
-    -- Resolve auraOpts[optKey] with its three buckets guaranteed to exist.
-    -- Store.SeedAuraDefaults installs every roster key at login (including the
+    -- Resolve auraRules[optKey] with its three buckets guaranteed to exist.
+    -- Store.SeedAuraRules installs every roster key at login (including the
     -- back-filled new-aura maps), so this is belt-and-braces — but a raw
     -- `o.required[class]` on a nil map is a hard Lua error that would take the
-    -- whole Auras page down, and a new roster entry is exactly when that map
+    -- whole Buffs page down, and a new roster entry is exactly when that map
     -- can be missing. Creating the empty buckets here is additive and matches
     -- what the seeder would have written for an untouched, all-ignored rule.
     local function ruleMap(create)
-        local fs = FS(); if not fs or type(fs.auraOpts) ~= "table" then return nil end
-        local o = fs.auraOpts[optKey]
+        local rules = RULES(); if type(rules) ~= "table" then return nil end
+        local o = rules[optKey]
         if type(o) ~= "table" then
             if not create then return nil end
-            o = {}; fs.auraOpts[optKey] = o
+            o = {}; rules[optKey] = o
         end
         if type(o.required) ~= "table" then o.required = {} end
         if type(o.optional) ~= "table" then o.optional = {} end
@@ -2586,11 +2442,11 @@ local function buildHelp(flow)
 
     local g = flow:AddSection("Setup Guide")
     g:Hint("1.  Install Daseeki Nexus on every account you want connected.")
-    g:Hint("2.  On each account, open Settings \226\134\146 Mesh & Accounts and set a unique Account ID (1\226\128\1512 digits, different on each account).")
-    g:Hint("3.  On the same Mesh & Accounts page, set the SAME Channel name (16+ letters/numbers, case sensitive) AND the SAME Token (6 letters/numbers) on every account \226\128\148 generate the credentials there, or paste a setup bundle to copy the same Channel and Token to another account.")
+    g:Hint("2.  On each account, open Settings \226\134\146 Setup and set a unique Account ID (1\226\128\1512 digits, different on each account).")
+    g:Hint("3.  On the same Setup page, set the SAME Channel name (16+ letters/numbers, case sensitive) AND the SAME Token (6 letters/numbers) on every account \226\128\148 generate the credentials there, or paste a setup bundle to copy the same Channel and Token to another account.")
     g:Hint("4.  Enable the mesh, then log out and back in once on each account \226\128\148 characters appear across your accounts within seconds.")
     g:Hint("5.  Migrating from another world-buff addon? Run /nexus import to merge ShadowNetwork's settings, Channel, Token and data — it shows a confirmation with a summary of what it will add or update before applying — and /nexus import instances for NovaInstanceTracker's instance runs (see Troubleshooting).")
-    g:Hint("Prefer it guided? Settings \226\134\146 Mesh & Accounts has a Setup guide button that walks steps 2\226\128\1514 in a three-step dialog with a live done/needed status on each step.")
+    g:Hint("Prefer it guided? Settings \226\134\146 Setup has a Setup guide button that walks steps 2\226\128\1514 in a three-step dialog with a live done/needed status on each step.")
     g:Hint("Open this hub any time from the dashboard's Settings button, or with /nexus settings.")
 
     local c = flow:AddSection("Slash commands")
@@ -2631,22 +2487,24 @@ local function buildHelp(flow)
     mm:Hint("Drag \226\128\148 slide the button around the minimap ring to reposition it, unless it is locked. Lock or unlock it with \"Lock minimap button\" in Settings \226\134\146 General or in the Shift + Right-click menu; hide it entirely with \"Show minimap button\" in Settings \226\134\146 General.")
 
     local tr = flow:AddSection("Troubleshooting")
-    tr:Hint("Other accounts not showing? The Channel AND Token must match byte-for-byte on every account \226\128\148 both are case sensitive and together act as your mesh password. Correct any mismatch in Settings \226\134\146 Mesh & Accounts, then /reload.")
-    tr:Hint("Characters under the wrong account? Two accounts are sharing an Account ID. Give each account its own unique ID in Settings \226\134\146 Mesh & Accounts.")
-    tr:Hint("Copying settings to a new account? Set it up with the same Channel + Token, then use Sync Settings to Mesh in Settings \226\134\146 Mesh & Accounts, or /nexus syncsettings (you confirm the target account IDs first).")
+    tr:Hint("Other accounts not showing? The Channel AND Token must match byte-for-byte on every account \226\128\148 both are case sensitive and together act as your mesh password. Correct any mismatch in Settings \226\134\146 Setup, then /reload.")
+    tr:Hint("Characters under the wrong account? Two accounts are sharing an Account ID. Give each account its own unique ID in Settings \226\134\146 Setup.")
+    tr:Hint("Copying settings to a new account? Set it up with the same Channel + Token, then use Sync Settings to Mesh in Settings \226\134\146 Setup, or /nexus syncsettings (you confirm the target account IDs first).")
     tr:Hint("Coming from ShadowNetwork? Run /nexus import \226\128\148 it merges your settings, Channel, Token and stored data, showing a confirmation with a summary first. It only works while ShadowNetwork is still installed and loaded, so keep ShadowNetwork installed until you've seen that import confirmation and checked everything carried over before disabling it.")
 
-    local ac = flow:AddSection("Accounts & Tombstones")
-    ac:Hint("Deleting an account is local only \226\128\148 it hides that account on THIS client and leaves a 14-day tombstone that blocks it from re-appearing.")
-    ac:Hint("Remove a tombstone early and the account re-adds itself on its next heartbeat (while it is still meshing).")
+    -- The Tombstones TABLE left the Setup page (settings-rework item 3); the
+    -- mechanism did not, and it is still what makes a delete stick, so it stays
+    -- documented here. There is simply no longer a screen listing the countdowns.
+    local ac = flow:AddSection("Accounts")
+    ac:Hint("Deleting an account is local only \226\128\148 it hides that account on THIS client and leaves a 14-day tombstone that blocks it from re-appearing. The tombstone expires on its own; there is nothing to manage.")
     ac:Hint("Changing your Account ID migrates your data locally; other accounts keep showing your OLD ID until they delete it.")
     ac:Hint("If two accounts use the same ID you'll see an \"Account ID conflict\" warning \226\128\148 change one of them to a unique ID.")
     ac:Hint("You can't delete your OWN account \226\128\148 change your Account ID instead.")
 
     local ds = flow:AddSection("First-time setup (detailed)")
-    ds:Hint("1.  Account ID \226\128\148 In Settings \226\134\146 Mesh & Accounts, give this account a short unique ID (1\226\128\1512 digits). Every connected account needs a DIFFERENT ID; this is how the mesh tells your accounts apart.")
-    ds:Hint("2.  Channel \226\128\148 On the same Mesh & Accounts page, set a Channel name of 16+ letters and numbers. It is case sensitive and must be identical on every account \226\128\148 think of it as the room your accounts meet in.")
-    ds:Hint("3.  Token \226\128\148 Set a 6-character Token (letters/numbers), also identical everywhere. Generate the credentials on the Mesh & Accounts page, or paste a setup bundle to copy the same Channel and Token to another account. The Channel + Token together are your mesh password; anyone with both can see your roster, so keep them private.")
+    ds:Hint("1.  Account ID \226\128\148 In Settings \226\134\146 Setup, give this account a short unique ID (1\226\128\1512 digits). Every connected account needs a DIFFERENT ID; this is how the mesh tells your accounts apart.")
+    ds:Hint("2.  Channel \226\128\148 On the same Setup page, set a Channel name of 16+ letters and numbers. It is case sensitive and must be identical on every account \226\128\148 think of it as the room your accounts meet in.")
+    ds:Hint("3.  Token \226\128\148 Set a 6-character Token (letters/numbers), also identical everywhere. Generate the credentials on the Setup page, or paste a setup bundle to copy the same Channel and Token to another account. The Channel + Token together are your mesh password; anyone with both can see your roster, so keep them private.")
     ds:Hint("4.  Same faction \226\128\148 The mesh rides a hidden faction chat channel, so each account must log in a character on the SAME faction to connect. Cross-faction characters simply will not mesh.")
     ds:Hint("5.  Enable + relog \226\128\148 Enable the mesh, then log out and back in once on each account. Your characters appear across accounts within seconds.")
     ds:Hint("6.  Verify \226\128\148 Open the dashboard; you should see characters from your other accounts. Use the 60s / Online / Summoners filter toggles and the Alliance / Horde toggle to narrow the list, and click a character to open its detail pane, including its Note field. If not, check Troubleshooting above.")
@@ -2668,6 +2526,52 @@ end
 -- Registration with the Daseeki hub (flow = true)
 ----------------------------------------------------------------------
 
+-- The hub section roster, hoisted out of Register() so it is BUILDABLE
+-- HEADLESSLY. The settings rework renamed two pages the owner navigates by name
+-- ("Mesh & Accounts" -> "Setup", "Auras" -> "Buffs"), and a rename is exactly
+-- the kind of change that half-lands — title updated, build function still
+-- pointing at the old page, or vice versa. The "options" suite calls this and
+-- asserts every id/title pair, so "the renamed page is reachable" is a test
+-- rather than a screenshot.
+--
+-- The `id`s are DELIBERATELY unchanged. They are the hub's addressing keys (and
+-- this file's own refresher-list keys); renaming a page's label is a copy
+-- change, renaming its id would be a compatibility change for no gain.
+function Options.BuildSections()
+    return {
+        { id = "general",    title = "General",
+          build = function(flow) once("general", flow.pane, function() buildGeneral(flow) end) end,
+          refresh = function() refreshPage("general") end },
+        -- Item 2: "Mesh & Accounts" -> "Setup".
+        { id = "mesh",       title = "Setup",
+          build = function(flow) once("mesh", flow.pane, function() buildMesh(flow) end) end,
+          refresh = function() refreshPage("mesh") end },
+        -- Item 4: "Auras" -> "Buffs".
+        { id = "auras",      title = "Buffs",
+          build = function(flow) once("auras", flow.pane, function() buildBuffs(flow) end) end,
+          refresh = function() refreshPage("auras") end },
+        { id = "automation", title = "Automation",
+          build = function(flow) once("automation", flow.pane, function() buildAutomation(flow) end) end,
+          refresh = function() refreshPage("automation") end },
+        { id = "timers",     title = "Timers",
+          build = function(flow) once("timers", flow.pane, function() buildTimers(flow) end) end,
+          refresh = function() refreshPage("timers") end },
+        { id = "instances",  title = "Instances",
+          build = function(flow) once("instances", flow.pane, function() buildInstances(flow) end) end,
+          refresh = function() refreshPage("instances") end },
+        { id = "alerts",     title = "Alerts",
+          build = function(flow) once("alerts", flow.pane, function() buildAlerts(flow) end) end,
+          refresh = function() refreshPage("alerts") end },
+        { id = "blacklist",  title = "Blacklist",
+          build = function(flow) once("blacklist", flow.pane, function() buildBlacklist(flow) end) end,
+          refresh = function() refreshPage("blacklist") end },
+        -- Round-13: Help moved out of the dashboard into the hub (single-page dashboard).
+        { id = "help",       title = "Help",
+          build = function(flow) once("help", flow.pane, function() buildHelp(flow) end) end,
+          refresh = function() refreshPage("help") end },
+    }
+end
+
 function Options.Register()
     if not _G.DaseekiSuite then return end
     if not (_G.DaseekiUI and _G.DaseekiUI.Token) then
@@ -2680,36 +2584,7 @@ function Options.Register()
         icon  = "Interface\\Icons\\INV_Misc_Net_01",
         order = 40,
         flow  = true,
-        sections = {
-            { id = "general",    title = "General",
-              build = function(flow) once("general", flow.pane, function() buildGeneral(flow) end) end,
-              refresh = function() refreshPage("general") end },
-            { id = "mesh",       title = "Mesh & Accounts",
-              build = function(flow) once("mesh", flow.pane, function() buildMesh(flow) end) end,
-              refresh = function() refreshPage("mesh") end },
-            { id = "auras",      title = "Auras",
-              build = function(flow) once("auras", flow.pane, function() buildAuras(flow) end) end,
-              refresh = function() refreshPage("auras") end },
-            { id = "automation", title = "Automation",
-              build = function(flow) once("automation", flow.pane, function() buildAutomation(flow) end) end,
-              refresh = function() refreshPage("automation") end },
-            { id = "timers",     title = "Timers",
-              build = function(flow) once("timers", flow.pane, function() buildTimers(flow) end) end,
-              refresh = function() refreshPage("timers") end },
-            { id = "instances",  title = "Instances",
-              build = function(flow) once("instances", flow.pane, function() buildInstances(flow) end) end,
-              refresh = function() refreshPage("instances") end },
-            { id = "alerts",     title = "Alerts",
-              build = function(flow) once("alerts", flow.pane, function() buildAlerts(flow) end) end,
-              refresh = function() refreshPage("alerts") end },
-            { id = "blacklist",  title = "Blacklist",
-              build = function(flow) once("blacklist", flow.pane, function() buildBlacklist(flow) end) end,
-              refresh = function() refreshPage("blacklist") end },
-            -- Round-13: Help moved out of the dashboard into the hub (single-page dashboard).
-            { id = "help",       title = "Help",
-              build = function(flow) once("help", flow.pane, function() buildHelp(flow) end) end,
-              refresh = function() refreshPage("help") end },
-        },
+        sections = Options.BuildSections(),
     })
 end
 
@@ -2783,7 +2658,11 @@ ns:RegisterSelfTest("options", function(verbose)
     ck(isEditing(nil) == false and isEditing({}) == false and isEditing({ _label = {} }) == false,
        "isEditing is false for labels / checkboxes / nil")
 
-    -- Raw EditBoxes (the coordinate-row cells) work without a host wrapper.
+    -- Raw EditBoxes (the Setup page's three identity cells) work without a host
+    -- wrapper. This is the anti-regression seam for the Channel-typing bug after
+    -- item 2 rebuilt those fields by hand: the new boxes are raw EditBoxes, not
+    -- flow-API host frames, so `isEditing` HAS to recognise a bare box or the
+    -- focus guard silently stops guarding and the field nulls out mid-word again.
     local _, raw = fakeBox(function() return "" end)
     raw.focus = true;  ck(isEditing(raw) == true,  "raw editbox recognised while focused")
     raw.focus = false; ck(isEditing(raw) == false, "raw editbox recognised while idle")
@@ -2827,7 +2706,7 @@ ns:RegisterSelfTest("options", function(verbose)
         -- ... and every key the display class-rules must have a grid to set it.
         for k in pairs(D.CLASS_RULED_KEYS) do
             ck(writeKeys[k] == true,
-               ("display class-ruled key %q has an Auras-page grid"):format(k))
+               ("display class-ruled key %q has a Buffs-page grid"):format(k))
         end
         -- And each one must be a real threshold-bearing slot, spelled identically.
         if type(D.AURA_META) == "table" then
@@ -2858,12 +2737,14 @@ ns:RegisterSelfTest("options", function(verbose)
 
     withFaction("Horde", function()
         ck(ScopeFaction() == "Horde", "scope opens on the player's own faction (Horde)")
-        -- The write target follows the scope: this is the bug, stated directly.
+        -- The AUTOMATION write target still follows the scope (gossip picks,
+        -- summon triggers and the invite whitelist are genuinely per-faction).
+        -- Class rules no longer do — see the global-table assertions below.
         local fs = FS()
         local hordeFS = ns.Store and ns.Store.GetFactionSettings
                         and ns.Store.GetFactionSettings("Horde")
         ck(fs ~= nil and fs == hordeFS,
-           "class-rule writes land in the OWN-faction settings table")
+           "automation writes land in the OWN-faction settings table")
     end)
     withFaction("Alliance", function()
         ck(ScopeFaction() == "Alliance", "an Alliance player opens on Alliance")
@@ -2883,23 +2764,110 @@ ns:RegisterSelfTest("options", function(verbose)
         ck(ScopeFaction() == "Horde", "a bogus scope value resets to the own-faction default")
     end)
 
-    -- End-to-end, the owner's exact click: tick Shaman = required on the Auras
-    -- page while scoped to Horde, then read it back the way a card does.
-    withFaction("Horde", function()
-        local fs = FS()
-        if fs and fs.auraOpts and fs.auraOpts.dmtSP and D and D.AuraRequirement then
-            local o = fs.auraOpts.dmtSP
-            local pReq, pOpt, pIgn = o.required.SHAMAN, o.optional.SHAMAN, o.ignored.SHAMAN
-            o.required.SHAMAN, o.optional.SHAMAN, o.ignored.SHAMAN = true, nil, nil
-            local appl, req = D.AuraRequirement(8, { classTag = "SHAMAN" }, "Horde")
-            ck(appl == true and req == "required",
-               "Slip'kik required-for-Shaman on Horde reads back as required (red)")
-            o.required.SHAMAN, o.optional.SHAMAN, o.ignored.SHAMAN = pReq, pOpt, pIgn
-        end
-    end)
-
     _G.UnitFactionGroup = realUFG
     SetScopeFaction(nil)                        -- leave the live session unpinned
+
+    ----------------------------------------------------------------------
+    -- SETTINGS-REWORK ITEM 6 — the grids write the ONE GLOBAL table.
+    --
+    -- End-to-end, the owner's exact click: tick Shaman = required for Slip'kik,
+    -- then read it back the way a card does — and read it back on BOTH factions,
+    -- because the whole point of the merge is that the answer no longer depends
+    -- on which faction table the click happened to land in.
+    ----------------------------------------------------------------------
+    local rules = RULES()
+    ck(type(rules) == "table", "Store.GetAuraRules exposes the global rule table")
+    if type(rules) == "table" and D and D.AuraRequirement then
+        for _, g in ipairs(Options.CLASS_RULE_GRIDS) do
+            ck(type(rules[g.optKey]) == "table",
+               ("global rule map %q exists (seeded/back-filled)"):format(g.optKey))
+        end
+        local o = rules.dmtSP
+        if type(o) == "table" then
+            o.required = o.required or {}; o.optional = o.optional or {}; o.ignored = o.ignored or {}
+            local pReq, pOpt, pIgn = o.required.SHAMAN, o.optional.SHAMAN, o.ignored.SHAMAN
+            o.required.SHAMAN, o.optional.SHAMAN, o.ignored.SHAMAN = true, nil, nil
+            local aH, rH = D.AuraRequirement(8, { classTag = "SHAMAN" }, "Horde")
+            local aA, rA = D.AuraRequirement(8, { classTag = "SHAMAN" }, "Alliance")
+            ck(aH == true and rH == "required",
+               "Slip'kik required-for-Shaman reads back as required (red) on Horde")
+            ck(aA == true and rA == "required",
+               "...and identically on Alliance — one tick, one answer, both factions")
+            o.required.SHAMAN, o.optional.SHAMAN, o.ignored.SHAMAN = pReq, pOpt, pIgn
+        end
+    end
+
+    ----------------------------------------------------------------------
+    -- SETTINGS-REWORK ITEM 5 — the grid ORDER is the owner's, and it is pinned
+    -- against store.lua's Store.AURA_RULE_KEYS so the two tables cannot drift.
+    -- Order is a UI fact with no runtime consequence, which is exactly the kind
+    -- that silently reverts in a later refactor.
+    ----------------------------------------------------------------------
+    local wantOrder = ns.Store and ns.Store.AURA_RULE_KEYS
+    ck(type(wantOrder) == "table" and #wantOrder == 4, "Store.AURA_RULE_KEYS lists 4 rules")
+    if type(wantOrder) == "table" then
+        ck(wantOrder[1] == "battleShout" and wantOrder[2] == "rend"
+            and wantOrder[3] == "dmtSP" and wantOrder[4] == "dmtAP",
+           "canonical order is Battle Shout, Rend, Slip'kik, Fengus")
+        ck(#Options.CLASS_RULE_GRIDS == #wantOrder,
+           "the Buffs page draws exactly one grid per rule")
+        for i, key in ipairs(wantOrder) do
+            local g = Options.CLASS_RULE_GRIDS[i]
+            ck(g and g.optKey == key,
+               ("grid %d is %q (got %q)"):format(i, key, tostring(g and g.optKey)))
+        end
+    end
+
+    ----------------------------------------------------------------------
+    -- ITEMS 2 + 4 — the RENAMED PAGES ARE REACHABLE. A rename that updates the
+    -- label but not the builder (or the reverse) produces a page the owner can
+    -- see and not open, which no amount of reading the diff reliably catches.
+    -- Build the real roster and assert id -> title -> a callable builder.
+    ----------------------------------------------------------------------
+    local sections = Options.BuildSections()
+    ck(type(sections) == "table" and #sections > 0, "Options.BuildSections returns a roster")
+    local byId = {}
+    for _, s in ipairs(sections or {}) do
+        byId[s.id] = s
+        ck(type(s.title) == "string" and s.title ~= "",
+           ("section %q has a title"):format(tostring(s.id)))
+        ck(type(s.build) == "function" and type(s.refresh) == "function",
+           ("section %q has build + refresh"):format(tostring(s.id)))
+    end
+    ck(byId.mesh and byId.mesh.title == "Setup",
+       "item 2: the mesh page is titled \"Setup\" (was \"Mesh & Accounts\")")
+    ck(byId.auras and byId.auras.title == "Buffs",
+       "item 4: the aura page is titled \"Buffs\" (was \"Auras\")")
+    -- The ids are the hub's addressing keys AND this file's refresher-list keys;
+    -- a rename of either would strand every register() call on that page.
+    for _, id in ipairs({ "general", "mesh", "auras", "automation", "timers",
+                          "instances", "alerts", "blacklist", "help" }) do
+        ck(byId[id] ~= nil, ("section id %q survives the rename"):format(id))
+        ck(type(refreshers[id]) == "table",
+           ("refresher list %q exists for that section"):format(id))
+    end
+    -- No page may still be called by a retired name.
+    for _, s in ipairs(sections or {}) do
+        ck(s.title ~= "Auras" and s.title ~= "Mesh & Accounts",
+           ("no section still uses the old title %q"):format(tostring(s.title)))
+    end
+
+    ----------------------------------------------------------------------
+    -- ITEMS 1 + 3 — the retired BUILDERS are gone, not merely unreferenced.
+    -- These were file-locals/forward declarations; if a later edit reinstates
+    -- one, the section comes back with it. Asserting the absence of the writer
+    -- is the cheapest way to keep a deletion deleted.
+    ----------------------------------------------------------------------
+    ck(rawget(Options, "CopyFaction") ~= nil, "CopyFaction (automation copy) is retained")
+    ck(ns.Store and type(ns.Store.RetireLocations) == "function",
+       "item 1: Store.RetireLocations exists (locations are retired by migration)")
+    ck(ns.Store and type(ns.Store.RetireClassColors) == "function",
+       "item 1: Store.RetireClassColors exists (palette is fixed)")
+    -- Item 3 is UI-only: the MECHANISM must still be there in full.
+    ck(ns.Store and type(ns.Store.TombstoneAccount) == "function"
+        and type(ns.Store.IsTombstoned) == "function"
+        and type(ns.Store.SweepTombstones) == "function",
+       "item 3: the tombstone mechanism is untouched (UI removal only)")
 
     if verbose and pass then ns:Print("  PASS options/editbox-focus-guard") end
     return pass

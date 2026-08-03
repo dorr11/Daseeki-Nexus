@@ -111,22 +111,27 @@ end
 --
 -- ICON SOURCE OF TRUTH (owner feedback #1 — "buff icons arent correct"): icons
 -- are NOT hardcoded Interface\Icons guesses any more. Each slot carries the
--- REAL game `spellID` (the same catalogue options.lua AURA_DEFS uses) and the
--- icon is derived at runtime via Dashboard.AuraIcon(slot) →
--- C_Spell.GetSpellTexture(spellID) (question-mark fallback). This is the single
--- source shared by ui_shell (detail), ui_tab_sixties (cards) and ui_tab_timers.
+-- REAL game `spellID`, and the icon is derived at runtime via
+-- Dashboard.AuraIcon(slot) → C_Spell.GetSpellTexture(spellID) (question-mark
+-- fallback). This is the single source shared by ui_shell (detail), the cards
+-- and the timers dock.
 --
--- CROSS-FILE CONTRACT: `thresholdKey` values here are the keys the hub's
--- aura-config page (options.lua AURA_DEFS) writes into
--- GetFactionSettings().auraOpts.thresholds, and that the importer
--- (import.lua AURA_SLOT_KEY) resolves SN's positional thresholds onto. Keys
--- (exact, case-sensitive): dmf, ony, dmtAP, dmtSP, dmtStam, songflower, zg,
--- rend, battleShout — battleShout now DOES own a storage slot (9), so its
--- seeded thresholds and its seeded class map both drive a real display row.
--- `spellID` values mirror options.lua AURA_DEFS one-for-one for slots 1-8; the
--- two tail slots carry the IDs the TRACKER matches on (25101 / 29338), not the
--- options page's player-cast Battle Shout art id — the icon must belong to the
--- buff that actually landed in the slot.
+-- CROSS-FILE CONTRACT: `thresholdKey` is the aura VOCABULARY of this addon —
+-- the exact, case-sensitive keys shared by Store.AURA_THRESHOLD_SEEDS,
+-- Store.CLASS_RULE_SEEDS / Store.AURA_RULE_KEYS, options.lua's
+-- CLASS_RULE_GRIDS[].optKey, Dashboard.BUFF_TIME_RULE and the importer's
+-- AURA_SLOT_KEY: dmf, ony, dmtAP, dmtSP, dmtStam, songflower, zg, rend,
+-- battleShout. Every one of those is a raw table index, so a single flipped
+-- letter is silent.
+--
+-- (Historical note: these used to be the keys the hub's editable duration
+-- thresholds were stored under. The settings rework retired that table —
+-- buff-time colour is the fixed Dashboard.BUFF_TIME_RULE now — but the KEY
+-- NAMES stayed, because they are the vocabulary, not the feature.)
+--
+-- The two tail slots carry the IDs the TRACKER matches on (25101 / 29338), not
+-- the player-cast Battle Shout art id — the icon must belong to the buff that
+-- actually landed in the slot.
 ----------------------------------------------------------------------
 
 Dashboard.AURA_META = {
@@ -457,17 +462,27 @@ if UI then
     if UI.OnThemeChanged then UI.OnThemeChanged(reapply) end   -- a theme may change base sizes
 end
 
--- Class color (r,g,b) from the user override table, falling back to Blizzard's.
+-- Class color (r,g,b).
+--
+-- SETTINGS-REWORK ITEM 1: the per-class hex override is GONE. The "Colors"
+-- settings section is removed, the stored `db.classColors` table is parked and
+-- cleared by Store.RetireClassColors, and this path now reads the shipped
+-- palette UNCONDITIONALLY. It deliberately no longer consults SavedVariables at
+-- all — a leftover override in a hand-edited or rolled-back file must not be
+-- able to re-colour the roster behind the owner's back, and reading the palette
+-- makes this function pure and headless-testable.
+--
+-- Order: our own palette (Store.DEFAULT_CLASS_COLORS), then Blizzard's
+-- RAID_CLASS_COLORS for anything the palette does not name, then the theme's
+-- text colour.
 function Dashboard.ClassColor(classTag)
-    if classTag and ns.Store and ns.Store.GetSettings then
-        local db = ns.Store.GetSettings()
-        local hex = db and db.classColors and db.classColors[classTag]
-        if hex and #hex >= 6 then
-            local r = tonumber(hex:sub(1, 2), 16)
-            local g = tonumber(hex:sub(3, 4), 16)
-            local b = tonumber(hex:sub(5, 6), 16)
-            if r and g and b then return r / 255, g / 255, b / 255 end
-        end
+    local palette = ns.Store and ns.Store.DEFAULT_CLASS_COLORS
+    local hex = classTag and type(palette) == "table" and palette[classTag]
+    if type(hex) == "string" and #hex >= 6 then
+        local r = tonumber(hex:sub(1, 2), 16)
+        local g = tonumber(hex:sub(3, 4), 16)
+        local b = tonumber(hex:sub(5, 6), 16)
+        if r and g and b then return r / 255, g / 255, b / 255 end
     end
     local c = classTag and RAID_CLASS_COLORS and RAID_CLASS_COLORS[classTag]
     if c then return c.r, c.g, c.b end
@@ -842,11 +857,81 @@ end
 --   healthy (>= normal)  -> "ok" (green)
 --   below-normal         -> "warn" (amber; "accent" fallback on older Core)
 --   below-minimum        -> "danger" (red)
+--
+-- SETTINGS-REWORK ITEM 4: this is now the FALLBACK path only — it serves the
+-- buffs that carry no full-duration class (see BUFF_TIME_RULE below), which is
+-- exactly the seasonal tail slot. Every tracked world buff goes through
+-- Dashboard.BuffTimeToken instead.
 function Dashboard.AuraColorToken(remaining, threshold)
     threshold = threshold or DEFAULT_THRESHOLD
     if remaining >= (threshold.normal or 0) then return "ok" end
     if remaining >= (threshold.minimum or 0) then return warnToken() end
     return "danger"
+end
+
+----------------------------------------------------------------------
+-- SETTINGS-REWORK ITEM 4 — FIXED buff-time colouring.
+--
+-- The nine editable normal/minimum threshold pairs are retired. Buff-time
+-- colour is now a backend rule derived from each buff's FULL DURATION, stated
+-- once here and not configurable:
+--
+--     full 2h  ->  remaining < 90 min  = yellow, else green
+--     full 1h  ->  remaining < 55 min  = yellow, else green
+--     Battle Shout (15 min NPC cast, spell 25101)
+--              ->  remaining < 12 min  = yellow, else green
+--
+-- Note what is NOT here: red. A buff that is PRESENT is green or yellow; red is
+-- reserved for MISSING (Dashboard.AuraRequirement), so the card's red now means
+-- exactly one thing. The old three-band scheme spent red on "present but old",
+-- which is the state the owner reads as "still fine, top it up soon".
+--
+-- FULL DURATIONS are the game facts already encoded in this addon, restated in
+-- one table rather than inferred from the retired seeds:
+--   * 2h — Rallying Cry of the Dragonslayer (Ony), Spirit of Zandalar (ZG),
+--     Sayge's Dark Fortune (DMF) and the three Dire Maul tribute buffs
+--     (Fengus AP / Slip'kik SP / Mol'dar Stam). tracker.lua's
+--     SYNTH_DURATION_OTHER = 7200 is the same fact from the capture side.
+--   * 1h — Warchief's Blessing (Rend; tracker's SYNTH_DURATION_REND = 3600)
+--     and Songflower Serenade (its retired 58/57 seed pair is a 1h buff's).
+--   * Battle Shout is the 15-minute NPC ("Fallen Hero") cast, spell 25101 —
+--     AURA_META[9].spellID, tracker BUFF_SPELL_IDS[25101] = 9. NOT the 2-minute
+--     player self-cast, which tracker's BS_SELFCAST_MAX filter rejects, and NOT
+--     boonable (tracker BOONABLE_SLOT stops at slot 8).
+--
+-- Keys are thresholdKeys (AURA_META[slot].thresholdKey), so this table is
+-- indexed by the same byte strings as everything else in the aura vocabulary.
+-- A key that is absent here has no full-duration class and keeps the old
+-- green/amber/red behaviour through AuraColorToken — today that is only the
+-- seasonal tail slot, which carries thresholdKey = nil.
+----------------------------------------------------------------------
+
+local HOUR = 3600
+Dashboard.BUFF_FULL_2H = 2 * HOUR
+Dashboard.BUFF_FULL_1H = HOUR
+Dashboard.BUFF_FULL_BS = 15 * 60
+
+-- full = the buff's full duration (seconds); warnBelow = strictly-below cutoff.
+Dashboard.BUFF_TIME_RULE = {
+    ony         = { full = 7200, warnBelow = 90 * 60 },
+    zg          = { full = 7200, warnBelow = 90 * 60 },
+    dmf         = { full = 7200, warnBelow = 90 * 60 },
+    dmtAP       = { full = 7200, warnBelow = 90 * 60 },
+    dmtSP       = { full = 7200, warnBelow = 90 * 60 },
+    dmtStam     = { full = 7200, warnBelow = 90 * 60 },
+    rend        = { full = 3600, warnBelow = 55 * 60 },
+    songflower  = { full = 3600, warnBelow = 55 * 60 },
+    battleShout = { full =  900, warnBelow = 12 * 60 },
+}
+
+-- Colour token for a PRESENT buff under the fixed rule. Returns nil when the
+-- key has no full-duration class, so the caller can fall back to the legacy
+-- threshold path instead of silently painting everything green.
+function Dashboard.BuffTimeToken(thresholdKey, remaining)
+    local rule = thresholdKey and Dashboard.BUFF_TIME_RULE[thresholdKey]
+    if not rule then return nil end
+    if (tonumber(remaining) or 0) < rule.warnBelow then return warnToken() end
+    return "ok"
 end
 
 ----------------------------------------------------------------------
@@ -908,11 +993,18 @@ end
 local CLASS_RULED_KEYS = { rend = true, dmtSP = true, battleShout = true, dmtAP = true }
 Dashboard.CLASS_RULED_KEYS = CLASS_RULED_KEYS
 
--- Class rule state for an aura opt map ("rend"/"battleShout"/"dmtSP") on a faction.
-function Dashboard.ClassRuleState(optKey, classTag, faction)
+-- Class rule state for an aura rule map ("rend"/"battleShout"/"dmtSP"/"dmtAP").
+--
+-- SETTINGS-REWORK ITEM 6: FACTION-BLIND. There is one global rule table
+-- (Store.GetAuraRules) instead of factionSettings[F].auraOpts[optKey]. The
+-- third parameter is accepted and IGNORED so every existing call site — cards,
+-- detail, the requirement helper, the suites — keeps compiling and keeps
+-- meaning the same thing; passing a faction simply cannot change the answer any
+-- more, which is the entire point of the merge.
+function Dashboard.ClassRuleState(optKey, classTag, _faction)
     if not classTag then return "ignored" end
-    local fs = ns.Store and ns.Store.GetFactionSettings and ns.Store.GetFactionSettings(faction)
-    local o = fs and fs.auraOpts and fs.auraOpts[optKey]
+    local rules = ns.Store and ns.Store.GetAuraRules and ns.Store.GetAuraRules()
+    local o = rules and rules[optKey]
     if not o then return "ignored" end
     if o.required and o.required[classTag] then return "required" end
     if o.optional and o.optional[classTag] then return "optional" end
@@ -1614,7 +1706,8 @@ local function testAuraClassRules(fails)
     local a2, r2 = Dashboard.AuraRequirement(SP_SLOT, { classTag = "MAGE" }, FAC)
     ck(a2 == true and r2 == "optional", "dmtSP Mage (optional) is applicable+optional")
     -- Required (flip Warrior required, then restore): applicable + required (red).
-    local o = ns.Store.GetFactionSettings(FAC).auraOpts.dmtSP
+    -- SETTINGS-REWORK ITEM 6: the write target is the ONE global rule table.
+    local o = ns.Store.GetAuraRules().dmtSP
     local pReq, pIgn = o.required.WARRIOR, o.ignored.WARRIOR
     o.ignored.WARRIOR = nil; o.required.WARRIOR = true
     local a3, r3 = Dashboard.AuraRequirement(SP_SLOT, { classTag = "WARRIOR" }, FAC)
@@ -1669,15 +1762,28 @@ local function testAuraClassRules(fails)
         ck(Dashboard.AuraRequirement(AP_SLOT, { classTag = c }, FAC) == false,
            ("dmtAP seeded default: %s is IGNORED (no red Missing tile)"):format(c))
     end
-    -- Same answer on the Horde table (class rules are faction-independent).
+    -- SETTINGS-REWORK ITEM 6: the faction argument cannot change the answer any
+    -- more — there is one global rule table and ClassRuleState ignores the third
+    -- parameter. Asserted for EVERY class on both sides rather than spot-checked,
+    -- because "the faction argument is inert" is the whole contract of the merge:
+    -- if a faction-sensitive read path ever creeps back in, this fails loudly.
+    for _, c in ipairs({ "WARRIOR", "PALADIN", "HUNTER", "ROGUE", "PRIEST",
+                         "SHAMAN", "MAGE", "WARLOCK", "DRUID" }) do
+        for _, slot in ipairs({ 2, 6, 8, 9 }) do
+            local aA, rA = Dashboard.AuraRequirement(slot, { classTag = c }, "Alliance")
+            local aH, rH = Dashboard.AuraRequirement(slot, { classTag = c }, "Horde")
+            ck(aA == aH and rA == rH,
+               ("global rules: slot %d / %s reads identically on both factions"):format(slot, c))
+        end
+    end
     ck(Dashboard.AuraRequirement(AP_SLOT, { classTag = "MAGE" }, "Horde") == false,
        "dmtAP Horde mage is IGNORED too")
     ck(select(2, Dashboard.AuraRequirement(AP_SLOT, { classTag = "SHAMAN" }, "Horde")) == "required",
        "dmtAP Horde shaman is required")
     ck(Dashboard.AuraRequirement(AP_SLOT, {}, FAC) == false,
        "dmtAP with no classTag -> non-applicable, never required")
-    -- The owner can re-tick it like any other rule (Auras page write path).
-    local ap = ns.Store.GetFactionSettings(FAC).auraOpts.dmtAP
+    -- The owner can re-tick it like any other rule (Buffs page write path).
+    local ap = ns.Store.GetAuraRules().dmtAP
     if ap then
         local pReq, pIgn = ap.required.MAGE, ap.ignored.MAGE
         ap.ignored.MAGE = nil; ap.required.MAGE = true
@@ -2175,10 +2281,111 @@ local function testRosterDedup(fails)
 end
 
 if ns.RegisterSelfTest then
+----------------------------------------------------------------------
+-- SETTINGS-REWORK ITEM 4 — the FIXED buff-time colour rule.
+--
+-- Three duration classes, three cutoffs, and a hard "never red while present".
+-- Boundaries are tested at exactly the cutoff and one second either side,
+-- because "< 90 min" vs "<= 90 min" is a one-character mistake that no amount
+-- of eyeballing a card catches — a buff sitting on the boundary would simply
+-- look like it flipped a minute early or late.
+--
+-- MUTATION COVERAGE (each assertion below is here to kill a specific wrong
+-- implementation, not to restate the code):
+--   * the cutoffs swapped between classes  -> the cross-class checks fail
+--   * >= instead of >                      -> the exact-cutoff checks fail
+--   * the old three-band threshold path left wired in -> the "never danger"
+--     sweep fails at low remaining, where AuraColorToken returns "danger"
+--   * a key silently absent from the table -> the coverage check fails
+----------------------------------------------------------------------
+local function testBuffTimeRule(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local D = Dashboard
+    ck(type(D.BUFF_TIME_RULE) == "table", "Dashboard.BUFF_TIME_RULE exists")
+    ck(type(D.BuffTimeToken) == "function", "Dashboard.BuffTimeToken exists")
+    if not (D.BUFF_TIME_RULE and D.BuffTimeToken) then return end
+
+    -- The amber token depends on the running Core (warn, or accent on an older
+    -- one). Resolve it the same way the implementation does rather than pinning
+    -- a literal, so this suite tests the RULE and not the theme.
+    local AMBER = D.BuffTimeToken("ony", 0)
+    ck(AMBER ~= "ok" and AMBER ~= "danger", "the below-cutoff token is amber, not ok/danger")
+
+    -- ---- coverage: every tracked buff has a class, and only the seasonal
+    -- tail slot (thresholdKey = nil) is outside the rule ---------------------
+    local outside = {}
+    for slot, meta in pairs(D.AURA_META or {}) do
+        local key = meta.thresholdKey
+        if key and not D.BUFF_TIME_RULE[key] then
+            outside[#outside + 1] = ("slot %d (%s)"):format(slot, key)
+        end
+    end
+    ck(#outside == 0,
+       "every threshold-bearing slot has a full-duration class; missing: "
+       .. (table.concat(outside, ", ")))
+    ck(D.BuffTimeToken(nil, 0) == nil,
+       "a slot with no thresholdKey returns nil (caller keeps green/amber/red)")
+    ck(D.BuffTimeToken("notARealBuff", 0) == nil, "an unknown key returns nil, never a colour")
+
+    -- ---- 2h class: yellow under 90 min ------------------------------------
+    local TWO_H = { "ony", "zg", "dmf", "dmtAP", "dmtSP", "dmtStam" }
+    for _, k in ipairs(TWO_H) do
+        ck(D.BUFF_TIME_RULE[k].full == 7200, k .. " is a 2h buff")
+        ck(D.BuffTimeToken(k, 7200)     == "ok",    k .. " at full 2h -> green")
+        ck(D.BuffTimeToken(k, 90 * 60)  == "ok",    k .. " at EXACTLY 90m -> green (not <)")
+        ck(D.BuffTimeToken(k, 90 * 60 - 1) == AMBER, k .. " one second under 90m -> yellow")
+        ck(D.BuffTimeToken(k, 60)       == AMBER,   k .. " at 1m -> yellow, NOT red")
+        ck(D.BuffTimeToken(k, 0)        == AMBER,   k .. " at 0 -> yellow, NOT red")
+    end
+
+    -- ---- 1h class: yellow under 55 min ------------------------------------
+    for _, k in ipairs({ "rend", "songflower" }) do
+        ck(D.BUFF_TIME_RULE[k].full == 3600, k .. " is a 1h buff")
+        ck(D.BuffTimeToken(k, 3600)     == "ok",    k .. " at full 1h -> green")
+        ck(D.BuffTimeToken(k, 55 * 60)  == "ok",    k .. " at EXACTLY 55m -> green")
+        ck(D.BuffTimeToken(k, 55 * 60 - 1) == AMBER, k .. " one second under 55m -> yellow")
+        -- Cross-class: a 1h buff at 60m must NOT be judged by the 2h cutoff.
+        ck(D.BuffTimeToken(k, 60 * 60)  == "ok",
+           k .. " at 60m is GREEN (the 90m cutoff belongs to 2h buffs)")
+    end
+
+    -- ---- Battle Shout: the 15-minute NPC cast (spell 25101) ---------------
+    ck(D.BUFF_TIME_RULE.battleShout.full == 900,
+       "battleShout is the 15-minute NPC buff, not the 2-minute self-cast")
+    ck(D.BuffTimeToken("battleShout", 900)      == "ok",    "BS at full 15m -> green")
+    ck(D.BuffTimeToken("battleShout", 12 * 60)  == "ok",    "BS at EXACTLY 12m -> green")
+    ck(D.BuffTimeToken("battleShout", 12 * 60 - 1) == AMBER, "BS one second under 12m -> yellow")
+    ck(D.BuffTimeToken("battleShout", 60)       == AMBER,   "BS at 1m -> yellow, NOT red")
+    -- Cross-class: BS at 30m (impossible in game, but a boon-parse artefact can
+    -- produce it) must not borrow the 1h/2h cutoffs.
+    ck(D.BuffTimeToken("battleShout", 30 * 60)  == "ok", "BS above its own cutoff is green")
+
+    -- The slot that carries the rule really is spell 25101 on both sides.
+    local bs = D.AURA_META and D.AURA_META[9]
+    ck(bs and bs.thresholdKey == "battleShout" and bs.spellID == 25101,
+       "AURA_META slot 9 is Battle Shout / thresholdKey battleShout / spell 25101")
+
+    -- ---- NEVER RED while present, at any remaining, for every class -------
+    -- Red belongs to MISSING now. This sweep is what fails loudly if the old
+    -- three-band threshold path is ever re-wired into the present-buff branch.
+    for key in pairs(D.BUFF_TIME_RULE) do
+        for _, secs in ipairs({ 0, 1, 59, 300, 3599, 3600, 5399, 5400, 7199, 7200, 99999 }) do
+            local tok = D.BuffTimeToken(key, secs)
+            ck(tok == "ok" or tok == AMBER,
+               ("%s at %ds must be green or yellow, never %s"):format(key, secs, tostring(tok)))
+        end
+    end
+
+    -- Junk remaining must not throw or return red.
+    ck(D.BuffTimeToken("ony", nil) == AMBER, "nil remaining reads as 0 -> yellow")
+    ck(D.BuffTimeToken("ony", "banana") == AMBER, "non-numeric remaining reads as 0 -> yellow")
+end
+
     ns:RegisterSelfTest("dashboard", function(verbose)
         local cases = {
             { name = "aura slot map agreement (tracker <-> AURA_META)", fn = testAuraSlotMap },
             { name = "aura class rules", fn = testAuraClassRules },
+            { name = "fixed buff-time rule (settings rework item 4)", fn = testBuffTimeRule },
             { name = "cooldown decay", fn = testDecayRemaining },
             { name = "aura display decay (A6.8/A7.6)", fn = testAuraDisplayDecay },
             { name = "dmf schedule", fn = testDMFSchedule },

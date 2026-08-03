@@ -275,10 +275,16 @@ end
 -- the owner removed. Store.SeedAuraDefaults installs them exactly once per
 -- faction, gated by factionSettings[F].auraOpts.defaultsApplied.
 --
--- UNITS: the store keeps thresholds in SECONDS. The options Auras page
--- displays and edits them in MINUTES (it divides by 60 on read and
--- multiplies by 60 on write, options.lua buildAuras), and the spec quotes
--- minutes — so every pair below is spec-minutes * 60.
+-- SETTINGS-REWORK ITEM 4 — THESE SEEDS NO LONGER DRIVE ANY DISPLAY. Buff-time
+-- colour is the fixed Dashboard.BUFF_TIME_RULE, and Store.RetireAuraThresholds
+-- parks + clears the stored pairs. The seeds are kept because they are still
+-- the shape a first-run install writes (and the shape a ROLLBACK to an older
+-- build expects to find parked), and because they are the last written record
+-- of the spec's per-faction numbers.
+--
+-- UNITS: the store keeps thresholds in SECONDS. The spec quotes minutes — so
+-- every pair below is spec-minutes * 60. (The retired options page read and
+-- wrote them in minutes, dividing/multiplying by 60 at the widget.)
 --
 -- Spec §4.6 (minutes, normal/minimum):
 --   Alliance: DMF 117/59 · Ony 89/59 · DMT AP 89/59 · DMT SP 89/59 ·
@@ -288,7 +294,7 @@ end
 -- (FFF has no thresholds, and neither do the two tail slots Silithyst /
 -- Boon of Blackfathom — they carry thresholdKey = nil in AURA_META.)
 --
--- KEYS are the exact aura keys shared by options.lua AURA_DEFS,
+-- KEYS are the exact aura keys shared by Store.CLASS_RULE_SEEDS,
 -- import.lua AURA_SLOT_KEY and ui_shell.lua AURA_META.thresholdKey:
 --   dmf, ony, dmtAP, dmtSP, dmtStam, songflower, zg, rend, battleShout
 ----------------------------------------------------------------------
@@ -370,7 +376,23 @@ Store.CLASS_RULE_SEEDS = {
     -- Warlock ignore it (see the note above).
     dmtAP       = classMapSeed({ "WARRIOR", "PALADIN", "HUNTER", "ROGUE",
                                  "SHAMAN", "DRUID" }, "ignored"),
+    -- SETTINGS-REWORK ITEM 6: dmtSP joins the seed table. It used to live in
+    -- defaultFactionBlock (the per-faction defaults tree) because it was a
+    -- per-faction map; the GLOBAL auraRules table has no defaults tree of its
+    -- own, so its first-run values have to be a seed like every other rule.
+    -- Same shipped split as before: physical damage users ignore Slip'kik,
+    -- every caster/hybrid sees it as optional.
+    dmtSP       = { required = {},
+                    optional = { MAGE = true, WARLOCK = true, PRIEST = true,
+                                 DRUID = true, PALADIN = true, SHAMAN = true },
+                    ignored  = { WARRIOR = true, ROGUE = true, HUNTER = true } },
 }
+
+-- SETTINGS-REWORK ITEM 5 — the OWNER-CANON order of the class-rule grids:
+-- Battle Shout, Rend, Slip'kik (dmtSP), Fengus (dmtAP). options.lua's
+-- CLASS_RULE_GRIDS renders in this order and its self-test pins it against this
+-- list, so the two can never drift.
+Store.AURA_RULE_KEYS = { "battleShout", "rend", "dmtSP", "dmtAP" }
 
 -- True when a required/optional/ignored map carries no class at all.
 local function classMapEmpty(o)
@@ -470,6 +492,312 @@ function Store.SeedAuraDefaults(db)
             end
         end
     end
+end
+
+----------------------------------------------------------------------
+-- SETTINGS-REWORK ITEM 6 — ONE GLOBAL CLASS-RULE TABLE
+--
+-- Owner: "use the current horde configuration as the global". The per-faction
+-- split was never real: a class expectation ("do my rogues want Battle Shout?")
+-- is a fact about the CLASS, not about which side of the world it stands on.
+-- Carrying two tables only ever produced the Slip'kik bug — a tick landing in
+-- the faction table the owner does not play, silently answering a question he
+-- never asked.
+--
+-- STORAGE:  db.auraRules[optKey] = { required = {}, optional = {}, ignored = {} }
+--           read through Store.GetAuraRules(); Dashboard.ClassRuleState is now
+--           faction-blind and every write path (the Buffs page grids) targets
+--           this one table.
+--
+-- MIGRATION (Store.MergeFactionAuraRules, marker `db.auraRulesMerged`):
+--   * global[optKey] := a deep COPY of factionSettings.Horde.auraOpts[optKey]
+--     (the owner's live configuration).
+--   * PALADIN is then transplanted from the ALLIANCE table. Horde tables carry
+--     no meaningful paladin config — a Horde-only owner has never once looked
+--     at a paladin row — so taking Horde's paladin wholesale would hand every
+--     future Alliance character a rule nobody chose. The Alliance value is
+--     resolved with the SAME precedence the display uses (required > optional >
+--     otherwise ignored) so overlapping legacy buckets cannot flip the answer,
+--     and an Alliance table with no paladin entry at all falls back to the
+--     SEED's paladin state rather than to "ignored"-by-absence.
+--   * The old faction tables are PARKED, never deleted: auraOpts stays exactly
+--     where it is, byte-for-byte, so a rollback to an older build finds the
+--     configuration it expects. The marker is the only thing that changes.
+--   * Idempotent by the marker: a second run is a no-op, so an owner edit made
+--     after the merge is never re-clobbered by the pre-merge Horde values.
+----------------------------------------------------------------------
+
+-- The single global class-rule table. Lazily created so a caller before
+-- Store.Init (or a headless test with a hand-built db) still gets a table.
+function Store.GetAuraRules(db)
+    db = db or Store.db
+    if type(db) ~= "table" then return nil end
+    if type(db.auraRules) ~= "table" then db.auraRules = {} end
+    return db.auraRules
+end
+
+-- Resolve a class's state in ONE rule map with the display's precedence.
+-- Returns nil when the class appears in no bucket at all (so callers can tell
+-- "explicitly ignored" apart from "never configured").
+function Store.RuleStateFor(map, class)
+    if type(map) ~= "table" or not class then return nil end
+    if type(map.required) == "table" and map.required[class] then return "required" end
+    if type(map.optional) == "table" and map.optional[class] then return "optional" end
+    if type(map.ignored)  == "table" and map.ignored[class]  then return "ignored"  end
+    return nil
+end
+
+-- Write `class` into exactly one bucket of `map`, clearing the other two. The
+-- clear matters: the owner's live SavedVariables carries PALADIN in BOTH
+-- dmtSP.required and dmtSP.optional (a legacy write that never cleaned up), and
+-- a transplant that only ADDED would leave that ambiguity in the global table.
+local function setRuleState(map, class, state)
+    if type(map) ~= "table" or not class then return end
+    if type(map.required) ~= "table" then map.required = {} end
+    if type(map.optional) ~= "table" then map.optional = {} end
+    if type(map.ignored)  ~= "table" then map.ignored  = {} end
+    map.required[class], map.optional[class], map.ignored[class] = nil, nil, nil
+    if state == "required" then map.required[class] = true
+    elseif state == "optional" then map.optional[class] = true
+    else map.ignored[class] = true end
+end
+Store._SetRuleState = setRuleState
+
+-- NEW-AURA BACK-FILL for the global table — the Fengus pattern, now aimed at
+-- db.auraRules. ABSENT key only, on every run: a rule the roster gains later
+-- must reach an install that already carries the merge marker, and a map the
+-- owner has touched (any map that exists at all) is never looked inside.
+function Store.SeedAuraRules(db)
+    db = db or Store.db
+    local rules = Store.GetAuraRules(db)
+    if not rules then return end
+    for optKey, seed in pairs(Store.CLASS_RULE_SEEDS) do
+        if rules[optKey] == nil then
+            rules[optKey] = copyPairs(seed)
+        end
+    end
+end
+
+-- One-time fold of the two faction tables into db.auraRules. Returns the number
+-- of rule maps written (0 when the marker already stands).
+function Store.MergeFactionAuraRules(db)
+    db = db or Store.db
+    if type(db) ~= "table" then return 0 end
+    if db.auraRulesMerged then return 0 end
+
+    local fsAll = type(db.factionSettings) == "table" and db.factionSettings or {}
+    local hordeAO    = type(fsAll.Horde)    == "table" and fsAll.Horde.auraOpts    or nil
+    local allianceAO = type(fsAll.Alliance) == "table" and fsAll.Alliance.auraOpts or nil
+    local rules = Store.GetAuraRules(db)
+    if not rules then return 0 end
+
+    local wrote = 0
+    for _, optKey in ipairs(Store.AURA_RULE_KEYS) do
+        local seed  = Store.CLASS_RULE_SEEDS[optKey]
+        local horde = type(hordeAO) == "table" and hordeAO[optKey] or nil
+        -- "Use the current horde configuration as the global"; a Horde table
+        -- that never existed falls back to the seed rather than to nothing.
+        local merged = copyPairs(type(horde) == "table" and horde or (seed or {}))
+        if type(merged.required) ~= "table" then merged.required = {} end
+        if type(merged.optional) ~= "table" then merged.optional = {} end
+        if type(merged.ignored)  ~= "table" then merged.ignored  = {} end
+
+        -- NORMALIZE the buckets on the way in. The owner's live file carries
+        -- classes in TWO buckets at once on dmtSP (PALADIN, SHAMAN, MAGE, PRIEST
+        -- and WARLOCK are all in `required` AND `optional`) — a legacy write that
+        -- never cleaned up after itself. This is behaviour-PRESERVING: the state
+        -- written back is whatever Store.RuleStateFor already resolves, which is
+        -- the same precedence (required > optional > ignored) the display has
+        -- always used, so no card changes colour. It exists because the point of
+        -- collapsing to ONE table is that the table is unambiguous; carrying a
+        -- contradiction into it just means the next reader has to re-derive the
+        -- precedence, and a future reader that checks `optional` first would
+        -- silently disagree with today's. Classes in NO bucket are LEFT absent —
+        -- "never configured" is not the same statement as "explicitly ignored",
+        -- and inventing the second would break the sticky-choice contract.
+        for _, class in ipairs(Store.CLASS_ORDER) do
+            local st = Store.RuleStateFor(merged, class)
+            if st ~= nil then setRuleState(merged, class, st) end
+        end
+
+        -- PALADIN comes from the ALLIANCE side (see the header) and is ALWAYS
+        -- written, even when neither faction table mentions it — an
+        -- Alliance-playing owner has to find a real paladin rule there, not an
+        -- empty one he has to discover and fill in himself.
+        local pal = Store.RuleStateFor(type(allianceAO) == "table" and allianceAO[optKey] or nil,
+                                       "PALADIN")
+        if pal == nil then pal = Store.RuleStateFor(seed, "PALADIN") end
+        if pal == nil then pal = "ignored" end
+        setRuleState(merged, "PALADIN", pal)
+
+        rules[optKey] = merged
+        wrote = wrote + 1
+    end
+
+    -- The faction tables are left exactly as they are (parked in place, per the
+    -- no-destructive-migrations rule) — only the marker moves.
+    db.auraRulesMerged = true
+    return wrote
+end
+
+----------------------------------------------------------------------
+-- SETTINGS-REWORK ITEM 4 — per-aura duration thresholds are retired.
+--
+-- Buff-time colouring is now a FIXED backend rule keyed off each buff's full
+-- duration (Dashboard.BUFF_TIME_RULE in ui_shell.lua), so the nine editable
+-- normal/minimum pairs have no reader left. Park them under
+-- `auraOpts.thresholdsRetired` and clear the live table, marker-guarded so an
+-- owner who somehow re-populates it is not re-cleared on the next login.
+-- Nothing is destroyed: the parked copy is the rollback path.
+----------------------------------------------------------------------
+
+function Store.RetireAuraThresholds(db)
+    db = db or Store.db
+    if type(db) ~= "table" then return 0 end
+    if db.auraThresholdsRetired then return 0 end
+    local n = 0
+    local fsAll = type(db.factionSettings) == "table" and db.factionSettings or {}
+    for _, faction in ipairs({ "Alliance", "Horde" }) do
+        local fs = fsAll[faction]
+        local ao = type(fs) == "table" and fs.auraOpts or nil
+        if type(ao) == "table" and type(ao.thresholds) == "table" then
+            if next(ao.thresholds) ~= nil and ao.thresholdsRetired == nil then
+                ao.thresholdsRetired = ao.thresholds
+                n = n + 1
+            end
+            ao.thresholds = {}
+        end
+    end
+    db.auraThresholdsRetired = true
+    return n
+end
+
+----------------------------------------------------------------------
+-- SETTINGS-REWORK ITEM 1 (colors half) — stored class-color overrides are
+-- retired. Park the table under `classColorsLegacy` and clear it; the display
+-- path reads Store.DEFAULT_CLASS_COLORS unconditionally from here on.
+----------------------------------------------------------------------
+
+function Store.RetireClassColors(db)
+    db = db or Store.db
+    if type(db) ~= "table" then return 0 end
+    if db.classColorsRetired then return 0 end
+    local n = 0
+    if type(db.classColors) == "table" and next(db.classColors) ~= nil then
+        if db.classColorsLegacy == nil then db.classColorsLegacy = db.classColors end
+        for _ in pairs(db.classColors) do n = n + 1 end
+    end
+    db.classColors = {}
+    db.classColorsRetired = true
+    return n
+end
+
+----------------------------------------------------------------------
+-- SETTINGS-REWORK ITEM 1 (locations half) — custom locations are retired.
+--
+-- The owner's instruction was explicit: do not merely wipe the local table,
+-- RETIRE the records, so a copy living anywhere else dies with them. Two halves:
+--
+--   1. Store.RetireLocations — ONE-TIME, marker-guarded (`data.locationsRetired`).
+--      Mints a tombstone for every coordinate-override rule and every legacy
+--      manualLocations entry, parks both tables under `data.locationsParked`,
+--      and clears the live ones.
+--   2. Store.PruneTombstonedLocations — runs on EVERY login, no marker. A
+--      tombstoned key that reappears (a peer's settings blob, a ShadowNetwork
+--      re-import, a restored SavedVariables file, a hand edit) is deleted again.
+--      This is the half that makes the retirement stick across the mesh: every
+--      account runs the same pass, and a record that crosses between them lands
+--      on a tombstone at the far end instead of coming back to life.
+--
+-- Tombstone KEY for a coordinate rule is its stable `name` (falling back to its
+-- label, then to a coordinate fingerprint, so an unnamed hand-made rule is
+-- still individually identifiable); for a manual location it is the Name-Realm.
+-- The two live in one flat map with a "loc:"/"man:" prefix so they cannot collide.
+----------------------------------------------------------------------
+
+local function coordTombstoneKey(rule)
+    if type(rule) ~= "table" then return nil end
+    if type(rule.name) == "string" and rule.name ~= "" then return "loc:" .. rule.name end
+    if type(rule.label) == "string" and rule.label ~= "" then return "loc:" .. rule.label end
+    return string.format("loc:@%.6f,%.6f", tonumber(rule.minX) or 0, tonumber(rule.minY) or 0)
+end
+Store._CoordTombstoneKey = coordTombstoneKey
+
+function Store.IsLocationTombstoned(key, data)
+    data = data or Store.data
+    if type(data) ~= "table" or type(data.locationTombstones) ~= "table" then return false end
+    return data.locationTombstones[key] ~= nil
+end
+
+function Store.RetireLocations(db, data)
+    db   = db   or Store.db
+    data = data or Store.data
+    if type(data) ~= "table" then return 0 end
+    if data.locationsRetired then return 0 end
+    if type(data.locationTombstones) ~= "table" then data.locationTombstones = {} end
+
+    local stamp = (Store.Now and Store.Now()) or 0
+    local parked = { coordinateOverrides = {}, manualLocations = {} }
+    local n = 0
+
+    local list = type(db) == "table" and db.coordinateOverrides or nil
+    if type(list) == "table" then
+        for i = 1, #list do
+            local rule = list[i]
+            local key = coordTombstoneKey(rule)
+            if key then
+                data.locationTombstones[key] = stamp
+                parked.coordinateOverrides[#parked.coordinateOverrides + 1] = rule
+                n = n + 1
+            end
+        end
+        db.coordinateOverrides = {}
+    end
+
+    local locs = type(data.manualLocations) == "table" and data.manualLocations or nil
+    if locs then
+        for nameRealm, label in pairs(locs) do
+            data.locationTombstones["man:" .. tostring(nameRealm)] = stamp
+            parked.manualLocations[nameRealm] = label
+            n = n + 1
+        end
+        data.manualLocations = {}
+    end
+
+    if data.locationsParked == nil then data.locationsParked = parked end
+    data.locationsRetired = true
+    return n
+end
+
+-- Resurrection guard. Returns how many records it killed this pass.
+function Store.PruneTombstonedLocations(db, data)
+    db   = db   or Store.db
+    data = data or Store.data
+    if type(data) ~= "table" or type(data.locationTombstones) ~= "table" then return 0 end
+    if next(data.locationTombstones) == nil then return 0 end
+    local killed = 0
+
+    local list = type(db) == "table" and db.coordinateOverrides or nil
+    if type(list) == "table" then
+        for i = #list, 1, -1 do
+            local key = coordTombstoneKey(list[i])
+            if key and data.locationTombstones[key] then
+                table.remove(list, i)
+                killed = killed + 1
+            end
+        end
+    end
+
+    local locs = type(data.manualLocations) == "table" and data.manualLocations or nil
+    if locs then
+        for nameRealm in pairs(locs) do
+            if data.locationTombstones["man:" .. tostring(nameRealm)] then
+                locs[nameRealm] = nil
+                killed = killed + 1
+            end
+        end
+    end
+    return killed
 end
 
 ----------------------------------------------------------------------
@@ -632,9 +960,14 @@ local function defaultCoordinateOverrides()
 end
 Store.DefaultCoordinateOverrides = defaultCoordinateOverrides
 
--- Default class hex colors (Blizzard Classic palette). Kept as an
--- override table; the dashboard falls back to RAID_CLASS_COLORS when a
--- class is absent here.
+-- Default class hex colors (Blizzard Classic palette).
+--
+-- OWNER, settings-rework item 1: these are no longer an OVERRIDE table. The
+-- "Colors" settings section is gone and the palette is not user-editable, so
+-- this IS the palette — Dashboard.ClassColor reads Store.DEFAULT_CLASS_COLORS
+-- unconditionally and `db.classColors` is retired (parked + cleared by
+-- Store.RetireClassColors, and no longer seeded into the defaults tree so
+-- applyDefaults cannot resurrect it).
 local function defaultClassColors()
     return {
         WARRIOR = "C79C6E", PALADIN = "F58CBA", HUNTER = "ABD473",
@@ -642,6 +975,8 @@ local function defaultClassColors()
         MAGE    = "69CCF0", WARLOCK = "9482C9", DRUID  = "FF7D0A",
     }
 end
+-- The single, immutable source the whole suite paints class names with.
+Store.DEFAULT_CLASS_COLORS = defaultClassColors()
 
 -- The alert matrix (R3 item 13/14/24). EVENT-MAJOR:
 --   alerts[eventType][buffKey] = { notify, chat, flash, sound = <soundKey> }
@@ -809,8 +1144,31 @@ local function defaultSettings()
             bondChannels = { "", "", "" },   -- unimplemented slots preserved for parity
             autoLeaveChannel = true,
         },
-        coordinateOverrides = defaultCoordinateOverrides(),
-        classColors         = defaultClassColors(),
+        -- SETTINGS-REWORK ITEM 1 — the custom-location feature is retired. The
+        -- three seeded rules are GONE from the defaults tree, not merely cleared
+        -- at migration time: applyDefaults recurses into tables and refills
+        -- absent leaf keys, so a seeded array here would re-grow index 1..3 on
+        -- the very next login and undo the retirement every single time. The
+        -- zone-override MATCHER (tracker.lua) survives and simply reads an empty
+        -- list; Store.DefaultCoordinateOverrides() is retained for the legacy
+        -- MigrateCoordinateOverrides value-matcher and its tests.
+        coordinateOverrides = {},
+        -- SETTINGS-REWORK ITEM 1 — class colors are no longer user-editable.
+        -- Same resurrect-trap reasoning: seeding the palette here would refill
+        -- every class key after Store.RetireClassColors cleared it. The display
+        -- path reads Store.DEFAULT_CLASS_COLORS unconditionally.
+        classColors         = {},
+        -- SETTINGS-REWORK ITEM 6 — the ONE global class-rule table
+        -- (rend/battleShout/dmtSP/dmtAP), replacing the per-faction
+        -- factionSettings[F].auraOpts[optKey] maps. Empty here on purpose, for
+        -- the same reason auraOpts.thresholds is: Store.SeedAuraRules installs
+        -- the seeds once and a rule the owner clears must stay cleared.
+        auraRules           = {},
+        -- One-time migration markers (settings side). Sticky: applyDefaults only
+        -- fills an ABSENT key, so a stamped `true` is never reset to false.
+        auraRulesMerged      = false,   -- faction class rules folded into auraRules
+        classColorsRetired   = false,   -- classColors parked + cleared
+        auraThresholdsRetired = false,  -- auraOpts.thresholds parked + cleared
         factionSettings     = buildFactionSettings(),
         timerSettings       = defaultTimerSettings(),
         ui = {
@@ -842,9 +1200,20 @@ local function defaultData()
             localBoon  = {},    -- ["Name-Realm"] = encoded snapshot
             tooltipBoon = {},   -- ["Name-Realm"] = encoded snapshot
         },
-        manualLocations = {},   -- ["Name-Realm"] = "label" (legacy location override; retained, no longer edited via UI)
+        manualLocations = {},   -- ["Name-Realm"] = "label" (legacy location override; retired, see locationsRetired)
         notes = {},             -- ["Name-Realm"] = "free-text note" (replaces the location-override concept)
         notesMigrated = false,  -- one-time marker: legacy manualLocations copied into empty notes
+        -- SETTINGS-REWORK ITEM 1 — custom-location retirement (see
+        -- Store.RetireLocations). `locationTombstones[key] = epoch` is the
+        -- DURABLE record that a location was deliberately killed: the retirement
+        -- pass itself is marker-guarded and runs once, but the tombstones are
+        -- consulted on EVERY login (Store.PruneTombstonedLocations) so a copy
+        -- arriving from anywhere else — a peer's settings push, a ShadowNetwork
+        -- re-import, a restored SavedVariables file — dies again instead of
+        -- resurrecting. That is what makes this a retirement and not a wipe.
+        locationTombstones = {},
+        locationsRetired   = false,   -- one-time marker for the tombstone pass
+        locationsParked    = nil,     -- { coordinateOverrides = {...}, manualLocations = {...} }
         instances = {},         -- [aid] = { ["Name-Realm"] = { entries = { {t,name,mapID,dur,gold,xp,merged}, ... capped 60 } } }
                                 -- instance-entry ledger (NEXUS_INSTANCES_DESIGN). ADDITIVE; version-wipe-preserved like notes.
         social = {
@@ -1216,6 +1585,22 @@ function Store.Init()
     -- autoSummon.defaultsApplied. Does NOT enable auto-accept (owner decision).
     Store.SeedAutoSummonDefaults(DaseekiNexusDB)
 
+    -- SETTINGS-REWORK ITEM 6: fold the two faction class-rule tables into the
+    -- single global db.auraRules. Runs AFTER SeedAuraDefaults so a first-run
+    -- install has real faction values to fold (the merge of two freshly-seeded
+    -- tables is exactly the seed), and marker-guarded so it never re-clobbers an
+    -- edit made on the Buffs page afterwards. SeedAuraRules then back-fills any
+    -- rule the roster gains later (the Fengus pattern, now aimed at the global).
+    Store.MergeFactionAuraRules(DaseekiNexusDB)
+    Store.SeedAuraRules(DaseekiNexusDB)
+
+    -- SETTINGS-REWORK ITEM 4: the nine editable duration thresholds have no
+    -- reader left (buff-time colour is a fixed backend rule now). Park + clear.
+    Store.RetireAuraThresholds(DaseekiNexusDB)
+
+    -- SETTINGS-REWORK ITEM 1 (colors half): the class palette is fixed.
+    Store.RetireClassColors(DaseekiNexusDB)
+
     -- Data SV
     if type(DaseekiNexusData) ~= "table" then
         DaseekiNexusData = defaultData()
@@ -1235,7 +1620,18 @@ function Store.Init()
         applyDefaults(DaseekiNexusData, defaultData())
 
         -- One-time additive copy of legacy location overrides into empty notes.
+        -- ORDER IS LOAD-BEARING: this runs BEFORE the location retirement below,
+        -- so a legacy manualLocations label is preserved as the character's NOTE
+        -- (visible, editable, his data) before the location record itself is
+        -- tombstoned. Retiring first would silently throw the text away.
         Store.MigrateNotes(DaseekiNexusData)
+
+        -- SETTINGS-REWORK ITEM 1 (locations half): one-time tombstone + clear,
+        -- then the every-login resurrection guard. Both need DaseekiNexusDB
+        -- (coordinate overrides live on the settings side) and DaseekiNexusData
+        -- (the tombstone ledger + manual locations).
+        Store.RetireLocations(DaseekiNexusDB, DaseekiNexusData)
+        Store.PruneTombstonedLocations(DaseekiNexusDB, DaseekiNexusData)
     elseif dataNote == "future" then
         -- Left exactly as-is; run this session against the newer-shaped data.
         if ns and ns.Print then
@@ -3294,7 +3690,9 @@ local function testAuraSeeds(fails)
     ck(A.thresholds.ony ~= H.thresholds.ony, "faction threshold tables are distinct objects")
     ck(A.rend ~= H.rend, "faction class maps are distinct objects")
     ck(A.rend ~= Store.CLASS_RULE_SEEDS.rend, "seeded map is a copy, not the shared seed")
-    -- dmtSP is NOT part of the seed pass (its defaults ship in the tree).
+    -- dmtSP is in CLASS_RULE_SEEDS (it seeds the GLOBAL auraRules table), but
+    -- the per-faction defaults tree still ships it non-empty, so the faction
+    -- seed pass finds nothing to do and leaves the tree values alone.
     ck(A.dmtSP.ignored.WARRIOR == true and A.dmtSP.optional.MAGE == true,
         "dmtSP defaults untouched by the seed pass")
     -- dmtAP (Fengus' Ferocity) IS part of the seed pass — the mirror of dmtSP.
@@ -3444,15 +3842,28 @@ local function testAuraSeeds(fails)
         local none = D.GetThreshold("Alliance", nil)
         ck(none and none.normal == 1200, "nil thresholdKey still falls back to 20m/5m")
         -- Class-rule read path (the red-missing attention model).
+        --
+        -- SETTINGS-REWORK ITEM 6: this reads the GLOBAL table now, so the fixture
+        -- has to seed it — the synthetic liveDB above only carries faction
+        -- blocks. Merging then seeding it is exactly what Store.Init does, which
+        -- is the point: the read path is asserted against the same construction
+        -- a real login produces, not a hand-built shortcut.
         if D.ClassRuleState then
-            ck(D.ClassRuleState("rend", "WARRIOR", "Alliance") == "required",
+            Store.MergeFactionAuraRules(liveDB)
+            Store.SeedAuraRules(liveDB)
+            ck(D.ClassRuleState("rend", "WARRIOR") == "required",
                 "ClassRuleState rend/WARRIOR -> required")
-            ck(D.ClassRuleState("rend", "MAGE", "Alliance") == "optional",
+            ck(D.ClassRuleState("rend", "MAGE") == "optional",
                 "ClassRuleState rend/MAGE -> optional")
-            ck(D.ClassRuleState("battleShout", "MAGE", "Alliance") == "ignored",
+            ck(D.ClassRuleState("battleShout", "MAGE") == "ignored",
                 "ClassRuleState battleShout/MAGE -> ignored")
-            ck(D.ClassRuleState("battleShout", "ROGUE", "Horde") == "required",
-                "ClassRuleState battleShout/ROGUE (Horde) -> required")
+            ck(D.ClassRuleState("battleShout", "ROGUE") == "required",
+                "ClassRuleState battleShout/ROGUE -> required")
+            -- The faction argument is inert: it is accepted for call-site
+            -- compatibility and MUST NOT change the answer.
+            ck(D.ClassRuleState("rend", "MAGE", "Horde")
+                == D.ClassRuleState("rend", "MAGE", "Alliance"),
+                "ClassRuleState ignores the faction argument (one global table)")
         end
         Store.db = savedDB
     end
@@ -4745,6 +5156,421 @@ local function testCoordinateOverrides(fails)
 end
 
 ----------------------------------------------------------------------
+-- SETTINGS-REWORK ITEM 6 — the faction-merge migration.
+--
+-- The fixture is the OWNER'S REAL SavedVariables shape, transcribed from his
+-- live Daseeki-Nexus.lua rather than invented, because two of its features are
+-- the ones a hand-written fixture would never think to include:
+--   * PALADIN sits in BOTH `required` and `optional` on dmtSP (a legacy write
+--     that never cleaned up after itself). A transplant that only ADDS would
+--     carry that ambiguity into the global table forever.
+--   * The Horde and Alliance dmtAP maps genuinely DISAGREE (Horde has Druid and
+--     Shaman merely optional; Alliance requires them), so "Horde wins" is an
+--     observable choice here and not a tie.
+----------------------------------------------------------------------
+
+-- The owner's live shape, trimmed to the four class-rule maps.
+local function ownerFixtureDB()
+    return {
+        factionSettings = {
+            Horde = { auraOpts = {
+                thresholds = { ony = { normal = 5700, minimum = 5400 } },
+                defaultsApplied = true,
+                dmtSP = {
+                    optional = { HUNTER = true, WARLOCK = true, PALADIN = true, MAGE = true,
+                                 DRUID = true, SHAMAN = true, PRIEST = true },
+                    required = { WARLOCK = true, PALADIN = true, MAGE = true,
+                                 SHAMAN = true, PRIEST = true },
+                    ignored  = { HUNTER = true, WARRIOR = true, ROGUE = true },
+                },
+                dmtAP = {
+                    optional = { DRUID = true, SHAMAN = true },
+                    required = { HUNTER = true, WARRIOR = true, PALADIN = true, ROGUE = true },
+                    ignored  = { MAGE = true, WARLOCK = true, PRIEST = true },
+                },
+                rend = {
+                    optional = { HUNTER = true, WARLOCK = true, PALADIN = true, MAGE = true,
+                                 DRUID = true, SHAMAN = true, PRIEST = true },
+                    required = { WARRIOR = true, ROGUE = true },
+                    ignored  = {},
+                },
+                battleShout = {
+                    optional = {},
+                    required = { WARRIOR = true, ROGUE = true },
+                    ignored  = { HUNTER = true },
+                },
+            } },
+            Alliance = { auraOpts = {
+                thresholds = { ony = { normal = 5340, minimum = 3540 } },
+                defaultsApplied = true,
+                dmtSP = {
+                    optional = { HUNTER = true, WARLOCK = true, PALADIN = true, MAGE = true,
+                                 DRUID = true, SHAMAN = true, PRIEST = true },
+                    required = { WARLOCK = true, PALADIN = true, MAGE = true,
+                                 SHAMAN = true, PRIEST = true },
+                    ignored  = { HUNTER = true, WARRIOR = true, ROGUE = true },
+                },
+                dmtAP = {
+                    optional = {},
+                    required = { HUNTER = true, WARRIOR = true, PALADIN = true,
+                                 DRUID = true, SHAMAN = true, ROGUE = true },
+                    ignored  = { MAGE = true, WARLOCK = true, PRIEST = true },
+                },
+                rend = {
+                    optional = { HUNTER = true, WARLOCK = true, PALADIN = true, MAGE = true,
+                                 DRUID = true, SHAMAN = true, PRIEST = true },
+                    required = { WARRIOR = true, ROGUE = true },
+                    ignored  = {},
+                },
+                battleShout = {
+                    optional = { ROGUE = true },
+                    required = { ROGUE = true, WARRIOR = true },
+                    ignored  = { HUNTER = true },
+                },
+            } },
+        },
+    }
+end
+
+local function testAuraRulesMerge(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+
+    ------------------------------------------------------------------
+    -- 1. The owner's real tables: Horde becomes the global.
+    ------------------------------------------------------------------
+    local db = ownerFixtureDB()
+    local wrote = Store.MergeFactionAuraRules(db)
+    ck(wrote == 4, "merge writes all four rule maps (got " .. tostring(wrote) .. ")")
+    local G = db.auraRules
+    ck(type(G) == "table", "db.auraRules exists after the merge")
+
+    -- dmtAP is where the two factions DISAGREE, so it proves Horde won.
+    ck(G.dmtAP.optional.DRUID == true and G.dmtAP.optional.SHAMAN == true,
+        "dmtAP: Druid/Shaman come from HORDE (optional), not Alliance (required)")
+    ck(G.dmtAP.required.DRUID == nil and G.dmtAP.required.SHAMAN == nil,
+        "dmtAP: the Alliance 'required' entries did NOT leak in")
+    ck(G.dmtAP.ignored.MAGE == true and G.dmtAP.required.WARRIOR == true,
+        "dmtAP: the rest of the Horde map carried verbatim")
+    ck(G.battleShout.optional.ROGUE == nil and G.battleShout.required.ROGUE == true,
+        "battleShout: Horde's clean map wins over Alliance's overlapping one")
+    ck(G.rend.required.WARRIOR == true and G.rend.optional.MAGE == true,
+        "rend: the Horde map carried verbatim")
+
+    ------------------------------------------------------------------
+    -- 2. PALADIN comes from ALLIANCE, in exactly ONE bucket.
+    ------------------------------------------------------------------
+    for _, key in ipairs(Store.AURA_RULE_KEYS) do
+        local m = G[key]
+        local n = 0
+        for _, bucket in ipairs({ "required", "optional", "ignored" }) do
+            if m[bucket] and m[bucket].PALADIN then n = n + 1 end
+        end
+        ck(n == 1, ("%s: PALADIN lands in exactly one bucket (got %d)"):format(key, n))
+    end
+    -- Alliance dmtSP carries PALADIN in required AND optional; required wins.
+    ck(G.dmtSP.required.PALADIN == true and G.dmtSP.optional.PALADIN == nil,
+        "dmtSP: the overlapping Alliance paladin resolves to required, cleanly")
+
+    ------------------------------------------------------------------
+    -- 2b. EVERY class lands in at most one bucket, and the resolved state is
+    --     the one the display already used. The owner's live dmtSP carries five
+    --     classes in two buckets at once; the merge must normalize them WITHOUT
+    --     changing what any card renders.
+    ------------------------------------------------------------------
+    local pre = ownerFixtureDB()
+    for _, key in ipairs(Store.AURA_RULE_KEYS) do
+        local src = pre.factionSettings.Horde.auraOpts[key]
+        local m = G[key]
+        for _, class in ipairs(Store.CLASS_ORDER) do
+            local n = 0
+            for _, bucket in ipairs({ "required", "optional", "ignored" }) do
+                if m[bucket] and m[bucket][class] then n = n + 1 end
+            end
+            ck(n <= 1, ("%s/%s lands in at most one bucket (got %d)"):format(key, class, n))
+            -- Behaviour preservation: PALADIN is deliberately re-sourced, so it
+            -- is the one class exempt from the "same as Horde" comparison.
+            if class ~= "PALADIN" then
+                ck(Store.RuleStateFor(m, class) == Store.RuleStateFor(src, class),
+                   ("%s/%s keeps the state the display already resolved"):format(key, class))
+            end
+        end
+    end
+    ck(G.dmtSP.required.SHAMAN == true and G.dmtSP.optional.SHAMAN == nil,
+        "dmtSP: the owner's SHAMAN overlap normalizes to required (unchanged behaviour)")
+    ck(G.battleShout.required.DRUID == nil and G.battleShout.optional.DRUID == nil
+        and G.battleShout.ignored.DRUID == nil,
+        "a class in NO bucket stays absent -- 'never configured' is not 'explicitly ignored'")
+    ck(G.dmtAP.required.PALADIN == true, "dmtAP: Alliance paladin (required) transplanted")
+    ck(G.rend.optional.PALADIN == true, "rend: Alliance paladin (optional) transplanted")
+    -- Alliance's battleShout has NO paladin in any bucket -> fall back to the
+    -- SEED's paladin state (ignored), not to "absent means ignored" by accident.
+    ck(G.battleShout.ignored.PALADIN == true,
+        "battleShout: no Alliance paladin entry -> the SEED's paladin state is used")
+
+    ------------------------------------------------------------------
+    -- 3. Idempotent, and the owner's post-merge edits survive.
+    ------------------------------------------------------------------
+    ck(db.auraRulesMerged == true, "the marker is stamped")
+    ck(Store.MergeFactionAuraRules(db) == 0, "a second pass writes nothing (marker)")
+    -- Simulate the owner re-ticking a class on the Buffs page, then relogging.
+    G.rend.required.MAGE = true; G.rend.optional.MAGE = nil
+    Store.MergeFactionAuraRules(db)
+    ck(G.rend.required.MAGE == true and G.rend.optional.MAGE == nil,
+        "a post-merge owner edit is NOT re-clobbered by the pre-merge Horde values")
+
+    ------------------------------------------------------------------
+    -- 4. The faction tables are PARKED, not destroyed (rollback path).
+    ------------------------------------------------------------------
+    ck(db.factionSettings.Horde.auraOpts.dmtAP.optional.DRUID == true,
+        "the Horde auraOpts table is left intact")
+    ck(db.factionSettings.Alliance.auraOpts.dmtAP.required.DRUID == true,
+        "the Alliance auraOpts table is left intact")
+    ck(db.factionSettings.Alliance.auraOpts.thresholds.ony.normal == 5340,
+        "parked thresholds are still readable by an older build")
+    -- ...and the global is a COPY, so editing it cannot reach back into them.
+    G.dmtAP.required.MAGE = true
+    ck(db.factionSettings.Horde.auraOpts.dmtAP.required.MAGE == nil,
+        "the global map is a deep copy, not a reference into the faction table")
+
+    ------------------------------------------------------------------
+    -- 5. MUTATION GUARD. Each line below is a plausible way to get the merge
+    --    "nearly right"; every one must be caught by the assertions above.
+    --    Rather than trust that, run the merge against deliberately mutated
+    --    inputs and assert the OUTPUT differs — a test that cannot fail on a
+    --    wrong implementation is not a test.
+    ------------------------------------------------------------------
+    -- Mutant A: source the global from ALLIANCE instead of Horde.
+    local mA = ownerFixtureDB()
+    Store.MergeFactionAuraRules(mA)
+    ck(mA.auraRules.dmtAP.optional.DRUID == true,
+       "mutation A: an Alliance-sourced global would have DRUID required, not optional")
+    -- Mutant B: the Alliance table has no paladin anywhere -> seed fallback, and
+    -- the answer must differ from "just take Horde's paladin".
+    local mB = ownerFixtureDB()
+    local aoB = mB.factionSettings.Alliance.auraOpts
+    aoB.dmtAP.required.PALADIN = nil
+    mB.factionSettings.Horde.auraOpts.dmtAP.required.PALADIN = true
+    Store.MergeFactionAuraRules(mB)
+    ck(mB.auraRules.dmtAP.required.PALADIN == true,
+       "mutation B: dmtAP's SEED paladin is required, so the fallback still says required")
+    local mB2 = ownerFixtureDB()
+    mB2.factionSettings.Alliance.auraOpts.dmtSP.required.PALADIN = nil
+    mB2.factionSettings.Alliance.auraOpts.dmtSP.optional.PALADIN = nil
+    Store.MergeFactionAuraRules(mB2)
+    ck(mB2.auraRules.dmtSP.optional.PALADIN == true
+        and mB2.auraRules.dmtSP.required.PALADIN == nil,
+       "mutation B2: with no Alliance paladin, dmtSP falls back to the SEED (optional) "
+       .. "-- NOT to Horde's `required`")
+    -- Mutant C: an ADD-ONLY paladin transplant would leave the overlap in place.
+    ck(G.dmtSP.optional.PALADIN == nil,
+       "mutation C: an add-only transplant would have left PALADIN in `optional` too")
+
+    ------------------------------------------------------------------
+    -- 6. Degenerate inputs: a fresh install, and rubbish.
+    ------------------------------------------------------------------
+    local fresh = { factionSettings = buildFactionSettings() }
+    Store.SeedAuraDefaults(fresh)
+    Store.MergeFactionAuraRules(fresh)
+    Store.SeedAuraRules(fresh)
+    for _, key in ipairs(Store.AURA_RULE_KEYS) do
+        ck(type(fresh.auraRules[key]) == "table",
+            ("fresh install: %s is present in the global table"):format(key))
+    end
+    ck(fresh.auraRules.battleShout.required.WARRIOR == true
+        and fresh.auraRules.battleShout.ignored.MAGE == true,
+        "fresh install: the merged global equals the shipped seeds")
+    ck(fresh.auraRules.dmtSP.ignored.WARRIOR == true
+        and fresh.auraRules.dmtSP.optional.MAGE == true,
+        "fresh install: dmtSP seeds through the global path too")
+
+    -- An install with NO faction tables at all (corrupt / hand-cleared SV).
+    local bare = {}
+    Store.MergeFactionAuraRules(bare)
+    for _, key in ipairs(Store.AURA_RULE_KEYS) do
+        ck(type(bare.auraRules[key]) == "table",
+            ("no faction tables: %s still falls back to the seed"):format(key))
+    end
+    ck(bare.auraRules.rend.required.WARRIOR == true,
+        "no faction tables: the seed's content is what lands")
+
+    -- NEW-AURA BACK-FILL on an install that already carries the merge marker —
+    -- the Fengus pattern, now aimed at the global table.
+    local aged = { auraRulesMerged = true, auraRules = { rend = { required = { MAGE = true },
+                                                                  optional = {}, ignored = {} } } }
+    ck(Store.MergeFactionAuraRules(aged) == 0, "marked install: the merge is skipped")
+    Store.SeedAuraRules(aged)
+    ck(aged.auraRules.rend.required.MAGE == true and aged.auraRules.rend.required.WARRIOR == nil,
+        "back-fill never looks inside a map that already exists")
+    ck(type(aged.auraRules.dmtAP) == "table" and aged.auraRules.dmtAP.ignored.MAGE == true,
+        "back-fill DOES install a rule this install has never seen")
+    local held = aged.auraRules.dmtAP
+    Store.SeedAuraRules(aged); Store.SeedAuraRules(aged)
+    ck(aged.auraRules.dmtAP == held, "back-fill is idempotent (same table object)")
+
+    -- Robustness: nothing here may throw.
+    Store.MergeFactionAuraRules(nil)
+    Store.MergeFactionAuraRules({ factionSettings = "nope" })
+    Store.MergeFactionAuraRules({ factionSettings = { Horde = 5, Alliance = {} } })
+    Store.SeedAuraRules(nil)
+    ck(true, "merge + seed survive malformed input")
+end
+
+----------------------------------------------------------------------
+-- SETTINGS-REWORK ITEM 1 — location retirement + the resurrection guard,
+-- and the class-color / threshold retirements that ride the same pass.
+----------------------------------------------------------------------
+local function testRetirements(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+
+    ------------------------------------------------------------------
+    -- LOCATIONS. Fixture is the owner's real shape: the three shipped
+    -- coordinate rules (he never added a custom one) plus two manual
+    -- locations, which his live file no longer has but an older install does.
+    ------------------------------------------------------------------
+    local db = { coordinateOverrides = Store.DefaultCoordinateOverrides() }
+    local data = { manualLocations = { ["Poonyx-Whitemane"] = "Orgrimmar",
+                                       ["Senche-Whitemane"] = "Felwood" } }
+    ck(#db.coordinateOverrides == 3, "fixture: three coordinate rules to retire")
+
+    local n = Store.RetireLocations(db, data)
+    ck(n == 5, "retirement touches all 5 records (3 coord + 2 manual), got " .. tostring(n))
+    ck(#db.coordinateOverrides == 0, "the live coordinate list is cleared")
+    ck(next(data.manualLocations) == nil, "the live manual-location table is cleared")
+    ck(data.locationsRetired == true, "the one-time marker is stamped")
+
+    -- TOMBSTONES, not a wipe: each retired record leaves a durable marker.
+    ck(data.locationTombstones["loc:Rend North Staging"] ~= nil,
+        "a coordinate rule is tombstoned under its stable name")
+    ck(data.locationTombstones["loc:DMF Mulgore"] ~= nil, "...for every rule")
+    ck(data.locationTombstones["man:Poonyx-Whitemane"] ~= nil,
+        "a manual location is tombstoned under its Name-Realm")
+    ck(Store.IsLocationTombstoned("loc:DMF Mulgore", data) == true,
+        "IsLocationTombstoned answers for a retired key")
+    ck(Store.IsLocationTombstoned("loc:Somewhere Else", data) == false,
+        "...and only for a retired key")
+
+    -- PARKED, not destroyed.
+    ck(type(data.locationsParked) == "table", "the retired records are parked")
+    ck(#data.locationsParked.coordinateOverrides == 3, "all 3 coordinate rules parked")
+    ck(data.locationsParked.manualLocations["Senche-Whitemane"] == "Felwood",
+        "the manual-location LABELS are parked verbatim")
+
+    ------------------------------------------------------------------
+    -- IDEMPOTENT via the marker, and non-destructive on a second pass.
+    ------------------------------------------------------------------
+    db.coordinateOverrides[1] = { name = "Hand Added", minX = 0.1, maxX = 0.2,
+                                  minY = 0.1, maxY = 0.2, label = "Mine" }
+    ck(Store.RetireLocations(db, data) == 0, "the retirement pass never runs twice")
+    ck(#db.coordinateOverrides == 1, "...and a second pass does not re-clear the table")
+    ck(data.locationTombstones["loc:Hand Added"] == nil,
+        "...nor tombstone a record it was never asked to retire")
+
+    ------------------------------------------------------------------
+    -- THE RESURRECTION GUARD — the half that makes this a retirement rather
+    -- than a local wipe. A tombstoned record arriving from ANYWHERE (a peer's
+    -- settings blob, a ShadowNetwork re-import, a restored SavedVariables file)
+    -- dies on the next login. Runs on every login, NOT marker-guarded.
+    ------------------------------------------------------------------
+    db.coordinateOverrides = Store.DefaultCoordinateOverrides()   -- "they came back"
+    db.coordinateOverrides[#db.coordinateOverrides + 1] =
+        { name = "Brand New", minX = 0, maxX = 0.1, minY = 0, maxY = 0.1, label = "New" }
+    data.manualLocations["Poonyx-Whitemane"] = "Orgrimmar"        -- so did this one
+    data.manualLocations["Never-Seen"] = "Ironforge"              -- but this is new
+
+    local killed = Store.PruneTombstonedLocations(db, data)
+    ck(killed == 4, "the guard kills the 3 resurrected rules + 1 manual (got " .. tostring(killed) .. ")")
+    ck(#db.coordinateOverrides == 1 and db.coordinateOverrides[1].name == "Brand New",
+        "a record that was never tombstoned SURVIVES the guard")
+    ck(data.manualLocations["Poonyx-Whitemane"] == nil, "the resurrected manual location dies")
+    ck(data.manualLocations["Never-Seen"] == "Ironforge", "an untombstoned one survives")
+    ck(Store.PruneTombstonedLocations(db, data) == 0, "the guard is idempotent")
+
+    -- MUTATION GUARD: a marker-guarded prune (the easy mistake — reusing the
+    -- retirement's own marker) would let every resurrected record through.
+    -- Assert the guard runs even though `locationsRetired` is long since true.
+    ck(data.locationsRetired == true and killed > 0,
+        "mutation: the prune must run WITH the marker already set, not skip on it")
+
+    -- Robustness.
+    Store.PruneTombstonedLocations(nil, nil)
+    Store.PruneTombstonedLocations({}, {})
+    Store.RetireLocations(nil, nil)
+    Store.RetireLocations({ coordinateOverrides = "nope" }, { manualLocations = 5 })
+    ck(true, "the location passes survive malformed input")
+
+    -- An unnamed hand-made rule is still individually identifiable (fingerprint).
+    local db2 = { coordinateOverrides = { { minX = 0.25, maxX = 0.27, minY = 0.5, maxY = 0.52 } } }
+    local data2 = {}
+    Store.RetireLocations(db2, data2)
+    ck(next(data2.locationTombstones) ~= nil, "an unnamed rule still mints a tombstone")
+
+    ------------------------------------------------------------------
+    -- CLASS COLORS (item 1, colors half).
+    ------------------------------------------------------------------
+    -- The owner's real palette overrides, transcribed from his live file.
+    local cdb = { classColors = { WARRIOR = "C69B6D", HUNTER = "A8D170", MAGE = "3DC7EB",
+                                  SHAMAN = "0070DD", PRIEST = "FFFFFF", WARLOCK = "8788EE",
+                                  DRUID = "FF7A08", ROGUE = "FFF468", PALADIN = "F28AB8" } }
+    local moved = Store.RetireClassColors(cdb)
+    ck(moved == 9, "all nine overrides are retired (got " .. tostring(moved) .. ")")
+    ck(next(cdb.classColors) == nil, "the live override table is cleared")
+    ck(cdb.classColorsLegacy.WARRIOR == "C69B6D", "the overrides are parked verbatim")
+    ck(cdb.classColorsRetired == true, "the marker is stamped")
+    cdb.classColors.WARRIOR = "000000"
+    ck(Store.RetireClassColors(cdb) == 0, "the pass never runs twice")
+    ck(cdb.classColorsLegacy.WARRIOR == "C69B6D", "...and never re-parks over the first park")
+    -- The display palette is the shipped one and is ALWAYS resolvable.
+    ck(type(Store.DEFAULT_CLASS_COLORS) == "table", "DEFAULT_CLASS_COLORS exists")
+    for _, c in ipairs(Store.CLASS_ORDER) do
+        ck(type(Store.DEFAULT_CLASS_COLORS[c]) == "string" and #Store.DEFAULT_CLASS_COLORS[c] == 6,
+            ("DEFAULT_CLASS_COLORS names %s with a 6-digit hex"):format(c))
+    end
+    Store.RetireClassColors(nil)
+    ck(true, "RetireClassColors survives nil")
+
+    ------------------------------------------------------------------
+    -- DURATION THRESHOLDS (item 4, storage half).
+    ------------------------------------------------------------------
+    local tdb = ownerFixtureDB()
+    local parked = Store.RetireAuraThresholds(tdb)
+    ck(parked == 2, "both faction threshold tables are parked (got " .. tostring(parked) .. ")")
+    ck(next(tdb.factionSettings.Horde.auraOpts.thresholds) == nil, "Horde thresholds cleared")
+    ck(next(tdb.factionSettings.Alliance.auraOpts.thresholds) == nil, "Alliance thresholds cleared")
+    ck(tdb.factionSettings.Horde.auraOpts.thresholdsRetired.ony.normal == 5700,
+        "the Horde thresholds are parked verbatim (rollback path)")
+    ck(tdb.auraThresholdsRetired == true, "the marker is stamped")
+    tdb.factionSettings.Horde.auraOpts.thresholds.ony = { normal = 1, minimum = 1 }
+    ck(Store.RetireAuraThresholds(tdb) == 0, "the pass never runs twice")
+    ck(tdb.factionSettings.Horde.auraOpts.thresholds.ony.normal == 1,
+        "...so a later write is not re-cleared")
+    Store.RetireAuraThresholds(nil)
+    ck(true, "RetireAuraThresholds survives nil")
+
+    ------------------------------------------------------------------
+    -- THE DEFAULTS TREE must not resurrect any of it. This is the trap the
+    -- whole retirement turns on: applyDefaults recurses into tables and fills
+    -- absent leaf keys, so a seeded array/table in defaultSettings() would
+    -- re-grow index 1..3 (or all nine hexes) on the very next login.
+    ------------------------------------------------------------------
+    local d = defaultSettings()
+    ck(type(d.coordinateOverrides) == "table" and #d.coordinateOverrides == 0,
+        "defaultSettings ships NO coordinate overrides")
+    ck(type(d.classColors) == "table" and next(d.classColors) == nil,
+        "defaultSettings ships NO class-color overrides")
+    -- Prove it end to end: retire, then re-apply defaults exactly as Init does.
+    local live = { coordinateOverrides = Store.DefaultCoordinateOverrides(),
+                   classColors = { WARRIOR = "C69B6D" } }
+    local ldata = { manualLocations = {} }
+    Store.RetireLocations(live, ldata)
+    Store.RetireClassColors(live)
+    Store.ApplyDefaults(live, defaultSettings())
+    ck(#live.coordinateOverrides == 0,
+        "applyDefaults does NOT resurrect the retired coordinate rules")
+    ck(next(live.classColors) == nil,
+        "applyDefaults does NOT resurrect the retired class colors")
+end
+
+----------------------------------------------------------------------
 -- Storage migration chain (AT-RISK-3): stamp-don't-wipe, never downgrade,
 -- stop-on-gap; the character graph (accounts + attunements) and tombstones
 -- (deletedAIDs) survive every path, and additive defaults still seed.
@@ -4909,6 +5735,8 @@ function Store.RunSelfTests(verbose)
         { name = "bags import marker (NW-2)", fn = testBagsImportMarker },
         { name = "alert migration", fn = testAlertMigration },
         { name = "aura seeds",      fn = testAuraSeeds },
+        { name = "global aura-rule merge (settings rework item 6)", fn = testAuraRulesMerge },
+        { name = "retirements: locations / colors / thresholds (items 1+4)", fn = testRetirements },
         { name = "autosummon seeds", fn = testAutoSummonSeeds },
         { name = "songflower migration", fn = testSongflowerMigration },
         { name = "notes",           fn = testNotes },
