@@ -2684,6 +2684,28 @@ local function testInstancesUI(fails)
         "rest: absent xp data renders the em-dash on BOTH cells (designed path)")
     ck(byName["HasData-R"].xpText == "25%" and byName["HasData-R"].restedText == "50%",
         "rest: present xp data formats normally -- so the em-dash is data, not a bug")
+
+    -- ── THE LOGOUT-WIPE SHAPE (owner: every character em-dashed) ────────────────
+    -- The capture bug did not leave the fields ABSENT, it left them PRESENT AND
+    -- ZERO — a sub-60 record carrying xp/xpMax/restedXP = 0/0/0, which is what the
+    -- teardown capture persisted for every character. That shape must still render
+    -- the em-dash (0 XP out of 0 is not a percentage), and the row must not divide
+    -- by zero on the way. Pinned so the view's half of the contract is explicit:
+    -- the view was always right, and this shape is the fingerprint of a capture-side
+    -- regression, NOT of a formatting one. See tracker.lua testXPCapture.
+    local rWiped = IU.ExpRow({ level = 41, xp = 0, xpMax = 0, restedXP = 0 }, "Wiped-R", "MAGE")
+    ck(rWiped.levelText == "41", "wiped: LVL still renders (which is what the owner saw)")
+    ck(rWiped.xpText == EM and rWiped.restedText == EM,
+        "wiped: a zeroed sub-60 trio renders em-dash on XP and REST, no divide-by-zero")
+
+    -- ...and the distinction that makes the em-dash meaningful: a rested pool of
+    -- ZERO alongside a VALID xpMax is data, and reads "0%", never an em-dash. If
+    -- these two collapsed together the view could not tell "not captured" from
+    -- "captured, and this character has spent its rest".
+    local rZeroRest = IU.ExpRow({ level = 41, xp = 1200, xpMax = 3600, restedXP = 0 }, "Spent-R", "MAGE")
+    ck(rZeroRest.xpText == "33%", "zero-rest: XP still formats from a valid xpMax")
+    ck(rZeroRest.restedText == "0%" and rZeroRest.restedToken == "muted",
+        "zero-rest: 0 rested with a valid xpMax is '0%', NOT the absent-data em-dash")
 end
 
 if ns.RegisterSelfTest then

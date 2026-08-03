@@ -3785,6 +3785,26 @@ local function testInboundSanityGuard(fails)
     ck(Store.SanitizeInboundRecord(nil) == 0, "nil record is a no-op")
     ck(Store.SanitizeInboundRecord("x") == 0, "non-table record is a no-op")
 
+    -- ---- XP / RESTED IS NEVER A LEVEL-IMPOSSIBLE CLAIM --------------------
+    -- The guard judges attunements and Dire Maul buffs. XP into the current level
+    -- and the rested pool are level-independent BY CONSTRUCTION (xpMax IS the
+    -- level), so there is nothing for the guard to disprove and nothing it may
+    -- touch. Pinned here because these are exactly the fields the instance log's
+    -- Rest view reads: a guard that quietly zeroed them would reproduce the
+    -- em-dash bug from the receive side after the capture side was fixed.
+    local xpRec = { level = 16, xp = 1200, xpMax = 3600, restedXP = 5400,
+                    attunements = { MC = true } }
+    Store.SanitizeInboundRecord(xpRec)
+    ck(xpRec.xp == 1200 and xpRec.xpMax == 3600 and xpRec.restedXP == 5400,
+       "sanitizer leaves xp/xpMax/restedXP alone even while stripping the record")
+    ck(Store.RestedPercent(xpRec) == 150,
+       "a sanitized record still yields its rested percent")
+    -- A rested pool at 150% of a LOW level is legal (rest accrues while parked),
+    -- so it must not read as "too much for that level" and get clipped.
+    local parked = { level = 2, xp = 10, xpMax = 900, restedXP = 1350 }
+    ck(Store.SanitizeInboundRecord(parked) == 0, "a parked low-level's full rest pool strips nothing")
+    ck(parked.restedXP == 1350, "a level-2's 150% rested pool is legal data")
+
     -- ---- END TO END on the real write path --------------------------------
     -- The impossible fields are gone, but the RECORD still lands: stripping a
     -- field must never cost the peer its presence on the roster.

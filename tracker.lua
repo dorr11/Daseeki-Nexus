@@ -849,18 +849,56 @@ end
 -- globals — UnitXP / UnitXPMax are already used live in instances.lua on 11509,
 -- GetXPExhaustion is the stock rested-pool global. Values ride the u32 wire fields
 -- (see protocol.lua EncodeCharacter) which clamp to the u32 range.
+--
+-- ── THE LOGOUT WIPE (owner: "every character shows — for XP and REST") ────────
+--
+-- This function used to write UNCONDITIONALLY, and it is called from the same
+-- Tracker.Capture that PLAYER_LEAVING_WORLD and PLAYER_LOGOUT fire SYNCHRONOUSLY
+-- and FORCED as the session's final act. During teardown the unit APIs are cold —
+-- exactly the condition the A17.2 latch above exists for, and which captureLocation
+-- / captureCooldowns / preserveSlots / captureDMF all already consult. UnitXPMax
+-- reads 0 there, the old "defensive" branch below turned that cold read into
+-- 0/0/0, and WriteSelfCharacter persisted it. Since the LAST write of every
+-- session was that teardown capture, what the SavedVariables held on the next
+-- login was ALWAYS 0/0/0 — for every character, no matter how much real XP the
+-- mid-session captures had written moments earlier. xpMax 0 makes
+-- Store.RestedPercent nil and InstancesUI.ExpRow render the em-dash, which is the
+-- entire reported bug. (Proof in the owner's live store: peers held Puucons at
+-- ownerEpoch ...304 with a real 100/400/600 from a mid-session push, while that
+-- character's OWN account held the same session 93s later at ...397 zeroed.)
+--
+-- TWO RULES, both "freeze, never wipe":
+--   1. TEARDOWN — do not write at all. The record keeps the last known-good
+--      values, which is what the whole logout flush is supposed to preserve.
+--      PLAYER_LEAVING_WORLD also fires before every ORDINARY loading screen, so
+--      this covers zone and instance transitions too.
+--   2. A COLD xpMax ON A SUB-60 — every level below 60 has a non-zero XP
+--      requirement, so xpMax <= 0 on a sub-60 character is not a fact about the
+--      character, it is proof the API is not warm yet (a fresh login, mid-loading
+--      screen). Freeze rather than zero. This also removes any need for a separate
+--      ENTERING_WORLD grace window here: a cold read declares itself.
+--
+-- 0/0/0 is still written for a genuine level >= 60 — there the zero IS the fact.
 local function captureXP(rec)
+    -- Rule 1: teardown freeze (A17.2 latch, same gate captureLocation uses).
+    if Tracker.IsTeardown() then return end
+
     local level = rec.level or (UnitLevel and UnitLevel("player")) or 0
-    if level >= 60 or not (UnitXP and UnitXPMax) then
+    if level >= 60 then
+        -- A max-level character earns no XP: the zeros are honest data.
         rec.xp, rec.xpMax, rec.restedXP = 0, 0, 0
         return
     end
+    -- No API at all (headless / a stripped client): freeze, do not invent zeros.
+    if not (UnitXP and UnitXPMax) then return end
+
+    -- Rule 2: a sub-60 xpMax of 0 is a cold read, not "no XP". Freeze the trio.
+    local xpMax = UnitXPMax("player") or 0
+    if xpMax <= 0 then return end
+
     rec.xp       = UnitXP("player") or 0
-    rec.xpMax    = UnitXPMax("player") or 0
+    rec.xpMax    = xpMax
     rec.restedXP = (GetXPExhaustion and GetXPExhaustion()) or 0
-    -- Defensive: if xpMax reads 0 below 60 (API not yet warm on a fresh login),
-    -- zero the trio so Store.RestedPercent yields nil rather than dividing by 0.
-    if rec.xpMax == 0 then rec.xp, rec.restedXP = 0, 0 end
 end
 
 -- Resting / PvP / instance flags.
@@ -3443,6 +3481,169 @@ local function testTeardownLatch(fails)
     if not ok then fails[#fails + 1] = "error in latch fixtures: " .. tostring(err) end
 end
 
+----------------------------------------------------------------------
+-- XP / RESTED CAPTURE — the fields the instance log's Rest view reads, and the
+-- LOGOUT WIPE that emptied them (owner: "XP and REST show — for every character").
+--
+-- Driven end to end through the real Tracker.Capture, not captureXP in isolation:
+-- the defect was never in the arithmetic, it was that the session's FINAL capture
+-- — fired synchronously and forced by PLAYER_LEAVING_WORLD / PLAYER_LOGOUT — wrote
+-- cold-API zeros over good data and that write is the one SavedVariables keeps.
+-- Testing the helper alone would have passed while the bug shipped.
+----------------------------------------------------------------------
+local function testXPCapture(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+
+    local saved = {
+        auras = _G.C_UnitAuras, cont = _G.C_Container, item = _G.C_Item,
+        map = _G.C_Map, getTime = _G.GetTime,
+        resting = _G.IsResting, pvp = _G.UnitIsPVP, ffa = _G.UnitIsPVPFreeForAll,
+        inInst = _G.IsInInstance, savedInst = _G.GetNumSavedInstances,
+        now = ns.Store.Now, settings = ns.Store.GetSettings,
+        ensure = ns.Store.EnsureSelfCharacter, write = ns.Store.WriteSelfCharacter,
+        loggedIn = ns.state.loggedIn,
+        sub = _G.GetSubZoneText, mini = _G.GetMinimapZoneText,
+        level = _G.UnitLevel, xp = _G.UnitXP, xpMax = _G.UnitXPMax,
+        exhaust = _G.GetXPExhaustion,
+    }
+    local savedLatch = {
+        Tracker._leavingWorld, Tracker._loggingOut, Tracker._enteredWorldAt,
+        Tracker._auraCapturedAt, Tracker._cdCapturedAt,
+        Tracker._lastPushHash, Tracker._lastPushAt,
+    }
+
+    local frameNow, epochNow = 30000, 1700000000
+    _G.GetTime   = function() return frameNow end
+    ns.Store.Now = function() return epochNow end
+    ns.state.loggedIn = true
+
+    _G.C_UnitAuras = { GetBuffDataByIndex = function() return nil end }
+    _G.C_Container = { GetItemCooldown = function() return 0, 0, 1 end }
+    _G.C_Item = { GetItemCount = function() return 0 end }
+    _G.C_Map  = { GetBestMapForUnit = function() return nil end,
+                  GetPlayerMapPosition = function() return nil end }
+    _G.IsResting = function() return true end
+    _G.UnitIsPVP = function() return false end
+    _G.UnitIsPVPFreeForAll = function() return false end
+    _G.IsInInstance = function() return false, "none" end
+    _G.GetNumSavedInstances = function() return 0 end
+    _G.GetSubZoneText     = function() return "" end
+    _G.GetMinimapZoneText = function() return "" end
+    ns.Store.GetSettings = function() return { coordinateOverrides = {} } end
+
+    -- One durable record across captures, exactly as the game holds it.
+    local rec = {}
+    ns.Store.EnsureSelfCharacter = function() return rec end
+    ns.Store.WriteSelfCharacter  = function() end
+
+    -- The live XP APIs, swappable between warm and cold.
+    local lvl, xpNow, xpMaxNow, restedNow = 41, 50000, 155000, 232500
+    _G.UnitLevel        = function() return lvl end
+    _G.UnitXP           = function() return xpNow end
+    _G.UnitXPMax        = function() return xpMaxNow end
+    _G.GetXPExhaustion  = function() return restedNow end
+    -- Teardown / loading-screen cold reads: the unit APIs answer 0 / nil.
+    local function goCold() xpNow, xpMaxNow, restedNow = 0, 0, nil end
+    -- ...or GARBAGE. The A17.2 header's word for teardown reads is "nothing OR
+    -- garbage", and every other capture piece freezes rather than sort the two
+    -- apart. These non-zero values slip past the cold-read rule, so they are what
+    -- isolate the TEARDOWN rule from it — one mutant per rule.
+    local function goGarbage() xpNow, xpMaxNow, restedNow = 7, 11, 13 end
+    local function goWarm(x, m, r) xpNow, xpMaxNow, restedNow = x, m, r end
+
+    local ok, err = pcall(function()
+        Tracker._leavingWorld, Tracker._loggingOut = false, false
+        Tracker._enteredWorldAt = frameNow - 60
+        Tracker._auraCapturedAt, Tracker._cdCapturedAt = nil, nil
+        Tracker._lastPushHash, Tracker._lastPushAt = nil, 0
+
+        -- 1) A normal in-session capture WRITES the three fields. This is the
+        --    contract the Rest view consumes; without it every row is an em-dash.
+        Tracker.Capture()
+        ck(rec.xp == 50000, "capture writes xp (got " .. tostring(rec.xp) .. ")")
+        ck(rec.xpMax == 155000, "capture writes xpMax (got " .. tostring(rec.xpMax) .. ")")
+        ck(rec.restedXP == 232500, "capture writes restedXP (got " .. tostring(rec.restedXP) .. ")")
+        -- The view's actual gate: RestedPercent must produce a number, not nil.
+        ck(ns.Store.RestedPercent(rec) == 150,
+           "captured record yields a rested percent (got " .. tostring(ns.Store.RestedPercent(rec)) .. ")")
+
+        -- 2) THE REGRESSION — PLAYER_LEAVING_WORLD. The latch is set; the forced
+        --    teardown capture must NOT touch the trio. This is the write
+        --    SavedVariables persists, so a failure here is precisely the reported
+        --    bug. Asserted with GARBAGE rather than zeros on purpose: zeros are
+        --    also refused by the cold-read rule, so only a non-zero teardown read
+        --    can prove the TEARDOWN gate itself is present.
+        goGarbage()
+        Tracker._leavingWorld = true
+        Tracker.Capture(true)
+        ck(rec.xp == 50000 and rec.xpMax == 155000 and rec.restedXP == 232500,
+           "leaving-world teardown must FREEZE xp/xpMax/restedXP (got "
+           .. tostring(rec.xp) .. "/" .. tostring(rec.xpMax) .. "/" .. tostring(rec.restedXP) .. ")")
+
+        -- 3) Same for PLAYER_LOGOUT, the terminal latch — the last capture of the
+        --    session and the one that used to zero every character.
+        Tracker._leavingWorld = false
+        Tracker._loggingOut = true
+        Tracker.Capture(true)
+        ck(rec.xp == 50000 and rec.xpMax == 155000 and rec.restedXP == 232500,
+           "logout teardown must FREEZE xp/xpMax/restedXP (got "
+           .. tostring(rec.xp) .. "/" .. tostring(rec.xpMax) .. "/" .. tostring(rec.restedXP) .. ")")
+        ck(ns.Store.RestedPercent(rec) == 150,
+           "the rested percent survives the logout capture (the whole point)")
+
+        -- 3b) And the cold-zero flavour of teardown — the shape actually found in
+        --     the owner's store — is refused too, by whichever rule gets there first.
+        goCold()
+        Tracker.Capture(true)
+        ck(rec.xp == 50000 and rec.xpMax == 155000 and rec.restedXP == 232500,
+           "a cold-zero logout capture must not wipe the trio either")
+
+        -- 4) A COLD xpMax with NO teardown latch — a fresh login before the unit
+        --    APIs warm up. xpMax 0 on a sub-60 is impossible, so it is evidence of
+        --    a cold API, never of "no XP". Freeze, do not wipe. (This is the case
+        --    the teardown gate does NOT cover, so it pins the second rule.)
+        Tracker._loggingOut = false
+        Tracker.Capture()
+        ck(rec.xp == 50000 and rec.xpMax == 155000 and rec.restedXP == 232500,
+           "a cold sub-60 xpMax must not wipe the stored trio")
+
+        -- 5) The freeze is not a one-way stick: a warm read updates as normal,
+        --    including a rested pool that has legitimately drained to 0.
+        goWarm(60000, 155000, 0)
+        Tracker.Capture()
+        ck(rec.xp == 60000 and rec.xpMax == 155000, "a warm read updates after a freeze")
+        ck(rec.restedXP == 0, "a genuinely drained rested pool writes 0")
+        ck(ns.Store.RestedPercent(rec) == 0,
+           "0 rested with a valid xpMax is 0%, NOT absent data")
+
+        -- 6) Level 60: the zeros are the fact, not a cold read. Written honestly
+        --    even though the APIs are handing back live numbers.
+        lvl = 60
+        goWarm(12345, 67890, 4242)
+        Tracker.Capture()
+        ck(rec.xp == 0 and rec.xpMax == 0 and rec.restedXP == 0,
+           "a level-60 capture zeroes the trio honestly (got "
+           .. tostring(rec.xp) .. "/" .. tostring(rec.xpMax) .. "/" .. tostring(rec.restedXP) .. ")")
+        ck(ns.Store.RestedPercent(rec) == nil, "a level 60 has no rested percent")
+    end)
+
+    _G.C_UnitAuras, _G.C_Container, _G.C_Item, _G.C_Map = saved.auras, saved.cont, saved.item, saved.map
+    _G.GetTime, _G.IsResting = saved.getTime, saved.resting
+    _G.UnitIsPVP, _G.UnitIsPVPFreeForAll = saved.pvp, saved.ffa
+    _G.IsInInstance, _G.GetNumSavedInstances = saved.inInst, saved.savedInst
+    _G.GetSubZoneText, _G.GetMinimapZoneText = saved.sub, saved.mini
+    _G.UnitLevel, _G.UnitXP, _G.UnitXPMax = saved.level, saved.xp, saved.xpMax
+    _G.GetXPExhaustion = saved.exhaust
+    ns.Store.Now, ns.Store.GetSettings = saved.now, saved.settings
+    ns.Store.EnsureSelfCharacter, ns.Store.WriteSelfCharacter = saved.ensure, saved.write
+    ns.state.loggedIn = saved.loggedIn
+    Tracker._leavingWorld, Tracker._loggingOut, Tracker._enteredWorldAt = savedLatch[1], savedLatch[2], savedLatch[3]
+    Tracker._auraCapturedAt, Tracker._cdCapturedAt = savedLatch[4], savedLatch[5]
+    Tracker._lastPushHash, Tracker._lastPushAt = savedLatch[6], savedLatch[7]
+
+    if not ok then fails[#fails + 1] = "error in xp-capture fixtures: " .. tostring(err) end
+end
+
 -- A10.1 — the change filter, end to end through the real Tracker.Capture.
 -- Counts actual STATE_CHANGED fires, so it proves the MESH signal is gated and
 -- (just as important) that the local store write is NOT.
@@ -4644,7 +4845,12 @@ local function testImpossibleRepair(fails)
     local function real(d) return { duration = d,   option = 0, source = 2 } end  -- genuine
 
     local function mkBucket()
-        local wyx = { level = 16, auraStates = {} }
+        -- Wyx and Parked carry real XP/rested data as well as the fabricated
+        -- slots: the repair pass rewrites both records, and must come nowhere
+        -- near the trio the Rest view reads. (The XP fields have their own
+        -- capture-side story — see testXPCapture — and no repair can know a
+        -- parked alt's XP, so touching them here could only ever destroy data.)
+        local wyx = { level = 16, auraStates = {}, xp = 1200, xpMax = 3600, restedXP = 5400 }
         for s = 1, 10 do wyx.auraStates[s] = ph() end
         local cep = { level = 20, auraStates = { [1] = { duration = 4074, option = 0, source = 0 } } }
         for s = 2, 10 do cep.auraStates[s] = ph() end
@@ -4653,7 +4859,8 @@ local function testImpossibleRepair(fails)
                       attunements = { MC = true, BWL = true, Ony = true, Naxx = true } }
         local zaan = { level = 60, auraStates = { [1] = zero(), [3] = zero(), [9] = zero(),
                                                   [2] = real(7199), [7] = real(7132) } }
-        local lowAtt = { level = 16, attunements = { MC = true, Naxx = true, ZG = true } }
+        local lowAtt = { level = 16, attunements = { MC = true, Naxx = true, ZG = true },
+                         xp = 900, xpMax = 3600, restedXP = 0 }
         return { characters = { Wyx = wyx, Ceporah = cep, Phoenix = pho, Zaan = zaan },
                  homeless   = { Parked = lowAtt } }
     end
@@ -4688,6 +4895,15 @@ local function testImpossibleRepair(fails)
     ck(b.homeless.Parked.attunements.ZG == true,
        "repair: ungated raids survive the attunement demotion")
     ck(touched == 3, "repair: exactly three records changed (Wyx, Ceporah, Parked)")
+    -- The repair rewrites Wyx and Parked, and must leave the Rest view's fields alone.
+    ck(b.characters.Wyx.xp == 1200 and b.characters.Wyx.xpMax == 3600
+       and b.characters.Wyx.restedXP == 5400,
+       "repair: xp/xpMax/restedXP survive a record the pass rewrites (Wyx)")
+    ck(b.homeless.Parked.xp == 900 and b.homeless.Parked.xpMax == 3600
+       and b.homeless.Parked.restedXP == 0,
+       "repair: a 0 rested pool is DATA and is not confused for absence (Parked)")
+    ck(ns.Store.RestedPercent(b.characters.Wyx) == 150,
+       "repair: the repaired record still renders a rested percent")
     ck((counts.auraBlocks or 0) == 2, "repair: two records had fabricated slots")
     ck((counts.auraSlots or 0) == 19, "repair: 10 + 9 fabricated slots stripped")
     ck((counts.attune or 0) == 2, "repair: two impossible attunement flags demoted")
@@ -4908,6 +5124,7 @@ function Tracker.RunSelfTests(verbose)
         { name = "live aura matching (apostrophe matrix)", fn = testLiveAuraMatching },
         { name = "spell-ID matching (A6.4/A6.6)", fn = testSpellIDMatching },
         { name = "teardown latch + grace windows", fn = testTeardownLatch },
+        { name = "xp/rested capture + logout freeze", fn = testXPCapture },
         { name = "capture guards (A6.1/A6.2/A6.3/A17.2/A9.2)", fn = testCaptureGuards },
         { name = "boon cast lifecycle (A7.1/A7.2/A7.3/A7.4)", fn = testBoonCastLifecycle },
         { name = "boon tooltip reconciliation (A7.5)", fn = testBoonReconcile },
