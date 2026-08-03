@@ -950,7 +950,12 @@ function buildCoordPane(flow)
     act:Button({ text = "Add Location", width = 130, onClick = function()
         local rules = coordList()
         if #rules >= COORD_CAP then ns:Print("location limit is " .. COORD_CAP .. "."); return end
-        rules[#rules + 1] = { name = "", zone = "", label = "New Location",
+        -- A new rule is born UNSCOPED, so `zone` is omitted (nil) rather than "".
+        -- An empty string is not "no zone" to the coordinate matcher — it
+        -- compares unequal to every real zone name, so a rule stored that way
+        -- could never match anywhere, in any zone. The per-row "Here" button
+        -- stamps a real zone when the user wants the rule scoped to one.
+        rules[#rules + 1] = { name = "", label = "New Location",
                               minX = 0, maxX = 0.02, minY = 0, maxY = 0.02 }
         rebuild()
     end })
