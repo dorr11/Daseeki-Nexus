@@ -98,6 +98,13 @@ local BS_CLASSES   = { "WARRIOR", "ROGUE", "HUNTER" }
 -- Slip'kik's Savvy / DMT SP covers all 9 classes (same as Rend); defaults live
 -- in store.lua (physical = ignored, casters = optional), editable per faction.
 local SLIPKIK_CLASSES = { "WARRIOR", "PALADIN", "HUNTER", "ROGUE", "PRIEST", "SHAMAN", "MAGE", "WARLOCK", "DRUID" }
+-- Fengus' Ferocity / DMT AP — the melee attack-power tribute buff, and the
+-- mirror image of Slip'kik. Same all-9 roster; defaults live in store.lua
+-- (Store.CLASS_RULE_SEEDS.dmtAP: the six weapon classes required, Mage/Priest/
+-- Warlock ignored). Owner report: a mage was showing a red "Missing Fengus'
+-- Ferocity" because a threshold-bearing slot with no class rule is
+-- required-for-everyone.
+local FENGUS_CLASSES  = { "WARRIOR", "PALADIN", "HUNTER", "ROGUE", "PRIEST", "SHAMAN", "MAGE", "WARLOCK", "DRUID" }
 
 -- THE class-rule grid roster: one row per class-ruled buff the Auras page draws.
 -- `optKey` is the EXACT, CASE-SENSITIVE key this page writes into
@@ -117,6 +124,11 @@ local CLASS_RULE_GRIDS = {
     -- so it ships ignored for War/Rogue/Hunter and optional for casters.
     { optKey = "dmtSP",       classes = SLIPKIK_CLASSES,
       title = "Slip'kik's Savvy (DMT SP) — Required Classes" },
+    -- Fengus' Ferocity (DMT AP): the mirror of the row above — magic damage
+    -- dealers don't want attack power, so it ships required for the six weapon
+    -- classes and ignored for Mage/Priest/Warlock.
+    { optKey = "dmtAP",       classes = FENGUS_CLASSES,
+      title = "Fengus' Ferocity (DMT AP) — Required Classes" },
 }
 Options.CLASS_RULE_GRIDS = CLASS_RULE_GRIDS
 
@@ -1746,16 +1758,33 @@ function buildClassRuleGrid(flow, title, optKey, classes)
     local STATES = { "required", "optional", "ignored" }
     -- Lowercase colored pill text (round-3 item 31).
     local STATE_LABEL = { required = "required", optional = "optional", ignored = "ignored" }
-    local function getState(class)
-        local fs = FS(); if not fs then return "ignored" end
+    -- Resolve auraOpts[optKey] with its three buckets guaranteed to exist.
+    -- Store.SeedAuraDefaults installs every roster key at login (including the
+    -- back-filled new-aura maps), so this is belt-and-braces — but a raw
+    -- `o.required[class]` on a nil map is a hard Lua error that would take the
+    -- whole Auras page down, and a new roster entry is exactly when that map
+    -- can be missing. Creating the empty buckets here is additive and matches
+    -- what the seeder would have written for an untouched, all-ignored rule.
+    local function ruleMap(create)
+        local fs = FS(); if not fs or type(fs.auraOpts) ~= "table" then return nil end
         local o = fs.auraOpts[optKey]
+        if type(o) ~= "table" then
+            if not create then return nil end
+            o = {}; fs.auraOpts[optKey] = o
+        end
+        if type(o.required) ~= "table" then o.required = {} end
+        if type(o.optional) ~= "table" then o.optional = {} end
+        if type(o.ignored)  ~= "table" then o.ignored  = {} end
+        return o
+    end
+    local function getState(class)
+        local o = ruleMap(false); if not o then return "ignored" end
         if o.required[class] then return "required" end
         if o.optional[class] then return "optional" end
         return "ignored"
     end
     local function setState(class, st)
-        local fs = FS(); if not fs then return end
-        local o = fs.auraOpts[optKey]
+        local o = ruleMap(true); if not o then return end
         o.required[class], o.optional[class], o.ignored[class] = nil, nil, nil
         if st == "required" then o.required[class] = true
         elseif st == "optional" then o.optional[class] = true

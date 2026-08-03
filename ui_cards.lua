@@ -1267,6 +1267,31 @@ local function testCardsLogic(fails)
     ck(Cards.NeedsBuffs(bare) == true, "bare warrior needs buffs")
     ck(Cards.MissingCount(bare) >= 1, "bare warrior missing >= 1")
 
+    -- Fengus' Ferocity / DMT AP (slot 6) is class-ruled since round-24 (owner:
+    -- "magic damage dealers wouldn't want it"). The card's missing count is the
+    -- surface he read it on, so pin it here as well as on AuraRequirement:
+    -- a bare MAGE must not be charged for the melee attack-power buff, a bare
+    -- WARRIOR must. Counted by DIFFERENCE against a required-for-MAGE override,
+    -- so the assertion survives any future re-ordering of the other slots.
+    local AP_SLOT = 6
+    local bareMage = mkEntry("Mag-R", "1", { class = "MAGE" })
+    local mageBefore = Cards.MissingCount(bareMage)
+    ck(Dashboard.AuraRequirement(AP_SLOT, bareMage.rec, "Alliance") == false,
+       "card: dmtAP is non-applicable for a mage (not Missing, not in the tally)")
+    ck(Dashboard.AuraRequirement(AP_SLOT, bare.rec, "Alliance") == true,
+       "card: dmtAP IS applicable for a warrior")
+    local ap = ns.Store and ns.Store.GetFactionSettings
+               and ns.Store.GetFactionSettings("Alliance").auraOpts.dmtAP
+    if ap then
+        local pReq, pIgn = ap.required.MAGE, ap.ignored.MAGE
+        ap.ignored.MAGE = nil; ap.required.MAGE = true
+        ck(Cards.MissingCount(bareMage) == mageBefore + 1,
+           "card: requiring dmtAP for MAGE adds exactly one missing buff")
+        ap.required.MAGE = pReq; ap.ignored.MAGE = pIgn
+        ck(Cards.MissingCount(bareMage) == mageBefore,
+           "card: restoring the ignored default removes it again")
+    end
+
     -- AgoText compact + stale flag.
     local a1, s1 = Cards.AgoText({ lastDataUpdate = NOW - 120 }, NOW)
     ck(a1 == "2m" and s1 == false, "2m ago, not stale")

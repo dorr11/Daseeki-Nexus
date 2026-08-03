@@ -32,6 +32,19 @@
   releases. Clicking away still saves as before, and switching to another character while
   the box is still active saves the note to the character you actually wrote it for.
 
+- Fixed: **Fengus' Ferocity no longer reads as Missing on casters.** Fengus is the
+  Dire Maul tribute *attack power* buff, so a mage, priest or warlock has no use for
+  it — but the card counted it like any other world buff and showed a level 60 mage
+  "WORLD BUFFS · 7/8 HELD" with a red Missing tile. Fengus is now a per-class rule
+  like Slip'kik's Savvy and Rend: it ships **required** for Warrior, Paladin, Hunter,
+  Rogue, Shaman and Druid, and **ignored** (hidden, never counted) for Mage, Priest
+  and Warlock. Casters now read 7/7. A new "Fengus' Ferocity (DMT AP) — Required
+  Classes" grid on Settings → Auras lets you set any class to
+  required / optional / ignored per faction, exactly like the other rules.
+  Existing installs get the new defaults automatically on the next login — nothing to
+  re-tick — and if you had already set Fengus' classes by hand, your choices are kept.
+>>>>>>> e8f919c (fix(nexus/auras): Fengus' Ferocity is a per-class rule (casters stop reading Missing))
+
 - Fixed: **an old Daseeki Core could take the dashboard down with it.** Three places
   drew their divider rules with a Core 2.2.0 drawing call, unguarded — on an older
   Core that is a Lua error mid-build, and you lose the whole panel rather than one

@@ -329,11 +329,27 @@ Store.AURA_THRESHOLD_SEEDS = {
 --     the shipped default is self-documenting in the Auras page. Absence and
 --     an explicit `ignored` entry are behaviourally identical -- see
 --     Dashboard.ClassRuleState, which falls through to "ignored".
+--   DMT AP (Fengus' Ferocity) — OWNER, round-24: "magic damage dealers wouldn't
+--     want it, so it showing as missing on mage is incorrect." Fengus is the
+--     Dire Maul tribute MELEE attack-power buff (+200 AP, spellID 22817, aura
+--     slot 6 / thresholdKey "dmtAP"), so it is the exact mirror image of
+--     Slip'kik's Savvy: every weapon-swinging class REQUIRES it (Warrior,
+--     Paladin, Hunter, Rogue, Shaman, Druid) and the three pure casters
+--     (Mage, Priest, Warlock) IGNORE it — hidden, never a red "Missing", and
+--     never in the "N/N HELD" denominator. IGNORED (not optional) is the
+--     deliberate match for Slip'kik's non-required presentation: Slip'kik puts
+--     the classes that do not want it (War/Rogue/Hunter) in `ignored`, so
+--     Fengus puts its non-wanters there too. Owner-adjustable in the Auras page
+--     like every other rule.
 --   DMT SP (Slip'kik's Savvy) is NOT seeded here: the spec gives it no
 --     required/optional/ignored defaults, and our defaults tree already ships
 --     an owner-approved caster/physical split (see defaultFactionBlock).
 -- Both factions share these class rules (class expectations are not faction-
--- dependent; the Horde/Alliance split only affects thresholds).
+-- dependent; the Horde/Alliance split only affects thresholds). PALADIN and
+-- SHAMAN are written into BOTH faction tables — the class that faction cannot
+-- roll simply never matches a real character's classTag, and the Auras page
+-- draws all nine rows on both sides (only the Gossip page faction-filters).
+-- That is the shipped dmtSP/rend/battleShout convention; Fengus follows it.
 
 local function classMapSeed(required, otherState)
     local req, opt, ign = {}, {}, {}
@@ -350,6 +366,10 @@ end
 Store.CLASS_RULE_SEEDS = {
     rend        = classMapSeed({ "WARRIOR", "ROGUE" }, "optional"),
     battleShout = classMapSeed({ "WARRIOR", "ROGUE" }, "ignored"),
+    -- Fengus' Ferocity: the six melee/hybrid classes require it, Mage/Priest/
+    -- Warlock ignore it (see the note above).
+    dmtAP       = classMapSeed({ "WARRIOR", "PALADIN", "HUNTER", "ROGUE",
+                                 "SHAMAN", "DRUID" }, "ignored"),
 }
 
 -- True when a required/optional/ignored map carries no class at all.
@@ -377,17 +397,40 @@ local function copyPairs(src)
 end
 
 ----------------------------------------------------------------------
--- One-time seeding of aura thresholds + Rend/Battle Shout class rules.
+-- One-time seeding of aura thresholds + the class-ruled aura maps.
 --
 -- ADDITIVE ONLY, and sticky. For each faction:
---   * `auraOpts.defaultsApplied` already true -> do nothing at all. This is
---     what keeps a deleted threshold row or a demoted class deleted.
+--   * `auraOpts.defaultsApplied` already true -> the FIRST-RUN pass is skipped
+--     entirely. This is what keeps a deleted threshold row or a demoted class
+--     deleted.
 --   * thresholds table completely empty -> install all nine pairs.
 --     Non-empty (an older DB the owner already configured) -> left EXACTLY
 --     as-is; we never merge into a table the owner has touched.
---   * rend / battleShout maps with no class in any of the three buckets ->
---     install the seed. Any class already present -> left as-is.
---   * Then stamp defaultsApplied = true so this never runs again.
+--   * rend / battleShout / dmtAP maps with no class in any of the three
+--     buckets -> install the seed. Any class already present -> left as-is.
+--   * Then stamp defaultsApplied = true so the first-run pass never re-runs.
+--
+-- NEW-AURA BACK-FILL (round-24, Fengus' Ferocity). The sticky flag above is
+-- correct for auras that EXISTED when it was stamped, but it is the wrong
+-- answer for a class rule the roster gained afterwards: every already-installed
+-- SavedVariables file carries defaultsApplied = true, so a brand-new entry in
+-- CLASS_RULE_SEEDS would land on fresh installs only and every existing player
+-- would keep the "required for everyone" fallback (Dashboard.AuraRequirement
+-- treats a threshold-bearing slot with no rule map as required) — i.e. exactly
+-- the red "Missing Fengus' Ferocity" on a mage that this change exists to kill.
+--
+-- So a SECOND pass runs unconditionally, and it seeds a class-rule map only
+-- when `auraOpts[optKey]` is literally ABSENT (nil). Absent means "this install
+-- has never heard of this aura", which cannot be a user choice: the Auras page
+-- always writes through a real table, and a user who demotes every class to
+-- ignored still leaves the table (with populated `ignored`) behind. So this can
+-- add a rule the owner has never seen and can NEVER overwrite one he has
+-- touched — the additive-only house rule, held exactly.
+--
+-- Deliberately NOT done by putting dmtAP in defaultFactionBlock: applyDefaults
+-- recursively fills leaf keys on every login, so a tree-resident class map
+-- resurrects each class the owner un-ticks (the resurrect trap the thresholds
+-- comment in defaultFactionBlock already warns about).
 --
 -- Nothing is ever deleted or rewritten, so this satisfies the release-safety
 -- rule against destructive SavedVariables migrations. Safe to call repeatedly.
@@ -401,21 +444,30 @@ function Store.SeedAuraDefaults(db)
     for faction, seeds in pairs(Store.AURA_THRESHOLD_SEEDS) do
         local fs = fsAll[faction]
         local ao = type(fs) == "table" and fs.auraOpts or nil
-        if type(ao) == "table" and not ao.defaultsApplied then
-            -- Thresholds: only when genuinely unseeded (empty table).
-            if type(ao.thresholds) ~= "table" then ao.thresholds = {} end
-            if next(ao.thresholds) == nil then
-                for key, pair in pairs(seeds) do
-                    ao.thresholds[key] = { normal = pair.normal, minimum = pair.minimum }
+        if type(ao) == "table" then
+            if not ao.defaultsApplied then
+                -- Thresholds: only when genuinely unseeded (empty table).
+                if type(ao.thresholds) ~= "table" then ao.thresholds = {} end
+                if next(ao.thresholds) == nil then
+                    for key, pair in pairs(seeds) do
+                        ao.thresholds[key] = { normal = pair.normal, minimum = pair.minimum }
+                    end
                 end
+                -- Class rules: only when no class is configured in any bucket.
+                for optKey, seed in pairs(Store.CLASS_RULE_SEEDS) do
+                    if classMapEmpty(ao[optKey]) then
+                        ao[optKey] = copyPairs(seed)
+                    end
+                end
+                ao.defaultsApplied = true
             end
-            -- Class rules: only when no class is configured in any bucket.
+            -- New-aura back-fill (see the header): ABSENT map only, on every
+            -- run, stamped or not. Never touches a map that already exists.
             for optKey, seed in pairs(Store.CLASS_RULE_SEEDS) do
-                if classMapEmpty(ao[optKey]) then
+                if ao[optKey] == nil then
                     ao[optKey] = copyPairs(seed)
                 end
             end
-            ao.defaultsApplied = true
         end
     end
 end
@@ -3157,6 +3209,23 @@ local function testAuraSeeds(fails)
     -- dmtSP is NOT part of the seed pass (its defaults ship in the tree).
     ck(A.dmtSP.ignored.WARRIOR == true and A.dmtSP.optional.MAGE == true,
         "dmtSP defaults untouched by the seed pass")
+    -- dmtAP (Fengus' Ferocity) IS part of the seed pass — the mirror of dmtSP.
+    ck(type(A.dmtAP) == "table" and type(H.dmtAP) == "table",
+        "dmtAP class map seeded on both factions")
+    if type(A.dmtAP) == "table" and type(H.dmtAP) == "table" then
+        for _, c in ipairs({ "WARRIOR", "PALADIN", "HUNTER", "ROGUE", "SHAMAN", "DRUID" }) do
+            ck(A.dmtAP.required[c] == true, "dmtAP " .. c .. " required (Alliance)")
+            ck(H.dmtAP.required[c] == true, "dmtAP " .. c .. " required (Horde)")
+        end
+        for _, c in ipairs({ "MAGE", "PRIEST", "WARLOCK" }) do
+            ck(A.dmtAP.ignored[c] == true, "dmtAP " .. c .. " ignored (Alliance)")
+            ck(A.dmtAP.required[c] == nil, "dmtAP " .. c .. " NOT required (the owner bug)")
+            ck(H.dmtAP.ignored[c] == true, "dmtAP " .. c .. " ignored (Horde)")
+        end
+        ck(next(A.dmtAP.optional) == nil, "dmtAP: nothing optional (required or hidden)")
+        ck(A.dmtAP ~= H.dmtAP, "dmtAP faction maps are distinct objects")
+        ck(A.dmtAP ~= Store.CLASS_RULE_SEEDS.dmtAP, "dmtAP seeded map is a copy")
+    end
 
     ck(A.defaultsApplied == true and H.defaultsApplied == true,
         "defaultsApplied stamped on both factions")
@@ -3182,11 +3251,60 @@ local function testAuraSeeds(fails)
     A2.thresholds = { ony = { normal = 111, minimum = 22 } }
     A2.rend.required.MAGE = true
     A2.defaultsApplied = true
+    -- Stamp the Horde side too: a real already-installed SavedVariables file has
+    -- the flag on BOTH factions, and that is what makes the back-fill assertions
+    -- below a genuine migration test rather than a first-run one.
+    db2.factionSettings.Horde.auraOpts.defaultsApplied = true
     Store.SeedAuraDefaults(db2)
     ck(A2.thresholds.ony.normal == 111, "flag set: existing threshold untouched")
     ck(A2.thresholds.dmf == nil, "flag set: no new threshold rows added")
     ck(A2.rend.required.MAGE == true and A2.rend.required.WARRIOR == nil,
         "flag set: class map untouched")
+    -- NEW-AURA BACK-FILL (round-24). The flag correctly blocks the first-run
+    -- pass, but a class rule this install has NEVER SEEN must still arrive, or
+    -- every existing player keeps the required-for-everyone fallback — the red
+    -- "Missing Fengus' Ferocity" on a mage. This is the migration assertion:
+    -- the owner does not have to re-tick anything for the fix to take.
+    local A2ap = type(A2.dmtAP) == "table" and A2.dmtAP or nil
+    local H2ap = db2.factionSettings.Horde.auraOpts.dmtAP
+    H2ap = type(H2ap) == "table" and H2ap or nil
+    ck(A2ap ~= nil,
+        "flag set: a NEW class-ruled aura is back-filled onto an existing install")
+    ck(A2ap and A2ap.required.WARRIOR == true and A2ap.ignored.MAGE == true,
+        "flag set: the back-filled dmtAP carries the seeded buckets")
+    ck(A2ap and A2ap.required.MAGE == nil,
+        "flag set: back-filled dmtAP does not require MAGE")
+    ck(H2ap and H2ap.ignored.MAGE == true,
+        "flag set: the back-fill covers both faction tables")
+    ck(A2.thresholds.dmf == nil, "flag set: the back-fill adds NO threshold rows")
+
+    ------------------------------------------------------------------
+    -- 3b. USER OVERRIDE SURVIVES THE BACK-FILL. An auraOpts[optKey] table that
+    --     already exists is a choice the owner made (the Auras page always
+    --     writes a real table), so the back-fill must never look inside it.
+    ------------------------------------------------------------------
+    local db2b = { factionSettings = buildFactionSettings() }
+    local A2b = db2b.factionSettings.Alliance.auraOpts
+    A2b.defaultsApplied = true
+    A2b.dmtAP = { required = { MAGE = true }, optional = { DRUID = true },
+                  ignored = { WARRIOR = true } }
+    Store.SeedAuraDefaults(db2b)
+    ck(A2b.dmtAP.required.MAGE == true and A2b.dmtAP.optional.DRUID == true
+        and A2b.dmtAP.ignored.WARRIOR == true,
+        "override: an explicit dmtAP choice is not overwritten by the seed")
+    ck(A2b.dmtAP.required.WARRIOR == nil and A2b.dmtAP.required.DRUID == nil,
+        "override: the seed's own required set is NOT merged in")
+    -- An owner who demoted every class still made a choice: an existing map
+    -- with only `ignored` entries must not be treated as unseeded either.
+    A2b.dmtAP = { required = {}, optional = {}, ignored = { MAGE = true } }
+    Store.SeedAuraDefaults(db2b)
+    ck(next(A2b.dmtAP.required) == nil,
+        "override: an emptied dmtAP map is a choice, never re-seeded")
+    -- Idempotent: a second (and third) pass changes nothing.
+    local backfilled = db2b.factionSettings.Horde.auraOpts.dmtAP
+    Store.SeedAuraDefaults(db2b); Store.SeedAuraDefaults(db2b)
+    ck(db2b.factionSettings.Horde.auraOpts.dmtAP == backfilled,
+        "back-fill is idempotent (same table object after repeat calls)")
 
     ------------------------------------------------------------------
     -- 4. Legacy DB (no flag) that the owner already configured -> left alone,

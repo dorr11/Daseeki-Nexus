@@ -844,15 +844,17 @@ end
 -- on what a MISSING slot should look like.
 --
 -- Rules (spec §1):
---   * Rend (slot 2), Slip'kik's Savvy / DMT SP (slot 8) and Battle Shout
---     (slot 9) are governed by per-class rule maps
---     GetFactionSettings().auraOpts.{rend,dmtSP,battleShout}
+--   * Rend (slot 2), Fengus' Ferocity / DMT AP (slot 6), Slip'kik's Savvy /
+--     DMT SP (slot 8) and Battle Shout (slot 9) are governed by per-class rule
+--     maps GetFactionSettings().auraOpts.{rend,dmtAP,dmtSP,battleShout}
 --     {required|optional|ignored}[class] (see CLASS_RULED_KEYS). Ignored
 --     classes are non-applicable (hidden); optional = greyed-no-border when
 --     missing; required = danger border / red "Missing". Slip'kik defaults
 --     physical classes (War/Rogue/Hunter) to ignored, casters to optional;
---     Battle Shout ships Warrior/Rogue required and every other class ignored.
---   * Every other threshold-bearing world buff (Ony/ZG/Songflower/DMF/DMT AP/
+--     Fengus is its mirror (six weapon classes required, Mage/Priest/Warlock
+--     ignored); Battle Shout ships Warrior/Rogue required and every other
+--     class ignored.
+--   * Every other threshold-bearing world buff (Ony/ZG/Songflower/DMF/
 --     DMT Stam) is required-by-default: applicable + "required" for everyone.
 --   * The tail slot without a threshold key (the seasonal Fire Festival Fury)
 --     is OPTIONAL and treated as non-applicable when ABSENT, so it collapses
@@ -884,7 +886,15 @@ end
 -- display reads a different one, and the rule can never fire. Exported so the
 -- "options" suite can assert the write-key set and this read-key set are
 -- identical strings in BOTH directions.
-local CLASS_RULED_KEYS = { rend = true, dmtSP = true, battleShout = true }
+--
+-- dmtAP (Fengus' Ferocity, slot 6) is the FOURTH, added round-24 on owner
+-- report: "magic damage dealers wouldn't want it, so it showing as missing on
+-- mage is incorrect." Fengus is the tribute MELEE attack-power buff, so it is
+-- Slip'kik's mirror — Store.CLASS_RULE_SEEDS.dmtAP requires it for the six
+-- weapon classes and IGNORES it for Mage/Priest/Warlock. Without this entry the
+-- slot is threshold-bearing and therefore required-for-everyone, which is the
+-- red "Missing" tile on a mage card and the inflated "N/N HELD" denominator.
+local CLASS_RULED_KEYS = { rend = true, dmtSP = true, battleShout = true, dmtAP = true }
 Dashboard.CLASS_RULED_KEYS = CLASS_RULED_KEYS
 
 -- Class rule state for an aura opt map ("rend"/"battleShout"/"dmtSP") on a faction.
@@ -1630,6 +1640,61 @@ local function testAuraClassRules(fails)
     -- A classless record must not be treated as required either.
     ck(Dashboard.AuraRequirement(BS_SLOT, {}, FAC) == false,
        "battleShout with no classTag -> non-applicable, never required")
+
+    -- ---- Fengus' Ferocity / DMT AP (slot 6) class-ruling matrix -------------
+    -- OWNER BUG, round-24: a level-60 MAGE card read "WORLD BUFFS · 7/8 HELD"
+    -- with Fengus' Ferocity = Missing. Slot 6 carries a thresholdKey, and a
+    -- threshold-bearing slot with no class rule is required-for-everyone — so
+    -- the melee attack-power buff was red-flagged on every caster in the
+    -- roster. These assertions are the tripwire for both halves of the fix
+    -- (CLASS_RULED_KEYS.dmtAP above + Store.CLASS_RULE_SEEDS.dmtAP).
+    local AP_SLOT = 6
+    for _, c in ipairs({ "WARRIOR", "PALADIN", "HUNTER", "ROGUE", "SHAMAN", "DRUID" }) do
+        local aA, rA = Dashboard.AuraRequirement(AP_SLOT, { classTag = c }, FAC)
+        ck(aA == true and rA == "required",
+           ("dmtAP seeded default: %s is applicable+required"):format(c))
+    end
+    for _, c in ipairs({ "MAGE", "PRIEST", "WARLOCK" }) do
+        ck(Dashboard.AuraRequirement(AP_SLOT, { classTag = c }, FAC) == false,
+           ("dmtAP seeded default: %s is IGNORED (no red Missing tile)"):format(c))
+    end
+    -- Same answer on the Horde table (class rules are faction-independent).
+    ck(Dashboard.AuraRequirement(AP_SLOT, { classTag = "MAGE" }, "Horde") == false,
+       "dmtAP Horde mage is IGNORED too")
+    ck(select(2, Dashboard.AuraRequirement(AP_SLOT, { classTag = "SHAMAN" }, "Horde")) == "required",
+       "dmtAP Horde shaman is required")
+    ck(Dashboard.AuraRequirement(AP_SLOT, {}, FAC) == false,
+       "dmtAP with no classTag -> non-applicable, never required")
+    -- The owner can re-tick it like any other rule (Auras page write path).
+    local ap = ns.Store.GetFactionSettings(FAC).auraOpts.dmtAP
+    if ap then
+        local pReq, pIgn = ap.required.MAGE, ap.ignored.MAGE
+        ap.ignored.MAGE = nil; ap.required.MAGE = true
+        local aM2, rM2 = Dashboard.AuraRequirement(AP_SLOT, { classTag = "MAGE" }, FAC)
+        ck(aM2 == true and rM2 == "required",
+           "dmtAP is user-overridable: Mage re-ticked required reads back red")
+        ap.required.MAGE = pReq; ap.ignored.MAGE = pIgn   -- restore defaults
+    end
+
+    -- ---- "N/N HELD" denominator (the number the owner actually saw) --------
+    -- The detail pane counts a row only when BuffTileState says shown, and for
+    -- an absent buff that is exactly AuraRequirement's applicable flag. Count
+    -- it the same way here for a bare (no buffs at all) character of each class
+    -- so the denominator is pinned headlessly, without touching ui_detail.lua.
+    local function shownWhenBare(classTag, faction)
+        local n = 0
+        for _, slot in ipairs(Dashboard.AURA_DISPLAY_ORDER or {}) do
+            -- The DMF row renders even when absent (display-order contract), so
+            -- it is counted regardless of applicability, mirroring BuffTileState.
+            local meta = Dashboard.AURA_META[slot]
+            local appl = Dashboard.AuraRequirement(slot, { classTag = classTag }, faction)
+            if appl or (meta and meta.key == "dmf") then n = n + 1 end
+        end
+        return n
+    end
+    local mageShown, warShown = shownWhenBare("MAGE", FAC), shownWhenBare("WARRIOR", FAC)
+    ck(mageShown == 7, ("bare mage shows 7 buff rows (0/7 HELD), got " .. mageShown))
+    ck(warShown  == 8, ("bare warrior shows 8 buff rows (0/8 HELD), got " .. warShown))
 end
 
 -- Self-test: AURA_META agrees with the TRACKER's slot map (drift guard).
