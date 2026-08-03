@@ -495,16 +495,23 @@ end
 -- headless suite can assert the geometry still leaves a readable instance-name
 -- flex if any column is ever re-tuned. `content` = panel width 364 (ui_cards
 -- INST_W) minus the panel's 10px padding a side.
+-- ROUND-25b (owner): the Logs rows carry FOUR columns — Character · Instance · Duration ·
+-- Ago. GOLD and XP are dropped from the rows; the exact figures already live in the row's
+-- hover tooltip, so no information is lost, and their 80px + 2 gaps go to the INSTANCE
+-- name, which is the column that was actually truncating dungeon names.
+--   flex = 344 - (name 56 + 2*pad 6 + dur 38 + ago 38 + gap 5) = 195   (was 105)
 InstancesUI.RECENT_COLS = {
-    content = 344, name = 56, dur = 38, gold = 42, xp = 38, ago = 38,
+    content = 344, name = 56, dur = 38, ago = 38,
+    gold = 42, xp = 38,        -- retained for the TOOLTIP figures, not rendered as columns
     gap = 5,   -- between the right-aligned numeral columns
     pad = 6,   -- either side of the flexing instance name
 }
 
 -- px left over for the flexing, ellipsising instance name. Pure.
+-- Round-25b: only the two rendered numeral columns (dur, ago) and their single gap count.
 function InstancesUI.InstanceFlexWidth(C)
     C = C or InstancesUI.RECENT_COLS
-    local fixed = C.name + 2 * C.pad + C.dur + C.gold + C.xp + C.ago + 3 * C.gap
+    local fixed = C.name + 2 * C.pad + C.dur + C.ago + C.gap
     return C.content - fixed
 end
 
@@ -849,6 +856,9 @@ local RC = InstancesUI.RECENT_COLS
 local COL_NAME, COL_DUR, COL_GOLD = RC.name, RC.dur, RC.gold
 local COL_XP, COL_AGO             = RC.xp, RC.ago
 local COL_GAP, COL_PAD            = RC.gap, RC.pad
+-- ROUND-25b: the REST view's own right-aligned column chain, mirrored by its captions.
+--   content 344 = name (flex ~118) + LVL 46 + XP 84 + REST 78 + 3 x gap 5
+local REST_LVL_W, REST_XP_W, REST_REST_W = 46, 84, 78
 
 local function tag(frame, id)
     if ns.Audit and ns.Audit.Tag and frame then ns.Audit.Tag(frame, id) end
@@ -1108,12 +1118,25 @@ function InstancesPanel.Attach(host)
         f:SetWidth(w); f:SetTextColor(UI.Color("faint")); f:SetText(text)
         return f
     end
+    -- ROUND-25b: Logs = Character · Instance · DUR · AGO. GOLD/XP columns are gone (their
+    -- figures live in the row tooltip). CHAR and INSTANCE are LEFT-aligned captions over
+    -- the two flexing left cells, so all four columns are labelled rather than just the
+    -- numerals — abbreviated to fit the 56px name and the flexing instance cell.
+    -- Three right-chain captions: Logs uses two (DUR/AGO), Rest uses three (LVL/XP/REST).
+    -- Labels and widths are swapped per view in Refresh.
     local capAgo  = caption("AGO",  COL_AGO)
-    local capXP   = caption("XP",   COL_XP,   capAgo)
-    local capGold = caption("GOLD", COL_GOLD, capXP)
-    local capDur  = caption("DUR",  COL_DUR,  capGold)
-    cols:SetWidth(COL_AGO + COL_XP + COL_GOLD + COL_DUR + 3 * COL_GAP)
+    local capDur  = caption("DUR",  COL_DUR, capAgo)
+    local capLvl  = caption("LVL",  REST_LVL_W, capDur)
+    capLvl:Hide()
+    cols:SetWidth(COL_AGO + COL_DUR + COL_GAP)
     P.cols = cols
+    -- Left-side captions ride the same line, anchored to the panel rather than the
+    -- right-aligned chain (they sit over the name / instance cells).
+    local capChar = fstr(host, "microLabel"); capChar:SetTextColor(UI.Color("faint"))
+    capChar:SetText("CHAR"); capChar:SetWidth(COL_NAME); capChar:SetWordWrap(false)
+    local capInst = fstr(host, "microLabel"); capInst:SetTextColor(UI.Color("faint"))
+    capInst:SetText("INSTANCE"); capInst:SetWordWrap(false)
+    P.capChar, P.capInst = capChar, capInst
 
     local scroll = CreateFrame("ScrollFrame", nil, host)
     scroll:SetClipsChildren(true); scroll:EnableMouseWheel(true)
@@ -1141,11 +1164,10 @@ function InstancesPanel.Attach(host)
         r.name:SetWidth(COL_NAME); r.name:SetWordWrap(false); r.name:SetJustifyH("LEFT")
         r.ago = fstr(r, "microLabel", "RIGHT"); r.ago:SetPoint("RIGHT", r, "RIGHT", 0, 0)
         r.ago:SetWidth(COL_AGO); r.ago:SetWordWrap(false); r.ago:SetTextColor(UI.Color("muted"))
-        r.xp = fstr(r, "small", "RIGHT"); r.xp:SetPoint("RIGHT", r.ago, "LEFT", -COL_GAP, 0)
-        r.xp:SetWidth(COL_XP); r.xp:SetWordWrap(false)
-        r.gold = fstr(r, "small", "RIGHT"); r.gold:SetPoint("RIGHT", r.xp, "LEFT", -COL_GAP, 0)
-        r.gold:SetWidth(COL_GOLD); r.gold:SetWordWrap(false)
-        r.dur = fstr(r, "small", "RIGHT"); r.dur:SetPoint("RIGHT", r.gold, "LEFT", -COL_GAP, 0)
+        -- ROUND-25b (owner): GOLD and XP are no longer row columns — DUR chains straight
+        -- off AGO. Their exact figures remain on the row's hover tooltip, so the data is
+        -- still one hover away and the ~90px they occupied goes to the instance name.
+        r.dur = fstr(r, "small", "RIGHT"); r.dur:SetPoint("RIGHT", r.ago, "LEFT", -COL_GAP, 0)
         r.dur:SetWidth(COL_DUR); r.dur:SetWordWrap(false)
         r.inst = fstr(r, "small"); r.inst:SetPoint("LEFT", r.name, "RIGHT", COL_PAD, 0)
         r.inst:SetPoint("RIGHT", r.dur, "LEFT", -COL_PAD, 0); r.inst:SetWordWrap(false); r.inst:SetJustifyH("LEFT")
@@ -1195,13 +1217,21 @@ function InstancesPanel.Attach(host)
 
     -- EXP rows (round-10 item 2): class-colored name · level · xp cur/total · rested%.
     P._expRows = {}
+    -- ROUND-25b (owner): the Rest rows get a FIXED right-anchored column chain — the same
+    -- shape the Logs rows use — so the new CHARACTER/LEVEL/XP/REST captions sit exactly over
+    -- their columns. These cells used to be auto-width, which is why the view could only
+    -- carry a section label instead of true column headers.
     local function makeExpRow()
         local r = CreateFrame("Frame", nil, child)
         r:SetHeight(REC_H)
-        r.name = fstr(r, "small"); r.name:SetPoint("LEFT", r, "LEFT", 0, 0); r.name:SetWordWrap(false)
         r.rested = fstr(r, "numeral", "RIGHT"); r.rested:SetPoint("RIGHT", r, "RIGHT", 0, 0)
-        r.xp = fstr(r, "numeral", "RIGHT"); r.xp:SetPoint("RIGHT", r.rested, "LEFT", -12, 0)
-        r.lvl = fstr(r, "microLabel"); r.lvl:SetPoint("LEFT", r.name, "RIGHT", 8, 0); r.lvl:SetTextColor(UI.Color("muted"))
+        r.rested:SetWidth(REST_REST_W); r.rested:SetWordWrap(false)
+        r.xp = fstr(r, "numeral", "RIGHT"); r.xp:SetPoint("RIGHT", r.rested, "LEFT", -COL_GAP, 0)
+        r.xp:SetWidth(REST_XP_W); r.xp:SetWordWrap(false)
+        r.lvl = fstr(r, "microLabel", "RIGHT"); r.lvl:SetPoint("RIGHT", r.xp, "LEFT", -COL_GAP, 0)
+        r.lvl:SetWidth(REST_LVL_W); r.lvl:SetTextColor(UI.Color("muted")); r.lvl:SetWordWrap(false)
+        r.name = fstr(r, "small"); r.name:SetPoint("LEFT", r, "LEFT", 0, 0)
+        r.name:SetPoint("RIGHT", r.lvl, "LEFT", -COL_GAP, 0); r.name:SetWordWrap(false)
         return r
     end
     local function getExp(i)
@@ -1251,8 +1281,28 @@ function InstancesPanel.Attach(host)
             r:Show()
             prev = r
         end
-        for _, aid in ipairs(aids) do placeMeter("Acct " .. aid, view.accounts[aid]) end
-        placeMeter("All", view.total, true)
+        -- ROUND-25b (owner): the meter block is ONE row, driven by the Account dropdown.
+        -- The per-account "Acct N" rows are gone; the single row shows whatever the
+        -- selection means:
+        --   Account = All -> the cross-account aggregate. Stays NEUTRAL-toked with no cap
+        --       denominator, per the earlier ruling: the server caps PER ACCOUNT, so a sum
+        --       across accounts has no cap to measure against and colouring it would be a
+        --       red meter that means nothing.
+        --   Account = N  -> that account's own meters, with the normal per-account state
+        --       tokens (ok / warn / danger) and the at-cap countdown, exactly as its row
+        --       used to render.
+        -- Shared by BOTH views, since the meter block sits above the view switch.
+        local sel = P.selectedAcct
+        if sel and view.accounts[sel] then
+            placeMeter("Account " .. (tonumber(sel) or sel), view.accounts[sel])
+        elseif sel then
+            -- Selected an account the engine has no counts for yet: show it at zero rather
+            -- than silently falling back to All, which would misreport the selection.
+            placeMeter("Account " .. (tonumber(sel) or sel), {})
+        else
+            placeMeter("All", view.total, true)
+        end
+        local _ = aids   -- (account ids no longer drive the row count)
         for j = n + 1, #P._meters do P._meters[j]:Hide() end
         P._meterModels, P._meterCount = models, n
         P.SyncTicker()
@@ -1291,8 +1341,32 @@ function InstancesPanel.Attach(host)
         recLbl:SetText(isExp and "RESTED" or "RECENT")
         recLbl:ClearAllPoints(); recLbl:SetPoint("TOPLEFT", host, "TOPLEFT", PAD, -listTop)
         -- Column captions ride the label line; they describe the INSTANCES columns only.
+        -- ROUND-25b: the caption row is SWAPPED per view, not hidden in Rest.
+        --   Logs : CHAR · INSTANCE (left) + DUR · AGO (right chain)
+        --   Rest : CHAR (left) + LVL · XP · REST (right chain)
+        -- The right-hand chain is one `cols` frame whose captions are re-labelled and
+        -- re-widthed per view, so both views get true column headers over their columns.
         cols:ClearAllPoints(); cols:SetPoint("TOPRIGHT", host, "TOPRIGHT", -PAD, -listTop)
-        cols:SetShown(not isExp)
+        cols:SetShown(true)
+        if isExp then
+            capAgo:SetText("REST"); capAgo:SetWidth(REST_REST_W)
+            capDur:SetText("XP");   capDur:SetWidth(REST_XP_W)
+            capLvl:SetText("LVL");  capLvl:SetWidth(REST_LVL_W); capLvl:Show()
+            cols:SetWidth(REST_REST_W + REST_XP_W + REST_LVL_W + 2 * COL_GAP)
+            capInst:Hide()
+        else
+            capAgo:SetText("AGO"); capAgo:SetWidth(COL_AGO)
+            capDur:SetText("DUR"); capDur:SetWidth(COL_DUR)
+            capLvl:Hide()
+            cols:SetWidth(COL_AGO + COL_DUR + COL_GAP)
+            capInst:Show()
+        end
+        capChar:ClearAllPoints()
+        capChar:SetPoint("TOPLEFT", host, "TOPLEFT", PAD, -listTop)
+        capChar:Show()
+        capInst:ClearAllPoints()
+        capInst:SetPoint("LEFT", capChar, "RIGHT", COL_PAD, 0)
+        capInst:SetPoint("RIGHT", cols, "LEFT", -COL_PAD, 0)
         scroll:ClearAllPoints()
         scroll:SetPoint("TOPLEFT", host, "TOPLEFT", PAD, -(listTop + 15))
         scroll:SetPoint("BOTTOMRIGHT", host, "BOTTOMRIGHT", -PAD, PAD)
@@ -1347,10 +1421,10 @@ function InstancesPanel.Attach(host)
                     if cr then r.name:SetTextColor(cr, cg, cb) else r.name:SetTextColor(UI.Color("text")) end
                     r.inst:SetText(model.instanceText or model.instance)
                     -- Computed columns (owner round-15 item 1), compact form.
+                    -- ROUND-25b: only DUR and AGO render as columns now; cells.gold/xp are
+                    -- still computed and still surface in r._tip below.
                     local cells = InstancesUI.RecentCells(model)
                     r.dur:SetText(cells.dur);  r.dur:SetTextColor(UI.Color("muted"))
-                    r.gold:SetText(cells.gold); r.gold:SetTextColor(UI.Color(cells.goldToken))
-                    r.xp:SetText(cells.xp or ""); r.xp:SetTextColor(UI.Color("muted"))
                     r.ago:SetText(cells.ago)
                     r._tip = InstancesUI.RowTooltip(model, nowE)
                     r:Show()
@@ -1516,12 +1590,28 @@ local function testInstancesUI(fails)
     -- a readable flex inside the panel's 344px of content.
     local RCOL = IU.RECENT_COLS
     ck(RCOL.content == 344, "cols: budget is the 364 panel minus 10px padding a side")
-    ck(IU.InstanceFlexWidth() == 105,
-        "cols: instance name flexes to 105px (got " .. IU.InstanceFlexWidth() .. ")")
+
+    -- ── ROUND-25b: Logs is FOUR columns (Character · Instance · DUR · AGO) ──────
+    -- GOLD and XP left the rows; their width goes to the flexing instance name.
+    ck(IU.InstanceFlexWidth() == 344 - (RCOL.name + 2 * RCOL.pad + RCOL.dur + RCOL.ago + RCOL.gap),
+        "cols: flex = content - (name + pads + dur + ago + one gap)")
+    ck(IU.InstanceFlexWidth() == 195,
+        "cols: instance flexes to 195px (was 105) -- got " .. IU.InstanceFlexWidth())
+    ck(IU.InstanceFlexWidth() > 105, "cols: dropping GOLD/XP genuinely widened the name")
+    -- The figures are NOT lost: RecentCells still computes them for the row tooltip.
+    local keptCells = IU.RecentCells(IU.RowModel({ t = T - 60, name = "Deadmines", dur = 600,
+        gold = 48000, xp = 12400 }, "Alt-Realm", "ROGUE", T))
+    ck(keptCells.gold ~= nil and keptCells.xp ~= nil,
+        "cols: gold/xp still computed for the tooltip after leaving the row")
+
+    -- REST column chain sums to the same content budget as the Logs chain.
+    ck(46 + 84 + 78 + 3 * RCOL.gap + 56 + 2 * RCOL.pad <= RCOL.content,
+        "rest cols: LVL/XP/REST + name + pads fit the 344 budget")
     ck(IU.InstanceFlexWidth() >= 90,
         "cols: the instance name keeps at least 90px -- 'Blackrock Depths' must fit")
-    local fixedSum = RCOL.name + 2 * RCOL.pad + RCOL.dur + RCOL.gold + RCOL.xp + RCOL.ago
-                     + 3 * RCOL.gap + IU.InstanceFlexWidth()
+    -- ROUND-25b: four rendered columns now, so the sum drops GOLD/XP and two of the gaps.
+    local fixedSum = RCOL.name + 2 * RCOL.pad + RCOL.dur + RCOL.ago
+                     + RCOL.gap + IU.InstanceFlexWidth()
     ck(fixedSum == RCOL.content, "cols: the columns exactly consume the content width")
 
     -- ── The NIT-parity row hover ────────────────────────────────────────────
@@ -1859,6 +1949,39 @@ local function testInstancesUI(fails)
     ck(IU.ResolveCharSelection(d24, nil, "Cee-R") == "Cee-R", "cascade: All accounts keeps any char")
     ck(IU.ResolveCharSelection(d24, "1", nil) == nil, "cascade: All char stays All")
     ck(IU.ResolveCharSelection(d24, "2", "Eee-R") == "Eee-R", "cascade: homeless char counts as belonging")
+
+    -- ── ROUND-25b: Rest ordering is an ASSERTED INVARIANT (level DESC, ties name ASC) ──
+    local dTie = { accounts = { ["1"] = { characters = {
+        ["Bravo-R"]   = { level = 40, classTag = "MAGE" },
+        ["Alpha-R"]   = { level = 40, classTag = "ROGUE" },
+        ["Charlie-R"] = { level = 55, classTag = "DRUID" },
+        ["Delta-R"]   = { level = 12, classTag = "PRIEST" },
+    } } } }
+    local tie = IU.RestRows(dTie)
+    local tnames = {}; for _, r in ipairs(tie) do tnames[#tnames + 1] = r.nameRealm end
+    ck(table.concat(tnames, ",") == "Charlie-R,Alpha-R,Bravo-R,Delta-R",
+        "rest sort: level DESC, ties name ASC (got " .. table.concat(tnames, ",") .. ")")
+    -- Invariant restated as a property, so a future sort change cannot quietly break it.
+    for i = 2, #tie do
+        local a, b = tie[i - 1], tie[i]
+        ck(a.level > b.level or (a.level == b.level and tostring(a.nameRealm) < tostring(b.nameRealm)),
+            "rest sort invariant holds between rows " .. (i - 1) .. " and " .. i)
+    end
+
+    -- ROUND-25b (owner asked to confirm): em-dashes on XP/REST are the DESIGNED absent-data
+    -- path, not a formatting bug. A record with no xp/xpMax/restedXP — which is exactly what
+    -- an account predating the xp sync pushes — renders EMDASH in both cells, while a record
+    -- WITH the fields formats normally. Both paths asserted so the distinction stays visible.
+    local dAbsent = { accounts = { ["1"] = { characters = {
+        ["NoData-R"] = { level = 30, classTag = "MAGE" },                       -- no xp fields
+        ["HasData-R"] = { level = 30, classTag = "ROGUE", xp = 100, xpMax = 400, restedXP = 200 },
+    } } } }
+    local rowsAbsent = IU.RestRows(dAbsent)
+    local byName = {}; for _, r in ipairs(rowsAbsent) do byName[r.nameRealm] = r end
+    ck(byName["NoData-R"].xpText == EMDASH and byName["NoData-R"].restedText == EMDASH,
+        "rest: absent xp data renders the em-dash on BOTH cells (designed path)")
+    ck(byName["HasData-R"].xpText == "100/400" and byName["HasData-R"].restedText == "50%",
+        "rest: present xp data formats normally -- so the em-dash is data, not a bug")
 end
 
 if ns.RegisterSelfTest then

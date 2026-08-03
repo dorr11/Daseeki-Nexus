@@ -203,7 +203,7 @@ end
 -- Store.DMFCooldownRemaining owns the offline-freeze maths (it returns ONLINE seconds
 -- remaining, 0 when ready), so this stays a pure presentation mapping.
 -- Remote characters take the identical three labels — the engine hands us the same fields.
-function Detail.DMFCooldownState(rec, e)
+function Detail.DMFCooldownState(rec, e, cellW)
     rec = rec or {}
     -- ROUND-23 (owner): a boon-stashed DMF reads GREEN, not accent. It is a HELD, owned
     -- state — the buff is safely banked — so it belongs with "Ready" in the ok family
@@ -211,7 +211,7 @@ function Detail.DMFCooldownState(rec, e)
     if rec.dmfInBoon then return "In Boon", "ok" end
     if not rec.dmfCooldownActive then return "Ready", "ok" end
     local rem = dmfCooldownRemaining(rec, e)
-    if rem > 0 then return Detail.CompactDuration(rem), "warn" end
+    if rem > 0 then return Detail.CdDurationText(rem, cellW), "warn" end
     return "On CD", "warn"
 end
 
@@ -229,6 +229,23 @@ function Detail.TallyText(list)
         if i == TALLY_SPLIT then parts[#parts + 1] = Dd.Colored(TALLY_DIVIDER, "faint") end
     end
     return table.concat(parts, "  ")
+end
+
+-- ROUND-25b (owner): the COOLDOWNS values go back to the SPACED form ("12h 30m") now that
+-- round-25's 60/40 split widened the cells to ~89px. Round-23 had forced the compact form
+-- purely as a width workaround at 67px cells — with the constraint gone the workaround
+-- goes too. Compact is retained as an AUTOMATIC FALLBACK, chosen BY MEASUREMENT rather
+-- than by a hardcoded rule: if the spaced string would not fit the cell at the given font
+-- scale, the compact form is used instead. Pure, so both branches are asserted.
+--   `cellW` is the value cell's px width; `emPx` the numeral font's average advance.
+local CD_VALUE_EM = 13 * 0.52          -- numeral 13pt, ~0.52em average advance
+function Detail.CdDurationText(secs, cellW, scale)
+    local D = Dash()
+    local spaced = (D and D.FormatDuration and D.FormatDuration(secs)) or tostring(secs)
+    if not cellW then return spaced end
+    local w = #spaced * CD_VALUE_EM * (scale or 1)
+    if w <= cellW then return spaced end
+    return Detail.CompactDuration(secs)
 end
 
 -- ROUND-23 (owner): the detail header's sub-line — "Level 60 · Rogue · Account 1".
@@ -696,6 +713,8 @@ function Detail.Attach(parent)
     -- still carries the fully spelled-out state.
     local CD_ICON, CD_GAP, CD_ROW_H = 16, 6, 21
     local CD_CELL_W = (COL_R_W - 2 * CD_GAP) / 3
+    -- round-25b: the value cell inside each pair — what the duration formatter measures against
+    local CD_VALUE_W = CD_CELL_W - CD_ICON - 6
 
     local cdGrid = CreateFrame("Frame", nil, rightCol)
     cdGrid:SetPoint("BOTTOMLEFT", rightCol, "BOTTOMLEFT", 0, 0)
@@ -734,7 +753,7 @@ function Detail.Attach(parent)
         -- Colored state value, filling the rest of this grid cell, centred on the icon.
         local vf = fstr(cdGrid, "numeral", "LEFT")
         vf:SetPoint("LEFT", f, "RIGHT", 6, 0)
-        vf:SetWidth(CD_CELL_W - CD_ICON - 6); vf:SetWordWrap(false)
+        vf:SetWidth(CD_VALUE_W); vf:SetWordWrap(false)
         return f, vf
     end
     -- Row 0: chrono | hearth side by side (owner). Row 1: the new DMF cooldown.
@@ -908,7 +927,7 @@ function Detail.Attach(parent)
         local chronoRem = Dd.ItemCdRemaining(rec, "chronoboon", e)
         local chronoOnCd = chronoRem > 0
         if chronoOnCd then
-            chronoVal:SetText(Detail.CompactDuration(chronoRem)); chronoVal:SetTextColor(UI.Color("warn"))
+            chronoVal:SetText(Detail.CdDurationText(chronoRem, CD_VALUE_W)); chronoVal:SetTextColor(UI.Color("warn"))
             D.chronoIcon.icon:SetDesaturated(true)
         else
             chronoVal:SetText("Ready"); chronoVal:SetTextColor(UI.Color("ok"))
@@ -924,7 +943,7 @@ function Detail.Attach(parent)
 
         local hearthRem = Dd.ItemCdRemaining(rec, "hearthstone", e)
         if hearthRem > 0 then
-            hearthVal:SetText(Detail.CompactDuration(hearthRem)); hearthVal:SetTextColor(UI.Color("warn"))
+            hearthVal:SetText(Detail.CdDurationText(hearthRem, CD_VALUE_W)); hearthVal:SetTextColor(UI.Color("warn"))
             D.hearthIcon.icon:SetDesaturated(true)
             D.hearthIcon._state = "Cooldown " .. Dd.FormatDuration(hearthRem); D.hearthIcon._stateTok = "warn"
         else
@@ -946,7 +965,7 @@ function Detail.Attach(parent)
         -- The WORLD BUFFS rows never showed this because they re-resolve on every refresh.
         -- Do the same here: re-set the texture each paint so it self-heals once the art is in.
         D.dmfIcon.icon:SetTexture(Dd.AuraIcon(D.dmfSlot or 5))
-        local dmfText, dmfTok = Detail.DMFCooldownState(rec, e)
+        local dmfText, dmfTok = Detail.DMFCooldownState(rec, e, CD_VALUE_W)
         D.dmfVal:SetText(dmfText); D.dmfVal:SetTextColor(UI.Color(dmfTok))
         D.dmfIcon.icon:SetDesaturated(dmfTok == "warn")   -- desat only while actually waiting
         D.dmfIcon:SetBackdropBorderColor(UI.Color(dmfTok))
@@ -1358,6 +1377,22 @@ local function testHeaderSubline(fails)
         "validator flags a too-narrow C1 (short " .. tight.short .. ")")
     ck(tight.worst == "buff-row status" or tight.worst == "raid tally",
         "validator names which row is the binding one")
+
+    -- ── ROUND-25b: cooldown durations go back to the SPACED form, with a MEASURED
+    -- compact fallback. The real cell after the 60/40 split is (280-12)/3 - 16 - 6 = ~67.
+    local CELL = (280 - 12) / 3 - 16 - 6
+    local spacedForm = Detail.CdDurationText(45000, CELL)          -- 12h 30m
+    ck(spacedForm:find(" ", 1, true) ~= nil, "spaced form is used at the real cell width")
+    ck(spacedForm == Dash().FormatDuration(45000), "spaced form matches FormatDuration")
+    ck(Detail.CdDurationText(45000, CELL, 1.3):find(" ", 1, true) ~= nil,
+        "spaced form still fits at the 1.3x font ceiling (that is why it could come back)")
+    -- ...and the fallback genuinely triggers when the cell really is too small — this is
+    -- the round-23 situation, so the workaround still exists where it is warranted.
+    local narrow = Detail.CdDurationText(45000, 20)
+    ck(narrow == Detail.CompactDuration(45000), "too-narrow cell falls back to compact")
+    ck(narrow:find(" ", 1, true) == nil, "the compact fallback has no space")
+    ck(Detail.CdDurationText(45000, nil) == Dash().FormatDuration(45000),
+        "no cell width given -> spaced (measurement is opt-in, not assumed)")
 
     -- Separator matches the statusFS beside it in the same band (one rhythm, not two).
     ck(SEP == "  \194\183  ", "separator is the suite middot, spaced like statusFS")
