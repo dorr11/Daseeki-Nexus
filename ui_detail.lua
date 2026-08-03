@@ -59,8 +59,6 @@ local LOCK_LBL_H  = 12        -- the "RAID LOCKOUTS" eyebrow line
 local LOCK_LBL_GAP = 6        -- eyebrow -> keys (matches round-13's +6 header breathing room)
 local LOCK_GAP    = 6         -- air between the buff list and the block
 local LOCK_BLOCK  = LOCK_LBL_H + LOCK_LBL_GAP + LOCK_H   -- 31
-local NOTE_H      = 66        -- round-19: NOTE grew into the space RAID LOCKOUTS vacated
-                              -- in the right column (22 -> 66, multi-line)
 -- Round-17 (owner, yellow arrow): the header's bottom hairline was OVERLAPPING the column
 -- eyebrows. The rule sits HRULE_GAP below the header band, but the grid started at the
 -- header's bottom edge (gridTop = -(PAD_V+HEADER_H)), i.e. 6px ABOVE the rule — so the
@@ -106,6 +104,14 @@ local BUFF_HUE = {
 -- right — so the divider marks a real boundary rather than decorating a line break.
 local TALLY_ORDER = { "MC", "BWL", "AQ40", "Naxx", "Ony", "ZG", "AQ20" }
 local TALLY_SPLIT = 4          -- divider sits AFTER this index (Naxx | Ony)
+-- ROUND-23 BUGFIX. Round-22 emitted the divider as Colored("|", "faint"), which composes
+-- |cffRRGGBB .. "|" .. |r  — and WoW's escape parser reads the resulting "||" as an ESCAPED
+-- PIPE, renders one "|", then treats the trailing "r" as literal text and never closes the
+-- colour. On screen: "Naxx |r Ony". The fix is to escape the pipe BEFORE colouring, so the
+-- sequence becomes |cffRRGGBB .. "||" .. |r — the parser renders one grey pipe and the |r
+-- still terminates the colour. This is the general hazard of composing user-visible glyphs
+-- into colour-coded strings: any literal "|" must be doubled first.
+local TALLY_DIVIDER = "||"     -- renders as a single "|"
 Detail.TALLY_ORDER, Detail.TALLY_SPLIT = TALLY_ORDER, TALLY_SPLIT   -- for the tests
 
 local function Dash() return ns.Dashboard end
@@ -145,13 +151,48 @@ end
 -- remaining, 0 when ready), so this stays a pure presentation mapping.
 -- Remote characters take the identical three labels — the engine hands us the same fields.
 function Detail.DMFCooldownState(rec, e)
-    local D = Dash()
     rec = rec or {}
-    if rec.dmfInBoon then return "In Boon", "accent" end
+    -- ROUND-23 (owner): a boon-stashed DMF reads GREEN, not accent. It is a HELD, owned
+    -- state — the buff is safely banked — so it belongs with "Ready" in the ok family
+    -- rather than looking like a warning.
+    if rec.dmfInBoon then return "In Boon", "ok" end
     if not rec.dmfCooldownActive then return "Ready", "ok" end
     local rem = dmfCooldownRemaining(rec, e)
-    if rem > 0 then return (D and D.FormatDuration(rem)) or tostring(rem), "warn" end
+    if rem > 0 then return Detail.CompactDuration(rem), "warn" end
     return "On CD", "warn"
+end
+
+-- ROUND-23: compose the raid-tally line. Pure, so the colour-escape correctness is
+-- headless-testable rather than only visible in-game (which is how the "|r" bug shipped).
+-- Round-17 ink: green available / red locked / grey not-attuned. Round-22 divider: weekly
+-- raids | short-cycle raids, as a glyph rather than a texture so the tally stays ONE
+-- FontString (a texture needs its own frame + anchors, and round-21b's crash was an anchor
+-- cycle) and inherits the line's font scaling.
+function Detail.TallyText(list)
+    local Dd = Dash()
+    local parts = {}
+    for i, r in ipairs(list or {}) do
+        parts[#parts + 1] = Dd.Colored(r.key, r.token)
+        if i == TALLY_SPLIT then parts[#parts + 1] = Dd.Colored(TALLY_DIVIDER, "faint") end
+    end
+    return table.concat(parts, "  ")
+end
+
+-- ROUND-23 (owner): the detail header's sub-line — "Level 60 · Rogue · Account 1".
+-- Separator is the suite's MIDDOT, spaced exactly like the statusFS beside it in the same
+-- header band ("ONLINE  ·  2m ago"), so the two halves of the band read as one rhythm.
+-- "Account N" replaces the old "#N" shorthand. The account segment is OMITTED entirely
+-- when the id is absent or non-numeric — dropping the segment (rather than emitting an
+-- empty one) is what keeps the separators from doubling up into a trailing " · ".
+-- Pure, so the copy is headless-tested.
+local SUBLINE_SEP = "  \194\183  "
+function Detail.HeaderSubline(rec, aid)
+    rec = rec or {}
+    local bits = { "Level " .. tostring(rec.level or 60),
+                   rec.className or rec.classTag or "?" }
+    local n = tonumber(aid)
+    if n then bits[#bits + 1] = "Account " .. n end
+    return table.concat(bits, SUBLINE_SEP)
 end
 
 -- Compact tile-caption duration ("1h59", "59m", "45s", "2d3h") — fits a 20px tile
@@ -507,6 +548,7 @@ function Detail.Attach(parent)
     if Dash() and Dash().SizedFont then Dash().SizedFont(nameFS, "header", 4) end
     nameFS:SetWordWrap(false)
     local subFS = fstr(header, "small"); subFS:SetPoint("LEFT", nameFS, "RIGHT", 10, 0)
+    subFS:SetWordWrap(false)   -- round-23: right bound set below, once statusDot exists
     subFS:SetTextColor(UI.Color("muted"))
     -- Status cluster (right): dot + Online/Offline · freshness.
     local statusFS = fstr(header, "microLabel", "RIGHT")
@@ -514,6 +556,15 @@ function Detail.Attach(parent)
     -- Status pip: a DIAMOND with pop (round-8 item 2), matching the card pips.
     local statusDot, statusHalo = Dash().MakeStatusPip(header, 9)
     statusDot:SetPoint("RIGHT", statusFS, "LEFT", -8, 0)
+    -- ROUND-23: bound the sub-line against the status pip now that it exists. The full
+    -- Name-Realm can be long (a 12-char name on "Bloodsail Buccaneers" is 33 chars) and at
+    -- 1.3x font scale name + sub-line + status overruns the 714px band — measured, it does.
+    -- The SUB-LINE yields and ellipsizes; the NAME never does, because it is the owner's
+    -- explicit ask and the pane's identity anchor, and level/class/account are all
+    -- recoverable elsewhere. Deliberately ONE-WAY: subFS already anchors LEFT to nameFS, so
+    -- bounding the name against the sub-line would recreate exactly the sfHdr<->sfMeta
+    -- anchor cycle that crashed round-21. The anchor gate covers this.
+    subFS:SetPoint("RIGHT", statusDot, "LEFT", -10, 0)
     D.nameFS, D.subFS, D.statusFS, D.statusDot, D.statusHalo = nameFS, subFS, statusFS, statusDot, statusHalo
 
     -- Header bottom hairline (one sharp rule, §9 UI.Hairline). Pop pass: borderLite.
@@ -568,13 +619,20 @@ function Detail.Attach(parent)
     -- 2x2 rather than 3-across because 3 cells would be 71 wide, leaving only ~49 for the
     -- value — "12h 30m" already runs ~42 at the default scale and overflows at 1.3x. The
     -- column has ~120px of vertical slack after the swap, so spending one row is free.
-    local CD_ICON, CD_GAP, CD_ROW_H = 16, 10, 21
-    local CD_CELL_W = (COL_R_W - CD_GAP) / 2
+    -- ROUND-23 (owner override): all THREE cooldowns share ONE row — chrono, hearth, DMF.
+    --   cell = (COL_R_W 214 - 2 x CD_GAP 6) / 3 = 67   (icon 16 + 4 gap + ~47 of value)
+    -- TRADEOFF, stated plainly: 47px cannot hold the spaced "12h 30m" (~42 at scale 1.0,
+    -- ~55 at 1.3x), so the three values switch to the COMPACT duration form ("12h30",
+    -- "59m", "2d3h") that the pane already defines. No precision is lost — the compact form
+    -- keeps the same two units, it only drops the space — and each icon's hover tooltip
+    -- still carries the fully spelled-out state.
+    local CD_ICON, CD_GAP, CD_ROW_H = 16, 6, 21
+    local CD_CELL_W = (COL_R_W - 2 * CD_GAP) / 3
 
     local cdGrid = CreateFrame("Frame", nil, rightCol)
     cdGrid:SetPoint("BOTTOMLEFT", rightCol, "BOTTOMLEFT", 0, 0)
     cdGrid:SetPoint("RIGHT", rightCol, "RIGHT", 0, 0)
-    cdGrid:SetHeight(CD_ROW_H + CD_ICON)          -- two rows
+    cdGrid:SetHeight(CD_ICON)                     -- round-23: ONE row of three
     local cdLbl = microLabel(rightCol, "COOLDOWNS")
     cdLbl:SetPoint("BOTTOMLEFT", cdGrid, "TOPLEFT", 0, 6)
     tag(cdLbl, "detail.cdlabel")
@@ -618,10 +676,11 @@ function Detail.Attach(parent)
     -- Fortune, slot 5) rather than an item icon — there is no item, the cooldown is on the
     -- faire buff itself. This is also why the WORLD BUFFS row drops its CD parentheticals:
     -- the cooldown now has one home instead of being spelled out in two places.
-    local dmfIcon, dmfVal = cdIconRow(Dash().AuraIcon(5), "Darkmoon Faire cooldown", 0, 1)
+    local dmfIcon, dmfVal = cdIconRow(Dash().AuraIcon(5), "Darkmoon Faire cooldown", 2, 0)
     tag(chronoIcon, "detail.cdicon1")   -- 16px item-icon square (geometry assertion)
     tag(hearthIcon, "detail.cdicon2")   -- round-22: shares row 0 with chrono (side by side)
     tag(dmfIcon, "detail.cdicon3")
+    D.dmfSlot = 5   -- round-23: re-resolved every Refresh (see the icon-cache note below)
     D.chronoVal, D.hearthVal, D.dmfVal = chronoVal, hearthVal, dmfVal
     D.chronoIcon, D.hearthIcon, D.dmfIcon = chronoIcon, hearthIcon, dmfIcon
 
@@ -650,11 +709,18 @@ function Detail.Attach(parent)
     local noteBox = CreateFrame("EditBox", nil, rightCol, "BackdropTemplate")
     noteBox:SetPoint("TOPLEFT", rightCol, "TOPLEFT", 0, -(LOCK_LBL_H + 4))
     noteBox:SetPoint("RIGHT", rightCol, "RIGHT", 0, 0)
-    -- ROUND-19 priority 3: RAID LOCKOUTS vacated the right column's top-right, so NOTE
-    -- claims that space — 22 -> NOTE_H (66), and MULTI-LINE so the height is actually
-    -- usable text rather than one line floating in a tall box. Enter still commits (the
-    -- OnEnterPressed handler below clears focus), so the interaction is unchanged.
-    noteBox:SetHeight(NOTE_H); noteBox:SetAutoFocus(false)
+    -- ROUND-19 priority 3: RAID LOCKOUTS vacated the right column, so NOTE claimed the
+    -- space and became MULTI-LINE. Enter still commits (the OnEnterPressed handler below
+    -- clears focus), so the interaction is unchanged.
+    -- ROUND-23 (owner's green outline): NOTE fills the right column's whole upper area
+    -- instead of a fixed 66px box — from under its label down to just above the COOLDOWNS
+    -- block, full column width. Anchored TOP (label) and BOTTOM (the cooldown label) rather
+    -- than given a height, so it FLEXES: if the cooldown block or the pane height ever
+    -- changes, the note absorbs the difference instead of needing a new magic number.
+    -- One-way anchors only (noteBox -> rightCol/cdLbl); cdLbl hangs off cdGrid, which hangs
+    -- off rightCol, so the graph stays acyclic — the anchor gate covers it.
+    noteBox:SetPoint("BOTTOM", cdLbl, "TOP", 0, 8)
+    noteBox:SetAutoFocus(false)
     noteBox:SetMultiLine(true)
     local noteLbl = microLabel(rightCol, "NOTE")
     noteLbl:SetPoint("TOPLEFT", rightCol, "TOPLEFT", 0, 0)   -- round-22: column top rail
@@ -704,11 +770,13 @@ function Detail.Attach(parent)
         local e = nowE()
         local faction = entry.faction or rec.faction
 
-        -- Header. Name = short (realm stripped) in the brightened class hue (pop pass).
-        nameFS:SetText(Dd.ShortName(entry.nameRealm))
+        -- ROUND-23 (owner): the header shows the FULL "Name-Realm", not the realm-stripped
+        -- short name, still in the brightened class hue. The CARDS keep ShortName — a card
+        -- is a narrow list row where the realm would crowd out everything else; this pane
+        -- is the place with room to name the character in full.
+        nameFS:SetText(entry.nameRealm or "?")
         nameFS:SetTextColor(brightClass(rec.classTag))
-        local acct = (entry.aid and entry.aid ~= "" and ("#" .. entry.aid)) or ""
-        subFS:SetText(("Level %s %s  %s"):format(rec.level or 60, rec.className or rec.classTag or "?", acct))
+        subFS:SetText(Detail.HeaderSubline(rec, entry.aid))
         local online = entry.online
         Dd.PaintStatusPip(statusDot, D.statusHalo, online)
         statusFS:SetText((online and "ONLINE" or "OFFLINE") .. "  \194\183  " .. Dd.FreshnessText(rec.lastDataUpdate))
@@ -759,18 +827,7 @@ function Detail.Attach(parent)
         buffLbl:SetText(("WORLD BUFFS  \194\183  %d/%d HELD"):format(held, shown))
 
         -- Raid tally line.
-        local list = Detail.RaidTally(rec, e)
-        local parts = {}
-        for i, r in ipairs(list) do
-            -- Round-17 addendum: green available / red locked / grey not-attuned.
-            parts[#parts + 1] = Dd.Colored(r.key, r.token)
-            -- ROUND-22 addendum: weekly | short-cycle divider. A faint "|" GLYPH rather
-            -- than a 1px texture: the tally is a single FontString, so a glyph keeps it
-            -- that way — a texture would need its own frame and anchors, and the round-21b
-            -- crash was an anchor cycle. It also inherits the line's font scaling for free.
-            if i == TALLY_SPLIT then parts[#parts + 1] = Dd.Colored("|", "faint") end
-        end
-        tallyFS:SetText(table.concat(parts, "  "))
+        tallyFS:SetText(Detail.TallyText(Detail.RaidTally(rec, e)))
 
         -- Telemetry (chrono / hearth item icons + colored state value). The icon desats
         -- while on cooldown (mirrors the card stack); the tooltip carries the state.
@@ -783,7 +840,7 @@ function Detail.Attach(parent)
         local chronoRem = Dd.ItemCdRemaining(rec, "chronoboon", e)
         local chronoOnCd = chronoRem > 0
         if chronoOnCd then
-            chronoVal:SetText(Dd.FormatDuration(chronoRem)); chronoVal:SetTextColor(UI.Color("warn"))
+            chronoVal:SetText(Detail.CompactDuration(chronoRem)); chronoVal:SetTextColor(UI.Color("warn"))
             D.chronoIcon.icon:SetDesaturated(true)
         else
             chronoVal:SetText("Ready"); chronoVal:SetTextColor(UI.Color("ok"))
@@ -799,7 +856,7 @@ function Detail.Attach(parent)
 
         local hearthRem = Dd.ItemCdRemaining(rec, "hearthstone", e)
         if hearthRem > 0 then
-            hearthVal:SetText(Dd.FormatDuration(hearthRem)); hearthVal:SetTextColor(UI.Color("warn"))
+            hearthVal:SetText(Detail.CompactDuration(hearthRem)); hearthVal:SetTextColor(UI.Color("warn"))
             D.hearthIcon.icon:SetDesaturated(true)
             D.hearthIcon._state = "Cooldown " .. Dd.FormatDuration(hearthRem); D.hearthIcon._stateTok = "warn"
         else
@@ -815,6 +872,12 @@ function Detail.Attach(parent)
         -- its state is the SN DMFable tri-state rather than a raw item cooldown, so the rim
         -- follows the state token instead of a simple on/off-CD test (a boon-frozen DMF is
         -- neither "ready" green nor "on cooldown" red).
+        -- ROUND-23 BUGFIX (owner saw a red "?"): the DMF icon was resolved ONCE at build
+        -- time, but Dashboard.AuraIcon returns the question-mark FALLBACK when the spell art
+        -- has not been cached by the client yet — and at pane-build time it usually has not.
+        -- The WORLD BUFFS rows never showed this because they re-resolve on every refresh.
+        -- Do the same here: re-set the texture each paint so it self-heals once the art is in.
+        D.dmfIcon.icon:SetTexture(Dd.AuraIcon(D.dmfSlot or 5))
         local dmfText, dmfTok = Detail.DMFCooldownState(rec, e)
         D.dmfVal:SetText(dmfText); D.dmfVal:SetTextColor(UI.Color(dmfTok))
         D.dmfIcon.icon:SetDesaturated(dmfTok == "warn")   -- desat only while actually waiting
@@ -863,7 +926,7 @@ local function testDMFCooldownState(fails)
                      dmfCooldown = { offlineSince = 0, remainingOnlineSecs = 3600,
                                      lastTickEpoch = base } }
     t, tok = Detail.DMFCooldownState(booned, base)
-    ck(t == "In Boon" and tok == "accent", "DMF stashed in a boon -> In Boon/accent (frozen)")
+    ck(t == "In Boon" and tok == "ok", "DMF stashed in a boon -> In Boon/ok GREEN (round-23: was accent)")
     -- ...and a boon outranks even a ready cooldown (the buff is held, not re-takeable).
     t = Detail.DMFCooldownState({ dmfInBoon = true, dmfCooldownActive = false }, base)
     ck(t == "In Boon", "boon outranks the ready state")
@@ -1070,6 +1133,34 @@ local function testRaidTally(fails)
             ("tally slot %d should be %s (got %s)"):format(i, key, tostring(list[i] and list[i].key)))
     end
     ck(Detail.TALLY_SPLIT == 4, "divider sits after the 4th key (Naxx | Ony)")
+
+    -- ROUND-23 BUGFIX, pinned: the composed tally must not contain an UNESCAPED pipe. The
+    -- shipped bug was Colored("|") producing |cff… .. "|" .. |r — the parser ate "||" as an
+    -- escaped pipe and rendered a literal "r" ("Naxx |r Ony"). Walk the string and require
+    -- that every "|" is either part of |c…/|r or doubled.
+    -- Walk it exactly as WoW's parser does — "||" is an escape and consumes BOTH pipes —
+    -- and require the colour nesting to balance. This is the assertion that actually
+    -- catches the bug: with a bare "|" divider the string is |cff… .. "|" .. "|r", whose
+    -- middle pipes pair off as an escape, leaving a literal "r" and the colour NEVER
+    -- CLOSED. (A naive "is there a lone pipe?" check does NOT catch it — verified by
+    -- regression — because after the escape pairs up there is no lone pipe left.)
+    local s = Detail.TallyText(list)
+    local i, depth, bad = 1, 0, nil
+    while i <= #s do
+        if s:sub(i, i) == "|" then
+            local nxt = s:sub(i + 1, i + 1)
+            if nxt == "|" then i = i + 2                 -- escaped literal pipe
+            elseif nxt == "c" then depth = depth + 1; i = i + 10
+            elseif nxt == "r" then depth = depth - 1; i = i + 2
+            else bad = bad or i; i = i + 1 end
+            if depth < 0 then bad = bad or i end
+        else i = i + 1 end
+    end
+    ck(bad == nil, "tally has no stray '|' escape (first at " .. tostring(bad) .. ")")
+    ck(depth == 0, "every |c colour is closed by a |r (unbalanced depth " .. depth .. ")")
+    -- ...and the visible divider is present exactly once, as a properly ESCAPED pipe.
+    local _, n = s:gsub("||", "")
+    ck(n == 1, "exactly one escaped-pipe divider in the tally (got " .. tostring(n) .. ")")
     ck(want[Detail.TALLY_SPLIT] == "Naxx" and want[Detail.TALLY_SPLIT + 1] == "Ony",
         "the split really is the weekly / short-cycle boundary")
     if locked ~= 2 then fails[#fails + 1] = "expected 2 locked (MC, Ony), got " .. locked end
@@ -1142,6 +1233,46 @@ local function testDetailGeometry(fails)
 end
 
 -- Row-list STATUS matrix (owner round-3): map a BuffTileState result -> (text, tok).
+-- ROUND-23: the detail header's sub-line copy.
+local function testHeaderSubline(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local SEP = "  \194\183  "
+
+    ck(Detail.HeaderSubline({ level = 60, className = "Rogue" }, 1)
+        == "Level 60" .. SEP .. "Rogue" .. SEP .. "Account 1",
+        "full sub-line -> 'Level 60 · Rogue · Account 1'")
+
+    -- "Account N", never the old "#N".
+    local s = Detail.HeaderSubline({ level = 60, className = "Rogue" }, 2)
+    ck(s:find("Account 2", 1, true) ~= nil, "account reads 'Account 2'")
+    ck(s:find("#", 1, true) == nil, "the old '#N' shorthand is gone")
+
+    -- Account segment OMITTED cleanly when the id is absent or non-numeric — and crucially
+    -- without leaving a dangling separator.
+    for _, aid in ipairs({ "", "abc" }) do
+        local t = Detail.HeaderSubline({ level = 60, className = "Rogue" }, aid)
+        ck(t == "Level 60" .. SEP .. "Rogue", "aid '" .. aid .. "' -> account segment dropped")
+        ck(t:sub(-#SEP) ~= SEP, "no trailing separator for aid '" .. aid .. "'")
+    end
+    local t = Detail.HeaderSubline({ level = 60, className = "Rogue" }, nil)
+    ck(t == "Level 60" .. SEP .. "Rogue", "nil aid -> account segment dropped")
+    ck(t:find("Account", 1, true) == nil, "nil aid -> no empty 'Account' text")
+
+    -- A numeric STRING id still counts (the store keeps aids as strings).
+    ck(Detail.HeaderSubline({ level = 60, className = "Rogue" }, "3"):find("Account 3", 1, true) ~= nil,
+        "string aid '3' -> Account 3")
+
+    -- Fallbacks: classTag when className is absent, default level, nil record.
+    ck(Detail.HeaderSubline({ level = 55, classTag = "ROGUE" }, nil)
+        == "Level 55" .. SEP .. "ROGUE", "falls back to classTag")
+    ck(Detail.HeaderSubline({ className = "Mage" }, nil):find("Level 60", 1, true) ~= nil,
+        "missing level defaults to 60")
+    ck(Detail.HeaderSubline(nil, nil):find("Level 60", 1, true) ~= nil, "nil record -> no error")
+
+    -- Separator matches the statusFS beside it in the same band (one rhythm, not two).
+    ck(SEP == "  \194\183  ", "separator is the suite middot, spaced like statusFS")
+end
+
 local function testRowStatus(fails)
     local function ck(c, m) if not c then fails[#fails + 1] = m end end
     -- missing required -> "Missing" / danger
@@ -1213,6 +1344,7 @@ if ns.RegisterSelfTest then
             { name = "caption compact",     fn = testCaptionCompact },
             { name = "raid tally",          fn = testRaidTally },
             { name = "pane geometry",       fn = testDetailGeometry },
+            { name = "header subline",      fn = testHeaderSubline },
             { name = "row status",          fn = testRowStatus },
             { name = "color fns (rgb)",     fn = testColorFns },
             { name = "item icon path",      fn = testItemIconTex },
