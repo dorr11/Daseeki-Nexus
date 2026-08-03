@@ -2,6 +2,36 @@
 
 ## Unreleased
 
+- Fixed: **the group list on an instance-log hover was not really in columns.** A
+  tooltip line is a single piece of text, so the four "columns" of names were just four
+  names glued together — each one started wherever the previous name happened to end, and
+  on a 40-man raid the result was four ragged edges. The roster is now laid out as a real
+  grid: every column starts at one fixed point down the whole block, and the level sits in
+  its own right-aligned slot so single- and double-digit levels leave the names lined up
+  too. Column width is measured from the actual names in the group, so a five-man stays
+  compact and a full raid of long names is capped rather than running off the screen.
+
+- Fixed: **group members on the instance-log hover showed up plain white.** They were
+  meant to be class-coloured, but runs recorded before class capture existed — and imports
+  whose source had no class field — carry no class per member, and there was nothing to
+  fall back on. Nexus now looks the name up in the characters it already knows (your own,
+  your alts, and any peer on the mesh) and colours from that; the "(you)" entry always
+  colours, since your own class is never in doubt. A name it genuinely does not know stays
+  neutral rather than being coloured with a guess, and if two realms disagree about a name
+  it stays neutral too. Newly recorded runs already carried class and are unaffected.
+
+- Changed: **the Rest view's columns now split the table 40 / 20 / 20 / 20.** CHARACTER,
+  LEVEL, XP and REST used to be sized to their own contents, which left the three numbers
+  bunched against the right edge with a gulf after the character name. They now take fixed
+  shares of the list width, so the header row sits over its columns and the space is spread
+  evenly. Numbers stay right-aligned.
+
+- Fixed: **pressing Escape in a character's NOTE box threw away what you had typed.**
+  Escape restored the previously saved note and *then* released the box, so the save that
+  fires on release wrote the restored text back over yours. Escape now saves and then
+  releases. Clicking away still saves as before, and switching to another character while
+  the box is still active saves the note to the character you actually wrote it for.
+
 - Fixed: **an old Daseeki Core could take the dashboard down with it.** Three places
   drew their divider rules with a Core 2.2.0 drawing call, unguarded — on an older
   Core that is a Lua error mid-build, and you lose the whole panel rather than one

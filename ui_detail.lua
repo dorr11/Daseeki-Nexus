@@ -492,6 +492,31 @@ function Detail.ItemIconTex(itemID)
     return QUESTION_ICON
 end
 
+-- ── NOTE COMMIT (round-29) ──────────────────────────────────────────────────
+-- The ONE place the note box's text reaches the store. Both commit routes (Escape and
+-- focus-loss) call it, so there is a single answer to "what does saving a note mean" and
+-- a seam the headless suite can drive without an EditBox.
+--
+-- Store shape is UNCHANGED: this is exactly the Store.SetNote call the round-19 handler
+-- made, including the empty-string-means-erase rule that Store.GetNote already mirrors on
+-- read. Returns the value written (nil when erased) so a caller can assert it.
+function Detail.CommitNote(nameRealm, text)
+    if type(nameRealm) ~= "string" or nameRealm == "" then return nil end
+    local t = (type(text) == "string" and text ~= "") and text or nil
+    if ns.Store and ns.Store.SetNote then ns.Store.SetNote(nameRealm, t) end
+    return t
+end
+
+-- Escape on the note box: COMMIT, then blur. Exported (rather than living inline in the
+-- handler) purely so the ordering can be pinned by a test — reverting-then-blurring is
+-- the exact round-28 bug this replaces, and it is invisible to any test that only checks
+-- the save function. `box` needs GetText / ClearFocus and nothing else.
+function Detail.NoteEscape(box, nameRealm)
+    local saved = Detail.CommitNote(nameRealm, box and box.GetText and box:GetText())
+    if box and box.ClearFocus then box:ClearFocus() end
+    return saved
+end
+
 -- ════════════════════════════════════════════════════════════════════════════
 --  FRAME BUILD + INSTANT SWAP  (in-game only; UI is non-nil there)
 -- ════════════════════════════════════════════════════════════════════════════
@@ -827,18 +852,24 @@ function Detail.Attach(parent)
         self:SetBackdropBorderColor(UI.Color("controlBorder"))
     end)
     local function noteGet(nr) if ns.Store and ns.Store.GetNote then return ns.Store.GetNote(nr) end end
-    local function noteSet(nr, t) if ns.Store and ns.Store.SetNote then ns.Store.SetNote(nr, t) end end
     -- ROUND-28 addendum (owner): Enter inserts a NEWLINE. The OnEnterPressed override that
     -- committed-and-blurred is REMOVED, not replaced — a multi-line EditBox handles Enter
     -- natively once nothing intercepts it, so removing the handler IS the feature.
     -- Commit semantics after this:
     --   Enter        -> newline (no save, no blur)
-    --   focus lost   -> SAVES (unchanged; clicking away or Escape both route through it)
-    --   Escape       -> reverts to the stored note, then blurs (unchanged)
-    -- Nothing else committed on Enter, so no save path is lost.
-    noteBox:SetScript("OnEscapePressed", function(self) self:SetText(noteGet(D._current or "") or ""); self:ClearFocus() end)
+    --   focus lost   -> SAVES
+    --   Escape       -> SAVES, then blurs        (ROUND-29 — see below)
+    --
+    -- ROUND-29 (owner: "Escape loses the typed text"). The round-28 Escape handler read
+    --     self:SetText(noteGet(D._current)) ; self:ClearFocus()
+    -- i.e. it REVERTED the box to the stored note and only then dropped focus — so the
+    -- OnEditFocusLost save that fired a moment later saved the reverted text back over
+    -- itself. Everything typed since the box gained focus was destroyed by the save path
+    -- that was supposed to protect it. Escape now COMMITS and then blurs, and both routes
+    -- (Escape, clicking away) go through the one Detail.CommitNote seam.
+    noteBox:SetScript("OnEscapePressed", function(self) Detail.NoteEscape(self, D._current) end)
     noteBox:SetScript("OnEditFocusLost", function(self)
-        if D._current then local t = self:GetText(); noteSet(D._current, (t ~= "" and t) or nil) end
+        Detail.CommitNote(D._current, self:GetText())
     end)
     D.noteBox = noteBox
 
@@ -867,6 +898,13 @@ function Detail.Attach(parent)
         end
         emptyFS:Hide(); header:Show(); leftCol:Show(); rightCol:Show()
         if hrule then hrule:Show() end
+        -- ROUND-29: OnEditFocusLost reads D._current AT FIRE TIME, so swapping characters
+        -- while the note box still holds focus would have saved the half-typed note onto
+        -- the character just selected. Commit it to the OUTGOING one and blur first.
+        if D.noteBox and D._current and D._current ~= entry.nameRealm
+           and D.noteBox.HasFocus and D.noteBox:HasFocus() then
+            Detail.NoteEscape(D.noteBox, D._current)
+        end
         D._current, D._entry = entry.nameRealm, entry
         local rec = entry.rec
         local Dd = Dash()
@@ -1476,9 +1514,65 @@ local function testItemIconTex(fails)
     ns.Dashboard = savedD
 end
 
+-- ROUND-29 (owner: "Escape loses the typed text"). The round-28 Escape handler reverted
+-- the box to the stored note and THEN dropped focus, so the focus-lost save wrote the
+-- reverted text back — everything typed was destroyed by the save path itself. The bug was
+-- pure ORDERING, which is why the test drives Detail.NoteEscape (commit, then blur) with a
+-- fake edit box rather than only asserting that CommitNote can write.
+local function testNoteCommit(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local S = ns.Store
+    if not (S and S.SetNote and S.GetNote) then
+        fails[#fails + 1] = "note commit: ns.Store.SetNote/GetNote must exist for the note path"
+        return
+    end
+    local NR = "NoteTester-Realm"
+    S.SetNote(NR, "stored note")
+
+    -- A fake EditBox. SetText is provided ON PURPOSE even though the commit path must not
+    -- call it: that is what makes this test sensitive to a handler that reverts the box
+    -- before saving, which is exactly what round-28 did.
+    local function fakeBox(text)
+        return { blurred = false,
+                 GetText = function(self) return self.text end,
+                 SetText = function(self, t) self.text = t end,
+                 ClearFocus = function(self) self.blurred = true end,
+                 text = text }
+    end
+
+    -- THE REGRESSION: type over the stored note, hit Escape.
+    local box = fakeBox("typed but not committed")
+    Detail.NoteEscape(box, NR)
+    ck(S.GetNote(NR) == "typed but not committed",
+        "note escape: Escape SAVES the typed text (got " .. tostring(S.GetNote(NR)) .. ")")
+    ck(box.blurred == true, "note escape: Escape still drops focus")
+    ck(box.text == "typed but not committed",
+        "note escape: Escape must not revert the box's own text")
+
+    -- Focus-loss (clicking away) goes through the same seam and must behave identically.
+    Detail.CommitNote(NR, "clicked away")
+    ck(S.GetNote(NR) == "clicked away", "note focus-loss: saves the current text")
+
+    -- Clearing the box erases the note. Same shape Store.GetNote already reads back as nil,
+    -- so no new store shape is introduced.
+    ck(Detail.CommitNote(NR, "") == nil, "note commit: an empty box commits nil, not \"\"")
+    ck(S.GetNote(NR) == nil, "note commit: an emptied box erases the stored note")
+
+    -- No selected character -> nothing is written anywhere.
+    S.SetNote(NR, "keep me")
+    ck(Detail.CommitNote(nil, "orphan") == nil, "note commit: no character selected -> no write")
+    ck(S.GetNote(NR) == "keep me", "note commit: an orphan commit cannot touch another note")
+    local orphanBox = fakeBox("orphan")
+    Detail.NoteEscape(orphanBox, nil)
+    ck(orphanBox.blurred == true, "note escape: Escape blurs even with nothing selected")
+    ck(S.GetNote(NR) == "keep me", "note escape: ...and still writes nothing")
+    S.SetNote(NR, "")
+end
+
 if ns.RegisterSelfTest then
     ns:RegisterSelfTest("detail", function(verbose)
         local cases = {
+            { name = "note commit/escape", fn = testNoteCommit },
             { name = "dmf cooldown state", fn = testDMFCooldownState },
             { name = "buff display matrix", fn = testBuffMatrix },
             { name = "detail/card agreement", fn = testDetailCardAgreement },

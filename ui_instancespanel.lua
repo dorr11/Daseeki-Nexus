@@ -532,18 +532,56 @@ function InstancesUI.InstanceFlexWidth(C)
     return C.content - fixed
 end
 
+-- ── REST VIEW COLUMN SPLIT (round-29, owner) ────────────────────────────────
+-- The Rest view's LVL / XP / REST cells were FIXED at 26 / 46 / 46 px (round-28, sized to
+-- their compact formats). Correct for the numerals, wrong for the table: the three of them
+-- plus their gaps came to 133 of the 344 available, so CHAR flexed to ~199 and the row read
+-- as a name marooned on the left with three numerals bunched against the right edge.
+--
+-- Owner's rule: split the TABLE WIDTH 40 / 20 / 20 / 20 (CHAR / LVL / XP / REST). The three
+-- numeral columns are RIGHT-aligned inside their 20% cells exactly as before, so the extra
+-- width lands as breathing room between columns rather than between CHAR and LVL alone —
+-- which is the dead space he is pointing at. The columns TILE the table (no inter-column
+-- gap is added on top): a right-aligned numeral in a 20% cell already sits well clear of
+-- its left neighbour, and tiling is what makes the percentages exactly true.
+--
+-- `total` is the LIVE list width, so the split tracks the panel instead of re-deriving a
+-- magic number if the panel is ever re-sized. CHAR takes the rounding remainder, so the
+-- four widths always sum to `total` to the pixel. Pure.
+InstancesUI.REST_SPLIT = { char = 0.40, lvl = 0.20, xp = 0.20, rest = 0.20 }
+
+function InstancesUI.RestColumnWidths(total)
+    total = math.floor(tonumber(total) or 0)
+    if total < 40 then total = InstancesUI.RECENT_COLS.content end
+    local S = InstancesUI.REST_SPLIT
+    local lvl  = math.floor(total * S.lvl  + 0.5)
+    local xp   = math.floor(total * S.xp   + 0.5)
+    local rest = math.floor(total * S.rest + 0.5)
+    return { total = total, char = total - lvl - xp - rest, lvl = lvl, xp = xp, rest = rest }
+end
+
 -- The group roster as a TWO-COLUMN name list: { {left, right}, ... }, each cell
 -- "Bramble 57" and the character's own row annotated. Capped, with a "+N more"
 -- tail so a 40-man raid cannot grow a tooltip past the screen. Pure.
 -- ROUND-26 Part B: the group roster as an N-COLUMN grid of CELLS (not pre-joined strings),
 -- so the renderer can colour each name by class. Each cell is
---   { text = "60 Name", classTag = "ROGUE"|nil, isSelf = bool, more = bool }
+--   { text = "60 Name", lvlText = "60"|nil, nameText = "Name (you)",
+--     classTag = "ROGUE"|nil, isSelf = bool, more = bool }
 -- LEVEL sits LEFT of the name (owner). classTag comes from the enriched snapshot; for
 -- LEGACY rows (encoded before round-26, so class-less) the caller can pass `classBy`, a
 -- short-name -> classTag map built from the mesh roster, and we fall back to that. A name
 -- in neither renders PLAIN rather than guessed — an unknown class is not a grey class.
 -- Pure.
-function InstancesUI.GroupGrid(members, cols, cap, classBy)
+--
+-- ROUND-29 (owner: "the group names render plain white"): TWO changes here.
+--  1. `text` is now ALSO split into `lvlText` / `nameText`, because the renderer stopped
+--     concatenating cells into one tooltip line and now lays each part into its own
+--     FontString at a FIXED column x (InstancesUI.GroupGridLayout). `text` is kept
+--     byte-identical so every existing consumer and test is untouched.
+--  2. `selfClass` (the ROW CHARACTER's class, which the panel already knows from the
+--     store) colours the isSelf cell even on a fully class-less LEGACY snapshot. That is
+--     the one member whose class we can know for certain without guessing.
+function InstancesUI.GroupGrid(members, cols, cap, classBy, selfClass)
     cols = cols or 4
     cap  = cap or 40
     members = members or {}
@@ -554,14 +592,22 @@ function InstancesUI.GroupGrid(members, cols, cap, classBy)
         else
             local lvl = tonumber(m.level) or 0
             local nm = tostring(m.name)
-            local txt = (lvl > 0) and (lvl .. " " .. nm) or nm
-            if m.isSelf then txt = txt .. " (you)" end
+            local isSelf = m.isSelf and true or false
+            local nameText = isSelf and (nm .. " (you)") or nm
+            local lvlText = (lvl > 0) and tostring(lvl) or nil
+            local txt = lvlText and (lvlText .. " " .. nameText) or nameText
             local cls = m.classTag
             if (not cls or cls == "") and classBy then cls = classBy[nm] end
-            cells[#cells + 1] = { text = txt, classTag = cls, isSelf = m.isSelf and true or false }
+            if (not cls or cls == "") and isSelf then cls = selfClass end
+            if cls == "" then cls = nil end
+            cells[#cells + 1] = { text = txt, lvlText = lvlText, nameText = nameText,
+                                  classTag = cls, isSelf = isSelf }
         end
     end
-    if over > 0 then cells[#cells + 1] = { text = "+" .. over .. " more", more = true } end
+    if over > 0 then
+        local tail = "+" .. over .. " more"
+        cells[#cells + 1] = { text = tail, nameText = tail, more = true }
+    end
     local rows = {}
     for i = 1, #cells, cols do
         local row = {}
@@ -569,6 +615,97 @@ function InstancesUI.GroupGrid(members, cols, cap, classBy)
         rows[#rows + 1] = row
     end
     return rows
+end
+
+-- ── GROUP GRID GEOMETRY (round-29, owner: "everything in each column aligns at a
+--    single starting point") ────────────────────────────────────────────────────
+-- The old renderer packed four cells into a tooltip line's two native columns by string
+-- concatenation, so every cell after the first started wherever the PREVIOUS name's width
+-- had left off — four ragged pseudo-columns. The grid is now laid out for real: one
+-- FontString pair (level, name) per cell at a FIXED x within the tooltip.
+--
+-- Each cell is  [ level, right-aligned in a fixed lvlW slot ][ lvlGap ][ name, left ].
+-- Right-aligning the level is what makes the NAME start points line up even though "7"
+-- and "60" are different widths — the name x is a constant, not "after the level".
+--
+--   colGap 14  — the visual gutter between columns at the tooltip's 12pt face. Narrower
+--                reads as one run-on column; wider wastes a 40-man's width budget.
+--   maxWidth 520 — the whole grid's px budget, and the ONLY thing that can force a name to
+--                ellipsise. Derived at the tooltip face (FRIZQT__ 12pt, ~6.2px mean advance,
+--                digits ~6.7, capitals ~7.6):
+--                  level slot   "60" -> 14, + lvlGap 4               = 18
+--                  widest name  WoW caps character names at 12 chars = ~76
+--                  the ONE self cell also carries " (you)"           = +25
+--                  4 * (18 + 101) + 3 gutters * 14                   = 518
+--                so 520 seats the absolute worst case — a 40-man in which the longest
+--                name present is a 12-character name — without clipping anything, and the
+--                resulting ~540px tooltip is still under half of a 1024-wide UI. NOTE this
+--                is a CEILING, not a size: the grid is measured, so a real raid of 6-9
+--                character names comes out around 406px and a 5-man narrower still.
+--   fallbackAdvance 6.2 — mean px per character of FRIZQT__ at 12pt, used ONLY when
+--                GetStringWidth is unavailable (headless). In-game the widths are MEASURED.
+InstancesUI.GROUP_GRID = {
+    cols = 4,               -- unchanged rule: four columns at every group size
+    cap  = 40,
+    lvlGap = 4,
+    colGap = 14,
+    maxWidth = 520,
+    fallbackAdvance = 6.2,
+    inset = 10,             -- GameTooltip's own text inset, each side
+}
+
+-- Column math for a GroupGrid result. `measure(text) -> px` is the renderer's real
+-- FontString measurement in-game and a character-count estimate headless, so this is a
+-- PURE function of (rows, measure) and the whole thing is testable without a client.
+-- Returns nil for an empty grid, else
+--   { cols, lvlW, nameW, lvlGap, colGap, pitch, x = {..}, nameX = {..}, width }
+-- where x[k] is column k's LEVEL slot origin and nameX[k] its NAME origin, both relative
+-- to the tooltip line's left edge. Every column shares one pitch, so x is strictly
+-- increasing and cell k always ends at or before `width`.
+function InstancesUI.GroupGridLayout(rows, measure, opts)
+    local G = InstancesUI.GROUP_GRID
+    opts = opts or {}
+    local lvlGap = opts.lvlGap  or G.lvlGap
+    local colGap = opts.colGap  or G.colGap
+    local maxW   = opts.maxWidth or G.maxWidth
+    measure = measure or function(s) return #tostring(s or "") * G.fallbackAdvance end
+    local cols, lvlW, nameW = 0, 0, 0
+    for _, row in ipairs(rows or {}) do
+        local n = 0
+        for _, c in ipairs(row) do
+            n = n + 1
+            if c.lvlText and c.lvlText ~= "" then
+                local w = measure(c.lvlText) or 0
+                if w > lvlW then lvlW = w end
+            end
+            local w = measure(c.nameText or c.text or "") or 0
+            if w > nameW then nameW = w end
+        end
+        if n > cols then cols = n end
+    end
+    if cols == 0 then return nil end
+    lvlW = math.ceil(lvlW)
+    -- A roster with no levels at all (every member decoded bare) spends nothing on the
+    -- level slot rather than reserving an empty one.
+    local slot = (lvlW > 0) and (lvlW + lvlGap) or 0
+    -- The name column is as wide as the WIDEST ACTUAL name, capped by the grid budget —
+    -- a party of short names gets a tight tooltip, a 40-man of long ones ellipsises
+    -- instead of running off the screen. Either way every column is the SAME width, which
+    -- is the whole point.
+    local room = maxW - cols * slot - (cols - 1) * colGap
+    local maxName = math.floor(room / cols)
+    if maxName < 1 then maxName = 1 end
+    nameW = math.ceil(nameW)
+    if nameW > maxName then nameW = maxName end
+    local pitch = slot + nameW + colGap
+    local x, nameX = {}, {}
+    for k = 1, cols do
+        x[k] = (k - 1) * pitch
+        nameX[k] = x[k] + slot
+    end
+    return { cols = cols, lvlW = lvlW, nameW = nameW, lvlGap = lvlGap, colGap = colGap,
+             pitch = pitch, x = x, nameX = nameX,
+             width = (cols - 1) * pitch + slot + nameW }
 end
 
 -- Legacy two-column string form. Retained: the round-15 tests pin it, and it is the
@@ -621,7 +758,7 @@ end
 --
 -- Every section is OMITTED when the run has no data for it, so a pre-detail
 -- entry renders exactly the block it always did plus the clock lines.
-function InstancesUI.RowTooltip(model, nowE)
+function InstancesUI.RowTooltip(model, nowE, classBy)
     model = model or {}
     local lines = {}
     local function add(label, value) lines[#lines + 1] = { label, value } end
@@ -669,7 +806,13 @@ function InstancesUI.RowTooltip(model, nowE)
 
     -- Group: FOUR columns, class-coloured, level LEFT of the name. The cap rises from 20 to
     -- 40 now that four columns make a full raid ten rows instead of twenty.
-    local roster = InstancesUI.GroupGrid(model.group, 4, 40)
+    -- ROUND-29: `classBy` (short name -> class tag, from the store's own character graph)
+    -- is finally WIRED. It was designed in round-26 and never passed by any caller, which
+    -- is why every LEGACY / imported roster rendered plain white: those snapshots carry no
+    -- per-member class tag and there was nothing to fall back to. model.classTag covers the
+    -- row's own character, so the "(you)" cell colours even with no map at all.
+    local G = InstancesUI.GROUP_GRID
+    local roster = InstancesUI.GroupGrid(model.group, G.cols, G.cap, classBy, model.classTag)
     if #roster > 0 then
         tip.groupHeader = "Group (" .. #(model.group or {}) .. ")"
         tip.groupRows = roster
@@ -788,6 +931,33 @@ function InstancesUI.ClassLookup(data)
         end
     end
     return map
+end
+
+-- ROUND-29: collapse a ClassLookup map (nameRealm -> classTag) to SHORT name -> classTag.
+-- A group snapshot stores bare names ("Bramble"), so that is the only key the roster grid
+-- can look up; the store's character graph — self, alts, and every mesh peer that has ever
+-- been seen — is keyed Name-Realm. This is the bridge.
+--
+-- AMBIGUITY IS DROPPED, NOT GUESSED: if two realms both know a "Bramble" and they are
+-- different classes, the short name maps to NOTHING and that cell renders neutral. Same
+-- doctrine as GroupGrid's own comment — an unknown class is not a grey class, and a
+-- CONFIDENTLY WRONG class colour is worse than no colour. Agreeing duplicates are kept.
+-- Pure.
+function InstancesUI.ShortClassMap(classMap)
+    local short, ambiguous = {}, {}
+    for nameRealm, tag in pairs(classMap or {}) do
+        if type(nameRealm) == "string" and type(tag) == "string" and tag ~= "" then
+            local nm = nameRealm:match("^([^%-]+)") or nameRealm
+            if not ambiguous[nm] then
+                if short[nm] == nil then
+                    short[nm] = tag
+                elseif short[nm] ~= tag then
+                    short[nm], ambiguous[nm] = nil, true
+                end
+            end
+        end
+    end
+    return short
 end
 
 -- Per-character EXPERIENCE / REST row (owner round-10 item 2). Consumes the record
@@ -962,8 +1132,12 @@ local COL_GAP, COL_PAD            = RC.gap, RC.pad
 --   LVL  46 -> 26  ("41" not "Level 41" — two digits at the numeral font is ~14px)
 --   XP   84 -> 46  ("50%" not "8000/16000")
 --   REST 78 -> 46  ("150%" — the "(Max)" suffix is now colour, not text)
--- Name flex therefore gains 90px: 344 - (26+46+46) - 3*gap 5 - pads 12 = 199 (was 109).
-local REST_LVL_W, REST_XP_W, REST_REST_W = 26, 46, 46
+-- ROUND-29 (owner): those fixed widths are REPLACED by a 40/20/20/20 percentage split of
+-- the live list width (InstancesUI.RestColumnWidths). The constants below are only the
+-- pre-layout defaults the cells are created with; Refresh re-widths them every pass from
+-- the real width, so a resized panel keeps the split rather than the pixels.
+local REST_DEFAULT_W = InstancesUI.RestColumnWidths(InstancesUI.RECENT_COLS.content)
+local REST_LVL_W, REST_XP_W, REST_REST_W = REST_DEFAULT_W.lvl, REST_DEFAULT_W.xp, REST_DEFAULT_W.rest
 
 local function tag(frame, id)
     if ns.Audit and ns.Audit.Tag and frame then ns.Audit.Tag(frame, id) end
@@ -980,6 +1154,142 @@ local function microLabel(parent, text)
     l:SetTextColor(UI.Color("muted"))   -- pop pass
     if text then l:SetText(text) end
     return l
+end
+
+-- ════════════════════════════════════════════════════════════════════════════
+--  ROSTER GRID ON THE ROW HOVER  (round-29, owner)
+-- ════════════════════════════════════════════════════════════════════════════
+-- A GameTooltip line is ONE FontString (two with AddDoubleLine), so round-26's four-column
+-- roster was four cells CONCATENATED into two lines' worth of text. Cell 2 therefore
+-- started wherever cell 1's name happened to end, cell 3 after cell 2, and so on — four
+-- columns that were ragged by construction. Owner: "everything in each column aligns at a
+-- single starting point."
+--
+-- The fix is to stop drawing the grid as text. Each roster row still costs exactly one
+-- tooltip line — added as a BLANK line, purely to buy the line's height and let the
+-- tooltip lay itself out — and the cells are our OWN FontStrings, parented to GameTooltip
+-- and anchored to that blank line's FontString at the fixed x's from
+-- InstancesUI.GroupGridLayout. One FontString pair (level, name) per cell, pooled.
+--
+-- WHY ANCHOR TO THE LINE rather than to the tooltip with a computed y: line heights are
+-- the tooltip's business (font, scale, wrapping), so taking the baseline from the line
+-- Blizzard already positioned is the only way rows cannot drift into each other. Rows can
+-- therefore never overlap — each one IS a tooltip line.
+--
+-- Widths are MEASURED with GetStringWidth against the tooltip's own font, so the columns
+-- are exactly as wide as the names in front of the player rather than a guessed constant.
+local ROSTER = { cells = {}, shown = 0, measureFS = nil, hooked = false }
+
+-- One hidden FontString in the tooltip's own face, reused for every measurement.
+-- Returns nil when the client cannot measure (headless mock), which sends
+-- GroupGridLayout to its documented character-count fallback.
+local function rosterMeasure(text)
+    local m = ROSTER.measureFS
+    if not m then
+        if not (GameTooltip and GameTooltip.CreateFontString) then return nil end
+        m = GameTooltip:CreateFontString(nil, "ARTWORK")
+        if m.SetFontObject and GameTooltipText then m:SetFontObject(GameTooltipText) end
+        if m.Hide then m:Hide() end
+        ROSTER.measureFS = m
+    end
+    if not m.SetText or not m.GetStringWidth then return nil end
+    m:SetText(text or "")
+    local w = m:GetStringWidth()
+    if type(w) ~= "number" then return nil end
+    return w
+end
+
+local function rosterCellAt(i)
+    local c = ROSTER.cells[i]
+    if c then return c end
+    -- The tooltip's OWN font object, so the grid is the same face and size as every other
+    -- line in the hover rather than the dashboard's condensed body face.
+    local lv = GameTooltip:CreateFontString(nil, "OVERLAY")
+    if GameTooltipText then lv:SetFontObject(GameTooltipText) end
+    lv:SetJustifyH("RIGHT"); lv:SetWordWrap(false)
+    local nm = GameTooltip:CreateFontString(nil, "OVERLAY")
+    if GameTooltipText then nm:SetFontObject(GameTooltipText) end
+    nm:SetJustifyH("LEFT"); nm:SetWordWrap(false)
+    c = { lv = lv, nm = nm }
+    ROSTER.cells[i] = c
+    return c
+end
+
+local function rosterHide()
+    for i = 1, ROSTER.shown do
+        local c = ROSTER.cells[i]
+        if c then c.lv:Hide(); c.nm:Hide() end
+    end
+    ROSTER.shown = 0
+end
+
+-- Class colour for a cell, with the graceful path spelled out: a roster member whose class
+-- we do not know renders in the normal body colour. Never black, never a guessed class.
+local function rosterColor(c)
+    if c.more then return UI.Color("muted") end
+    if c.classTag then
+        local r, g, b = Dashboard.ClassColor(c.classTag)
+        if r then return r, g, b end
+    end
+    return UI.Color("text")
+end
+
+-- Lay `tip.groupRows` into the tooltip. Returns true when it drew, false when the caller
+-- must fall back (no grid, or a client that will not tell us how many lines it has).
+local function rosterPaint(tip)
+    rosterHide()
+    if not (tip and tip.groupRows and GameTooltip) then return false end
+    if not ROSTER.hooked and GameTooltip.HookScript then
+        -- The pool lives on GameTooltip, which every addon in the game shares. When the
+        -- tooltip goes away the cells MUST go with it, or they would hang over the next
+        -- thing it shows; the minimum width has to be released for the same reason.
+        GameTooltip:HookScript("OnHide", function()
+            rosterHide()
+            if GameTooltip.SetMinimumWidth then GameTooltip:SetMinimumWidth(0) end
+        end)
+        ROSTER.hooked = true
+    end
+    local base = GameTooltip.NumLines and GameTooltip:NumLines()
+    if type(base) ~= "number" then return false end
+    local L = InstancesUI.GroupGridLayout(tip.groupRows, rosterMeasure)
+    if not L then return false end
+    for _ = 1, #tip.groupRows do GameTooltip:AddLine(" ") end
+    -- The tooltip sizes itself to its LINES, and our grid lines are blank, so it has to be
+    -- told how wide the grid is or the cells would spill past the backdrop.
+    if GameTooltip.SetMinimumWidth then
+        GameTooltip:SetMinimumWidth(L.width + 2 * InstancesUI.GROUP_GRID.inset)
+    end
+    local idx = 0
+    for r = 1, #tip.groupRows do
+        local lineFS = _G["GameTooltipTextLeft" .. (base + r)]
+        if lineFS then
+            local row = tip.groupRows[r]
+            for k = 1, L.cols do
+                local cell = row[k]
+                if cell then
+                    idx = idx + 1
+                    local slot = rosterCellAt(idx)
+                    local cr, cg, cb = rosterColor(cell)
+                    slot.lv:ClearAllPoints()
+                    slot.lv:SetPoint("LEFT", lineFS, "LEFT", L.x[k], 0)
+                    -- SetWidth(0) means "auto" to a FontString, so a level-less roster
+                    -- (lvlW 0) is left un-widthed rather than told to size itself.
+                    if L.lvlW > 0 then slot.lv:SetWidth(L.lvlW) end
+                    slot.lv:SetText(cell.lvlText or "")
+                    slot.lv:SetTextColor(cr, cg, cb)
+                    slot.lv:Show()
+                    slot.nm:ClearAllPoints()
+                    slot.nm:SetPoint("LEFT", lineFS, "LEFT", L.nameX[k], 0)
+                    slot.nm:SetWidth(L.nameW)
+                    slot.nm:SetText(cell.nameText or cell.text or "")
+                    slot.nm:SetTextColor(cr, cg, cb)
+                    slot.nm:Show()
+                end
+            end
+        end
+    end
+    ROSTER.shown = idx
+    return true
 end
 
 -- Build the instances panel into `host` (a raised panel frame from ui_cards). Returns
@@ -1318,25 +1628,29 @@ function InstancesPanel.Attach(host)
                 GameTooltip:AddDoubleLine(cells[1], cells[2] .. "   " .. cells[3],
                                           vr, vg, vb, vr, vg, vb)
             end
-            -- Roster: FOUR columns, each name in its class colour. A tooltip line only has
-            -- two native columns, so the four cells are packed into two — each side holding
-            -- a colour-coded pair — which keeps the class tint per NAME rather than per line.
+            -- Roster: FOUR TRUE COLUMNS (round-29). rosterPaint adds one blank tooltip line
+            -- per grid row and lays our own class-coloured FontStrings into it at fixed
+            -- column x's, so every column starts at ONE point down the whole block. If the
+            -- client will not co-operate (rosterPaint returns false) we fall back to the
+            -- round-26 concatenated form rather than dropping the roster entirely.
             if tip.groupRows then
                 GameTooltip:AddLine(" ")
                 GameTooltip:AddLine(tip.groupHeader, hr, hg, hb)
-                local function cell(c)
-                    if not c then return "" end
-                    if c.more then return Dashboard.Colored(c.text, "muted") end
-                    local cr, cg, cb = Dashboard.ClassColor(c.classTag)
-                    if not c.classTag or not cr then return Dashboard.Colored(c.text, "text") end
-                    return ("|cff%02x%02x%02x%s|r"):format(
-                        math.floor(cr * 255 + 0.5), math.floor(cg * 255 + 0.5),
-                        math.floor(cb * 255 + 0.5), c.text)
-                end
-                for _, row in ipairs(tip.groupRows) do
-                    GameTooltip:AddDoubleLine(cell(row[1]) .. "   " .. cell(row[2]),
-                                              cell(row[3]) .. "   " .. cell(row[4]),
-                                              vr, vg, vb, vr, vg, vb)
+                if not rosterPaint(tip) then
+                    local function cell(c)
+                        if not c then return "" end
+                        if c.more then return Dashboard.Colored(c.text, "muted") end
+                        local cr, cg, cb = Dashboard.ClassColor(c.classTag)
+                        if not c.classTag or not cr then return Dashboard.Colored(c.text, "text") end
+                        return ("|cff%02x%02x%02x%s|r"):format(
+                            math.floor(cr * 255 + 0.5), math.floor(cg * 255 + 0.5),
+                            math.floor(cb * 255 + 0.5), c.text)
+                    end
+                    for _, row in ipairs(tip.groupRows) do
+                        GameTooltip:AddDoubleLine(cell(row[1]) .. "   " .. cell(row[2]),
+                                                  cell(row[3]) .. "   " .. cell(row[4]),
+                                                  vr, vg, vb, vr, vg, vb)
+                    end
                 end
             end
             if tip.tradeLines then
@@ -1371,14 +1685,18 @@ function InstancesPanel.Attach(host)
     local function makeExpRow()
         local r = CreateFrame("Frame", nil, child)
         r:SetHeight(REC_H)
+        -- ROUND-29: the three numeral cells TILE (offset 0, not -COL_GAP) because their
+        -- widths are now percentage shares that must add up to the table exactly. The
+        -- separation is inside each cell: a right-aligned "50%" in a 20% cell already
+        -- leaves ~40px of clear space before its left neighbour's text.
         r.rested = fstr(r, "numeral", "RIGHT"); r.rested:SetPoint("RIGHT", r, "RIGHT", 0, 0)
         r.rested:SetWidth(REST_REST_W); r.rested:SetWordWrap(false)
-        r.xp = fstr(r, "numeral", "RIGHT"); r.xp:SetPoint("RIGHT", r.rested, "LEFT", -COL_GAP, 0)
+        r.xp = fstr(r, "numeral", "RIGHT"); r.xp:SetPoint("RIGHT", r.rested, "LEFT", 0, 0)
         r.xp:SetWidth(REST_XP_W); r.xp:SetWordWrap(false)
-        r.lvl = fstr(r, "microLabel", "RIGHT"); r.lvl:SetPoint("RIGHT", r.xp, "LEFT", -COL_GAP, 0)
+        r.lvl = fstr(r, "microLabel", "RIGHT"); r.lvl:SetPoint("RIGHT", r.xp, "LEFT", 0, 0)
         r.lvl:SetWidth(REST_LVL_W); r.lvl:SetTextColor(UI.Color("muted")); r.lvl:SetWordWrap(false)
         r.name = fstr(r, "small"); r.name:SetPoint("LEFT", r, "LEFT", 0, 0)
-        r.name:SetPoint("RIGHT", r.lvl, "LEFT", -COL_GAP, 0); r.name:SetWordWrap(false)
+        r.name:SetPoint("RIGHT", r.lvl, "LEFT", 0, 0); r.name:SetWordWrap(false)
         return r
     end
     local function getExp(i)
@@ -1493,21 +1811,37 @@ function InstancesPanel.Attach(host)
         -- re-widthed per view, so both views get true column headers over their columns.
         cols:ClearAllPoints(); cols:SetPoint("TOPRIGHT", host, "TOPRIGHT", -PAD, -listTop)
         cols:SetShown(true)
+        -- ROUND-29: hoisted above the caption block — the Rest captions and the Rest ROWS
+        -- must be sized from the SAME width or the headers would not sit over their columns.
+        local W = scroll:GetWidth(); if W < 1 then W = host:GetWidth() - 2 * PAD end
+        -- ROUND-29: the Rest view's caption chain TILES its cells (see makeExpRow), so the
+        -- shared capDur/capLvl links are re-anchored per view — gapped in Logs, flush in
+        -- Rest. Same edges either way (capDur -> capAgo -> cols), so the anchor graph is
+        -- unchanged; only the offset moves.
+        local restW = InstancesUI.RestColumnWidths(W)
         if isExp then
-            capAgo:SetText("REST"); capAgo:SetWidth(REST_REST_W)
-            capDur:SetText("XP");   capDur:SetWidth(REST_XP_W)
-            capLvl:SetText("LVL");  capLvl:SetWidth(REST_LVL_W); capLvl:Show()
-            cols:SetWidth(REST_REST_W + REST_XP_W + REST_LVL_W + 2 * COL_GAP)
+            capAgo:SetText("REST"); capAgo:SetWidth(restW.rest)
+            capDur:SetText("XP");   capDur:SetWidth(restW.xp)
+            capDur:ClearAllPoints(); capDur:SetPoint("RIGHT", capAgo, "LEFT", 0, 0)
+            capLvl:SetText("LVL");  capLvl:SetWidth(restW.lvl)
+            capLvl:ClearAllPoints(); capLvl:SetPoint("RIGHT", capDur, "LEFT", 0, 0)
+            capLvl:Show()
+            cols:SetWidth(restW.rest + restW.xp + restW.lvl)
             capInst:Hide()
         else
             capAgo:SetText("AGO"); capAgo:SetWidth(COL_AGO)
             capDur:SetText("DUR"); capDur:SetWidth(COL_DUR)
+            capDur:ClearAllPoints(); capDur:SetPoint("RIGHT", capAgo, "LEFT", -COL_GAP, 0)
+            capLvl:ClearAllPoints(); capLvl:SetPoint("RIGHT", capDur, "LEFT", -COL_GAP, 0)
             capLvl:Hide()
             cols:SetWidth(COL_AGO + COL_DUR + COL_GAP)
             capInst:Show()
         end
         capChar:ClearAllPoints()
         capChar:SetPoint("TOPLEFT", host, "TOPLEFT", PAD, -listTop)
+        -- ROUND-29: in Rest the CHAR caption spans its 40% share; Logs keeps the 70px
+        -- name column it has always had (that view's split is untouched).
+        capChar:SetWidth(isExp and restW.char or COL_NAME)
         capChar:Show()
         capInst:ClearAllPoints()
         capInst:SetPoint("LEFT", capChar, "RIGHT", COL_PAD, 0)
@@ -1517,7 +1851,10 @@ function InstancesPanel.Attach(host)
         scroll:SetPoint("BOTTOMRIGHT", host, "BOTTOMRIGHT", -PAD, PAD)
 
         local classMap = InstancesUI.ClassLookup(data or {})
-        local W = scroll:GetWidth(); if W < 1 then W = host:GetWidth() - 2 * PAD end
+        -- ROUND-29: the roster grid on the row hover falls back to this SHORT-name map when
+        -- a group snapshot carries no per-member class (every pre-round-26 capture, and any
+        -- NIT import whose source had no class field). Built once per refresh, not per row.
+        local shortClass = InstancesUI.ShortClassMap(classMap)
         child:SetWidth(W)
         for _, r in ipairs(P._rows) do r:Hide() end
         for _, r in ipairs(P._expRows) do r:Hide() end
@@ -1532,6 +1869,10 @@ function InstancesPanel.Attach(host)
                 shown = shown + 1
                 local r = getExp(shown)
                 r:ClearAllPoints(); r:SetPoint("TOPLEFT", child, "TOPLEFT", 0, -y); r:SetPoint("TOPRIGHT", child, "TOPRIGHT", 0, -y)
+                -- ROUND-29: re-width the three numeral cells to their 40/20/20/20 shares of
+                -- the LIVE list width every pass (the NAME cell flexes into what is left,
+                -- so it needs no explicit width).
+                r.lvl:SetWidth(restW.lvl); r.xp:SetWidth(restW.xp); r.rested:SetWidth(restW.rest)
                 local cr, cg, cb = Dashboard.ClassColor(m.classTag)
                 r.name:SetText(m.name or "?")
                 if cr then r.name:SetTextColor(cr, cg, cb) else r.name:SetTextColor(UI.Color("text")) end
@@ -1572,7 +1913,7 @@ function InstancesPanel.Attach(host)
                     local cells = InstancesUI.RecentCells(model)
                     r.dur:SetText(cells.dur);  r.dur:SetTextColor(UI.Color("muted"))
                     r.ago:SetText(cells.ago)
-                    r._tip = InstancesUI.RowTooltip(model, nowE)
+                    r._tip = InstancesUI.RowTooltip(model, nowE, shortClass)
                     r:Show()
                     y = y + REC_H + REC_GAP
                 end
@@ -1753,9 +2094,33 @@ local function testInstancesUI(fails)
     ck(keptCells.gold ~= nil and keptCells.xp ~= nil,
         "cols: gold/xp still computed for the tooltip after leaving the row")
 
-    -- REST column chain sums to the same content budget as the Logs chain.
-    ck(REST_LVL_W + REST_XP_W + REST_REST_W + 3 * RCOL.gap + RCOL.name + 2 * RCOL.pad <= RCOL.content,
-        "rest cols: LVL/XP/REST + name + pads fit the 344 budget")
+    -- ── REST VIEW: the 40/20/20/20 split (round-29, owner) ──────────────────
+    -- The columns TILE the table exactly — no leftover slack for CHAR to swallow, which
+    -- was the dead space in the screenshot.
+    local rw = IU.RestColumnWidths(RCOL.content)
+    ck(rw.char + rw.lvl + rw.xp + rw.rest == RCOL.content,
+        "rest cols: the four columns tile the table exactly (got "
+        .. (rw.char + rw.lvl + rw.xp + rw.rest) .. " of " .. RCOL.content .. ")")
+    ck(rw.lvl == rw.xp and rw.xp == rw.rest,
+        "rest cols: LVL / XP / REST are the same 20% width")
+    local function pct(w) return w / RCOL.content end
+    ck(math.abs(pct(rw.char) - 0.40) <= 0.01,
+        "rest cols: CHAR takes ~40% (got " .. string.format("%.1f%%", pct(rw.char) * 100) .. ")")
+    ck(math.abs(pct(rw.lvl) - 0.20) <= 0.01,
+        "rest cols: LVL takes ~20% (got " .. string.format("%.1f%%", pct(rw.lvl) * 100) .. ")")
+    ck(rw.char > rw.lvl * 1.9, "rest cols: CHAR is nearly twice any numeral column")
+    -- The split follows the LIVE width, so a re-sized panel keeps the proportions.
+    local rwWide = IU.RestColumnWidths(500)
+    ck(rwWide.char + rwWide.lvl + rwWide.xp + rwWide.rest == 500,
+        "rest cols: an arbitrary table width still tiles exactly")
+    ck(math.abs(rwWide.char / 500 - 0.40) <= 0.01, "rest cols: 40% holds at another width")
+    -- A frame that has not been laid out yet (width 0) falls back to the content budget
+    -- rather than producing zero-width columns.
+    ck(IU.RestColumnWidths(0).total == RCOL.content, "rest cols: unlaid-out width -> 344 fallback")
+    ck(IU.RestColumnWidths(nil).char == rw.char, "rest cols: nil width -> the same fallback")
+    -- The Logs view's own split is untouched by this change.
+    ck(REST_LVL_W + REST_XP_W + REST_REST_W < RCOL.content,
+        "rest cols: the pre-layout defaults still fit the budget")
     ck(IU.InstanceFlexWidth() >= 90,
         "cols: the instance name keeps at least 90px -- 'Blackrock Depths' must fit")
     -- ROUND-25b: four rendered columns now, so the sum drops GOLD/XP and two of the gaps.
@@ -1821,6 +2186,15 @@ local function testInstancesUI(fails)
         .. tostring(tipF.groupRows[1][1].text) .. ")")
     ck(tipF.groupRows[1][2].text == "57 Bramble", "tooltip: second cell filled")
     ck(tipF.groupRows[1][4] == nil, "tooltip: a short last row simply has no 4th cell")
+    -- ROUND-29: `text` is unchanged, but each cell now also carries the two PARTS the
+    -- column renderer positions independently.
+    ck(tipF.groupRows[1][1].lvlText == "58" and tipF.groupRows[1][1].nameText == "Tester (you)",
+        "tooltip: the self cell splits into level + name, marker on the NAME half")
+    ck(tipF.groupRows[1][2].lvlText == "57" and tipF.groupRows[1][2].nameText == "Bramble",
+        "tooltip: a plain cell splits the same way")
+    ck(tipF.groupRows[1][1].lvlText .. " " .. tipF.groupRows[1][1].nameText
+       == tipF.groupRows[1][1].text,
+        "tooltip: the two halves still rejoin into the legacy `text`")
     ck(#tipF.tradeLines == 2, "tooltip: both trades listed")
     ck(tipF.tradeLines[1]:find("Gave 50g 0s 0c to Bramble", 1, true) ~= nil,
         "tooltip: trade phrasing (got " .. tostring(tipF.tradeLines[1]) .. ")")
@@ -1864,6 +2238,166 @@ local function testInstancesUI(fails)
     ck(#IU.GroupPairs({}, 20) == 0, "roster: no members -> no rows")
     ck(IU.GroupPairs({ { name = "Solo" } }, 20)[1][1] == "Solo",
         "roster: a member with no level renders bare")
+
+    -- ════════════════════════════════════════════════════════════════════════
+    --  ROUND-29: THE ROSTER GRID — column math and class colouring
+    -- ════════════════════════════════════════════════════════════════════════
+    -- Owner's complaint was that the four "columns" did not line up, because the cells were
+    -- concatenated text. These assertions pin the property that fixes it: every column has
+    -- ONE x, shared by every row, and every cell ends inside the grid's declared width.
+    --
+    -- The measure function stands in for the client's GetStringWidth. Deliberately
+    -- PROPORTIONAL and uneven (wide 'W', narrow 'i') so a layout that quietly depended on
+    -- monospace or on equal-length names could not pass.
+    local function measure(s)
+        local w = 0
+        for ch in tostring(s or ""):gmatch(".") do
+            if ch == "W" or ch == "M" then w = w + 11
+            elseif ch == "i" or ch == "l" or ch == " " then w = w + 3
+            else w = w + 6 end
+        end
+        return w
+    end
+
+    local GG = IU.GROUP_GRID
+    ck(GG.cols == 4, "grid: the column count is unchanged at FOUR")
+
+    -- Shape check across the three group sizes that actually occur.
+    local function raidOf(n, namer)
+        local m = {}
+        for i = 1, n do
+            m[i] = { name = (namer and namer(i)) or ("Raider" .. i), level = 60,
+                     classTag = (i % 2 == 0) and "ROGUE" or "MAGE" }
+        end
+        return m
+    end
+    for _, size in ipairs({ 5, 10, 20, 40 }) do
+        local rows = IU.GroupGrid(raidOf(size), GG.cols, GG.cap)
+        local L = IU.GroupGridLayout(rows, measure)
+        local want = math.ceil(size / GG.cols)
+        ck(#rows == want,
+            ("grid %d-man: %d rows of four (got %d)"):format(size, want, #rows))
+        ck(L and L.cols == math.min(size, GG.cols),
+            ("grid %d-man: %d columns"):format(size, math.min(size, GG.cols)))
+        -- MONOTONIC: every column starts strictly right of the one before it.
+        local ok = true
+        for k = 2, L.cols do
+            if not (L.x[k] > L.x[k - 1]) then ok = false end
+            if L.x[k] - L.x[k - 1] ~= L.pitch then ok = false end
+        end
+        ck(ok, ("grid %d-man: column x's are monotonic and evenly pitched"):format(size))
+        -- IN BOUNDS: the last column's name cell ends exactly at the declared width, and
+        -- nothing sticks out past it.
+        ck(L.nameX[L.cols] + L.nameW == L.width,
+            ("grid %d-man: the last cell ends at the grid width"):format(size))
+        ck(L.width <= GG.maxWidth,
+            ("grid %d-man: width %d stays inside the %d budget"):format(size, L.width, GG.maxWidth))
+        -- NO OVERLAP between adjacent cells: a column's name ends before the next
+        -- column's level slot begins.
+        local clear = true
+        for k = 2, L.cols do
+            if L.nameX[k - 1] + L.nameW > L.x[k] then clear = false end
+        end
+        ck(clear, ("grid %d-man: adjacent cells never overlap"):format(size))
+    end
+
+    -- The point of the level slot: names start at the SAME x whether the level beside them
+    -- is one digit or two. This is the assertion that would have failed before round-29.
+    local mixed = IU.GroupGrid({ { name = "Ann", level = 7 }, { name = "Bo", level = 60 },
+                                 { name = "Cy", level = 9 },  { name = "Dee", level = 42 } },
+                               4, 40)
+    local Lm = IU.GroupGridLayout(mixed, measure)
+    ck(Lm.nameX[1] - Lm.x[1] == Lm.nameX[2] - Lm.x[2],
+        "grid: the level slot is a CONSTANT width, so single- and double-digit levels "
+        .. "leave the name at the same offset")
+    ck(Lm.lvlW == measure("60"),
+        "grid: the level slot is sized to the WIDEST level, not the first one (got "
+        .. Lm.lvlW .. ")")
+
+    -- A roster of long names is capped rather than allowed to run off the screen; the
+    -- columns stay equal and in-bounds either way.
+    local long = IU.GroupGrid(raidOf(40, function(i) return "Wwwwwwwwwww" .. (i % 10) end),
+                              4, 40)
+    local Ll = IU.GroupGridLayout(long, measure)
+    ck(Ll.width <= GG.maxWidth,
+        "grid: a raid of maximum-length names is capped at the width budget (got " .. Ll.width .. ")")
+    ck(Ll.nameX[4] + Ll.nameW == Ll.width, "grid: capped names still end at the grid width")
+    -- ...and a party of short names does NOT pay for width it does not use.
+    local short = IU.GroupGridLayout(IU.GroupGrid(raidOf(5, function(i) return "Al" .. i end), 4, 40),
+                                     measure)
+    ck(short.width < Ll.width, "grid: short names produce a narrower grid than long ones")
+
+    -- Degenerate inputs.
+    ck(IU.GroupGridLayout({}, measure) == nil, "grid: no rows -> no layout")
+    ck(IU.GroupGridLayout(nil, measure) == nil, "grid: nil rows -> no layout")
+    local noLvl = IU.GroupGridLayout(IU.GroupGrid({ { name = "Solo" } }, 4, 40), measure)
+    ck(noLvl.lvlW == 0 and noLvl.nameX[1] == noLvl.x[1],
+        "grid: a level-less roster spends nothing on the level slot")
+    -- The default measure (no client) must still produce a usable layout rather than nil.
+    local est = IU.GroupGridLayout(IU.GroupGrid(raidOf(40), 4, 40))
+    ck(est and est.cols == 4 and est.width > 0,
+        "grid: with no measure function the character-count fallback still lays out")
+
+    -- ── CLASS COLOURING (round-29 owner report: "the names render plain white") ──
+    -- Case 1 — an ENRICHED snapshot (round-26 and later) carries its own class per member.
+    local enriched = IU.GroupGrid({ { name = "Ann", level = 60, classTag = "ROGUE" },
+                                    { name = "Bo",  level = 59 } }, 4, 40)
+    ck(enriched[1][1].classTag == "ROGUE", "roster colour: a captured class tag is carried")
+    ck(enriched[1][2].classTag == nil,
+        "roster colour: a member with no class stays nil -- the renderer paints it neutral "
+        .. "rather than guessing")
+    -- Case 2 — a LEGACY snapshot (no class on any member) resolved through the store's
+    -- character graph. This is the path the owner's Naxx entry takes.
+    local legacy = { { name = "Ann", level = 60 }, { name = "Bo", level = 59 },
+                     { name = "Ghost", level = 60 } }
+    local byName = { Ann = "ROGUE", Bo = "PRIEST" }
+    local lifted = IU.GroupGrid(legacy, 4, 40, byName)
+    ck(lifted[1][1].classTag == "ROGUE" and lifted[1][2].classTag == "PRIEST",
+        "roster colour: a class-less legacy member is coloured from the store's character graph")
+    ck(lifted[1][3].classTag == nil,
+        "roster colour: a name the store has never seen stays neutral, not guessed")
+    -- The captured tag WINS over the map: the snapshot saw the real class at the time.
+    local both = IU.GroupGrid({ { name = "Ann", level = 60, classTag = "MAGE" } }, 4, 40,
+                              { Ann = "ROGUE" })
+    ck(both[1][1].classTag == "MAGE", "roster colour: a captured tag beats the lookup map")
+    -- Case 3 — the "(you)" cell. The row's own character class is known from the store
+    -- even when the snapshot is entirely class-less, so the self cell always colours.
+    local selfOnly = IU.GroupGrid({ { name = "Tester", level = 58, isSelf = true },
+                                    { name = "Ghost", level = 60 } }, 4, 40, nil, "WARLOCK")
+    ck(selfOnly[1][1].classTag == "WARLOCK",
+        "roster colour: the (you) cell falls back to the row character's own class")
+    ck(selfOnly[1][1].nameText == "Tester (you)",
+        "roster colour: the (you) marker rides the NAME half, so it is inside the coloured cell")
+    ck(selfOnly[1][1].isSelf == true, "roster colour: the self cell is still flagged")
+    ck(selfOnly[1][2].classTag == nil, "roster colour: selfClass never leaks onto other members")
+    -- The overflow tail is a cell like any other, and must NOT pick up a class.
+    local overflow = IU.GroupGrid(raidOf(45), 4, 40)
+    local tail = overflow[#overflow][#overflow[#overflow]]
+    ck(tail.more == true and tail.classTag == nil and tail.nameText == "+5 more",
+        "roster colour: the '+N more' tail is a plain muted cell")
+
+    -- ShortClassMap: the bridge from the store's Name-Realm graph to a snapshot's bare names.
+    local scm = IU.ShortClassMap({ ["Ann-Real"] = "ROGUE", ["Bo-Real"] = "PRIEST" })
+    ck(scm.Ann == "ROGUE" and scm.Bo == "PRIEST", "short class map: realm suffix stripped")
+    -- Same name, two realms, SAME class -> still usable.
+    local agree = IU.ShortClassMap({ ["Ann-One"] = "ROGUE", ["Ann-Two"] = "ROGUE" })
+    ck(agree.Ann == "ROGUE", "short class map: duplicates that agree are kept")
+    -- Same name, two realms, DIFFERENT class -> dropped, because colouring it would be a
+    -- coin flip and a confidently wrong class colour is worse than none.
+    local clash = IU.ShortClassMap({ ["Ann-One"] = "ROGUE", ["Ann-Two"] = "MAGE" })
+    ck(clash.Ann == nil, "short class map: an ambiguous short name is dropped, not guessed")
+    ck(IU.ShortClassMap(nil) ~= nil, "short class map: nil input -> empty map, never nil")
+    ck(IU.ShortClassMap({ ["Odd-R"] = "" }).Odd == nil, "short class map: a blank tag is not a class")
+    -- End to end: the tooltip builder wires the map through to the cells.
+    local tipC = IU.RowTooltip(IU.RowModel({ t = T - 60, name = "Naxxramas",
+        group = "*Tester:60|Ann:60|Ghost:60" }, "Tester-Realm", "WARLOCK", T), T,
+        IU.ShortClassMap({ ["Ann-Realm"] = "ROGUE" }))
+    ck(tipC.groupRows[1][1].classTag == "WARLOCK",
+        "roster colour end-to-end: the hover's (you) cell carries the row character's class")
+    ck(tipC.groupRows[1][2].classTag == "ROGUE",
+        "roster colour end-to-end: a legacy member is lifted from the store map")
+    ck(tipC.groupRows[1][3].classTag == nil,
+        "roster colour end-to-end: an unknown member stays neutral")
 
     -- ── ONE ROW PER PHYSICAL INSTANCE: the display-grouping matrix ──────────
     -- Owner: "if i leave and re-enter the same instance, without resetting it,
