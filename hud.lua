@@ -929,8 +929,19 @@ local function ensureBanner()
     f:Hide()
 
     local fs = f:CreateFontString(nil, "OVERLAY")
-    -- No outlined FontObject in the framework — build the outlined face here.
-    fs:SetFont("Fonts\\FRIZQT__.TTF", 30, "THICKOUTLINE")
+    -- The framework ships no THICKOUTLINE FontObject at banner size, so size+flags are
+    -- ours — but the FACE must not be. This was hardcoded to Friz Quadrata, which made
+    -- the one piece of Nexus type the raid actually reads mid-pull the only piece that
+    -- ignored the Core font picker. SizedFont reads the current picked face+size off the
+    -- `header` role and re-applies on OnFontChanged / OnThemeChanged, so the banner now
+    -- tracks the picker live; +15 over header's 15pt reproduces the previous 30px at
+    -- scale 1.0 and scales with the user's font-scale setting from there.
+    local Dash = ns.Dashboard
+    if Dash and Dash.SizedFont then
+        Dash.SizedFont(fs, "header", 15, "THICKOUTLINE")
+    else
+        fs:SetFont("Fonts\\FRIZQT__.TTF", 30, "THICKOUTLINE")   -- pre-kit fallback
+    end
     fs:SetPoint("CENTER", f, "CENTER", 0, 0)
     fs:SetJustifyH("CENTER")
     UI.Skin(fs, function(self) self:SetTextColor(UI.Color("accent")) end)

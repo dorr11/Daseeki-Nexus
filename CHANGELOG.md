@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Fixed: **the on-screen alert banner ignored your chosen font.** The big centred
+  warning (pull timers, quest hand-ins, cooldown alerts) was hardcoded to the game's
+  default face while every other piece of Nexus type follows the font you pick in
+  Daseeki Core — so the one line you actually read mid-pull was the one line in the
+  wrong font. It now uses your picked face, keeps its heavy outline, and changes with
+  the picker and your font-size setting without a reload. Same size, position and
+  colour as before at the default setting.
+
 - Fixed: **the group list on an instance-log hover was not really in columns.** A
   tooltip line is a single piece of text, so the four "columns" of names were just four
   names glued together — each one started wherever the previous name happened to end, and
