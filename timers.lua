@@ -4281,7 +4281,11 @@ local function testLogDedup(fails)
     ns.Store.AddTimerLog("rend", { epoch = a, who = "same", trust = "local" })
     ns.Store.AddTimerLog("rend", { epoch = a + 10, who = "same", trust = "local" })
     tcheck(#logs.rend == 1, "same-source pops within 30s dedup to 1 log", fails)
-    ns.Store.AddTimerLog("rend", { epoch = a + 40, who = "same", trust = "local" })
+    -- F10 keep-max-epoch: the merged row's epoch advanced to a+10, so the next
+    -- distinct pop must clear the +/-30s window from THERE (a+45 > a+10+30).
+    -- Old expectation used a+40, which is exactly 30s from the advanced epoch —
+    -- a boundary duplicate under the new (spec SN 10.1) semantics, not a new row.
+    ns.Store.AddTimerLog("rend", { epoch = a + 45, who = "same", trust = "local" })
     tcheck(#logs.rend == 2, "pop past 30s window is a new log entry", fails)
     logs.rend = {}
 end
