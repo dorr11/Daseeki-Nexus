@@ -1168,9 +1168,121 @@ function HUD.SaveGroupPosition(g)
     pb[key] = { point = point or "CENTER", x = x or 0, y = y or 0 }
 end
 
+----------------------------------------------------------------------
+-- NW-6 — the pull bar against a Core that predates the 2.2.0 ledger kit
+--
+-- UI.MakeStatusBar arrived with Core 2.2.0. Nexus's toc requires Core by
+-- PRESENCE, not by version, so an un-updated Core 2.0.0 made the first
+-- world-buff pull throw "attempt to call field 'MakeStatusBar' (a nil value)" —
+-- and unlike the Hairline ornaments there is no setting that turns pull bars off,
+-- so it was unavoidable. The call therefore goes through ns:CoreAPI like every
+-- other 2.2.0 site, but a pull bar cannot simply be SKIPPED (it IS the feature),
+-- so the nil branch degrades to the plain fill bar below instead.
+--
+-- What an old Core costs the owner: the interpolated drain (the fill snaps to
+-- each tick), the spark riding the fill edge, and the outlined numeral face if
+-- the theme has no `numeral` role. Everything else — traffic-light hue, urgency
+-- brighten, countdown text, icon, label, grouping — is unchanged. It is a
+-- plainer timer bar, not a missing one.
+----------------------------------------------------------------------
+
+-- Same call surface the pull bars use (SetBarValue / GetBarValue / SetBarRange /
+-- SetBarText / SetUrgent, plus the _urgent flag applyBarVisual reads), built from
+-- plain Blizzard widgets and the pre-2.2.0 DaseekiUI (UI.Color/UI.Skin/UI.fonts).
+-- Range and value are held in Lua rather than read back off the widget so the
+-- clamp is ours and never depends on a widget answering GetMinMaxValues.
+local function fallbackStatusBar(parent, opts)
+    opts = opts or {}
+    local sb = CreateFrame("StatusBar", nil, parent)
+    if opts.width then sb:SetWidth(opts.width) end
+    sb:SetHeight(opts.height or 14)
+    sb:SetStatusBarTexture("Interface\\Buttons\\WHITE8X8")   -- flat; colour is the token
+
+    local lo, hi = opts.min or 0, opts.max or 1
+    sb:SetMinMaxValues(lo, hi)
+
+    local fillToken = opts.fillToken or "brand"
+    local bgToken   = opts.bgToken or "inset"
+
+    local bg = sb:CreateTexture(nil, "BACKGROUND")
+    bg:SetAllPoints(sb)
+
+    -- No spark: it is the kit's own continuous motion and has no cheap stand-in.
+    local textFS
+    if opts.text then
+        textFS = sb:CreateFontString(nil, "OVERLAY")
+        -- `numeral` is itself a 2.2.0 font role, so fall back the way the kit does.
+        local face = UI.fonts and (UI.fonts[opts.textFont or "numeral"] or UI.fonts.body)
+        if face then textFS:SetFontObject(face) end
+        textFS:SetPoint("LEFT", sb, "LEFT", 4, 0)
+        textFS:SetPoint("RIGHT", sb, "RIGHT", -4, 0)
+        textFS:SetJustifyH(opts.textJustify or "LEFT")
+    end
+    sb._textFS = textFS
+    sb._urgent = false
+    sb._degraded = true          -- the marker the "hudkit" suite asserts on
+
+    sb.__reskin = function(self)
+        local fr, fg, fb = UI.Color(fillToken)
+        if self._urgent then fr, fg, fb = brighten(fr, fg, fb) end
+        self:SetStatusBarColor(fr, fg, fb)
+        bg:SetColorTexture(UI.Color(bgToken))
+        if textFS then
+            local tr, tg, tb = UI.Color("text")
+            if self._urgent then tr, tg, tb = brighten(tr, tg, tb) end
+            textFS:SetTextColor(tr, tg, tb)
+        end
+    end
+    UI.Skin(sb, sb.__reskin)
+
+    sb._val = opts.value or lo
+    sb:SetValue(sb._val)
+
+    -- `immediate` is accepted and ignored: this bar has no tween to skip.
+    function sb:SetBarValue(v)
+        v = tonumber(v) or lo
+        if v < lo then v = lo elseif v > hi then v = hi end
+        self._val = v
+        self:SetValue(v)
+    end
+    function sb:GetBarValue() return self._val end
+    function sb:SetBarRange(a, b)
+        lo, hi = tonumber(a) or 0, tonumber(b) or 1
+        self:SetMinMaxValues(lo, hi)
+        self:SetBarValue(self._val)
+    end
+    function sb:SetBarText(s) if self._textFS then self._textFS:SetText(s or "") end end
+    -- Brighten fill + text; never dims (BRAND_SPEC §7/§8), same contract as the kit.
+    function sb:SetUrgent(on)
+        on = on and true or false
+        if self._urgent == on then return end
+        self._urgent = on
+        self.__reskin(self)
+    end
+
+    return sb
+end
+
+-- Resolved ONCE per session, not per bar (the ui_timersdock precedent): an older
+-- Core loses the kit for every bar and says so exactly once, rather than
+-- narrating on every world-buff pop.
+local kitStatusBar, kitResolved
+local function statusBarMaker()
+    if not kitResolved then
+        kitResolved  = true
+        kitStatusBar = ns:CoreAPI(ns.CORE_KIT_VERSION, "the Nexus pull bars",
+                                  UI and UI.MakeStatusBar)
+    end
+    return kitStatusBar or fallbackStatusBar
+end
+
+-- Test seam: forget the resolved maker so a suite can re-run the guard.
+function HUD._ResetCoreKit() kitStatusBar, kitResolved = nil, nil end
+
 -- Build one pull bar (both dimensions set at creation, per style rule).
 -- Structure: outer Frame (positioned by the group) → token FlatFrame bg →
--- UI.MakeStatusBar fill (interpolation + spark + numeral countdown). Icon and
+-- UI.MakeStatusBar fill (interpolation + spark + numeral countdown), or the
+-- degraded fill bar above when Core predates the kit. Icon and
 -- label are children of the STATUS BAR (drawn above the fill), so they never sit
 -- behind the drain. The countdown is the kit's own text FS (numeral, right).
 -- `buffKey` is the BUFF (not the bar key): it drives icon/label/alert routing and
@@ -1185,7 +1297,7 @@ local function createBar(buffKey)
     bg:SetAllPoints(bar)
     bar._bg = bg
 
-    local sb = UI.MakeStatusBar(bar, {
+    local sb = statusBarMaker()(bar, {
         spark      = true,
         text       = true,
         textFont   = "numeral",
@@ -1218,6 +1330,7 @@ local function createBar(buffKey)
     bar:Hide()
     return bar
 end
+HUD._CreateBar = createBar   -- test seam: the "hudkit" suite drives the real builder
 
 -- Evict the oldest bar when at cap (never a currently-relevant main bar if a
 -- small one exists; simplest: evict the oldest by insertion order).
@@ -1251,6 +1364,107 @@ local function paintBar(bar, remaining, duration)
     end
     applyBarVisual(sb)          -- apply the (possibly brightened) fill hue
 end
+
+-- ── NW-6 regression suite: the pull bar on an un-updated Core ─────────────────
+-- UI.MakeStatusBar is the one 2.2.0-kit call the HUD cannot skip, and pull bars
+-- have no default-off switch, so an unguarded call site is a guaranteed hard
+-- error on the first world-buff pop for anyone who updates Nexus but not Core.
+-- This drives the REAL createBar down both roads — kit absent (a stubbed Core
+-- 2.0.0) and kit present — so re-unguarding the call fails here, not in a raid.
+-- Registered below the DaseekiUI guard because it builds actual bars.
+ns:RegisterSelfTest("hudkit", function(verbose)
+    -- Failures are COLLECTED, not printed: this suite hijacks ns.Print to count
+    -- the stale-Core notice, so printing mid-run would pollute what it counts.
+    local fails = {}
+    local function check(c, m) if not c then fails[#fails + 1] = m end end
+
+    local savedMake  = UI.MakeStatusBar
+    local savedSuite = _G.DaseekiSuite
+    local savedPrint = ns.Print
+    local lines = {}
+    ns.Print = function(_, msg) lines[#lines + 1] = tostring(msg) end
+
+    -- (1) Core 2.0.0: no ledger kit, and a Core too old to even answer
+    -- RequireCore — so nobody has told the owner anything and Nexus must.
+    UI.MakeStatusBar = nil
+    _G.DaseekiSuite  = nil
+    HUD._ResetCoreKit()
+    local ok, bar = pcall(HUD._CreateBar, "rend")
+    check(ok, "an un-updated Core must not error the pull bar: " .. tostring(bar))
+    local sb = ok and bar and bar._sb or nil
+    check(sb ~= nil, "a bar is still built without the kit")
+    check(sb and sb._degraded == true, "...and it is the degraded fill bar")
+    check(#lines == 1, "the stale-Core notice speaks exactly once (got " .. #lines .. ")")
+    check(lines[1] and lines[1]:find("pull bars", 1, true) ~= nil,
+        "the notice names the pull bars, not some other feature")
+
+    -- It has to WORK as a timer bar, not merely exist: these are the exact calls
+    -- onPullDetected and the driver ticker make on every live bar.
+    if sb then
+        sb:SetBarRange(0, 30)
+        sb:SetBarValue(30, true)
+        check(sb:GetBarValue() == 30, "the degraded bar starts full")
+        sb:SetBarValue(12)
+        check(sb:GetBarValue() == 12, "...and drains")
+        sb:SetBarValue(99)
+        check(sb:GetBarValue() == 30, "...clamped at the top of the range")
+        sb:SetBarValue(-5)
+        check(sb:GetBarValue() == 0, "...and at the bottom")
+        check(pcall(function() sb:SetBarText(HUD.CountdownText(12)) end),
+            "the countdown readout does not error")
+        sb:SetUrgent(true)
+        check(sb._urgent == true, "urgency is reachable (applyBarVisual reads this flag)")
+        sb:SetUrgent(false)
+        check(sb._urgent == false, "and releases")
+        check(pcall(function() bar._icon:SetTexture(buffIcon("rend")); bar._label:SetText("Rend") end),
+            "icon and label still hang off the degraded bar")
+        check(pcall(paintBar, bar, 2, 30), "paintBar drives the degraded bar")
+        check(sb._stateToken == "danger", "...and the traffic light still lands on red")
+    end
+
+    -- A second bar must NOT re-narrate: the maker is resolved once per session.
+    lines = {}
+    local ok2, bar2 = pcall(HUD._CreateBar, "onyH")
+    check(ok2, "a second bar on the same stale Core still builds: " .. tostring(bar2))
+    check(#lines == 0, "and the notice does not repeat per bar")
+
+    -- (1b) A Core new enough to answer, answering "too old": Core prints its own
+    -- line, so Nexus stays quiet — and still degrades rather than trusting the API.
+    UI.MakeStatusBar = savedMake
+    _G.DaseekiSuite  = { RequireCore = function() return false end }
+    HUD._ResetCoreKit()
+    lines = {}
+    local okB, barB = pcall(HUD._CreateBar, "nefH")
+    check(okB, "a Core that reports itself stale still builds a bar: " .. tostring(barB))
+    check(barB and barB._sb and barB._sb._degraded == true,
+        "Core's verdict wins over the API being present")
+    check(#lines == 0, "Nexus adds no second line — Core already spoke")
+
+    -- (2) Core 2.2.0: the kit is present and it is what gets built.
+    local kitCalls = 0
+    UI.MakeStatusBar = function(p, o) kitCalls = kitCalls + 1; return savedMake(p, o) end
+    _G.DaseekiSuite  = { RequireCore = function() return true end }
+    HUD._ResetCoreKit()
+    lines = {}
+    local ok3, bar3 = pcall(HUD._CreateBar, "zg")
+    check(ok3, "a current Core builds the kit bar: " .. tostring(bar3))
+    check(kitCalls == 1, "the kit's MakeStatusBar is the one that ran")
+    check(bar3 and bar3._sb and bar3._sb._degraded == nil,
+        "the kit bar is NOT the degraded stand-in")
+    check(#lines == 0, "a current Core says nothing at all")
+
+    UI.MakeStatusBar = savedMake
+    _G.DaseekiSuite  = savedSuite
+    ns.Print         = savedPrint
+    HUD._ResetCoreKit()
+
+    local pass = #fails == 0
+    if verbose then
+        for i = 1, #fails do ns:Print("  FAIL: " .. fails[i]) end
+        ns:Print("  hudkit selftest " .. (pass and "PASS" or "FAIL"))
+    end
+    return pass
+end)
 
 -- Per-bar zone relevance: a VARIANT bar is relevant only when the player stands
 -- in that bar's OWN landing zone (an Orgrimmar waiter must not see the Barrens

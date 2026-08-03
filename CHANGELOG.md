@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Fixed: **the first world-buff pull timer could throw a Lua error if you updated Nexus
+  but not Daseeki Core.** The pull bar is drawn with a bar widget that arrived in Core
+  2.2.0, and it was being used without checking that the installed Core actually has it —
+  so on an older Core the very first Rend or Onyxia pull errored, and there is no setting
+  that turns pull bars off to avoid it. Nexus now checks first: with Core 2.2.0 or newer
+  nothing changes, and on an older Core the bar is drawn plainly instead — same colours,
+  same countdown, same icon and label, just without the smooth drain and the spark that
+  rides its edge — with one chat line telling you to update Daseeki Core.
+
 - Changed: **the Instance Log's columns now split the table 30 / 30 / 20 / 20** — this
   supersedes the 40 / 20 / 20 / 20 split in the two entries below, in both the Rest and the
   Logs view. 40% was more room than any character name needs and it squeezed the second
