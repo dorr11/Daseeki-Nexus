@@ -501,63 +501,73 @@ function InstancesUI.RecentCells(model)
     }
 end
 
--- The RECENT column budget in px. Lives HERE rather than as a panel-local so the
--- headless suite can assert the geometry still leaves a readable instance-name
--- flex if any column is ever re-tuned. `content` = panel width 364 (ui_cards
--- INST_W) minus the panel's 10px padding a side.
--- ROUND-25b (owner): the Logs rows carry FOUR columns — Character · Instance · Duration ·
--- Ago. GOLD and XP are dropped from the rows; the exact figures already live in the row's
--- hover tooltip, so no information is lost, and their 80px + 2 gaps go to the INSTANCE
--- name, which is the column that was actually truncating dungeon names.
---   flex = 344 - (name 56 + 2*pad 6 + dur 38 + ago 38 + gap 5) = 195   (was 105)
--- ROUND-27 addendum (owner: "reduce the dead space between Instance and Dur"): the CHAR
--- column widens 56 -> 70 so a realistic character name fits UN-ELLIPSIZED. Measured at the
--- row's `small` font (11pt, ~0.52em average advance): "Konditioner" (11 chars) needs ~63px
--- and was being cut at 56; 70 seats a 12-character name (~69px). INSTANCE starts further
--- right and its FLEX shrinks 195 -> 181 accordingly, which is what closes the gulf before
--- DUR — the flex column was absorbing all the slack. Still far above the 90px floor the
--- suite asserts for "Blackrock Depths".
-InstancesUI.RECENT_COLS = {
-    content = 344, name = 70, dur = 38, ago = 38,
-    gold = 42, xp = 38,        -- retained for the TOOLTIP figures, not rendered as columns
-    gap = 5,   -- between the right-aligned numeral columns
-    pad = 6,   -- either side of the flexing instance name
-}
-
--- px left over for the flexing, ellipsising instance name. Pure.
--- Round-25b: only the two rendered numeral columns (dur, ago) and their single gap count.
-function InstancesUI.InstanceFlexWidth(C)
-    C = C or InstancesUI.RECENT_COLS
-    local fixed = C.name + 2 * C.pad + C.dur + C.ago + C.gap
-    return C.content - fixed
-end
-
--- ── REST VIEW COLUMN SPLIT (round-29, owner) ────────────────────────────────
--- The Rest view's LVL / XP / REST cells were FIXED at 26 / 46 / 46 px (round-28, sized to
--- their compact formats). Correct for the numerals, wrong for the table: the three of them
--- plus their gaps came to 133 of the 344 available, so CHAR flexed to ~199 and the row read
--- as a name marooned on the left with three numerals bunched against the right edge.
+-- The list content budget in px. Lives HERE rather than as a panel-local so the headless
+-- suite can assert the geometry, and so both views' column splits can fall back to it
+-- before the frame has been laid out. `content` = panel width 364 (ui_cards INST_W) minus
+-- the panel's 10px padding a side.
 --
--- Owner's rule: split the TABLE WIDTH 40 / 20 / 20 / 20 (CHAR / LVL / XP / REST). The three
--- numeral columns are RIGHT-aligned inside their 20% cells exactly as before, so the extra
--- width lands as breathing room between columns rather than between CHAR and LVL alone —
--- which is the dead space he is pointing at. The columns TILE the table (no inter-column
--- gap is added on top): a right-aligned numeral in a 20% cell already sits well clear of
--- its left neighbour, and tiling is what makes the percentages exactly true.
---
--- `total` is the LIVE list width, so the split tracks the panel instead of re-deriving a
--- magic number if the panel is ever re-sized. CHAR takes the rounding remainder, so the
--- four widths always sum to `total` to the pixel. Pure.
-InstancesUI.REST_SPLIT = { char = 0.40, lvl = 0.20, xp = 0.20, rest = 0.20 }
+-- ROUND-30 (owner): this table used to carry a per-column px budget as well
+-- (name/dur/ago/gold/xp + gap + pad) — the Logs view's hand-tuned chain, plus an
+-- InstanceFlexWidth() helper for the slack the instance name absorbed. BOTH views now
+-- tile a PERCENTAGE split of the live list width (see ColumnWidths below), so there is no
+-- fixed per-column px and no flex column left to compute. The gold/xp figures those
+-- entries once sized left the rows in round-25b and live on the row's hover tooltip.
+InstancesUI.RECENT_COLS = { content = 344 }
 
-function InstancesUI.RestColumnWidths(total)
+-- ── TILED COLUMN SPLIT — BOTH VIEWS (round-29 Rest, round-30 Logs; owner) ───
+-- Round-29 fixed the Rest view: its LVL / XP / REST cells were FIXED px (26 / 46 / 46),
+-- which came to 133 of the 344 available, so CHAR flexed to ~199 and the row read as a
+-- name marooned on the left with three numerals bunched against the right edge.
+--
+-- Owner's rule: split the TABLE WIDTH 40 / 20 / 20 / 20. Round-30 applies the SAME rule to
+-- the Logs view (CHAR / INSTANCE / DUR / AGO), which round-29 deliberately left on its own
+-- content-sized chain. One splitter serves both — the views differ only in their column
+-- NAMES, which is data, not code.
+--
+-- The numeral columns stay RIGHT-aligned inside their 20% cells and the identity columns
+-- (CHAR, and the Logs view's INSTANCE — "Naxxramas ×3") stay LEFT-aligned, so the extra
+-- width lands as breathing room BETWEEN columns rather than piling up behind CHAR alone —
+-- which is the dead space the owner is pointing at. The columns TILE the table (no
+-- inter-column gap is added on top): a right-aligned numeral in a 20% cell already sits
+-- well clear of its left neighbour, and tiling is what makes the percentages exactly true.
+--
+-- A split spec is the ratio per column plus `order`, the columns LEFT to RIGHT. The FIRST
+-- column is the REMAINDER column: every other column rounds to its share and the first
+-- takes what is left, so the widths always sum to `total` to the pixel. The leading
+-- column's own ratio is therefore DECLARATIVE — it is never read, only stated, and the
+-- suite asserts each spec's ratios sum to 1 so a mis-stated one cannot pass unnoticed.
+InstancesUI.REST_SPLIT = { char = 0.40, lvl = 0.20, xp = 0.20, rest = 0.20,
+                           order = { "char", "lvl", "xp", "rest" } }
+InstancesUI.LOGS_SPLIT = { char = 0.40, inst = 0.20, dur = 0.20, ago = 0.20,
+                           order = { "char", "inst", "dur", "ago" } }
+
+-- `total` is the LIVE list width, so a split tracks the panel instead of re-deriving a
+-- magic number if the panel is ever re-sized. A frame that has not been laid out yet
+-- reports ~0, which falls back to the content budget rather than collapsing every column
+-- to nothing. Pure.
+function InstancesUI.ColumnWidths(total, split)
+    split = split or InstancesUI.REST_SPLIT
     total = math.floor(tonumber(total) or 0)
     if total < 40 then total = InstancesUI.RECENT_COLS.content end
-    local S = InstancesUI.REST_SPLIT
-    local lvl  = math.floor(total * S.lvl  + 0.5)
-    local xp   = math.floor(total * S.xp   + 0.5)
-    local rest = math.floor(total * S.rest + 0.5)
-    return { total = total, char = total - lvl - xp - rest, lvl = lvl, xp = xp, rest = rest }
+    local order = split.order
+    local out, used = { total = total }, 0
+    for i = 2, #order do
+        local k = order[i]
+        local w = math.floor(total * split[k] + 0.5)
+        out[k] = w
+        used = used + w
+    end
+    out[order[1]] = total - used
+    return out
+end
+
+-- The two named views. Thin, so a caller reads as the view it means.
+function InstancesUI.RestColumnWidths(total)
+    return InstancesUI.ColumnWidths(total, InstancesUI.REST_SPLIT)
+end
+
+function InstancesUI.LogsColumnWidths(total)
+    return InstancesUI.ColumnWidths(total, InstancesUI.LOGS_SPLIT)
 end
 
 -- The group roster as a TWO-COLUMN name list: { {left, right}, ... }, each cell
@@ -1107,37 +1117,28 @@ local REC_GAP    = 1
 local MAX_METERS = 8
 local MAX_REC    = 40
 
--- RECENT register column budget. The panel is 364 wide (ui_cards INST_W) and
--- pads 10 a side, so a row has 344 to spend. Right-anchored numeral columns,
--- left-anchored identity columns, and the instance name takes what is left:
+-- COLUMN WIDTHS FOR BOTH VIEWS. The panel is 364 wide (ui_cards INST_W) and pads 10 a
+-- side, so a row has 344 to spend — but nothing below is a hand-tuned px budget any more:
 --
---   name 56 | 6 | instance ~105 (flex, ellipsis) | 6 | DUR 38 | GOLD 42 | XP 38 | AGO 38
---                                                        \___ 5px gaps between numerals
+--   Logs : CHAR 40% | INSTANCE 20% | DUR 20% | AGO 20%
+--   Rest : CHAR 40% | LVL 20%      | XP  20% | REST 20%
 --
--- 56 + 6 + 6 + 38+5+42+5+38+5+38 = 239 fixed, leaving ~105 for the instance
--- name (~18 chars of the 11px condensed body face — "Blackrock Depths" fits).
--- Both name and instance are non-wrapping and width-clamped, so anything longer
--- ellipsises rather than colliding with the numerals. All four right columns
--- fit in COMPACT form (InstancesUI.RecentCells); the exact figures live in the
--- row tooltip. Captions sit on the RECENT label line, so this costs no height.
--- The numbers themselves live in InstancesUI.RECENT_COLS (headless-asserted).
-local RC = InstancesUI.RECENT_COLS
-local COL_NAME, COL_DUR, COL_GOLD = RC.name, RC.dur, RC.gold
-local COL_XP, COL_AGO             = RC.xp, RC.ago
-local COL_GAP, COL_PAD            = RC.gap, RC.pad
--- ROUND-25b: the REST view's own right-aligned column chain, mirrored by its captions.
---   content 344 = name (flex ~118) + LVL 46 + XP 84 + REST 78 + 3 x gap 5
--- ROUND-28: the value columns narrow to their new compact formats and the reclaimed
--- width goes to the flexing NAME (the only cell that was actually truncating).
---   LVL  46 -> 26  ("41" not "Level 41" — two digits at the numeral font is ~14px)
---   XP   84 -> 46  ("50%" not "8000/16000")
---   REST 78 -> 46  ("150%" — the "(Max)" suffix is now colour, not text)
--- ROUND-29 (owner): those fixed widths are REPLACED by a 40/20/20/20 percentage split of
--- the live list width (InstancesUI.RestColumnWidths). The constants below are only the
--- pre-layout defaults the cells are created with; Refresh re-widths them every pass from
--- the real width, so a resized panel keeps the split rather than the pixels.
+-- ROUND-29 gave the Rest view that split; ROUND-30 (owner: "update the column spacing in
+-- this section like we did for the Rest section") gives it to Logs, which until now kept
+-- a fixed chain (name 70 | pad | instance flex | pad | DUR 38 | gap | AGO 38). Both views
+-- now go through InstancesUI.ColumnWidths against the LIVE list width, so a resized panel
+-- keeps the SPLIT rather than the pixels, and the identity columns stop swallowing the
+-- slack. The constants below are only the pre-layout defaults the cells are CREATED with;
+-- Refresh re-widths every cell each pass from the real width.
+--
+-- CHAR and INSTANCE are non-wrapping and width-clamped, so a name longer than its 20/40%
+-- share ellipsises rather than colliding with the numerals — the un-truncated instance
+-- name is the row tooltip's title, and the full character name is one line under it.
 local REST_DEFAULT_W = InstancesUI.RestColumnWidths(InstancesUI.RECENT_COLS.content)
 local REST_LVL_W, REST_XP_W, REST_REST_W = REST_DEFAULT_W.lvl, REST_DEFAULT_W.xp, REST_DEFAULT_W.rest
+local LOGS_DEFAULT_W = InstancesUI.LogsColumnWidths(InstancesUI.RECENT_COLS.content)
+local LOGS_CHAR_W, LOGS_INST_W           = LOGS_DEFAULT_W.char, LOGS_DEFAULT_W.inst
+local LOGS_DUR_W,  LOGS_AGO_W            = LOGS_DEFAULT_W.dur,  LOGS_DEFAULT_W.ago
 
 local function tag(frame, id)
     if ns.Audit and ns.Audit.Tag and frame then ns.Audit.Tag(frame, id) end
@@ -1527,29 +1528,31 @@ function InstancesPanel.Attach(host)
     cols:SetHeight(12)
     cols:SetPoint("RIGHT", host, "RIGHT", -PAD, 0)   -- TOP set per-refresh
     tag(cols, "instances.recentcols")
+    -- ROUND-30: the caption chain TILES in BOTH views now (offset 0, no inter-caption
+    -- gap), because both views' cells tile — a gap here would drift the header off its
+    -- column by 5px per link.
     local function caption(text, w, anchorTo)
         local f = fstr(cols, "microLabel", "RIGHT")
-        if anchorTo then f:SetPoint("RIGHT", anchorTo, "LEFT", -COL_GAP, 0)
+        if anchorTo then f:SetPoint("RIGHT", anchorTo, "LEFT", 0, 0)
         else f:SetPoint("RIGHT", cols, "RIGHT", 0, 0) end
         f:SetWidth(w); f:SetTextColor(UI.Color("faint")); f:SetText(text)
         return f
     end
     -- ROUND-25b: Logs = Character · Instance · DUR · AGO. GOLD/XP columns are gone (their
     -- figures live in the row tooltip). CHAR and INSTANCE are LEFT-aligned captions over
-    -- the two flexing left cells, so all four columns are labelled rather than just the
-    -- numerals — abbreviated to fit the 56px name and the flexing instance cell.
+    -- the two left cells, so all four columns are labelled rather than just the numerals.
     -- Three right-chain captions: Logs uses two (DUR/AGO), Rest uses three (LVL/XP/REST).
     -- Labels and widths are swapped per view in Refresh.
-    local capAgo  = caption("AGO",  COL_AGO)
-    local capDur  = caption("DUR",  COL_DUR, capAgo)
+    local capAgo  = caption("AGO",  LOGS_AGO_W)
+    local capDur  = caption("DUR",  LOGS_DUR_W, capAgo)
     local capLvl  = caption("LVL",  REST_LVL_W, capDur)
     capLvl:Hide()
-    cols:SetWidth(COL_AGO + COL_DUR + COL_GAP)
+    cols:SetWidth(LOGS_AGO_W + LOGS_DUR_W)
     P.cols = cols
     -- Left-side captions ride the same line, anchored to the panel rather than the
     -- right-aligned chain (they sit over the name / instance cells).
     local capChar = fstr(host, "microLabel"); capChar:SetTextColor(UI.Color("faint"))
-    capChar:SetText("CHAR"); capChar:SetWidth(COL_NAME); capChar:SetWordWrap(false)
+    capChar:SetText("CHAR"); capChar:SetWidth(LOGS_CHAR_W); capChar:SetWordWrap(false)
     local capInst = fstr(host, "microLabel"); capInst:SetTextColor(UI.Color("faint"))
     capInst:SetText("INSTANCE"); capInst:SetWordWrap(false)
     P.capChar, P.capInst = capChar, capInst
@@ -1568,26 +1571,35 @@ function InstancesPanel.Attach(host)
     emptyFS:SetText("No instance entries recorded."); emptyFS:Hide()
     P._empty = emptyFS
 
-    -- One RECENT row: name · instance (flex) · DUR · GOLD · XP · AGO. The four
-    -- right columns are fixed-width and right-aligned so the numerals form hard
-    -- column edges down the list; the instance name flexes into what remains and
-    -- ellipsises. Hovering a row shows the exact (un-abbreviated) figures.
+    -- One RECENT row: CHAR · INSTANCE · DUR · AGO, tiling the row 40/20/20/20.
+    -- ROUND-30 (owner): these four cells used to be a fixed chain (a 70px name, two 38px
+    -- numerals gapped 5, and the instance flexing into the ~181px left over). They now
+    -- TILE the percentage split, exactly as the Rest row has since round-29 — offset 0 on
+    -- every link, because the shares must add up to the row to the pixel.
+    --
+    -- The chain runs RIGHT to LEFT: r -> ago -> dur -> inst -> name. INSTANCE takes an
+    -- explicit width and a RIGHT anchor (not the LEFT-to-name anchor it used to have), so
+    -- CHAR can take the remainder off ITS left — reversing that one link is what keeps the
+    -- graph acyclic while letting the rounding remainder land on CHAR.
     local function makeRecRow()
         local r = CreateFrame("Frame", nil, child)
         r:SetHeight(REC_H)
         r:EnableMouse(true)   -- tooltip only; the wheel still reaches the scroll frame
-        r.name = fstr(r, "small"); r.name:SetPoint("LEFT", r, "LEFT", 0, 0)
-        r.name:SetWidth(COL_NAME); r.name:SetWordWrap(false); r.name:SetJustifyH("LEFT")
         r.ago = fstr(r, "microLabel", "RIGHT"); r.ago:SetPoint("RIGHT", r, "RIGHT", 0, 0)
-        r.ago:SetWidth(COL_AGO); r.ago:SetWordWrap(false); r.ago:SetTextColor(UI.Color("muted"))
+        r.ago:SetWidth(LOGS_AGO_W); r.ago:SetWordWrap(false); r.ago:SetTextColor(UI.Color("muted"))
         -- ROUND-25b (owner): GOLD and XP are no longer row columns — DUR chains straight
         -- off AGO. Their exact figures remain on the row's hover tooltip, so the data is
-        -- still one hover away and the ~90px they occupied goes to the instance name.
-        r.dur = fstr(r, "small", "RIGHT"); r.dur:SetPoint("RIGHT", r.ago, "LEFT", -COL_GAP, 0)
-        r.dur:SetWidth(COL_DUR); r.dur:SetWordWrap(false)
-        r.inst = fstr(r, "small"); r.inst:SetPoint("LEFT", r.name, "RIGHT", COL_PAD, 0)
-        r.inst:SetPoint("RIGHT", r.dur, "LEFT", -COL_PAD, 0); r.inst:SetWordWrap(false); r.inst:SetJustifyH("LEFT")
+        -- still one hover away.
+        r.dur = fstr(r, "small", "RIGHT"); r.dur:SetPoint("RIGHT", r.ago, "LEFT", 0, 0)
+        r.dur:SetWidth(LOGS_DUR_W); r.dur:SetWordWrap(false)
+        -- LEFT-aligned inside its own 20% cell — it carries text ("Naxxramas ×3"), not a
+        -- numeral, so it reads off a left edge like CHAR does.
+        r.inst = fstr(r, "small"); r.inst:SetPoint("RIGHT", r.dur, "LEFT", 0, 0)
+        r.inst:SetWidth(LOGS_INST_W); r.inst:SetWordWrap(false); r.inst:SetJustifyH("LEFT")
         r.inst:SetTextColor(UI.Color("muted"))
+        r.name = fstr(r, "small"); r.name:SetPoint("LEFT", r, "LEFT", 0, 0)
+        r.name:SetPoint("RIGHT", r.inst, "LEFT", 0, 0)
+        r.name:SetWordWrap(false); r.name:SetJustifyH("LEFT")
         r:SetScript("OnEnter", function(self)
             local tip = self._tip
             if not (tip and GameTooltip) then return end
@@ -1685,8 +1697,8 @@ function InstancesPanel.Attach(host)
     local function makeExpRow()
         local r = CreateFrame("Frame", nil, child)
         r:SetHeight(REC_H)
-        -- ROUND-29: the three numeral cells TILE (offset 0, not -COL_GAP) because their
-        -- widths are now percentage shares that must add up to the table exactly. The
+        -- ROUND-29: the three numeral cells TILE (offset 0, no inter-column gap) because
+        -- their widths are percentage shares that must add up to the table exactly. The
         -- separation is inside each cell: a right-aligned "50%" in a 20% cell already
         -- leaves ~40px of clear space before its left neighbour's text.
         r.rested = fstr(r, "numeral", "RIGHT"); r.rested:SetPoint("RIGHT", r, "RIGHT", 0, 0)
@@ -1814,11 +1826,13 @@ function InstancesPanel.Attach(host)
         -- ROUND-29: hoisted above the caption block — the Rest captions and the Rest ROWS
         -- must be sized from the SAME width or the headers would not sit over their columns.
         local W = scroll:GetWidth(); if W < 1 then W = host:GetWidth() - 2 * PAD end
-        -- ROUND-29: the Rest view's caption chain TILES its cells (see makeExpRow), so the
-        -- shared capDur/capLvl links are re-anchored per view — gapped in Logs, flush in
-        -- Rest. Same edges either way (capDur -> capAgo -> cols), so the anchor graph is
-        -- unchanged; only the offset moves.
+        -- ROUND-29/30: BOTH views' caption chains TILE their cells (see makeExpRow /
+        -- makeRecRow), so every link is offset 0. The shared capDur/capLvl are still
+        -- re-anchored per view because the Rest view carries a third caption; the EDGES
+        -- are identical either way (capLvl -> capDur -> capAgo -> cols), so the anchor
+        -- graph does not change with the view.
         local restW = InstancesUI.RestColumnWidths(W)
+        local logsW = InstancesUI.LogsColumnWidths(W)
         if isExp then
             capAgo:SetText("REST"); capAgo:SetWidth(restW.rest)
             capDur:SetText("XP");   capDur:SetWidth(restW.xp)
@@ -1829,23 +1843,25 @@ function InstancesPanel.Attach(host)
             cols:SetWidth(restW.rest + restW.xp + restW.lvl)
             capInst:Hide()
         else
-            capAgo:SetText("AGO"); capAgo:SetWidth(COL_AGO)
-            capDur:SetText("DUR"); capDur:SetWidth(COL_DUR)
-            capDur:ClearAllPoints(); capDur:SetPoint("RIGHT", capAgo, "LEFT", -COL_GAP, 0)
-            capLvl:ClearAllPoints(); capLvl:SetPoint("RIGHT", capDur, "LEFT", -COL_GAP, 0)
+            capAgo:SetText("AGO"); capAgo:SetWidth(logsW.ago)
+            capDur:SetText("DUR"); capDur:SetWidth(logsW.dur)
+            capDur:ClearAllPoints(); capDur:SetPoint("RIGHT", capAgo, "LEFT", 0, 0)
+            capLvl:ClearAllPoints(); capLvl:SetPoint("RIGHT", capDur, "LEFT", 0, 0)
             capLvl:Hide()
-            cols:SetWidth(COL_AGO + COL_DUR + COL_GAP)
+            cols:SetWidth(logsW.ago + logsW.dur)
             capInst:Show()
         end
         capChar:ClearAllPoints()
         capChar:SetPoint("TOPLEFT", host, "TOPLEFT", PAD, -listTop)
-        -- ROUND-29: in Rest the CHAR caption spans its 40% share; Logs keeps the 70px
-        -- name column it has always had (that view's split is untouched).
-        capChar:SetWidth(isExp and restW.char or COL_NAME)
+        -- ROUND-29/30: CHAR spans its 40% share in BOTH views now.
+        capChar:SetWidth(isExp and restW.char or logsW.char)
         capChar:Show()
+        -- The INSTANCE caption needs no width: with the row tiling, the span from CHAR's
+        -- right edge to the numeral chain's left edge IS the 20% instance column, so the
+        -- two flush anchors size it exactly and it cannot drift off its cells.
         capInst:ClearAllPoints()
-        capInst:SetPoint("LEFT", capChar, "RIGHT", COL_PAD, 0)
-        capInst:SetPoint("RIGHT", cols, "LEFT", -COL_PAD, 0)
+        capInst:SetPoint("LEFT", capChar, "RIGHT", 0, 0)
+        capInst:SetPoint("RIGHT", cols, "LEFT", 0, 0)
         scroll:ClearAllPoints()
         scroll:SetPoint("TOPLEFT", host, "TOPLEFT", PAD, -(listTop + 15))
         scroll:SetPoint("BOTTOMRIGHT", host, "BOTTOMRIGHT", -PAD, PAD)
@@ -1903,6 +1919,10 @@ function InstancesPanel.Attach(host)
                     shown = shown + 1
                     local r = getRec(shown)
                     r:ClearAllPoints(); r:SetPoint("TOPLEFT", child, "TOPLEFT", 0, -y); r:SetPoint("TOPRIGHT", child, "TOPRIGHT", 0, -y)
+                    -- ROUND-30: re-width the three fixed-share cells to the LIVE list
+                    -- width every pass (CHAR flexes into what is left, so it needs no
+                    -- explicit width) — the same treatment the Rest rows get above.
+                    r.inst:SetWidth(logsW.inst); r.dur:SetWidth(logsW.dur); r.ago:SetWidth(logsW.ago)
                     local cr, cg, cb = Dashboard.ClassColor(model.classTag)
                     r.name:SetText(model.name or "?")
                     if cr then r.name:SetTextColor(cr, cg, cb) else r.name:SetTextColor(UI.Color("text")) end
@@ -2073,60 +2093,103 @@ local function testInstancesUI(fails)
     ck(emptyCells.gold == "0c" and emptyCells.ago == "now" and emptyCells.xp == nil,
         "cells: nil model degrades to zeroes, never errors")
 
-    -- Column budget: the four numeral columns must still leave the instance name
-    -- a readable flex inside the panel's 344px of content.
+    -- Column budget: the panel's 344px of content, which both views' splits fall back to
+    -- before the frame has been laid out.
     local RCOL = IU.RECENT_COLS
     ck(RCOL.content == 344, "cols: budget is the 364 panel minus 10px padding a side")
 
     -- ── ROUND-25b: Logs is FOUR columns (Character · Instance · DUR · AGO) ──────
-    -- GOLD and XP left the rows; their width goes to the flexing instance name.
-    ck(IU.InstanceFlexWidth() == 344 - (RCOL.name + 2 * RCOL.pad + RCOL.dur + RCOL.ago + RCOL.gap),
-        "cols: flex = content - (name + pads + dur + ago + one gap)")
-    -- ROUND-27: CHAR widened 56 -> 70 to seat a 12-char name, so the flex gives back 14px
-    -- (195 -> 181) — that reclaimed slack is what closes the Instance/DUR gulf.
-    ck(RCOL.name == 70, "cols: CHAR is 70 wide (fits ~12 chars at the row font)")
-    ck(IU.InstanceFlexWidth() == 181,
-        "cols: instance flexes to 181px -- got " .. IU.InstanceFlexWidth())
-    ck(IU.InstanceFlexWidth() > 105, "cols: still far wider than the pre-round-25b 105")
-    -- The figures are NOT lost: RecentCells still computes them for the row tooltip.
+    -- GOLD and XP left the rows, but they are NOT lost: RecentCells still computes them
+    -- for the row tooltip.
     local keptCells = IU.RecentCells(IU.RowModel({ t = T - 60, name = "Deadmines", dur = 600,
         gold = 48000, xp = 12400 }, "Alt-Realm", "ROGUE", T))
     ck(keptCells.gold ~= nil and keptCells.xp ~= nil,
         "cols: gold/xp still computed for the tooltip after leaving the row")
 
-    -- ── REST VIEW: the 40/20/20/20 split (round-29, owner) ──────────────────
-    -- The columns TILE the table exactly — no leftover slack for CHAR to swallow, which
-    -- was the dead space in the screenshot.
+    -- ── BOTH VIEWS: the 40/20/20/20 split (round-29 Rest, round-30 Logs; owner) ──
+    -- The columns TILE the table exactly — no leftover slack for the identity column to
+    -- swallow, which is the dead space in both screenshots. ONE splitter serves both
+    -- views; only the column NAMES differ.
+    ck(IU.ColumnWidths ~= nil, "cols: one shared splitter exists")
     local rw = IU.RestColumnWidths(RCOL.content)
+    local lw = IU.LogsColumnWidths(RCOL.content)
+    -- The shared splitter IS what each view calls: same total, same ratios -> same pixels
+    -- under whichever names that view uses.
+    ck(rw.char == lw.char, "cols: both views' CHAR column is the same 40% (rest "
+        .. rw.char .. " vs logs " .. lw.char .. ")")
+    ck(rw.lvl == lw.inst and rw.xp == lw.dur and rw.rest == lw.ago,
+        "cols: the three 20% columns match across the two views, splitter for splitter")
+    ck(IU.ColumnWidths(RCOL.content, IU.LOGS_SPLIT).char == lw.char,
+        "cols: the named view helper is the shared splitter with its own spec")
+    ck(#IU.REST_SPLIT.order == 4 and #IU.LOGS_SPLIT.order == 4,
+        "cols: each spec declares its four columns left to right")
+    ck(IU.LOGS_SPLIT.order[1] == "char" and IU.REST_SPLIT.order[1] == "char",
+        "cols: CHAR leads both specs, so it takes the rounding remainder")
+    -- The leading column's ratio is never READ (it takes the remainder), so a spec whose
+    -- ratios do not sum to 1 would still tile — and silently ship the wrong proportions.
+    -- This is the only assertion that can catch that, so both specs are checked.
+    local function ratioSum(S)
+        local s = 0
+        for i = 1, #S.order do s = s + S[S.order[i]] end
+        return s
+    end
+    ck(math.abs(ratioSum(IU.REST_SPLIT) - 1) < 1e-9,
+        "cols: the Rest spec's declared ratios sum to 1 (got " .. ratioSum(IU.REST_SPLIT) .. ")")
+    ck(math.abs(ratioSum(IU.LOGS_SPLIT) - 1) < 1e-9,
+        "cols: the Logs spec's declared ratios sum to 1 (got " .. ratioSum(IU.LOGS_SPLIT) .. ")")
+
+    local function pct(w) return w / RCOL.content end
+    -- REST view.
     ck(rw.char + rw.lvl + rw.xp + rw.rest == RCOL.content,
         "rest cols: the four columns tile the table exactly (got "
         .. (rw.char + rw.lvl + rw.xp + rw.rest) .. " of " .. RCOL.content .. ")")
     ck(rw.lvl == rw.xp and rw.xp == rw.rest,
         "rest cols: LVL / XP / REST are the same 20% width")
-    local function pct(w) return w / RCOL.content end
     ck(math.abs(pct(rw.char) - 0.40) <= 0.01,
         "rest cols: CHAR takes ~40% (got " .. string.format("%.1f%%", pct(rw.char) * 100) .. ")")
     ck(math.abs(pct(rw.lvl) - 0.20) <= 0.01,
         "rest cols: LVL takes ~20% (got " .. string.format("%.1f%%", pct(rw.lvl) * 100) .. ")")
     ck(rw.char > rw.lvl * 1.9, "rest cols: CHAR is nearly twice any numeral column")
+    -- LOGS view (round-30) — pinned to the same shape, so a later re-tune of one view
+    -- cannot silently drag the other with it.
+    ck(lw.char + lw.inst + lw.dur + lw.ago == RCOL.content,
+        "logs cols: the four columns tile the table exactly (got "
+        .. (lw.char + lw.inst + lw.dur + lw.ago) .. " of " .. RCOL.content .. ")")
+    ck(lw.inst == lw.dur and lw.dur == lw.ago,
+        "logs cols: INSTANCE / DUR / AGO are the same 20% width")
+    ck(math.abs(pct(lw.char) - 0.40) <= 0.01,
+        "logs cols: CHAR takes ~40% (got " .. string.format("%.1f%%", pct(lw.char) * 100) .. ")")
+    ck(math.abs(pct(lw.inst) - 0.20) <= 0.01,
+        "logs cols: INSTANCE takes ~20% (got " .. string.format("%.1f%%", pct(lw.inst) * 100) .. ")")
+    ck(lw.char > lw.inst * 1.9, "logs cols: CHAR is nearly twice any other column")
     -- The split follows the LIVE width, so a re-sized panel keeps the proportions.
-    local rwWide = IU.RestColumnWidths(500)
+    local rwWide, lwWide = IU.RestColumnWidths(500), IU.LogsColumnWidths(500)
     ck(rwWide.char + rwWide.lvl + rwWide.xp + rwWide.rest == 500,
         "rest cols: an arbitrary table width still tiles exactly")
+    ck(lwWide.char + lwWide.inst + lwWide.dur + lwWide.ago == 500,
+        "logs cols: an arbitrary table width still tiles exactly")
     ck(math.abs(rwWide.char / 500 - 0.40) <= 0.01, "rest cols: 40% holds at another width")
+    ck(math.abs(lwWide.char / 500 - 0.40) <= 0.01, "logs cols: 40% holds at another width")
+    -- An ODD width is the case the remainder rule exists for: 3 x round(0.2 x 345) = 207,
+    -- so CHAR must absorb the 138 that is left rather than the columns over/under-running.
+    local lwOdd = IU.LogsColumnWidths(345)
+    ck(lwOdd.char + lwOdd.inst + lwOdd.dur + lwOdd.ago == 345,
+        "logs cols: an odd width still tiles to the pixel (CHAR takes the remainder)")
     -- A frame that has not been laid out yet (width 0) falls back to the content budget
     -- rather than producing zero-width columns.
     ck(IU.RestColumnWidths(0).total == RCOL.content, "rest cols: unlaid-out width -> 344 fallback")
     ck(IU.RestColumnWidths(nil).char == rw.char, "rest cols: nil width -> the same fallback")
-    -- The Logs view's own split is untouched by this change.
+    ck(IU.LogsColumnWidths(0).total == RCOL.content, "logs cols: unlaid-out width -> 344 fallback")
+    ck(IU.LogsColumnWidths(nil).char == lw.char, "logs cols: nil width -> the same fallback")
     ck(REST_LVL_W + REST_XP_W + REST_REST_W < RCOL.content,
         "rest cols: the pre-layout defaults still fit the budget")
-    ck(IU.InstanceFlexWidth() >= 90,
-        "cols: the instance name keeps at least 90px -- 'Blackrock Depths' must fit")
-    -- ROUND-25b: four rendered columns now, so the sum drops GOLD/XP and two of the gaps.
-    local fixedSum = RCOL.name + 2 * RCOL.pad + RCOL.dur + RCOL.ago
-                     + RCOL.gap + IU.InstanceFlexWidth()
-    ck(fixedSum == RCOL.content, "cols: the columns exactly consume the content width")
+    ck(LOGS_INST_W + LOGS_DUR_W + LOGS_AGO_W + LOGS_CHAR_W == RCOL.content,
+        "logs cols: the pre-layout defaults tile the budget")
+    -- ROUND-30: a folded row's instance cell carries the "xN" suffix, so the 20% cell has
+    -- to seat name + suffix or ellipsise cleanly. The un-truncated name is the tooltip
+    -- title, so an ellipsis costs nothing — but the cell must not be so narrow that the
+    -- suffix alone cannot show.
+    ck(lw.inst >= 40, "logs cols: the instance cell seats a short name + its xN suffix")
 
     -- ── The NIT-parity row hover ────────────────────────────────────────────
     -- A label lookup keeps these assertions independent of line ORDER, which is

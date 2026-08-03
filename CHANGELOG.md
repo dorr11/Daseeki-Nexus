@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Changed: **the Instance Log's Logs view is spaced like its Rest view.** Character,
+  Instance, Dur and Ago now take 40% / 20% / 20% / 20% of the list's width instead of the
+  hand-tuned pixel widths they had, so the columns are evenly spread rather than bunched
+  against the right edge, and the headers sit over them. Both views share one splitter,
+  so they cannot drift apart again. An instance name too long for its column is shortened
+  with an ellipsis; hovering the row still shows it in full.
+
 - Fixed: **"Battle Shout (Boon)" was a state the game cannot produce.** A chronoboon
   cannot hold a Battle Shout or Fire Festival Fury — the Displacer will not take them —
   but the code that reads a chronoboon's tooltip checked all ten tracked buffs instead of
