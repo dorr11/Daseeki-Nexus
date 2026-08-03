@@ -219,7 +219,15 @@ local DEFAULT_THRESHOLD = { normal = 20 * 60, minimum = 5 * 60 }
 -- Raid lockout display list (spec §1 dot row).
 ----------------------------------------------------------------------
 
-Dashboard.RAID_DISPLAY = { "Naxx", "AQ40", "BWL", "MC", "ZG", "AQ20", "Ony" }
+-- ROUND-22 addendum: realigned to the OWNER-CANON order that ui_detail's TALLY_ORDER now
+-- uses ("MC BWL AQ40 NAXX | ONY ZG AQ20" — weekly-reset raids, then short-cycle), so the
+-- two constants finally agree instead of quietly diverging.
+-- NOTE: as of this round BOTH RAID_DISPLAY and RAID_GROUPS below have ZERO consumers —
+-- nothing in the addon reads either one (the detail tally uses its own TALLY_ORDER, and
+-- the card pip row was retired). They are kept as exported vocabulary rather than deleted
+-- because they are public Dashboard fields a sibling could be mid-way through adopting;
+-- flagged for the coordinator to decide between adopting or deleting them.
+Dashboard.RAID_DISPLAY = { "MC", "BWL", "AQ40", "Naxx", "Ony", "ZG", "AQ20" }
 
 -- Full raid names for diamond-pip tooltips (60s cards, parity item 1) and the
 -- detail Raids rows (parity item 2). Keys match Store.RAID_KEYS.

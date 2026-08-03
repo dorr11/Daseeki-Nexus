@@ -101,7 +101,12 @@ local BUFF_HUE = {
 -- Open-page raid tally order + labels (BRAND_SPEC §7 L3: MC BWL ZG AQ40 Naxx Ony AQ20;
 -- keys match Store.RAID_KEYS). Round-17: locked = danger red, open+attuned = ok green,
 -- not attuned = faint grey (see Detail.TallyToken). No raid diamonds.
-local TALLY_ORDER = { "MC", "BWL", "ZG", "AQ40", "Naxx", "Ony", "AQ20" }
+-- ROUND-22 addendum (owner-canon): "MC BWL AQ40 NAXX | ONY ZG AQ20". The split is
+-- semantic — WEEKLY-reset raids on the left, SHORT-CYCLE (Ony 5-day, ZG/AQ20 3-day) on the
+-- right — so the divider marks a real boundary rather than decorating a line break.
+local TALLY_ORDER = { "MC", "BWL", "AQ40", "Naxx", "Ony", "ZG", "AQ20" }
+local TALLY_SPLIT = 4          -- divider sits AFTER this index (Naxx | Ony)
+Detail.TALLY_ORDER, Detail.TALLY_SPLIT = TALLY_ORDER, TALLY_SPLIT   -- for the tests
 
 local function Dash() return ns.Dashboard end
 local function nowE()
@@ -125,16 +130,28 @@ local function dmfCooldownRemaining(rec, e)
     return 0
 end
 
--- DMF READY / remaining-CD parenthetical.
---   not on cooldown      -> "READY", "ok"     (green)
---   on cooldown, rem > 0 -> "<dur>", "danger" (red)
---   on cooldown, rem = 0 -> "on CD", "danger" (red)
-function Detail.DMFParenthetical(rec, e)
+-- ROUND-22: the DMF cooldown's TRI-STATE, for the COOLDOWNS block. This replaces the old
+-- DMFParenthetical that the WORLD BUFFS row used to append; the cooldown now has exactly
+-- one home. Follows the SN DMFable model the engine already implements:
+--   * DMFable (no active cooldown) ......... "Ready"    ok      — can take a new fortune
+--   * stashed in a chronoboon .............. "In Boon"  accent  — FROZEN, not counting down
+--   * on cooldown .......................... "<dur>"    warn    — ticks on ONLINE time only
+--   * on cooldown, elapsed/unknown ......... "On CD"    warn
+-- "In Boon" is checked FIRST because a boon freezes the cooldown: reporting a countdown
+-- there would imply time is passing when it is not. It reads `accent` rather than danger —
+-- per §5a a held/stashed buff is a calm, owned state, not a warning. And the cooldown reads
+-- `warn` rather than `danger`: waiting for the faire is a "not yet", not a failure.
+-- Store.DMFCooldownRemaining owns the offline-freeze maths (it returns ONLINE seconds
+-- remaining, 0 when ready), so this stays a pure presentation mapping.
+-- Remote characters take the identical three labels — the engine hands us the same fields.
+function Detail.DMFCooldownState(rec, e)
     local D = Dash()
-    if not rec.dmfCooldownActive then return "READY", "ok" end
+    rec = rec or {}
+    if rec.dmfInBoon then return "In Boon", "accent" end
+    if not rec.dmfCooldownActive then return "Ready", "ok" end
     local rem = dmfCooldownRemaining(rec, e)
-    if rem > 0 then return (D and D.FormatDuration(rem)) or tostring(rem), "danger" end
-    return "on CD", "danger"
+    if rem > 0 then return (D and D.FormatDuration(rem)) or tostring(rem), "warn" end
+    return "On CD", "warn"
 end
 
 -- Compact tile-caption duration ("1h59", "59m", "45s", "2d3h") — fits a 20px tile
@@ -208,12 +225,14 @@ function Detail.BuffTileState(slot, rec, faction, e, online, aid)
                  fullText = full, spellID = meta.spellID }
     end
 
-    -- Absent DMF still renders, surfacing its re-acquire window (READY / on-CD).
+    -- ROUND-22 (owner): an absent DMF still RENDERS — the display-order contract keeps the
+    -- row visible even when the buff is missing — but it now reads like every other missing
+    -- row ("Missing", required/optional coloured). The READY / on-CD nuance moved to the
+    -- COOLDOWNS block, so the cooldown is stated in exactly one place instead of two.
     if isDMF then
-        local par, ptok = Detail.DMFParenthetical(rec, e)
+        local tok = (requirement == "optional") and "warn" or "danger"
         return { shown = true, slot = slot, missing = true, boon = false, calm = false,
-                 tint = ptok, durText = par, durTok = ptok,
-                 fullText = "(" .. par .. ")", spellID = meta.spellID }
+                 tint = tok, durText = nil, durTok = tok, fullText = nil, spellID = meta.spellID }
     end
 
     -- Missing but applicable: required = danger, optional = warn.
@@ -309,10 +328,13 @@ end
 --   present            -> the duration text (FormatDuration, or "..(Boon)" green)
 -- The DMF row's PRESENT-case parenthetical is appended by the renderer (it embeds an
 -- inline color escape, which would make the pure return string awkward to assert).
-function Detail.RowStatus(s, isDMF)
+-- ROUND-22: `isDMF` is retained for call-site compatibility but is NO LONGER USED — a
+-- missing DMF now reads "Missing" like every other row, because its re-acquire state moved
+-- to the COOLDOWNS block. Keeping the parameter avoids churning the two call sites and
+-- their tests for a signature change that carries no behaviour.
+function Detail.RowStatus(s, isDMF)   -- luacheck: ignore isDMF
     if not s or not s.shown then return "", "faint" end
     if s.missing then
-        if isDMF then return (s.durText or "READY"), (s.durTok or "ok") end
         return "Missing", (s.tint or "danger")
     end
     return (s.fullText or s.durText or ""), (s.boon and "ok" or (s.durTok or "ok"))
@@ -538,27 +560,31 @@ function Detail.Attach(parent)
     rightCol:SetWidth(COL_R_W)
     D.rightCol = rightCol
 
-    -- Right column layout (owner round-3): the top rail is a SIDE-BY-SIDE pair —
-    -- COOLDOWNS on the LEFT, RAID LOCKOUTS on the RIGHT (both labels share the
-    -- rightCol top edge). NOTE moves to the BOTTOM where the buttons used to be.
-    -- The Invite + Cancel-buffs buttons are DELETED (owner crossed them out; those
-    -- actions stay on the minimap right-click menu). Split: cooldowns 92 · gap 12 ·
-    -- lockouts 110 within the 214-wide column.
-    local CD_W, LOCK_X = 92, 104
+    -- ROUND-22 (owner): NOTE and COOLDOWNS SWAP — NOTE now sits at the TOP of the right
+    -- column under the header, COOLDOWNS at the BOTTOM. The cooldown icons also stop being
+    -- a vertical stack: they lay out as a 2-COLUMN GRID so chrono and hearth sit next to
+    -- each other, with the new DMF cooldown on the second row.
+    --   column 214 - CD_GAP 10 = 204 / 2 = 102 per cell (icon 16 + 6 + ~80 of value)
+    -- 2x2 rather than 3-across because 3 cells would be 71 wide, leaving only ~49 for the
+    -- value — "12h 30m" already runs ~42 at the default scale and overflows at 1.3x. The
+    -- column has ~120px of vertical slack after the swap, so spending one row is free.
+    local CD_ICON, CD_GAP, CD_ROW_H = 16, 10, 21
+    local CD_CELL_W = (COL_R_W - CD_GAP) / 2
 
-    -- COOLDOWNS block (top-left). Owner round-5: the CHRONO / HEARTH micro-labels are
-    -- replaced by the ITEM ICONS (chronoboon 184937 / hearthstone 6948) — same
-    -- cropped/framed treatment + item IDs the cards' right-edge stack uses — each
-    -- followed by its colored state value. The icon IS the label; the full item name
-    -- lives on the hover tooltip.
+    local cdGrid = CreateFrame("Frame", nil, rightCol)
+    cdGrid:SetPoint("BOTTOMLEFT", rightCol, "BOTTOMLEFT", 0, 0)
+    cdGrid:SetPoint("RIGHT", rightCol, "RIGHT", 0, 0)
+    cdGrid:SetHeight(CD_ROW_H + CD_ICON)          -- two rows
     local cdLbl = microLabel(rightCol, "COOLDOWNS")
-    cdLbl:SetPoint("TOPLEFT", rightCol, "TOPLEFT", 0, 0)
+    cdLbl:SetPoint("BOTTOMLEFT", cdGrid, "TOPLEFT", 0, 6)
     tag(cdLbl, "detail.cdlabel")
-    local CD_ICON = 16
-    local function cdIconRow(itemID, fullName, y)
-        local f = CreateFrame("Frame", nil, rightCol, "BackdropTemplate")
+
+    -- One icon+value pair at grid cell (col, row). `icon` is an item ID (number) or a
+    -- ready-made texture path (string) so the DMF pair can use the aura icon.
+    local function cdIconRow(icon, fullName, col, row)
+        local f = CreateFrame("Frame", nil, cdGrid, "BackdropTemplate")
         f:SetSize(CD_ICON, CD_ICON)
-        f:SetPoint("TOPLEFT", rightCol, "TOPLEFT", 0, y)
+        f:SetPoint("TOPLEFT", cdGrid, "TOPLEFT", col * (CD_CELL_W + CD_GAP), -row * CD_ROW_H)
         UI.Skin(f, function(self)
             self:SetBackdrop(UI.FLAT_BACKDROP)
             self:SetBackdropColor(UI.Color("inset"))
@@ -568,7 +594,7 @@ function Detail.Attach(parent)
         ic:SetPoint("TOPLEFT", f, "TOPLEFT", 1, -1)
         ic:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", -1, 1)
         ic:SetTexCoord(0.08, 0.92, 0.08, 0.92)
-        ic:SetTexture(Detail.ItemIconTex(itemID))
+        ic:SetTexture(type(icon) == "string" and icon or Detail.ItemIconTex(icon))
         f.icon = ic
         f._name = fullName
         f:EnableMouse(true)
@@ -579,18 +605,25 @@ function Detail.Attach(parent)
             GameTooltip:Show()
         end)
         f:SetScript("OnLeave", function() GameTooltip:Hide() end)
-        -- Colored state value, right-aligned to CD_W, vertically centered on the icon.
-        local vf = fstr(rightCol, "numeral", "RIGHT")
+        -- Colored state value, filling the rest of this grid cell, centred on the icon.
+        local vf = fstr(cdGrid, "numeral", "LEFT")
         vf:SetPoint("LEFT", f, "RIGHT", 6, 0)
-        vf:SetPoint("RIGHT", rightCol, "TOPLEFT", CD_W, y - CD_ICON / 2)
+        vf:SetWidth(CD_CELL_W - CD_ICON - 6); vf:SetWordWrap(false)
         return f, vf
     end
-    -- Round-13: +6 gap below the COOLDOWNS header (first icon -16 -> -22; pitch 21 kept).
-    local chronoIcon, chronoVal = cdIconRow(184937, "Chronoboon Displacer", -22)
-    local hearthIcon, hearthVal = cdIconRow(6948, "Hearthstone", -43)
+    -- Row 0: chrono | hearth side by side (owner). Row 1: the new DMF cooldown.
+    local chronoIcon, chronoVal = cdIconRow(184937, "Chronoboon Displacer", 0, 0)
+    local hearthIcon, hearthVal = cdIconRow(6948, "Hearthstone", 1, 0)
+    -- ROUND-22: the DMF cooldown joins COOLDOWNS, using the AURA icon (Sayge's Dark
+    -- Fortune, slot 5) rather than an item icon — there is no item, the cooldown is on the
+    -- faire buff itself. This is also why the WORLD BUFFS row drops its CD parentheticals:
+    -- the cooldown now has one home instead of being spelled out in two places.
+    local dmfIcon, dmfVal = cdIconRow(Dash().AuraIcon(5), "Darkmoon Faire cooldown", 0, 1)
     tag(chronoIcon, "detail.cdicon1")   -- 16px item-icon square (geometry assertion)
-    D.chronoVal, D.hearthVal = chronoVal, hearthVal
-    D.chronoIcon, D.hearthIcon = chronoIcon, hearthIcon
+    tag(hearthIcon, "detail.cdicon2")   -- round-22: shares row 0 with chrono (side by side)
+    tag(dmfIcon, "detail.cdicon3")
+    D.chronoVal, D.hearthVal, D.dmfVal = chronoVal, hearthVal, dmfVal
+    D.chronoIcon, D.hearthIcon, D.dmfIcon = chronoIcon, hearthIcon, dmfIcon
 
     -- ROUND-19 (owner, deferred from round-18): RAID LOCKOUTS moves OUT of the right
     -- column's top rail and into the detail pane's BOTTOM-LEFT, under the buff list. It is
@@ -610,11 +643,12 @@ function Detail.Attach(parent)
     raidLbl:SetPoint("BOTTOMLEFT", tallyFS, "TOPLEFT", 0, LOCK_LBL_GAP)
     tag(raidLbl, "detail.raidlabel")
 
-    -- NOTE block — PINNED TO THE PANE BOTTOM (owner round-4 item 2): the editbox sits
-    -- flush at the right column's bottom (just above the dock divider), the label rides
-    -- above it. Full column width.
+    -- NOTE block — ROUND-22 (owner): swapped with COOLDOWNS, so NOTE now sits at the TOP of
+    -- the right column, directly under the pane header, and COOLDOWNS took the bottom.
+    -- (It had been pinned to the pane bottom since round-4.) The label rides above the box,
+    -- so the block starts with the label on the column's top rail.
     local noteBox = CreateFrame("EditBox", nil, rightCol, "BackdropTemplate")
-    noteBox:SetPoint("BOTTOMLEFT", rightCol, "BOTTOMLEFT", 0, 0)
+    noteBox:SetPoint("TOPLEFT", rightCol, "TOPLEFT", 0, -(LOCK_LBL_H + 4))
     noteBox:SetPoint("RIGHT", rightCol, "RIGHT", 0, 0)
     -- ROUND-19 priority 3: RAID LOCKOUTS vacated the right column's top-right, so NOTE
     -- claims that space — 22 -> NOTE_H (66), and MULTI-LINE so the height is actually
@@ -623,7 +657,7 @@ function Detail.Attach(parent)
     noteBox:SetHeight(NOTE_H); noteBox:SetAutoFocus(false)
     noteBox:SetMultiLine(true)
     local noteLbl = microLabel(rightCol, "NOTE")
-    noteLbl:SetPoint("BOTTOMLEFT", noteBox, "TOPLEFT", 0, 4)
+    noteLbl:SetPoint("TOPLEFT", rightCol, "TOPLEFT", 0, 0)   -- round-22: column top rail
     tag(noteLbl, "detail.notelabel")
     noteBox:SetFontObject(UI.fonts.body); noteBox:SetTextInsets(7, 7, 0, 0)
     UI.Skin(noteBox, function(self)
@@ -711,11 +745,10 @@ function Detail.Attach(parent)
                 row.name:SetText(meta.name)
                 row.name:SetTextColor(nameColor(slot))
                 -- Status (state color). The DMF PRESENT case appends its re-acquire paren.
+                -- ROUND-22: the DMF row no longer appends its re-acquire parenthetical —
+                -- the cooldown lives in the COOLDOWNS block now, so this row reads exactly
+                -- like the other nine (duration / "(Boon)" when held, "Missing" when not).
                 local statusText, statusTok = Detail.RowStatus(s, meta.key == "dmf")
-                if meta.key == "dmf" and not s.missing then
-                    local par, ptok = Detail.DMFParenthetical(rec, e)
-                    statusText = statusText .. "  " .. Dd.Colored("(" .. par .. ")", ptok)
-                end
                 row.status:SetText(statusText)
                 row.status:SetTextColor(UI.Color(statusTok))
                 row._tipName = meta.name
@@ -728,9 +761,14 @@ function Detail.Attach(parent)
         -- Raid tally line.
         local list = Detail.RaidTally(rec, e)
         local parts = {}
-        for _, r in ipairs(list) do
+        for i, r in ipairs(list) do
             -- Round-17 addendum: green available / red locked / grey not-attuned.
             parts[#parts + 1] = Dd.Colored(r.key, r.token)
+            -- ROUND-22 addendum: weekly | short-cycle divider. A faint "|" GLYPH rather
+            -- than a 1px texture: the tally is a single FontString, so a glyph keeps it
+            -- that way — a texture would need its own frame and anchors, and the round-21b
+            -- crash was an anchor cycle. It also inherits the line's font scaling for free.
+            if i == TALLY_SPLIT then parts[#parts + 1] = Dd.Colored("|", "faint") end
         end
         tallyFS:SetText(table.concat(parts, "  "))
 
@@ -773,6 +811,16 @@ function Detail.Attach(parent)
         -- two telemetry rows read with one language instead of one rimmed and one static.
         D.hearthIcon:SetBackdropBorderColor(UI.Color(hearthRem > 0 and "danger" or "ok"))
 
+        -- ROUND-22: the DMF cooldown pair. Same icon+value treatment as the two above, but
+        -- its state is the SN DMFable tri-state rather than a raw item cooldown, so the rim
+        -- follows the state token instead of a simple on/off-CD test (a boon-frozen DMF is
+        -- neither "ready" green nor "on cooldown" red).
+        local dmfText, dmfTok = Detail.DMFCooldownState(rec, e)
+        D.dmfVal:SetText(dmfText); D.dmfVal:SetTextColor(UI.Color(dmfTok))
+        D.dmfIcon.icon:SetDesaturated(dmfTok == "warn")   -- desat only while actually waiting
+        D.dmfIcon:SetBackdropBorderColor(UI.Color(dmfTok))
+        D.dmfIcon._state = dmfText; D.dmfIcon._stateTok = dmfTok
+
         -- Note.
         if not noteBox:HasFocus() then noteBox:SetText(noteGet(entry.nameRealm) or "") end
     end
@@ -791,33 +839,50 @@ end
 -- is unchanged (READY / a red duration / "on CD"); what changed is that a
 -- character who is ONLINE and mid-cooldown finally produces a duration instead
 -- of always reading READY (A8.2).
-local function testDMFParenthetical(fails)
+-- ROUND-22: the DMF cooldown's TRI-STATE, now rendered in the COOLDOWNS block instead of
+-- appended to the WORLD BUFFS row. Mirrors the SN DMFable model the engine implements.
+local function testDMFCooldownState(fails)
     local function ck(c, m) if not c then fails[#fails + 1] = m end end
     local base = 1000000
 
-    local t, tok = Detail.DMFParenthetical({ dmfCooldownActive = false }, base)
-    ck(t == "READY" and tok == "ok", "DMF not-CD should be READY/ok")
+    -- DMFable: no active cooldown -> can take a new fortune.
+    local t, tok = Detail.DMFCooldownState({ dmfCooldownActive = false }, base)
+    ck(t == "Ready" and tok == "ok", "DMFable -> Ready/ok")
 
-    -- Mid-cooldown while ONLINE: a real red duration (this is the A8.2 fix — the
-    -- old offlineSince-based model returned 0 here and rendered READY).
+    -- Mid-cooldown while ONLINE: a real duration, warn (waiting, not a failure).
     local rec = { dmfCooldownActive = true,
                   dmfCooldown = { offlineSince = 0, remainingOnlineSecs = 3600,
                                   lastTickEpoch = base } }
-    t, tok = Detail.DMFParenthetical(rec, base)
-    ck(tok == "danger" and t ~= "on CD" and t ~= "READY",
-       "DMF mid-CD while online should be a red duration")
+    t, tok = Detail.DMFCooldownState(rec, base)
+    ck(tok == "warn" and t ~= "On CD" and t ~= "Ready",
+       "DMF mid-CD while online -> a warn duration")
 
-    -- Active but with no knowable remaining (a REMOTE record: the wire carries
-    -- only the boolean) -> the tri-state "on CD".
+    -- STASHED IN BOON: the cooldown is FROZEN, so it must NOT read as a countdown. Checked
+    -- before the cooldown branch precisely so a boon never implies time is passing.
+    local booned = { dmfInBoon = true, dmfCooldownActive = true,
+                     dmfCooldown = { offlineSince = 0, remainingOnlineSecs = 3600,
+                                     lastTickEpoch = base } }
+    t, tok = Detail.DMFCooldownState(booned, base)
+    ck(t == "In Boon" and tok == "accent", "DMF stashed in a boon -> In Boon/accent (frozen)")
+    -- ...and a boon outranks even a ready cooldown (the buff is held, not re-takeable).
+    t = Detail.DMFCooldownState({ dmfInBoon = true, dmfCooldownActive = false }, base)
+    ck(t == "In Boon", "boon outranks the ready state")
+
+    -- REMOTE record: the wire carries the boolean but not remainingOnlineSecs, so the
+    -- engine returns 0 remaining -> the third label rather than a bogus "Ready".
     local remote = { dmfCooldownActive = true, dmfCooldown = { offlineSince = base } }
-    t, tok = Detail.DMFParenthetical(remote, base + 3600)
-    ck(t == "on CD" and tok == "danger", "DMF remote/unknown-remaining should be on CD/danger")
+    t, tok = Detail.DMFCooldownState(remote, base + 3600)
+    ck(t == "On CD" and tok == "warn", "DMF remote/unknown-remaining -> On CD/warn")
 
-    -- Cleared cooldown reads READY again.
+    -- Defensive: a nil record must not error (the pane paints before a selection resolves).
+    t, tok = Detail.DMFCooldownState(nil, base)
+    ck(t == "Ready" and tok == "ok", "nil record -> Ready/ok, no error")
+
+    -- Cleared cooldown reads Ready again.
     if ns.Store and ns.Store.DMFCooldownClear then
         ns.Store.DMFCooldownClear(rec)
-        t, tok = Detail.DMFParenthetical(rec, base)
-        ck(t == "READY" and tok == "ok", "DMF cleared -> READY/ok")
+        t, tok = Detail.DMFCooldownState(rec, base)
+        ck(t == "Ready" and tok == "ok", "DMF cleared -> Ready/ok")
     end
 end
 
@@ -996,6 +1061,17 @@ local function testRaidTally(fails)
     local rec = { raidLockouts = { MC = e + 3600, BWL = e - 10, Ony = e + 7200 } }
     local list, locked, open = Detail.RaidTally(rec, e)
     if #list ~= #TALLY_ORDER then fails[#fails + 1] = "tally should list all 7 raids" end
+
+    -- ROUND-22 addendum: the owner-canon order "MC BWL AQ40 NAXX | ONY ZG AQ20", and the
+    -- divider index that splits weekly-reset from short-cycle raids.
+    local want = { "MC", "BWL", "AQ40", "Naxx", "Ony", "ZG", "AQ20" }
+    for i, key in ipairs(want) do
+        ck(list[i] and list[i].key == key,
+            ("tally slot %d should be %s (got %s)"):format(i, key, tostring(list[i] and list[i].key)))
+    end
+    ck(Detail.TALLY_SPLIT == 4, "divider sits after the 4th key (Naxx | Ony)")
+    ck(want[Detail.TALLY_SPLIT] == "Naxx" and want[Detail.TALLY_SPLIT + 1] == "Ony",
+        "the split really is the weekly / short-cycle boundary")
     if locked ~= 2 then fails[#fails + 1] = "expected 2 locked (MC, Ony), got " .. locked end
     if open ~= 5 then fails[#fails + 1] = "expected 5 open, got " .. open end
 
@@ -1080,9 +1156,13 @@ local function testRowStatus(fails)
     -- booned -> full "..(Boon)" / ok
     t, tok = Detail.RowStatus({ shown = true, missing = false, boon = true, fullText = "1h 59m (Boon)", durTok = "ok" }, false)
     ck(t == "1h 59m (Boon)" and tok == "ok", "boon -> frozen dur (Boon)/ok")
-    -- missing DMF keeps its re-acquire state (durText/durTok), NOT "Missing"
+    -- ROUND-22: a missing DMF now reads "Missing" like every other row — its re-acquire
+    -- state moved to the COOLDOWNS block, so the row no longer special-cases. Passing
+    -- isDMF=true must make NO difference any more; that is the whole point of the change.
     t, tok = Detail.RowStatus({ shown = true, missing = true, durText = "READY", durTok = "ok", tint = "danger" }, true)
-    ck(t == "READY" and tok == "ok", "missing DMF -> READY/ok (re-acquire, not 'Missing')")
+    ck(t == "Missing" and tok == "danger", "missing DMF -> Missing/danger (CD moved to COOLDOWNS)")
+    local t2, tok2 = Detail.RowStatus({ shown = true, missing = true, durText = "READY", durTok = "ok", tint = "danger" }, false)
+    ck(t == t2 and tok == tok2, "isDMF flag no longer changes RowStatus output")
     -- hidden slot -> empty
     t = Detail.RowStatus({ shown = false }, false)
     ck(t == "", "hidden slot -> empty status")
@@ -1127,7 +1207,7 @@ end
 if ns.RegisterSelfTest then
     ns:RegisterSelfTest("detail", function(verbose)
         local cases = {
-            { name = "dmf parenthetical",   fn = testDMFParenthetical },
+            { name = "dmf cooldown state", fn = testDMFCooldownState },
             { name = "buff display matrix", fn = testBuffMatrix },
             { name = "detail/card agreement", fn = testDetailCardAgreement },
             { name = "caption compact",     fn = testCaptionCompact },
