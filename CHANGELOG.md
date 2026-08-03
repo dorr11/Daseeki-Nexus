@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Changed: **the Instance Log's columns now split the table 30 / 30 / 20 / 20** — this
+  supersedes the 40 / 20 / 20 / 20 split in the two entries below, in both the Rest and the
+  Logs view. 40% was more room than any character name needs and it squeezed the second
+  column, which is the one carrying the longest text: "Blackrock Depths" was being cut
+  short with an ellipsis on every row. Character and Instance (and, in the Rest view,
+  Character and Level) now share the width evenly at 30% each, Dur and Ago keep 20%, and a
+  full dungeon name fits. Alignment is unchanged, and both views still share one splitter.
+
 - Changed: **the three mesh preferences on Setup now share one row.** "Suppress
   mesh-disabled alert", "Auto-leave standard chat channels" and "Hard-throttle mesh sends"
   were split across two lines — one, then two; they now sit side by side on the same three
