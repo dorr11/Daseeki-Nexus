@@ -1752,6 +1752,17 @@ Tracker._attuneChanged = attuneChanged
 -- Only records that actually carry a matrix are published, so a character that
 -- has not logged in since the update stays absent (reads as nil = unknown) and
 -- is never greyed on a peer's screen.
+--
+-- COPIED, never aliased. Publishing rec.attunements directly would hand the
+-- namespace a LIVE reference into the character record: any later mutation of
+-- the published payload would silently rewrite the stored matrix (and vice
+-- versa), across a boundary where neither side can see the other. Today that
+-- happens to be harmless only because CaptureAttunements routes through
+-- MergeAttunements, which returns the FRESH table it was handed rather than
+-- mutating the stored one — an accident of the current call path, not a
+-- contract. One in-place merge anywhere downstream and a payload edit becomes
+-- a store corruption. The matrix is flat by construction (Store.RAID_KEYS ->
+-- boolean, or nil for UNKNOWN), so a one-level copy is a full copy.
 function Tracker.AttunePayload()
     local out = {}
     local S = ns.Store
@@ -1761,7 +1772,9 @@ function Tracker.AttunePayload()
         if type(tbl) == "table" then
             for nameRealm, rec in pairs(tbl) do
                 if type(rec) == "table" and type(rec.attunements) == "table" then
-                    out[nameRealm] = rec.attunements
+                    local flags = {}
+                    for k, v in pairs(rec.attunements) do flags[k] = v end
+                    out[nameRealm] = flags
                 end
             end
         end
@@ -4091,6 +4104,59 @@ local function testAttunement(fails)
                "payload: entries are nameRealm -> flags")
         end
     end)
+
+    -- ---- 11b) PAYLOAD MUTATION ISOLATION -----------------------------------
+    -- AttunePayload must publish COPIES, never live references into the stored
+    -- character records. Mutating what we handed the namespace must not reach
+    -- the store, and mutating the store must not retro-edit a payload already
+    -- published. Fixture drives GetSelfAccount through a stubbed self bucket.
+    do
+        local savedAcc = ns.Store.data.accounts
+        local savedAID = ns.GetAccountID
+        ns.GetAccountID = function() return "1" end
+        local stored  = { MC = true,  BWL = false }
+        local parked  = { Naxx = false }
+        ns.Store.data.accounts = {
+            ["1"] = {
+                isSelf = true,
+                characters = { ["Live-Realm"]   = { attunements = stored } },
+                homeless   = { ["Parked-Realm"] = { attunements = parked } },
+                segments = { sixties = {}, summoners = {}, norole = {} },
+                segmentHashes = {},
+            },
+        }
+
+        local p = Tracker.AttunePayload()
+        ck(p["Live-Realm"] ~= nil and p["Parked-Realm"] ~= nil,
+           "isolation: both characters (characters + homeless) are published")
+        ck(p["Live-Realm"] ~= stored,
+           "THE FIX: the published table is NOT the stored table (no aliasing)")
+        ck(p["Parked-Realm"] ~= parked,
+           "THE FIX: homeless records are copied too")
+        ck(p["Live-Realm"].MC == true and p["Live-Realm"].BWL == false,
+           "isolation: the copy carries the same values")
+
+        -- Mutating the PAYLOAD must not touch the store.
+        p["Live-Realm"].MC  = false
+        p["Live-Realm"].ZG  = true
+        p["Parked-Realm"].Naxx = true
+        ck(stored.MC == true, "isolation: a payload edit does not regress the stored matrix")
+        ck(stored.ZG == nil,  "isolation: a payload insert does not leak into the record")
+        ck(parked.Naxx == false, "isolation: same for a homeless record")
+
+        -- Mutating the STORE must not retro-edit an already-published payload.
+        stored.BWL = true
+        ck(p["Live-Realm"].BWL == false,
+           "isolation: a later store write does not mutate a published payload")
+
+        -- Two successive payloads are independent of each other, too.
+        local q = Tracker.AttunePayload()
+        ck(q["Live-Realm"] ~= p["Live-Realm"],
+           "isolation: successive payloads do not share tables")
+
+        ns.GetAccountID        = savedAID
+        ns.Store.data.accounts = savedAcc
+    end
 
     Tracker._enteredWorldAt     = savedEW
     Tracker._attuneAllFalseRuns = savedRuns

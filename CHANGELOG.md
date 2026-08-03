@@ -12,6 +12,25 @@
   60s per account — but until every account has reloaded there is avoidable mesh
   chatter. Reload (or relog) all of your accounts once, together, and it stops.
 
+- Fixed: **a duplicate character card that no amount of reloading would clear.** Nexus
+  keeps one bucket of characters per account, and exactly one of them is flagged as
+  *this* account — the flag that makes your own roster untouchable, so nothing
+  arriving over the mesh can ever delete your characters. If you ran Nexus before
+  setting an account ID, the unattributed bucket got that flag (correctly, at the
+  time); setting an account ID afterwards flagged the real bucket too, and nothing
+  ever took the flag back off the old one. The result was two buckets both claiming
+  to be you, and because the stale-twin cleanup deliberately never removes anything
+  from a bucket flagged as yours, the leftover copy of a character was permanently
+  immune to it — the same character drawn twice, both lit green, forever.
+
+  Nexus now checks this at login: only the bucket matching your current account ID
+  may claim to be you, and any other bucket still wearing the flag has it removed
+  (noted in `/dsn debug mesh`). Nothing is deleted by that check — it only lets the
+  ordinary cleanup, with all of its existing safeguards, finally do its job. The
+  duplicate clears on your next login and stays gone. If you have never set an
+  account ID the check does nothing at all, so pre-setup rosters keep their
+  protection.
+
 - Fixed: **the Auras and Automation pages now open on YOUR faction instead of always
   Alliance.** Everything on those two pages is saved per faction, and the Faction
   toggle at the top used to reset to Alliance every single reload. So if you play

@@ -1024,6 +1024,11 @@ end
 ----------------------------------------------------------------------
 
 function Store.OnLogin()
+    -- B5.1: FIRST, because it is a precondition for the sweeps below. A bucket
+    -- wrongly flagged isSelf is immune to stale-twin retirement, so demoting the
+    -- impostors before SweepStaleTwins runs is what lets a single reload heal an
+    -- existing duplicate instead of leaving it stranded until the next write.
+    Store.SanitizeSelfBuckets()
     Store.SweepTombstones()
     Store.WeeklyResetSweep()
     Store.SweepOrphanBucket()
@@ -1987,6 +1992,71 @@ function Store.SweepStaleTwins()
         end
     end
     return n
+end
+
+----------------------------------------------------------------------
+-- B5.1 — self-bucket sanity pass (login)
+--
+-- THE CORRUPTION. `isSelf` is a singleton claim: exactly one bucket on this
+-- machine is *us*. Two paths can leave a second bucket wearing the flag:
+--
+--   * GetSelfAccount with NO account id chosen yet deliberately flags the
+--     ORPHAN ("") bucket self, so self-immunity still protects our live
+--     characters before setup. Once the owner later sets a real account id,
+--     GetSelfAccount flags the real bucket too — and nothing ever takes the
+--     flag back off the "" bucket. Both are now self.
+--   * An account id that CHANGES (a re-setup, or an import that wrote a
+--     bucket under the old id) leaves the previous key's bucket flagged.
+--
+-- WHY IT IS PERMANENT DAMAGE. ReconcileStaleTwins refuses, by design, to
+-- remove anything from a bucket flagged isSelf (our roster is the one thing
+-- on this machine no remote epoch may delete). So a stale duplicate parked in
+-- a wrongly-self bucket is immortal: the live account re-pushes that character
+-- forever and the twin is never retired. The owner's account-#3 SavedVariables
+-- shows exactly this — a second "Puucons-Whitemane" under the EMPTY-STRING key
+-- whose bucket carries isSelf = true, sitting beside the genuine self bucket.
+--
+-- THE RULE. At most ONE bucket may be isSelf: the one whose KEY EQUALS
+-- ns:GetAccountID(). Any OTHER bucket wearing the flag — empty-key or a
+-- mismatched key — has it cleared. Clearing is all we do: no record is
+-- removed here. That is the point. Demoting the bucket to an ordinary foreign
+-- bucket makes its contents eligible for the NORMAL stale-twin retirement,
+-- which then applies its own guards (strictly-older ownerEpoch only, equal is
+-- ambiguous) rather than this pass inventing a deletion rule of its own.
+--
+-- THE GUARDS:
+--   * The bucket matching the current account id is NEVER touched — not
+--     cleared, not set. GetSelfAccount owns flagging it.
+--   * If the account id is unset or invalid we do NOTHING. Without a valid id
+--     we cannot tell which of the flagged buckets is genuine, and guessing
+--     could strip self-immunity from our real roster. Pre-setup (id "") the
+--     "" bucket being self is CORRECT, not corrupt.
+--   * Idempotent: once a run has cleared the impostors, every later run finds
+--     one flagged bucket (or none) and changes nothing.
+--
+-- Returns the number of buckets demoted.
+----------------------------------------------------------------------
+
+function Store.SanitizeSelfBuckets()
+    local accounts = Store.data and Store.data.accounts
+    if type(accounts) ~= "table" then return 0 end
+
+    -- Without a VALID id there is no way to name the genuine self bucket, so
+    -- there is no safe edit to make. Covers the unset ("") pre-setup case.
+    local aid = ns and ns.GetAccountID and ns:GetAccountID()
+    if not (ns and ns.IsValidAccountID and ns:IsValidAccountID(aid)) then return 0 end
+
+    local cleared = 0
+    for key, bucket in pairs(accounts) do
+        if key ~= aid and type(bucket) == "table" and bucket.isSelf == true then
+            bucket.isSelf = false
+            cleared = cleared + 1
+            ghostLog(("store: account %s was wrongly flagged as this account (self is %s); "
+                      .. "flag cleared — its stale copies can now be retired normally")
+                :format((key ~= "" and key) or "(orphan)", aid))
+        end
+    end
+    return cleared
 end
 
 ----------------------------------------------------------------------
@@ -3729,6 +3799,145 @@ local function testStaleTwins(fails)
     Store._ghostLog     = savedLog
 end
 
+----------------------------------------------------------------------
+-- B5.1 — self-bucket sanity pass
+----------------------------------------------------------------------
+local function testSelfBucketSanity(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local T = 1700000000
+    local OLD = T - 14 * 86400
+
+    local savedAccounts = Store.data.accounts
+    local savedLog      = Store._ghostLog
+    local savedGetAID   = ns.GetAccountID
+
+    local function rec(epoch) return { level = 60, ownerEpoch = epoch } end
+    local function bucket(chars, isSelf, segs)
+        return { isSelf = isSelf or false, characters = chars or {}, homeless = {},
+                 segments = segs or { sixties = {}, summoners = {}, norole = {} },
+                 segmentHashes = {} }
+    end
+
+    -- ---- THE OWNER'S ACCOUNT-#3 SHAPE, REPRODUCED -------------------------
+    -- His SavedVariables carry the genuine self bucket under key "3" AND a
+    -- stale duplicate "Puucons-Whitemane" under the EMPTY-STRING key whose
+    -- bucket is ALSO flagged isSelf (left over from before he set an account
+    -- id). Two isSelf buckets = corrupt state.
+    local function ownerShape()
+        Store.data.accounts = {
+            ["3"] = bucket({ ["Puucons-Whitemane"] = rec(T) }, true),
+            [""]  = bucket({ ["Puucons-Whitemane"] = rec(OLD) }, true,
+                           { sixties = { "Puucons-Whitemane", "Other-R" },
+                             summoners = {}, norole = {} }),
+        }
+    end
+    ns.GetAccountID = function() return "3" end
+
+    -- CONTROL: with BOTH flagged self, the stale twin is immortal — this is
+    -- precisely the bug. ReconcileStaleTwins refuses to touch an isSelf bucket.
+    ownerShape()
+    ck(#Store.ReconcileStaleTwins("Puucons-Whitemane", "3") == 0,
+        "control: while the empty-key bucket is flagged self, the duplicate is immortal")
+    ck(Store.data.accounts[""].characters["Puucons-Whitemane"] ~= nil,
+        "control: ...the stale copy survives (the defect the sanity pass fixes)")
+
+    -- THE SANITY PASS.
+    ownerShape()
+    Store._ghostLog = {}
+    ck(Store.SanitizeSelfBuckets() == 1, "exactly one impostor bucket is demoted")
+    ck(Store.data.accounts[""].isSelf == false,
+        "THE FIX: the empty-key bucket's isSelf claim is cleared")
+    ck(Store.data.accounts["3"].isSelf == true,
+        "the genuine bucket (key == account id) keeps its flag")
+    ck(Store.data.accounts[""].characters["Puucons-Whitemane"] ~= nil,
+        "the pass CLEARS A FLAG ONLY — it never removes a record itself")
+    ck(#Store._ghostLog == 1, "the demotion is written to the debug ring (+ amber line)")
+
+    -- ...and retirement now proceeds, both by the login sweep...
+    ck(Store.SweepStaleTwins() == 1, "the login sweep now retires the unblocked stale copy")
+    ck(Store.data.accounts[""].characters["Puucons-Whitemane"] == nil,
+        "THE OWNER'S CASE RESOLVES: the duplicate Puucons-Whitemane is gone")
+    ck(Store.data.accounts["3"].characters["Puucons-Whitemane"] ~= nil,
+        "...and his real character is the copy kept")
+    ck(Store.data.accounts[""].segments.sixties[1] == "X",
+        "...the vacated manifest slot is tombstoned as usual")
+
+    -- ...and on the next ordinary WRITE of that character.
+    ownerShape()
+    Store.SanitizeSelfBuckets()
+    local mine = Store.NewCharacterRecord("Puucons-Whitemane")
+    mine.ownerEpoch = T
+    Store.WriteSelfCharacter("Puucons-Whitemane", mine)
+    ck(Store.data.accounts[""].characters["Puucons-Whitemane"] == nil,
+        "retirement also proceeds on the next write, with no reload needed")
+
+    -- IDEMPOTENT.
+    ownerShape()
+    ck(Store.SanitizeSelfBuckets() == 1, "first pass demotes")
+    ck(Store.SanitizeSelfBuckets() == 0, "second pass finds nothing left to demote")
+    ck(Store.SanitizeSelfBuckets() == 0, "...and stays a no-op")
+    ck(Store.data.accounts["3"].isSelf == true, "...the genuine flag survives every pass")
+
+    -- ---- GUARD: a MISMATCHED key, not just the empty one -------------------
+    ns.GetAccountID = function() return "11" end
+    Store.data.accounts = {
+        ["11"] = bucket({ ["Mine-R"] = rec(T) }, true),
+        ["3"]  = bucket({ ["Mine-R"] = rec(OLD) }, true),    -- old identity
+        ["7"]  = bucket({ ["Peer-R"] = rec(T) }, false),     -- ordinary peer
+    }
+    ck(Store.SanitizeSelfBuckets() == 1, "a mismatched-KEY self bucket is demoted too")
+    ck(Store.data.accounts["3"].isSelf == false, "...the old identity loses the claim")
+    ck(Store.data.accounts["11"].isSelf == true, "...the current account keeps it")
+    ck(Store.data.accounts["7"].isSelf == false, "...an ordinary peer is unchanged")
+
+    -- ---- GUARD: unset account id -> DO NOTHING -----------------------------
+    -- Pre-setup, GetSelfAccount deliberately flags the "" bucket self so our
+    -- live characters keep self-immunity. That is CORRECT, not corruption, and
+    -- with no id there is no way to name a genuine bucket anyway.
+    ns.GetAccountID = function() return "" end
+    Store.data.accounts = {
+        [""]  = bucket({ ["Mine-R"] = rec(T) }, true),
+        ["3"] = bucket({ ["Mine-R"] = rec(OLD) }, true),
+    }
+    ck(Store.SanitizeSelfBuckets() == 0, "an UNSET account id is a total no-op")
+    ck(Store.data.accounts[""].isSelf == true, "...the pre-setup orphan keeps self-immunity")
+    ck(Store.data.accounts["3"].isSelf == true, "...and nothing else is touched either")
+
+    -- ---- GUARD: invalid account id -> DO NOTHING ---------------------------
+    for _, bad in ipairs({ "abc", "123", "  ", "3x" }) do
+        ns.GetAccountID = function() return bad end
+        Store.data.accounts = {
+            [""]  = bucket({}, true),
+            ["3"] = bucket({}, true),
+        }
+        ck(Store.SanitizeSelfBuckets() == 0,
+            "an INVALID account id (" .. bad .. ") is a no-op")
+        ck(Store.data.accounts[""].isSelf == true and Store.data.accounts["3"].isSelf == true,
+            "...no flag is disturbed on an invalid id (" .. bad .. ")")
+    end
+    ns.GetAccountID = function() return nil end
+    Store.data.accounts = { [""] = bucket({}, true) }
+    ck(Store.SanitizeSelfBuckets() == 0, "a nil account id is a no-op")
+
+    -- ---- GUARD: the genuine bucket is never TOUCHED, in either direction ---
+    -- Not cleared, and not set either: flagging it is GetSelfAccount's job.
+    ns.GetAccountID = function() return "3" end
+    Store.data.accounts = { ["3"] = bucket({ ["Mine-R"] = rec(T) }, false) }
+    ck(Store.SanitizeSelfBuckets() == 0, "an unflagged genuine bucket needs no demotion")
+    ck(Store.data.accounts["3"].isSelf == false,
+        "...and the pass does not SET the flag either (GetSelfAccount owns that)")
+
+    -- ---- no accounts / already-clean stores are no-ops ---------------------
+    Store.data.accounts = {}
+    ck(Store.SanitizeSelfBuckets() == 0, "an empty store is a no-op")
+    Store.data.accounts = { ["3"] = bucket({}, true), ["7"] = bucket({}, false) }
+    ck(Store.SanitizeSelfBuckets() == 0, "an already-correct store is a no-op")
+
+    ns.GetAccountID     = savedGetAID
+    Store.data.accounts = savedAccounts
+    Store._ghostLog     = savedLog
+end
+
 function Store.RunSelfTests(verbose)
     local suites = {
         { name = "defaults",        fn = testDefaults },
@@ -3744,6 +3953,7 @@ function Store.RunSelfTests(verbose)
         { name = "item cd epochs (A9.1)",   fn = testItemCdEpochs },
         { name = "manifest ghost cleanup (B4)", fn = testManifestGhostCleanup },
         { name = "stale-twin reconciliation (B5)", fn = testStaleTwins },
+        { name = "self-bucket sanity (B5.1)", fn = testSelfBucketSanity },
     }
     local allPass = true
     for _, suite in ipairs(suites) do
