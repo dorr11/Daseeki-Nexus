@@ -62,10 +62,22 @@ local CARD_PAD_V = 7        -- card vertical padding   (round-11 item 4: 9 -> 7,
 -- share the card's BOTTOM band with the hearth icon + its countdown text, so the binding
 -- constraint is WIDTH, not height — the card never needed to grow. 22 is the largest edge
 -- that keeps the full 10-tile run clear of the countdown (24 overruns it); see the pure,
--- headless-tested Cards.StripGeometry. Border stays 1px: on a 22px tile a 2px edge would
--- read HEAVIER than the original (~33% of the tile vs 21% at 18/1px), so 1px preserves the
--- §5b state-border weight; the 1px icon inset grows the visible art 16 -> 20px.
+-- headless-tested Cards.StripGeometry.
+--
+-- ROUND-21 (owner, side-by-side against the reference cards): round-16's "border stays
+-- 1px" call is REVERSED. Its arithmetic was right about the ratio and wrong about what
+-- the player sees: `edgeSize` is measured in the frame's LOCAL units, not pixels, so a
+-- 1-unit edge on a card sitting at the usual Classic UI scale lands SUB-PIXEL and the
+-- renderer antialiases it into a washed grey hairline — which is exactly the "faint and
+-- thin" the owner called out. The state ring is the strip's whole job (held vs missing at
+-- a glance), so it now draws at RING_PX PHYSICAL pixels, scale-corrected the way the
+-- suite's other pixel-exact edges are (UI.Hairline's 768/physH math), at full opacity and
+-- at a normalized brightness. See Cards.RingEdgeSize / Cards.RingInk (both pure + pinned).
 local TILE       = 22       -- buff strip tile edge (round-16: 18 -> 22)
+-- STATE-RING dial (round-21). Physical pixels, not local units — see ringBackdrop().
+local RING_PX    = 2        -- ring thickness in PHYSICAL screen pixels (round-16: 1 -> 2)
+local RING_ALPHA = 1        -- rings always run fully opaque (never inherit a token alpha)
+local RING_VALUE = 0.92     -- HSV brightness floor every ring ink is normalized UP to
 local TILE_GAP   = 3
 local STRIP_TILES = 10      -- tiles in the buff strip (pool size)
 local CD_TEXT_W   = 34      -- reserve for the bottom-band countdown text ("1h05m") to the
@@ -368,6 +380,47 @@ function Cards.StripTileStyle(entry, slot, nowE)
     }
 end
 
+----------------------------------------------------------------------
+-- STATE RING (round-21) — the shared card-scale chip-ring math. PURE + pinned.
+----------------------------------------------------------------------
+-- One physical screen pixel expressed in a frame's LOCAL coordinate units. Mirrors
+-- Blizzard's PixelUtil / UI.Hairline math: the virtual UI is 768 units tall, so one
+-- device pixel is 768/physicalHeight units at scale 1, divided again by the frame's
+-- effective scale. Split out from the frame so it is testable headless.
+function Cards.PixelUnit(physH, scale)
+    physH = tonumber(physH); if not physH or physH <= 0 then physH = 1080 end
+    scale = tonumber(scale); if not scale or scale <= 0 then scale = 1 end
+    return (768 / physH) / scale
+end
+
+-- Backdrop `edgeSize` (local units) that renders as RING_PX PHYSICAL pixels. Clamped to
+-- a sane band so a bogus scale or screen size can never erase the ring or fatten it into
+-- the icon: at every real Classic display/scale combination the raw value lands well
+-- inside [0.5, 4] and the clamp is inert.
+function Cards.RingEdgeSize(physH, scale)
+    local e = RING_PX * Cards.PixelUnit(physH, scale)
+    if e < 0.5 then return 0.5 end
+    if e > 4   then return 4   end
+    return e
+end
+
+-- State-ring INK. The ring is the card's at-a-glance legibility signal, so every state
+-- color is normalized UP to a common on-screen brightness floor (RING_VALUE, the HSV
+-- "value" = max channel) and painted at full opacity. This is a PURE VALUE SCALE: hue and
+-- saturation survive exactly, so the state -> color mapping is untouched — a green ring is
+-- the same green, just no longer half-lit. Themes whose token already clears the floor
+-- (Winterspring's warn, most reds) pass through unchanged; the dull ones (every theme's
+-- `ok`) are the ones that gain. Returns r, g, b, a.
+function Cards.RingInk(r, g, b)
+    r, g, b = tonumber(r) or 1, tonumber(g) or 1, tonumber(b) or 1
+    local mx = math.max(r, g, b)
+    if mx > 0 and mx < RING_VALUE then
+        local k = RING_VALUE / mx
+        r, g, b = r * k, g * k, b * k
+    end
+    return r, g, b, RING_ALPHA
+end
+
 -- Compact "updated ago" text + stale flag ("2m"/"41m"/"2h"/"1d"; ""/false if none).
 function Cards.AgoText(rec, nowE)
     local upd = (rec and rec.lastDataUpdate) or 0
@@ -574,6 +627,60 @@ local function showCardPeek(card, entry)
 end
 
 ----------------------------------------------------------------------
+-- STATE-RING painter (round-21) — the ONE card-scale chip-ring helper.
+----------------------------------------------------------------------
+-- Every ok/danger/warn ring a card draws goes through here: the buff-strip tiles and the
+-- chrono/hearth cd chips. They sit millimetres apart on the same card speaking the same
+-- green-is-held / red-is-not language, so they must carry the same ring WEIGHT — a ring's
+-- thickness is a material property of the card, not something that scales with the tile.
+-- (The DETAIL pane's buff ROWS are a different surface with their own paint and are
+-- deliberately untouched.)
+--
+-- The backdrop table is memoized on the snapped edge size: every card shares the same
+-- frame scale, and :Populate re-paints ~1/s per visible card x 10 tiles, so rebuilding the
+-- table per tile would be pure garbage. It rebuilds only when the player's UI scale or
+-- resolution actually moves the snapped value.
+local ringBd, ringBdEdge
+local function ringBackdrop(frame)
+    local physH = 1080
+    if GetPhysicalScreenSize then
+        local _, h = GetPhysicalScreenSize()
+        if h and h > 0 then physH = h end
+    end
+    local scale = (frame and frame.GetEffectiveScale and frame:GetEffectiveScale()) or 1
+    local e = Cards.RingEdgeSize(physH, scale)
+    if ringBd and ringBdEdge == e then return ringBd, e end
+    ringBdEdge = e
+    ringBd = {
+        bgFile   = "Interface\\Buttons\\WHITE8X8",
+        edgeFile = "Interface\\Buttons\\WHITE8X8",
+        edgeSize = e,
+        insets   = { left = e, right = e, top = e, bottom = e },
+    }
+    return ringBd, e
+end
+
+-- Paint `frame` as a state chip: inset fill + a RING_PX-thick, brightness-normalized ring
+-- in `token`'s hue. Also keeps the frame's icon clear of the ring — the icon lives on
+-- ARTWORK, which draws ABOVE the backdrop's BORDER-layer edge, so an icon inset smaller
+-- than the ring would overdraw it and thin it straight back to a hairline (the round-16
+-- geometry only worked because a 1-unit inset exactly matched a 1-unit edge). Re-anchored
+-- only when the snapped size changes, not on every repaint.
+local function paintStateRing(frame, token)
+    local bd, e = ringBackdrop(frame)
+    frame:SetBackdrop(bd)
+    frame:SetBackdropColor(UI.Color("inset"))
+    frame:SetBackdropBorderColor(Cards.RingInk(UI.Color(token)))
+    local ic = frame.icon
+    if ic and frame._ringInset ~= e then
+        frame._ringInset = e
+        ic:ClearAllPoints()
+        ic:SetPoint("TOPLEFT", frame, "TOPLEFT", e, -e)
+        ic:SetPoint("BOTTOMRIGHT", frame, "BOTTOMRIGHT", -e, e)
+    end
+end
+
+----------------------------------------------------------------------
 -- A compact card (mockup .card anatomy). Pooled; :Populate(entry, selected).
 ----------------------------------------------------------------------
 local function makeCard(parent, pane)
@@ -688,6 +795,8 @@ local function makeCard(parent, pane)
         if i == 1 then t:SetPoint("BOTTOMLEFT", card, "BOTTOMLEFT", CARD_PAD_H, CARD_PAD_V)
         else t:SetPoint("LEFT", card.tiles[i - 1], "RIGHT", TILE_GAP, 0) end
         local ic = t:CreateTexture(nil, "ARTWORK")
+        -- Provisional 1-unit inset; paintStateRing re-anchors it to the snapped RING_PX
+        -- edge on the first :Populate so the icon never overdraws the ring (round-21).
         ic:SetPoint("TOPLEFT", t, "TOPLEFT", 1, -1)
         ic:SetPoint("BOTTOMRIGHT", t, "BOTTOMRIGHT", -1, 1)
         ic:SetTexCoord(0.08, 0.92, 0.08, 0.92)
@@ -771,7 +880,6 @@ local function makeCard(parent, pane)
         self.chrono:ClearAllPoints()
         local slotY = self._slotY[(rec.classTag == "WARLOCK") and 2 or 1]
         self.chrono:SetPoint("TOPRIGHT", self, "TOPRIGHT", -CARD_PAD_H, slotY)
-        self.chrono:SetBackdrop(UI.FLAT_BACKDROP); self.chrono:SetBackdropColor(UI.Color("inset"))
         -- A9.1: derived from the stored START EPOCH, via the one shared helper.
         local chronoRem = Dashboard.ItemCdRemaining(rec, "chronoboon", nowE)
         -- Round-17b: the border/desat/countdown track the ITEM COOLDOWN only — being
@@ -779,7 +887,8 @@ local function makeCard(parent, pane)
         local cSt = Cards.CdIconState(chronoRem)
         local onCd = chronoRem > 0
         self.chrono.icon:SetDesaturated(onCd)
-        self.chrono:SetBackdropBorderColor(UI.Color(cSt.border))   -- ok ready / danger on CD
+        -- Round-21: same state ring as the buff strip (ok ready / danger on CD).
+        paintStateRing(self.chrono, cSt.border)
         if cSt.cd then
             self.chrono.cd:SetText(cSt.cd); self.chrono.cd:SetTextColor(UI.Color("danger")); self.chrono.cd:Show()
         else
@@ -794,9 +903,8 @@ local function makeCard(parent, pane)
                              onCd and "danger" or (rec.chronoboonActive and "accent" or "muted") }
         local hearthRem = Dashboard.ItemCdRemaining(rec, "hearthstone", nowE)
         local hSt = Cards.CdIconState(hearthRem)
-        self.hearth:SetBackdrop(UI.FLAT_BACKDROP); self.hearth:SetBackdropColor(UI.Color("inset"))
         self.hearth.icon:SetDesaturated(hearthRem > 0)
-        self.hearth:SetBackdropBorderColor(UI.Color(hSt.border))           -- green ready / red CD
+        paintStateRing(self.hearth, hSt.border)                            -- green ready / red CD
         if hSt.cd then
             self.hearth.cd:SetText(hSt.cd); self.hearth.cd:SetTextColor(UI.Color("danger")); self.hearth.cd:Show()
         else
@@ -806,7 +914,9 @@ local function makeCard(parent, pane)
                              hearthRem > 0 and "danger" or "ok" }
 
         -- Buff strip: real-icon tiles double-encoding state (§5b) — §5a lit/desat
-        -- icon + a state border (held ok-green / missing danger-red / warn optional).
+        -- icon + a state RING (held ok-green / missing danger-red / warn optional).
+        -- Round-21: the ring is 2 physical px at normalized brightness (paintStateRing);
+        -- the state -> token mapping below is unchanged.
         local order = Dashboard.AURA_DISPLAY_ORDER or {}
         local ti = 0
         for _, slot in ipairs(order) do
@@ -819,9 +929,7 @@ local function makeCard(parent, pane)
                     t.icon:SetTexture(Dashboard.AuraIcon(slot))
                     t.icon:SetDesaturated(sty.desat)
                     t.icon:SetAlpha(sty.desat and 0.6 or 1)
-                    t:SetBackdrop(UI.FLAT_BACKDROP)
-                    t:SetBackdropColor(UI.Color("inset"))
-                    t:SetBackdropBorderColor(UI.Color(sty.border))
+                    paintStateRing(t, sty.border)
                 end
             end
         end
@@ -1473,6 +1581,64 @@ local function testStripStyle(fails)
     end
 end
 
+-- Round-21: STATE-RING geometry + ink. The owner's complaint was legibility, so the two
+-- numbers that produce it are pinned — a future round cannot quietly walk the ring back to
+-- a sub-pixel hairline or a half-lit token without this failing.
+local function testStateRing(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local function near(a, b) return math.abs(a - b) < 1e-6 end
+
+    -- PixelUnit: 768 virtual units / physical height, then / effective scale.
+    ck(near(Cards.PixelUnit(768, 1), 1), "768px tall @ scale 1 -> 1 unit per pixel")
+    ck(near(Cards.PixelUnit(1080, 1), 768 / 1080), "1080p @ scale 1 -> 768/1080 units per pixel")
+    ck(near(Cards.PixelUnit(1440, 0.5), (768 / 1440) / 0.5), "scale divides the unit size")
+    -- Degenerate inputs fall back rather than dividing by zero / returning nan.
+    ck(near(Cards.PixelUnit(0, 1), 768 / 1080), "physH 0 -> 1080 fallback")
+    ck(near(Cards.PixelUnit(nil, nil), 768 / 1080), "nil inputs -> 1080 @ scale 1")
+    ck(Cards.PixelUnit(1080, 0) == Cards.PixelUnit(1080, 1), "scale 0 -> treated as 1")
+
+    -- RingEdgeSize is exactly RING_PX (2) pixels' worth of local units, clamped [0.5, 4].
+    ck(near(Cards.RingEdgeSize(768, 1), 2), "2 physical px == 2 units when 1 unit == 1 px")
+    ck(near(Cards.RingEdgeSize(1080, 1), 2 * (768 / 1080)), "1080p @ scale 1 -> 2 * pixelUnit")
+    ck(Cards.RingEdgeSize(1080, 1) > Cards.PixelUnit(1080, 1),
+        "the ring is strictly THICKER than the 1px hairline it replaced")
+    ck(Cards.RingEdgeSize(100000, 1) == 0.5, "absurdly tall screen clamps at the 0.5 floor")
+    ck(Cards.RingEdgeSize(200, 1) == 4, "absurdly short screen clamps at the 4 ceiling")
+    -- Every plausible Classic display height paired with its plausible UI-scale range
+    -- (the slider floor of 0.64, or the pixel-perfect 768/physH on the tall panels, up to
+    -- 1.0) lands inside the band, so the clamp is inert in practice.
+    for _, p in ipairs({ { 768, 0.64 }, { 768, 1.0 }, { 900, 0.64 }, { 900, 1.0 },
+                         { 1080, 0.64 }, { 1080, 1.0 }, { 1200, 0.64 }, { 1200, 1.0 },
+                         { 1440, 0.53 }, { 1440, 1.0 }, { 2160, 0.3556 }, { 2160, 1.0 } }) do
+        local e = Cards.RingEdgeSize(p[1], p[2])
+        ck(e > 0.5 and e < 4, ("real display %dp @ scale %s stays off the clamps"):format(p[1], tostring(p[2])))
+    end
+
+    -- RingInk normalizes brightness UP to RING_VALUE (0.92) and always returns alpha 1.
+    local r, g, b, a = Cards.RingInk(0.3608, 0.7216, 0.5412)   -- Winterspring `ok` #5CB88A
+    ck(near(math.max(r, g, b), 0.92), "a dull token is lifted to the 0.92 brightness floor")
+    ck(a == 1, "ring ink is fully opaque")
+    ck(g > 0.7216 and r > 0.3608 and b > 0.5412, "every channel brightens (no channel loses ink)")
+    -- Hue + saturation are preserved EXACTLY: a pure value scale keeps channel ratios.
+    ck(near(r / g, 0.3608 / 0.7216) and near(b / g, 0.5412 / 0.7216),
+        "channel ratios (hue + saturation) survive the lift unchanged")
+    -- Already-bright tokens pass through untouched — the ring never DIMS a color.
+    local wr, wg, wb = Cards.RingInk(0.9216, 0.7608, 0.2980)    -- Winterspring `warn`
+    ck(near(wr, 0.9216) and near(wg, 0.7608) and near(wb, 0.2980),
+        "a token already above the floor is passed through unscaled")
+    ck(select(1, Cards.RingInk(1, 1, 1)) == 1, "white is never scaled past 1")
+    -- Field Ledger (the default theme) reds/greens both clear the floor after the lift.
+    for _, c in ipairs({ { 0.4824, 0.6510, 0.3686 }, { 0.8078, 0.2902, 0.2196 }, { 0.8392, 0.6353, 0.2902 } }) do
+        local cr, cg, cb = Cards.RingInk(c[1], c[2], c[3])
+        ck(math.max(cr, cg, cb) >= 0.92 - 1e-9, "every Field Ledger state ink reaches the floor")
+        ck(cr <= 1 and cg <= 1 and cb <= 1, "no channel is pushed out of range")
+    end
+    -- Degenerate ink cannot blow up (pure black has no hue to scale).
+    local zr, zg, zb, za = Cards.RingInk(0, 0, 0)
+    ck(zr == 0 and zg == 0 and zb == 0 and za == 1, "black ink stays black (no divide by zero)")
+    ck(select(4, Cards.RingInk(nil, nil, nil)) == 1, "nil ink -> opaque fallback, no error")
+end
+
 -- Round-11 item 5: cd-icon state derivation (green ready / red + countdown on CD).
 local function testCdIconState(fails)
     local function ck(c, m) if not c then fails[#fails + 1] = m end end
@@ -1647,6 +1813,7 @@ if ns.RegisterSelfTest then
             { name = "selection machine", fn = testSelectionMachine },
             { name = "slot state",        fn = testSlotState },
             { name = "strip tile style",  fn = testStripStyle },
+            { name = "state ring",        fn = testStateRing },
             { name = "cd icon state",     fn = testCdIconState },
             { name = "on-accent label",   fn = testOnAccentTextColor },
             { name = "hover peek",        fn = testPeek },
