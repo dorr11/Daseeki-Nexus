@@ -1069,7 +1069,66 @@ end
 Store.NewAccountBucket = newAccountBucket
 
 ----------------------------------------------------------------------
--- Init: attach SVs, apply defaults, run the version-stamped wipe
+-- Storage migration chain  (AT-RISK-3 fix — stamp, don't wipe)
+--
+-- MIGRATIONS[n] upgrades a DaseekiNexusData table stamped version n to version
+-- n+1: a PURE transform-in-place. Nothing is discarded -- the character graph
+-- (accounts + attunements), tombstones (deletedAIDs), timers, social, notes,
+-- instances and the sync caches all ride through untouched unless a step
+-- deliberately rewrites them. This replaces the old rebuild-from-defaults branch
+-- that silently wiped `accounts` on any version change.
+--
+-- STORAGE_VERSION ships at 1, so the chain has no steps yet; the runner exists
+-- now so the FIRST real storage bump is a data change (add MIGRATIONS[1]), not a
+-- plumbing change -- and the wipe branch is gone, so a future bump can never fall
+-- back to discarding the graph.
+--
+-- Contract (mirrors Daseeki-ClassHUD/store.lua Store.Migrate, the house model):
+--   * absent / unknown version -> STAMP to current. Today's saved data already
+--     has the current shape, so assume-compatible-and-seed; NEVER wipe.
+--   * version NEWER than ours   -> leave EXACTLY as-is (never downgrade); the
+--     caller logs once and skips the additive backfill.
+--   * a known older version     -> run the ordered step(s) n -> n+1 in place.
+--   * a MISSING step in the chain -> STOP with a "gap" error rather than
+--     half-converting or wiping. Unreachable in a correctly-shipped build.
+----------------------------------------------------------------------
+
+Store.MIGRATIONS = {}
+
+-- Returns: ok, fromVersion, toVersion, note
+--   ok=true  with note "stamped"  (version was absent -> set to current)
+--   ok=true  with note "migrated" (0+ steps ran; safe to backfill defaults)
+--   ok=false with note "future"   (saved by a newer build; left untouched)
+--   ok=false with note "gap"      (older, but a step is missing; stopped clean)
+--   ok=false with note "no table" (defensive; nothing to do)
+function Store.MigrateData(data)
+    if type(data) ~= "table" then return false, nil, nil, "no table" end
+    local from = tonumber(data.version)
+    if from == nil then
+        -- Fresh table, or a pre-version private build: the data is already
+        -- current-shaped, so stamp it. applyDefaults (below) fills any gaps.
+        data.version = Store.STORAGE_VERSION
+        return true, nil, Store.STORAGE_VERSION, "stamped"
+    end
+    if from > Store.STORAGE_VERSION then
+        -- Saved by a newer build. Leave it EXACTLY as-is -- downgrading a
+        -- player's character graph is worse than not reading it this session.
+        return false, from, from, "future"
+    end
+    while (data.version or 0) < Store.STORAGE_VERSION do
+        local step = Store.MIGRATIONS[data.version]
+        if type(step) ~= "function" then
+            -- No path forward: STOP rather than half-convert or wipe.
+            return false, from, data.version, "gap"
+        end
+        step(data)                              -- pure transform-in-place
+        data.version = data.version + 1
+    end
+    return true, from, data.version, "migrated"
+end
+
+----------------------------------------------------------------------
+-- Init: attach SVs, apply defaults, run the storage migration chain
 ----------------------------------------------------------------------
 
 function Store.Init()
@@ -1108,50 +1167,37 @@ function Store.Init()
         DaseekiNexusData = defaultData()
     end
 
-    -- Version-stamped wipe: if the storage schema advanced, discard the
-    -- character-graph (accounts) but PRESERVE timers, social, and
-    -- manualLocations exactly, per spec.
-    if DaseekiNexusData.version ~= Store.STORAGE_VERSION then
-        local preservedTimers  = DaseekiNexusData.timers
-        local preservedSocial  = DaseekiNexusData.social
-        local preservedManual  = DaseekiNexusData.manualLocations
-        local preservedNotes   = DaseekiNexusData.notes
-        local preservedNotesMig = DaseekiNexusData.notesMigrated
-        local preservedDeleted = DaseekiNexusData.deletedAIDs
-        -- Instance ledger is account-scoped state the wipe must PRESERVE (like
-        -- notes/manualLocations): the caps math is only useful across sessions.
-        local preservedInstances = DaseekiNexusData.instances
-        -- The suite-namespace payloads are cross-account caches (like accounts,
-        -- reconstructible from the mesh) but expensive to re-pull -- KBs per
-        -- owner -- so preserve them across a character-graph wipe rather than
-        -- forcing every peer to resend. Not schema-coupled to the char graph.
-        local preservedSyncNS  = DaseekiNexusData.syncNamespaces
-        local preservedSyncKV  = DaseekiNexusData.syncKV
-        local preservedImported = DaseekiNexusData.bagsImported
-        -- The Inventory owners graph is cross-account gold/item data with its own
-        -- schema; a character-data wipe must never take it.
-        local preservedInventory = DaseekiNexusData.inventory
+    -- Storage migration (AT-RISK-3): an additive MIGRATIONS chain that
+    -- TRANSFORMS the saved data in place. Nothing is discarded -- the character
+    -- graph (accounts + attunements), tombstones (deletedAIDs), timers, social,
+    -- notes, instances and the sync caches all survive a version change, which
+    -- the old rebuild-from-defaults branch used to silently wipe. See
+    -- Store.MigrateData for the stamp / never-downgrade / stop-on-gap contract.
+    local dataOK, dataFrom, dataTo, dataNote = Store.MigrateData(DaseekiNexusData)
+    if dataOK then
+        -- Backfill any structure a partial / older / freshly-stamped DB is
+        -- missing. Additive and non-clobbering, so a migration step's output
+        -- (and every existing value) is never overwritten.
+        applyDefaults(DaseekiNexusData, defaultData())
 
-        DaseekiNexusData = defaultData()
-        DaseekiNexusData.version = Store.STORAGE_VERSION
-        if preservedTimers  then DaseekiNexusData.timers = preservedTimers end
-        if preservedSocial  then DaseekiNexusData.social = preservedSocial end
-        if preservedManual  then DaseekiNexusData.manualLocations = preservedManual end
-        if preservedNotes   then DaseekiNexusData.notes = preservedNotes end
-        if preservedNotesMig ~= nil then DaseekiNexusData.notesMigrated = preservedNotesMig end
-        if preservedDeleted then DaseekiNexusData.deletedAIDs = preservedDeleted end
-        if preservedInstances then DaseekiNexusData.instances = preservedInstances end
-        if preservedSyncNS  then DaseekiNexusData.syncNamespaces = preservedSyncNS end
-        if preservedSyncKV  then DaseekiNexusData.syncKV = preservedSyncKV end
-        if preservedImported ~= nil then DaseekiNexusData.bagsImported = preservedImported end
-        if preservedInventory then DaseekiNexusData.inventory = preservedInventory end
+        -- One-time additive copy of legacy location overrides into empty notes.
+        Store.MigrateNotes(DaseekiNexusData)
+    elseif dataNote == "future" then
+        -- Left exactly as-is; run this session against the newer-shaped data.
+        if ns and ns.Print then
+            ns:Print("your Daseeki-Nexus character data was saved by a newer version "
+                .. "(storage v" .. tostring(dataFrom) .. "). It has been left untouched -- "
+                .. "update the addon to use it.")
+        end
+    else
+        -- "gap" (a missing migration step) or a malformed table: stop clean,
+        -- change nothing, so a later build with the step can still convert it.
+        if ns and ns.Print then
+            ns:Print("your Daseeki-Nexus character data could not be upgraded from "
+                .. "storage v" .. tostring(dataFrom) .. " (stopped at v" .. tostring(dataTo)
+                .. "); no changes were made.")
+        end
     end
-
-    -- Backfill any structure a partial/older DB is missing.
-    applyDefaults(DaseekiNexusData, defaultData())
-
-    -- One-time additive copy of legacy location overrides into empty notes.
-    Store.MigrateNotes(DaseekiNexusData)
 
     Store.db   = DaseekiNexusDB
     Store.data = DaseekiNexusData
@@ -4362,9 +4408,114 @@ local function testCoordinateOverrides(fails)
     ck(alerts.pullTimer.nefH.flash == false, "the flash default is hand-in only, not Nef-wide")
 end
 
+----------------------------------------------------------------------
+-- Storage migration chain (AT-RISK-3): stamp-don't-wipe, never downgrade,
+-- stop-on-gap; the character graph (accounts + attunements) and tombstones
+-- (deletedAIDs) survive every path, and additive defaults still seed.
+----------------------------------------------------------------------
+local function testStorageMigration(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+
+    -- A representative saved-data table: a character graph carrying an
+    -- attunement, plus a tombstone, timers and a note. Every case below proves
+    -- this rides through untouched.
+    local function sampleData(ver)
+        return {
+            version = ver,
+            accounts = {
+                ["7"] = {
+                    isSelf = true,
+                    characters = {
+                        ["Alt-R"] = { level = 60, attunements = { mc = true, ony = true } },
+                    },
+                },
+            },
+            deletedAIDs = { ["9"] = 1699000000 },   -- a tombstone: must not resurrect
+            timers      = { flower = { 111 } },
+            notes       = { ["Alt-R"] = "keep me" },
+        }
+    end
+
+    -- (1) ABSENT version -> STAMPED to current, NOTHING wiped.
+    local d = sampleData(nil)
+    local ok, from, to, note = Store.MigrateData(d)
+    ck(ok == true and note == "stamped", "absent version -> stamped (not wiped)")
+    ck(from == nil and to == Store.STORAGE_VERSION and d.version == Store.STORAGE_VERSION,
+        "stamped to the current storage version")
+    ck(d.accounts["7"].characters["Alt-R"].attunements.mc == true,
+        "STAMP preserves the character graph + attunements")
+    ck(d.deletedAIDs["9"] == 1699000000, "STAMP preserves tombstones (no resurrection)")
+
+    -- current-version table is a no-op "migrated" (0 steps); data untouched.
+    local dCur = sampleData(Store.STORAGE_VERSION)
+    local okC, _, _, noteC = Store.MigrateData(dCur)
+    ck(okC == true and noteC == "migrated", "current version -> migrated (0 steps)")
+    ck(dCur.accounts["7"] ~= nil, "current-version data left intact")
+
+    -- (2) NEWER version -> left EXACTLY as-is, ok=false / "future".
+    local dF = sampleData(Store.STORAGE_VERSION + 5)
+    local okF, fromF, toF, noteF = Store.MigrateData(dF)
+    ck(okF == false and noteF == "future", "newer version -> future (never downgraded)")
+    ck(fromF == Store.STORAGE_VERSION + 5 and dF.version == Store.STORAGE_VERSION + 5,
+        "future version left untouched")
+    ck(dF.accounts["7"].characters["Alt-R"].attunements.ony == true,
+        "future data left exactly as-is")
+
+    -- (3) A simulated 1 -> 2 transform runs IN PLACE and preserves everything.
+    local savedSV   = Store.STORAGE_VERSION
+    local savedStep = Store.MIGRATIONS[1]
+    Store.STORAGE_VERSION = 2
+    local ran = false
+    Store.MIGRATIONS[1] = function(data)
+        ran = true
+        data.migratedFlag = true           -- pure transform: add, don't remove
+    end
+    local dm = sampleData(1)
+    local okM, fromM, toM, noteM = Store.MigrateData(dm)
+    ck(okM == true and noteM == "migrated", "known older version -> migrated")
+    ck(ran == true and fromM == 1 and toM == 2, "the 1->2 step ran; cursor advanced to 2")
+    ck(dm.version == 2, "version stamped to 2 after the step")
+    ck(dm.migratedFlag == true, "the transform's output is present")
+    ck(dm.accounts["7"].characters["Alt-R"].attunements.mc == true,
+        "1->2 preserves accounts + attunements")
+    ck(dm.deletedAIDs["9"] == 1699000000, "1->2 preserves tombstones")
+    ck(dm.notes["Alt-R"] == "keep me" and dm.timers.flower[1] == 111,
+        "1->2 preserves notes + timers")
+
+    -- (4) MISSING step in the chain -> STOP with "gap"; nothing half-done/wiped.
+    Store.MIGRATIONS[1] = nil
+    local dg = sampleData(1)
+    local okG, fromG, toG, noteG = Store.MigrateData(dg)
+    ck(okG == false and noteG == "gap", "missing step -> gap (not a partial convert / wipe)")
+    ck(dg.version == 1, "gap leaves the version where the chain stalled")
+    ck(dg.accounts["7"] ~= nil, "gap preserves the character graph (no wipe)")
+    ck(dg.deletedAIDs["9"] == 1699000000, "gap preserves tombstones")
+
+    Store.STORAGE_VERSION = savedSV
+    Store.MIGRATIONS[1]   = savedStep
+
+    -- (6) Additive defaults still seed AFTER a stamp, and never clobber. This is
+    -- the Init sequence: MigrateData (stamp) then applyDefaults(defaultData()).
+    local dS = { version = nil,
+                 accounts = { ["7"] = { characters = {} } },
+                 notes    = { ["Keep-R"] = "user note" } }
+    local okS = Store.MigrateData(dS)
+    ck(okS == true, "stamp precedes the defaults backfill")
+    Store.ApplyDefaults(dS, { social = { guild = {}, friends = {} },
+                              notes  = { ["Keep-R"] = "SHOULD NOT OVERWRITE" } })
+    ck(type(dS.social) == "table" and type(dS.social.guild) == "table",
+        "additive defaults seed missing structure after a stamp")
+    ck(dS.notes["Keep-R"] == "user note",
+        "additive defaults never clobber an existing value")
+
+    -- defensive: a non-table is refused, not crashed.
+    ck(select(1, Store.MigrateData(nil)) == false, "nil data refused (no crash)")
+end
+
 function Store.RunSelfTests(verbose)
     local suites = {
         { name = "defaults",        fn = testDefaults },
+        { name = "storage migration (AT-RISK-3)", fn = testStorageMigration },
         { name = "alert migration", fn = testAlertMigration },
         { name = "aura seeds",      fn = testAuraSeeds },
         { name = "autosummon seeds", fn = testAutoSummonSeeds },
