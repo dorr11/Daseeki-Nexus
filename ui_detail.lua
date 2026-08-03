@@ -34,8 +34,18 @@ local PAD_H     = 14
 local HEADER_H  = 31          -- header band height. ROUND-20b: was 40 but the code rendered
                               -- HEADER_H-6 (34) — the mismatch my round-18 alignment modelled
                               -- wrongly. Now literal: SetHeight(HEADER_H), no hidden -6.
-local COL_R_W   = 214         -- right column fixed width (mockup dgrid 1fr / 214px)
 local COL_GAP   = 14
+-- ROUND-25 (owner): the detail grid is a FIXED 60 / 40 split rather than a fixed-width
+-- right column. The fractions are the owner's decision — the arithmetic below VALIDATES
+-- that the content still fits them (and flags if it ever stops), it does NOT derive them.
+--     inner = PANE_W 742 - 2*PAD_H 14           = 714
+--     avail = inner - COL_GAP 14                = 700
+--     C1    = 60% of 700                        = 420   (was 486)
+--     C2    = 40% of 700                        = 280   (was 214)
+local PANE_W    = 742         -- detail.pane width (LAYOUT_SPEC)
+local C1_FRAC   = 0.60
+local COL_SPLIT                -- assigned just below, once ColumnSplit is defined
+local COL_L_W, COL_R_W        -- C1 / C2 pixel widths
 -- Buff display (owner round-3 verdict): a LABELED ROW LIST (return to the pre-rebuild
 -- detail panel's row pattern) — one row per tracked buff: small cropped/framed icon ·
 -- buff name (tinted by its family hue) · right-aligned STATE status. NOT a tile grid
@@ -113,6 +123,49 @@ local TALLY_SPLIT = 4          -- divider sits AFTER this index (Naxx | Ony)
 -- into colour-coded strings: any literal "|" must be doubled first.
 local TALLY_DIVIDER = "||"     -- renders as a single "|"
 Detail.TALLY_ORDER, Detail.TALLY_SPLIT = TALLY_ORDER, TALLY_SPLIT   -- for the tests
+
+-- ROUND-25: the two-column split. PURE. The fractions are the OWNER'S FIXED DECISION;
+-- this only turns them into pixels. Returns C1/C2 widths plus the intermediates, so the
+-- validator and the tests can talk about the same numbers.
+function Detail.ColumnSplit(paneW, padH, gap, c1Frac)
+    paneW  = paneW  or PANE_W
+    padH   = padH   or PAD_H
+    gap    = gap    or COL_GAP
+    c1Frac = c1Frac or C1_FRAC
+    local inner = paneW - 2 * padH
+    local avail = inner - gap
+    local c1 = math.floor(avail * c1Frac + 0.5)
+    return { inner = inner, avail = avail, gap = gap, c1 = c1, c2 = avail - c1 }
+end
+
+-- ROUND-25 VALIDATION (explicitly NOT derivation). Given the owner's fixed C1, check that
+-- the left column still holds its widest content at a font scale, and report the shortfall
+-- if it does not so the failure is loud rather than a silent overlap.
+-- C1's two width-critical rows are:
+--   * a buff row: the STATUS_X rail (a fixed px constant — it does NOT scale) plus the
+--     widest status string, which DOES scale;
+--   * the bottom raid tally: 7 keys + the weekly/short-cycle divider, all scaling.
+-- `emPx` is the average glyph advance at scale 1.0 for the relevant font; the callers pass
+-- the pane's own body/numeral sizes so the estimate tracks the real type.
+function Detail.ColumnFits(c1, scale, opts)
+    scale = scale or 1.0
+    opts = opts or {}
+    local bodyEm   = (opts.bodyEm or 12) * 0.52 * scale      -- status text (body)
+    local numEm    = (opts.numEm  or 13) * 0.52 * scale      -- tally keys (numeral)
+    local statusW  = #(opts.widestStatus or "1h 59m (Boon)") * bodyEm
+    local tallyW   = #(opts.widestTally or "MC  BWL  AQ40  Naxx  |  Ony  ZG  AQ20") * numEm
+    local needRow  = STATUS_X + statusW
+    local need     = math.max(needRow, tallyW)
+    return {
+        need = math.floor(need + 0.5), have = c1,
+        fits = need <= c1,
+        short = math.max(0, math.floor(need - c1 + 0.5)),
+        worst = (needRow >= tallyW) and "buff-row status" or "raid tally",
+    }
+end
+
+COL_SPLIT = Detail.ColumnSplit()
+COL_L_W, COL_R_W = COL_SPLIT.c1, COL_SPLIT.c2
 
 local function Dash() return ns.Dashboard end
 local function nowE()
@@ -580,8 +633,18 @@ function Detail.Attach(parent)
     -- Left column (1fr): buff grid.
     local leftCol = CreateFrame("Frame", nil, parent)
     leftCol:SetPoint("TOPLEFT", parent, "TOPLEFT", PAD_H, gridTop)
+    -- ROUND-25: C1 is what remains after C2 + the gap, which by construction IS the 60%
+    -- side of the split (714 - 14 - 280 = 420 = COL_L_W). Anchoring rather than SetWidth
+    -- keeps the two columns provably complementary — they cannot drift apart.
     leftCol:SetPoint("BOTTOMRIGHT", parent, "BOTTOMRIGHT", -(PAD_H + COL_R_W + COL_GAP), PAD_V)
     D.leftCol = leftCol
+    -- FLAG, don't fail: if C1 ever stops holding its widest content, say so in chat rather
+    -- than letting the status column silently overlap. Checked at the 1.3x font ceiling.
+    local fit = Detail.ColumnFits(COL_L_W, 1.3)
+    if not fit.fits and ns and ns.Print then
+        ns:Print(("detail C1 is %dpx short at max font scale (%s needs %d, has %d)")
+            :format(fit.short, fit.worst, fit.need, fit.have))
+    end
 
     local buffLbl = microLabel(leftCol, "WORLD BUFFS")
     buffLbl:SetPoint("TOPLEFT", leftCol, "TOPLEFT", 0, 0)
@@ -620,7 +683,12 @@ function Detail.Attach(parent)
     -- value — "12h 30m" already runs ~42 at the default scale and overflows at 1.3x. The
     -- column has ~120px of vertical slack after the swap, so spending one row is free.
     -- ROUND-23 (owner override): all THREE cooldowns share ONE row — chrono, hearth, DMF.
-    --   cell = (COL_R_W 214 - 2 x CD_GAP 6) / 3 = 67   (icon 16 + 4 gap + ~47 of value)
+    --   cell = (COL_R_W 280 - 2 x CD_GAP 6) / 3 = 89   (icon 16 + 4 gap + ~69 of value)
+    -- ROUND-25 note: the 60/40 split widened C2 from 214 to 280, so these cells grew 67 ->
+    -- 89. That RELIEVES the round-23 squeeze that forced the compact duration form — ~69px
+    -- now holds the spaced "12h 30m" (~42 at scale 1.0, ~55 at 1.3x). Left on the compact
+    -- form regardless, because the owner did not ask to change it this round; flagged in
+    -- the report so it is a decision rather than an oversight.
     -- TRADEOFF, stated plainly: 47px cannot hold the spaced "12h 30m" (~42 at scale 1.0,
     -- ~55 at 1.3x), so the three values switch to the COMPACT duration form ("12h30",
     -- "59m", "2d3h") that the pane already defines. No precision is lost — the compact form
@@ -1268,6 +1336,28 @@ local function testHeaderSubline(fails)
     ck(Detail.HeaderSubline({ className = "Mage" }, nil):find("Level 60", 1, true) ~= nil,
         "missing level defaults to 60")
     ck(Detail.HeaderSubline(nil, nil):find("Level 60", 1, true) ~= nil, "nil record -> no error")
+
+    -- ── ROUND-25: the fixed 60 / 40 column split ────────────────────────────────
+    local sp = Detail.ColumnSplit()
+    ck(sp.inner == 714, "inner width 714 (pane 742 - 2*PAD_H 14)")
+    ck(sp.avail == 700, "700 available after the 14px gutter")
+    ck(sp.c1 == 420 and sp.c2 == 280, "60/40 -> C1 420, C2 280 (got " .. sp.c1 .. "/" .. sp.c2 .. ")")
+    ck(sp.c1 + sp.c2 + sp.gap == sp.inner, "the two columns + gutter exactly fill the inner width")
+    -- The fractions are the OWNER'S input, so the function must honour whatever it is given.
+    local half = Detail.ColumnSplit(742, 14, 14, 0.5)
+    ck(half.c1 == half.c2, "an even split really splits evenly (no baked-in bias)")
+
+    -- VALIDATION, not derivation: C1 holds its widest content at the 1.3x font ceiling.
+    local fit = Detail.ColumnFits(sp.c1, 1.3)
+    ck(fit.fits == true, "C1 420 holds its widest row at 1.3x (needs " .. fit.need .. ")")
+    ck(fit.short == 0, "no shortfall at 1.3x")
+    ck(Detail.ColumnFits(sp.c1, 1.0).fits == true, "C1 fits at 1.0x too")
+    -- ...and the validator must actually BITE: an absurdly narrow C1 has to report the gap.
+    local tight = Detail.ColumnFits(240, 1.3)
+    ck(tight.fits == false and tight.short > 0,
+        "validator flags a too-narrow C1 (short " .. tight.short .. ")")
+    ck(tight.worst == "buff-row status" or tight.worst == "raid tally",
+        "validator names which row is the binding one")
 
     -- Separator matches the statusFS beside it in the same band (one rhythm, not two).
     ck(SEP == "  \194\183  ", "separator is the suite middot, spaced like statusFS")
