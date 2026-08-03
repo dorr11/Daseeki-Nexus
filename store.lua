@@ -19,6 +19,10 @@ ns.Store = Store
 
 Store.SETTINGS_VERSION = 2     -- R3: alert matrix flipped buff-major -> event-major (migration below)
 Store.STORAGE_VERSION  = 1     -- bump wipes character data, keeps timers/social/manualLocations
+-- Inventory module owners-graph schema. Versioned independently of
+-- STORAGE_VERSION: the graph is additive suite data, not mesh character data, so
+-- a character-data wipe must not take the cross-account gold with it.
+Store.INVENTORY_SCHEMA = 1
 
 -- Aura-slot source codes (the numeric `source` field on each auraStates slot).
 -- LIVE   = captured live from this character's own auras (self, highest trust).
@@ -732,6 +736,11 @@ local function defaultSettings()
         -- same as a fresh one. FLAGGED: the options UI checkbox for this lives in
         -- options.lua, which this batch does not own.
         dmfPushAnnounce   = true,
+        -- Inventory module (inventory.lua): cross-account item counts + gold.
+        -- Default ON, and Inventory.IsEnabled treats an ABSENT key as ON too, so
+        -- a SavedVariables file written before this key existed behaves exactly
+        -- like a fresh one. ADDITIVE — no settingsVersion bump needed.
+        inventoryEnabled  = true,
         accountID         = "",           -- user sets via /dsn account
         minimap = {
             hide = false,
@@ -804,6 +813,22 @@ local function defaultData()
         syncKV = {},
         -- One-time idempotent guard for the wave-N5 Bags import (see MigrateBags).
         bagsImported = false,
+        -- Inventory module owners graph (inventory.lua). ADDITIVE and
+        -- schema-versioned independently of STORAGE_VERSION, so it can grow
+        -- without touching the character-data wipe contract.
+        --   owners[ownerKey] = { rev, updatedAt, data = <"bags" payload> }
+        --   parts[nameRealm] = { bank, mail, mailN, mailMoney, bankAt, mailAt }
+        --     — our own cold components (bank + mail are only readable while
+        --       their frame is open, so their counts are kept between visits).
+        --   migrated         — sticky one-time Daseeki-Bags 1.x import guard.
+        --       Set ONLY after a non-empty import; an absent or empty source
+        --       leaves it clear so a later Bags install still migrates.
+        inventory = {
+            schema   = Store.INVENTORY_SCHEMA,
+            owners   = {},
+            parts    = {},
+            migrated = false,
+        },
     }
 end
 
@@ -1103,6 +1128,9 @@ function Store.Init()
         local preservedSyncNS  = DaseekiNexusData.syncNamespaces
         local preservedSyncKV  = DaseekiNexusData.syncKV
         local preservedImported = DaseekiNexusData.bagsImported
+        -- The Inventory owners graph is cross-account gold/item data with its own
+        -- schema; a character-data wipe must never take it.
+        local preservedInventory = DaseekiNexusData.inventory
 
         DaseekiNexusData = defaultData()
         DaseekiNexusData.version = Store.STORAGE_VERSION
@@ -1116,6 +1144,7 @@ function Store.Init()
         if preservedSyncNS  then DaseekiNexusData.syncNamespaces = preservedSyncNS end
         if preservedSyncKV  then DaseekiNexusData.syncKV = preservedSyncKV end
         if preservedImported ~= nil then DaseekiNexusData.bagsImported = preservedImported end
+        if preservedInventory then DaseekiNexusData.inventory = preservedInventory end
     end
 
     -- Backfill any structure a partial/older DB is missing.
@@ -2790,6 +2819,102 @@ function Store.MigrateBags(now)
             stats.total))
     end
     return stats
+end
+
+----------------------------------------------------------------------
+-- INVENTORY OWNERS GRAPH (inventory.lua) — additive area
+--
+-- The system of record for cross-account item counts and gold. Three inputs
+-- converge here: our own capture, every peer payload the mesh delivered into
+-- syncNamespaces["bags"], and the one-time Daseeki-Bags 1.x import. Entries are
+-- shaped like the namespace store on purpose —
+--   owners[ownerKey] = { rev, updatedAt, data = <the "bags" wire payload> }
+-- — so projecting one into the other is a copy, not a translation.
+--
+-- Distinct from syncNamespaces["bags"] in one way that matters: that table is
+-- the TRANSPORT and holds only what crossed (or is about to cross) the wire.
+-- This one additionally holds this account's own alts, imported from Bags 1.x,
+-- which no peer ever published and which the mesh has no way to carry.
+--
+-- The rev gate is owner-wins-by-rev with a timestamp tiebreak, because the two
+-- inputs count revisions independently: Bags bumps per local edit, the mesh
+-- bumps per publish, and the two sequences meet here.
+----------------------------------------------------------------------
+
+function Store.InventoryArea()
+    local d = Store.data
+    if type(d) ~= "table" then return nil end
+    local a = d.inventory
+    if type(a) ~= "table" then
+        a = {}
+        d.inventory = a
+    end
+    if type(a.owners) ~= "table" then a.owners = {} end
+    if type(a.parts)  ~= "table" then a.parts  = {} end
+    if a.schema   == nil then a.schema   = Store.INVENTORY_SCHEMA end
+    if a.migrated == nil then a.migrated = false end
+    return a
+end
+
+function Store.InventoryOwners()
+    local a = Store.InventoryArea()
+    return a and a.owners or {}
+end
+
+function Store.InventoryGet(ownerKey)
+    local a = Store.InventoryArea()
+    return a and a.owners[ownerKey] or nil
+end
+
+function Store.InventoryGetData(ownerKey)
+    local e = Store.InventoryGet(ownerKey)
+    return e and e.data or nil
+end
+
+-- Our own cold components for one character (bank + mail counts between visits).
+function Store.InventoryParts(nameRealm, create)
+    if type(nameRealm) ~= "string" or nameRealm == "" then return nil end
+    local a = Store.InventoryArea()
+    if not a then return nil end
+    local p = a.parts[nameRealm]
+    if not p and create then
+        p = { bank = {}, mail = {}, mailN = 0, mailMoney = 0, bankAt = 0, mailAt = 0 }
+        a.parts[nameRealm] = p
+    end
+    return p
+end
+
+-- PURE core: owner-wins-by-rev merge into an owners map. A strictly greater rev
+-- wins; an equal rev wins only with a strictly newer timestamp (which keeps a
+-- repeated import idempotent while still letting a same-rev refresh through).
+-- Returns "applied" or "stale"; mutates `owners` on apply.
+function Store.InventoryApply(owners, ownerKey, rev, data, now)
+    if type(owners) ~= "table" then return "stale" end
+    if type(ownerKey) ~= "string" or ownerKey == "" then return "stale" end
+    if type(data) ~= "table" then return "stale" end
+    rev = tonumber(rev) or 0
+    now = tonumber(now) or 0
+    local cur = owners[ownerKey]
+    if cur then
+        local curRev = tonumber(cur.rev) or 0
+        local curAt  = tonumber(cur.updatedAt) or 0
+        if rev < curRev then return "stale" end
+        if rev == curRev and now <= curAt then return "stale" end
+    end
+    owners[ownerKey] = { rev = rev, updatedAt = now, data = data }
+    return "applied"
+end
+
+-- Live wrapper.
+function Store.InventoryPut(ownerKey, rev, data, now)
+    local a = Store.InventoryArea()
+    if not a then return "stale" end
+    return Store.InventoryApply(a.owners, ownerKey, rev, data, now or serverNow())
+end
+
+function Store.InventoryDrop(ownerKey)
+    local a = Store.InventoryArea()
+    if a then a.owners[ownerKey] = nil end
 end
 
 ----------------------------------------------------------------------

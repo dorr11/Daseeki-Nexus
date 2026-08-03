@@ -661,6 +661,32 @@ local function buildGeneral(flow)
         set = function(v) local db = DB(); if db then db.autoAssistAll = v and true or false end end,
     }).Refresh)
 
+    -- Inventory module (inventory.lua). DEFAULT ON — and an ABSENT key also
+    -- reads as ON, so this checkbox shows ticked on a SavedVariables file
+    -- written before the module existed. Turning it off makes the module fully
+    -- inert (no scanning, no publishing, timers and ticker stopped), which is
+    -- why `set` routes through Inventory.SetEnabled rather than writing the key
+    -- directly. Reads fall back to the raw key so the row still renders if
+    -- inventory.lua somehow failed to load.
+    local r3 = sec:AddRow({ vAlign = "center" })
+    register("general", r3:Checkbox({
+        label = "Cross-account inventory & gold",
+        tooltip = "Track item counts and gold for every character on every account "
+               .. "in your mesh. Off makes the module inert; stored data is kept.",
+        get = function()
+            local I = ns.Inventory
+            if I and I.IsEnabled then return I.IsEnabled() end
+            local db = DB()
+            return not db or db.inventoryEnabled ~= false
+        end,
+        set = function(v)
+            local I = ns.Inventory
+            if I and I.SetEnabled then I.SetEnabled(v and true or false); return end
+            local db = DB()
+            if db then db.inventoryEnabled = v and true or false end
+        end,
+    }).Refresh)
+
     -- Location-data status line (round-3 item 16): green when every own
     -- active-faction level-60 has a usable location, amber when some are missing.
     local locStatus = sec:AddRow():Label("")
