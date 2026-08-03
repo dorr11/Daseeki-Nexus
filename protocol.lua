@@ -36,11 +36,18 @@ Protocol.PREFIX_LIST = {
 -- Binary state-schema version. BUMP HISTORY:
 --   v1 — original character record.
 --   v2 — appended xp (u32), xpMax (u32), restedXP (u32) at the END of the
---        pack/unpack order (Experience/Rest view). DecodeCharacter version-gates
---        and cleanly REJECTS any mismatched version (returns nil, "unsupported
---        schema version N"), so a v1<->v2 mesh split simply holds last-known data
---        with no crash. After this ships, BOTH accounts must /reload before
---        records flow again (see the report's both-accounts note).
+--        pack/unpack order (Experience/Rest view).
+--
+-- DECODER TOLERANCE (release gate D-14 / NW-7). DecodeCharacter accepts any
+-- schema at or below SCHEMA_VERSION and rejects only a NEWER one. Every bump so
+-- far has been append-at-the-tail and newReader reads 0 / "" past the end of the
+-- buffer, so an OLDER payload decodes with its absent tail fields reading as
+-- "not sent" — which is exactly what they mean. A newer payload is still refused
+-- outright: we cannot know what its extra fields displaced.
+--
+-- The tolerance must ship one release BEFORE the encoder that needs it,
+-- otherwise the release that introduces v3 also breaks every v2 peer that has
+-- not updated yet. That is the whole point of it landing here, at v2.
 Protocol.SCHEMA_VERSION = 2     -- our binary state-schema version
 
 -- Register every prefix so inbound messages reach CHAT_MSG_ADDON. Safe to
@@ -368,7 +375,10 @@ end
 function Protocol.DecodeCharacter(bytes)
     local r = newReader(bytes)
     local version = r.u8()
-    if version ~= Protocol.SCHEMA_VERSION then
+    -- Accept our schema and every older one; reject only NEWER (see the bump
+    -- history above). Version 0 is not a schema — it is what an empty or
+    -- truncated buffer reads as — so it stays rejected.
+    if version < 1 or version > Protocol.SCHEMA_VERSION then
         return nil, "unsupported schema version " .. tostring(version)
     end
 
@@ -650,6 +660,70 @@ local function testU16Clamp()
     return true
 end
 
+-- Decoder tolerance (NW-7 / release gate D-14): OLDER schemas decode, NEWER
+-- ones are refused cleanly. Built by restamping (and, for v1, re-truncating)
+-- real encoder output, so the fixtures are exactly what a peer would put on the
+-- wire rather than a hand-rolled guess.
+local V2_TAIL_BYTES = 12   -- xp + xpMax + restedXP, three u32s appended for v2
+
+local function testSchemaTolerance()
+    local rec = ns.Store.NewCharacterRecord("Older-Whitemane")
+    rec.classTag, rec.className, rec.faction = "MAGE", "Mage", "Alliance"
+    rec.level, rec.boonCount, rec.shardCount = 60, 3, 0
+    rec.location = "Ironforge"
+    rec.lastSeen, rec.lastDataUpdate, rec.ownerEpoch = 1785000500, 1785000500, 1785000500
+    rec.raidLockouts = { MC = 1785200000 }
+    rec.auraStates = { [1] = { duration = 3600, option = 1, source = 0 } }
+    rec.xp, rec.xpMax, rec.restedXP = 734512, 1526400, 381600
+
+    local v2bytes = Protocol.EncodeCharacter(rec)
+    if not v2bytes then return false, "encoder produced nothing" end
+
+    -- A genuine v1 payload: version byte 1, and NONE of the v2 tail present.
+    local v1bytes = "\1" .. v2bytes:sub(2, #v2bytes - V2_TAIL_BYTES)
+    if #v1bytes ~= #v2bytes - V2_TAIL_BYTES then
+        return false, "v1 fixture is the wrong length"
+    end
+    local old, oerr = Protocol.DecodeCharacter(v1bytes)
+    if not old then return false, "a v1 payload must decode, got: " .. tostring(oerr) end
+    if old.nameRealm ~= rec.nameRealm or old.level ~= rec.level
+        or old.classTag ~= rec.classTag or old.faction ~= rec.faction
+        or old.location ~= rec.location then
+        return false, "v1 payload lost a v1-era field"
+    end
+    if old.raidLockouts.MC ~= 1785200000 then return false, "v1 payload lost its raid lockout" end
+    if not old.auraStates[1] or old.auraStates[1].duration ~= 3600 then
+        return false, "v1 payload lost its aura slot"
+    end
+    -- The absent v2 tail reads as "not sent", which is what it means.
+    if old.xp ~= 0 or old.xpMax ~= 0 or old.restedXP ~= 0 then
+        return false, "absent v2 tail should read as 0, got " .. tostring(old.xp)
+    end
+
+    -- v2 is unchanged by the tolerance: same bytes, same record.
+    local cur = Protocol.DecodeCharacter(v2bytes)
+    if not cur then return false, "v2 payload must still decode" end
+    local same, why = recordsMatch(rec, cur)
+    if not same then return false, "v2 behavior changed: " .. tostring(why) end
+
+    -- A NEWER schema is refused cleanly — nil plus a reason, never a partial
+    -- record and never an error. We cannot know what its extra fields displaced.
+    local v3bytes = "\3" .. v2bytes:sub(2)
+    local future, ferr = Protocol.DecodeCharacter(v3bytes)
+    if future ~= nil then return false, "a v3 payload must be rejected, not decoded" end
+    if type(ferr) ~= "string" or not ferr:find("unsupported schema version 3", 1, true) then
+        return false, "v3 rejection must say why, got: " .. tostring(ferr)
+    end
+
+    -- Version 0 is not a schema: it is what an empty or truncated buffer reads
+    -- as, and it must stay rejected rather than decode a record of zeroes.
+    if Protocol.DecodeCharacter("") ~= nil then return false, "an empty buffer must be rejected" end
+    if Protocol.DecodeCharacter("\0" .. v2bytes:sub(2)) ~= nil then
+        return false, "version 0 must be rejected"
+    end
+    return true
+end
+
 -- Run every self-test. Returns overall bool; prints per-test lines when
 -- verbose (the /dsn debug selftest path). Also returns to callers so a
 -- future CI harness could consume the result table.
@@ -660,6 +734,7 @@ function Protocol.RunSelfTests(verbose)
         { name = "chunking",         fn = testChunking },
         { name = "state round-trip", fn = testRoundTrip },
         { name = "u16 clamp",        fn = testU16Clamp },
+        { name = "schema tolerance (NW-7)", fn = testSchemaTolerance },
     }
     local allPass, results = true, {}
     for _, t in ipairs(suite) do

@@ -376,6 +376,11 @@ function TimersDock.Attach(parent)
     tag(wbRows, "dock.wbrows")
     D.wbRows = wbRows
 
+    -- NW-6: UI.Hairline arrived with the Core 2.2.0 ledger kit. Resolved ONCE,
+    -- above the row loop, so an older Core loses the row rules and says so once
+    -- rather than erroring — or narrating — per row.
+    local Hairline = ns:CoreAPI(ns.CORE_KIT_VERSION, "the Nexus timers dock", UI and UI.Hairline)
+
     local prev
     for i, def in ipairs(WB_ROWS) do
         local r = CreateFrame("Frame", nil, wbRows)
@@ -441,9 +446,11 @@ function TimersDock.Attach(parent)
         hit:SetScript("OnLeave", function() GameTooltip:Hide() end)
         r.statusHit = hit
         -- One hairline per row (sharp control-panel rule). Pop pass: borderLite.
-        r.rule = UI.Hairline(r, { token = "borderLite" })
-        r.rule:SetPoint("BOTTOMLEFT", r, "BOTTOMLEFT", 0, 0)
-        r.rule:SetPoint("BOTTOMRIGHT", r, "BOTTOMRIGHT", 0, 0)
+        if Hairline then
+            r.rule = Hairline(r, { token = "borderLite" })
+            r.rule:SetPoint("BOTTOMLEFT", r, "BOTTOMLEFT", 0, 0)
+            r.rule:SetPoint("BOTTOMRIGHT", r, "BOTTOMRIGHT", 0, 0)
+        end
         D._wbRows[i] = r
         prev = r
     end

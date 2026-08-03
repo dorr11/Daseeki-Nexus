@@ -1001,11 +1001,17 @@ Dashboard.RegisterTab("characters", function(host)
     chipbar:SetHeight(CHIP_H)
     tag(chipbar, "cards.chipbar")
     pane.chipbar = chipbar
-    local chipRule = UI.Hairline(cardsP, { token = "borderLite" })
-    chipRule:SetPoint("BOTTOMLEFT", chipbar, "BOTTOMLEFT", 0, 0)
-    chipRule:SetPoint("BOTTOMRIGHT", chipbar, "BOTTOMRIGHT", 0, 0)
-    tag(chipRule, "cards.chiprule")   -- round-20b: the owner-drawn reference line; the
-                                      -- detail header rule is pinned to this Y in LAYOUT_SPEC
+    -- NW-6: UI.Hairline arrived with the Core 2.2.0 ledger kit. Fetched through
+    -- the guard so an older Core loses this rule and says so once, rather than
+    -- erroring out of the whole dashboard build.
+    local Hairline = ns:CoreAPI(ns.CORE_KIT_VERSION, "the Nexus character cards", UI and UI.Hairline)
+    if Hairline then
+        local chipRule = Hairline(cardsP, { token = "borderLite" })
+        chipRule:SetPoint("BOTTOMLEFT", chipbar, "BOTTOMLEFT", 0, 0)
+        chipRule:SetPoint("BOTTOMRIGHT", chipbar, "BOTTOMRIGHT", 0, 0)
+        tag(chipRule, "cards.chiprule")   -- round-20b: the owner-drawn reference line; the
+                                          -- detail header rule is pinned to this Y in LAYOUT_SPEC
+    end
 
     -- Filter SEGMENTED control (one housing, 60S | ONLINE | SUMMONERS), left side.
     local filterSeg = makeFilterSegmented(chipbar, pane)

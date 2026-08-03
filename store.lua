@@ -812,6 +812,8 @@ local function defaultData()
         -- of the vanished DaseekiWoWHelperRemote global).
         syncKV = {},
         -- One-time idempotent guard for the wave-N5 Bags import (see MigrateBags).
+        -- Set ONLY after a non-empty import; an absent or empty source leaves it
+        -- clear so a later Daseeki-Bags install still migrates.
         bagsImported = false,
         -- Inventory module owners graph (inventory.lua). ADDITIVE and
         -- schema-versioned independently of STORAGE_VERSION, so it can grow
@@ -2845,19 +2847,28 @@ function Store.MigrateBags(now)
         mesh   = (type(G.DaseekiBagsMesh) == "table") and G.DaseekiBagsMesh or nil,
         helper = (type(G.DaseekiWoWHelperRemote) == "table") and G.DaseekiWoWHelperRemote or nil,
     }
-    -- Nothing to import: still set the guard so we don't re-scan every login.
-    if not sources.mesh and not sources.helper then
-        Store.data.bagsImported = true
-        return nil
-    end
+    -- Source absent: Daseeki-Bags is not installed (yet). Return WITHOUT setting
+    -- the marker, so a Bags install that lands AFTER Nexus still imports. Marker
+    -- ONLY on a successful non-empty import is the house rule (Conduit
+    -- migrate.lua; inventory.lua MigrateFromBags does the same). Re-checking
+    -- costs two table type tests per login.
+    if not sources.mesh and not sources.helper then return nil end
 
     local seed, stats = Store.BuildBagsNamespaceSeed(sources, now)
+
+    -- Source present but empty: Bags is installed and has written nothing we can
+    -- use yet. Same reasoning — leave the marker clear and try again next login.
+    if stats.total == 0 then return stats end
+
     local nsp = Store.SyncNSNamespace("bags", true)
     -- Merge with owner-wins-by-rev so a re-run (or already-live mesh data)
     -- never clobbers a newer payload we already hold.
     for ownerKey, entry in pairs(seed) do
         Store.SyncNSApply(nsp, ownerKey, entry.rev, entry.data, entry.updatedAt)
     end
+    -- Non-empty source seen and processed: latch. SyncNSApply may have rejected
+    -- every entry as stale on a re-run, which is still a successful import of
+    -- data we already hold.
     Store.data.bagsImported = true
     if ns and ns.Print then
         ns:Print(string.format(
@@ -4512,10 +4523,65 @@ local function testStorageMigration(fails)
     ck(select(1, Store.MigrateData(nil)) == false, "nil data refused (no crash)")
 end
 
+----------------------------------------------------------------------
+-- Bags import marker (NW-2): the marker latches ONLY after a non-empty import,
+-- so a Daseeki-Bags install that lands after Nexus still migrates. Mirrors
+-- inventory.lua's deferred-install cases for the newer module.
+----------------------------------------------------------------------
+local function testBagsImportMarker(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+
+    local G = _G
+    local savedMesh, savedHelper = G.DaseekiBagsMesh, G.DaseekiWoWHelperRemote
+    local savedFlag = Store.data.bagsImported
+    local savedNS   = Store.data.syncNamespaces and Store.data.syncNamespaces.bags
+    if Store.data.syncNamespaces then Store.data.syncNamespaces.bags = nil end
+    Store.data.bagsImported = false
+
+    -- (a) Bags is not installed at all.
+    G.DaseekiBagsMesh, G.DaseekiWoWHelperRemote = nil, nil
+    ck(Store.MigrateBags(1700000000) == nil, "absent source imports nothing")
+    ck(Store.data.bagsImported == false, "absent source leaves the marker CLEAR")
+
+    -- (b) Bags installed but its mesh table holds no owners yet.
+    G.DaseekiBagsMesh = {}
+    local emptyStats = Store.MigrateBags(1700000100)
+    ck(emptyStats ~= nil and emptyStats.total == 0, "empty source found no owners")
+    ck(Store.data.bagsImported == false, "empty source leaves the marker CLEAR")
+    ck(Store.SyncNSGet("bags", "Rich-Whitemane") == nil, "empty source imported nothing")
+
+    -- A realm bucket with no characters is still empty.
+    G.DaseekiBagsMesh = { Whitemane = {} }
+    Store.MigrateBags(1700000150)
+    ck(Store.data.bagsImported == false, "an empty realm bucket leaves the marker CLEAR")
+
+    -- (c) Bags data finally appears — the import runs, lands, and ONLY now latches.
+    G.DaseekiBagsMesh = {
+        Whitemane = {
+            Rich  = { rev = 4, ts = 1699999000, money = 500000, itemCounts = { [6948] = 1 } },
+            Poor  = { rev = 2, ts = 1699999100, money = 12 },
+        },
+    }
+    local lateStats = Store.MigrateBags(1700000200)
+    ck(lateStats ~= nil and lateStats.total == 2, "late install imported both owners")
+    ck(Store.data.bagsImported == true, "late install latched the marker")
+    local rich = Store.SyncNSGet("bags", "Rich-Whitemane")
+    ck(rich ~= nil and rich.data.money == 500000, "late install landed real data")
+    ck(rich ~= nil and rich.rev == 4, "the legacy rev rode across")
+
+    -- (d) ...and does not run twice.
+    ck(Store.MigrateBags(1700000300) == nil, "latched marker blocks a re-run")
+
+    G.DaseekiBagsMesh, G.DaseekiWoWHelperRemote = savedMesh, savedHelper
+    Store.data.bagsImported = savedFlag
+    if Store.data.syncNamespaces then Store.data.syncNamespaces.bags = savedNS end
+end
+
 function Store.RunSelfTests(verbose)
     local suites = {
         { name = "defaults",        fn = testDefaults },
         { name = "storage migration (AT-RISK-3)", fn = testStorageMigration },
+        { name = "bags import marker (NW-2)", fn = testBagsImportMarker },
         { name = "alert migration", fn = testAlertMigration },
         { name = "aura seeds",      fn = testAuraSeeds },
         { name = "autosummon seeds", fn = testAutoSummonSeeds },

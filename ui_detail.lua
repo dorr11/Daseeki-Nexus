@@ -638,10 +638,18 @@ function Detail.Attach(parent)
     D.nameFS, D.subFS, D.statusFS, D.statusDot, D.statusHalo = nameFS, subFS, statusFS, statusDot, statusHalo
 
     -- Header bottom hairline (one sharp rule, §9 UI.Hairline). Pop pass: borderLite.
-    local hrule = UI.Hairline(parent, { token = "borderLite" })
-    tag(hrule, "detail.hrule")   -- round-18: pinned to the cards list top by LAYOUT_SPEC
-    hrule:SetPoint("TOPLEFT", header, "BOTTOMLEFT", 0, -HRULE_GAP)
-    hrule:SetPoint("TOPRIGHT", header, "BOTTOMRIGHT", 0, -HRULE_GAP)
+    -- NW-6: UI.Hairline arrived with the Core 2.2.0 ledger kit. Fetched through
+    -- the guard so an older Core loses this rule and says so once, rather than
+    -- erroring out of the whole detail build.
+    -- Declared in the enclosing scope: D:Show() below toggles it with the header.
+    local hrule
+    local Hairline = ns:CoreAPI(ns.CORE_KIT_VERSION, "the Nexus detail pane", UI and UI.Hairline)
+    if Hairline then
+        hrule = Hairline(parent, { token = "borderLite" })
+        tag(hrule, "detail.hrule")   -- round-18: pinned to the cards list top by LAYOUT_SPEC
+        hrule:SetPoint("TOPLEFT", header, "BOTTOMLEFT", 0, -HRULE_GAP)
+        hrule:SetPoint("TOPRIGHT", header, "BOTTOMRIGHT", 0, -HRULE_GAP)
+    end
 
     -- ── Two-column grid below the header ────────────────────────────────────
     -- Round-17: start the grid BELOW the hairline (+GRID_GAP), not at the header's bottom
@@ -853,11 +861,12 @@ function Detail.Attach(parent)
         end
         if not entry or not entry.rec then
             D._current, D._entry = nil, nil
-            emptyFS:Show(); header:Hide(); hrule:Hide()
+            emptyFS:Show(); header:Hide(); if hrule then hrule:Hide() end
             leftCol:Hide(); rightCol:Hide()
             return
         end
-        emptyFS:Hide(); header:Show(); hrule:Show(); leftCol:Show(); rightCol:Show()
+        emptyFS:Hide(); header:Show(); leftCol:Show(); rightCol:Show()
+        if hrule then hrule:Show() end
         D._current, D._entry = entry.nameRealm, entry
         local rec = entry.rec
         local Dd = Dash()

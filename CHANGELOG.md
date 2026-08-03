@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+- Fixed: **an old Daseeki Core could take the dashboard down with it.** Three places
+  drew their divider rules with a Core 2.2.0 drawing call, unguarded — on an older
+  Core that is a Lua error mid-build, and you lose the whole panel rather than one
+  line. Those calls now go through a version guard: an out-of-date Core costs you the
+  rule and gets you one chat line telling you to update Daseeki Core, and everything
+  else draws as normal. Requires Daseeki Core v2.2.0 for the full dress.
+
+- Fixed: **a Daseeki Bags install that arrived after Nexus never got imported.** The
+  one-time cross-account Bags import marked itself "done" even when Bags was not
+  installed, so installing Bags later found the door already shut and your old
+  cross-account bag data never came across. The marker is now set only after an
+  import that actually read something, so a later Bags install still migrates. The
+  newer Inventory module already worked this way; this brings the older path in line.
+  Anyone whose marker is already stuck stays stuck — the reset is a separate change.
+
+- Mesh: **peers on an older data format are no longer ignored.** Character records
+  carry a format version, and Nexus used to accept only its own exact version, so any
+  future format bump would blank out every peer who had not updated yet. It now reads
+  older versions too (fields the old sender did not have simply read as absent) and
+  refuses only versions NEWER than it understands. This ships one release ahead of the
+  next format bump on purpose: the tolerance has to be out in the wild before anything
+  starts sending the new shape.
+
 - **⚠ ALL ACCOUNTS SHOULD RELOAD TOGETHER AFTER THIS UPDATE.** This release changes
   how the heartbeat's segment hashes are computed (they now include a coarse
   fingerprint of each character's data, not just the list of names). An updated

@@ -34,6 +34,53 @@ function ns:SafeCall(fn, ...)
 end
 
 ----------------------------------------------------------------------
+-- Cross-addon API guard  (ROLLOUT_CONTINUITY_AUDIT NW-6 / release gate D-13)
+--
+-- Nexus declares "## Dependencies: Daseeki-Core", which guarantees SOME Core is
+-- loaded — not that it is new enough. Every DaseekiUI API introduced by a
+-- particular Core must therefore be fetched through here, so a stale Core costs
+-- the user that one ornament plus one explanatory chat line rather than a Lua
+-- error that aborts the whole dashboard build.
+--
+--     local Hairline = ns:CoreAPI(ns.CORE_KIT_VERSION, "the character cards",
+--                                 UI and UI.Hairline)
+--     if Hairline then ... end
+--
+-- Returns the function when it is safe to call, nil otherwise. The probe is the
+-- last word in both directions: a Core too old to even have RequireCore has no
+-- version to compare, and a Core that reports new enough but is missing the
+-- function is still not safe to call.
+----------------------------------------------------------------------
+
+-- Core version that introduced the ledger UI kit (UI.Hairline and friends).
+ns.CORE_KIT_VERSION = "2.2.0"
+
+local coreAPITold = {}   -- caller label -> true; one line per session per site
+
+function ns:CoreAPI(minVersion, caller, api)
+    local DS = _G.DaseekiSuite
+    local coreSpoke = false
+    if type(DS) == "table" and type(DS.RequireCore) == "function" then
+        local ok, current = pcall(DS.RequireCore, minVersion, caller)
+        if ok then
+            coreSpoke = true
+            if not current then return nil end   -- Core printed the line itself
+        end
+    end
+    if type(api) == "function" then return api end
+    -- API missing. If Core was never able to answer (it predates RequireCore),
+    -- nobody has told the user anything yet, so say it once from here.
+    local key = tostring(caller or "?")
+    if not coreSpoke and not coreAPITold[key] then
+        coreAPITold[key] = true
+        ns:Print(string.format(
+            "Daseeki Core v%s needed for %s, an older Core is installed — update Daseeki-Core.",
+            tostring(minVersion), tostring(caller or "this feature")))
+    end
+    return nil
+end
+
+----------------------------------------------------------------------
 -- Event dispatch
 --
 -- Modules subscribe with ns:RegisterEvent(event, handler). The single
@@ -338,7 +385,53 @@ ns:RegisterSelfTest("core", function(verbose)
     ck(t2 == nil, "empty input rejected")
     local t3 = ns:ParseWhisper("BobOnly", "Whitemane")
     ck(t3 == nil, "target without message rejected")
-    if verbose and pass then ns:Print("  PASS core/parse-whisper") end
+
+    ------------------------------------------------------------------
+    -- ns:CoreAPI — the NW-6 cross-addon guard. Every branch below must end in
+    -- "returns the function" or "returns nil", never in an error.
+    ------------------------------------------------------------------
+    local G = _G
+    local savedSuite = G.DaseekiSuite
+    local said = {}
+    local realPrint = ns.Print
+    ns.Print = function(_, ...) said[#said + 1] = table.concat({ ... }, " ") end
+    local probe = function() return "drew" end
+
+    -- (a) Current Core: the API comes back and nobody says anything.
+    G.DaseekiSuite = { RequireCore = function() return true end }
+    ck(ns:CoreAPI("2.2.0", "case a", probe) == probe, "current Core hands back the API")
+    ck(#said == 0, "current Core is silent")
+
+    -- (b) Stale Core: nil back, and Nexus stays quiet because Core printed.
+    G.DaseekiSuite = { RequireCore = function() return false end }
+    ck(ns:CoreAPI("2.2.0", "case b", probe) == nil, "stale Core withholds the API")
+    ck(#said == 0, "stale Core: Core owns the message, Nexus does not double up")
+
+    -- (c) Core predates RequireCore AND lacks the API: Nexus must speak, once.
+    G.DaseekiSuite = {}
+    ck(ns:CoreAPI("2.2.0", "case c", nil) == nil, "pre-RequireCore Core without the API withholds it")
+    ck(#said == 1, "pre-RequireCore Core gets exactly one line from Nexus")
+    ck(said[1]:find("2.2.0", 1, true) ~= nil and said[1]:find("case c", 1, true) ~= nil,
+        "the line names the version needed and the feature")
+    for _ = 1, 10 do ns:CoreAPI("2.2.0", "case c", nil) end
+    ck(#said == 1, "still one line after 10 more calls from the same site")
+
+    -- (d) Core absent entirely but the API somehow present -> pass it through.
+    G.DaseekiSuite = nil
+    ck(ns:CoreAPI("2.2.0", "case d", probe) == probe, "the probe is the last word when Core cannot answer")
+
+    -- (e) A Core whose RequireCore itself errors must not take Nexus with it.
+    G.DaseekiSuite = { RequireCore = function() error("boom") end }
+    ck(ns:CoreAPI("2.2.0", "case e", probe) == probe, "an erroring RequireCore falls back to the probe")
+
+    -- (f) Core says current but the API is missing anyway -> still not callable.
+    G.DaseekiSuite = { RequireCore = function() return true end }
+    ck(ns:CoreAPI("2.2.0", "case f", nil) == nil, "a present-but-missing API is never handed back")
+
+    ns.Print = realPrint
+    G.DaseekiSuite = savedSuite
+
+    if verbose and pass then ns:Print("  PASS core/parse-whisper + coreapi guard") end
     return pass
 end)
 
