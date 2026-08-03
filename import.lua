@@ -2302,6 +2302,189 @@ local function selfTest(verbose)
         sdb.snImported = savedMarker
     end
 
+    ------------------------------------------------------------------
+    -- E-18 (ROLLOUT_CONTINUITY_AUDIT rule 18): no "uninstall the old addon"
+    -- message before a NON-ZERO applied count.
+    --
+    -- The hint is a claim about the user's DATA, not about the importer having
+    -- run: "you can disable it now" is only true if something actually carried
+    -- over. A no-op re-run that still says it is how people delete the only
+    -- copy of their alts. These cases drive the two real importer paths end to
+    -- end (through the live Store, not the mapper in isolation) and read the
+    -- chat lines the user would actually see.
+    ------------------------------------------------------------------
+    if ns.Store and ns.Store.GetSettings and ns.Store.GetData then
+        local G     = _G or getfenv(0)
+        local Store = ns.Store
+        local sdb   = Store.GetSettings()
+        local sdata = Store.GetData()
+
+        -- Any phrasing that nudges the user toward removing the source addon.
+        -- The gate is about MEANING, not one exact sentence: a reworded hint
+        -- that still says "you can turn it off" has to trip this too.
+        local REMOVAL_TOKENS = {
+            "uninstall", "disable it", "can disable", "safe to remove",
+            "no longer need", "turn it off", "delete the addon", "remove it",
+        }
+        local function hintsRemoval(lines)
+            for i = 1, #lines do
+                local low = tostring(lines[i]):lower()
+                for j = 1, #REMOVAL_TOKENS do
+                    if low:find(REMOVAL_TOKENS[j], 1, true) then return true end
+                end
+            end
+            return false
+        end
+        -- Self-check the detector: a suite that cannot see the hint would pass
+        -- every "no hint" case for the wrong reason.
+        check("E-18 detector sees a removal hint when one is present",
+            hintsRemoval({ "import complete. Keep it installed until you have confirmed, then you can disable it." }))
+        check("E-18 detector does not fire on ordinary importer chatter",
+            not hintsRemoval({ "import applied:", "  characters: +1 new, ~0 updated, 0 kept as-is." }))
+
+        local savedPrint    = ns.Print
+        local savedAccounts = sdata.accounts
+        local savedMarker   = sdb.snImported
+        local savedSNdb     = G[SN_SETTINGS_GLOBAL]
+        local savedSNdata   = G[SN_STORAGE_GLOBAL]
+
+        -- Capture chat, but let this suite's OWN failure lines through to the
+        -- real printer -- otherwise a regression here is swallowed by the very
+        -- capture that is meant to observe it.
+        local said = {}
+        ns.Print = function(self, msg)
+            local s = tostring(msg)
+            if s:find("selftest FAIL", 1, true) then return savedPrint(self, msg) end
+            said[#said + 1] = s
+        end
+
+        -- A source carrying exactly one character we have never seen. Empty
+        -- settings keep the run's only moving part the character graph.
+        sdata.accounts        = {}
+        sdb.snImported        = nil
+        G[SN_SETTINGS_GLOBAL] = {}
+        G[SN_STORAGE_GLOBAL]  = {
+            accounts = { ["e18"] = { isSelf = false, characters = {
+                ["Carryover-Realm"] = {
+                    nameRealm = "Carryover-Realm", classTag = "MAGE", level = 60,
+                    lastDataUpdateEpoch = 1700000000,
+                },
+            } } },
+            deletedAIDs = {},
+        }
+
+        -- (a) A run that ACTUALLY pulls something in: the hint is EARNED.
+        said = {}
+        local okA, resA = Import.Run(false)
+        local appliedA = resA and ((resA.plan.charsAdd or 0) + (resA.plan.charsUpdate or 0))
+        check("E-18 SN: the seeded run applies one character", okA and appliedA == 1)
+        -- The empty SN settings table must map to an EMPTY partial, so the only
+        -- live-Store state this suite touches is data.accounts + the marker, both
+        -- of which it saves and restores. If this ever trips, the suite has begun
+        -- backfilling real settings and the save/restore above is incomplete.
+        check("E-18 SN: the empty settings source backfills nothing (no suite residue)",
+            (resA.plan.settingsBackfill or 0) == 0)
+        check("E-18 SN: a NON-ZERO applied count DOES earn the disable hint", hintsRemoval(said))
+        check("E-18 SN: the earned hint also tells them to confirm first",
+            table.concat(said, " | "):lower():find("until you", 1, true) ~= nil)
+        check("E-18 SN: the non-zero run latches the provenance marker",
+            type(sdb.snImported) == "table" and sdb.snImported.chars == 1
+            and sdb.snImported.runs == 1)
+
+        -- (b) The IDENTICAL re-run. Newest-wins keeps every record (equal
+        --     ownerEpoch is not strictly newer) and the settings are already
+        --     backfilled, so NOTHING moves -- the E-18 case proper.
+        said = {}
+        local okB, resB = Import.Run(false)
+        local appliedB = resB and ((resB.plan.charsAdd or 0) + (resB.plan.charsUpdate or 0))
+        check("E-18 SN: the identical re-run applies nothing",
+            okB and appliedB == 0 and (resB.plan.settingsBackfill or 0) == 0)
+        check("E-18 SN: a ZERO-count run emits NO uninstall/disable hint", not hintsRemoval(said))
+        check("E-18 SN: the zero-count run says so plainly instead",
+            table.concat(said, " | "):lower():find("nothing new to carry over", 1, true) ~= nil)
+        -- The marker still counts the run (that is what makes the second-run
+        -- warning work), but it must never RECORD a carry-over that did not
+        -- happen -- chars/settings are the honest zero.
+        check("E-18 SN: the zero-count marker records no carried data",
+            type(sdb.snImported) == "table" and sdb.snImported.chars == 0
+            and sdb.snImported.settings == 0 and sdb.snImported.runs == 2)
+        check("E-18 SN: the re-run did not duplicate the character",
+            sdata.accounts["e18"] and sdata.accounts["e18"].characters["Carryover-Realm"] ~= nil)
+
+        G[SN_SETTINGS_GLOBAL] = savedSNdb
+        G[SN_STORAGE_GLOBAL]  = savedSNdata
+        sdata.accounts        = savedAccounts
+        sdb.snImported        = savedMarker
+
+        -- (c) The NIT (instance-run) path carries NO removal language at all,
+        --     on EITHER branch. It imports a run LOG, and the source addon keeps
+        --     recording after the import -- so there is nothing to earn the hint
+        --     with, and no count that would make it honest.
+        local savedNIT       = G["NITdatabase"]
+        local savedStoreData = Store.data
+        Store.data = { instances = {} }
+        G["NITdatabase"] = { global = { ["Jom Gabbar"] = { instances = {
+            { playerName = "Artaeum", instanceName = "Blackwing Lair", instanceID = 469,
+              type = "raid", difficultyID = 1, enteredTime = 1000, leftTime = 4600,
+              enteredMoney = 500, leftMoney = 1500 },
+        } } } }
+
+        said = {}
+        local okDry, dryCounts = Import.RunInstances(true)
+        check("E-18 NIT: the dry branch ran and spoke", okDry and #said > 0)
+        check("E-18 NIT: the dry branch previewed the seeded run", dryCounts and dryCounts.runs == 1)
+        check("E-18 NIT: DRY-RUN output carries no uninstall language", not hintsRemoval(said))
+
+        said = {}
+        local okApp, appCounts = Import.RunInstances(false)
+        check("E-18 NIT: the applied branch ran and spoke", okApp and #said > 0)
+        check("E-18 NIT: the applied branch really imported the run", appCounts and appCounts.runs == 1)
+        check("E-18 NIT: APPLIED output carries no uninstall language", not hintsRemoval(said))
+        check("E-18 NIT: the applied branch reports what it merged",
+            table.concat(said, " | "):find("merged 1 new entries", 1, true) ~= nil)
+
+        -- (c2) The ZERO-COUNT applied branch, reached the way a user reaches it:
+        --      re-importing an already-imported log. It still prints "applied:",
+        --      but it merged NOTHING -- exactly the shape that would make a
+        --      "you can uninstall it now" line a lie.
+        said = {}
+        local okAgain, againCounts = Import.RunInstances(false)
+        check("E-18 NIT: the re-import is idempotent (0 merged)",
+            okAgain and table.concat(said, " | "):find("merged 0 new entries", 1, true) ~= nil)
+        check("E-18 NIT: the re-import still sees the source's one run",
+            againCounts and againCounts.runs == 1)
+        check("E-18 NIT: a ZERO-merge applied run carries no uninstall language",
+            not hintsRemoval(said))
+
+        -- (c3) A source that is present but carries NO runs at all. Nothing can
+        --      have carried over, on either branch, so neither may editorialise.
+        G["NITdatabase"] = { global = { ["Jom Gabbar"] = { instances = {} } } }
+        said = {}
+        local okEmptyDry, emptyDryCounts = Import.RunInstances(true)
+        check("E-18 NIT: an empty source previews cleanly",
+            okEmptyDry and emptyDryCounts and (emptyDryCounts.runs or 0) == 0)
+        check("E-18 NIT: an EMPTY-source DRY run carries no uninstall language",
+            not hintsRemoval(said))
+
+        said = {}
+        local okEmptyApp = Import.RunInstances(false)
+        check("E-18 NIT: an empty source applies cleanly and merges nothing",
+            okEmptyApp and table.concat(said, " | "):find("merged 0 new entries", 1, true) ~= nil)
+        check("E-18 NIT: an EMPTY-source APPLIED run carries no uninstall language",
+            not hintsRemoval(said))
+
+        -- The no-source branch is the third thing the user can see, and it must
+        -- not editorialise about removal either.
+        said = {}
+        G["NITdatabase"] = nil
+        check("E-18 NIT: a missing source refuses cleanly", Import.RunInstances(false) == false)
+        check("E-18 NIT: the missing-source line carries no uninstall language", not hintsRemoval(said))
+
+        Store.data       = savedStoreData
+        G["NITdatabase"] = savedNIT
+        ns.Print         = savedPrint
+    end
+
     if verbose and ns.Print then
         ns:Print(pass and "  import selftest: PASS" or "  import selftest: FAIL")
     end

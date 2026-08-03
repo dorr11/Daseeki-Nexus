@@ -1317,26 +1317,66 @@ local function selfTest(verbose)
     -- 4b) DEFERRED INSTALL — the marker must NOT latch against an absent or
     --     empty source, or a user who enables Inventory before installing Bags
     --     never imports anything.
+    --
+    --     Doubles as the E-18 coverage for this path (ROLLOUT_CONTINUITY_AUDIT
+    --     rule 18: no "uninstall the old addon" message before a non-zero
+    --     applied count). Here the whole chat line is gated on applied > 0, so
+    --     the assertion is that a no-op migration is SILENT — a user who has
+    --     not yet installed Bags must not be told their bags "imported", and
+    --     nothing on any branch may nudge them toward removing the source.
     ------------------------------------------------------------------
     local G = _G
     local savedAccount = G.DaseekiBagsAccount
     area.owners, area.migrated = {}, false
 
+    local REMOVAL_TOKENS = {
+        "uninstall", "disable it", "can disable", "safe to remove",
+        "no longer need", "turn it off", "delete the addon", "remove it",
+    }
+    local function hintsRemoval(lines)
+        for i = 1, #lines do
+            local low = tostring(lines[i]):lower()
+            for j = 1, #REMOVAL_TOKENS do
+                if low:find(REMOVAL_TOKENS[j], 1, true) then return true end
+            end
+        end
+        return false
+    end
+    ck("E-18 detector sees a removal hint when one is present",
+        hintsRemoval({ "inventory: done -- you can disable it now." }))
+    ck("E-18 detector does not fire on the real import line",
+        not hintsRemoval({ "inventory: imported 3 character(s) from Daseeki Bags (3 with gold, 3 with item counts)." }))
+
+    -- Capture chat, but let this suite's own failure lines through so a
+    -- regression is still visible in the harness output.
+    local savedPrint = ns.Print
+    local said = {}
+    ns.Print = function(self, msg)
+        local s = tostring(msg)
+        if s:find("FAIL inventory/", 1, true) then return savedPrint(self, msg) end
+        said[#said + 1] = s
+    end
+
     -- (a) Enabled with no Bags data present at all.
     G.DaseekiBagsAccount = nil
+    said = {}
     ck("absent source imports nothing", Inventory.MigrateFromBags(1700003000) == nil)
     ck("absent source leaves the marker CLEAR", area.migrated == false)
+    ck("E-18: an absent source says NOTHING in chat", #said == 0)
 
     -- (b) Bags installed but its SavedVariables carry no owners yet.
     G.DaseekiBagsAccount = { account = {} }
+    said = {}
     local emptyStats = Inventory.MigrateFromBags(1700003100)
     ck("empty source found no owners", emptyStats ~= nil and emptyStats.owners == 0)
     ck("empty source leaves the marker CLEAR", area.migrated == false)
     ck("empty source imported nothing", next(area.owners) == nil)
+    ck("E-18: an empty source says NOTHING in chat", #said == 0)
 
     -- (c) Bags installed later / its data finally appears — the import still
     --     runs and lands, and only now does the marker latch.
     G.DaseekiBagsAccount = legacyAccount
+    said = {}
     local lateStats = Inventory.MigrateFromBags(1700003200)
     ck("late install imported the owners", lateStats ~= nil and lateStats.applied == 3)
     ck("late install latched the marker", area.migrated == true)
@@ -1344,10 +1384,48 @@ local function selfTest(verbose)
         S.InventoryGet("Rich-Whitemane") ~= nil
         and S.InventoryGet("Rich-Whitemane").data.money == 500000)
     ck("late install skipped the guild bank", S.InventoryGet("Guildy*-Whitemane") == nil)
+    -- E-18: only NOW, behind a non-zero applied count, is anything said at all.
+    ck("E-18: a non-zero applied count DOES announce itself, once", #said == 1)
+    ck("E-18: the announcement names the count it actually applied",
+        said[1] ~= nil and said[1]:find("imported 3 character", 1, true) ~= nil)
+    ck("E-18: even the earned announcement carries no uninstall language",
+        not hintsRemoval(said))
 
     -- (d) ...and does not run twice.
+    said = {}
     ck("latched marker blocks a re-run", Inventory.MigrateFromBags(1700003300) == nil)
+    ck("E-18: the blocked re-run says NOTHING in chat", #said == 0)
 
+    -- (e) The E-18 gate proper: a source that is present and NON-EMPTY but
+    --     whose every record is stale against what we already hold. This is the
+    --     re-scan-after-a-cleared-flag case the migrator documents. It latches
+    --     the marker (the source WAS processed) with applied = 0 -- and a run
+    --     that moved nothing must not tell the user it imported anything.
+    --     Its owner carries a fixed mesh rev+ts, so the second pass is stale by
+    --     construction rather than by clock luck.
+    local frozenSource = {
+        Whitemane = {
+            Frozen = { money = 4242, class = "DRUID", level = 60,
+                       mesh = { rev = 7, itemCounts = { [858] = 5 }, ts = 1700004000 } },
+        },
+    }
+    G.DaseekiBagsAccount = frozenSource
+    area.migrated = false
+    said = {}
+    local frozenFirst = Inventory.MigrateFromBags(1700004100)
+    ck("unchanged-source fixture lands on its first pass",
+        frozenFirst ~= nil and frozenFirst.applied == 1)
+    ck("E-18: that first, real import DOES announce itself", #said == 1)
+
+    area.migrated = false           -- as if the flag were cleared / reset
+    said = {}
+    local frozenAgain = Inventory.MigrateFromBags(1700004200)
+    ck("re-scan of an unchanged source applies nothing",
+        frozenAgain ~= nil and frozenAgain.owners == 1 and frozenAgain.applied == 0)
+    ck("E-18: a ZERO-applied re-scan says NOTHING in chat", #said == 0)
+    ck("re-scan still latches the marker on a non-empty source", area.migrated == true)
+
+    ns.Print = savedPrint
     G.DaseekiBagsAccount = savedAccount
 
     -- Malformed sources are inert.
