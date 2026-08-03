@@ -1153,7 +1153,31 @@ end
 -- current (untrusted / partial / skipped) scan did not fill. LIVE slots decay by
 -- the time elapsed since they were written and drop out once they hit zero;
 -- BOON-sourced slots are frozen (a suspended buff does not tick).
-local function preserveSlots(prev, elapsed, into)
+--
+-- `inSession` — WHY THIS PARAMETER EXISTS (the Wyx-Whitemane data-integrity bug).
+--
+-- A6.1's synthetic duration means "THIS SESSION watched the slot go live but the
+-- aura API will not tell us how long is left". It was applied to any carried
+-- slot with duration <= 0, which silently also caught a completely different
+-- thing: a zero-duration slot LOADED FROM THE SAVED STORE, where zero means the
+-- character does not hold the buff at all.
+--
+-- The SuperNova import (import.lua `mapAuraStates`) materialises ALL TEN slots
+-- for every imported character as `{ duration = 0, option = 1, source = 0 }` —
+-- source 0 is AURA_SOURCE.LIVE. So every imported record carried ten slots that
+-- read as "live, duration unreadable". The first capture after login is ALWAYS
+-- partial (PLAYER_ENTERING_WORLD is inside ENTERING_WORLD_GRACE), partial calls
+-- preserveSlots, and all ten placeholders detonated into a full world-buff set:
+-- 7200s on every slot and 3600s on Rend. A level-16 alt logged in for 28 seconds
+-- came back out holding 10/10 world buffs at 1h59m. No other character's data
+-- was involved — the record fabricated the buffs out of its own zero placeholders.
+--
+-- The discriminator is `Tracker._auraCapturedAt`: nil until THIS session's first
+-- aura write, so a zero on the very first capture provably came off disk and is
+-- "not held", never "live but unreadable". Once the session has written slots
+-- itself, a zero really can be the unreadable-duration case A6.1 is about, and
+-- the synthetic duration applies exactly as before.
+local function preserveSlots(prev, elapsed, into, inSession)
     if type(prev) ~= "table" then return into end
     for slot, cell in pairs(prev) do
         if type(cell) == "table" and into[slot] == nil then
@@ -1161,7 +1185,9 @@ local function preserveSlots(prev, elapsed, into)
             local dur = tonumber(cell.duration) or 0
             if src ~= BOON_SOURCE then
                 if dur <= 0 then
-                    dur = synthDuration(slot)     -- known live, duration unreadable
+                    -- Known live this session with an unreadable duration -> synth.
+                    -- Straight off disk -> the character simply does not hold it.
+                    dur = inSession and synthDuration(slot) or 0
                 else
                     dur = dur - elapsed
                 end
@@ -1195,9 +1221,12 @@ local function captureAuras(rec)
     local now = ns.Store.Now()
     local prev = rec.auraStates
     local elapsed = sinceCapture(Tracker._auraCapturedAt, now)
+    -- Has THIS session written aura slots yet? Gates A6.1's synthetic duration —
+    -- see the preserveSlots header for why a zero off disk must not synthesize.
+    local inSession = (Tracker._auraCapturedAt ~= nil)
 
     if Tracker.IsTeardown() then
-        rec.auraStates = preserveSlots(prev, elapsed, {})
+        rec.auraStates = preserveSlots(prev, elapsed, {}, inSession)
         Tracker._auraCapturedAt = now
         return
     end
@@ -1279,7 +1308,7 @@ local function captureAuras(rec)
     local partial = (sawAnyBuff == 0) or Tracker.InEnteringWorldGrace(ENTERING_WORLD_GRACE)
                     or (Tracker._inBoonCast and true or false)
     if partial then
-        preserveSlots(prev, elapsed, slots)
+        preserveSlots(prev, elapsed, slots, inSession)
     end
 
     -- Chronoboon fields. NOTE (A7.4): `boonCount` no longer lives here — it is
@@ -1922,6 +1951,28 @@ if ns.Store then
         if not ATTUNE_QUESTS[raidKey] then return nil end   -- not a tracked raid
         if type(rec) ~= "table" then return nil end
 
+        -- LEVEL IMPOSSIBILITY OUTRANKS BOTH SOURCES (the other half of the
+        -- Wyx-Whitemane report: his raid row read attuned/green for MC, BWL,
+        -- AQ40 and Naxx at level 16).
+        --
+        -- The nil = "treat as attuned" default above is deliberate and stays: it
+        -- is what stops a mid-rollout mesh greying every character a peer on an
+        -- older build cannot describe yet. But it was answering for characters
+        -- who CANNOT be attuned at all, and "no data" is not the same as "no
+        -- data and the answer is knowable anyway". Every gated chain here ends
+        -- well above level 50 (see Store.SanitizeInboundRecord for the evidence
+        -- and the gate), so a known level below it is positive proof of NOT
+        -- attuned — an answer, not a default.
+        --
+        -- Deliberately BELOW the ATTUNE_ALWAYS check: ZG / AQ20 / AQ40 need no
+        -- attunement and stay true at any level. Deliberately ABOVE the two data
+        -- sources: a stored true for an impossible level is the corruption this
+        -- batch exists to kill, so impossibility beats even a monotonic true.
+        -- An unknown level (0 / nil) is not evidence and falls through.
+        local level = tonumber(rec.level) or 0
+        local minLevel = (ns.Store.ATTUNE_MIN_LEVEL) or 50
+        if level > 0 and level < minLevel then return false end
+
         -- nil until some source has an opinion; a single TRUE short-circuits.
         local answer = nil
 
@@ -2002,6 +2053,242 @@ function Tracker.MigrateMCFalses()
     if touched > 0 then
         Tracker.InvalidateAttuneIndex()
         markAttuneDirty()               -- republish: rev bump, peers re-pull
+    end
+    return touched
+end
+
+----------------------------------------------------------------------
+-- ONE-SHOT REPAIR of the records the synthetic-duration bug already wrote.
+--
+-- Layer (b) of the Wyx-Whitemane fix. preserveSlots can no longer fabricate a
+-- world buff out of an imported zero placeholder, but it did so for weeks, and
+-- nothing re-probes a character that never logs in again. Without this pass a
+-- parked level-16 keeps "10/10 HELD" forever.
+--
+-- THREE RULES, each with its own evidence. All CLEAR fields (to nil = unknown);
+-- none deletes a record, per store.lua's no-destructive-migrations rule.
+--
+-- R1 — THE FABRICATED AURA BLOCK. Fingerprint: eight or more slots present, and
+--   EVERY present slot has source == LIVE and option == 1. That pair cannot
+--   occur naturally. Live capture writes `option = 0` unconditionally (see
+--   captureAuras), boon-sourced slots carry source == BOON, and mesh-relayed
+--   slots carry source == RELAYED — so option == 1 on a LIVE slot only ever
+--   comes from import.lua's `mapAuraStates`, whose default for an absent slot is
+--   exactly `{ duration = 0, option = 1, source = 0 }`. Matching blocks are the
+--   import placeholder skeleton, either still at zero (a live landmine waiting
+--   for its character's next login) or already detonated into the full 7200s /
+--   3600s set. Both are cleared: the character re-captures the truth the next
+--   time it logs in, and the landmine is gone.
+--
+--   This rule is what actually heals Wyx. R2/R3 below are the level-impossibility
+--   layers, and on their own they would only clear three of his ten buffs.
+--
+-- R2 — DIRE MAUL TRIBUTE slots (6/7/8) on a record whose known level is below
+--   Store.DMT_MIN_LEVEL. Same evidence as the inbound guard.
+--
+-- R3 — GATED ATTUNEMENTS (MC/BWL/Ony/Naxx) claimed true by a record whose known
+--   level is below Store.ATTUNE_MIN_LEVEL. Demoted to nil (UNKNOWN), never to
+--   false — attunement is monotonic and an unproven false is its own bug (see
+--   the MC cleanup above). Applied to the character records AND to the "attune"
+--   namespace payloads, which are a second, independent source RaidAttuned ORs
+--   in; healing only the record would leave the namespace copy to win.
+--
+-- A level of 0 / nil is UNKNOWN and is never judged, exactly as in the inbound
+-- guard. Idempotent via a marker key, in the style of Tracker.MigrateMCFalses.
+----------------------------------------------------------------------
+Tracker.AURA_REPAIR_KEY = "impossibleRecordsRepaired"
+
+-- PURE: is ONE slot import-born? source == LIVE with option == 1 is a pair the
+-- live capture path cannot produce (it writes option 0 unconditionally), so it
+-- only ever comes from import.lua's `mapAuraStates` default. See R1 above.
+local function isImportBornSlot(cell)
+    return type(cell) == "table"
+       and (tonumber(cell.source) or 0) == 0
+       and (tonumber(cell.option) or 0) == 1
+end
+
+-- PURE: how many slots in this block carry the import fingerprint.
+function Tracker._FabricatedSlotCount(states)
+    if type(states) ~= "table" then return 0 end
+    local n = 0
+    for _, cell in pairs(states) do
+        if isImportBornSlot(cell) then n = n + 1 end
+    end
+    return n
+end
+
+-- PURE: does this block hold a whole import placeholder skeleton? The threshold
+-- is what keeps the rule conservative — we clear a WHOLESALE fabricated set, not
+-- an individual odd-looking slot, so a record that merely happens to carry one
+-- import-born slot alongside real captures is left alone.
+--
+-- The clearing itself is PER SLOT, not whole-block: a character can hold a
+-- genuine live buff (option 0) captured after the skeleton was written, and that
+-- one must survive. Ceporah-Whitemane in the owner's store is exactly this shape
+-- — nine fabricated slots plus one real capture — and a whole-block rule either
+-- spared all ten or destroyed the real one.
+Tracker.FABRICATED_BLOCK_MIN = 8
+
+function Tracker._IsFabricatedAuraBlock(states)
+    return Tracker._FabricatedSlotCount(states) >= Tracker.FABRICATED_BLOCK_MIN
+end
+
+-- PURE: strip the import-born slots from a block that qualifies. Returns how
+-- many slots were removed (0 when the block does not meet the threshold).
+function Tracker._StripFabricatedSlots(states)
+    if not Tracker._IsFabricatedAuraBlock(states) then return 0 end
+    local removed = 0
+    for slot, cell in pairs(states) do
+        if isImportBornSlot(cell) then
+            states[slot] = nil
+            removed = removed + 1
+        end
+    end
+    return removed
+end
+
+-- PURE given its arguments: repair ONE account bucket. Mutates the records it
+-- touches and accumulates into `counts`; returns the number of records changed.
+function Tracker._RepairImpossibleIn(bucket, counts)
+    if type(bucket) ~= "table" then return 0 end
+    counts = counts or {}
+    local S = ns.Store
+    local attuneMin = (S and S.ATTUNE_MIN_LEVEL) or 50
+    local dmtMin    = (S and S.DMT_MIN_LEVEL) or 45
+    local gated     = (S and S.ATTUNE_GATED_RAIDS) or { MC = true, BWL = true, Ony = true, Naxx = true }
+    local dmtSlots  = (S and S.DMT_AURA_SLOTS) or { [6] = true, [7] = true, [8] = true }
+
+    local touched = 0
+    for _, tbl in ipairs({ bucket.characters, bucket.homeless }) do
+        if type(tbl) == "table" then
+            for _, rec in pairs(tbl) do
+                if type(rec) == "table" then
+                    local hit = false
+                    local level = tonumber(rec.level) or 0
+
+                    -- R1: the fabricated / placeholder aura slots.
+                    local stripped = Tracker._StripFabricatedSlots(rec.auraStates)
+                    if stripped > 0 then
+                        counts.auraBlocks = (counts.auraBlocks or 0) + 1
+                        counts.auraSlots  = (counts.auraSlots or 0) + stripped
+                        hit = true
+                    end
+
+                    -- R2: Dire Maul Tribute buffs below the dungeon's level.
+                    if level > 0 and level < dmtMin and type(rec.auraStates) == "table" then
+                        for slot in pairs(dmtSlots) do
+                            local cell = rec.auraStates[slot]
+                            if type(cell) == "table" and (tonumber(cell.duration) or 0) > 0 then
+                                rec.auraStates[slot] = nil
+                                counts.dmt = (counts.dmt or 0) + 1
+                                hit = true
+                            end
+                        end
+                    end
+
+                    -- R3: gated attunements below any possible chain completion.
+                    if level > 0 and level < attuneMin and type(rec.attunements) == "table" then
+                        for key in pairs(gated) do
+                            if rec.attunements[key] == true then
+                                rec.attunements[key] = nil
+                                counts.attune = (counts.attune or 0) + 1
+                                hit = true
+                            end
+                        end
+                    end
+
+                    if hit then touched = touched + 1 end
+                end
+            end
+        end
+    end
+    return touched
+end
+
+-- PURE given its arguments: demote impossible gated trues inside the "attune"
+-- namespace payloads. `levelOf(nameRealm)` returns a known level or nil/0.
+-- Returns the number of flags demoted.
+function Tracker._RepairAttuneNamespace(nsTbl, levelOf)
+    if type(nsTbl) ~= "table" or type(levelOf) ~= "function" then return 0 end
+    local S = ns.Store
+    local attuneMin = (S and S.ATTUNE_MIN_LEVEL) or 50
+    local gated     = (S and S.ATTUNE_GATED_RAIDS) or { MC = true, BWL = true, Ony = true, Naxx = true }
+
+    local demoted = 0
+    for _, entry in pairs(nsTbl) do
+        local data = type(entry) == "table" and entry.data
+        if type(data) == "table" then
+            for nameRealm, flags in pairs(data) do
+                local level = tonumber(levelOf(nameRealm)) or 0
+                if type(flags) == "table" and level > 0 and level < attuneMin then
+                    for key in pairs(gated) do
+                        if flags[key] == true then
+                            flags[key] = nil
+                            demoted = demoted + 1
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return demoted
+end
+
+-- The one-shot runner. Sweeps EVERY account bucket, not just our own: the
+-- placeholder skeletons ride the mesh, so a peer bucket holds the same landmines,
+-- and a peer whose owner has not patched yet would otherwise re-detonate into a
+-- copy we keep. A peer record cleared here simply re-fills from that peer's next
+-- push. Returns the number of records changed.
+function Tracker.RepairImpossibleRecords()
+    local S = ns.Store
+    local data = S and S.data
+    if type(data) ~= "table" then return 0 end
+    if data[Tracker.AURA_REPAIR_KEY] then return 0 end
+
+    local counts = {}
+    local touched = 0
+
+    -- Level index across every bucket, for the namespace pass below.
+    local levels = {}
+    if type(data.accounts) == "table" then
+        for _, bucket in pairs(data.accounts) do
+            if type(bucket) == "table" then
+                for _, tbl in ipairs({ bucket.characters, bucket.homeless }) do
+                    if type(tbl) == "table" then
+                        for nameRealm, rec in pairs(tbl) do
+                            local lv = type(rec) == "table" and tonumber(rec.level) or nil
+                            if lv and lv > (levels[nameRealm] or 0) then levels[nameRealm] = lv end
+                        end
+                    end
+                end
+            end
+        end
+        for _, bucket in pairs(data.accounts) do
+            touched = touched + Tracker._RepairImpossibleIn(bucket, counts)
+        end
+    end
+
+    local nsAttune = 0
+    if type(data.syncNamespaces) == "table" then
+        nsAttune = Tracker._RepairAttuneNamespace(
+            data.syncNamespaces[ATTUNE_NS], function(n) return levels[n] end)
+    end
+    counts.nsAttune = nsAttune
+
+    data[Tracker.AURA_REPAIR_KEY] = true
+
+    if touched > 0 or nsAttune > 0 then
+        Tracker.InvalidateAttuneIndex()
+        if (counts.attune or 0) > 0 or nsAttune > 0 then
+            markAttuneDirty()          -- republish: rev bump, peers re-pull
+        end
+        if ns and ns.Print then
+            ns:Print(string.format(
+                "|cffffc020repaired %d character record(s) with impossible data|r "
+                .. "(%d fabricated buff set(s), %d Dire Maul buff(s), %d attunement flag(s))",
+                touched, counts.auraBlocks or 0, counts.dmt or 0,
+                (counts.attune or 0) + nsAttune))
+        end
     end
     return touched
 end
@@ -2414,6 +2701,14 @@ function Tracker.OnLogin()
     -- One-shot: demote the MC falses the single-id probe left behind (no-op
     -- after the first run, and on a fresh install).
     if ns.SafeCall then ns:SafeCall(Tracker.MigrateMCFalses) else Tracker.MigrateMCFalses() end
+    -- One-shot: scrub the buff sets the synthetic-duration bug fabricated, the
+    -- import placeholder skeletons that fabricate them, and any level-impossible
+    -- attunement. No-op after the first run, and on a fresh install.
+    if ns.SafeCall then
+        ns:SafeCall(Tracker.RepairImpossibleRecords)
+    else
+        Tracker.RepairImpossibleRecords()
+    end
     Tracker.InvalidateAttuneIndex()
 
     -- First snapshot once the world is ready.
@@ -2460,8 +2755,35 @@ function Tracker.DebugAuras()
     if not any then ns:Print("  (no player buffs)") end
 end
 
+----------------------------------------------------------------------
+-- Diagnostic: /nexus debug sanity
+--
+-- Reads the inbound sanity guard's counters (layer (a) of the Wyx-Whitemane
+-- fix) plus the repair pass's marker. A non-zero record count means a peer on
+-- the mesh is still handing us level-impossible claims — i.e. that account has
+-- not picked up the fix yet, and the guard is doing its job.
+----------------------------------------------------------------------
+function Tracker.DebugSanity()
+    local S = ns.Store
+    local c = S and S._inboundSanity
+    if type(c) ~= "table" then
+        ns:Print("debug sanity: the inbound guard is not loaded")
+        return
+    end
+    ns:Print(string.format(
+        "inbound sanity guard: %d record(s) stripped -- %d attunement flag(s), %d aura slot(s)",
+        c.records or 0, c.attune or 0, c.auras or 0))
+    ns:Print(string.format("  gates: attunement < %d, Dire Maul buffs < %d",
+        S.ATTUNE_MIN_LEVEL or 0, S.DMT_MIN_LEVEL or 0))
+    ns:Print(string.format("  nameless inbound dropped: %d",
+        S._droppedNamelessInbound or 0))
+    local done = S.data and S.data[Tracker.AURA_REPAIR_KEY]
+    ns:Print("  one-shot impossible-record repair: " .. (done and "already run" or "PENDING"))
+end
+
 if ns.RegisterDebugCommand then
     ns:RegisterDebugCommand("auras", function() Tracker.DebugAuras() end)
+    ns:RegisterDebugCommand("sanity", function() Tracker.DebugSanity() end)
 end
 
 ----------------------------------------------------------------------
@@ -2732,6 +3054,57 @@ local function testCaptureGuards(fails)
        "logout synth: Rend with no duration -> 3600s")
     ck(rec.auraStates[1] and rec.auraStates[1].duration == 7200,
        "logout synth: non-Rend with no duration -> 7200s")
+
+    -- ---- REGRESSION: the Wyx-Whitemane fabricated world-buff set -----------
+    -- A record loaded FROM DISK carrying import.lua's ten zero-duration
+    -- placeholder slots, on a character that holds nothing. The first capture of
+    -- a session is always partial (login sits inside ENTERING_WORLD_GRACE), and
+    -- partial calls preserveSlots. Before the fix every placeholder detonated
+    -- into a full world buff and a level-16 alt came out holding 10/10 at 1h59m.
+    -- The discriminator is that _auraCapturedAt is nil: nothing has been written
+    -- this session, so these zeros provably came off disk and mean "not held".
+    local function importSlot() return { duration = 0, option = 1, source = 0 } end
+    settle()                                     -- settle() sets _auraCapturedAt = nil
+    rec = { auraStates = {} }
+    for s = 1, 10 do rec.auraStates[s] = importSlot() end
+    Tracker._enteredWorldAt = frameNow           -- inside the grace => partial
+    setAuras()                                   -- a buffless level 16
+    Tracker._captureAuras(rec)
+    local fabricated = 0
+    for _, cell in pairs(rec.auraStates) do
+        if (tonumber(cell.duration) or 0) > 0 then fabricated = fabricated + 1 end
+    end
+    ck(fabricated == 0,
+       "import placeholders off disk do NOT synthesize into world buffs (Wyx bug)")
+    ck(rec.auraStates[SLOT_REND] == nil,
+       "off-disk zero on Rend is dropped, not turned into 3600s")
+
+    -- The SAME zeros, once the session has written slots itself, are the genuine
+    -- A6.1 case (live but unreadable) and MUST still synthesize. This is the
+    -- mutation guard: a fix that simply deleted synthDuration passes the case
+    -- above and fails this one.
+    settle()
+    rec = { auraStates = { [SLOT_REND] = liveSlot(0), [1] = liveSlot(0) } }
+    Tracker._auraCapturedAt = epochNow           -- this session HAS written slots
+    Tracker._enteredWorldAt = frameNow           -- partial, not teardown
+    setAuras()
+    Tracker._captureAuras(rec)
+    ck(rec.auraStates[SLOT_REND] and rec.auraStates[SLOT_REND].duration == 3600,
+       "in-session zero on Rend still synthesizes 3600s (A6.1 preserved)")
+    ck(rec.auraStates[1] and rec.auraStates[1].duration == 7200,
+       "in-session zero still synthesizes 7200s (A6.1 preserved)")
+
+    -- A REAL buff carried off disk is untouched by the gate — only zeros were
+    -- ever ambiguous, and a positive duration is evidence in its own right.
+    settle()
+    rec = { auraStates = { [1] = liveSlot(3000), [4] = importSlot() } }
+    Tracker._enteredWorldAt = frameNow
+    setAuras()
+    Tracker._captureAuras(rec)
+    ck(rec.auraStates[1] and rec.auraStates[1].duration == 3000,
+       "off-disk slot with a real duration is preserved unchanged")
+    ck(rec.auraStates[4] == nil,
+       "off-disk placeholder alongside a real buff is still dropped")
 
     -- Preserved LIVE slots decay by in-session elapsed; BOON slots stay frozen.
     settle()
@@ -3972,6 +4345,31 @@ local function testAttunement(fails)
     ck(RA(recFull, "Karazhan") == nil, "RaidAttuned: an untracked raid key -> nil")
     ck(RA(recFull, nil) == nil, "RaidAttuned: a nil raid key -> nil")
 
+    -- ---- level impossibility (the Wyx-Whitemane raid row) ------------------
+    -- A level 16 with NO attunement data used to answer nil, which the detail
+    -- pane renders as attuned/green — the second half of the owner's report.
+    local lowBare = { nameRealm = "Wyx-Whitemane", level = 16 }
+    for _, k in ipairs({ "MC", "BWL", "Ony", "Naxx" }) do
+        ck(RA(lowBare, k) == false,
+           "RaidAttuned: " .. k .. " is FALSE for a level 16 (impossible, not unknown)")
+    end
+    for _, k in ipairs({ "ZG", "AQ20", "AQ40" }) do
+        ck(RA(lowBare, k) == true,
+           "RaidAttuned: " .. k .. " needs no attunement — still true at level 16")
+    end
+    -- Impossibility outranks even a stored true (that true IS the corruption).
+    local lowLying = { nameRealm = "Wyx-Whitemane", level = 16,
+                       attunements = { MC = true, Naxx = true } }
+    ck(RA(lowLying, "MC") == false, "RaidAttuned: an impossible stored true is overruled")
+    ck(RA(lowLying, "Naxx") == false, "RaidAttuned: impossibility beats monotonic true")
+    -- The gate is `below`, not `at or below`, and an unknown level is not evidence.
+    local atGate = { nameRealm = "Edge-Realm", level = ns.Store.ATTUNE_MIN_LEVEL }
+    ck(RA(atGate, "MC") == nil, "RaidAttuned: exactly at the gate is not judged")
+    local noLevel = { nameRealm = "Stranger-Realm" }
+    ck(RA(noLevel, "MC") == nil, "RaidAttuned: an unknown level still answers nil")
+    local sixty = { nameRealm = "Main-Realm", level = 60, attunements = { MC = true } }
+    ck(RA(sixty, "MC") == true, "RaidAttuned: a level 60 is unaffected by the gate")
+
     -- ---- 10) the cross-account namespace projection -----------------------
     local S = ns.Store
     if S and S.SyncNSPut then
@@ -4229,6 +4627,146 @@ local function testAttunement(fails)
 end
 
 ----------------------------------------------------------------------
+-- THE ONE-SHOT REPAIR PASS (layer (b) of the Wyx-Whitemane fix)
+--
+-- Fixture shapes, all taken from the owner's real store:
+--   Wyx      lvl 16, ten detonated placeholders (the reported bug)
+--   Ceporah  lvl 20, nine placeholders + ONE genuine live capture (option 0)
+--   Phoenix  lvl 60, a real booned buff set — must not be touched
+--   Zaan     lvl 60, three placeholders mixed with real slots — below the
+--            threshold, so the block is left alone (conservative by design)
+----------------------------------------------------------------------
+local function testImpossibleRepair(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+
+    local function ph()   return { duration = 7172, option = 1, source = 0 } end  -- detonated
+    local function zero() return { duration = 0,    option = 1, source = 0 } end  -- undetonated
+    local function real(d) return { duration = d,   option = 0, source = 2 } end  -- genuine
+
+    local function mkBucket()
+        local wyx = { level = 16, auraStates = {} }
+        for s = 1, 10 do wyx.auraStates[s] = ph() end
+        local cep = { level = 20, auraStates = { [1] = { duration = 4074, option = 0, source = 0 } } }
+        for s = 2, 10 do cep.auraStates[s] = ph() end
+        local pho = { level = 60, auraStates = { [1] = real(7020), [2] = real(3540),
+                                                 [3] = real(6780), [5] = real(7200) },
+                      attunements = { MC = true, BWL = true, Ony = true, Naxx = true } }
+        local zaan = { level = 60, auraStates = { [1] = zero(), [3] = zero(), [9] = zero(),
+                                                  [2] = real(7199), [7] = real(7132) } }
+        local lowAtt = { level = 16, attunements = { MC = true, Naxx = true, ZG = true } }
+        return { characters = { Wyx = wyx, Ceporah = cep, Phoenix = pho, Zaan = zaan },
+                 homeless   = { Parked = lowAtt } }
+    end
+
+    local function slotCount(rec)
+        local n = 0
+        if type(rec.auraStates) == "table" then for _ in pairs(rec.auraStates) do n = n + 1 end end
+        return n
+    end
+
+    -- ---- the pure per-bucket worker ---------------------------------------
+    local b, counts = mkBucket(), {}
+    local touched = Tracker._RepairImpossibleIn(b, counts)
+
+    ck(slotCount(b.characters.Wyx) == 0,
+       "repair: the fabricated 10/10 world-buff set is cleared (Wyx)")
+    ck(slotCount(b.characters.Ceporah) == 1,
+       "repair: nine placeholders stripped, the one REAL capture survives (Ceporah)")
+    ck(b.characters.Ceporah.auraStates[1] ~= nil
+       and b.characters.Ceporah.auraStates[1].duration == 4074,
+       "repair: the surviving slot keeps its real duration")
+    ck(slotCount(b.characters.Phoenix) == 4,
+       "repair: a genuine level-60 buff set is untouched")
+    ck(b.characters.Phoenix.attunements.MC == true
+       and b.characters.Phoenix.attunements.Naxx == true,
+       "repair: a level-60's attunements are untouched")
+    ck(slotCount(b.characters.Zaan) == 5,
+       "repair: a block below the fabricated threshold is left alone (conservative)")
+    ck(b.homeless.Parked.attunements.MC == nil
+       and b.homeless.Parked.attunements.Naxx == nil,
+       "repair: level-impossible attunements demoted in HOMELESS records too")
+    ck(b.homeless.Parked.attunements.ZG == true,
+       "repair: ungated raids survive the attunement demotion")
+    ck(touched == 3, "repair: exactly three records changed (Wyx, Ceporah, Parked)")
+    ck((counts.auraBlocks or 0) == 2, "repair: two records had fabricated slots")
+    ck((counts.auraSlots or 0) == 19, "repair: 10 + 9 fabricated slots stripped")
+    ck((counts.attune or 0) == 2, "repair: two impossible attunement flags demoted")
+
+    -- ---- idempotent: a second pass over the SAME bucket changes nothing ----
+    local counts2 = {}
+    ck(Tracker._RepairImpossibleIn(b, counts2) == 0,
+       "repair: a second pass over repaired data touches nothing")
+    ck(next(counts2) == nil, "repair: the second pass accumulates no counts")
+    ck(Tracker._RepairImpossibleIn(nil, {}) == 0, "repair: a nil bucket is a no-op")
+
+    -- ---- the fabricated-block predicate -----------------------------------
+    local eight = {}
+    for s = 1, 8 do eight[s] = zero() end
+    ck(Tracker._IsFabricatedAuraBlock(eight) == true, "predicate: 8 slots meets the threshold")
+    local seven = {}
+    for s = 1, 7 do seven[s] = zero() end
+    ck(Tracker._IsFabricatedAuraBlock(seven) == false, "predicate: 7 slots is below the threshold")
+    local allReal = {}
+    for s = 1, 10 do allReal[s] = real(7000) end
+    ck(Tracker._IsFabricatedAuraBlock(allReal) == false,
+       "predicate: ten GENUINE slots are never fabricated (source/option differ)")
+    local liveOptZero = {}
+    for s = 1, 10 do liveOptZero[s] = { duration = 7000, option = 0, source = 0 } end
+    ck(Tracker._IsFabricatedAuraBlock(liveOptZero) == false,
+       "predicate: live capture (option 0) is never mistaken for the import default")
+    ck(Tracker._IsFabricatedAuraBlock(nil) == false, "predicate: nil block is not fabricated")
+
+    -- ---- the attune NAMESPACE pass ----------------------------------------
+    local levels = { ["Wyx-Whitemane"] = 16, ["Phoenix-Whitemane"] = 60 }
+    local nsTbl = {
+        ["1"] = { data = {
+            ["Wyx-Whitemane"]     = { MC = true, Naxx = true, ZG = true },
+            ["Phoenix-Whitemane"] = { MC = true, Naxx = true },
+            ["Unknown-Whitemane"] = { MC = true },
+        }, rev = 73 },
+    }
+    local demoted = Tracker._RepairAttuneNamespace(nsTbl, function(n) return levels[n] end)
+    ck(demoted == 2, "namespace: exactly the two impossible flags demoted")
+    ck(nsTbl["1"].data["Wyx-Whitemane"].MC == nil
+       and nsTbl["1"].data["Wyx-Whitemane"].Naxx == nil,
+       "namespace: a level-16's gated flags are demoted")
+    ck(nsTbl["1"].data["Wyx-Whitemane"].ZG == true,
+       "namespace: ungated raids survive")
+    ck(nsTbl["1"].data["Phoenix-Whitemane"].MC == true,
+       "namespace: a level-60's flags are untouched")
+    ck(nsTbl["1"].data["Unknown-Whitemane"].MC == true,
+       "namespace: a character with no known level is not judged")
+    ck(Tracker._RepairAttuneNamespace(nsTbl, function(n) return levels[n] end) == 0,
+       "namespace: idempotent")
+    ck(Tracker._RepairAttuneNamespace(nil, function() end) == 0, "namespace: nil table is a no-op")
+
+    -- ---- the MARKER makes the runner one-shot -----------------------------
+    local S = ns.Store
+    local savedAccounts = S.data.accounts
+    local savedNs       = S.data.syncNamespaces
+    local savedMarker   = S.data[Tracker.AURA_REPAIR_KEY]
+    S.data.accounts       = { ["9"] = mkBucket() }
+    S.data.syncNamespaces = nil
+    S.data[Tracker.AURA_REPAIR_KEY] = nil
+
+    local first = Tracker.RepairImpossibleRecords()
+    ck(first == 3, "runner: the first run repairs the corrupted fixture")
+    ck(S.data[Tracker.AURA_REPAIR_KEY] == true, "runner: the marker is set after the run")
+    ck(slotCount(S.data.accounts["9"].characters.Wyx) == 0, "runner: Wyx is healed")
+
+    -- Re-corrupt, then prove the marker stops a second run cold.
+    S.data.accounts["9"] = mkBucket()
+    ck(Tracker.RepairImpossibleRecords() == 0,
+       "runner: the marker makes a second run a no-op")
+    ck(slotCount(S.data.accounts["9"].characters.Wyx) == 10,
+       "runner: the second run really did not touch the data")
+
+    S.data.accounts       = savedAccounts
+    S.data.syncNamespaces = savedNs
+    S.data[Tracker.AURA_REPAIR_KEY] = savedMarker
+end
+
+----------------------------------------------------------------------
 -- COORDINATE OVERRIDE ZONE SCOPING
 --
 -- The live bug this guards: `(not o.zone or o.zone == zone)` scoped an
@@ -4376,6 +4914,7 @@ function Tracker.RunSelfTests(verbose)
         { name = "DMF capture edges + debuff push (A8)", fn = testDMFCapture },
         { name = "raid attunement (quest matrix + RaidAttuned tri-state)", fn = testAttunement },
         { name = "coordinate override zone scoping", fn = testCoordinateOverride },
+        { name = "impossible-record repair pass", fn = testImpossibleRepair },
     }
     local allPass = true
     for _, suite in ipairs(suites) do

@@ -1544,6 +1544,89 @@ function Store.CarryNonWireFields(existing, incoming)
     return incoming
 end
 
+----------------------------------------------------------------------
+-- INBOUND SANITY GUARD — level-impossible claims never merge silently.
+--
+-- Layer (a) of the Wyx-Whitemane fix. The write-side root cause is repaired in
+-- tracker.lua's preserveSlots, but a mesh is only as good as the worst copy on
+-- it: a peer still running an unpatched build, or replaying a cached payload
+-- written before the fix, can hand us a record whose claims its own level says
+-- are impossible. Such a record is not merged on trust — the impossible FIELDS
+-- are stripped and counted, and the rest of the record is kept.
+--
+-- STRIP THE FIELD, NEVER THE RECORD. Dropping the whole frame would also drop
+-- the character's location, level, XP and lockouts, i.e. punish a peer for one
+-- bad field and make them read OFFLINE. Only what is provably impossible goes.
+--
+-- WHAT IS ACTUALLY LEVEL-GATED, and what is deliberately NOT:
+--
+--   ATTUNEMENTS (MC / BWL / Ony / Naxx) — every one is the tail of a quest chain
+--     that cannot be reached below the high 50s: MC needs Blackrock Depths, BWL
+--     needs MC cleared, Ony is a 55+ chain, Naxx needs 60 plus Argent Dawn rep.
+--     The gate is set at 50, comfortably BELOW the real requirement, so a legal
+--     record can never trip it. ZG / AQ20 / AQ40 carry no personal attunement in
+--     this addon's model (Tracker.ATTUNE_ALWAYS) and are never touched.
+--
+--   DIRE MAUL TRIBUTE buffs (slots 6/7/8 — Fengus / Mol'dar / Slip'kik) — these
+--     require having been inside Dire Maul, a 55-60 dungeon. Gate at 45.
+--
+--   EVERY OTHER WORLD BUFF IS **NOT** GATED AND IS NEVER STRIPPED. Rallying Cry,
+--     Warchief's Blessing, Spirit of Zandalar, Songflower, Sayge's fortune, the
+--     Fallen Hero's Battle Shout and Fire Festival Fury are all obtainable at any
+--     level — a level-16 standing in Orgrimmar for a head turn-in legitimately
+--     holds Rallying Cry. Rejecting those on level would be inventing a rule the
+--     game does not have, so the guard does not. The fabricated full-house set is
+--     stopped at its source (preserveSlots) and scrubbed from history by the
+--     repair pass; this layer only catches what is IMPOSSIBLE, not what is odd.
+--
+-- AN UNKNOWN LEVEL IS NOT EVIDENCE. level 0 / nil / non-numeric means the record
+-- never told us, so nothing is stripped: the guard judges a record only by the
+-- level THE RECORD ITSELF CARRIES.
+--
+-- PURE given its argument. Mutates `record`; returns the number of fields cleared.
+----------------------------------------------------------------------
+Store.ATTUNE_MIN_LEVEL   = 50
+Store.DMT_MIN_LEVEL      = 45
+Store.ATTUNE_GATED_RAIDS = { MC = true, BWL = true, Ony = true, Naxx = true }
+Store.DMT_AURA_SLOTS     = { [6] = true, [7] = true, [8] = true }
+
+-- Diagnostic counters, in the style of Store._droppedNamelessInbound. Read with
+-- /nexus debug sanity.
+Store._inboundSanity = { attune = 0, auras = 0, records = 0 }
+
+function Store.SanitizeInboundRecord(record)
+    if type(record) ~= "table" then return 0 end
+    local level = tonumber(record.level) or 0
+    if level <= 0 then return 0 end          -- unknown level proves nothing
+    local cleared = 0
+
+    if level < Store.ATTUNE_MIN_LEVEL and type(record.attunements) == "table" then
+        for key in pairs(Store.ATTUNE_GATED_RAIDS) do
+            if record.attunements[key] == true then
+                record.attunements[key] = nil     -- nil = UNKNOWN, not `false`
+                cleared = cleared + 1
+                Store._inboundSanity.attune = Store._inboundSanity.attune + 1
+            end
+        end
+    end
+
+    if level < Store.DMT_MIN_LEVEL and type(record.auraStates) == "table" then
+        for slot in pairs(Store.DMT_AURA_SLOTS) do
+            local cell = record.auraStates[slot]
+            if type(cell) == "table" and (tonumber(cell.duration) or 0) > 0 then
+                record.auraStates[slot] = nil
+                cleared = cleared + 1
+                Store._inboundSanity.auras = Store._inboundSanity.auras + 1
+            end
+        end
+    end
+
+    if cleared > 0 then
+        Store._inboundSanity.records = Store._inboundSanity.records + 1
+    end
+    return cleared
+end
+
 -- Inbound (relayed) write helper. Enforces self-immunity and the
 -- owner/epoch tiebreaker. `senderAID` (optional) is the account ID of the
 -- mesh peer that relayed this record; when two inbound writes carry an EQUAL
@@ -1577,6 +1660,11 @@ function Store.WriteInboundCharacter(aid, nameRealm, record, senderAID)
     -- Done before the epoch guard on purpose: `record` is a decoded temporary,
     -- and converting a record we then reject costs nothing.
     Store.AdoptWireCooldowns(record, serverNow())
+    -- Layer (a): strip claims this record's own level makes impossible. Runs on
+    -- the decoded temporary, before the epoch guard, so a rejected record costs
+    -- nothing and an accepted one can never carry an impossible field into the
+    -- store. See Store.SanitizeInboundRecord for the gates and their evidence.
+    Store.SanitizeInboundRecord(record)
     local bucket = Store.GetAccount(aid, true)
     if not bucket then return false end
     local existing = bucket.characters[nameRealm]
@@ -3626,6 +3714,105 @@ local function testInboundNameGuard(fails)
     Store._droppedNamelessInbound = savedCount
 end
 
+-- Layer (a) of the Wyx-Whitemane fix: a record whose own level makes its claims
+-- impossible has those FIELDS stripped and counted, while the rest of the record
+-- still writes through. Drives the real Store.WriteInboundCharacter for the
+-- end-to-end case so the guard is proven to sit on the actual write path.
+local function testInboundSanityGuard(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local saved = Store._inboundSanity
+    Store._inboundSanity = { attune = 0, auras = 0, records = 0 }
+
+    -- ---- impossible attunement on a low-level record ----------------------
+    local low = { level = 16, attunements = { MC = true, BWL = true, Ony = true,
+                                              Naxx = true, ZG = true, AQ20 = true } }
+    local n = Store.SanitizeInboundRecord(low)
+    ck(n == 4, "level 16: all four gated attunements stripped")
+    ck(low.attunements.MC == nil and low.attunements.BWL == nil
+       and low.attunements.Ony == nil and low.attunements.Naxx == nil,
+       "gated attunements demoted to nil (UNKNOWN), not false")
+    ck(low.attunements.ZG == true and low.attunements.AQ20 == true,
+       "ungated raids (ZG/AQ20) are never touched")
+    ck(Store._inboundSanity.attune == 4, "attune counter incremented per flag")
+    ck(Store._inboundSanity.records == 1, "records counter incremented once")
+
+    -- ---- a legal record is untouched --------------------------------------
+    local hi = { level = 60, attunements = { MC = true, Naxx = true } }
+    ck(Store.SanitizeInboundRecord(hi) == 0, "level 60 attunements pass untouched")
+    ck(hi.attunements.MC == true and hi.attunements.Naxx == true,
+       "a level-60 record keeps every attunement")
+
+    -- Exactly AT the gate is legal — the gate is `below`, not `at or below`.
+    local at = { level = Store.ATTUNE_MIN_LEVEL, attunements = { MC = true } }
+    ck(Store.SanitizeInboundRecord(at) == 0, "level exactly at the gate is accepted")
+    ck(at.attunements.MC == true, "boundary record keeps its attunement")
+
+    -- ---- an UNKNOWN level is not evidence ---------------------------------
+    for _, lv in ipairs({ 0 }) do
+        local unk = { level = lv, attunements = { MC = true, Naxx = true } }
+        ck(Store.SanitizeInboundRecord(unk) == 0,
+           "level " .. tostring(lv) .. " (unknown) strips nothing")
+        ck(unk.attunements.MC == true, "unknown level keeps attunements")
+    end
+    local nolv = { attunements = { MC = true } }
+    ck(Store.SanitizeInboundRecord(nolv) == 0, "absent level strips nothing")
+    ck(nolv.attunements.MC == true, "absent level keeps attunements")
+
+    -- ---- Dire Maul Tribute buffs below the dungeon's level ----------------
+    local dmt = { level = 16, auraStates = {
+        [1] = { duration = 7200, option = 0, source = 0 },   -- Rallying Cry: LEGAL at 16
+        [6] = { duration = 7200, option = 0, source = 0 },   -- Fengus:  impossible
+        [7] = { duration = 7200, option = 0, source = 0 },   -- Mol'dar: impossible
+        [8] = { duration = 7200, option = 0, source = 0 },   -- Slip'kik: impossible
+        [9] = { duration = 7200, option = 0, source = 0 },   -- Battle Shout: LEGAL at 16
+    } }
+    ck(Store.SanitizeInboundRecord(dmt) == 3, "level 16: exactly the three DM:T slots stripped")
+    ck(dmt.auraStates[6] == nil and dmt.auraStates[7] == nil and dmt.auraStates[8] == nil,
+       "DM:T slots cleared below the dungeon's level")
+    ck(dmt.auraStates[1] ~= nil and dmt.auraStates[9] ~= nil,
+       "ungated world buffs are NEVER stripped on level (a 16 can hold them)")
+    ck(Store._inboundSanity.auras == 3, "aura counter incremented per slot")
+
+    -- A zero-duration DM:T slot is "not held" and is not a claim worth counting.
+    local zero = { level = 16, auraStates = { [6] = { duration = 0, option = 1, source = 0 } } }
+    ck(Store.SanitizeInboundRecord(zero) == 0, "a zero-duration DM:T slot is not a claim")
+
+    -- A level-60 keeps its DM:T buffs.
+    local dmt60 = { level = 60, auraStates = { [6] = { duration = 7200, option = 0, source = 0 } } }
+    ck(Store.SanitizeInboundRecord(dmt60) == 0, "level 60 keeps Dire Maul buffs")
+
+    -- ---- non-table input is a no-op ---------------------------------------
+    ck(Store.SanitizeInboundRecord(nil) == 0, "nil record is a no-op")
+    ck(Store.SanitizeInboundRecord("x") == 0, "non-table record is a no-op")
+
+    -- ---- END TO END on the real write path --------------------------------
+    -- The impossible fields are gone, but the RECORD still lands: stripping a
+    -- field must never cost the peer its presence on the roster.
+    local AID = "44"
+    local savedAcct = Store.data and Store.data.accounts and Store.data.accounts[AID]
+    local wire = Store.NewCharacterRecord("Lowbie-Realm")
+    wire.level = 16
+    wire.ownerEpoch = 5000
+    wire.location = "Trade Quarter"
+    wire.attunements = { MC = true, Naxx = true }
+    wire.auraStates = { [6] = { duration = 7200, option = 0, source = 0 },
+                        [1] = { duration = 7200, option = 0, source = 0 } }
+    ck(Store.WriteInboundCharacter(AID, "Lowbie-Realm", wire, AID) == true,
+       "the record still writes through the guard")
+    local held = Store.data.accounts[AID].characters["Lowbie-Realm"]
+    ck(held ~= nil, "guarded record is present in the store")
+    ck(held and held.location == "Trade Quarter", "the rest of the record survives intact")
+    ck(held and held.attunements and held.attunements.MC == nil,
+       "impossible attunement never reached the store")
+    ck(held and held.auraStates and held.auraStates[6] == nil,
+       "impossible Dire Maul buff never reached the store")
+    ck(held and held.auraStates and held.auraStates[1] ~= nil,
+       "the legal world buff reached the store untouched")
+    if Store.data and Store.data.accounts then Store.data.accounts[AID] = savedAcct end
+
+    Store._inboundSanity = saved
+end
+
 -- Non-wire fields must SURVIVE an inbound replace, while everything the wire
 -- carries must still be authoritatively overwritten (including being cleared).
 -- Drives the real Store.WriteInboundCharacter, not the helper in isolation, so
@@ -4706,6 +4893,7 @@ function Store.RunSelfTests(verbose)
         { name = "songflower migration", fn = testSongflowerMigration },
         { name = "notes",           fn = testNotes },
         { name = "inbound name guard", fn = testInboundNameGuard },
+        { name = "inbound sanity guard", fn = testInboundSanityGuard },
         { name = "non-wire carry-forward", fn = testNonWireCarryForward },
         { name = "rested percent",  fn = testRestedPercent },
         { name = "dmf cooldown",    fn = testDMFCooldown },
