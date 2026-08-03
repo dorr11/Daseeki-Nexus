@@ -729,7 +729,8 @@ end
 -- All characters { nameRealm, classTag, level } ordered by LEVEL desc then name asc,
 -- with an "All" sentinel { all = true } prepended (owner round-10 item 3 dropdown).
 -- Pure over a Store.GetData() shape.
-function InstancesUI.CharList(data)
+-- ROUND-24 (owner): `aid` filters to ONE account's characters; nil = every account.
+function InstancesUI.CharList(data, aid)
     local out = {}
     local accounts = data and data.accounts
     if type(accounts) == "table" then
@@ -741,9 +742,11 @@ function InstancesUI.CharList(data)
                 end
             end
         end
-        for _, bucket in pairs(accounts) do
-            scan(bucket.characters)
-            scan(bucket.homeless)
+        for id, bucket in pairs(accounts) do
+            if aid == nil or id == aid then
+                scan(bucket.characters)
+                scan(bucket.homeless)
+            end
         end
     end
     table.sort(out, function(a, b)
@@ -752,6 +755,68 @@ function InstancesUI.CharList(data)
     end)
     table.insert(out, 1, { all = true, label = "All" })
     return out
+end
+
+-- ROUND-24 (owner): the ACCOUNT dropdown's entries — an "All" sentinel, then every account
+-- registered in the mesh, labelled "Account N" per the round-23 convention. Only NUMERIC
+-- ids get an entry: a non-numeric id has no sensible "Account N" label, and the round-23
+-- header rule already drops those rather than printing a malformed one. Pure.
+function InstancesUI.AccountList(data)
+    local out = { { all = true, label = "All" } }
+    local accounts = data and data.accounts
+    if type(accounts) == "table" then
+        for _, aid in ipairs(InstancesUI.SortedAccountIDs(accounts)) do
+            if tonumber(aid) then
+                out[#out + 1] = { aid = aid, label = "Account " .. tonumber(aid) }
+            end
+        end
+    end
+    return out
+end
+
+-- ROUND-24 (owner): the REST view's rows — per-character XP/rested, NON-60s ONLY.
+-- Level 60s are excluded ENTIRELY (not shown as bare "Level 60" rows like the old EXP
+-- view did): the view answers "who has rested XP banked", and a 60 has no answer to give.
+-- Ordered level DESC then name, so the character closest to 60 leads. Pure.
+function InstancesUI.RestRows(data, aid, charFilter)
+    local rows = {}
+    local accounts = data and data.accounts
+    if type(accounts) == "table" then
+        local function scan(t)
+            if type(t) ~= "table" then return end
+            for nameRealm, rec in pairs(t) do
+                if type(rec) == "table" and (rec.level or 0) < 60
+                   and (charFilter == nil or nameRealm == charFilter) then
+                    rows[#rows + 1] = InstancesUI.ExpRow(rec, nameRealm, rec.classTag)
+                end
+            end
+        end
+        for id, bucket in pairs(accounts) do
+            if aid == nil or id == aid then
+                scan(bucket.characters)
+                scan(bucket.homeless)
+            end
+        end
+    end
+    table.sort(rows, function(a, b)
+        if a.level ~= b.level then return a.level > b.level end
+        return tostring(a.nameRealm) < tostring(b.nameRealm)
+    end)
+    return rows
+end
+
+-- ROUND-24 (owner): the account -> character CASCADE. Changing the account resets the
+-- character selection to "All" UNLESS the selected character still belongs to the newly
+-- selected account (in which case keeping it is the least surprising behaviour). With
+-- "All accounts" selected every character stays valid. Pure, so the cascade is testable
+-- without driving the dropdowns.
+function InstancesUI.ResolveCharSelection(data, aid, selectedChar)
+    if not selectedChar then return nil end
+    if aid == nil then return selectedChar end
+    for _, c in ipairs(InstancesUI.CharList(data, aid)) do
+        if c.nameRealm == selectedChar then return selectedChar end
+    end
+    return nil
 end
 
 -- ════════════════════════════════════════════════════════════════════════════
@@ -808,50 +873,54 @@ function InstancesPanel.Attach(host)
     local P = { _meters = {}, _rows = {} }
     P.frame = host
 
-    P.view = "instances"       -- "instances" | "exp"  (owner round-10 item 2)
-    P.selectedChar = nil       -- nil = All  (owner round-10 item 3)
-
-    -- Header: INSTANCES | EXP toggle (left) + caps meta (right).
-    local toggle = CreateFrame("Frame", nil, host)
-    toggle:SetPoint("TOPLEFT", host, "TOPLEFT", PAD, -PAD); toggle:SetHeight(14)
-    tag(toggle, "instances.header")
-    P._tSegs = {}
-    local function makeTSeg(key, text)
-        local b = CreateFrame("Button", nil, toggle)
-        local l = fstr(b, "microLabel"); l:SetPoint("LEFT", b, "LEFT", 0, 0); l:SetText(text)
-        b:SetSize((l:GetStringWidth() or 40) + 2, 14); b._lbl = l; b._key = key
-        b:SetScript("OnClick", function() P.view = key; P.Refresh() end)
-        function b:Apply(active) self._lbl:SetTextColor(UI.Color(active and "accent" or "muted")) end
-        P._tSegs[#P._tSegs + 1] = b
-        return b
+    -- ROUND-24 (owner): a THREE-DROPDOWN filter row — View · Account · Character —
+    -- replaces the round-10 INSTANCES|EXP micro-toggle and the lone character dropdown.
+    -- All three selections persist in UIState so the panel reopens as it was left.
+    local st0 = (Dashboard.UIState and Dashboard.UIState()) or {}
+    P.view         = st0.instView or "logs"    -- "logs" | "rest"
+    P.selectedAcct = st0.instAcct              -- nil = All accounts
+    P.selectedChar = st0.instChar              -- nil = All characters
+    local function persist()
+        local s = Dashboard.UIState and Dashboard.UIState()
+        if not s then return end
+        s.instView, s.instAcct, s.instChar = P.view, P.selectedAcct, P.selectedChar
     end
-    local segI = makeTSeg("instances", "INSTANCES"); segI:SetPoint("LEFT", toggle, "LEFT", 0, 0)
-    local sep = fstr(toggle, "microLabel"); sep:SetText("|"); sep:SetTextColor(UI.Color("faint"))
-    sep:SetPoint("LEFT", segI, "RIGHT", 6, 0)
-    local segE = makeTSeg("exp", "EXP"); segE:SetPoint("LEFT", sep, "RIGHT", 6, 0)
+
+    -- Panel title (owner: "give the section a title 'INSTANCE LOG'").
+    local title = microLabel(host, "INSTANCE LOG")
+    title:SetPoint("TOPLEFT", host, "TOPLEFT", PAD, -PAD)
+    tag(title, "instances.header")
+    P.title = title
 
     local meta = fstr(host, "microLabel", "RIGHT")
     meta:SetPoint("TOPRIGHT", host, "TOPRIGHT", -PAD, -PAD)
     meta:SetTextColor(UI.Color("muted"))
+    -- Same flex rule the dock learned in round-21: the fixed TITLE yields to the live meta
+    -- so the two can never overlap. One-way (title -> meta), so no anchor cycle.
+    title:SetPoint("RIGHT", meta, "LEFT", -8, 0)
+    title:SetWordWrap(false)
     P.meta = meta
 
-    -- Character DROPDOWN (round-10 item 3): filters BOTH views to a selected character
-    -- ("All" default). Below the toggle. Clicking opens a scrollable popup of all chars
-    -- (level desc, name asc) + "All" at top; the cap meters below stay global.
-    local dd = CreateFrame("Button", nil, host, "BackdropTemplate")
-    dd:SetHeight(17)
-    dd:SetPoint("TOPLEFT", host, "TOPLEFT", PAD, -(PAD + 18))
-    dd:SetPoint("RIGHT", host, "RIGHT", -PAD, 0)
-    UI.Skin(dd, function(self)
-        self:SetBackdrop(UI.FLAT_BACKDROP); self:SetBackdropColor(UI.Color("inset")); self:SetBackdropBorderColor(UI.Color("borderLite"))
-    end)
-    dd.label = fstr(dd, "small"); dd.label:SetPoint("LEFT", dd, "LEFT", 7, 0); dd.label:SetText("All")
-    local ddArrow = fstr(dd, "small"); ddArrow:SetPoint("RIGHT", dd, "RIGHT", -6, 0); ddArrow:SetText("\226\150\190")
-    ddArrow:SetTextColor(UI.Color("muted"))
-    tag(dd, "instances.charselect")
-    P.dd = dd
-    -- Popup list (own frame, DIALOG strata; 10 rows visible, scroll for the rest).
+    -- ── Dropdown FACTORY (round-24) ─────────────────────────────────────────────
+    -- One shared visual language (the round-10 popup style, generalised): a bordered
+    -- button with a caret plus a DIALOG-strata scrollable popup. `rebuildFn` returns
+    -- { label=, value=, tint= } entries; `onPick` receives the value (nil = "All").
     local DD_ROW_H, DD_VIS = 16, 10
+    local closeOtherPopups   -- fwd decl: only one popup open at a time
+    local function makeDropdown(id, rebuildFn, onPick)
+        local dd = CreateFrame("Button", nil, host, "BackdropTemplate")
+        dd:SetHeight(17)
+        UI.Skin(dd, function(self)
+            self:SetBackdrop(UI.FLAT_BACKDROP); self:SetBackdropColor(UI.Color("inset"))
+            self:SetBackdropBorderColor(UI.Color("borderLite"))
+        end)
+        dd.label = fstr(dd, "small"); dd.label:SetPoint("LEFT", dd, "LEFT", 6, 0)
+        dd.label:SetWordWrap(false); dd.label:SetText("All")
+        local arrow = fstr(dd, "small"); arrow:SetPoint("RIGHT", dd, "RIGHT", -5, 0)
+        arrow:SetText("\226\150\190"); arrow:SetTextColor(UI.Color("muted"))
+        dd.label:SetPoint("RIGHT", arrow, "LEFT", -4, 0)
+        tag(dd, id)
+    -- Popup list (own frame, DIALOG strata; 10 rows visible, scroll for the rest).
     local pop = CreateFrame("Frame", nil, dd, "BackdropTemplate")
     pop:SetFrameStrata("DIALOG"); pop:SetPoint("TOPLEFT", dd, "BOTTOMLEFT", 0, -1); pop:SetPoint("TOPRIGHT", dd, "BOTTOMRIGHT", 0, -1)
     pop:SetHeight(DD_VIS * DD_ROW_H + 4)
@@ -866,47 +935,108 @@ function InstancesPanel.Attach(host)
         local maxs = math.max(0, popChild:GetHeight() - self:GetHeight())
         self:SetVerticalScroll(math.max(0, math.min(maxs, self:GetVerticalScroll() - delta * DD_ROW_H * 2)))
     end)
-    P._ddRows = {}
+    dd._rows, dd.pop = {}, pop
     local function ddRebuild()
-        local data = ns.Store and ns.Store.GetData and ns.Store.GetData()
-        local list = InstancesUI.CharList(data)
+        local list = rebuildFn() or {}
         local W = popScroll:GetWidth(); if W < 1 then W = dd:GetWidth() - 4 end
         popChild:SetWidth(W)
-        for _, r in ipairs(P._ddRows) do r:Hide() end
+        for _, r in ipairs(dd._rows) do r:Hide() end
         local y = 0
         for i, item in ipairs(list) do
-            local r = P._ddRows[i]
+            local r = dd._rows[i]
             if not r then
                 r = CreateFrame("Button", nil, popChild)
                 r:SetHeight(DD_ROW_H)
                 r.txt = fstr(r, "small"); r.txt:SetPoint("LEFT", r, "LEFT", 6, 0); r.txt:SetWordWrap(false)
                 r.txt:SetPoint("RIGHT", r, "RIGHT", -6, 0); r.txt:SetJustifyH("LEFT")
                 r:SetScript("OnEnter", function(self) self.txt:SetTextColor(UI.Color("accent")) end)
-                P._ddRows[i] = r
+                dd._rows[i] = r
             end
             r:ClearAllPoints(); r:SetPoint("TOPLEFT", popChild, "TOPLEFT", 0, -y); r:SetPoint("TOPRIGHT", popChild, "TOPRIGHT", 0, -y)
-            if item.all then
-                r.txt:SetText("All"); r.txt:SetTextColor(UI.Color("text"))
-                r._sel = nil
-                r:SetScript("OnLeave", function(self) self.txt:SetTextColor(UI.Color("text")) end)
-            else
-                local cr, cg, cb = Dashboard.ClassColor(item.classTag)
-                r.txt:SetText(("%s  \194\183 %d"):format((item.nameRealm:match("^([^%-]+)") or item.nameRealm), item.level))
-                if cr then r.txt:SetTextColor(cr, cg, cb) else r.txt:SetTextColor(UI.Color("text")) end
-                r._sel = item.nameRealm
-                r:SetScript("OnLeave", function(self) if cr then self.txt:SetTextColor(cr, cg, cb) else self.txt:SetTextColor(UI.Color("text")) end end)
-            end
-            r:SetScript("OnClick", function(self) P.selectedChar = self._sel; pop:Hide(); P.Refresh() end)
+            r.txt:SetText(item.label)
+            local cr, cg, cb
+            if item.tint then cr, cg, cb = Dashboard.ClassColor(item.tint) end
+            if cr then r.txt:SetTextColor(cr, cg, cb) else r.txt:SetTextColor(UI.Color("text")) end
+            r:SetScript("OnLeave", function(self)
+                if cr then self.txt:SetTextColor(cr, cg, cb) else self.txt:SetTextColor(UI.Color("text")) end
+            end)
+            r._val = item.value
+            r:SetScript("OnClick", function(self)
+                pop:Hide(); onPick(self._val); persist(); P.Refresh()
+            end)
             r:Show()
             y = y + DD_ROW_H
         end
         popChild:SetHeight(math.max(y, 1))
     end
-    dd:SetScript("OnClick", function() if pop:IsShown() then pop:Hide() else ddRebuild(); pop:Show() end end)
-    P._ddRebuild = ddRebuild
+    dd:SetScript("OnClick", function()
+        if pop:IsShown() then pop:Hide()
+        else closeOtherPopups(pop); ddRebuild(); pop:Show() end
+    end)
+    dd._rebuild = ddRebuild
+    return dd
+    end   -- makeDropdown
+
+    P._popups = {}
+    closeOtherPopups = function(keep)
+        for _, p in ipairs(P._popups) do if p ~= keep then p:Hide() end end
+    end
+
+    -- ── The three dropdowns, left to right, inside the 364px panel ──────────────
+    -- Usable width = 364 - 2*PAD(10) = 344; two 6px gaps leave 332 for three fields.
+    -- View is narrowest (its labels are short), Account is fixed ("Account 99"), and
+    -- Character takes the remainder because names are the longest of the three.
+    local DD_GAP, DD_VIEW_W, DD_ACCT_W = 6, 74, 92
+    local ddView = makeDropdown("instances.viewselect",
+        function() return { { label = "Logs", value = "logs" }, { label = "Rest", value = "rest" } } end,
+        function(v) P.view = v or "logs" end)
+    ddView:SetPoint("TOPLEFT", host, "TOPLEFT", PAD, -(PAD + 16))
+    ddView:SetWidth(DD_VIEW_W)
+
+    local ddAcct = makeDropdown("instances.acctselect",
+        function()
+            local data = ns.Store and ns.Store.GetData and ns.Store.GetData()
+            local out = {}
+            for _, a in ipairs(InstancesUI.AccountList(data)) do
+                out[#out + 1] = { label = a.label, value = a.aid }
+            end
+            return out
+        end,
+        function(v)
+            P.selectedAcct = v
+            -- CASCADE (owner): a new account resets the character unless it still belongs.
+            local data = ns.Store and ns.Store.GetData and ns.Store.GetData()
+            P.selectedChar = InstancesUI.ResolveCharSelection(data, P.selectedAcct, P.selectedChar)
+        end)
+    ddAcct:SetPoint("LEFT", ddView, "RIGHT", DD_GAP, 0)
+    ddAcct:SetWidth(DD_ACCT_W)
+
+    local ddChar = makeDropdown("instances.charselect",
+        function()
+            local data = ns.Store and ns.Store.GetData and ns.Store.GetData()
+            local out = {}
+            for _, c in ipairs(InstancesUI.CharList(data, P.selectedAcct)) do
+                if c.all then out[#out + 1] = { label = "All" }
+                else
+                    out[#out + 1] = {
+                        label = ("%s  \194\183 %d"):format(c.nameRealm:match("^([^%-]+)") or c.nameRealm, c.level),
+                        value = c.nameRealm, tint = c.classTag,
+                    }
+                end
+            end
+            return out
+        end,
+        function(v) P.selectedChar = v end)
+    ddChar:SetPoint("LEFT", ddAcct, "RIGHT", DD_GAP, 0)
+    ddChar:SetPoint("RIGHT", host, "RIGHT", -PAD, 0)
+
+    P.ddView, P.ddAcct, P.ddChar = ddView, ddAcct, ddChar
+    P.dd = ddChar   -- retained alias (older refresh code refers to P.dd)
+    P._popups = { ddView.pop, ddAcct.pop, ddChar.pop }
+    P._ddRebuild = function() ddChar._rebuild() end
 
     -- Meters container (per-account rows + ALL row) — GLOBAL, below the dropdown.
-    local METERS_TOP = PAD + 40
+    local METERS_TOP = PAD + 38   -- round-24: title 16 + dropdown row 17 + 5 air
     local metersTop = CreateFrame("Frame", nil, host)
     metersTop:SetPoint("TOPLEFT", host, "TOPLEFT", PAD, -METERS_TOP)
     metersTop:SetPoint("RIGHT", host, "RIGHT", -PAD, 0)
@@ -1149,14 +1279,16 @@ function InstancesPanel.Attach(host)
         local n = P.PaintMeters(nowE)
 
         -- Toggle + dropdown repaint.
-        for _, seg in ipairs(P._tSegs) do seg:Apply(P.view == seg._key) end
-        dd.label:SetText(P.selectedChar and (P.selectedChar:match("^([^%-]+)") or P.selectedChar) or "All")
+        -- ROUND-24: repaint the three dropdown captions from the live selections.
+        P.ddView.label:SetText(P.view == "rest" and "Rest" or "Logs")
+        P.ddAcct.label:SetText(P.selectedAcct and ("Account " .. (tonumber(P.selectedAcct) or P.selectedAcct)) or "All")
+        P.ddChar.label:SetText(P.selectedChar and (P.selectedChar:match("^([^%-]+)") or P.selectedChar) or "All")
 
         -- List label + scroll region, positioned below the (global) meters.
         local metersH = n * METER_H + math.max(0, n - 1) * METER_GAP
         local listTop = P._metersTop + metersH + 8
-        local isExp = (P.view == "exp")
-        recLbl:SetText(isExp and "EXPERIENCE" or "RECENT")
+        local isExp = (P.view == "rest")   -- round-24: "logs" | "rest"
+        recLbl:SetText(isExp and "RESTED" or "RECENT")
         recLbl:ClearAllPoints(); recLbl:SetPoint("TOPLEFT", host, "TOPLEFT", PAD, -listTop)
         -- Column captions ride the label line; they describe the INSTANCES columns only.
         cols:ClearAllPoints(); cols:SetPoint("TOPRIGHT", host, "TOPRIGHT", -PAD, -listTop)
@@ -1173,25 +1305,25 @@ function InstancesPanel.Attach(host)
         local y, shown = 0, 0
 
         if isExp then
-            -- EXP view: per-character xp / rested rows, filtered by the dropdown.
-            local list = InstancesUI.CharList(data)
-            for _, item in ipairs(list) do
-                if not item.all and (not P.selectedChar or item.nameRealm == P.selectedChar) then
-                    local m = InstancesUI.ExpRow(resolveRec(data, item.nameRealm), item.nameRealm, item.classTag)
-                    shown = shown + 1
-                    local r = getExp(shown)
-                    r:ClearAllPoints(); r:SetPoint("TOPLEFT", child, "TOPLEFT", 0, -y); r:SetPoint("TOPRIGHT", child, "TOPRIGHT", 0, -y)
-                    local cr, cg, cb = Dashboard.ClassColor(m.classTag)
-                    r.name:SetText(m.name or "?")
-                    if cr then r.name:SetTextColor(cr, cg, cb) else r.name:SetTextColor(UI.Color("text")) end
-                    r.lvl:SetText(m.levelText)
-                    r.xp:SetText(m.xpText or ""); r.xp:SetTextColor(UI.Color("muted"))
-                    r.rested:SetText(m.restedText or ""); r.rested:SetTextColor(UI.Color("muted"))
-                    r:Show()
-                    y = y + REC_H + REC_GAP
-                end
+            -- ROUND-24 REST view: per-character XP / rested, NON-60s ONLY (a 60 has no
+            -- rested progression to report, so it is excluded outright rather than shown
+            -- as a bare "Level 60" row like the old EXP view did). Account + character
+            -- filters both apply, and the model layer owns the rule.
+            for _, m in ipairs(InstancesUI.RestRows(data, P.selectedAcct, P.selectedChar)) do
+                shown = shown + 1
+                local r = getExp(shown)
+                r:ClearAllPoints(); r:SetPoint("TOPLEFT", child, "TOPLEFT", 0, -y); r:SetPoint("TOPRIGHT", child, "TOPRIGHT", 0, -y)
+                local cr, cg, cb = Dashboard.ClassColor(m.classTag)
+                r.name:SetText(m.name or "?")
+                if cr then r.name:SetTextColor(cr, cg, cb) else r.name:SetTextColor(UI.Color("text")) end
+                r.lvl:SetText(m.levelText)
+                r.xp:SetText(m.xpText or ""); r.xp:SetTextColor(UI.Color("muted"))
+                r.rested:SetText(m.restedText or ""); r.rested:SetTextColor(UI.Color("muted"))
+                r:Show()
+                y = y + REC_H + REC_GAP
             end
-            P._empty:SetText("No characters."); P._empty:SetShown(shown == 0)
+            -- Empty copy names the rule, so an all-60s account does not look broken.
+            P._empty:SetText("No characters below 60."); P._empty:SetShown(shown == 0)
         else
             -- INSTANCES view: recent runs (newest first), filtered by the dropdown.
             -- ONE ROW PER PHYSICAL INSTANCE: re-entries into the same live
@@ -1202,7 +1334,9 @@ function InstancesPanel.Attach(host)
             for i = 1, #groups do
                 local item = groups[i]
                 if shown >= MAX_REC then break end
-                if (not P.selectedChar) or (item.nameRealm == P.selectedChar) then
+                -- ROUND-24: BOTH the account and character dropdowns filter the log.
+                local acctOK = (not P.selectedAcct) or (item.aid == P.selectedAcct)
+                if acctOK and ((not P.selectedChar) or (item.nameRealm == P.selectedChar)) then
                     local model = InstancesUI.RowModel(item.primary, item.nameRealm,
                         classMap[item.nameRealm], nowE, false, item.visits)
                     shown = shown + 1
@@ -1671,6 +1805,60 @@ local function testInstancesUI(fails)
     ck(list[2].nameRealm == "Ann-R" and list[3].nameRealm == "Bee-R",
         "charlist: level 60 block ordered by name asc (Ann before Bee)")
     ck(list[4].nameRealm == "Cee-R" and list[4].level == 42, "charlist: lower level last")
+
+    -- ── ROUND-24: the three-dropdown model ──────────────────────────────────────
+    local d24 = { accounts = {
+        ["1"] = { characters = {
+            ["Ann-R"] = { level = 60, classTag = "MAGE" },
+            ["Cee-R"] = { level = 42, classTag = "ROGUE", xp = 100, xpMax = 400, restedXP = 600 },
+        } },
+        ["2"] = { characters = {
+            ["Bee-R"] = { level = 60, classTag = "PRIEST" },
+            ["Dee-R"] = { level = 15, classTag = "DRUID", xp = 50, xpMax = 200, restedXP = 100 },
+        }, homeless = { ["Eee-R"] = { level = 7, classTag = "WARRIOR" } } },
+        ["x9"] = { characters = { ["Zed-R"] = { level = 30, classTag = "MAGE" } } },
+    } }
+
+    -- ACCOUNT dropdown: All sentinel, then numeric accounts as "Account N". A non-numeric
+    -- id gets no entry (no sensible label), matching the round-23 header rule.
+    local accts = IU.AccountList(d24)
+    ck(accts[1].all == true and accts[1].label == "All", "accountlist: All sentinel first")
+    ck(accts[2].label == "Account 1" and accts[2].aid == "1", "accountlist: 'Account 1'")
+    ck(accts[3].label == "Account 2", "accountlist: numeric order")
+    ck(#accts == 3, "accountlist: non-numeric account id excluded (got " .. #accts .. ")")
+
+    -- CHARACTER dropdown cascades off the account.
+    local all1 = IU.CharList(d24, "1")
+    ck(#all1 == 3, "charlist(aid=1): All + 2 chars")
+    ck(all1[2].nameRealm == "Ann-R" and all1[3].nameRealm == "Cee-R", "charlist(aid=1): level desc")
+    local all2 = IU.CharList(d24, "2")
+    local names = {}; for i = 2, #all2 do names[#names + 1] = all2[i].nameRealm end
+    ck(#all2 == 4, "charlist(aid=2): All + characters AND homeless")
+    ck(table.concat(names, ",") == "Bee-R,Dee-R,Eee-R", "charlist(aid=2): homeless included, level desc")
+    ck(#IU.CharList(d24) == 7, "charlist(nil): every account (All + 6)")
+
+    -- REST view: NON-60s ONLY, 60s excluded entirely.
+    local rest = IU.RestRows(d24)
+    local rnames = {}; for _, r in ipairs(rest) do rnames[#rnames + 1] = r.nameRealm end
+    -- Cee-R 42 > Zed-R 30 > Dee-R 15 > Eee-R 7.
+    ck(table.concat(rnames, ",") == "Cee-R,Zed-R,Dee-R,Eee-R",
+        "rest: non-60s only, level desc (got " .. table.concat(rnames, ",") .. ")")
+    for _, r in ipairs(rest) do ck(r.level < 60, "rest: no level-60 row (" .. r.nameRealm .. ")") end
+    ck(#IU.RestRows(d24, "1") == 1 and IU.RestRows(d24, "1")[1].nameRealm == "Cee-R",
+        "rest: account filter applies")
+    ck(#IU.RestRows(d24, "2", "Dee-R") == 1, "rest: character filter applies")
+    ck(#IU.RestRows(d24, "1", "Dee-R") == 0, "rest: char not in the account -> empty")
+    -- The rest row still carries the NIT information set.
+    local cee = IU.RestRows(d24, "1")[1]
+    ck(cee.levelText == "Level 42" and cee.xpText == "100/400", "rest: level + XP cur/max")
+    ck(cee.restedText == "150% (Max)", "rest: rested percent with the (Max) marker")
+
+    -- CASCADE: changing account resets the character unless it belongs to the new account.
+    ck(IU.ResolveCharSelection(d24, "1", "Cee-R") == "Cee-R", "cascade: char kept when it belongs")
+    ck(IU.ResolveCharSelection(d24, "2", "Cee-R") == nil, "cascade: char RESET when it does not")
+    ck(IU.ResolveCharSelection(d24, nil, "Cee-R") == "Cee-R", "cascade: All accounts keeps any char")
+    ck(IU.ResolveCharSelection(d24, "1", nil) == nil, "cascade: All char stays All")
+    ck(IU.ResolveCharSelection(d24, "2", "Eee-R") == "Eee-R", "cascade: homeless char counts as belonging")
 end
 
 if ns.RegisterSelfTest then
