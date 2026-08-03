@@ -960,11 +960,17 @@ function buildCoordPane(flow)
             acceptText = "Reset",
             onAccept = function()
                 local db = DB(); if not db then return end
-                db.coordinateOverrides = {
-                    { name = "Rend North Staging", zone = "Orgrimmar", minX = 0.30, maxX = 0.55, minY = 0.55, maxY = 0.80, label = "Rend Staging (N)" },
-                    { name = "Rend South Staging", zone = "Durotar",   minX = 0.40, maxX = 0.60, minY = 0.10, maxY = 0.30, label = "Rend Staging (S)" },
-                    { name = "DMF Mulgore",        zone = "Mulgore",   minX = 0.30, maxX = 0.50, minY = 0.55, maxY = 0.75, label = "Darkmoon Faire" },
-                }
+                -- A17.3: this button used to carry its OWN literal copy of the
+                -- seeds, so it re-installed the oversized boxes the store had
+                -- just been taught to shrink — "Reset to Defaults" was the one
+                -- way to reintroduce the bug. Ask the store for the defaults
+                -- instead; one definition, no drift. (Fallback keeps the button
+                -- working if the export is ever absent.)
+                if ns.Store and type(ns.Store.DefaultCoordinateOverrides) == "function" then
+                    db.coordinateOverrides = ns.Store.DefaultCoordinateOverrides()
+                else
+                    db.coordinateOverrides = {}
+                end
                 rebuild()
             end })
     end })
@@ -2233,7 +2239,10 @@ local function buildTimers(flow)
     -- ── Songflower display ───────────────────────────────────────────────────────
     -- Drives the songflower UP?/minus display state machine (timers.lua NodeState).
     local sf = flow:AddSection("Songflower Display")
-    sf:Hint("UP? window shows after respawn (0 = always).")
+    -- F13: the old section hint described the removed "UP? duration" slider.
+    -- A picked node counts down, shows "UP?" when it respawns, then runs the
+    -- expired window below before going quiet.
+    sf:Hint("Picked nodes count down, show \"UP?\" on respawn, then fade out.")
     -- ROUND-17b: this slider used to write felwood.flowerMinusDuration, which the engine
     -- stopped consuming as a respawn length (the respawn is fixed) — the control was inert.
     -- It now drives felwood.flowerExpiredWindow, the live key timers.lua reads (default
@@ -2245,14 +2254,16 @@ local function buildTimers(flow)
         format = function(v) v = math.floor(v); return ("%d:%02d"):format(math.floor(v / 60), v % 60) end,
     })
     sf:Hint("How long a respawned flower shows a negative counter before going quiet.")
-    local sfUp = sf:Slider({
-        label = "UP? duration — (0-60:00) default always", width = 300, min = 0, max = 3600, step = 30,
-        get = function() local ts = TS(); return ts and ts.felwood.flowerUpDuration or 0 end,
-        set = function(v) local ts = TS(); if ts then ts.felwood.flowerUpDuration = v end end,
-        format = function(v) v = math.floor(v); if v <= 0 then return "always" end
-            return ("%d:%02d"):format(math.floor(v / 60), v % 60) end,
-    })
-    register("timers", function() if sfMinus.Refresh then sfMinus.Refresh() end; if sfUp.Refresh then sfUp.Refresh() end end)
+    -- F13: the "UP? duration" slider is GONE. It wrote felwood.flowerUpDuration,
+    -- and since the pin display moved to the three-state model (cooldown ->
+    -- "UP?" -> expired window) nothing reads that key: timers.lua drives the
+    -- states from NODE_RESPAWN + flowerExpiredWindow, pins.lua asks
+    -- Timers.GetNodeState, and import.lua explicitly refuses to import it. The
+    -- control moved a number that changed nothing on screen — worse than absent,
+    -- because it read as a working setting. The stored key and its 5 -> 0
+    -- migration stay in store.lua: removing them would be a SavedVariables
+    -- change, and they are harmless once nothing offers to edit them.
+    register("timers", function() if sfMinus.Refresh then sfMinus.Refresh() end end)
 
     -- ── Danger: reset timer data ───────────────────────────────────────────────
     flow:AddSection("Danger Zone")
@@ -2266,6 +2277,22 @@ local function buildTimers(flow)
                 t.flower, t.tuber = {}, {}
                 t.logs = { rend = {}, onyH = {}, onyA = {} }
                 t.timerVersion = (t.timerVersion or 1) + 1
+                -- F13: wiping the SAVED tables is only half a reset. timers.lua
+                -- also holds in-memory anchors (pending pulls, last-yell epochs,
+                -- dedup stamps, derived cooldown state) that outlive this button,
+                -- so the old data walked straight back into the fresh tables and
+                -- "Reset Timer Data" appeared not to work until a /reload.
+                -- Guarded on existence: the export lands with the timers-side
+                -- change, and a missing one must degrade to the old behaviour
+                -- rather than error inside a confirm handler.
+                if ns.Timers and type(ns.Timers.ResetState) == "function" then
+                    ns:SafeCall(ns.Timers.ResetState)
+                end
+                -- Live bars are derived from the same state; drop them too so the
+                -- screen matches the store.
+                if ns.HUD and type(ns.HUD.ClearBars) == "function" then
+                    ns:SafeCall(ns.HUD.ClearBars)
+                end
                 ns:Print("timer data reset.")
             end })
     end })

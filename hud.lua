@@ -40,6 +40,85 @@ local VARIANT_ZONES = {
 }
 HUD.VARIANT_ZONES = VARIANT_ZONES
 
+-- ── F4 — landing-blind fan-out windows ───────────────────────────────────────
+-- Only the LOCAL yell detector knows which landing it is announcing; every
+-- relay (NWB, boss-mod, mesh, SN, /dsn hud) reports "rend, N seconds left" with
+-- no landing at all. Those reports used to fall back to the plain "rend" key and
+-- spawn a THIRD bar that no local pop could ever arbitrate with, so the trust
+-- ladder was unreachable for the exact sources that need it most. A landing-blind
+-- report now FANS OUT to the full variant set, so every source produces the same
+-- two keys.
+--
+-- Windows are the CONSERVATIVE Thrall rows (6s Orgrimmar / 17s Barrens), never
+-- the Herald rows (6s/6s): a landing-blind report cannot tell Thrall from Herald,
+-- and over-running a Barrens bar merely shows it a few seconds too long, while
+-- under-running it drops the bar early AND arms the 60s recently-expired block so
+-- the true pop can never re-raise it. Long is the safe direction.
+--
+-- Preferred source is timers.lua's live export (Timers.REND_BARS.thrall); this
+-- table is the fallback mirror for load-order/headless cases. Keep in sync.
+local VARIANT_WINDOWS = {
+    rend = { { zone = "Orgrimmar", seconds = 6 }, { zone = "Barrens", seconds = 17 } },
+}
+-- Where each variant buff's authoritative window rows live in timers.lua.
+local VARIANT_WINDOW_SOURCE = {
+    rend = function()
+        local T = ns.Timers
+        return T and T.REND_BARS and T.REND_BARS.thrall
+    end,
+}
+
+local function variantWindows(buffKey)
+    local src = VARIANT_WINDOW_SOURCE[buffKey]
+    local rows = src and src()
+    if type(rows) ~= "table" or #rows == 0 then rows = VARIANT_WINDOWS[buffKey] end
+    return rows
+end
+HUD._VariantWindows = variantWindows
+
+-- Build the fan-out plan for a landing-blind report. PURE (rows injectable).
+--
+-- The PRIMARY landing is the LONGEST row, because the generic per-buff window a
+-- relay quotes IS that landing (timers.lua PULL_WINDOWS.rend == 17 == Barrens).
+-- Its bar therefore takes the supplied duration verbatim.
+--
+-- Every sibling is derived from the SAME yell epoch rather than guessed: both
+-- landings count down from one yell, so
+--     elapsed        = primaryWindow - suppliedDuration
+--     siblingRemain  = siblingWindow - elapsed
+--                    = suppliedDuration - (primaryWindow - siblingWindow)
+-- A sibling whose landing has ALREADY happened (derived remaining <= 0) is
+-- dropped rather than created — otherwise onPullDetected's "duration <= 0 means
+-- unknown" fallback would silently inflate a finished 6s Orgrimmar landing into
+-- a fresh 40s bar.
+--
+-- With no usable duration at all, every landing falls back to its full window.
+-- Returns an ordered array { { zone=, duration= }, ... } (primary first), or nil.
+function HUD._VariantPlan(buffKey, duration, rows)
+    rows = rows or variantWindows(buffKey)
+    if type(rows) ~= "table" or #rows == 0 then return nil end
+
+    local pi, primaryWindow = nil, -1
+    for i = 1, #rows do
+        local s = tonumber(rows[i] and rows[i].seconds)
+        if s and s > primaryWindow then pi, primaryWindow = i, s end
+    end
+    if not pi then return nil end
+
+    local known = (type(duration) == "number") and duration > 0
+    local out = { { zone = rows[pi].zone, duration = known and duration or primaryWindow } }
+    for i = 1, #rows do
+        if i ~= pi then
+            local s = tonumber(rows[i] and rows[i].seconds)
+            if s then
+                local d = known and (duration - (primaryWindow - s)) or s
+                if d > 0 then out[#out + 1] = { zone = rows[i].zone, duration = d } end
+            end
+        end
+    end
+    return out
+end
+
 -- Bar identity. Plain buffKey, EXCEPT a multi-zone buff fired for one of its
 -- own known variant zones -> "buff:zone", so both landings render at once.
 -- A nil/unknown zone (e.g. the /demo path) falls back to the plain key.
@@ -82,6 +161,22 @@ function HUD._PartitionFrozen(list)
         if e.group == "main" then m = m + 1 else s = s + 1 end
     end
     return m, s
+end
+
+-- F12 — pull-bar countdown text (spec §10.7): `M:SS` at 60s and above, whole
+-- seconds below that, and ONE DECIMAL below 5s — the last few seconds are when a
+-- raider is actually reading the bar, and "3s" held for a full second reads as a
+-- frozen bar. Pure so the headless suite can assert every boundary.
+local DECIMAL_BELOW = 5
+function HUD.CountdownText(rem)
+    rem = tonumber(rem) or 0
+    if rem < 0 then rem = 0 end
+    if rem >= 60 then
+        return string.format("%d:%02d", math.floor(rem / 60), math.floor(rem % 60))
+    elseif rem < DECIMAL_BELOW then
+        return string.format("%.1fs", rem)
+    end
+    return string.format("%.0fs", rem)
 end
 
 -- ── A12.1 — alert dedup windows, PER CATEGORY ────────────────────────────────
@@ -590,10 +685,83 @@ local function warnColor()
     return WARN_RGB[1], WARN_RGB[2], WARN_RGB[3], 1
 end
 
--- Current real-zone name, lowercased.
-local function zoneNow()
-    return lower(GetRealZoneText and GetRealZoneText() or "")
+-- ── F11 — bar-placement zone chain (spec §10.7) ──────────────────────────────
+-- Checked STRICTLY IN ORDER:
+--   1. a coordinate override whose NAME contains "rend"  -> the Barrens
+--   2. the real zone text
+--   3. the manual location override
+-- (1) is what makes staging work: a raider parked in the Rend staging box is
+-- waiting on the BARRENS landing, so the Barrens bar is the one that must be
+-- large — even though GetRealZoneText still says Orgrimmar/Durotar. (3) is a
+-- fallback, not an override: the real zone wins whenever it reads at all, and
+-- the manual value only speaks while the zone APIs are cold (login / loading
+-- screen), which is exactly the window the spec orders it into.
+--
+-- NOTE: this is ONE chain for ALL bars, per spec. A consequence worth knowing
+-- in-game: while you stand in a Rend staging box, Horde Ony/Nef bars classify
+-- "small" (their zone reads as the Barrens, not Orgrimmar). That is the spec'd
+-- behaviour — the staging box means "I am here for the Barrens buff".
+
+local function playerMapXY()
+    if not (C_Map and C_Map.GetBestMapForUnit and C_Map.GetPlayerMapPosition) then return nil end
+    local mapID = C_Map.GetBestMapForUnit("player")
+    if not mapID then return nil end
+    local pos = C_Map.GetPlayerMapPosition(mapID, "player")
+    if not pos or not pos.GetXY then return nil end
+    return pos:GetXY()
 end
+
+-- Pure: is (x, y) inside an override box whose NAME says "rend"? Matched on
+-- `name` (the stable rule id) and only then on `label` (user-facing, renameable)
+-- — the spec keys this on the name. An override with no zone (or "") is
+-- unscoped and matches on coordinates alone, mirroring the imported shape.
+function HUD._RendOverrideHit(overrides, zone, x, y)
+    if type(overrides) ~= "table" then return false end
+    if type(x) ~= "number" or type(y) ~= "number" then return false end
+    for i = 1, #overrides do
+        local o = overrides[i]
+        if type(o) == "table"
+           and (o.zone == nil or o.zone == "" or o.zone == zone)
+           and x >= (o.minX or 0) and x <= (o.maxX or 1)
+           and y >= (o.minY or 0) and y <= (o.maxY or 1)
+           and lower(o.name or o.label or ""):find("rend", 1, true) then
+            return true
+        end
+    end
+    return false
+end
+
+local function rendStagingHere()
+    local db = ns.Store and ns.Store.GetSettings and ns.Store.GetSettings()
+    local overrides = db and db.coordinateOverrides
+    if type(overrides) ~= "table" or #overrides == 0 then return false end
+    local x, y = playerMapXY()
+    if not x then return false end
+    return HUD._RendOverrideHit(overrides, GetRealZoneText and GetRealZoneText() or "", x, y)
+end
+
+-- The player's own manual location override, lowercased ("" when unset). Read
+-- straight off the table rather than through Store.GetManualLocation, which
+-- indexes Store.data unguarded — zoneNow runs on the bar ticker and must never
+-- be the thing that errors.
+local function manualZone()
+    local data = ns.Store and ns.Store.data
+    local locs = data and data.manualLocations
+    if type(locs) ~= "table" then return "" end
+    if not (UnitName and GetRealmName) then return "" end
+    local name = UnitName("player")
+    if not name then return "" end
+    local realm = (GetRealmName() or ""):gsub("%s+", "")
+    return lower(locs[name .. "-" .. realm] or "")
+end
+
+local function zoneNow()
+    if rendStagingHere() then return "barrens" end
+    local real = lower(GetRealZoneText and GetRealZoneText() or "")
+    if real ~= "" then return real end
+    return manualZone()
+end
+HUD._ZoneNow = zoneNow
 
 local function inRaidInstance()
     if not IsInInstance then return false end
@@ -664,6 +832,12 @@ local function buffIcon(k)  local m = BUFF_META[k]; return m and m.icon or "Inte
 -- containment compare, because a landing name can be a substring of the real
 -- zone text ("barrens" vs. GetRealZoneText's "The Barrens").
 local function zoneRelevant(k)
+    -- F11 (spec §10.7): "ZG is always main". The Zandalar bar carries a 50.5s
+    -- window — long enough to matter from anywhere on the continent — so it is
+    -- never parked in the idle corner, whatever zone the player is standing in.
+    -- Special-cased ahead of the BUFF_META lookup so it cannot be undone by
+    -- editing zg's zone set.
+    if k == "zg" then return true end
     local m = BUFF_META[k]
     if not m or not m.zones then return false end
     local here = zoneNow()
@@ -749,7 +923,8 @@ local function ensureBanner()
     if banner then return banner end
     local f = CreateFrame("Frame", "DaseekiNexusBanner", UIParent)
     f:SetSize(700, 60)
-    f:SetPoint("TOP", UIParent, "TOP", 0, -170)
+    -- Spec §11: on-screen alerts sit 180 px below the screen top (was -170).
+    f:SetPoint("TOP", UIParent, "TOP", 0, -180)
     f:SetFrameStrata("HIGH")
     f:Hide()
 
@@ -1155,9 +1330,7 @@ local function ensureTicker()
                 else
                     local dur = b._duration or DEFAULT_PULL_WINDOW
                     paintBar(b, rem, dur)
-                    b._sb:SetBarText(rem >= 60
-                        and string.format("%d:%02d", math.floor(rem / 60), math.floor(rem % 60))
-                        or  string.format("%.0fs", rem))
+                    b._sb:SetBarText(HUD.CountdownText(rem))
                 end
             end
         end
@@ -1180,6 +1353,11 @@ end
 -- trust + notice kind, so a genuine trust UPGRADE still speaks.
 local lastTrustNoticeAt = {}   -- "buff:trust:kind" -> frameClock
 local function trustNotice(buffKey, trust, kind, sources)
+    -- F9 — this is a CHAT line like any other alert, but it reached ns:Print
+    -- directly and so ignored the raid chat override: a raider who suppressed
+    -- alert chat still got "[Intercepted DBM] …" mid-pull. Gate it on the same
+    -- raid chat state the dispatcher uses, so one setting governs one channel.
+    if raidDisabled("chat") then return end
     local t = frameClock()
     local dkey = buffKey .. ":" .. tostring(trust) .. ":" .. tostring(kind)
     local prev = lastTrustNoticeAt[dkey]
@@ -1193,6 +1371,10 @@ local function trustNotice(buffKey, trust, kind, sources)
         ns:Print("|cff82bf6b[Timer confirmed]|r " .. label .. who .. ".")
     end
 end
+-- Test seam: the notice is normally reached only through a 3s C_Timer defer,
+-- which the headless harness stubs to a no-op, so the raid gate (F9) would be
+-- untestable through the bar path.
+HUD._TrustNotice = trustNotice
 
 -- A13.3 — every distinct source that has reported this bar, so the deferred
 -- notice can tell "boss-mod guess" from "boss-mod guess, corroborated".
@@ -1241,8 +1423,39 @@ end
 -- PULL_DETECTED(buffKey, duration, trust, zone) handler. `zone` carries the
 -- LANDING zone, which is what splits a multi-zone buff into two bars: identity
 -- below is the bar key, not the buff key (Rend fires twice per pop).
+--
+-- F4 — `zone` has a DUAL MEANING in the wild: the local detector passes a
+-- LANDING name, but relays have been seen passing the OBSERVER's zone (or
+-- nothing). Only a string that names one of THIS buff's own landings is trusted
+-- as landing info; anything else — nil, "", "Durotar", a stray observer zone —
+-- is treated as "no landing info" and fans out, rather than being keyed as a
+-- third, un-arbitrable plain "rend" bar.
 local function onPullDetected(buffKey, duration, trust, zone)
     if not BUFF_META[buffKey] and buffKey ~= "battleShout" then return end
+
+    -- Landing-blind report for a multi-landing buff -> raise the FULL variant
+    -- set, so a relay produces exactly the keys a local pop does and the trust
+    -- ladder can arbitrate across sources. Each recursive call carries a real
+    -- landing, so barKeyOf resolves to a variant key and cannot re-enter here;
+    -- the barKeyOf re-check per row makes that structural, not incidental.
+    if VARIANT_ZONES[buffKey] and barKeyOf(buffKey, zone) == buffKey then
+        local plan = HUD._VariantPlan(buffKey, duration)
+        if plan and #plan > 0 then
+            local fanned = false
+            for i = 1, #plan do
+                local row = plan[i]
+                if barKeyOf(buffKey, row.zone) ~= buffKey then
+                    fanned = true
+                    onPullDetected(buffKey, row.duration, trust, row.zone)
+                end
+            end
+            -- Every row fanned out; the landing-blind report itself raises no bar.
+            -- (NoteAnnouncerYell + the pull alert are stamped by the children, and
+            -- the alert dispatcher's per-BUFF dedup collapses them into one — the
+            -- same one-alert/two-bars shape the local path has always produced.)
+            if fanned then return end
+        end
+    end
 
     -- A12.4: a pull report for an Ony/Nef announcer IS the evidence that that
     -- announcer yelled. Stamp it first, before any path can return early, so the
@@ -1759,7 +1972,10 @@ local function registerCommands()
             -- fabricate a demo pull bar for visual checks
             local k = args:match("(%S+)") or "rend"
             if not BUFF_META[k] then k = "rend" end
-            -- No zone: the demo wants ONE plain-keyed bar, not a variant pair.
+            -- F4: no zone = landing-blind, exactly like a relay — so a `rend`
+            -- demo now raises the real variant PAIR rather than the old
+            -- plain-keyed bar that no live pop could ever arbitrate with. That
+            -- makes the demo an honest rehearsal of what a relayed pop looks like.
             onPullDetected(k, 30, "local", nil)
             ns:Print("demo pull bar: " .. buffLabel(k))
         end
@@ -1777,6 +1993,7 @@ local function runSelfTests(verbose)
     local function check(cond, msg)
         if not cond then pass = false; if verbose then ns:Print("  FAIL: " .. msg) end end
     end
+    local function near(a, b) return math.abs((tonumber(a) or -999) - b) < 0.01 end
     check(buffLabel("rend") == "Rend", "buffLabel rend")
     check(buffIcon("zg"):find("Talisman"), "buffIcon zg")
     check(SOUND_BY_KEY["RaidWarning"] ~= nil, "sound RaidWarning present")
@@ -1786,6 +2003,79 @@ local function runSelfTests(verbose)
     check(buffLabel("dmf") == "DMF" and buffLabel("fff") == "FFF", "dmf/fff BUFF_META present")
     check(BUFF_META.rend.zones["barrens"] == true, "rend zone meta covers the Barrens")
     check(barKeyOf("rend", "Barrens") == "rend:barrens", "variant bars key by buff+zone")
+
+    -- ── F4 — the fan-out plan for a landing-blind report ─────────────────────
+    local ROWS = { { zone = "Orgrimmar", seconds = 6 }, { zone = "Barrens", seconds = 17 } }
+    local plan = HUD._VariantPlan("rend", 17, ROWS)
+    check(plan and #plan == 2, "a landing-blind rend report plans BOTH landings")
+    check(plan[1].zone == "Barrens" and near(plan[1].duration, 17),
+        "the primary is the longest landing and takes the supplied duration verbatim")
+    check(plan[2].zone == "Orgrimmar" and near(plan[2].duration, 6),
+        "the sibling is derived from the same yell epoch (17 -> 6 at t=0)")
+
+    -- 5s into the pop: Barrens has 12 left, so Orgrimmar has 1.
+    plan = HUD._VariantPlan("rend", 12, ROWS)
+    check(#plan == 2 and near(plan[2].duration, 1),
+        "mid-pop, the sibling keeps the SAME epoch (12 - (17-6) = 1)")
+
+    -- Past the Orgrimmar landing: that bar must not be resurrected.
+    plan = HUD._VariantPlan("rend", 8, ROWS)
+    check(#plan == 1 and plan[1].zone == "Barrens",
+        "a landing that already happened is dropped, not inflated to a fresh bar")
+
+    -- No usable duration -> each landing falls back to its full spec window.
+    for _, d in ipairs({ 0, -3, "x" }) do
+        plan = HUD._VariantPlan("rend", d, ROWS)
+        check(#plan == 2 and near(plan[1].duration, 17) and near(plan[2].duration, 6),
+            "an unusable duration (" .. tostring(d) .. ") falls back to full windows")
+    end
+    check(HUD._VariantPlan("onyH", 14.5) == nil, "a single-landing buff has no fan-out plan")
+
+    -- The conservative Thrall windows, never Herald's 6/6: a too-long Barrens bar
+    -- is cosmetic, a too-short one expires and arms the 60s re-raise block.
+    local live = HUD._VariantWindows("rend")
+    local maxSec = 0
+    for _, r in ipairs(live) do if r.seconds > maxSec then maxSec = r.seconds end end
+    check(maxSec == 17, "fan-out uses the conservative 17s Barrens window")
+
+    -- ── F12 — countdown text boundaries (spec §10.7) ─────────────────────────
+    check(HUD.CountdownText(75)   == "1:15",  "above 60s reads M:SS")
+    check(HUD.CountdownText(60)   == "1:00",  "exactly 60s is M:SS")
+    check(HUD.CountdownText(59.4) == "59s",   "below 60s is whole seconds")
+    check(HUD.CountdownText(5)    == "5s",    "exactly 5s is still whole seconds")
+    check(HUD.CountdownText(4.96) == "5.0s",  "below 5s gains one decimal")
+    check(HUD.CountdownText(0.4)  == "0.4s",  "the last second reads in tenths")
+    check(HUD.CountdownText(-2)   == "0.0s",  "a negative remaining clamps to zero")
+
+    -- ── F11 — "rend"-named coordinate override -> the Barrens ────────────────
+    local OVR = {
+        { name = "Rend North Staging", label = "Rend Staging (N)",
+          minX = 0.48, maxX = 0.52, minY = 0.45, maxY = 0.49 },
+        { name = "DMF Mulgore", label = "Darkmoon Faire", zone = "Mulgore",
+          minX = 0.42, maxX = 0.46, minY = 0.57, maxY = 0.61 },
+    }
+    check(HUD._RendOverrideHit(OVR, "Orgrimmar", 0.50, 0.47) == true,
+        "standing in the Rend staging box reads as the Barrens")
+    check(HUD._RendOverrideHit(OVR, "Orgrimmar", 0.20, 0.20) == false,
+        "elsewhere in Orgrimmar does not")
+    check(HUD._RendOverrideHit(OVR, "Mulgore", 0.44, 0.59) == false,
+        "a non-rend override (DMF) never claims the Barrens")
+    check(HUD._RendOverrideHit(OVR, "Durotar", 0.50, 0.47) == true,
+        "an unscoped rend rule matches on coordinates alone")
+    check(HUD._RendOverrideHit(OVR, "Orgrimmar", nil, nil) == false,
+        "a cold map position is not a match")
+    check(HUD._RendOverrideHit(nil, "Orgrimmar", 0.5, 0.47) == false,
+        "no overrides configured is not a match")
+
+    -- ── F11 — ZG is ALWAYS main ──────────────────────────────────────────────
+    local savedZone = _G.GetRealZoneText
+    _G.GetRealZoneText = function() return "Winterspring" end
+    check(zoneRelevant("zg") == true, "ZG is main even from the far side of the world")
+    check(zoneRelevant("onyH") == false, "a normal buff is still zone-gated")
+    _G.GetRealZoneText = function() return "Orgrimmar" end
+    check(zoneRelevant("onyH") == true, "...and relevant in its own zone")
+    _G.GetRealZoneText = savedZone
+
     if verbose then ns:Print("  hud selftest " .. (pass and "PASS" or "FAIL")) end
     return pass
 end
@@ -1889,6 +2179,63 @@ ns:RegisterSelfTest("hudalerts", function(verbose)
         "the Barrens variant is untouched by its sibling's upgrade")
     check(#barrens.sources == 1 and barrens.sources[1] == "dbm",
         "sources do not leak across variants")
+
+    -- (5b) F4 — LANDING-BLIND fan-out, and the trust ladder it unlocks.
+    --
+    -- This is the whole finding in one case: a relay reports "rend, 17s" with no
+    -- landing. Before, that made a THIRD bar keyed plain "rend" that no local pop
+    -- could ever meet, so TrustAction had nothing to arbitrate and a boss-mod
+    -- guess sat on screen uncorrected next to two real bars.
+    HUD._ResetBarState(); lines = {}
+    HUD._OnPullDetected("rend", 17, "dbm", nil)          -- a landing-blind relay
+    check(HUD._BarCount() == 2, "a landing-blind rend report raises the variant PAIR")
+    check(HUD._BarInfo("rend") == nil, "and NO plain-keyed third bar (the F4 bug)")
+    local fOrg, fBar = HUD._BarInfo("rend:orgrimmar"), HUD._BarInfo("rend:barrens")
+    check(fOrg ~= nil and fBar ~= nil, "both landings exist under the shared keys")
+    check(near(fBar.remaining, 17), "the primary landing keeps the reported window")
+    check(near(fOrg.remaining, 6), "the sibling is derived from the same yell epoch")
+
+    -- The local witness now lands on the SAME keys, so the ladder is reachable.
+    HUD._OnPullDetected("rend", 5, "local", "Orgrimmar")
+    fOrg = HUD._BarInfo("rend:orgrimmar")
+    check(HUD._BarCount() == 2, "the local pop meets the relayed bar — no new bar")
+    check(fOrg.trust == "local", "trust arbitration is REACHABLE across sources")
+    check(near(fOrg.remaining, 5), "and the better epoch rewrites the window")
+    check(#fOrg.sources == 2, "the relay still counts as corroboration")
+    check(HUD.TrustNoticeFor(fOrg.trust, fOrg.sources) == "confirm",
+        "a corroborated bar confirms instead of warning")
+
+    -- An observer zone is NOT landing info: it must fan out, not key a third bar.
+    HUD._ResetBarState(); lines = {}
+    HUD._OnPullDetected("rend", 17, "nwb", "Durotar")
+    check(HUD._BarCount() == 2, "a non-variant zone string fans out (observer zone)")
+    check(HUD._BarInfo("rend") == nil, "...and never keys a plain 'rend' bar")
+
+    -- A single-landing buff is untouched by any of this.
+    HUD._ResetBarState(); lines = {}
+    HUD._OnPullDetected("onyH", 14.5, "nwb", nil)
+    check(HUD._BarCount() == 1 and HUD._BarInfo("onyH") ~= nil,
+        "a single-landing buff still raises exactly one plain-keyed bar")
+
+    -- (5c) F9 — the trust notice is CHAT, so it obeys the raid chat override.
+    -- It used to reach ns:Print directly: a raider who had suppressed alert chat
+    -- still got "[Intercepted DBM] Rend — no local or NWB confirmation." mid-pull.
+    HUD._ResetBarState(); setRaid(true)
+    ts.raidDisable.chat = true                       -- suppress chat in raid
+    lines = {}
+    HUD._TrustNotice("rend", "dbm", "warn", {})
+    check(#lines == 0, "in raid with chat suppressed, the trust notice is silent")
+
+    ts.raidDisable.chat = false                      -- owner re-opens raid chat
+    lines = {}
+    HUD._TrustNotice("rend", "dbm", "warn", {})
+    check(#lines == 1 and lines[1]:find("Intercepted", 1, true) ~= nil,
+        "re-opening raid chat lets the same notice through")
+
+    setRaid(false); lines = {}
+    HUD._TrustNotice("onyH", "dbm", "warn", {})
+    check(#lines == 1, "outside a raid the notice always speaks")
+    ts.raidDisable.chat = false
 
     -- (6) A12.4 — buff-gain attribution end to end through the dispatcher.
     HUD._ResetBarState(); lines = {}

@@ -533,19 +533,48 @@ function Store.SeedAutoSummonDefaults(db)
     end
 end
 
--- Default coordinate overrides (spec: up to 15; ships with the three
--- canonical staging/DMF rules). Each rule maps a zone + coord box to a
--- human label shown in the dashboard location column.
+-- Default coordinate overrides (spec: up to 15; ships with the three canonical
+-- staging/DMF rules). Each rule maps an optional zone + coord box to a human
+-- label shown in the dashboard location column.
+--
+-- A17.3 — these seeds shipped ~12x oversized. The reference defines each default
+-- as a POINT + tolerance 0.02 (a 0.04 x 0.04 box, ~0.16% of the map); ours were
+-- hand-written as 0.25 x 0.25 / 0.20 x 0.20 rectangles, so a quarter of Orgrimmar
+-- matched "Rend North Staging" and characters standing anywhere near the middle
+-- of the city reported their location as "Rend Staging (N)". The centres had
+-- drifted too — every one of the three was wrong, not merely wide.
+--
+-- Both are now taken from the reference's three default rules:
+--     Rend North   (0.509452, 0.475196) tol 0.02
+--     Rend South   (0.491113, 0.683181) tol 0.02
+--     Mulgore DMF  (0.447506, 0.592198) tol 0.02
+--
+-- ZONE SCOPING: the reference matches on coordinates alone. We keep our zone
+-- scope ONLY for the DMF rule, whose name names its zone. The two Rend rules are
+-- left UNSCOPED (`zone` omitted -> nil), because a wrong zone guess makes an
+-- override silently dead, and at ±0.02 the box is doing the work anyway. nil is
+-- deliberate rather than "": the location matcher treats nil as unscoped, while
+-- "" compares unequal to every real zone name.
+local COORD_TOL = 0.02
+local function box(x, y, tol)
+    tol = tol or COORD_TOL
+    return x - tol, x + tol, y - tol, y + tol
+end
+
 local function defaultCoordinateOverrides()
+    local nX1, nX2, nY1, nY2 = box(0.509452, 0.475196)
+    local sX1, sX2, sY1, sY2 = box(0.491113, 0.683181)
+    local mX1, mX2, mY1, mY2 = box(0.447506, 0.592198)
     return {
-        { name = "Rend North Staging", zone = "Orgrimmar",
-          minX = 0.30, maxX = 0.55, minY = 0.55, maxY = 0.80, label = "Rend Staging (N)" },
-        { name = "Rend South Staging", zone = "Durotar",
-          minX = 0.40, maxX = 0.60, minY = 0.10, maxY = 0.30, label = "Rend Staging (S)" },
+        { name = "Rend North Staging",
+          minX = nX1, maxX = nX2, minY = nY1, maxY = nY2, label = "Rend Staging (N)" },
+        { name = "Rend South Staging",
+          minX = sX1, maxX = sX2, minY = sY1, maxY = sY2, label = "Rend Staging (S)" },
         { name = "DMF Mulgore", zone = "Mulgore",
-          minX = 0.30, maxX = 0.50, minY = 0.55, maxY = 0.75, label = "Darkmoon Faire" },
+          minX = mX1, maxX = mX2, minY = mY1, maxY = mY2, label = "Darkmoon Faire" },
     }
 end
+Store.DefaultCoordinateOverrides = defaultCoordinateOverrides
 
 -- Default class hex colors (Blizzard Classic palette). Kept as an
 -- override table; the dashboard falls back to RAID_CLASS_COLORS when a
@@ -594,13 +623,26 @@ local ALERT_EVENT_SOUND = {
     buffGain     = "CheckboxOn",
 }
 
+-- F12 (spec §11): "Nefarian quest hand-in additionally flashes." The Nef hand-in
+-- is the one event a raid lead can miss while tabbed out — it is not on a
+-- cooldown clock, so there is no second chance to catch it — and it is the only
+-- row the reference ships with the client-icon flash channel on by default.
+local ALERT_DEFAULT_FLASH = {
+    questHandin = { nefH = true, nefA = true },
+}
+
 local function defaultAlertMatrix()
     local matrix = {}
     for _, evt in ipairs(ALERT_EVENT_TYPES) do
         local perBuff = {}
         local snd = ALERT_EVENT_SOUND[evt] or "RaidWarning"
+        local flashRows = ALERT_DEFAULT_FLASH[evt]
         for _, buff in ipairs(ALERT_EVENT_BUFFS[evt]) do
-            perBuff[buff] = { notify = true, chat = false, flash = false, sound = snd }
+            perBuff[buff] = {
+                notify = true, chat = false,
+                flash  = (flashRows and flashRows[buff]) == true,
+                sound  = snd,
+            }
         end
         matrix[evt] = perBuff
     end
@@ -894,6 +936,70 @@ function Store.MigrateSongflowerDefaults(db)
 end
 
 ----------------------------------------------------------------------
+-- A17.3 — coordinate-override box correction.
+--
+-- The three seeded rules shipped with rectangles ~12x the reference's ±0.02
+-- tolerance (and drifted centres), so a character standing in mid-Orgrimmar was
+-- labelled "Rend Staging (N)". Existing saves already hold the bad boxes, so the
+-- seed fix alone heals nobody who has logged in.
+--
+-- MATCH-BY-VALUE, exactly like MigrateSongflowerDefaults: a stored rule is
+-- rewritten ONLY when its name is one of ours AND all four of its bounds still
+-- equal the old shipped literals. Anyone who nudged a box — even by one axis —
+-- has expressed intent and is left completely alone. That makes this safe to run
+-- unconditionally and idempotent (after the rewrite the bounds no longer match,
+-- so a second pass is a no-op) with no marker flag to maintain.
+----------------------------------------------------------------------
+
+-- The exact rectangles the bad build shipped. Keyed by rule name.
+local LEGACY_COORD_BOXES = {
+    ["Rend North Staging"] = { minX = 0.30, maxX = 0.55, minY = 0.55, maxY = 0.80 },
+    ["Rend South Staging"] = { minX = 0.40, maxX = 0.60, minY = 0.10, maxY = 0.30 },
+    ["DMF Mulgore"]        = { minX = 0.30, maxX = 0.50, minY = 0.55, maxY = 0.75 },
+}
+
+-- Float compare against stored literals; they round-trip exactly through the SV
+-- writer, but an epsilon costs nothing and survives a reformat.
+local function sameCoord(a, b)
+    return type(a) == "number" and math.abs(a - b) < 1e-9
+end
+
+local function isLegacyCoordBox(rule)
+    local old = rule and rule.name and LEGACY_COORD_BOXES[rule.name]
+    if not old then return false end
+    return sameCoord(rule.minX, old.minX) and sameCoord(rule.maxX, old.maxX)
+       and sameCoord(rule.minY, old.minY) and sameCoord(rule.maxY, old.maxY)
+end
+Store._IsLegacyCoordBox = isLegacyCoordBox
+
+function Store.MigrateCoordinateOverrides(db)
+    if type(db) ~= "table" then return 0 end
+    local list = db.coordinateOverrides
+    if type(list) ~= "table" then return 0 end
+
+    -- Index the corrected seeds by name so each stored rule heals to its own.
+    local fresh = {}
+    for _, r in ipairs(defaultCoordinateOverrides()) do fresh[r.name] = r end
+
+    local fixed = 0
+    for i = 1, #list do
+        local rule = list[i]
+        if type(rule) == "table" and isLegacyCoordBox(rule) then
+            local new = fresh[rule.name]
+            if new then
+                rule.minX, rule.maxX = new.minX, new.maxX
+                rule.minY, rule.maxY = new.minY, new.maxY
+                -- The two Rend rules become unscoped along with their geometry;
+                -- the stored zone was part of the same wrong seed.
+                rule.zone = new.zone
+                fixed = fixed + 1
+            end
+        end
+    end
+    return fixed
+end
+
+----------------------------------------------------------------------
 -- Notes migration (replaces the per-character location-override concept).
 --
 -- The manual-location override is retired in favour of a free-text note. This
@@ -953,6 +1059,9 @@ function Store.Init()
     -- Rewrite any SV still holding the wrong songflower defaults (120/5 -> 1500/0)
     -- before defaults backfill; user-customized values are left untouched.
     Store.MigrateSongflowerDefaults(DaseekiNexusDB)
+    -- A17.3: shrink the three oversized seeded coordinate boxes to the reference
+    -- ±0.02 tolerance. Match-by-value, so user-edited boxes are never touched.
+    Store.MigrateCoordinateOverrides(DaseekiNexusDB)
 
     applyDefaults(DaseekiNexusDB, defaultSettings())
     DaseekiNexusDB.settingsVersion = Store.SETTINGS_VERSION
@@ -2063,8 +2172,34 @@ end
 -- Retention: timer logs (cap 15, 48h expiry, 30s dedup)
 ----------------------------------------------------------------------
 
+-- F10 — an entry's KIND. Spec §10.1 dedups "of the same kind for Ony — pop vs
+-- kill", so a kill and a pop 5s apart are two real events, while two reports of
+-- the same kill are one. Normalized to a boolean so nil / false / absent all
+-- read alike.
+local function logKind(entry)
+    return (entry and entry.killed) and true or false
+end
+
+-- F10 — is a stored `who` actually missing? The wire carries "?" for "a pop
+-- happened but nobody knows who", so it is absence, not a name.
+local function whoMissing(who)
+    return who == nil or who == "" or who == "?"
+end
+Store._LogKind, Store._WhoMissing = logKind, whoMissing
+
 -- Insert a log entry newest-first with dedup + expiry + cap. `entry` is
 -- { epoch, who, killed?/quest? }. Returns true if inserted.
+--
+-- F10 — dedup keys on EPOCH ±30s + KIND, per spec §10.1. It used to also require
+-- `e.who == entry.who`, which made the identity of an event include who reported
+-- it: one Rend pop arriving from Thrall's yell, the world-buff addon's log, the
+-- mesh and SN produced FOUR rows in the pop log (different `who` each time), and
+-- every consumer that counts entries or reads "the newest pop" saw a log full of
+-- phantom pops. Same epoch window + same kind is the SAME EVENT no matter who
+-- says so; the extra reports now merge into the stored row:
+--   * the HIGHER epoch wins (the later report is the better-resolved timestamp)
+--   * a missing `who` ("?" or absent) is BACK-FILLED from whoever does know
+-- so the merged row is strictly more informative than either report alone.
 function Store.AddTimerLog(logKey, entry)
     local logs = Store.data.timers.logs
     local list = logs[logKey]
@@ -2073,11 +2208,16 @@ function Store.AddTimerLog(logKey, entry)
         logs[logKey] = list
     end
     local now = entry.epoch or serverNow()
-    -- Dedup: same source within the dedup window is a duplicate report.
+    local kind = logKind(entry)
     for i = 1, #list do
         local e = list[i]
         if math.abs((e.epoch or 0) - now) <= LOG_DEDUP_WINDOW
-           and e.who == entry.who then
+           and logKind(e) == kind then
+            -- Duplicate of a known event: merge rather than drop outright.
+            if now > (e.epoch or 0) then e.epoch = now end
+            if whoMissing(e.who) and not whoMissing(entry.who) then
+                e.who = entry.who
+            end
             return false
         end
     end
@@ -3938,6 +4078,165 @@ local function testSelfBucketSanity(fails)
     Store._ghostLog     = savedLog
 end
 
+-- F10 — timer-log dedup (spec §10.1). The identity of a pop is EPOCH ±30s +
+-- KIND. It used to include `who`, so the same pop reported by the local yell,
+-- the world-buff addon's log, the mesh and SN landed as four separate rows and
+-- every "when did Rend last pop" reader saw phantom pops.
+local function testTimerLogDedup(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+
+    local savedTimers = Store.data and Store.data.timers
+    Store.data = Store.data or {}
+    -- Base on the real clock: TrimLog purges anything older than 48h, so a
+    -- synthetic small epoch would be deleted the moment it was inserted.
+    local T = Store.Now()
+    local function reset() Store.data.timers = { logs = {} } end
+    local function rows(k) return Store.data.timers.logs[k] or {} end
+
+    ------------------------------------------------------------------
+    -- 1. THE BUG: one pop, four reporters, four different `who`.
+    ------------------------------------------------------------------
+    reset()
+    ck(Store.AddTimerLog("rend", { epoch = T,      who = "Thrall"   }) == true,
+        "the first report inserts")
+    ck(Store.AddTimerLog("rend", { epoch = T + 3,  who = "NWBlog"   }) == false,
+        "the world-buff addon's relay of the same pop is a duplicate")
+    ck(Store.AddTimerLog("rend", { epoch = T + 11, who = "MeshPeer" }) == false,
+        "the mesh relay is a duplicate")
+    ck(Store.AddTimerLog("rend", { epoch = T + 29, who = "SN"       }) == false,
+        "an SN relay still inside 30s is a duplicate")
+    ck(#rows("rend") == 1, "one pop logs exactly ONE row (was 4)")
+    ck(rows("rend")[1].epoch == T + 29, "the merged row keeps the HIGHEST epoch")
+    ck(rows("rend")[1].who == "Thrall", "an established who is never overwritten")
+
+    ------------------------------------------------------------------
+    -- 2. `who` back-fill: "?" / "" / nil are absence, not a name.
+    ------------------------------------------------------------------
+    for _, blank in ipairs({ "?", "", "\0nil" }) do
+        reset()
+        local first = { epoch = T }
+        if blank ~= "\0nil" then first.who = blank end
+        Store.AddTimerLog("rend", first)
+        Store.AddTimerLog("rend", { epoch = T + 5, who = "Ragefire" })
+        ck(#rows("rend") == 1, "the anonymous row absorbs the named report")
+        ck(rows("rend")[1].who == "Ragefire",
+            "a missing who (" .. blank .. ") is back-filled from whoever knows")
+    end
+
+    ------------------------------------------------------------------
+    -- 3. Outside the window is a genuinely new event.
+    ------------------------------------------------------------------
+    reset()
+    Store.AddTimerLog("rend", { epoch = T })
+    ck(Store.AddTimerLog("rend", { epoch = T + 31 }) == true,
+        "31s apart is a second event, not a duplicate")
+    ck(#rows("rend") == 2, "and both rows are kept")
+
+    ------------------------------------------------------------------
+    -- 4. KIND separates an Ony NPC kill from an Ony pop inside the window.
+    ------------------------------------------------------------------
+    reset()
+    ck(Store.AddTimerLog("onyH", { epoch = T, killed = true }) == true,
+        "a kill logs")
+    ck(Store.AddTimerLog("onyH", { epoch = T + 5 }) == true,
+        "a pop 5s after the kill is a DIFFERENT kind, not a duplicate")
+    ck(#rows("onyH") == 2, "kill and pop coexist")
+    ck(Store.AddTimerLog("onyH", { epoch = T + 6, killed = true }) == false,
+        "a second report of the KILL is a duplicate of the kill")
+    ck(#rows("onyH") == 2, "...and adds no row")
+
+    if savedTimers then Store.data.timers = savedTimers end
+end
+
+-- A17.3 — coordinate-override boxes. The seeds shipped ~12x the reference
+-- tolerance AND with drifted centres, so a character in mid-Orgrimmar reported
+-- their location as "Rend Staging (N)".
+local function testCoordinateOverrides(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+
+    local function inBox(r, x, y)
+        return x >= r.minX and x <= r.maxX and y >= r.minY and y <= r.maxY
+    end
+
+    ------------------------------------------------------------------
+    -- 1. Every seed is a ±0.02 box centred on the reference point.
+    ------------------------------------------------------------------
+    local d = Store.DefaultCoordinateOverrides()
+    ck(#d == 3, "three rules ship by default")
+    local CENTRES = {
+        ["Rend North Staging"] = { 0.509452, 0.475196 },
+        ["Rend South Staging"] = { 0.491113, 0.683181 },
+        ["DMF Mulgore"]        = { 0.447506, 0.592198 },
+    }
+    for _, r in ipairs(d) do
+        local c = CENTRES[r.name]
+        ck(c ~= nil, "seed '" .. tostring(r.name) .. "' is a known rule")
+        if c then
+            ck(math.abs((r.maxX - r.minX) - 0.04) < 1e-9, r.name .. ": X span is the ±0.02 tolerance")
+            ck(math.abs((r.maxY - r.minY) - 0.04) < 1e-9, r.name .. ": Y span is the ±0.02 tolerance")
+            ck(math.abs((r.minX + r.maxX) / 2 - c[1]) < 1e-9, r.name .. ": centred on the reference X")
+            ck(math.abs((r.minY + r.maxY) / 2 - c[2]) < 1e-9, r.name .. ": centred on the reference Y")
+            ck(inBox(r, c[1], c[2]), r.name .. ": the staging point itself matches")
+        end
+    end
+    ck(d[1].zone == nil and d[2].zone == nil, "the two Rend rules are unscoped (nil, not \"\")")
+    ck(d[3].zone == "Mulgore", "the DMF rule keeps the zone its name states")
+
+    ------------------------------------------------------------------
+    -- 2. Point-in-box matrix — the live symptom.
+    ------------------------------------------------------------------
+    local north  = d[1]
+    local LEGACY = { minX = 0.30, maxX = 0.55, minY = 0.55, maxY = 0.80 }
+    ck(inBox(LEGACY, 0.45, 0.60),
+        "mid-Orgrimmar DID match the old oversized seed (this was the bug)")
+    ck(not inBox(north, 0.45, 0.60),
+        "mid-Orgrimmar no longer matches Rend Staging (N)")
+    ck(not inBox(north, 0.509452, 0.560000), "a point 0.085 north of the spot misses")
+    ck(inBox(north, 0.509452 + 0.019, 0.475196), "just inside the tolerance still hits")
+
+    ------------------------------------------------------------------
+    -- 3. Migration: match-by-value only, idempotent, user edits untouched.
+    ------------------------------------------------------------------
+    local db = { coordinateOverrides = {
+        { name = "Rend North Staging", zone = "Orgrimmar", minX = 0.30, maxX = 0.55, minY = 0.55, maxY = 0.80, label = "Rend Staging (N)" },
+        { name = "Rend South Staging", zone = "Durotar",   minX = 0.40, maxX = 0.60, minY = 0.10, maxY = 0.30, label = "Rend Staging (S)" },
+        { name = "DMF Mulgore",        zone = "Mulgore",   minX = 0.30, maxX = 0.50, minY = 0.55, maxY = 0.75, label = "Darkmoon Faire" },
+    } }
+    ck(Store.MigrateCoordinateOverrides(db) == 3, "all three legacy boxes are rewritten")
+    local m = db.coordinateOverrides
+    ck(math.abs(m[1].minX - (0.509452 - 0.02)) < 1e-9, "north healed to the reference box")
+    ck(m[1].zone == nil, "the migrated Rend rule becomes unscoped")
+    ck(m[3].zone == "Mulgore", "the migrated DMF rule keeps its zone")
+    ck(m[1].label == "Rend Staging (N)", "labels are presentation — never rewritten")
+    ck(Store.MigrateCoordinateOverrides(db) == 0, "idempotent: a second pass changes nothing")
+
+    local edited = { coordinateOverrides = {
+        { name = "Rend North Staging", zone = "Orgrimmar",
+          minX = 0.31, maxX = 0.55, minY = 0.55, maxY = 0.80, label = "mine" },
+    } }
+    ck(Store.MigrateCoordinateOverrides(edited) == 0,
+        "one nudged bound is user intent — the rule is left alone")
+    ck(edited.coordinateOverrides[1].minX == 0.31, "...and is genuinely unmodified")
+
+    ------------------------------------------------------------------
+    -- 4. Robustness.
+    ------------------------------------------------------------------
+    Store.MigrateCoordinateOverrides(nil)
+    Store.MigrateCoordinateOverrides({})
+    Store.MigrateCoordinateOverrides({ coordinateOverrides = "nope" })
+    Store.MigrateCoordinateOverrides({ coordinateOverrides = { "junk", {}, { name = "x" } } })
+    ck(true, "MigrateCoordinateOverrides survives malformed input")
+
+    ------------------------------------------------------------------
+    -- 5. F12 — the Nef quest hand-in rows flash by default (spec §11).
+    ------------------------------------------------------------------
+    local alerts = defaultAlertMatrix()
+    ck(alerts.questHandin.nefH.flash == true, "Nef Horde hand-in flashes by default")
+    ck(alerts.questHandin.nefA.flash == true, "Nef Alliance hand-in flashes by default")
+    ck(alerts.questHandin.rend.flash == false, "every other hand-in row stays unflashed")
+    ck(alerts.pullTimer.nefH.flash == false, "the flash default is hand-in only, not Nef-wide")
+end
+
 function Store.RunSelfTests(verbose)
     local suites = {
         { name = "defaults",        fn = testDefaults },
@@ -3954,6 +4253,8 @@ function Store.RunSelfTests(verbose)
         { name = "manifest ghost cleanup (B4)", fn = testManifestGhostCleanup },
         { name = "stale-twin reconciliation (B5)", fn = testStaleTwins },
         { name = "self-bucket sanity (B5.1)", fn = testSelfBucketSanity },
+        { name = "timer log dedup (F10)", fn = testTimerLogDedup },
+        { name = "coordinate overrides (A17.3)", fn = testCoordinateOverrides },
     }
     local allPass = true
     for _, suite in ipairs(suites) do
