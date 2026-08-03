@@ -297,6 +297,12 @@ local WARNED_BUFFS = { "rend", "onyH", "onyA" }
 -- passively-ingested ShadowNetwork broadcast source (snbridge.lua): trusted
 -- above NWB/DBM (it is another player's merged, human-confirmed feed) but
 -- below our own mesh peers (shared-token, first-party) and local detection.
+--
+-- "dbm" keeps its rung but no longer produces anchors at all: DBM's boss-kill
+-- and combat-start syncs describe a raid boss, not a world-buff drop, and both
+-- are now non-anchoring hints (F2/F5). The rank stays so a legacy anchor that
+-- still carries the tag (an old SavedVariables log entry) arbitrates as the
+-- weakest source rather than as an unknown one, which ranks 0.
 local TRUST_RANK = { ["local"] = 5, mesh = 4, sn = 3, nwb = 2, dbm = 1 }
 Timers.TRUST_RANK = TRUST_RANK
 
@@ -346,8 +352,30 @@ Timers._noteFreshness = noteFreshness
 Timers.state = {}
 
 -- Announcer respawn after a kill (spec §10.2). Not a cooldown.
+--
+-- TWO-PHASE MODEL (F12). 360s is NOT "dead then instantly back": it is the
+-- CERTAIN-DEAD phase, after which the announcer returns at a RANDOM time inside
+-- the following 120s window (NWB_BEHAVIOR_SPEC §3.4 — the 360s message is
+-- literally "will respawn at a random time within the next 2 minutes"). The
+-- availability MODEL flips at 360 (nothing blocks a drop from that instant), but
+-- a display that says a flat "Open" at 360 is over-promising, so BuffStatus
+-- exposes the phase alongside the state: "dead" (< 360), "window" (360..480 —
+-- can pop, announcer may still be walking back), "open" (>= 480).
 local ANNOUNCER_RESPAWN = 360
 Timers.ANNOUNCER_RESPAWN = ANNOUNCER_RESPAWN
+local ANNOUNCER_RESPAWN_WINDOW = 120
+Timers.ANNOUNCER_RESPAWN_WINDOW = ANNOUNCER_RESPAWN_WINDOW
+
+-- kind="killed" MEANS ONE THING: an ANNOUNCER NPC died (F2). Only these four
+-- buffs have an announcer whose death is a real, observable respawn event
+-- (Overlord Runthak / Major Mattingly / High Overlord Saurfang / Field Marshal
+-- Afrasiabi-Stonebridge). Rend and Zandalar have NO announcer NPC at all: the
+-- only "kill" in their world is the RAID BOSS dying (Rend Blackhand, Hakkar),
+-- which is a completely different event — it is not a drop and it starts no
+-- respawn. Every path that can produce a kill record is gated on this set, so a
+-- boss-kill report can never plant a phantom 6-minute respawn on Rend or ZG.
+local ANNOUNCER_BUFFS = { onyH = true, onyA = true, nefH = true, nefA = true }
+Timers.ANNOUNCER_BUFFS = ANNOUNCER_BUFFS
 
 local function stateOf(buffKey)
     local s = Timers.state[buffKey]
@@ -397,39 +425,95 @@ end
 -- Public buff readout (spec §10.2). This — not raw ComputeCD — is the correct
 -- source for "what should the UI say about this buff":
 --   nodata  : nothing observed
---   killed  : the announcer died and is still respawning (remaining <= 360s)
---   canpop  : off cooldown / respawn elapsed
+--   killed  : the announcer died and is still inside its certain-dead phase
+--   canpop  : off cooldown AND past the certain-dead phase
 --   cd      : on cooldown, `remaining` seconds left
--- A kill NEWER than the newest pop wins and models a 360s RESPAWN; once that
--- elapses the buff is immediately can-pop (A3.1). Kills never start a cooldown.
+--
+-- F3 — THE LONGER CONSTRAINT WINS, not the newest event. The old rule was "a
+-- kill newer than the newest pop wins", which let killing the announcer ERASE a
+-- live multi-hour cooldown from the readout: kill Runthak two minutes after an
+-- Onyxia drop and the UI said "killed, back in 6 minutes" when the buff was in
+-- fact five hours and fifty-eight minutes away. A kill and a cooldown are two
+-- INDEPENDENT gates on the same question ("when can this buff drop again"), so
+-- the answer is whichever gate clears LAST — regardless of which was recorded
+-- most recently. Kills still never start a cooldown (A3.1); they simply cannot
+-- shorten one either.
+--
+-- DISPLAY_GRACE is applied HERE and only here (SN spec §10.2: raw 10800s /
+-- display 10805s). The +5s absorbs detection lag and clock drift so a bar does
+-- not blink to "open" a heartbeat before the last relay of the same drop lands.
+-- The false-positive gate deliberately keeps using the RAW cooldown.
+--
+-- Extra fields when a kill is in play (additive; existing readers ignore them):
+--   phase          "dead" | "window" | "open"   (F12 two-phase respawn)
+--   windowEndsAt   epoch at which the announcer is certainly back
+--   windowRemaining seconds left of the 120s random window (0 outside it)
 function Timers.BuffStatus(buffKey, t)
     t = t or now()
     local s = Timers.state[buffKey]
     local pop    = (s and s.lastPop) or 0
     local killed = (s and s.killedAt) or 0
-    if killed > 0 and killed >= pop then
-        local remaining = ANNOUNCER_RESPAWN - (t - killed)
-        if remaining > 0 then
-            return { state = "killed", remaining = remaining,
-                     nextAt = killed + ANNOUNCER_RESPAWN }
+
+    -- Kill gate: certain-dead until +360, random window until +480.
+    local killEndsAt, windowEndsAt, phase, windowRemaining = 0, 0, nil, 0
+    if killed > 0 then
+        killEndsAt   = killed + ANNOUNCER_RESPAWN
+        windowEndsAt = killEndsAt + ANNOUNCER_RESPAWN_WINDOW
+        if t < killEndsAt then
+            phase, windowRemaining = "dead", ANNOUNCER_RESPAWN_WINDOW
+        elseif t < windowEndsAt then
+            phase, windowRemaining = "window", windowEndsAt - t
+        else
+            phase, windowRemaining = "open", 0
         end
-        return { state = "canpop", remaining = 0, nextAt = killed + ANNOUNCER_RESPAWN }
     end
-    -- Cooldown-disabled buffs (Nefarian on Era) never report a cooldown. The
-    -- kill/respawn branch above still applies to them — only the CD model is
-    -- gone, so with no live kill they simply read as "no data".
-    if cdDisabled(buffKey) then return { state = "nodata", remaining = 0, nextAt = 0 } end
-    if pop <= 0 then return { state = "nodata", remaining = 0, nextAt = 0 } end
-    local info = Timers.ComputeCD(buffKey, pop, t)
-    if info.onCD then
-        return { state = "cd", remaining = info.remaining, nextAt = info.nextAt }
+
+    -- Cooldown gate: cooldown-disabled buffs (Nefarian on Era) have none.
+    local cdEndsAt = 0
+    if not cdDisabled(buffKey) and pop > 0 then
+        local info = Timers.ComputeCD(buffKey, pop, t)
+        cdEndsAt = (info.nextAt or 0) + DISPLAY_GRACE
     end
-    return { state = "canpop", remaining = 0, nextAt = info.nextAt }
+
+    if pop <= 0 and killed <= 0 then
+        return { state = "nodata", remaining = 0, nextAt = 0 }
+    end
+
+    local cdLive   = cdEndsAt > t
+    local killLive = killEndsAt > t
+    if cdLive and (not killLive or cdEndsAt >= killEndsAt) then
+        return { state = "cd", remaining = cdEndsAt - t, nextAt = cdEndsAt,
+                 phase = phase, windowEndsAt = (killed > 0) and windowEndsAt or nil,
+                 windowRemaining = windowRemaining }
+    end
+    if killLive then
+        return { state = "killed", remaining = killEndsAt - t, nextAt = killEndsAt,
+                 phase = phase, windowEndsAt = windowEndsAt,
+                 windowRemaining = windowRemaining }
+    end
+    -- Both gates clear. A cooldown-disabled buff with no kill has nothing to say
+    -- (its pop, if one ever reached state, models no countdown at all).
+    if cdEndsAt <= 0 and killed <= 0 then
+        return { state = "nodata", remaining = 0, nextAt = 0 }
+    end
+    return { state = "canpop", remaining = 0,
+             nextAt = math.max(cdEndsAt, killEndsAt),
+             phase = phase, windowEndsAt = (killed > 0) and windowEndsAt or nil,
+             windowRemaining = windowRemaining }
 end
 
 -- False-positive gate (pure). A fresh POP within a full CD of the current
 -- anchor is a duplicate report and is rejected. A KILL is a reset and is
--- always allowed to re-anchor. Grace is intentionally NOT applied here.
+-- always allowed to re-anchor. Grace is intentionally NOT applied here (the
+-- gate uses the RAW cooldown; only the readout gets DISPLAY_GRACE).
+--
+-- DIRECTION MATTERS (F1): this gate answers "is this report a duplicate of the
+-- anchor we already hold", which is only meaningful for an epoch AT OR AFTER the
+-- anchor. An OLDER epoch is a different question — "may this report move the
+-- anchor BACKWARDS" — and is answered by IsAnchorRewind below. Folding the two
+-- together (abs(delta) < cd) would reject legitimate corrections outright and
+-- still leave the rewind unguarded for deltas beyond a cooldown, which is
+-- exactly the hole that let an old NWB log entry rewind a fresh anchor.
 function Timers.IsFalsePositive(buffKey, anchor, newEpoch, isKill)
     if isKill then return false end
     local cd = CD[buffKey]
@@ -439,6 +523,24 @@ function Timers.IsFalsePositive(buffKey, anchor, newEpoch, isKill)
         return true
     end
     return false
+end
+
+-- Backwards-anchor guard (pure, F1). An anchor that moves BACKWARDS re-opens a
+-- cooldown that has already partly run, resurrects CD warnings that were
+-- correctly cancelled, and makes the pull-recency gate re-evaluate an older
+-- moment. It is essentially never right, and every bulk ingest path (an NWB
+-- timer log walked in wire order, a peer snapshot, an SN log array) can hand us
+-- an older epoch AFTER a newer one.
+--
+-- The one legitimate case is a CORRECTION from a source that outranks whoever
+-- set the anchor: our own eyes correcting a relayed guess. So an older epoch may
+-- replace the stored anchor ONLY when the new trust STRICTLY outranks the stored
+-- trust. Equal trust never rewinds — two reports of the same rank are two
+-- opinions, and the newer moment is the one already applied.
+function Timers.IsAnchorRewind(prevAnchor, newEpoch, trust, prevTrust)
+    if not prevAnchor or prevAnchor <= 0 then return false end
+    if not newEpoch or newEpoch >= prevAnchor then return false end
+    return trustRank(trust) <= trustRank(prevTrust)
 end
 
 ----------------------------------------------------------------------
@@ -475,12 +577,15 @@ local function raisePull(buffKey, epoch, window, trust, zone, yellNum)
 end
 Timers._raisePull = raisePull
 
--- Public: raise a pull bar directly, bypassing the log/anchor path. Used by the
--- detectors that must bar WITHOUT recording a pop (Rend's second bar, the ZG
--- stage-2 bar, and the ZG quest hand-in).
-function Timers.RaisePull(buffKey, seconds, trust, zone, epoch, yellNum)
-    return raisePull(buffKey, epoch or now(), seconds, trust or "local", zone, yellNum)
-end
+-- (F13) `Timers.RaisePull` USED TO LIVE HERE and is deliberately gone. It was a
+-- published wrapper over `raisePull` with a DIFFERENT argument order, and it had
+-- exactly zero callers: every detector that bars without recording a pop (Rend's
+-- second bar, the ZG stage-2 bar, the ZG quest hand-in) calls the local
+-- `raisePull` directly, and no other file in the addon ever referenced it —
+--   grep -rn "RaisePull" --include=*.lua .   ->  the definition alone.
+-- A dead public surface with a mismatched signature is a trap for the next
+-- caller, so the trap is removed rather than documented. `Timers._raisePull`
+-- remains exposed for the self-tests.
 
 -- Soft-guarded alert emit. hud.lua owns the four-channel dispatcher and loads
 -- AFTER us, so this resolves at call time and degrades to a chat line.
@@ -530,6 +635,18 @@ function Timers.Record(buffKey, epoch, trust, who, kind, zone, pullDuration, yel
         return false, "cooldown disabled for this buff"
     end
 
+    -- F2 — ANNOUNCER-ONLY KILLS. `killed` writes the 6-minute respawn clock, so
+    -- it may only ever mean "the announcer NPC died". Rend and Zandalar have no
+    -- announcer; a "kill" reported for them is a RAID BOSS dying (Rend
+    -- Blackhand, Hakkar), which is not a drop and starts no respawn. Sources are
+    -- fixed at their own layer (DBM's boss-kill opcode no longer records at all,
+    -- snbridge maps a rendLog/zgLog `killed` flag to a pop) and this is the
+    -- backstop: rejected outright rather than silently reinterpreted, so a
+    -- future source cannot manufacture either a phantom respawn OR a pop anchor.
+    if isKill and not ANNOUNCER_BUFFS[buffKey] then
+        return false, "kill is announcer-only (" .. tostring(buffKey) .. " has no announcer)"
+    end
+
     local s = stateOf(buffKey)
     local prevAnchor = anchorEpoch(s)
     local prevTrust  = s.trust
@@ -558,6 +675,16 @@ function Timers.Record(buffKey, epoch, trust, who, kind, zone, pullDuration, yel
         if trustRank(trust) >= trustRank(prevTrust) and trust ~= prevTrust then
             s.confirmed = true
         end
+    end
+
+    -- F1 — NEVER REWIND AN ANCHOR. Checked against the anchor this write would
+    -- actually move (killedAt for a kill, lastPop for everything else), and only
+    -- a STRICTLY higher-trust source may pull one backwards. Without this, the
+    -- NWB timer log — an array walked in wire order — could hand Record a newer
+    -- entry and then an older one, and the older one won simply by arriving last.
+    local rewindPrev = isKill and (s.killedAt or 0) or prevAnchor
+    if Timers.IsAnchorRewind(rewindPrev, epoch, trust, prevTrust) then
+        return false, "older than the current anchor (no rewind)"
     end
 
     -- Apply the anchor. A kill stamps the RESPAWN clock (killedAt), never the
@@ -740,6 +867,56 @@ local function consumeHandinStash(buffKey, t)
 end
 Timers._consumeHandinStash = consumeHandinStash
 
+-- Non-consuming peek: is one of OUR OWN hand-ins still waiting for its yell?
+function Timers.HandinPending(buffKey, t)
+    local st = Timers._handinStash[buffKey]
+    if not st then return false end
+    return ((t or now()) - (st.at or 0)) <= HANDIN_STASH_TTL
+end
+
+----------------------------------------------------------------------
+-- Hand-in semantics — ONE definition for every source (F7)
+--
+-- A hand-in is not a drop. The head goes in, the announcer yells, and the buff
+-- lands ~13s later; the reference converts a logged hand-in to an assumed drop
+-- by adding 15s (13 measured + 2 leeway) and so do we — NWB_BEHAVIOR_SPEC §3.5.
+-- Before this, the lead was applied on exactly one path (the NWB timer log) and
+-- SN's quest-kind entries anchored at the raw hand-in second, so the same event
+-- reported by two sources produced two anchors 15s apart and the trust ladder
+-- arbitrated between a right answer and a wrong one.
+--
+-- The LOCAL rule (A4.1) additionally says a Rend hand-in never anchors by
+-- itself: we park the name and let the FOLLOWING yell anchor, because a hand-in
+-- that never produces a buff (raid wipes, someone else beat us to it server-
+-- side) must not put us on a phantom 3h cooldown. A remote report cannot use the
+-- stash — its yell, if any, is heard by someone else — so it takes the matching
+-- rule: it is accepted ONLY while no local hand-in of ours is pending. If one
+-- is, our own yell is seconds away carrying a better epoch and better
+-- attribution, and this report would just be a worse duplicate of it.
+--
+-- LOCAL hand-ins deliberately do NOT route here: Timers.OnQuestHandin sees the
+-- hand-in as it happens and owns the stash/alert/zone rules.
+local HANDIN_LEAD = 15
+Timers.HANDIN_LEAD = HANDIN_LEAD
+
+-- Assumed DROP epoch for a hand-in reported at `handinEpoch` (pure).
+function Timers.AssumedDropEpoch(handinEpoch)
+    return (tonumber(handinEpoch) or 0) + HANDIN_LEAD
+end
+
+-- Apply a hand-in reported by a REMOTE source. `handinEpoch` is the RAW hand-in
+-- time; the lead is applied here so no caller can double-apply it. Records as
+-- kind "quest" (so the store log still marks it a hand-in) and never bars.
+function Timers.RecordHandinReport(buffKey, handinEpoch, trust, who, zone, t)
+    handinEpoch = tonumber(handinEpoch)
+    if not handinEpoch or handinEpoch <= 0 then return false, "no hand-in epoch" end
+    if Timers.HandinPending(buffKey, t) then
+        return false, "local hand-in pending (its yell anchors)"
+    end
+    return Timers.Record(buffKey, Timers.AssumedDropEpoch(handinEpoch), trust, who,
+                         "quest", zone, nil, nil, { noPull = true })
+end
+
 -- Raise Rend's TWO stage-1 bars (Orgrimmar + Barrens). hud.lua now keys bars by
 -- buff + landing zone, so both bars live concurrently and emit ORDER carries no
 -- meaning — the old fire-the-player's-own-zone-LAST reorder (which existed only
@@ -899,16 +1076,46 @@ local function onCombatLog()
     Timers.OnAnnouncerDeath(buffKey, destName)
 end
 
+-- Generation token per buff for the armed respawn alert (F6). A second kill of
+-- the same announcer must cancel the first arm rather than fire two alerts.
+Timers._respawnGen = {}
+
 -- An announcer death is a RESPAWN event, not a cooldown start: it logs a
 -- `killed` entry, alerts, and broadcasts, and the readout becomes
--- "NPC killed — respawns in <t>" for 360s and then plain can-pop (A3.1).
--- It raises no pull bar (Record only bars on a pop).
+-- "NPC killed — respawns in <t>" for 360s and then the 120s random window
+-- (A3.1 + F12). It raises no pull bar (Record only bars on a pop).
+--
+-- F6 — the alerts matrix has an `npcRespawned` category and NOTHING ever fired
+-- it: we announced the death and then went silent through the entire respawn,
+-- so the one moment the player actually cares about (the announcer is back, go
+-- hand in) never reached them. The arm is a plain C_Timer.After at the end of
+-- the certain-dead phase, guarded by a per-buff generation token exactly as the
+-- CD-warning scheduler is, so a re-kill or a state reset cancels it.
 function Timers.OnAnnouncerDeath(buffKey, destName, t)
     t = t or now()
-    Timers.Record(buffKey, t, "local", destName, "killed",
-                  GetRealZoneText and GetRealZoneText() or nil)
+    local applied = Timers.Record(buffKey, t, "local", destName, "killed",
+                                  GetRealZoneText and GetRealZoneText() or nil)
     notify(buffKey, "npcDied",
         (destName or buffLabelOf(buffKey)) .. " was killed — respawns in about 6 minutes.")
+    if applied then Timers.ArmRespawnAlert(buffKey, destName, t) end
+    return true
+end
+
+-- Arm the npcRespawned alert for the end of the certain-dead phase. Exposed so
+-- the self-tests can drive it with a stubbed C_Timer.
+function Timers.ArmRespawnAlert(buffKey, destName, t)
+    local gen = (Timers._respawnGen[buffKey] or 0) + 1
+    Timers._respawnGen[buffKey] = gen
+    if not (C_Timer and C_Timer.After) then return false end
+    local delay = (t or now()) + ANNOUNCER_RESPAWN - now()
+    if delay < 0 then delay = 0 end
+    C_Timer.After(delay, function()
+        -- Stale arm guard: a newer kill (or a state reset) re-seeded this buff.
+        if Timers._respawnGen[buffKey] ~= gen then return end
+        notify(buffKey, "npcRespawned",
+            (destName or buffLabelOf(buffKey))
+            .. " is due back — respawning at a random time in the next 2 minutes.")
+    end)
     return true
 end
 
@@ -1035,6 +1242,67 @@ local function creditPullLand(prefix, landTime)
 end
 Timers._creditPullLand = creditPullLand
 
+----------------------------------------------------------------------
+-- Local buff GAIN (F6) — spec §11
+--
+-- The buff landing on US is the highest-confidence observation this addon can
+-- make: no yell to parse, no relay to trust, the aura is on the player frame.
+-- Two things were missing from it.
+--
+--  1. `BUFF_GAIN` was a seam with no producer. hud.lua has listened for it
+--     since A12.4 (its alerts matrix carries a buffGain category); nothing ever
+--     fired it, so "you got the buff" was the one event the alert framework
+--     could not report. We fire it here, after crediting the pull observation,
+--     with the buff key and the label so the HUD can alert without a lookup.
+--
+--  2. The gain never reached the pop log. Spec §11: gaining Rend or Onyxia
+--     locally also adds a log entry, DEDUPLICATED against the mesh/third-party
+--     sources. The store's own dedup is (epoch within 30s AND same `who`), and
+--     a gain's `who` is the player while the pop's `who` is the announcer — so
+--     handing it straight to AddTimerLog would double-log every witnessed drop.
+--     We therefore dedup on TIME ALONE here: the entry is written only when no
+--     existing entry already covers that moment, which makes this a BACKFILL —
+--     it records the drops nobody reported, and stays silent for the ones
+--     already logged. Nefarian/ZG have no store log and are skipped by
+--     STORE_LOG_KEY, exactly as everywhere else.
+--
+-- No anchor is written: the aura is proof the buff exists, not proof of WHEN it
+-- dropped (a chronoboon restore, a summon, a late relog all land the same aura),
+-- and the pop path already owns the anchor. The unboon window is filtered before
+-- we are ever called.
+----------------------------------------------------------------------
+
+-- Dedup window for the gain backfill; matches the store's own log dedup.
+local GAIN_LOG_DEDUP = 30
+Timers.GAIN_LOG_DEDUP = GAIN_LOG_DEDUP
+
+-- True when the store's log for this buff already carries an entry within
+-- GAIN_LOG_DEDUP of `epoch` (from ANY source: local yell, mesh, SN, NWB).
+local function logCoversMoment(logKey, epoch)
+    if not (ns.Store and ns.Store.GetTimers) then return true end   -- no store: never log
+    local timers = ns.Store.GetTimers()
+    local list = timers and timers.logs and timers.logs[logKey]
+    if type(list) ~= "table" then return false end
+    for i = 1, #list do
+        if math.abs((list[i].epoch or 0) - epoch) <= GAIN_LOG_DEDUP then return true end
+    end
+    return false
+end
+
+-- Fire BUFF_GAIN and backfill the pop log for a world buff that just landed on
+-- the player. Returns true when the log entry was written.
+function Timers.NoteLocalBuffGain(buffKey, landTime)
+    landTime = landTime or now()
+    ns:Fire("BUFF_GAIN", buffKey, buffLabelOf(buffKey) .. " landed on you.", landTime)
+    local logKey = STORE_LOG_KEY[buffKey]
+    if not (logKey and ns.Store and ns.Store.AddTimerLog) then return false end
+    if logCoversMoment(logKey, landTime) then return false end
+    local who = (UnitName and UnitName("player")) or "you"
+    return ns.Store.AddTimerLog(logKey, {
+        epoch = landTime, who = who, trust = "local", gain = true,
+    }) and true or false
+end
+
 -- Is a boonable buff appearing right now a chronoboon RESTORE rather than a
 -- genuine fresh pickup? Spec §13: "a booned -> live transition is NEVER fresh,
 -- and boonable slots gaining during the 3 s unboon window are excluded."
@@ -1075,7 +1343,14 @@ local function onPlayerAura(event, unit)
         local nm = auraNorm(aura.name)
         for prefix in pairs(PULL_AURA_CANDIDATES) do
             if nm:find(prefix, 1, true) == 1 then
-                creditPullLand(prefix, landTime)
+                -- creditPullLand resolves WHICH buff this aura belongs to by the
+                -- pending-pull gate (Ony and Nef share one aura), so the gain
+                -- alert + log backfill hang off its verdict and inherit the same
+                -- attribution — never firing when we cannot say which buff it was.
+                local credited = creditPullLand(prefix, landTime)
+                if credited then
+                    ns:SafeCall(Timers.NoteLocalBuffGain, credited, landTime)
+                end
             end
         end
     end
@@ -1347,8 +1622,10 @@ local NWB_LOG_TIME  = "H"
 local NWB_LOG_LAYER = "I"
 local NWB_LOG_WHO   = "J"
 
--- Hand-in -> assumed drop offset (measured ~13s, +2s leeway).
-local NWB_HANDIN_LEAD = 15
+-- Hand-in -> assumed drop offset (measured ~13s, +2s leeway). This is now ONE
+-- constant shared by every hand-in path (F7); the old NWB-only name is kept as
+-- an alias so nothing that referenced it breaks.
+local NWB_HANDIN_LEAD = HANDIN_LEAD
 Timers.NWB_HANDIN_LEAD = NWB_HANDIN_LEAD
 
 -- Log entry type -> base buff, and whether the timestamp is a hand-in rather
@@ -1362,7 +1639,12 @@ local NWB_LOG_ENTRY = {
 }
 Timers._nwbLogEntry = NWB_LOG_ENTRY
 
--- Parse ONE log entry. Returns buffKey, epoch, who, layerID — or nil.
+-- Parse ONE log entry. Returns buffKey, epoch, who, layerID, isHandin — or nil.
+--
+-- `epoch` is the RAW logged timestamp. The hand-in -> assumed-drop lead is NOT
+-- applied here any more (F7): the caller learns it is looking at a hand-in from
+-- the fifth return and routes it through the one hand-in path, so the lead
+-- cannot be applied twice or forgotten on a new path.
 function Timers.ParseNWBLogEntry(entry, t)
     if type(entry) ~= "table" then return nil end
     local meta = NWB_LOG_ENTRY[entry[NWB_LOG_TYPE]]
@@ -1370,34 +1652,61 @@ function Timers.ParseNWBLogEntry(entry, t)
     local buffKey = dropBuffKey(meta.base)
     local epoch = nwbEpoch(entry[NWB_LOG_TIME], buffKey, t)
     if not epoch then return nil end
-    if meta.handin then epoch = epoch + NWB_HANDIN_LEAD end
     local who = entry[NWB_LOG_WHO]
-    return buffKey, epoch, (type(who) == "string" and who) or nil, entry[NWB_LOG_LAYER]
+    return buffKey, epoch, (type(who) == "string" and who) or nil,
+           entry[NWB_LOG_LAYER], meta.handin == true
 end
 
 -- Walk the `F` array of one data table. Returns the number of entries parsed.
+--
+-- F1 — PRE-SCAN, THEN RECORD ONCE PER BUFF. This used to Record EVERY entry in
+-- wire order, which was wrong in both directions: the newest entry raced the
+-- older ones through the false-positive gate (so which anchor survived depended
+-- on array order, not on time), and an older entry arriving last could rewind a
+-- fresh anchor outright. A log is a HISTORY, and the only thing in it that can
+-- inform the current anchor is its newest entry per buff — which is exactly the
+-- policy snbridge already applies to SN's log arrays. So: scan the whole array,
+-- keep max(epoch) per buff, and hand Record that one value.
+--
+-- Hand-in entries compete on their ASSUMED DROP epoch (raw + lead), because that
+-- is the moment they are claiming; whichever kind wins is then applied through
+-- its own path, so a winning hand-in still gets the stash rule.
 function Timers.IngestNWBTimerLog(tbl, applied, t)
     applied = applied or {}
     t = t or now()
     local log = (type(tbl) == "table") and tbl[NWB_LOG_KEY] or nil
     if type(log) ~= "table" then return 0 end
     local parsed = 0
-    -- The log is an ARRAY on the wire, so walk it in order: entry order decides
-    -- which timestamp reaches Record first, and therefore which one wins the
-    -- anchor and which is gated out as a within-cooldown duplicate.
+    local best = {}   -- buffKey -> { epoch, raw, who, handin }
+
     for _, entry in ipairs(log) do
-        local buffKey, epoch, who = Timers.ParseNWBLogEntry(entry, t)
+        local buffKey, epoch, who, _, isHandin = Timers.ParseNWBLogEntry(entry, t)
         if buffKey then
             parsed = parsed + 1
             if cdDisabled(buffKey) then
                 -- Nefarian log entries go the same way as Nefarian timers on Era.
                 applied.nefRejected = (applied.nefRejected or 0) + 1
             else
-                applied.log = (applied.log or 0) + 1
-                local ok = Timers.Record(buffKey, epoch, "nwb", who or "NWB log", "pop")
-                if ok then applied.logApplied = (applied.logApplied or 0) + 1 end
+                local effective = isHandin and Timers.AssumedDropEpoch(epoch) or epoch
+                local cur = best[buffKey]
+                if not cur or effective > cur.epoch then
+                    best[buffKey] = { epoch = effective, raw = epoch,
+                                      who = who, handin = isHandin }
+                end
             end
         end
+    end
+
+    for buffKey, b in pairs(best) do
+        applied.log = (applied.log or 0) + 1
+        local ok
+        if b.handin then
+            ok = Timers.RecordHandinReport(buffKey, b.raw, "nwb",
+                                           b.who or "NWB log", nil, t)
+        else
+            ok = Timers.Record(buffKey, b.epoch, "nwb", b.who or "NWB log", "pop")
+        end
+        if ok then applied.logApplied = (applied.logApplied or 0) + 1 end
     end
     return parsed
 end
@@ -1414,34 +1723,20 @@ local function readNWBTimerFields(tbl, applied, t, skipNodes)
     if type(tbl) ~= "table" then return false end
     t = t or now()
 
-    local v = Timers.ValidateNWBDrops(tbl, t)
-    if not v.ok then
-        -- Whole-table rejection: a claimed drop arrived with no witnessing yell.
-        applied.rejectedPayload = (applied.rejectedPayload or 0) + 1
-        applied.rejectReason = v.reason
-        return false
-    end
-    for base, why in pairs(v.reject) do
-        applied.rejectedYell = (applied.rejectedYell or 0) + 1
-        applied.rejectReason = base .. ": " .. why
-    end
-
-    if v.accept.rend then
-        Timers.Record("rend", v.accept.rend, "nwb", "NWB", "pop"); applied.rend = true
-    end
-    if v.accept.ony then
-        Timers.Record(factionKey("ony"), v.accept.ony, "nwb", "NWB", "pop"); applied.ony = true
-    end
-    -- Nefarian: disabled on Era, so an inbound Nef timer is discarded outright.
-    -- Record would refuse it anyway; counting it here makes the drop VISIBLE in
-    -- `/nexus debug nwb` instead of looking like a silent no-op.
-    if v.accept.nef then
-        applied.nefRejected = (applied.nefRejected or 0) + 1
-    end
-
-    -- ROUND-17 audit fix 3: node keys are read from the TOP-LEVEL payload only.
-    -- `skipNodes` is set for every per-layer sub-table (see IngestNWBTimers).
+    -- F14 — FELWOOD AND THE TIMER LOG ARE READ FIRST, BEFORE the drop validation
+    -- can reject the payload. ValidateNWBDrops guards the three world-buff DROP
+    -- ANCHORS and nothing else: its whole-table rejection means "a claimed drop
+    -- arrived without a witnessing yell", which says nothing whatsoever about the
+    -- songflower and tuber epochs sitting in the same table, or about the Rend
+    -- hand-in log — those fields have their own independent guards (MarkNode's
+    -- local-hold + 10s duplicate gate, the log's own epoch sanity). Running the
+    -- validation first meant ONE bad drop field silently discarded a payload's
+    -- entire Felwood node set and its timer log, and on a layered realm that log
+    -- is the most trustworthy Rend data the wire carries. Order is the whole fix;
+    -- the validation itself is unchanged and still gates the anchors below.
     if not skipNodes then
+        -- ROUND-17 audit fix 3: node keys are read from the TOP-LEVEL payload only.
+        -- `skipNodes` is set for every per-layer sub-table (see IngestNWBTimers).
         -- Every inbound node write carries the standard network guards (fix 2):
         -- a local pick owns its node for the full respawn, and an epoch within
         -- 10s of the stored one is a cross-source duplicate.
@@ -1471,6 +1766,34 @@ local function readNWBTimerFields(tbl, applied, t, skipNodes)
     end
 
     Timers.IngestNWBTimerLog(tbl, applied, t)
+
+    -- Drop-anchor validation. Unchanged rules, now scoped to the three world-buff
+    -- drop epochs it was always about: a whole-table rejection stops the ANCHORS,
+    -- not the Felwood data and not the log, both of which merged above.
+    local v = Timers.ValidateNWBDrops(tbl, t)
+    if not v.ok then
+        applied.rejectedPayload = (applied.rejectedPayload or 0) + 1
+        applied.rejectReason = v.reason
+        return false
+    end
+    for base, why in pairs(v.reject) do
+        applied.rejectedYell = (applied.rejectedYell or 0) + 1
+        applied.rejectReason = base .. ": " .. why
+    end
+
+    if v.accept.rend then
+        Timers.Record("rend", v.accept.rend, "nwb", "NWB", "pop"); applied.rend = true
+    end
+    if v.accept.ony then
+        Timers.Record(factionKey("ony"), v.accept.ony, "nwb", "NWB", "pop"); applied.ony = true
+    end
+    -- Nefarian: disabled on Era, so an inbound Nef timer is discarded outright.
+    -- Record would refuse it anyway; counting it here makes the drop VISIBLE in
+    -- `/nexus debug nwb` instead of looking like a silent no-op.
+    if v.accept.nef then
+        applied.nefRejected = (applied.nefRejected or 0) + 1
+    end
+
     return true
 end
 Timers._readNWBTimerFields = readNWBTimerFields
@@ -1701,6 +2024,33 @@ function Timers.ParseDBM(body)
     return { protocol = protocol, opcode = fields[3], args = args, sender = fields[1] }
 end
 
+-- Non-anchoring DBM observations (F2 + F5). buffKey -> { at, what }.
+-- Diagnostic only: read by `/dsn debug timers`, never by the timer model.
+Timers._dbmHint = {}
+
+local function dbmHint(buffKey, what)
+    Timers._dbmHint[buffKey] = { at = now(), what = what }
+end
+Timers._dbmNoteHint = dbmHint
+
+-- DBM ingest is now entirely NON-ANCHORING. Both opcodes we read describe a RAID
+-- BOSS, and neither describes a world-buff drop:
+--
+--   "K" (boss killed) — F2. This was recorded as kind "killed", which in our
+--   model means "the ANNOUNCER died, start the 6-minute respawn". The creature
+--   ids here are Onyxia 10184, Nefarian 11583, Hakkar 14834 and Rend Blackhand
+--   10429: raid bosses, not announcers. So a guildmate's raid killing Onyxia
+--   planted a phantom announcer respawn, and (through the old kill-wins readout)
+--   could blank a live cooldown. Killing the boss is also NOT the drop — the
+--   head still has to be turned in, minutes to hours later, by someone who may
+--   not even be in that raid. So it records nothing at all.
+--
+--   "C" (combat start) — F5. This anchored a POP at RAID-PULL TIME, which is the
+--   most confidently wrong timestamp available: it is before the boss dies,
+--   before the head drops and long before any hand-in. A pull is not a pop.
+--
+-- Both survive as a hint the debug dump can show ("a raid is on Onyxia right
+-- now"), which is the honest value of a D5 sync, and nothing else consumes them.
 function Timers.OnDBMMessage(body)
     local m = Timers.ParseDBM(body)
     if not m then return end
@@ -1709,17 +2059,13 @@ function Timers.OnDBMMessage(body)
         -- "K": <creatureId>\t<difficulty>
         local cId = tonumber(m.args[1])
         local buffKey = cId and dbmCreatureToBuff(cId)
-        if buffKey then
-            Timers.Record(buffKey, now(), "dbm", "DBM", "killed")
-        end
+        if buffKey then dbmHint(buffKey, "bossKilled") end
     elseif op == "C" then
         -- "C": <delay>\t<modId>\t... — modId is a string boss-mod id; map by
         -- the creature id when it is numeric (Classic mods key on cId).
         local modId = tonumber(m.args[2])
         local buffKey = modId and dbmCreatureToBuff(modId)
-        if buffKey then
-            Timers.Record(buffKey, now(), "dbm", "DBM", "pop")
-        end
+        if buffKey then dbmHint(buffKey, "bossPulled") end
     end
 end
 
@@ -2475,12 +2821,20 @@ scheduleWarnings = function(buffKey)
 
     local s = stateOf(buffKey)
     local anchor = anchorEpoch(s)
-    -- A3.3: while the newest event is a KILL the buff is respawning, not on
-    -- cooldown, so every scheduled CD warning is suppressed. Kill/respawn timing
-    -- carries ~2 minutes of server jitter; warning off a kill-derived clock is
-    -- worse than saying nothing. Also bump the generation so any arm from a
-    -- previous pop is cancelled.
-    if (s.killedAt or 0) >= math.max(anchor, 1) then
+    local t = now()
+    -- A3.3 + F3: while the newest event is a KILL the buff is respawning, not on
+    -- cooldown, so scheduled CD warnings are suppressed — Kill/respawn timing
+    -- carries ~2 minutes of server jitter and warning off a kill-derived clock is
+    -- worse than saying nothing.
+    --
+    -- But that suppression used to be permanent for as long as killedAt >= the
+    -- pop anchor, which is the whole rest of the cooldown: pop Onyxia, kill
+    -- Runthak a minute later, and every 5-min / 1-min / off-cooldown warning for
+    -- the next six hours was cancelled, silently, forever. A kill says nothing
+    -- about a cooldown that is still running. So suppression now needs BOTH: the
+    -- kill is newer than the pop AND no live cooldown remains to warn about.
+    local liveCD = (anchor > 0) and (t < anchor + CD[buffKey])
+    if (s.killedAt or 0) >= math.max(anchor, 1) and not liveCD then
         Timers._warnGen[buffKey] = (Timers._warnGen[buffKey] or 0) + 1
         return
     end
@@ -2491,7 +2845,6 @@ scheduleWarnings = function(buffKey)
     local gen = (Timers._warnGen[buffKey] or 0) + 1
     Timers._warnGen[buffKey] = gen
 
-    local t = now()
     for i = 1, #WARN_THRESHOLDS do
         local th = WARN_THRESHOLDS[i]
         local fireAt = nextAt - th.lead
@@ -2538,13 +2891,23 @@ function Timers.RehydrateFromStore()
             if epoch > 0 and cd and (t - epoch) < cd then
                 local s = stateOf(buffKey)
                 if newest.killed then
-                    s.killedAt = math.max(s.killedAt or 0, epoch)
+                    -- F2 backstop on PERSISTED data: only an announcer buff may
+                    -- carry a kill. A `killed` entry on Rend is legacy debris
+                    -- from the old DBM boss-kill mapping (a boss kill written as
+                    -- an announcer death) and is skipped entirely rather than
+                    -- rehydrated — it is neither a respawn nor a pop.
+                    if ANNOUNCER_BUFFS[buffKey] then
+                        s.killedAt = math.max(s.killedAt or 0, epoch)
+                        s.trust = s.trust or newest.trust or "local"
+                        seeded = seeded + 1
+                        ns:Fire("TIMER_UPDATED", buffKey)
+                    end
                 else
                     s.lastPop = math.max(s.lastPop or 0, epoch)
+                    s.trust = s.trust or newest.trust or "local"
+                    seeded = seeded + 1
+                    ns:Fire("TIMER_UPDATED", buffKey)
                 end
-                s.trust = s.trust or newest.trust or "local"
-                seeded = seeded + 1
-                ns:Fire("TIMER_UPDATED", buffKey)
             end
         end
     end
@@ -2562,6 +2925,59 @@ function Timers.OnStoreRefreshed()
 end
 
 ----------------------------------------------------------------------
+-- Engine state reset (F13)
+--
+-- PUBLIC SURFACE — this is what an options "Reset timer state" control calls.
+-- It is deliberately owned here rather than open-coded by the UI, because the
+-- engine's runtime state is spread across four places and a partial wipe leaves
+-- the model inconsistent in ways that are very hard to see:
+--
+--   Timers.state          per-buff pop/kill anchors, trust and confirmation
+--   Timers._warnGen       CD-warning generation tokens — bumping these is what
+--                         CANCELS warnings already armed with C_Timer.After;
+--                         clearing the anchors without bumping them leaves live
+--                         arms that fire against state that no longer exists
+--   Timers._respawnGen    same idea for the armed npcRespawned alert (F6)
+--   nodeTrust             which source owns each Felwood node's timer; stale
+--                         trust would let a weak source be refused against an
+--                         owner that is gone
+--   pullObservations      the drift-calibration samples (store-backed)
+--
+-- Node POP EPOCHS are deliberately NOT wiped: they are Felwood observations,
+-- not world-buff state, and they expire on their own 25-minute clock.
+--
+-- Fires TIMER_UPDATED for every buff key so every readout repaints immediately.
+-- Returns true.
+----------------------------------------------------------------------
+function Timers.ResetState()
+    Timers.state       = {}
+    Timers._warnGen    = {}
+    Timers._respawnGen = {}
+    Timers._pendingPull = {}
+    Timers._handinStash = {}
+    Timers._dbmHint    = {}
+
+    -- Node trust: clear the store-backed table through the same accessor the
+    -- proxy uses (and the bare-VM fallback), so no stale owner survives.
+    Timers._nodeTrustFallback = {}
+    if ns.Store and ns.Store.GetTimers then
+        local t = ns.Store.GetTimers()
+        if t then t.nodeTrust = {} end
+    end
+
+    -- Drift-calibration samples.
+    if ns.Store and ns.Store.GetTimers then
+        local t = ns.Store.GetTimers()
+        if t then t.pullObservations = nil end
+    end
+
+    for i = 1, #Timers.BUFF_KEYS do
+        ns:Fire("TIMER_UPDATED", Timers.BUFF_KEYS[i])
+    end
+    return true
+end
+
+----------------------------------------------------------------------
 -- Weekly reset integration
 ----------------------------------------------------------------------
 
@@ -2573,6 +2989,7 @@ function Timers.CheckWeeklyReset()
     if wiped then
         Timers.state = {}
         Timers._warnGen = {}
+        Timers._respawnGen = {}   -- cancel any armed npcRespawned alert (F6)
         for i = 1, #Timers.BUFF_KEYS do
             ns:Fire("TIMER_UPDATED", Timers.BUFF_KEYS[i])
         end
@@ -2656,8 +3073,14 @@ function Timers.ApplySnapshot(snap, trust)
 end
 
 -- Inbound single-timer event from the mesh (peer relay). trust "mesh".
+-- A relayed HAND-IN takes the unified hand-in path (F7): +15s assumed-drop lead,
+-- and refused while one of our own hand-ins is still waiting for its yell.
 function Timers.OnMeshTimer(buffKey, epoch, kind, meta)
     noteFreshness("nexus")
+    if kind == "quest" then
+        return Timers.RecordHandinReport(buffKey, epoch or now(), "mesh",
+                                         (meta and meta.who) or "mesh", meta and meta.zone)
+    end
     Timers.Record(buffKey, epoch, "mesh", (meta and meta.who) or "mesh", kind or "pop",
                   meta and meta.zone)
 end
@@ -2684,6 +3107,13 @@ end
 function Timers.OnSNTimer(buffKey, epoch, kind, meta)
     noteFreshness("snPassive")
     if not CD[buffKey] then return end   -- unknown/untranslatable buff: skip
+    -- F7: an SN quest entry is a HAND-IN, and until now it anchored at the raw
+    -- hand-in second while the same event from NWB's log anchored 15s later. One
+    -- path now, one lead, one stash rule.
+    if kind == "quest" then
+        return Timers.RecordHandinReport(buffKey, epoch or now(), "sn",
+                                         (meta and meta.who) or "SN", meta and meta.zone)
+    end
     Timers.Record(buffKey, epoch or now(), "sn", (meta and meta.who) or "SN",
                   kind or "pop", meta and meta.zone)
 end
@@ -2907,8 +3337,17 @@ function Timers.DebugDump()
                   (st.state == "cd")     and ("CD " .. fmtRemaining(st.remaining))
                or (st.state == "killed") and ("NPC KILLED, respawn " .. fmtRemaining(st.remaining))
                or "READY"
-            ns:Print(string.format("  %-5s %s  trust=%s conf=%s",
-                k, status, tostring(s.trust), tostring(s.confirmed)))
+            -- Two-phase respawn (F12): after the certain-dead 360s the announcer
+            -- is still inside its 120s random window, and saying so is the
+            -- difference between "go now" and "go in a minute".
+            if st.phase == "window" then
+                status = status .. " (announcer due back within "
+                                .. fmtRemaining(st.windowRemaining or 0) .. ")"
+            end
+            local hint = Timers._dbmHint[k]
+            ns:Print(string.format("  %-5s %s  trust=%s conf=%s%s",
+                k, status, tostring(s.trust), tostring(s.confirmed),
+                hint and ("  dbm-hint=" .. hint.what .. "@" .. hint.at) or ""))
         else
             ns:Print(string.format("  %-5s (no data)", k))
         end
@@ -3089,16 +3528,28 @@ local function testAnnouncerKill(fails)
     local cdst = Timers.BuffStatus("onyH", t + 60)
     tcheck(cdst.state == "cd" and cdst.remaining > 0, "a pop still reads as cd", fails)
 
-    -- (d) a kill NEWER than the newest pop wins the readout.
+    -- (d) F3 — the LONGER constraint wins, not the newest event. (c) left a pop
+    -- at t with a live six-hour cooldown; killing the announcer two minutes in
+    -- must NOT erase it (the old rule read "killed, back in 6 minutes" while the
+    -- buff was genuinely ~6 hours away).
     Timers.Record("onyH", t + 120, "local", "Overlord Runthak", "killed")
-    tcheck(Timers.BuffStatus("onyH", t + 180).state == "killed",
-        "kill newer than the newest pop wins", fails)
-    -- ...and a pop newer than the kill takes it back.
-    Timers.state.onyH.lastPop = t + 300
-    tcheck(Timers.BuffStatus("onyH", t + 360).state == "cd",
-        "pop newer than the kill restores the cd readout", fails)
+    local mixed = Timers.BuffStatus("onyH", t + 180)
+    tcheck(mixed.state == "cd", "a kill does NOT erase a live cooldown (F3)", fails)
+    tcheck(mixed.remaining > CD.onyH - 300,
+        "the cooldown remaining is the real one, not the 360s respawn", fails)
+    tcheck(Timers.state.onyH.killedAt == t + 120,
+        "the kill is still recorded while the cooldown reads through", fails)
+    -- ...and when the cooldown has run out, the kill's respawn is what remains.
+    Timers.state = {}
+    Timers.Record("onyH", t, "local", "yeller", "pop")
+    Timers.Record("onyH", t + CD.onyH, "local", "Overlord Runthak", "killed")
+    tcheck(Timers.BuffStatus("onyH", t + CD.onyH + 60).state == "killed",
+        "past the cooldown, the newer kill owns the readout", fails)
 
-    -- (e) CD warnings are suppressed while the newest event is a kill (A3.3).
+    -- (e) F3 — CD warnings are suppressed by a kill ONLY when there is no live
+    -- cooldown left to warn about. The old rule suppressed for as long as
+    -- killedAt >= the pop anchor, i.e. permanently: one announcer kill silently
+    -- cancelled every warning for the rest of a six-hour cooldown.
     Timers.state = {}
     local fired = {}
     ns:On("CD_WARNING", function(buffKey, kind) fired[#fired + 1] = buffKey .. ":" .. kind end)
@@ -3110,7 +3561,18 @@ local function testAnnouncerKill(fails)
     local armedAfterPop = armed
     tcheck(armedAfterPop > 0, "a pop near the CD edge arms warnings", fails)
     Timers.Record("onyH", now(), "local", "Overlord Runthak", "killed")
-    tcheck(armed == armedAfterPop, "a kill arms NO further CD warnings (A3.3)", fails)
+    tcheck(armed > armedAfterPop,
+        "a kill during a LIVE cooldown keeps the warnings armed (F3)", fails)
+    -- With no live cooldown, the kill still suppresses: respawn timing carries
+    -- ~2 minutes of server jitter and warning off it is worse than silence.
+    Timers.state = {}
+    armed = 0
+    Timers.Record("onyH", now(), "local", "Overlord Runthak", "killed")
+    tcheck(armed == 0, "a kill with no live cooldown arms nothing (A3.3)", fails)
+    local genBefore = Timers._warnGen.onyH or 0
+    Timers.ScheduleWarnings("onyH")
+    tcheck((Timers._warnGen.onyH or 0) > genBefore,
+        "the suppressed path bumps the generation, cancelling earlier arms", fails)
     if C_Timer then C_Timer.After = realAfter end
 
     -- (f) the snapshot wire key stays `lastKilled` for peer compatibility.
@@ -4412,10 +4874,19 @@ local function testNWBIngest(fails)
     reset()
     local v = Timers.ValidateNWBDrops({ n = t - 100 }, t)
     tcheck(v.ok == false, "a drop with no stage-1 yell invalidates the payload", fails)
-    local a4 = Timers.IngestNWBTimers({ n = t - 100, f1 = t - 50 })
+    local a4 = Timers.IngestNWBTimers({ n = t - 100, f1 = t - 50,
+                                        F = { { G = "r", H = t - 700, J = "Eve" } } })
     tcheck(not a4.rend, "rejected payload records no rend anchor", fails)
     tcheck((a4.rejectedPayload or 0) >= 1, "whole-payload rejection is counted", fails)
-    tcheck((a4.flower or 0) == 0, "a rejected payload's flowers are dropped too", fails)
+    -- F14: the rejection is about the DROP ANCHORS. Felwood nodes and the timer
+    -- log are read before it and have their own guards, so a bad drop field no
+    -- longer throws away a whole payload's songflowers or its Rend log.
+    tcheck((a4.flower or 0) == 1, "a rejected payload's flowers still merge (F14)", fails)
+    tcheck((nodePopTable("flower") or {})[1] == t - 50,
+        "the flower epoch really was written despite the rejection", fails)
+    tcheck((a4.logApplied or 0) == 1, "a rejected payload's timer log still merges (F14)", fails)
+    tcheck(Timers.state.rend and Timers.state.rend.lastPop == t - 700,
+        "the log anchored Rend even though the drop set was rejected", fails)
 
     -- (b) yell within +/-120s of the drop is ACCEPTED, on both sides.
     reset()
@@ -4476,10 +4947,19 @@ local function testNWBIngest(fails)
     reset()
     local key, epoch, who = Timers.ParseNWBLogEntry({ G = "r", H = t - 500, I = 1454, J = "Bob" }, t)
     tcheck(key == "rend" and epoch == t - 500 and who == "Bob", "log type 'r' -> a Rend drop", fails)
-    -- 'q' is a HAND-IN, converted to an assumed drop at +15s.
-    key, epoch = Timers.ParseNWBLogEntry({ G = "q", H = t - 500, I = 1454, J = "Bob" }, t)
-    tcheck(key == "rend" and epoch == (t - 500) + Timers.NWB_HANDIN_LEAD,
-        "log type 'q' -> hand-in + 15s assumed drop", fails)
+    -- 'q' is a HAND-IN. The parser reports it as one and returns the RAW stamp;
+    -- the +15s assumed-drop lead now lives on the single hand-in path (F7) so it
+    -- cannot be applied twice or forgotten by a new caller.
+    local handin
+    key, epoch, who, _, handin = Timers.ParseNWBLogEntry({ G = "q", H = t - 500, I = 1454, J = "Bob" }, t)
+    tcheck(key == "rend" and epoch == t - 500 and handin == true,
+        "log type 'q' -> a Rend HAND-IN at its raw stamp", fails)
+    tcheck(Timers.AssumedDropEpoch(t - 500) == (t - 500) + Timers.HANDIN_LEAD,
+        "the assumed drop is hand-in + 15s", fails)
+    tcheck(Timers.NWB_HANDIN_LEAD == Timers.HANDIN_LEAD,
+        "the NWB lead alias and the shared lead are one constant", fails)
+    local _, _, _, _, notHandin = Timers.ParseNWBLogEntry({ G = "r", H = t - 500 }, t)
+    tcheck(notHandin == false, "a drop entry is not flagged as a hand-in", fails)
     key = Timers.ParseNWBLogEntry({ G = "o", H = t - 500 }, t)
     tcheck(key == factionKey("ony"), "log type 'o' -> a faction-resolved Onyxia drop", fails)
     key = Timers.ParseNWBLogEntry({ G = "n", H = t - 500 }, t)
@@ -4499,8 +4979,9 @@ local function testNWBIngest(fails)
 
     -- A hand-in entry lands 15s later than its raw stamp.
     reset()
+    Timers._handinStash = {}
     Timers.IngestNWBTimers({ F = { { G = "q", H = t - 500, I = 1454, J = "Ann" } } })
-    tcheck(Timers.state.rend and Timers.state.rend.lastPop == (t - 500) + Timers.NWB_HANDIN_LEAD,
+    tcheck(Timers.state.rend and Timers.state.rend.lastPop == (t - 500) + Timers.HANDIN_LEAD,
         "a 'q' hand-in anchors at +15s", fails)
 
     -- A Nefarian log entry is rejected with everything else Nef.
@@ -4517,12 +4998,35 @@ local function testNWBIngest(fails)
         F = { { G = "r", H = t - 600, J = "Cid" }, { G = "q", H = t - 500, J = "Dee" } },
     })
     tcheck(a9.ony, "the ony timer still merges alongside a log", fails)
-    tcheck((a9.log or 0) == 2, "both log entries parsed", fails)
-    -- The first entry anchors; the second is inside the Rend cooldown and is
-    -- correctly refused as a duplicate by the false-positive gate.
-    tcheck(Timers.state.rend and Timers.state.rend.lastPop == t - 600,
-        "the first log entry takes the anchor", fails)
-    tcheck((a9.logApplied or 0) == 1, "the within-cooldown duplicate is gated out", fails)
+    -- F1 — the log is PRE-SCANNED and only the newest entry per buff reaches
+    -- Record, so `log` counts BUFFS anchored, not raw entries. The old code
+    -- Recorded every entry in wire order, which made array order decide the
+    -- anchor: here the 'q' hand-in at (t-500)+15 is newer than the 'r' drop at
+    -- t-600, so it is the one that must win regardless of position.
+    tcheck((a9.log or 0) == 1, "one buff anchored from a two-entry log", fails)
+    tcheck(Timers.state.rend and Timers.state.rend.lastPop == (t - 500) + Timers.HANDIN_LEAD,
+        "the NEWEST log entry takes the anchor (max, not first)", fails)
+    tcheck((a9.logApplied or 0) == 1, "the newest entry applied", fails)
+
+    -- Order-independence: the same two entries in the opposite wire order must
+    -- produce the identical anchor (this is the rewind the old walk allowed).
+    reset()
+    local a9b = Timers.IngestNWBTimers({
+        F = { { G = "q", H = t - 500, J = "Dee" }, { G = "r", H = t - 600, J = "Cid" } },
+    })
+    tcheck((a9b.log or 0) == 1, "reversed order still anchors exactly one buff", fails)
+    tcheck(Timers.state.rend and Timers.state.rend.lastPop == (t - 500) + Timers.HANDIN_LEAD,
+        "wire order does not change which log entry wins", fails)
+
+    -- An old entry arriving after a newer one can no longer rewind the anchor:
+    -- the pre-scan collapses them, and the rewind guard is the backstop.
+    reset()
+    Timers.IngestNWBTimers({ F = { { G = "o", H = t - 100, J = "New" } } })
+    local onyKey = factionKey("ony")
+    local anchoredAt = Timers.state[onyKey] and Timers.state[onyKey].lastPop
+    Timers.IngestNWBTimers({ F = { { G = "o", H = t - 20000, J = "Old" } } })
+    tcheck(Timers.state[onyKey].lastPop == anchoredAt,
+        "an older log entry in a later payload cannot rewind the anchor", fails)
 
     -- A log entry cannot outrank a local anchor of the same moment.
     reset()
@@ -4746,6 +5250,404 @@ local function testUnboonGate(fails)
     Timers._pendingPull = savedPending or {}
 end
 
+----------------------------------------------------------------------
+-- F1 — anchor-rewind matrix by trust.
+--
+-- The gate that was missing entirely: IsFalsePositive only ever looked FORWARD
+-- from the anchor, so any report OLDER than the anchor sailed through and
+-- Record wrote it, moving the anchor backwards. Every bulk path could do it
+-- (an NWB log walked in wire order, a peer snapshot, an SN log array), and the
+-- symptom was a cooldown that jumped BACKWARDS — countdowns growing, warnings
+-- resurrected, "ready" un-readying.
+----------------------------------------------------------------------
+local function testAnchorRewind(fails)
+    -- (a) the pure predicate, both directions and every trust relation.
+    tcheck(Timers.IsAnchorRewind(0, 100, "local", "nwb") == false,
+        "no existing anchor: nothing to rewind", fails)
+    tcheck(Timers.IsAnchorRewind(1000, 1000, "nwb", "local") == false,
+        "an equal epoch is not a rewind", fails)
+    tcheck(Timers.IsAnchorRewind(1000, 1001, "nwb", "local") == false,
+        "a newer epoch is never a rewind", fails)
+    tcheck(Timers.IsAnchorRewind(1000, 999, "nwb", "nwb") == true,
+        "EQUAL trust may not rewind (two opinions, newest already applied)", fails)
+    tcheck(Timers.IsAnchorRewind(1000, 999, "nwb", "sn") == true,
+        "lower trust may not rewind", fails)
+    tcheck(Timers.IsAnchorRewind(1000, 999, "local", "sn") == false,
+        "STRICTLY higher trust may rewind (our eyes correct a relay)", fails)
+    tcheck(Timers.IsAnchorRewind(1000, 999, "nwb", nil) == false,
+        "any tagged source outranks an untagged anchor", fails)
+
+    -- (b) the same matrix through Record, on the pop anchor.
+    local t = now() - 40000     -- old enough that no pull bar can be raised
+    local function anchorAt(epoch, trust)
+        Timers.state = {}
+        Timers.Record("rend", epoch, trust, "seed", "pop")
+    end
+
+    anchorAt(t, "nwb")
+    local ok, why = Timers.Record("rend", t - 20000, "nwb", "older", "pop")
+    tcheck(ok == false and tostring(why):find("rewind"),
+        "nwb cannot rewind an nwb anchor", fails)
+    tcheck(Timers.state.rend.lastPop == t, "the newer anchor is intact", fails)
+
+    anchorAt(t, "mesh")
+    tcheck(Timers.Record("rend", t - 20000, "sn", "older", "pop") == false,
+        "a LOWER-trust older report cannot rewind", fails)
+    tcheck(Timers.state.rend.lastPop == t, "mesh anchor intact against sn", fails)
+
+    anchorAt(t, "nwb")
+    tcheck(Timers.Record("rend", t - 20000, "local", "our eyes", "pop") == true,
+        "a STRICTLY higher-trust correction may move the anchor back", fails)
+    tcheck(Timers.state.rend.lastPop == t - 20000, "the correction is applied", fails)
+    tcheck(Timers.state.rend.trust == "local", "and it owns the anchor afterwards", fails)
+
+    anchorAt(t, "sn")
+    tcheck(Timers.Record("rend", t - 20000, "sn", "older sn", "pop") == false,
+        "sn cannot rewind sn", fails)
+
+    -- (c) the KILL anchor gets the identical guard, checked against killedAt.
+    Timers.state = {}
+    Timers.Record("onyH", t, "local", "Runthak", "killed")
+    tcheck(Timers.Record("onyH", t - 500, "nwb", "NWB", "killed") == false,
+        "a lower-trust older kill cannot rewind killedAt", fails)
+    tcheck(Timers.state.onyH.killedAt == t, "killedAt intact", fails)
+    tcheck(Timers.Record("onyH", t - 500, "local", "Runthak", "killed") == false,
+        "equal trust cannot rewind killedAt either", fails)
+
+    -- (d) a first anchor is never blocked by the guard.
+    Timers.state = {}
+    tcheck(Timers.Record("rend", t, "dbm", "legacy", "pop") == true,
+        "the first anchor for a buff always applies", fails)
+
+    Timers.state = {}
+end
+
+----------------------------------------------------------------------
+-- F2 — kind="killed" means ANNOUNCER DEATH and nothing else.
+----------------------------------------------------------------------
+local function testAnnouncerOnlyKills(fails)
+    tcheck(Timers.ANNOUNCER_BUFFS.onyH and Timers.ANNOUNCER_BUFFS.onyA
+        and Timers.ANNOUNCER_BUFFS.nefH and Timers.ANNOUNCER_BUFFS.nefA,
+        "the four announcer buffs are the announcer set", fails)
+    tcheck(not Timers.ANNOUNCER_BUFFS.rend and not Timers.ANNOUNCER_BUFFS.zg,
+        "Rend and Zandalar have no announcer", fails)
+
+    local t = now() - 40000
+    Timers.state = {}
+    local ok, why = Timers.Record("rend", t, "local", "Rend Blackhand", "killed")
+    tcheck(ok == false and tostring(why):find("announcer"),
+        "a Rend 'kill' is refused (Rend Blackhand is a raid boss)", fails)
+    tcheck((Timers.state.rend == nil) or (Timers.state.rend.killedAt or 0) == 0,
+        "no respawn clock is started for Rend", fails)
+    tcheck((Timers.state.rend == nil) or (Timers.state.rend.lastPop or 0) == 0,
+        "and it is NOT silently reinterpreted as a pop either", fails)
+    tcheck(Timers.Record("zg", t, "sn", "Hakkar", "killed") == false,
+        "a Zandalar 'kill' is refused (Hakkar is a raid boss)", fails)
+    tcheck(Timers.Record("onyH", t, "local", "Overlord Runthak", "killed") == true,
+        "an announcer kill still records normally", fails)
+
+    -- DBM: the boss-kill and combat-start opcodes anchor NOTHING any more.
+    Timers.state = {}
+    Timers._dbmHint = {}
+    local onyKey = factionKey("ony")
+    Timers.OnDBMMessage("Someone-Realm\t1\tK\t10184\t1")      -- Onyxia killed
+    tcheck(next(Timers.state) == nil, "a DBM boss kill anchors nothing (F2)", fails)
+    tcheck(Timers._dbmHint[onyKey] and Timers._dbmHint[onyKey].what == "bossKilled",
+        "...it survives only as a diagnostic hint", fails)
+    Timers.OnDBMMessage("Someone-Realm\t1\tC\t10\t10184")     -- Onyxia pulled
+    tcheck(next(Timers.state) == nil, "a DBM combat start anchors nothing (F5)", fails)
+    tcheck(Timers._dbmHint[onyKey].what == "bossPulled",
+        "...and is recorded as a pull hint, not a pop", fails)
+    Timers.OnDBMMessage("Someone-Realm\t1\tK\t10429\t1")      -- Rend Blackhand
+    tcheck(Timers.state.rend == nil, "a Rend Blackhand kill plants no Rend state", fails)
+    tcheck(Timers.OnDBMMessage("garbage") == nil, "a malformed D5 body is safe", fails)
+
+    -- Persisted legacy debris: a `killed` entry on Rend (written by the OLD DBM
+    -- mapping) must not rehydrate into anything at all.
+    if ns.Store and ns.Store.GetTimers then
+        local logs = ns.Store.GetTimers().logs
+        local savedRend = logs.rend
+        Timers.state = {}
+        logs.rend = { { epoch = now() - 600, who = "DBM", trust = "dbm", killed = true } }
+        Timers.RehydrateFromStore()
+        tcheck((Timers.state.rend == nil) or ((Timers.state.rend.killedAt or 0) == 0
+               and (Timers.state.rend.lastPop or 0) == 0),
+            "a legacy Rend 'killed' log entry rehydrates to nothing", fails)
+        -- ...while an announcer buff's killed entry still rehydrates.
+        Timers.state = {}
+        logs.onyH = { { epoch = now() - 60, who = "Runthak", trust = "local", killed = true } }
+        Timers.RehydrateFromStore()
+        tcheck(Timers.state.onyH and (Timers.state.onyH.killedAt or 0) > 0,
+            "an announcer kill entry still rehydrates", fails)
+        logs.rend, logs.onyH = savedRend or {}, {}
+    end
+
+    Timers.state = {}
+end
+
+----------------------------------------------------------------------
+-- F12 — two-phase announcer respawn + the display grace that was exported and
+-- never used. F6 — the armed npcRespawned alert.
+----------------------------------------------------------------------
+local function testRespawnTwoPhase(fails)
+    tcheck(Timers.ANNOUNCER_RESPAWN == 360 and Timers.ANNOUNCER_RESPAWN_WINDOW == 120,
+        "respawn model is 360s certain-dead + a 120s random window", fails)
+
+    local t = 1600000000
+    Timers.state = {}
+    Timers.Record("onyA", t, "local", "Major Mattingly", "killed")
+
+    local dead = Timers.BuffStatus("onyA", t + 10)
+    tcheck(dead.state == "killed" and dead.phase == "dead",
+        "inside 360s the announcer is certainly dead", fails)
+    tcheck(math.abs(dead.remaining - 350) < 0.5, "remaining counts the certain-dead phase", fails)
+    tcheck(dead.windowEndsAt == t + 480, "the random window closes at +480", fails)
+
+    local win = Timers.BuffStatus("onyA", t + 400)
+    tcheck(win.state == "canpop", "past 360s the MODEL says the buff can pop", fails)
+    tcheck(win.phase == "window", "...but the display phase is the 120s random window", fails)
+    tcheck(math.abs(win.windowRemaining - 80) < 0.5, "the window remaining counts to +480", fails)
+
+    local open = Timers.BuffStatus("onyA", t + 500)
+    tcheck(open.state == "canpop" and open.phase == "open",
+        "past 480s the announcer is certainly back", fails)
+    tcheck(open.windowRemaining == 0, "no window remains once open", fails)
+
+    -- DISPLAY_GRACE: exported since forever, applied nowhere. The readout holds
+    -- "cd" for +5s past the raw cooldown (SN §10.2: raw 10800 / display 10805).
+    Timers.state = {}
+    Timers.Record("rend", t, "local", "Thrall", "pop")
+    tcheck(Timers.BuffStatus("rend", t + CD.rend - 1).state == "cd",
+        "on cooldown just before the raw cooldown ends", fails)
+    tcheck(Timers.BuffStatus("rend", t + CD.rend + 1).state == "cd",
+        "still 'cd' inside the +5s display grace (F12)", fails)
+    tcheck(Timers.BuffStatus("rend", t + CD.rend + DISPLAY_GRACE + 1).state == "canpop",
+        "flips to canpop once the display grace elapses", fails)
+    -- ...and the false-positive gate still uses the RAW cooldown, as specified.
+    tcheck(Timers.IsFalsePositive("rend", t, t + CD.rend - 1, false) == true,
+        "the dedup gate rejects inside the RAW cooldown", fails)
+    tcheck(Timers.IsFalsePositive("rend", t, t + CD.rend, false) == false,
+        "the dedup gate is not extended by the display grace", fails)
+
+    -- F6: an announcer death arms the npcRespawned alert for the end of the
+    -- certain-dead phase, cancellable by a later kill.
+    Timers.state = {}
+    Timers._respawnGen = {}
+    local realAfter = C_Timer and C_Timer.After
+    local arms = {}
+    if C_Timer then C_Timer.After = function(delay, fn) arms[#arms + 1] = { delay = delay, fn = fn } end end
+    Timers._lastNotice = nil
+    Timers.OnAnnouncerDeath("onyH", "Overlord Runthak", now())
+    tcheck(Timers._lastNotice and Timers._lastNotice.category == "npcDied",
+        "the death itself alerts npcDied", fails)
+    tcheck(#arms >= 1, "an announcer death ARMS a respawn alert (F6)", fails)
+    local firstArm = arms[#arms]
+    tcheck(firstArm and math.abs(firstArm.delay - ANNOUNCER_RESPAWN) <= 1,
+        "armed for the end of the certain-dead phase", fails)
+    Timers._lastNotice = nil
+    firstArm.fn()
+    tcheck(Timers._lastNotice and Timers._lastNotice.category == "npcRespawned",
+        "firing the arm emits the npcRespawned alert", fails)
+    -- A second kill invalidates the first arm (generation token).
+    Timers.OnAnnouncerDeath("onyH", "Overlord Runthak", now() + 5)
+    Timers._lastNotice = nil
+    firstArm.fn()
+    tcheck(Timers._lastNotice == nil, "the stale arm from the first kill is inert", fails)
+    arms[#arms].fn()
+    tcheck(Timers._lastNotice and Timers._lastNotice.category == "npcRespawned",
+        "the newest arm still fires", fails)
+    if C_Timer then C_Timer.After = realAfter end
+
+    Timers.state = {}
+    Timers._respawnGen = {}
+end
+
+----------------------------------------------------------------------
+-- F7 — one hand-in rule for every source.
+----------------------------------------------------------------------
+local function testHandinUnification(fails)
+    local t = now() - 40000     -- historical: no pull bars, no recency effects
+    Timers.state = {}
+    Timers._handinStash = {}
+
+    -- (a) an SN quest entry is a hand-in and gets the assumed-drop lead.
+    Timers.OnSNTimer("rend", t, "quest", { who = "Ann" })
+    tcheck(Timers.state.rend and Timers.state.rend.lastPop == t + Timers.HANDIN_LEAD,
+        "an SN hand-in anchors at the assumed drop (+15s)", fails)
+    tcheck(Timers.state.rend.trust == "sn", "...carrying sn trust", fails)
+
+    -- (b) NWB's log and SN's quest entry now agree to the second.
+    Timers.state = {}
+    Timers.IngestNWBTimers({ F = { { G = "q", H = t, J = "Ann" } } })
+    local viaNWB = Timers.state.rend and Timers.state.rend.lastPop
+    Timers.state = {}
+    Timers.OnSNTimer("rend", t, "quest", { who = "Ann" })
+    tcheck(viaNWB and Timers.state.rend.lastPop == viaNWB,
+        "the same hand-in from NWB and SN produces the IDENTICAL anchor", fails)
+
+    -- (c) our own pending hand-in wins: the following yell anchors, not a relay.
+    Timers.state = {}
+    Timers._handinStash = {}
+    Timers._stashHandin("rend", "Me", now())
+    tcheck(Timers.HandinPending("rend") == true, "our hand-in is pending", fails)
+    local ok, why = Timers.RecordHandinReport("rend", t, "sn", "Ann")
+    tcheck(ok == false and tostring(why):find("pending"),
+        "a remote hand-in is refused while ours is pending", fails)
+    tcheck((Timers.state.rend == nil) or (Timers.state.rend.lastPop or 0) == 0,
+        "...and anchors nothing", fails)
+    tcheck(Timers.HandinPending("rend") == true,
+        "the refusal does not consume the stash (only the yell does)", fails)
+
+    -- (d) an EXPIRED stash stops blocking.
+    Timers._handinStash.rend.at = now() - (HANDIN_STASH_TTL + 5)
+    tcheck(Timers.HandinPending("rend") == false, "an expired stash is not pending", fails)
+    tcheck(Timers.RecordHandinReport("rend", t, "sn", "Ann") == true,
+        "...so the remote hand-in is accepted again", fails)
+
+    -- (e) mesh relays take the same path.
+    Timers.state = {}
+    Timers._handinStash = {}
+    Timers.OnMeshTimer("onyH", t, "quest", { who = "Peer" })
+    tcheck(Timers.state.onyH and Timers.state.onyH.lastPop == t + Timers.HANDIN_LEAD,
+        "a mesh hand-in relay gets the same lead", fails)
+
+    -- (f) a hand-in never raises a pull bar, from any source.
+    local barred = false
+    ns:On("PULL_DETECTED", function() barred = true end)
+    Timers.state = {}
+    Timers._handinStash = {}
+    Timers.OnSNTimer("rend", now(), "quest", { who = "Fresh" })
+    tcheck(barred == false, "a fresh remote hand-in raises no pull bar", fails)
+
+    -- (g) the local rule is untouched: a Rend hand-in still only stashes.
+    Timers.state = {}
+    Timers._handinStash = {}
+    Timers.OnQuestHandin(4974, now())
+    tcheck(Timers._handinStash.rend ~= nil, "a LOCAL Rend hand-in still stashes", fails)
+    tcheck((Timers.state.rend == nil) or (Timers.state.rend.lastPop or 0) == 0,
+        "...and still anchors nothing by itself (A4.1)", fails)
+
+    Timers.state = {}
+    Timers._handinStash = {}
+end
+
+----------------------------------------------------------------------
+-- F6 — the BUFF_GAIN seam finally has a producer, and a local gain backfills
+-- the pop log (spec §11) without double-logging a drop we already recorded.
+----------------------------------------------------------------------
+local function testLocalBuffGain(fails)
+    if not (ns.Store and ns.Store.GetTimers and ns.Store.AddTimerLog) then
+        fails[#fails + 1] = "store absent for buff-gain test"; return
+    end
+    local logs = ns.Store.GetTimers().logs
+    logs.rend = {}
+    local gains = {}
+    ns:On("BUFF_GAIN", function(buffKey, message) gains[#gains + 1] = { buff = buffKey, message = message } end)
+    local t = now()
+
+    -- (a) a gain nothing else covers fires the alert AND backfills the log.
+    local wrote = Timers.NoteLocalBuffGain("rend", t)
+    tcheck(#gains == 1 and gains[1].buff == "rend", "a local gain fires BUFF_GAIN", fails)
+    tcheck(type(gains[1].message) == "string" and #gains[1].message > 0,
+        "the event carries a message for the alert dispatcher", fails)
+    tcheck(wrote == true, "...and backfills the pop log", fails)
+    tcheck(#logs.rend == 1 and logs.rend[1].gain == true, "the entry is marked as a gain", fails)
+
+    -- (b) a second gain for the same drop does not double-log.
+    gains = {}
+    tcheck(Timers.NoteLocalBuffGain("rend", t + 5) == false,
+        "a gain inside the dedup window writes no second entry", fails)
+    tcheck(#logs.rend == 1, "the log still holds one entry for that drop", fails)
+    tcheck(#gains == 1, "the alert still fires (alert dedup is the HUD's job)", fails)
+
+    -- (c) an entry from ANY other source covering the moment also suppresses it —
+    -- this is the "deduplicated against the mesh/third-party sources" rule.
+    logs.rend = {}
+    ns.Store.AddTimerLog("rend", { epoch = t, who = "Thrall", trust = "local" })
+    tcheck(Timers.NoteLocalBuffGain("rend", t + 10) == false,
+        "a yell-sourced entry already covers this drop", fails)
+    tcheck(#logs.rend == 1, "so no duplicate is written", fails)
+
+    -- (d) buffs with no store log never write one.
+    logs.rend = {}
+    tcheck(Timers.NoteLocalBuffGain("zg", t) == false, "ZG keeps no pop log", fails)
+    tcheck(Timers.NoteLocalBuffGain("nefH", t) == false, "Nefarian keeps no pop log", fails)
+
+    -- (e) a gain never anchors: the aura proves the buff exists, not when it
+    -- dropped (chronoboon restores land the same aura).
+    Timers.state = {}
+    logs.rend = {}
+    Timers.NoteLocalBuffGain("rend", t)
+    tcheck((Timers.state.rend == nil) or (Timers.state.rend.lastPop or 0) == 0,
+        "a gain writes no cooldown anchor", fails)
+
+    -- (f) the real aura handler feeds it: a pending pull + a landed world buff.
+    local savedAuras, savedTracker, savedPending = _G.C_UnitAuras, ns.Tracker, Timers._pendingPull
+    ns.Tracker = nil
+    _G.C_UnitAuras = { GetBuffDataByIndex = function(_, i)
+        if i == 1 then return { name = "Warchief's Blessing" } end
+        return nil
+    end }
+    logs.rend = {}
+    gains = {}
+    Timers._pendingPull = {}
+    Timers._setPendingPull("rend", now() - 10, 1)
+    Timers._onPlayerAura("UNIT_AURA", "player")
+    tcheck(#gains == 1 and gains[1].buff == "rend",
+        "a landed world buff fires BUFF_GAIN from the aura path", fails)
+    tcheck(Timers._pendingPull.rend == nil, "...and still credits the pull observation", fails)
+    -- With nothing pending the aura is not attributable and must stay silent.
+    gains = {}
+    Timers._pendingPull = {}
+    Timers._onPlayerAura("UNIT_AURA", "player")
+    tcheck(#gains == 0, "an aura with no pending pull fires nothing", fails)
+
+    _G.C_UnitAuras, ns.Tracker, Timers._pendingPull = savedAuras, savedTracker, savedPending or {}
+    logs.rend = {}
+    Timers.state = {}
+end
+
+----------------------------------------------------------------------
+-- F13 — Timers.ResetState(), the engine-owned wipe an options Reset calls.
+----------------------------------------------------------------------
+local function testResetState(fails)
+    local timers = ns.Store and ns.Store.GetTimers and ns.Store.GetTimers()
+    Timers.state = {}
+    Timers.Record("rend", now() - 100, "local", "Thrall", "pop")
+    Timers._warnGen.rend      = 7
+    Timers._respawnGen.onyH   = 3
+    Timers._dbmHint.zg        = { at = 1, what = "bossPulled" }
+    Timers._stashHandin("rend", "Me", now())
+    Timers._nodeTrust["flower1"] = "sn"
+    Timers.RecordPullObservation("rend", 1, 12)
+    Timers.MarkNode("flower", 1, now() - 60, "local")
+
+    local fired = {}
+    ns:On("TIMER_UPDATED", function(buffKey) fired[buffKey] = true end)
+    tcheck(Timers.ResetState() == true, "ResetState returns true", fails)
+    tcheck(next(Timers.state) == nil, "per-buff anchors wiped", fails)
+    tcheck(next(Timers._warnGen) == nil, "warning generations wiped (armed warnings cancelled)", fails)
+    tcheck(next(Timers._respawnGen) == nil, "respawn arms cancelled", fails)
+    tcheck(next(Timers._handinStash) == nil, "hand-in stash wiped", fails)
+    tcheck(next(Timers._dbmHint) == nil, "dbm hints wiped", fails)
+    tcheck(Timers._nodeTrust["flower1"] == nil, "node trust wiped", fails)
+    if timers then
+        tcheck(timers.pullObservations == nil, "drift observations wiped", fails)
+        -- Node POP epochs are Felwood observations on their own 25-minute clock
+        -- and are deliberately NOT part of a timer-state reset.
+        tcheck((nodePopTable("flower") or {})[1] ~= nil, "node pop epochs survive the reset", fails)
+    end
+    for i = 1, #Timers.BUFF_KEYS do
+        tcheck(fired[Timers.BUFF_KEYS[i]] == true,
+            "TIMER_UPDATED fired for " .. Timers.BUFF_KEYS[i], fails)
+    end
+    tcheck(Timers.BuffStatus("rend", now()).state == "nodata",
+        "the readout reads nodata after a reset", fails)
+
+    if timers then timers.flower = {} end
+    Timers.state = {}
+end
+
 function Timers.RunSelfTests(verbose)
     local suites = {
         { name = "cd derivation",     fn = testCDDerivation },
@@ -4773,6 +5675,13 @@ function Timers.RunSelfTests(verbose)
         { name = "ingest parsers",    fn = testIngestParsers },
         { name = "rehydrate from store", fn = testRehydrateFromStore },
         { name = "nwb payload ingest", fn = testNWBIngest },
+        -- Buff-drop pipeline audit (F1/F2/F6/F7/F12/F13).
+        { name = "anchor rewind by trust",   fn = testAnchorRewind },
+        { name = "announcer-only kills",     fn = testAnnouncerOnlyKills },
+        { name = "two-phase respawn + grace", fn = testRespawnTwoPhase },
+        { name = "hand-in unification",      fn = testHandinUnification },
+        { name = "local buff gain",          fn = testLocalBuffGain },
+        { name = "reset state",              fn = testResetState },
     }
     local allPass = true
     for _, suite in ipairs(suites) do

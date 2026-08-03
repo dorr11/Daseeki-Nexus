@@ -253,6 +253,29 @@ local SN_LOG_BUFF = {
     nefLogH = "nefH", nefLogA = "nefA", zgLog = "zg",
 }
 
+-- Which buffs have an ANNOUNCER NPC whose death is a real respawn event.
+--
+-- This is the snbridge half of the engine's announcer-only kill rule (F2). A
+-- log entry's `killed` flag is a per-buff claim and it does NOT mean the same
+-- thing in every log: for Onyxia and Nefarian it is the announcer (Runthak,
+-- Mattingly, Saurfang, Afrasiabi) dying, which starts a 6-minute respawn. Rend
+-- and Zandalar HAVE no announcer — the only killable thing in their world is the
+-- raid boss (Rend Blackhand, Hakkar) — so a `killed` flag in rendLog/zgLog is a
+-- boss kill, and forwarding it as kind "killed" asked the engine to start a
+-- respawn clock for an NPC that does not exist. Those route as a POP instead:
+-- in SN's own log a rendLog entry is an entry in the REND POP LOG, and the flag
+-- is annotation on when/how it was seen, not a different kind of event.
+--
+-- Resolved through the engine when it is loaded so there is exactly one
+-- definition of the set, with a literal fallback for the bare-VM path.
+local ANNOUNCER_FALLBACK = { onyH = true, onyA = true, nefH = true, nefA = true }
+local function isAnnouncerBuff(buffKey)
+    local T = ns.Timers
+    local set = (T and T.ANNOUNCER_BUFFS) or ANNOUNCER_FALLBACK
+    return set[buffKey] == true
+end
+SNBridge._isAnnouncerBuff = isAnnouncerBuff
+
 -- Guards applied to every node write from SN. Resolved through the engine so
 -- there is exactly one definition of "second-hand node data" (timers.lua), and
 -- degrades to nil — plain newest-wins — in a bare VM without the engine.
@@ -407,9 +430,12 @@ function SNBridge.Translate(payload, sender)
             local zone = pick(payload, "zone", "z")
             ns.Timers.OnSNPull(buff, epoch, duration, zone, { who = who })
         else
-            -- normalize kind to pop/killed/quest
+            -- Normalize kind to pop/killed/quest. Same announcer rule as the log
+            -- arrays below (F2): a "killed" claim for a buff with no announcer
+            -- is a raid-boss kill and is carried as a pop, never as a respawn.
             local kind = "pop"
-            if kindField == "killed" or kindField == "kill" then kind = "killed"
+            if kindField == "killed" or kindField == "kill" then
+                kind = isAnnouncerBuff(buff) and "killed" or "pop"
             elseif kindField == "quest" or kindField == "handin" then kind = "quest" end
             local zone = pick(payload, "zone", "z")
             ns.Timers.OnSNTimer(buff, epoch, kind, { who = who, zone = zone })
@@ -439,7 +465,17 @@ function SNBridge.Translate(payload, sender)
                 end
             end
             if best then
-                local kind = best.killed and "killed" or (best.quest and "quest" or "pop")
+                -- F2: a `killed` flag only means "announcer died" for the buffs
+                -- that HAVE an announcer; on rend/zg it is a raid-boss kill and
+                -- belongs in the pop log, not the respawn model.
+                local kind = "pop"
+                if best.killed and isAnnouncerBuff(buff) then
+                    kind = "killed"
+                elseif best.quest then
+                    -- F7: a hand-in, not a drop. OnSNTimer applies the +15s
+                    -- assumed-drop lead and the pending-local-hand-in rule.
+                    kind = "quest"
+                end
                 ns.Timers.OnSNTimer(buff, best.z, kind, { who = best.who or who })
                 handled = handled + 1
             end
@@ -963,7 +999,7 @@ local function testLogTranslate(fails)
     local function restore() ns.Timers.OnSNTimer, ns.Timers.OnSNPull, ns.Timers.MarkNode = savedT, savedP, savedN end
 
     local now = 1785279000
-    -- Newest entry per log anchors; 'killed' flag normalizes; empty log = 0.
+    -- Newest entry per log anchors; empty log = 0.
     local h = SNBridge.Translate({
         v = 2,
         rendLog = { { z = now - 3600, who = "old" }, { z = now, who = "fresh", killed = true } },
@@ -973,11 +1009,40 @@ local function testLogTranslate(fails)
     local byBuff = {}
     for _, e in ipairs(seen) do byBuff[e.buff] = e end
     tcheck(byBuff.rend and byBuff.rend.epoch == now, "rendLog newest entry anchored", fails)
-    tcheck(byBuff.rend and byBuff.rend.kind == "killed" and byBuff.rend.who == "fresh",
-        "rendLog killed flag + who carried", fails)
+    -- F2: Rend has NO announcer NPC — the only killable thing is Rend Blackhand
+    -- himself — so a rendLog `killed` flag is a raid-boss kill and rides as a
+    -- POP. Forwarding it as "killed" asked the engine to start a 6-minute
+    -- respawn for an NPC that does not exist.
+    tcheck(byBuff.rend and byBuff.rend.kind == "pop" and byBuff.rend.who == "fresh",
+        "rendLog killed flag routes as a POP, with who carried (F2)", fails)
     tcheck(byBuff.onyH and byBuff.onyH.epoch == now - 100, "onyLogH anchored", fails)
     tcheck(byBuff.onyA == nil, "empty onyLogA -> no anchor", fails)
     tcheck(h == 2, "two logs -> 2 anchors", fails)
+
+    -- ...and an ONYXIA log's killed flag still means the announcer died.
+    seen = {}
+    SNBridge.Translate({ v = 2, onyLogH = { { z = now, who = "Runthak", killed = true } } }, "B")
+    tcheck(seen[1] and seen[1].buff == "onyH" and seen[1].kind == "killed",
+        "onyLogH killed flag stays an announcer kill", fails)
+    -- Zandalar has no announcer either.
+    seen = {}
+    SNBridge.Translate({ v = 2, zgLog = { { z = now, who = "Hakkar", killed = true } } }, "B")
+    tcheck(seen[1] and seen[1].buff == "zg" and seen[1].kind == "pop",
+        "zgLog killed flag routes as a POP (Hakkar is not an announcer)", fails)
+    -- The single-event path applies the same rule.
+    seen = {}
+    SNBridge.Translate({ v = 2, buff = "rend", epoch = now, kind = "killed" }, "B")
+    tcheck(seen[1] and seen[1].kind == "pop", "single-event rend kill routes as a pop", fails)
+    seen = {}
+    SNBridge.Translate({ v = 2, buff = "nefH", epoch = now, kind = "killed" }, "B")
+    tcheck(seen[1] and seen[1].kind == "killed", "single-event nefH kill stays a kill", fails)
+
+    -- A quest entry carries the hand-in kind through to the engine, which owns
+    -- the +15s lead and the pending-local-hand-in rule (F7).
+    seen = {}
+    SNBridge.Translate({ v = 2, rendLog = { { z = now, who = "Ann", quest = true } } }, "B")
+    tcheck(seen[1] and seen[1].kind == "quest" and seen[1].epoch == now,
+        "rendLog quest flag routes as a hand-in at its raw epoch", fails)
 
     -- Flat node keys route through MarkNode (defensive/forward-looking shape).
     seen, nodes = {}, {}
