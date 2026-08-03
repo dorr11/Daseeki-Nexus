@@ -123,9 +123,14 @@ end
 
 -- World-buff rows. Onyxia rows carry a faction crest; `title` names the pop-log.
 local WB_ROWS = {
-    { key = "rend", logKey = "rend", slot = 2, label = "Rend (Warchief's)", title = "Rend" },
-    { key = "onyH", logKey = "onyH", slot = 1, label = "Onyxia", crest = "Horde",    title = "Onyxia (Horde)" },
-    { key = "onyA", logKey = "onyA", slot = 1, label = "Onyxia", crest = "Alliance", title = "Onyxia (Alliance)" },
+    -- ROUND-21 (owner): the row caption is just "Rend" — the "(Warchief's)" disambiguation
+    -- moves to `title`, which feeds the countdown hover tooltip's first line and the pop-log
+    -- header, so the full buff name is still one hover away while the row reads clean.
+    { key = "rend", logKey = "rend", slot = 2, label = "Rend", title = "Warchief's Blessing" },
+    -- ROUND-21 addendum 2 (owner): the faction CRESTS are gone; the row NAME itself carries
+    -- the faction in its colour, and hovering the name names the faction in a tooltip.
+    { key = "onyH", logKey = "onyH", slot = 1, label = "Onyxia", faction = "Horde",    title = "Onyxia (Horde)" },
+    { key = "onyA", logKey = "onyA", slot = 1, label = "Onyxia", faction = "Alliance", title = "Onyxia (Alliance)" },
 }
 
 -- Map a Timers.BuffStatus readout ({ state, remaining, nextAt }) to world-buff row
@@ -337,6 +342,14 @@ function TimersDock.Attach(parent)
     local wbMeta = fstr(parent, "microLabel", "RIGHT")
     wbMeta:SetPoint("TOPRIGHT", parent, "TOPRIGHT", -PAD_H, -PAD_V)
     wbMeta:SetTextColor(UI.Color("muted"))   -- pop pass
+    -- ROUND-21 (owner: the songflower header and its meta ran together). Both section
+    -- headers were LEFT-anchored with no right bound while their metas were RIGHT-anchored
+    -- with no left bound — nothing stopped them meeting in the middle, so at a wide font
+    -- (or a larger font scale) the two strings overlapped. The EYEBROW now yields: it is
+    -- bounded 8px short of the meta and ellipsizes, because the meta carries live DATA
+    -- (counts / realm · faction) while the eyebrow is a fixed label the user already knows.
+    wbHdr:SetPoint("RIGHT", wbMeta, "LEFT", -8, 0)
+    wbHdr:SetWordWrap(false)
     D.wbMeta = wbMeta
 
     -- Rows container (tagged so the geometry checker can target the WB rows block).
@@ -362,12 +375,29 @@ function TimersDock.Attach(parent)
         r.tile = makeIconTile(r, WB_TILE); r.tile:SetPoint("LEFT", r, "LEFT", 0, 0)
         r.tile.icon:SetTexture(Dashboard.AuraIcon(def.slot))
         r.name = fstr(r, "body"); r.name:SetPoint("LEFT", r.tile, "RIGHT", 8, 0); r.name:SetText(def.label)
-        r.name:SetTextColor(UI.Color("text"))   -- pop pass: full text white
-        if def.crest then
-            r.crest = r:CreateTexture(nil, "ARTWORK")
-            r.crest:SetSize(14, 14); r.crest:SetPoint("LEFT", r.name, "RIGHT", 5, 0)
-            r.crest:SetTexture(Dashboard.FactionCrest(def.crest))
-            r.crest:SetTexCoord(0.02, 0.62, 0.03, 0.63)
+        -- ROUND-21 addendum 2 (owner): the 14px faction crests are DELETED. A faction row
+        -- instead colours its NAME with the shared faction identity colour (Horde crimson /
+        -- Alliance royal blue, via Dashboard.FactionColor — the same constants the card pips
+        -- and the chip-bar A|H segment use, never a local literal), and hovering the name
+        -- names the faction. Non-faction rows (Rend) stay full-text white.
+        if def.faction then
+            r.name:SetTextColor(Dashboard.FactionColor(def.faction))
+            -- A FontString takes no mouse input, so a hit frame tracks the name's text
+            -- extents (it re-anchors as the string's width changes). It sits well left of
+            -- the countdown's own hit frame and the Log button, so their hovers are intact.
+            local nameHit = CreateFrame("Frame", nil, r)
+            nameHit:SetPoint("TOPLEFT", r.name, "TOPLEFT", -3, 2)
+            nameHit:SetPoint("BOTTOMRIGHT", r.name, "BOTTOMRIGHT", 3, -2)
+            nameHit:EnableMouse(true)
+            nameHit:SetScript("OnEnter", function(self)
+                GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+                GameTooltip:AddLine(def.faction, Dashboard.FactionColor(def.faction))
+                GameTooltip:Show()
+            end)
+            nameHit:SetScript("OnLeave", function() GameTooltip:Hide() end)
+            r.nameHit = nameHit
+        else
+            r.name:SetTextColor(UI.Color("text"))   -- pop pass: full text white
         end
         r.log = UI.MakeButton(r, { text = "Log", variant = "quiet", width = 40, height = 18,
             onClick = function() showPopLog(def.logKey, (def.title or def.label) .. " — Pop Log") end })
@@ -403,12 +433,19 @@ function TimersDock.Attach(parent)
     end
 
     -- ── Songflowers section (compact 2×5 mini grid) ──────────────────────────
-    local sfHdr = microLabel(parent, "SONGFLOWERS \194\183 FELWOOD")
+    -- ROUND-21 addendum 4 (owner): the eyebrow is just "FELWOOD" — the 2x5 grid below it is
+    -- self-evidently the songflowers, and the shorter label leaves the meta count ample room.
+    -- The anti-overlap rule below stays anyway, belt-and-braces for odd counts/font scales.
+    local sfHdr = microLabel(parent, "FELWOOD")
     sfHdr:SetPoint("TOPLEFT", wbRows, "BOTTOMLEFT", 0, -10)
     local sfMeta = fstr(parent, "microLabel", "RIGHT")
     sfMeta:SetPoint("TOPRIGHT", parent, "TOPRIGHT", -PAD_H, 0)
     -- keep the meta baseline aligned with the SF header.
     sfMeta:SetPoint("TOP", sfHdr, "TOP", 0, 0)
+    -- Same flex rule as the WB header above — this is the pair the owner caught colliding
+    -- ("SONGFLOWOOD up · 0 respawning"): the eyebrow truncates before it can reach the meta.
+    sfHdr:SetPoint("RIGHT", sfMeta, "LEFT", -8, 0)
+    sfHdr:SetWordWrap(false)
     sfMeta:SetTextColor(UI.Color("muted"))   -- pop pass
     D.sfMeta = sfMeta
 
@@ -431,6 +468,12 @@ function TimersDock.Attach(parent)
         -- Two-line cell (fills the taller round-4 cell): node name on top, status below.
         cell.nm = fstr(cell, "microLabel"); cell.nm:SetPoint("TOPLEFT", cell, "TOPLEFT", 6, -5)
         cell.nm:SetWordWrap(false); cell.nm:SetTextColor(UI.Color("muted"))   -- pop pass
+        -- ROUND-21 addendum 3 (owner): the LOCATION caption steps down one size so more of
+        -- each node name clears the ellipsis. -1 only, not -2: microLabel is already 11pt,
+        -- and 9pt would fall under the 720p legibility floor for a muted-tint label. The
+        -- status line below (cell.st) keeps its numeral size. SizedFont so it tracks the
+        -- font picker instead of freezing a face.
+        if Dashboard.SizedFont then Dashboard.SizedFont(cell.nm, "microLabel", -1) end
         -- Round-16b addendum 2 (owner: "the names are getting cut off"): the numeric
         -- prefix is dropped so the full node name gets the cell width. Node indices are
         -- unaffected everywhere else (pop log / slash output still name them by number).
@@ -465,6 +508,21 @@ function TimersDock.Attach(parent)
         end
     end
     D._layoutGrid = layoutGrid
+
+    -- ── FOOTER BAND (owner round-21) ─────────────────────────────────────────────
+    -- The band between the songflower grid's bottom edge and the panel's bottom border.
+    -- Its contents (DMF caption + the Broadcast/Refresh glyph pair) are VERTICALLY CENTRED
+    -- in it rather than pinned at a fixed bottom padding, which is what left them sitting
+    -- low. Derived from the REAL frames — grid bottom to panel bottom — so the centring
+    -- survives any future change to either edge instead of baking in today's numbers.
+    -- Band today: dock 268 - grid bottom 232 - 1px border = 35, so a 22px button centres
+    -- with ~6.5px of air above and below. Children use LEFT/RIGHT anchors, which centre
+    -- vertically by construction.
+    local footer = CreateFrame("Frame", nil, parent)
+    footer:SetPoint("TOPLEFT", sfGrid, "BOTTOMLEFT", 0, 0)
+    footer:SetPoint("BOTTOMRIGHT", parent, "BOTTOMRIGHT", -PAD_H, 1)
+    tag(footer, "dock.footer")
+    D.footer = footer
 
     -- ── Bottom-right ICON PAIR (owner round-10 item 1): Broadcast + Refresh ──────
     -- Icon buttons (glyph + tooltip) in the dock's bottom-right corner. Refresh (right)
@@ -510,7 +568,8 @@ function TimersDock.Attach(parent)
             ns:Print("timer-data request arrives in a later update.")
         end
     end)
-    refreshBtn:SetPoint("BOTTOMRIGHT", parent, "BOTTOMRIGHT", -PAD_H, PAD_V)
+    refreshBtn:SetPoint("RIGHT", footer, "RIGHT", 0, 0)   -- round-21: centred in the band
+    tag(refreshBtn, "dock.refresh")
     -- Broadcast (signal/horn glyph) — push our snapshot to the mesh (60s throttle).
     local bcast = iconButton("Interface\\AddOns\\Daseeki-Nexus\\textures\\icon-broadcast", "Broadcast timers to the mesh (60s)", function()
         local t = GetTime()
@@ -532,7 +591,7 @@ function TimersDock.Attach(parent)
     -- (Classic Era exposes no faire-schedule API).
     local dmfHost = CreateFrame("Frame", nil, parent)
     dmfHost:SetHeight(20)
-    dmfHost:SetPoint("BOTTOMLEFT", parent, "BOTTOMLEFT", PAD_H, PAD_V + 1)
+    dmfHost:SetPoint("LEFT", footer, "LEFT", 0, 0)        -- round-21: centred in the band
     dmfHost:SetPoint("RIGHT", bcast, "LEFT", -10, 0)
     dmfHost:EnableMouse(true)
     -- Round-16b addendum: the "Darkmoon:" word prefix is replaced by the DMF BUFF ICON
