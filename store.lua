@@ -31,6 +31,22 @@ Store.INVENTORY_SCHEMA = 1
 --           the dashboard renders these durations with a "(Boon)" suffix (item 37).
 Store.AURA_SOURCE = { LIVE = 0, RELAYED = 1, BOON = 2 }
 
+-- WHICH AURA SLOTS CAN PHYSICALLY BE STORED IN A CHRONOBOON.
+--
+-- The behavioural spec's tracked-set table marks slot 9 (the Fallen Hero's
+-- Battle Shout, spell 25101) and slot 10 (Fire Festival Fury) "Not boonable" —
+-- the Chronoboon Displacer will not suspend either of them. So an auraStates
+-- cell with source == BOON on slot 9 or 10 is not merely unlikely, it is
+-- IMPOSSIBLE, and a card row reading "Battle Shout (Boon)" can only ever have
+-- come from a parser bug (or from a peer that still has one).
+--
+-- This is the canonical set. tracker.lua keeps a local mirror (its pure parser
+-- has to run before Store exists in the headless harness) and a self-test
+-- asserts the two agree, in the same style as the aura matchers.
+Store.BOONABLE_AURA_SLOTS     = { [1] = true, [2] = true, [3] = true, [4] = true,
+                                  [5] = true, [6] = true, [7] = true, [8] = true }
+Store.NON_BOONABLE_AURA_SLOTS = { [9] = true, [10] = true }
+
 local LOG_CAP            = 15
 local LOG_EXPIRY         = 48 * 3600     -- 48h
 local LOG_DEDUP_WINDOW   = 30            -- 30s
@@ -1976,8 +1992,12 @@ end
 --     repair pass; this layer only catches what is IMPOSSIBLE, not what is odd.
 --
 -- AN UNKNOWN LEVEL IS NOT EVIDENCE. level 0 / nil / non-numeric means the record
--- never told us, so nothing is stripped: the guard judges a record only by the
--- level THE RECORD ITSELF CARRIES.
+-- never told us, so nothing LEVEL-GATED is stripped: those rules judge a record
+-- only by the level THE RECORD ITSELF CARRIES.
+--
+--   The one rule that is not level-gated is R0, the impossible BOON slot below:
+--   "the Chronoboon cannot hold a Battle Shout" is true at every level, so that
+--   check runs first and unconditionally.
 --
 -- PURE given its argument. Mutates `record`; returns the number of fields cleared.
 ----------------------------------------------------------------------
@@ -1988,13 +2008,42 @@ Store.DMT_AURA_SLOTS     = { [6] = true, [7] = true, [8] = true }
 
 -- Diagnostic counters, in the style of Store._droppedNamelessInbound. Read with
 -- /nexus debug sanity.
-Store._inboundSanity = { attune = 0, auras = 0, records = 0 }
+Store._inboundSanity = { attune = 0, auras = 0, records = 0, boon = 0 }
 
 function Store.SanitizeInboundRecord(record)
     if type(record) ~= "table" then return 0 end
-    local level = tonumber(record.level) or 0
-    if level <= 0 then return 0 end          -- unknown level proves nothing
     local cleared = 0
+
+    -- R0 — A BOON-SOURCED SLOT THAT CANNOT BE BOONED.
+    --
+    -- Unlike the two rules below this one is NOT level evidence, it is physics:
+    -- the Chronoboon Displacer does not suspend Battle Shout or Fire Festival
+    -- Fury (spec §4.1), so `source == BOON` on slot 9/10 is impossible however
+    -- old, however high-level, however trusted the sender. It therefore runs
+    -- BEFORE the unknown-level early return and is never gated on level.
+    --
+    -- Only the BOON source is stripped. A live or relayed Battle Shout is an
+    -- ordinary, entirely legal buff and is left completely alone — the slot is
+    -- cleared, not the buff's right to exist.
+    if type(record.auraStates) == "table" then
+        for slot in pairs(Store.NON_BOONABLE_AURA_SLOTS) do
+            local cell = record.auraStates[slot]
+            if type(cell) == "table"
+               and (tonumber(cell.source) or 0) == Store.AURA_SOURCE.BOON then
+                record.auraStates[slot] = nil
+                cleared = cleared + 1
+                Store._inboundSanity.boon = (Store._inboundSanity.boon or 0) + 1
+            end
+        end
+    end
+
+    local level = tonumber(record.level) or 0
+    if level <= 0 then                       -- unknown level proves nothing
+        if cleared > 0 then
+            Store._inboundSanity.records = Store._inboundSanity.records + 1
+        end
+        return cleared
+    end
 
     if level < Store.ATTUNE_MIN_LEVEL and type(record.attunements) == "table" then
         for key in pairs(Store.ATTUNE_GATED_RAIDS) do

@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+- Fixed: **"Battle Shout (Boon)" was a state the game cannot produce.** A chronoboon
+  cannot hold a Battle Shout or Fire Festival Fury — the Displacer will not take them —
+  but the code that reads a chronoboon's tooltip checked all ten tracked buffs instead of
+  the eight that can actually go in. So any hover over a boon icon whose tooltip merely
+  contained the words wrote Battle Shout down as stored, and it then showed up on the
+  character's card and detail row as a suspended buff, frozen, for as long as the boon
+  lasted. It is now ignored, along with Fire Festival Fury, and the "how many buffs are in
+  the boon" number no longer counts either of them.
+
+  Records that already picked up one of these are cleaned up once, on your next login,
+  across every account in your store and including the saved boon snapshots — and the
+  same rows arriving from a mesh peer who has not updated yet are stripped on the way in,
+  every time, not just once. A Battle Shout you actually *have* is untouched throughout:
+  only the impossible "in the boon" version is removed.
+
+- Fixed: **a stored buff with no readable time could steal the next one's.** In the same
+  tooltip read, a buff listed without its own remaining time picked up the minutes
+  belonging to whichever buff came after it — the surviving half of the old "Fengus'
+  1h 59m appeared on Rallying Cry" bug. Each buff's time is now read only from its own
+  line, and a buff whose time genuinely cannot be read keeps the number already on record
+  instead of being corrected to a wrong one.
+
 - Changed: **Settings is smaller.** Four things you were being asked to configure have
   been decided for you, because there was only ever one sensible answer and keeping the
   controls meant keeping the ways they could be set wrong.

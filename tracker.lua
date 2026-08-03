@@ -60,6 +60,17 @@ local BOON_DRIFT_TOLERANCE = 120
 -- Shout) and 10 (Fire Festival Fury) are explicitly NOT boonable per the spec's
 -- tracked-set table, so a live Battle Shout must never be flipped to "booned"
 -- when a boon cast succeeds. Slots 1-8 are the boonable world buffs.
+--
+-- THIS SET IS THE WHOLE TRUTH ABOUT "CAN BE BOONED", and every path that can
+-- write source = BOON must consult it — not just the cast path. It was the cast
+-- path alone that respected it, while ParseBoonBlock walked all ten slots, so a
+-- chronoboon tooltip that merely mentioned "Battle Shout" wrote slot 9 as
+-- boon-stored and the dashboard rendered the impossible "Battle Shout (Boon)".
+--
+-- Local mirror of Store.BOONABLE_AURA_SLOTS: the pure parser below has to run in
+-- the headless harness before store.lua exists, so it cannot reach through ns.
+-- testBoonScope asserts the mirror and the canonical set agree, so they cannot
+-- drift apart silently.
 local BOONABLE_SLOT = {
     [1] = true, [2] = true, [3] = true, [4] = true,
     [5] = true, [6] = true, [7] = true, [8] = true,
@@ -166,8 +177,17 @@ local CHRONOBOON_MARKERS = {
 }
 
 -- Names counted as stored world buffs when scanning the chronoboon tooltip.
--- Includes the two new tracked slots plus the chronoboon-only extras that count
--- toward boonCount but have no dashboard slot (Boon of Blackfathom / Spark).
+--
+-- BOONABLE NAMES ONLY. This list answers one question — "how many buffs are
+-- inside the boon" (Tracker.BoonedBuffCount) — and a buff that cannot be boonzed
+-- can never be one of them. "battle shout" and Fire Festival Fury used to sit
+-- here and inflated the count by up to two whenever the words appeared anywhere
+-- in the tooltip; they are the same two slots ParseBoonBlock now refuses (see
+-- BOONABLE_SLOT).
+--
+-- Boon of Blackfathom / Spark of Inspiration STAY: they really are suspended by
+-- the displacer and really do count, they simply have no dashboard slot of their
+-- own, which is why they are named here and not in BUFF_SLOTS.
 local STORED_BUFF_NAMES = {
     "rallying cry of the dragonslayer",
     "warchief's blessing",
@@ -177,8 +197,6 @@ local STORED_BUFF_NAMES = {
     "fengus' ferocity",
     "mol'dar's moxie",
     "slip'kik's savvy",
-    "battle shout",
-    FFF_AURA_PREFIX,
     "boon of blackfathom",
     "spark of inspiration",
 }
@@ -333,6 +351,11 @@ end
 
 Tracker._boonTooltipCount = 0
 Tracker._boonTooltipSeen  = 0
+-- Diagnostic (read with /nexus debug sanity): how many times a chronoboon
+-- tooltip named a buff that cannot be boonzed (slots 9/10) and was ignored. A
+-- non-zero value here is normal — it is exactly the number of "Battle Shout
+-- (Boon)" rows that would have been written before this fix.
+Tracker._boonScopeRejects = 0
 -- Parsed boon snapshot: { slots = { [slot] = { duration=sec }, ... },
 --                         dmf = bool, count = n }.  Nil until first parse.
 Tracker._boonParsed = nil
@@ -388,20 +411,64 @@ end
 -- This scans the block for EVERY tracked-slot buff and pairs each with the
 -- parenthetical that follows ITS OWN name, so ordering and newline-vs-space
 -- separation don't matter. Returns (slots, dmf) where slots[slot] = { duration }.
+--
+-- TWO CORRECTNESS RULES, both learned from live tooltips:
+--
+--  (1) BOONABLE SLOTS ONLY. This loop used to walk all ten BUFF_SLOTS while the
+--      cast path walked BOONABLE_SLOT, so the tooltip parser was the one writer
+--      that could mark a non-boonable slot as boon-stored. Any chronoboon
+--      tooltip whose text contained the words "Battle Shout" — a hover during a
+--      raid, a client that lists the buffs it CANNOT hold, anything — wrote
+--      slots[9], and every consumer downstream faithfully rendered "Battle Shout
+--      (Boon)": a state the game cannot produce. Slots 9/10 are now skipped
+--      outright and counted in Tracker._boonScopeRejects for /nexus debug sanity.
+--
+--  (2) EACH BUFF'S DURATION COMES FROM ITS OWN SEGMENT. Taking "the first (...)
+--      after the name starts" is only right when the name HAS a parenthetical of
+--      its own; when it does not, the search ran on to the end of the block and
+--      adopted the NEXT buff's minutes. That is the same shape as the original
+--      Fengus symptom the header describes and it survived the first fix:
+--          "Rallying Cry of the Dragonslayer\nFengus' Ferocity (119m)"
+--      gave slot 1 Fengus' 119m. The search is now clamped to the buff's own
+--      segment — up to the next newline, or the start of the next tracked buff
+--      name, whichever comes first — so a duration can never cross a name
+--      boundary. A name with no readable duration of its own yields duration 0,
+--      meaning "in the boon, remaining unknown"; ReconcileBoonSnapshot treats
+--      that as presence-only and keeps whatever number it already had.
 function Tracker.ParseBoonBlock(text)
     local slots, dmf = {}, false
     text = normName(text)
     if text == "" then return slots, dmf end
+
+    -- Where does the segment belonging to a name starting at `from` end?
+    -- The earliest of: the next newline, the start of any OTHER tracked buff
+    -- name after this one, or the end of the block.
+    local function segmentEnd(from, ownPrefix)
+        local stop = text:find("\n", from + #ownPrefix, true) or (#text + 1)
+        for j = 1, #BUFF_SLOTS do
+            local other = BUFF_SLOTS[j]
+            if other.prefix ~= "" and other.prefix ~= ownPrefix then
+                local at = text:find(other.prefix, from + #ownPrefix, true)
+                if at and at < stop then stop = at end
+            end
+        end
+        return stop - 1
+    end
+
     for s = 1, #BUFF_SLOTS do
         local def = BUFF_SLOTS[s]
         if def.prefix ~= "" then
             local from = text:find(def.prefix, 1, true)
             if from then
-                -- Duration = first "(...)" AFTER this buff name starts, so each
-                -- buff resolves to its OWN remaining time, not the block's first.
-                local dur = Tracker.ParseBoonDuration(text:sub(from)) or 0
-                slots[def.slot] = { duration = dur }
-                if def.prefix == DMF_BUFF_PREFIX then dmf = true end
+                if not BOONABLE_SLOT[def.slot] then
+                    -- (1) Named in the tooltip but physically unboonable: ignore.
+                    Tracker._boonScopeRejects = (Tracker._boonScopeRejects or 0) + 1
+                else
+                    -- (2) Own segment only.
+                    local seg = text:sub(from, segmentEnd(from, def.prefix))
+                    slots[def.slot] = { duration = Tracker.ParseBoonDuration(seg) or 0 }
+                    if def.prefix == DMF_BUFF_PREFIX then dmf = true end
+                end
             end
         end
     end
@@ -425,6 +492,23 @@ local function persistBoonCache(nameRealm, parsed)
     end
 end
 
+-- Drop any non-boonable slot from a boon snapshot's slot table, in place.
+-- Returns the number removed. Used on every snapshot that comes from OUTSIDE
+-- this session's parser — the persisted cache written by an older build is the
+-- one that matters — so a slots[9] booned before the fix cannot be rehydrated
+-- back into the record on the next login. Pure over its argument.
+function Tracker.ScrubNonBoonableSlots(slots)
+    if type(slots) ~= "table" then return 0 end
+    local removed = 0
+    for slot in pairs(slots) do
+        if not BOONABLE_SLOT[slot] then
+            slots[slot] = nil
+            removed = removed + 1
+        end
+    end
+    return removed
+end
+
 -- Rehydrate the parsed boon snapshot from the persisted cache (login path).
 function Tracker.RehydrateBoonCache()
     local nameRealm = selfNameRealm()
@@ -432,9 +516,14 @@ function Tracker.RehydrateBoonCache()
     local cached = data and data.caches and data.caches.tooltipBoon
                    and data.caches.tooltipBoon[nameRealm]
     if type(cached) == "table" and type(cached.slots) == "table" then
+        -- The cache on disk may predate the boonable-scope fix and hold a
+        -- slots[9]/[10]. Scrub before adopting, and take the count down with it
+        -- so "N in the boon" does not keep counting a buff that was never there.
+        local dropped = Tracker.ScrubNonBoonableSlots(cached.slots)
+        local count = math.max(0, (tonumber(cached.count) or 0) - dropped)
         Tracker._boonParsed = { slots = cached.slots, dmf = cached.dmf or false,
-                                count = cached.count or 0 }
-        Tracker._boonTooltipCount = cached.count or 0
+                                count = count }
+        Tracker._boonTooltipCount = count
     end
 end
 
@@ -471,7 +560,12 @@ function Tracker.ReconcileBoonSnapshot(parsed, cached)
             local drift = haveDur - tipDur
             if drift < 0 then drift = -drift end
             -- (b) correct only a real disagreement; keep `option` either way.
-            local dur = (drift > BOON_DRIFT_TOLERANCE) and tipDur or haveDur
+            -- A tooltip duration of 0 is NOT a disagreement — ParseBoonBlock
+            -- emits it for "the block names this buff but carries no readable
+            -- parenthetical for it", i.e. presence without a number. Correcting
+            -- a good cached duration down to that would be the leak bug wearing
+            -- a different hat, so presence-only readings keep the cached value.
+            local dur = (tipDur > 0 and drift > BOON_DRIFT_TOLERANCE) and tipDur or haveDur
             out[slot] = { duration = dur, option = have.option }
         else
             -- The tooltip knows about a slot we did not: adopt it.
@@ -638,12 +732,16 @@ function Tracker.SnapshotBoonable(rec, atFrame)
 end
 
 -- Project the record's BOONED slots into a cache snapshot ({slots, dmf, count}).
+-- BOONABLE_SLOT-gated: a record carrying a legacy boon-marked slot 9 (written by
+-- a pre-fix build, or relayed from a peer still running one) must not be able to
+-- launder it back into a fresh cache on the next cast.
 local function projectBoonCache(rec)
     local parsed = { slots = {}, dmf = false, count = 0 }
     local states = rec and rec.auraStates
     if type(states) ~= "table" then return parsed end
     for slot, cell in pairs(states) do
-        if type(cell) == "table" and (cell.source or 0) == BOON_SOURCE
+        if BOONABLE_SLOT[slot] and type(cell) == "table"
+           and (cell.source or 0) == BOON_SOURCE
            and (tonumber(cell.duration) or 0) > 0 then
             parsed.slots[slot] = { duration = math.floor(cell.duration),
                                    option = cell.option or 0 }
@@ -1360,11 +1458,18 @@ local function captureAuras(rec)
         -- the dashboard shows their frozen durations with "(Boon)" (item 37).
         -- Booned buffs are NOT live on the character, so only inject slots that
         -- live capture did not already fill.
+        -- BOONABLE_SLOT-gated and >0-gated: the last line of defence for the
+        -- record itself. Even if some cache path upstream ever hands us a
+        -- slots[9] again, it stops here rather than becoming a "Battle Shout
+        -- (Boon)" card row; and a presence-only entry (duration 0, see
+        -- ParseBoonBlock rule 2) is not injected, because a frozen "0s (Boon)"
+        -- tells the owner strictly less than showing nothing at all.
         local parsed = Tracker._boonParsed
         if parsed then
             for slot, cell in pairs(parsed.slots) do
-                if not slots[slot] then
-                    slots[slot] = { duration = cell.duration or 0,
+                local dur = tonumber(cell.duration) or 0
+                if BOONABLE_SLOT[slot] and not slots[slot] and dur > 0 then
+                    slots[slot] = { duration = dur,
                                     option = cell.option or 0, source = BOON_SOURCE }
                 end
             end
@@ -2272,6 +2377,115 @@ function Tracker._RepairAttuneNamespace(nsTbl, levelOf)
     return demoted
 end
 
+----------------------------------------------------------------------
+-- R4 — THE IMPOSSIBLE BOON SLOT (its own one-shot pass, its own marker).
+--
+-- Every record written while ParseBoonBlock walked all ten slots can be carrying
+-- an auraStates[9] (or [10]) with source == BOON: the "Battle Shout (Boon)" card
+-- row. Nothing re-probes those records — a peer's copy of a character that never
+-- logs in again keeps the row forever — so it needs the same one-shot sweep the
+-- fabricated blocks got.
+--
+-- WHY A SEPARATE MARKER, not a fourth rule inside RepairImpossibleRecords: that
+-- pass's marker (`impossibleRecordsRepaired`) is ALREADY true in every store that
+-- has run the mesh-bleed build. Adding a rule under the same key would ship a
+-- repair that never runs for exactly the people who need it. The new key means
+-- one extra pass on the first login after this build, and never again.
+--
+-- The rule needs no level evidence and no threshold: source == BOON on a
+-- non-boonable slot is impossible outright (see Store.NON_BOONABLE_AURA_SLOTS).
+-- Only the boon-sourced cell goes; a LIVE or RELAYED Battle Shout is a perfectly
+-- ordinary buff and is never touched.
+--
+-- The persisted tooltip caches are swept too: `caches.tooltipBoon[nameRealm]`
+-- is a second, independent source that captureAuras re-injects from, so healing
+-- only the records would let the cache write the row straight back.
+----------------------------------------------------------------------
+Tracker.BOON_SCOPE_REPAIR_KEY = "nonBoonableBoonSlotsRepaired"
+
+-- PURE: strip boon-sourced cells from non-boonable slots. Returns the count.
+function Tracker._StripNonBoonableBoonSlots(states)
+    if type(states) ~= "table" then return 0 end
+    local removed = 0
+    for slot, cell in pairs(states) do
+        if not BOONABLE_SLOT[slot] and type(cell) == "table"
+           and (tonumber(cell.source) or 0) == BOON_SOURCE then
+            states[slot] = nil
+            removed = removed + 1
+        end
+    end
+    return removed
+end
+
+-- PURE given its arguments: sweep ONE account bucket. Returns records changed,
+-- accumulating the slot total into counts.boonSlots.
+function Tracker._RepairBoonScopeIn(bucket, counts)
+    if type(bucket) ~= "table" then return 0 end
+    counts = counts or {}
+    local touched = 0
+    for _, tbl in ipairs({ bucket.characters, bucket.homeless }) do
+        if type(tbl) == "table" then
+            for _, rec in pairs(tbl) do
+                if type(rec) == "table" then
+                    local n = Tracker._StripNonBoonableBoonSlots(rec.auraStates)
+                    if n > 0 then
+                        counts.boonSlots = (counts.boonSlots or 0) + n
+                        touched = touched + 1
+                    end
+                end
+            end
+        end
+    end
+    return touched
+end
+
+-- PURE given its argument: sweep the persisted tooltip-boon caches. Returns the
+-- number of cache entries changed; also corrects each entry's stored count.
+function Tracker._RepairBoonCaches(tooltipBoon)
+    if type(tooltipBoon) ~= "table" then return 0 end
+    local touched = 0
+    for _, entry in pairs(tooltipBoon) do
+        if type(entry) == "table" and type(entry.slots) == "table" then
+            local dropped = Tracker.ScrubNonBoonableSlots(entry.slots)
+            if dropped > 0 then
+                entry.count = math.max(0, (tonumber(entry.count) or 0) - dropped)
+                touched = touched + 1
+            end
+        end
+    end
+    return touched
+end
+
+-- The one-shot runner for R4. Returns the number of records changed.
+function Tracker.RepairNonBoonableBoonSlots()
+    local S = ns.Store
+    local data = S and S.data
+    if type(data) ~= "table" then return 0 end
+    if data[Tracker.BOON_SCOPE_REPAIR_KEY] then return 0 end
+
+    local counts = {}
+    local touched = 0
+    if type(data.accounts) == "table" then
+        for _, bucket in pairs(data.accounts) do
+            touched = touched + Tracker._RepairBoonScopeIn(bucket, counts)
+        end
+    end
+    local caches = Tracker._RepairBoonCaches(data.caches and data.caches.tooltipBoon)
+
+    data[Tracker.BOON_SCOPE_REPAIR_KEY] = true
+
+    if touched > 0 or caches > 0 then
+        if ns and ns.Print then
+            ns:Print(string.format(
+                "|cffffc020removed %d impossible stored-buff slot(s)|r from %d character "
+                .. "record(s) and %d saved boon snapshot(s) "
+                .. "(Battle Shout / Fire Festival Fury cannot go into a chronoboon)",
+                counts.boonSlots or 0, touched, caches))
+        end
+    end
+    return touched
+end
+
 -- The one-shot runner. Sweeps EVERY account bucket, not just our own: the
 -- placeholder skeletons ride the mesh, so a peer bucket holds the same landmines,
 -- and a peer whose owner has not patched yet would otherwise re-detonate into a
@@ -2747,6 +2961,14 @@ function Tracker.OnLogin()
     else
         Tracker.RepairImpossibleRecords()
     end
+    -- One-shot (own marker, see R4): strip the boon-stored Battle Shout / Fire
+    -- Festival Fury slots the all-ten tooltip parse used to write, from the
+    -- records AND from the saved boon snapshots.
+    if ns.SafeCall then
+        ns:SafeCall(Tracker.RepairNonBoonableBoonSlots)
+    else
+        Tracker.RepairNonBoonableBoonSlots()
+    end
     Tracker.InvalidateAttuneIndex()
 
     -- First snapshot once the world is ready.
@@ -2809,14 +3031,19 @@ function Tracker.DebugSanity()
         return
     end
     ns:Print(string.format(
-        "inbound sanity guard: %d record(s) stripped -- %d attunement flag(s), %d aura slot(s)",
-        c.records or 0, c.attune or 0, c.auras or 0))
+        "inbound sanity guard: %d record(s) stripped -- %d attunement flag(s), %d aura slot(s), "
+        .. "%d impossible boon slot(s)",
+        c.records or 0, c.attune or 0, c.auras or 0, c.boon or 0))
     ns:Print(string.format("  gates: attunement < %d, Dire Maul buffs < %d",
         S.ATTUNE_MIN_LEVEL or 0, S.DMT_MIN_LEVEL or 0))
     ns:Print(string.format("  nameless inbound dropped: %d",
         S._droppedNamelessInbound or 0))
+    ns:Print(string.format("  tooltip lines naming an unboonable buff, ignored: %d",
+        Tracker._boonScopeRejects or 0))
     local done = S.data and S.data[Tracker.AURA_REPAIR_KEY]
     ns:Print("  one-shot impossible-record repair: " .. (done and "already run" or "PENDING"))
+    local boonDone = S.data and S.data[Tracker.BOON_SCOPE_REPAIR_KEY]
+    ns:Print("  one-shot unboonable-slot repair: " .. (boonDone and "already run" or "PENDING"))
 end
 
 if ns.RegisterDebugCommand then
@@ -2892,6 +3119,150 @@ local function testBoonBlock(fails)
     local cs = Tracker.ParseBoonBlock(CURLY)
     ck(cs[6] and cs[6].duration == 119 * 60, "curly-apos Fengus -> slot6, 119m")
     ck(cs[7] and cs[7].duration == 120 * 60, "curly-apos Mol'dar -> slot7, 120m")
+end
+
+----------------------------------------------------------------------
+-- BOON SCOPE (the "Battle Shout (Boon)" card row) + the residual duration leak.
+--
+-- Two defects, one parser:
+--
+--  1. ParseBoonBlock walked all ten BUFF_SLOTS while every other writer of
+--     source = BOON walked BOONABLE_SLOT. The spec's tracked-set table marks
+--     slot 9 (Battle Shout, 25101) and slot 10 (Fire Festival Fury) "Not
+--     boonable", so a tooltip that merely CONTAINED the words wrote slots[9] and
+--     the dashboard rendered a state the game cannot produce.
+--
+--  2. The duration search ran from the buff's name to the END OF THE BLOCK, so a
+--     name with no parenthetical of its own adopted the NEXT buff's minutes —
+--     the surviving half of the original "Fengus' 119m landed on Rallying Cry"
+--     symptom. Reproduced below from the parse header's own description.
+----------------------------------------------------------------------
+local function testBoonScope(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+
+    -- ---- 1) the unboonable slots are never boon-marked -------------------
+    local WITH_BS =
+        "World effects suspended:\n" ..
+        "Rallying Cry of the Dragonslayer (115m)\n" ..
+        "Battle Shout (14m)\n" ..
+        "Fengus' Ferocity (119m)\n" ..
+        "Fire Festival Fury (30m)\n" ..
+        "Sayge's Dark Fortune (119m)"
+
+    local savedRejects = Tracker._boonScopeRejects
+    Tracker._boonScopeRejects = 0
+    local slots, dmf = Tracker.ParseBoonBlock(WITH_BS)
+
+    ck(slots[9] == nil, "BS: a Battle Shout tooltip line is NOT boon-marked (slot 9)")
+    ck(slots[10] == nil, "FFF: a Fire Festival Fury line is NOT boon-marked (slot 10)")
+    ck(Tracker._boonScopeRejects == 2, "BS/FFF: both rejections hit the debug counter")
+    -- ...and the boonable slots around them parse exactly as before.
+    ck(slots[1] and slots[1].duration == 115 * 60, "BS fixture: slot 1 still 115m")
+    ck(slots[6] and slots[6].duration == 119 * 60, "BS fixture: slot 6 still 119m")
+    ck(slots[5] and slots[5].duration == 119 * 60, "BS fixture: slot 5 (DMF) still 119m")
+    ck(dmf == true, "BS fixture: DMF still flagged")
+    local n = 0; for _ in pairs(slots) do n = n + 1 end
+    ck(n == 3, "BS fixture: exactly the three BOONABLE slots resolve (got " .. n .. ")")
+    Tracker._boonScopeRejects = savedRejects
+
+    -- A block that is ONLY a Battle Shout yields nothing at all.
+    local only = Tracker.ParseBoonBlock("World effects suspended:\nBattle Shout (110m)")
+    ck(next(only) == nil, "BS alone: an unboonable-only block parses to no slots")
+
+    -- Every slot the parser can emit is boonable, whatever the input.
+    for slot in pairs(Tracker.ParseBoonBlock(WITH_BS)) do
+        ck(BOONABLE_SLOT[slot] == true,
+           "parser emitted non-boonable slot " .. tostring(slot))
+    end
+
+    -- ---- 2) the Fengus duration leak -------------------------------------
+    -- The parse header's own description: a buff named with no parenthetical of
+    -- its own, immediately followed by Fengus' 119m.
+    local LEAK =
+        "World effects suspended:\n" ..
+        "Rallying Cry of the Dragonslayer\n" ..
+        "Fengus' Ferocity (119m)\n" ..
+        "Mol'dar's Moxie (120m)"
+    local ls = Tracker.ParseBoonBlock(LEAK)
+    ck(ls[1] and ls[1].duration == 0,
+       "leak: a name with no duration of its own reads 0, not the next buff's")
+    ck(not (ls[1] and ls[1].duration == 119 * 60),
+       "leak: Fengus' 119m must NOT land on Rallying Cry")
+    ck(ls[6] and ls[6].duration == 119 * 60, "leak: Fengus keeps its own 119m")
+    ck(ls[7] and ls[7].duration == 120 * 60, "leak: Mol'dar keeps its own 120m")
+
+    -- Same-line separation (no newlines at all) must clamp on the NEXT NAME.
+    local ONELINE = "suspended: Rallying Cry of the Dragonslayer Fengus' Ferocity (119m)"
+    local os_ = Tracker.ParseBoonBlock(ONELINE)
+    ck(os_[1] and os_[1].duration == 0,
+       "leak: with no newline the clamp is the next buff NAME")
+    ck(os_[6] and os_[6].duration == 119 * 60, "leak: one-line Fengus still 119m")
+
+    -- ---- 3) presence-without-duration is not a reconcile correction ------
+    -- A 0 from the tooltip means "listed, minutes unreadable". Correcting a good
+    -- cached duration down to it would be the leak wearing a different hat.
+    local cached = { slots = { [1] = { duration = 6900, option = 3 } }, dmf = false, count = 1 }
+    local out = Tracker.ReconcileBoonSnapshot(
+        { slots = { [1] = { duration = 0 } }, dmf = false, count = 1 }, cached)
+    ck(out.slots[1] and out.slots[1].duration == 6900,
+       "reconcile: a presence-only (0s) tooltip reading keeps the cached duration")
+    ck(out.slots[1].option == 3, "reconcile: presence-only keeps the variant too")
+
+    -- ---- 4) the stored-buff COUNT agrees with the boonable set -----------
+    -- STORED_BUFF_NAMES feeds Tracker.BoonedBuffCount. Battle Shout and FFF used
+    -- to be in it and inflated the count by up to two.
+    for j = 1, #STORED_BUFF_NAMES do
+        local nm = STORED_BUFF_NAMES[j]
+        local slot = Tracker.MatchBuffSlot(nm)
+        -- Either it maps to a boonable dashboard slot, or it is one of the two
+        -- chronoboon-only extras that have no slot at all.
+        ck(slot == nil or BOONABLE_SLOT[slot] == true,
+           "stored-buff name '" .. nm .. "' maps to a NON-boonable slot")
+    end
+    local function has(list, needle)
+        for j = 1, #list do if list[j] == needle then return true end end
+        return false
+    end
+    ck(not has(STORED_BUFF_NAMES, "battle shout"), "count: Battle Shout is not a stored buff")
+    ck(not has(STORED_BUFF_NAMES, FFF_AURA_PREFIX), "count: FFF is not a stored buff")
+    ck(has(STORED_BUFF_NAMES, "boon of blackfathom"),
+       "count: the slotless chronoboon extras are still counted")
+
+    -- ---- 5) the local mirror and the canonical set agree ------------------
+    if ns.Store and ns.Store.BOONABLE_AURA_SLOTS then
+        for slot in pairs(ns.Store.BOONABLE_AURA_SLOTS) do
+            ck(BOONABLE_SLOT[slot] == true, "mirror: Store says " .. slot .. " is boonable")
+        end
+        for slot in pairs(BOONABLE_SLOT) do
+            ck(ns.Store.BOONABLE_AURA_SLOTS[slot] == true,
+               "mirror: tracker says " .. slot .. " is boonable")
+        end
+        for slot in pairs(ns.Store.NON_BOONABLE_AURA_SLOTS) do
+            ck(BOONABLE_SLOT[slot] == nil, "mirror: " .. slot .. " must NOT be boonable")
+        end
+    end
+
+    -- ---- 6) the record-side writers refuse a non-boonable slot ------------
+    -- Injection: a poisoned cache (a pre-fix disk snapshot) cannot reach the record.
+    local savedParsed = Tracker._boonParsed
+    Tracker._boonParsed = { slots = { [1] = { duration = 3000 },
+                                      [9] = { duration = 800 } }, dmf = false, count = 2 }
+    local injected = {}
+    for slot, cell in pairs(Tracker._boonParsed.slots) do
+        local dur = tonumber(cell.duration) or 0
+        if BOONABLE_SLOT[slot] and dur > 0 then injected[slot] = dur end
+    end
+    ck(injected[1] == 3000 and injected[9] == nil,
+       "injection guard: only boonable slots reach the record")
+    Tracker._boonParsed = savedParsed
+
+    -- The disk-cache scrubber.
+    local dirty = { [1] = { duration = 3000 }, [9] = { duration = 800 },
+                    [10] = { duration = 100 } }
+    ck(Tracker.ScrubNonBoonableSlots(dirty) == 2, "scrub: both impossible slots removed")
+    ck(dirty[1] ~= nil and dirty[9] == nil and dirty[10] == nil,
+       "scrub: the boonable slot survives")
+    ck(Tracker.ScrubNonBoonableSlots(nil) == 0, "scrub: nil is a no-op")
 end
 
 -- MATCHING MATRIX (owner live report): a world buff whose live name renders with
@@ -4983,6 +5354,136 @@ local function testImpossibleRepair(fails)
 end
 
 ----------------------------------------------------------------------
+-- R4 REPAIR + INBOUND GUARD for the impossible boon slot.
+--
+-- Records written before the parse was scoped can carry auraStates[9] with
+-- source = BOON. Two layers, exactly as the mesh-bleed fix has it: a one-shot
+-- repair for what is already on disk (marker-guarded, its OWN marker because the
+-- older pass's marker is already true everywhere), and an always-on inbound guard
+-- for what peers keep sending until they patch.
+----------------------------------------------------------------------
+local function testBoonScopeRepair(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local S = ns.Store
+    local BOON = (S.AURA_SOURCE and S.AURA_SOURCE.BOON) or 2
+
+    local function boon(dur) return { duration = dur, option = 0, source = BOON } end
+    local function live(dur) return { duration = dur, option = 0, source = 0 } end
+
+    -- ---- the pure stripper ------------------------------------------------
+    local states = { [1] = boon(6900), [6] = boon(7000), [9] = boon(800), [10] = boon(100) }
+    ck(Tracker._StripNonBoonableBoonSlots(states) == 2,
+       "strip: exactly the two impossible slots go")
+    ck(states[1] and states[6], "strip: the booned boonable slots survive")
+    ck(states[9] == nil and states[10] == nil, "strip: slots 9/10 are gone")
+    ck(Tracker._StripNonBoonableBoonSlots(states) == 0, "strip: idempotent")
+
+    -- A LIVE Battle Shout is an ordinary legal buff and is NEVER touched.
+    local liveBS = { [9] = live(800), [10] = live(100), [1] = boon(6900) }
+    ck(Tracker._StripNonBoonableBoonSlots(liveBS) == 0,
+       "strip: a LIVE Battle Shout is legal and is left alone")
+    ck(liveBS[9] and liveBS[10], "strip: live slots 9/10 survive intact")
+    -- Relayed (source 1) likewise.
+    local relayed = { [9] = { duration = 800, option = 0, source = 1 } }
+    ck(Tracker._StripNonBoonableBoonSlots(relayed) == 0, "strip: a RELAYED slot 9 is left alone")
+    ck(Tracker._StripNonBoonableBoonSlots(nil) == 0, "strip: nil block is a no-op")
+
+    -- ---- the bucket sweep -------------------------------------------------
+    local function mkBucket()
+        return {
+            characters = {
+                Boonwar = { nameRealm = "Boonwar-R", level = 60,
+                            auraStates = { [1] = boon(6900), [9] = boon(800) } },
+                Clean   = { nameRealm = "Clean-R", level = 60,
+                            auraStates = { [1] = boon(6900), [9] = live(800) } },
+            },
+            homeless = {
+                Parked = { nameRealm = "Parked-R", level = 60,
+                           auraStates = { [10] = boon(100) } },
+            },
+        }
+    end
+    local b, counts = mkBucket(), {}
+    ck(Tracker._RepairBoonScopeIn(b, counts) == 2,
+       "sweep: two records changed (characters AND homeless)")
+    ck((counts.boonSlots or 0) == 2, "sweep: two slots counted")
+    ck(b.characters.Boonwar.auraStates[9] == nil, "sweep: the booned slot 9 is gone")
+    ck(b.characters.Boonwar.auraStates[1] ~= nil, "sweep: the real booned slot survives")
+    ck(b.characters.Clean.auraStates[9] ~= nil, "sweep: a LIVE slot 9 is untouched")
+    ck(b.homeless.Parked.auraStates[10] == nil, "sweep: homeless records are swept too")
+    ck(Tracker._RepairBoonScopeIn(b, {}) == 0, "sweep: a second pass changes nothing")
+    ck(Tracker._RepairBoonScopeIn(nil, {}) == 0, "sweep: a nil bucket is a no-op")
+
+    -- ---- the persisted tooltip caches ------------------------------------
+    local caches = {
+        ["Boonwar-R"] = { slots = { [1] = { duration = 6900 }, [9] = { duration = 800 } },
+                          dmf = false, count = 2 },
+        ["Clean-R"]   = { slots = { [1] = { duration = 6900 } }, dmf = false, count = 1 },
+    }
+    ck(Tracker._RepairBoonCaches(caches) == 1, "caches: one snapshot changed")
+    ck(caches["Boonwar-R"].slots[9] == nil, "caches: the impossible slot is scrubbed")
+    ck(caches["Boonwar-R"].count == 1, "caches: the stored count comes down with it")
+    ck(caches["Clean-R"].count == 1, "caches: a clean snapshot is untouched")
+    ck(Tracker._RepairBoonCaches(caches) == 0, "caches: idempotent")
+    ck(Tracker._RepairBoonCaches(nil) == 0, "caches: nil is a no-op")
+
+    -- ---- the runner + its OWN marker --------------------------------------
+    local savedAccounts = S.data.accounts
+    local savedCaches   = S.data.caches
+    local savedMarker   = S.data[Tracker.BOON_SCOPE_REPAIR_KEY]
+    local savedOld      = S.data[Tracker.AURA_REPAIR_KEY]
+
+    S.data.accounts = { ["9"] = mkBucket() }
+    S.data.caches   = { tooltipBoon = { ["Boonwar-R"] = {
+        slots = { [9] = { duration = 800 } }, count = 1 } } }
+    S.data[Tracker.BOON_SCOPE_REPAIR_KEY] = nil
+    -- THE POINT OF THE SEPARATE MARKER: the older pass has already run in every
+    -- live store, so this one must not be gated behind it.
+    S.data[Tracker.AURA_REPAIR_KEY] = true
+
+    ck(Tracker.RepairNonBoonableBoonSlots() == 2,
+       "runner: runs even though the OLDER repair marker is already set")
+    ck(S.data[Tracker.BOON_SCOPE_REPAIR_KEY] == true, "runner: its own marker is set")
+    ck(S.data.accounts["9"].characters.Boonwar.auraStates[9] == nil, "runner: the record is healed")
+    ck(S.data.caches.tooltipBoon["Boonwar-R"].slots[9] == nil, "runner: the cache is healed")
+
+    S.data.accounts["9"] = mkBucket()
+    ck(Tracker.RepairNonBoonableBoonSlots() == 0, "runner: the marker makes a second run a no-op")
+    ck(S.data.accounts["9"].characters.Boonwar.auraStates[9] ~= nil,
+       "runner: the second run really did not touch the data")
+
+    S.data.accounts = savedAccounts
+    S.data.caches   = savedCaches
+    S.data[Tracker.BOON_SCOPE_REPAIR_KEY] = savedMarker
+    S.data[Tracker.AURA_REPAIR_KEY]       = savedOld
+
+    -- ---- the ALWAYS-ON inbound guard --------------------------------------
+    -- Unlike the level rules it is not gated on level, because "the chronoboon
+    -- cannot hold a Battle Shout" is true at every level — including a record
+    -- that never told us its level at all.
+    local saved = S._inboundSanity
+    S._inboundSanity = { attune = 0, auras = 0, records = 0, boon = 0 }
+
+    local inb = { level = 60, auraStates = { [1] = boon(6900), [9] = boon(800), [10] = boon(50) } }
+    ck(S.SanitizeInboundRecord(inb) == 2, "inbound: both impossible boon slots stripped")
+    ck(inb.auraStates[9] == nil and inb.auraStates[10] == nil, "inbound: slots 9/10 gone")
+    ck(inb.auraStates[1] ~= nil, "inbound: the legal booned slot survives")
+    ck(S._inboundSanity.boon == 2, "inbound: the boon counter incremented per slot")
+    ck(S._inboundSanity.records == 1, "inbound: the record counter incremented once")
+
+    local nolv = { auraStates = { [9] = boon(800) } }
+    ck(S.SanitizeInboundRecord(nolv) == 1,
+       "inbound: an UNKNOWN level is no excuse — impossible is impossible")
+    ck(nolv.auraStates[9] == nil, "inbound: stripped without any level evidence")
+
+    local ok = { level = 60, auraStates = { [9] = live(800), [10] = live(50) } }
+    ck(S.SanitizeInboundRecord(ok) == 0, "inbound: a live Battle Shout passes untouched")
+    ck(ok.auraStates[9] ~= nil, "inbound: and is still there afterwards")
+
+    S._inboundSanity = saved
+end
+
+----------------------------------------------------------------------
 -- COORDINATE OVERRIDE ZONE SCOPING
 --
 -- The live bug this guards: `(not o.zone or o.zone == zone)` scoped an
@@ -5121,6 +5622,8 @@ function Tracker.RunSelfTests(verbose)
         { name = "armed safety rescan (30s)", fn = testSafetyRescan },
         { name = "boon parsing", fn = testBoonParsing },
         { name = "boon block (owner 7-line fixture)", fn = testBoonBlock },
+        { name = "boon scope (unboonable slots + duration leak)", fn = testBoonScope },
+        { name = "boon scope repair + inbound guard", fn = testBoonScopeRepair },
         { name = "live aura matching (apostrophe matrix)", fn = testLiveAuraMatching },
         { name = "spell-ID matching (A6.4/A6.6)", fn = testSpellIDMatching },
         { name = "teardown latch + grace windows", fn = testTeardownLatch },
