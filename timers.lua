@@ -1436,12 +1436,36 @@ Timers._nwbStats = {
     },
     serializerPath = { libSerialize = 0, aceSerializer = 0 },
     ingested = 0, lastCmd = nil, lastCmdAt = 0, lastApplied = nil,
+    -- CUMULATIVE songflower-ingest totals since login. `lastApplied` carries the
+    -- same keys for the LAST payload only, and that snapshot is routinely empty
+    -- (a `settings` payload carries no flowers at all), which makes it useless
+    -- for answering "has the wire ever given me a flower?". These never reset.
+    flowerTotals = {
+        flowerHeard = 0, flowerApplied = 0, flowerFilled = 0, layersScanned = 0,
+        rejGuard = 0, rejMinNewer = 0, rejOlder = 0, rejLayerSkip = 0,
+    },
 }
+
+-- Counter names shared by the per-payload `applied` table and the cumulative
+-- totals above, in print order.
+local FLOWER_COUNTERS = {
+    "flowerHeard", "flowerApplied", "flowerFilled", "layersScanned",
+    "rejGuard", "rejMinNewer", "rejOlder", "rejLayerSkip",
+}
+Timers._flowerCounters = FLOWER_COUNTERS
 
 local function nwbBump(path, key)
     local t = Timers._nwbStats[path]
     if type(t) == "table" then t[key] = (t[key] or 0) + 1 end
 end
+
+-- Bump one flower counter on BOTH the per-payload table and the session totals.
+local function bumpFlower(applied, key)
+    if type(applied) == "table" then applied[key] = (applied[key] or 0) + 1 end
+    local tot = Timers._nwbStats.flowerTotals
+    if type(tot) == "table" then tot[key] = (tot[key] or 0) + 1 end
+end
+Timers._bumpFlower = bumpFlower
 
 -- NWB 3.39 serializes with LibSerialize; older builds used AceSerializer. Try
 -- LibSerialize first, fall back to AceSerializer, so both inbound formats
@@ -1711,6 +1735,49 @@ function Timers.IngestNWBTimerLog(tbl, applied, t)
     return parsed
 end
 
+-- Node-read modes for readNWBTimerFields (below).
+--   FULL  — a TOP-LEVEL payload: read flowers, tubers and dragons, trust "nwb".
+--   LAYER — a per-layer sub-table: FLOWERS ONLY, and collected into a caller
+--           supplied accumulator instead of written straight through. See
+--           Timers.IngestNWBTimers for why the write is deferred.
+local NODE_MODE_FULL  = "full"
+local NODE_MODE_LAYER = "layer"
+Timers.NODE_MODE_FULL, Timers.NODE_MODE_LAYER = NODE_MODE_FULL, NODE_MODE_LAYER
+
+-- Was a flower field present on the wire at all, under either key spelling?
+local function rawFlowerField(tbl, i)
+    local v = tbl["f" .. i]
+    if v == nil then v = tbl["flower" .. i] end
+    return v
+end
+
+-- Apply ONE inbound flower epoch and attribute the outcome to the diagnostic
+-- counters. `trust` is "nwb" for a top-level field and "nwbLayer" for one that
+-- came out of a per-layer sub-table. Every write carries the standard network
+-- guards: a local pick owns its node for the full respawn, and an epoch within
+-- 10s of the stored one is a cross-source duplicate.
+local function applyFlowerEpoch(applied, index, epoch, trust)
+    local prev = (Timers.NodePopEpoch and Timers.NodePopEpoch("flower", index)) or 0
+    local ok, why = Timers.MarkNode("flower", index, epoch, trust, netNodeOpts())
+    if ok then
+        -- `applied.flower` is the long-standing "something merged" counter and
+        -- keeps its meaning; the rest are the new diagnostic breakdown.
+        applied.flower = (applied.flower or 0) + 1
+        bumpFlower(applied, "flowerApplied")
+        -- The whole point of the layer fix: this node read "No data" a moment
+        -- ago and now does not.
+        if prev == 0 then bumpFlower(applied, "flowerFilled") end
+    elseif why == "localHold" or why == "overwriteGuard" then
+        bumpFlower(applied, "rejGuard")
+    elseif why == "minNewer" then
+        bumpFlower(applied, "rejMinNewer")
+    elseif why == "older" then
+        bumpFlower(applied, "rejOlder")
+    end
+    return ok
+end
+Timers._applyFlowerEpoch = applyFlowerEpoch
+
 -- Read the world-buff + node timer fields out of ONE NWB data table. Wire SHORT
 -- keys: n=rendTimer, s=onyTimer, y=nefTimer, o/t/z = the matching stage-1 yell
 -- epochs, f1..f10=flower1..10, t1..t6=tuber1..6, F=timer log. We also tolerate
@@ -1718,10 +1785,15 @@ end
 -- sub-table was not key-compacted. ZG/Zandalar is NOT transmitted by NWB at all,
 -- so there is no zan field to read. `applied` accumulates counts.
 --
+-- `nodeMode` selects the node behaviour (NODE_MODE_FULL, the default, or
+-- NODE_MODE_LAYER). In LAYER mode `flowerAcc` receives index -> best epoch and
+-- nothing is written to the store here.
+--
 -- Returns false when the whole table was discarded by drop validation.
-local function readNWBTimerFields(tbl, applied, t, skipNodes)
+local function readNWBTimerFields(tbl, applied, t, nodeMode, flowerAcc)
     if type(tbl) ~= "table" then return false end
     t = t or now()
+    nodeMode = nodeMode or NODE_MODE_FULL
 
     -- F14 — FELWOOD AND THE TIMER LOG ARE READ FIRST, BEFORE the drop validation
     -- can reject the payload. ValidateNWBDrops guards the three world-buff DROP
@@ -1734,17 +1806,39 @@ local function readNWBTimerFields(tbl, applied, t, skipNodes)
     -- entire Felwood node set and its timer log, and on a layered realm that log
     -- is the most trustworthy Rend data the wire carries. Order is the whole fix;
     -- the validation itself is unchanged and still gates the anchors below.
-    if not skipNodes then
-        -- ROUND-17 audit fix 3: node keys are read from the TOP-LEVEL payload only.
-        -- `skipNodes` is set for every per-layer sub-table (see IngestNWBTimers).
-        -- Every inbound node write carries the standard network guards (fix 2):
-        -- a local pick owns its node for the full respawn, and an epoch within
-        -- 10s of the stored one is a cross-source duplicate.
+    if nodeMode == NODE_MODE_LAYER then
+        -- PER-LAYER SUB-TABLE — FLOWERS ONLY, and collected rather than written.
+        --
+        -- Flowers only: on a layered realm the reference keeps tubers (`t1`..`t6`)
+        -- and dragons (`d1`..`d4`) as PERSONAL timers and never puts them on the
+        -- wire (NWB_BEHAVIOR_SPEC L823-824 / L1157), so there is nothing to read
+        -- for them here. They stay a top-level-only read: correct on a
+        -- non-layered realm, a no-op on a layered one.
+        --
+        -- Collected rather than written: pairs() order over the layers map is
+        -- undefined, and MarkNode's +/-10s guard makes a per-layer write
+        -- order-dependent. See Timers.IngestNWBTimers.
         for i = 1, 10 do
+            if rawFlowerField(tbl, i) ~= nil then bumpFlower(applied, "flowerHeard") end
             local e = nwbEpoch(tbl["f" .. i], "node", t) or nwbEpoch(tbl["flower" .. i], "node", t)
-            if e and Timers.MarkNode("flower", i, e, "nwb", netNodeOpts()) then
-                applied.flower = (applied.flower or 0) + 1
+            if e and flowerAcc then
+                local have = flowerAcc[i]
+                if have == nil then
+                    flowerAcc[i] = e
+                elseif e > have then
+                    flowerAcc[i] = e
+                    bumpFlower(applied, "rejLayerSkip")   -- the older candidate loses
+                else
+                    bumpFlower(applied, "rejLayerSkip")   -- this candidate loses
+                end
             end
+        end
+    else
+        -- TOP-LEVEL PAYLOAD — the full node set, trust "nwb".
+        for i = 1, 10 do
+            if rawFlowerField(tbl, i) ~= nil then bumpFlower(applied, "flowerHeard") end
+            local e = nwbEpoch(tbl["f" .. i], "node", t) or nwbEpoch(tbl["flower" .. i], "node", t)
+            if e then applyFlowerEpoch(applied, i, e, "nwb") end
         end
         -- Tubers and dragons are read for completeness, but note the sharing
         -- rule: the reference keeps them as PERSONAL timers on layered realms
@@ -1810,25 +1904,63 @@ Timers._readNWBTimerFields = readNWBTimerFields
 -- labelling, so a buff genuinely drops on every layer at once. We hold no layer
 -- model and must not present per-layer precision we cannot deliver.
 --
--- ROUND-17 audit fix 3 — NODE keys are the opposite case and are no longer
--- flattened. Songflowers are NOT shared across layers: each layer has its own
--- ten nodes, picked at its own times. Folding every layer's f1..f10 into one set
--- meant the newest pick of node 3 on ANY layer became "the" node-3 timer, which
--- on a layered realm (Whitemane is layered) is wrong roughly as often as there
--- are layers. Full per-layer tracking is out of scope for this release, so we
--- take the cheap and honest option: read node keys from the TOP-LEVEL payload
--- only and ignore the per-layer copies entirely. One layer's truth beats a
--- blend of all of them. The +/-10s duplicate guard in MarkNode then catches the
--- same pick arriving again from a second source.
+-- SONGFLOWERS — THE FILL-AND-GUARD POLICY (supersedes ROUND-17 audit fix 3).
+--
+-- Fix 3 read node keys from the TOP-LEVEL payload only and ignored the per-layer
+-- copies entirely, on the reasoning that "one layer's truth beats a blend of all
+-- of them". The reasoning was sound about the BLEND and wrong about the
+-- consequence: on a layered realm (Whitemane is one) nothing arrives flat, so
+-- ignoring the layers meant ignoring every songflower the wire carries. The grid
+-- read "No data" in all ten cells, forever. Zero data is not more accurate than
+-- imperfect data; it is just less useful.
+--
+-- So per-layer flowers are read again, under a policy that is deliberately
+-- narrow:
+--
+--   * A node we have NEVER seen (stored epoch 0) is FILLED. All three MarkNode
+--     guards require a stored epoch > 0, so a fill passes freely. This is the
+--     case that turns "No data" into a countdown.
+--   * A node holding our OWN pick is untouchable for the full 1500s respawn —
+--     `localHoldGuard` keys off the stored trust being "local". Layer data can
+--     never outrank standing at the node and watching it get picked.
+--   * A node holding second-hand data follows the ordinary network rule:
+--     newest-wins, plus the +/-10s cross-source duplicate guard. Without this a
+--     filled node could never be refreshed from the wire again and would simply
+--     go stale.
+--   * Layer-sourced writes record trust "nwbLayer", not "nwb", so a later local
+--     observation is visibly an upgrade in `/nexus debug timers`.
+--
+-- HONEST RESIDUAL — read this before trusting a filled cell. We do not track
+-- which layer WE are on, and NWB's payload does not tell us. A node filled from
+-- the layers map therefore reflects a pick that happened on SOME layer, not
+-- necessarily ours; walk to it and it may already be up, or still be down when
+-- we said it was up. That is the trade this policy makes on purpose — some data
+-- beats none, and a local observation always wins outright the moment we make
+-- one. Full per-layer node tracking (our own layer id, ten timers per layer)
+-- is out of scope; do not read the fill as a per-layer-accurate timer.
+--
+-- COLLECT-THEN-APPLY, and why it is not stylistic. pairs() order over the layers
+-- map is undefined in Lua. Calling MarkNode once per layer would make the
+-- outcome depend on that order: an earlier layer's epoch lands first, and the
+-- +/-10s minNewer guard then blocks a later layer's genuinely newer one. It
+-- would also fire NODE_UPDATED and maybeBroadcast() once per layer and put the
+-- intermediate values on the mesh. So each layer pass only COLLECTS a candidate
+-- epoch per node index; the newest across all layers is applied once, after the
+-- loop. Deterministic regardless of iteration order.
 function Timers.IngestNWBTimers(payload)
     if type(payload) ~= "table" then return end
     local applied = {}
     local t = now()
-    readNWBTimerFields(payload, applied, t)
+    readNWBTimerFields(payload, applied, t, NODE_MODE_FULL)
 
+    -- Per-layer pass: flowers only, collected into `acc` (index -> best epoch).
+    local acc = {}
     local layers = payload.layers
     if type(layers) == "table" then
-        for _, layer in pairs(layers) do readNWBTimerFields(layer, applied, t, true) end
+        for _, layer in pairs(layers) do
+            if type(layer) == "table" then bumpFlower(applied, "layersScanned") end
+            readNWBTimerFields(layer, applied, t, NODE_MODE_LAYER, acc)
+        end
     else
         for key, v in pairs(payload) do
             if key ~= NWB_LOG_KEY and type(v) == "table" then
@@ -1837,11 +1969,20 @@ function Timers.IngestNWBTimers(payload)
                     if type(lv) == "table" then looksLayerMap = true break end
                 end
                 if looksLayerMap then
-                    for _, layer in pairs(v) do readNWBTimerFields(layer, applied, t, true) end
+                    for _, layer in pairs(v) do
+                        if type(layer) == "table" then bumpFlower(applied, "layersScanned") end
+                        readNWBTimerFields(layer, applied, t, NODE_MODE_LAYER, acc)
+                    end
                 end
             end
         end
     end
+    -- ONE write per node index, with the newest epoch any layer offered.
+    for i = 1, 10 do
+        local e = acc[i]
+        if e then applyFlowerEpoch(applied, i, e, "nwbLayer") end
+    end
+
     Timers._nwbStats.lastApplied = applied
     return applied
 end
@@ -2122,8 +2263,15 @@ Timers.NODES = {
 -- 10 and 6 in five places (and so `dragon` cannot be forgotten in one of them).
 Timers.NODE_COUNTS = { flower = 10, tuber = 6, dragon = 4 }
 
--- Per-node trust of the LAST write ("local" / "nwb" / "sn" / "mesh"), keyed
--- "flower3". Feeds the localHoldGuard in MarkNode.
+-- Per-node trust of the LAST write, keyed "flower3". One of:
+--   "local"    our own eyes (cast / loot / own aura) — owns the node for 1500s
+--   "nwb"      a TOP-LEVEL NWB payload field
+--   "nwbLayer" an NWB per-layer sub-table field (see the fill-and-guard policy
+--              on Timers.IngestNWBTimers: it may reflect another layer's pick)
+--   "sn"       ShadowNetwork ingest / import
+--   "mesh"     a Nexus peer snapshot
+-- Feeds the localHoldGuard in MarkNode, which tests for "local" and nothing
+-- else — the other values are diagnostic labels, not a ranking.
 --
 -- PERSISTED, deliberately: the whole point of the guard is that our own pick
 -- owns its node for 25 minutes, and a /reload inside those 25 minutes must not
@@ -2157,6 +2305,15 @@ local function nodePopTable(kind)
         return t.dragon
     end
     return nil
+end
+
+-- Public read of a node's stored pop epoch; 0 when the node has never been seen.
+-- The NWB ingest sits ABOVE nodePopTable's scope in this file and needs to know
+-- whether a write is about to land on an EMPTY node, so it can count fills for
+-- `/nexus debug nwb`. Exposed on the module table for that reason.
+function Timers.NodePopEpoch(kind, index)
+    local pops = nodePopTable(kind)
+    return (pops and pops[index]) or 0
 end
 
 -- Nearest node of `kind` to (x,y). Returns index, distance. Pure helper.
@@ -2236,15 +2393,21 @@ end
 -- a duplicate) and 1440s for ANOTHER player's songflower pick (their pick is
 -- heuristic, so it must not stomp a fresher record). Our OWN songflower pick
 -- passes no guard — it is position- and spell-validated and should win outright.
+--
+-- Returns true on a write. On a refusal it returns false PLUS a reason string
+-- ("older" / "overwriteGuard" / "localHold" / "minNewer" / "noStore") so the NWB
+-- ingest can attribute its rejections in `/nexus debug nwb`. Every existing
+-- caller uses the result in boolean or `== true` / `== false` context, or
+-- parenthesises the tail call, so the extra value is inert for all of them.
 function Timers.MarkNode(kind, index, epoch, trust, opts)
     local pops = nodePopTable(kind)
-    if not pops then return false end
+    if not pops then return false, "noStore" end
     epoch = epoch or now()
     local prev = pops[index] or 0
     -- Ignore an older or identical epoch (dup relay); accept fresher picks.
-    if epoch <= prev then return false end
+    if epoch <= prev then return false, "older" end
     local guard = opts and opts.overwriteGuard
-    if guard and prev > 0 and (epoch - prev) < guard then return false end
+    if guard and prev > 0 and (epoch - prev) < guard then return false, "overwriteGuard" end
     -- ROUND-17 audit fix 2: a locally-observed pick OWNS its node for the full
     -- respawn. Our own pick is position- and spell/loot-validated; every network
     -- report of the same node inside those 25 minutes is either the same pick
@@ -2254,12 +2417,12 @@ function Timers.MarkNode(kind, index, epoch, trust, opts)
     local hold = opts and opts.localHoldGuard
     if hold and prev > 0 and (epoch - prev) < hold
        and Timers._nodeTrust[kind .. index] == "local" then
-        return false
+        return false, "localHold"
     end
     -- +/-10 s cross-source duplicate guard (NWB_BEHAVIOR_SPEC §5.7). The `<=`
     -- test above already covers the "older" half of the window.
     local minNewer = opts and opts.minNewer
-    if minNewer and prev > 0 and (epoch - prev) < minNewer then return false end
+    if minNewer and prev > 0 and (epoch - prev) < minNewer then return false, "minNewer" end
     pops[index] = epoch
     Timers._nodeTrust[kind .. index] = trust
     ns:Fire("NODE_UPDATED", kind .. index)
@@ -3402,12 +3565,33 @@ function Timers.NWBDebugDump()
     for k, v in pairs(applied) do af[#af + 1] = k .. "=" .. tostring(v) end
     ns:Print(string.format("  ingested=%d lastCmd=%s (at %d) lastApplied=[%s]",
         s.ingested, tostring(s.lastCmd), s.lastCmdAt, table.concat(af, " ")))
-    ns:Print("  NOTE: NWB never transmits ZG/Zandalar; layered realms nest timers"
-        .. " under a layers map (handled). Reassembly is AceComm's, shared-instance.")
+    -- Songflower ingest, CUMULATIVE since login. `lastApplied` above is the last
+    -- payload only and is routinely empty, so these are the numbers to read when
+    -- asking "is the wire giving me flowers at all?".
+    local ft, fl = s.flowerTotals or {}, {}
+    for i = 1, #FLOWER_COUNTERS do
+        local k = FLOWER_COUNTERS[i]
+        fl[#fl + 1] = k .. "=" .. tostring(ft[k] or 0)
+    end
+    ns:Print("  flowers (session totals): " .. table.concat(fl, " "))
+    ns:Print("  NOTE: NWB never transmits ZG/Zandalar. On a LAYERED realm the"
+        .. " songflower epochs arrive only inside the per-layer map, so we read"
+        .. " them: an EMPTY node is filled (trust nwbLayer), a node holding our"
+        .. " own pick is never overwritten for the full respawn, and a filled"
+        .. " node follows newest-wins + the 10s duplicate guard. We do not track"
+        .. " which layer WE are on, so a filled cell may reflect another layer's"
+        .. " pick — some data beats none, and a local pick always wins."
+        .. " Reassembly is AceComm's, shared-instance.")
     ns:Print("  lastApplied keys: rend/ony/flower/tuber/log = merged;"
         .. " rejectedPayload = drop with no stage-1 yell (whole payload dropped);"
         .. " rejectedYell = stage-1 yell >" .. YELL_DROP_TOLERANCE .. "s from the drop;"
         .. " nefRejected = Nefarian timer discarded (disabled on Era).")
+    ns:Print("  flower counters: flowerHeard = fields seen (top-level + every layer);"
+        .. " flowerApplied = writes that landed; flowerFilled = of those, ones that"
+        .. " filled a node with NO data; layersScanned = per-layer sub-tables read;"
+        .. " rejGuard = blocked by the local-pick hold; rejMinNewer = inside the 10s"
+        .. " duplicate window; rejOlder = older than what we hold;"
+        .. " rejLayerSkip = a layer's value dropped for a newer one on another layer.")
 end
 
 -- /nexus debug pulls — pull-window self-diagnosis. For each pull buff and yell
@@ -4821,6 +5005,11 @@ local function testNWBIngest(fails)
     local function reset()
         Timers.state = {}
         if timersStore then timersStore.flower, timersStore.tuber = {}, {} end
+        -- Wipe node trust too: the pop tables and the trust map must be reset
+        -- together or a stale "local" from an earlier case silently arms the
+        -- hold guard against the next one.
+        for i = 1, 10 do Timers._nodeTrust["flower" .. i] = nil end
+        for i = 1, 6  do Timers._nodeTrust["tuber" .. i]  = nil end
     end
 
     -- Every drop epoch must now travel with its stage-1 yell epoch:
@@ -4836,33 +5025,48 @@ local function testNWBIngest(fails)
 
     -- Layered realm: timers nested under the literally-named `layers` key.
     --
-    -- ROUND-17 audit fix 3 — world buffs still flatten across layers (they
-    -- genuinely drop on every layer at once), but NODES no longer do. Each layer
-    -- has its own ten flowers picked at its own times, so folding them together
-    -- made the newest pick of node N on ANY layer masquerade as node N's timer.
-    -- The old assertion here ("layered flower ingested") was asserting the bug.
+    -- World buffs flatten across layers (they genuinely drop on every layer at
+    -- once). Songflowers now follow the FILL-AND-GUARD policy — see the comment
+    -- on Timers.IngestNWBTimers. The old assertions here pinned audit fix 3's
+    -- "ignore per-layer nodes entirely", which on a layered realm (where nothing
+    -- arrives flat) meant ingesting no songflowers at all.
     reset()
     local a2 = Timers.IngestNWBTimers({ layers = { [1] = { n = t - 300, o = t - 310, f2 = t - 70 } } })
     tcheck(a2.rend, "layered rend ingested from payload.layers", fails)
-    tcheck((a2.flower or 0) == 0, "layered flower IGNORED (nodes are per-layer)", fails)
-    tcheck((nodePopTable("flower") or {})[2] == nil,
-        "no node epoch written from a layer sub-table", fails)
+    tcheck((a2.flower or 0) == 1, "layered flower INGESTED (fills an empty node)", fails)
+    tcheck((nodePopTable("flower") or {})[2] == t - 70,
+        "the layer's node epoch really was written", fails)
+    tcheck(Timers._nodeTrust["flower2"] == "nwbLayer",
+        "a layer-sourced write records nwbLayer trust, not nwb", fails)
 
     -- The heuristic layer-map fallback (payload without a literal `layers` key)
-    -- is held to the same rule: buffs yes, nodes no.
+    -- takes the same path.
     reset()
     local a2b = Timers.IngestNWBTimers({ someMap = { [1] = { n = t - 300, o = t - 310, f4 = t - 70 } } })
     tcheck(a2b.rend, "heuristic layer map still ingests buffs", fails)
-    tcheck((a2b.flower or 0) == 0, "heuristic layer map does NOT ingest nodes", fails)
+    tcheck((a2b.flower or 0) == 1, "heuristic layer map ingests nodes too", fails)
+    tcheck((nodePopTable("flower") or {})[4] == t - 70,
+        "heuristic layer map wrote the node epoch", fails)
 
-    -- Top-level nodes are still read on a layered payload — one layer's truth.
+    -- Top-level and per-layer copies of the same node: both are read, and the
+    -- ordinary network rule decides. The layer copy here is 70s newer, so it
+    -- takes the node (newest-wins past the 10s duplicate guard).
     reset()
     local a2c = Timers.IngestNWBTimers({
         f3 = t - 80, layers = { [1] = { f3 = t - 10 } },
     })
-    tcheck((a2c.flower or 0) == 1, "top-level flower still ingested alongside layers", fails)
-    tcheck((nodePopTable("flower") or {})[3] == t - 80,
-        "the TOP-LEVEL epoch wins, not the fresher per-layer one", fails)
+    tcheck((a2c.flower or 0) == 2, "top-level AND layer flower both applied", fails)
+    tcheck((nodePopTable("flower") or {})[3] == t - 10,
+        "the newer of the two epochs holds the node", fails)
+    -- ...and when the per-layer copy is the OLDER one, the top-level survives.
+    reset()
+    local a2d = Timers.IngestNWBTimers({
+        f3 = t - 10, layers = { [1] = { f3 = t - 80 } },
+    })
+    tcheck((nodePopTable("flower") or {})[3] == t - 10,
+        "an older per-layer epoch does not rewind the top-level one", fails)
+    tcheck((a2d.rejOlder or 0) >= 1, "the older layer epoch is counted as rejOlder", fails)
+    tcheck(Timers._nodeTrust["flower3"] == "nwb", "trust stays nwb when the layer loses", fails)
 
     -- Word keys tolerated (un-compacted layer).
     reset()
@@ -5038,6 +5242,215 @@ local function testNWBIngest(fails)
     local a10 = Timers.IngestNWBTimers({ F = { { G = "r", H = t - 590, J = "Cid" } } })
     tcheck((a10.logApplied or 0) == 0, "a log entry cannot displace a local anchor", fails)
     tcheck(Timers.state.rend.trust == "local", "local trust is retained", fails)
+
+    reset()
+end
+
+-- LAYERED-REALM SONGFLOWER INGEST — the fill-and-guard policy.
+--
+-- On a layered realm the songflower epochs arrive ONLY inside the per-layer map;
+-- nothing is written flat. Reading node keys from the top-level payload alone
+-- therefore ingested no songflowers at all and every cell read "No data". These
+-- cases pin the replacement policy and its honest limits.
+local function testNWBLayerFlowers(fails)
+    local t = now()
+    local timersStore = ns.Store and ns.Store.GetTimers and ns.Store.GetTimers()
+    if not timersStore then
+        fails[#fails + 1] = "layer flowers: no timers store"; return
+    end
+    local function reset()
+        Timers.state = {}
+        timersStore.flower, timersStore.tuber = {}, {}
+        for i = 1, 10 do Timers._nodeTrust["flower" .. i] = nil end
+    end
+    local function pops() return nodePopTable("flower") or {} end
+    -- Snapshot of the cumulative totals, for the delta assertions below.
+    local function totals()
+        local out, src = {}, Timers._nwbStats.flowerTotals or {}
+        for i = 1, #Timers._flowerCounters do
+            local k = Timers._flowerCounters[i]
+            out[k] = src[k] or 0
+        end
+        return out
+    end
+
+    ------------------------------------------------------------------
+    -- (a) THE BUG. Flowers live only inside `layers`; no top-level f1..f10.
+    ------------------------------------------------------------------
+    reset()
+    local a = Timers.IngestNWBTimers({
+        layers = {
+            [1] = { f1 = t - 100, f2 = t - 200 },
+            [2] = { f1 = t - 900, f5 = t - 300 },
+        },
+    })
+    tcheck(pops()[1] == t - 100, "layered f1 fills a node with no top-level copy", fails)
+    tcheck(pops()[2] == t - 200, "layered f2 fills its node too", fails)
+    tcheck(pops()[5] == t - 300, "a node present on only one layer still fills", fails)
+    tcheck((a.flower or 0) == 3, "three distinct nodes merged from the layers map", fails)
+    for _, i in ipairs({ 1, 2, 5 }) do
+        tcheck(Timers._nodeTrust["flower" .. i] == "nwbLayer",
+            "flower" .. i .. " records nwbLayer trust", fails)
+    end
+    tcheck((a.layersScanned or 0) == 2, "both layer sub-tables counted as scanned", fails)
+
+    ------------------------------------------------------------------
+    -- (b) A LOCAL PICK IS UNTOUCHABLE for the full respawn. Layer data may fill
+    --     an empty node; it may never overwrite what we saw with our own eyes.
+    ------------------------------------------------------------------
+    reset()
+    timersStore.flower[7] = t - 60
+    Timers._nodeTrust["flower7"] = "local"
+    local b = Timers.IngestNWBTimers({ layers = { [1] = { f7 = t } } })
+    tcheck(pops()[7] == t - 60, "a 60s-old LOCAL pick survives layer data", fails)
+    tcheck(Timers._nodeTrust["flower7"] == "local", "and keeps its local trust", fails)
+    tcheck((b.flower or 0) == 0, "nothing counted as merged", fails)
+    tcheck((b.rejGuard or 0) == 1, "the refusal is attributed to the local-hold guard", fails)
+    -- Right up to the boundary, then fair game once the respawn has elapsed.
+    reset()
+    timersStore.flower[7] = t - (NODE_RESPAWN - 1)
+    Timers._nodeTrust["flower7"] = "local"
+    Timers.IngestNWBTimers({ layers = { [1] = { f7 = t } } })
+    tcheck(pops()[7] == t - (NODE_RESPAWN - 1),
+        "local pick still held 1s before its respawn elapses", fails)
+    reset()
+    timersStore.flower[7] = t - (NODE_RESPAWN + 1)
+    Timers._nodeTrust["flower7"] = "local"
+    Timers.IngestNWBTimers({ layers = { [1] = { f7 = t } } })
+    tcheck(pops()[7] == t, "after the full respawn layer data may take the node", fails)
+
+    ------------------------------------------------------------------
+    -- (c) NEWEST-ACROSS-LAYERS, DETERMINISTICALLY. pairs() order over the layers
+    --     map is undefined, so the same three epochs are fed in all six
+    --     orderings: the newest must win every time. A per-layer MarkNode call
+    --     would fail this — the +/-10s guard would block whichever genuinely
+    --     newer epoch happened to arrive second.
+    ------------------------------------------------------------------
+    local E = { t - 400, t - 200, t - 50 }   -- >10s apart, newest last
+    local orders = {
+        { 1, 2, 3 }, { 1, 3, 2 }, { 2, 1, 3 },
+        { 2, 3, 1 }, { 3, 1, 2 }, { 3, 2, 1 },
+    }
+    for oi = 1, #orders do
+        local o = orders[oi]
+        reset()
+        local c = Timers.IngestNWBTimers({
+            layers = {
+                [1] = { f4 = E[o[1]] },
+                [2] = { f4 = E[o[2]] },
+                [3] = { f4 = E[o[3]] },
+            },
+        })
+        tcheck(pops()[4] == t - 50,
+            "newest layer epoch wins (ordering " .. oi .. ")", fails)
+        tcheck((c.flower or 0) == 1,
+            "exactly ONE write for the node, not one per layer (ordering " .. oi .. ")", fails)
+        tcheck((c.rejLayerSkip or 0) == 2,
+            "the two losing layer values are counted (ordering " .. oi .. ")", fails)
+    end
+
+    ------------------------------------------------------------------
+    -- (d) COUNTERS. Per-payload on `applied`, and mirrored as session totals.
+    ------------------------------------------------------------------
+    reset()
+    local before = totals()
+    -- f1 on three layers (2 skipped, 1 filled) + f7 held by a local pick.
+    timersStore.flower[7] = t - 60
+    Timers._nodeTrust["flower7"] = "local"
+    local d = Timers.IngestNWBTimers({
+        layers = {
+            [1] = { f1 = t - 300, f7 = t },
+            [2] = { f1 = t - 200 },
+            [3] = { f1 = t - 100 },
+        },
+    })
+    tcheck((d.flowerHeard or 0) == 4, "flowerHeard counts every field on every layer", fails)
+    tcheck((d.layersScanned or 0) == 3, "layersScanned counts the sub-tables", fails)
+    tcheck((d.rejLayerSkip or 0) == 2, "rejLayerSkip counts the outvoted layer values", fails)
+    tcheck((d.flowerApplied or 0) == 1, "flowerApplied counts the writes that landed", fails)
+    tcheck((d.flowerFilled or 0) == 1, "flowerFilled counts writes onto an EMPTY node", fails)
+    tcheck((d.rejGuard or 0) == 1, "rejGuard counts the local-hold refusal", fails)
+    local after = totals()
+    for _, k in ipairs({ "flowerHeard", "flowerApplied", "flowerFilled",
+                         "layersScanned", "rejGuard", "rejLayerSkip" }) do
+        tcheck(after[k] - before[k] == (d[k] or 0),
+            "session total for " .. k .. " moved by the per-payload amount", fails)
+    end
+    -- A write onto an already-filled node is applied but NOT counted as a fill.
+    reset()
+    before = totals()
+    timersStore.flower[1] = t - 300
+    Timers._nodeTrust["flower1"] = "nwbLayer"
+    local d2 = Timers.IngestNWBTimers({ layers = { [1] = { f1 = t - 100 } } })
+    tcheck((d2.flowerApplied or 0) == 1, "refreshing a filled node still applies", fails)
+    tcheck((d2.flowerFilled or 0) == 0, "...but is not a fill", fails)
+    -- ...and one inside the 10s duplicate window is attributed to minNewer.
+    reset()
+    timersStore.flower[1] = t - 300
+    Timers._nodeTrust["flower1"] = "nwbLayer"
+    local d3 = Timers.IngestNWBTimers({ layers = { [1] = { f1 = t - 295 } } })
+    tcheck((d3.rejMinNewer or 0) == 1, "a 5s-newer layer epoch is a cross-source duplicate", fails)
+    tcheck(pops()[1] == t - 300, "and the stored epoch is untouched", fails)
+
+    ------------------------------------------------------------------
+    -- (e) REGRESSION — a FLAT (non-layered) payload is unchanged: top-level
+    --     flowers still ingest, with trust "nwb" and no layer accounting.
+    ------------------------------------------------------------------
+    reset()
+    local e = Timers.IngestNWBTimers({ f1 = t - 50, f9 = t - 80, t3 = t - 90 })
+    tcheck(pops()[1] == t - 50 and pops()[9] == t - 80, "flat top-level flowers ingest", fails)
+    tcheck(Timers._nodeTrust["flower1"] == "nwb" and Timers._nodeTrust["flower9"] == "nwb",
+        "a flat payload records plain nwb trust", fails)
+    tcheck((e.flower or 0) == 2, "applied.flower keeps its meaning on the flat path", fails)
+    tcheck((e.layersScanned or 0) == 0, "no layers scanned for a flat payload", fails)
+    tcheck((e.flowerHeard or 0) == 2, "flowerHeard counts top-level fields too", fails)
+    tcheck((e.tuber or 0) == 1, "top-level tubers still ingest", fails)
+    -- Tubers and dragons are PERSONAL on a layered realm and never travel there,
+    -- so the per-layer pass must not read them even if a sender includes them.
+    reset()
+    local e2 = Timers.IngestNWBTimers({ layers = { [1] = { t3 = t - 90, d2 = t - 95 } } })
+    tcheck((e2.tuber or 0) == 0 and (e2.dragon or 0) == 0,
+        "the per-layer pass is flowers-only", fails)
+    tcheck((nodePopTable("tuber") or {})[3] == nil, "no tuber written from a layer", fails)
+
+    ------------------------------------------------------------------
+    -- (f) OUR OWN EYES WIN OUTRIGHT. A local pick passes no guard at all — not
+    --     the hold, not the 10s duplicate window — so it upgrades a layer fill
+    --     the moment we make one.
+    ------------------------------------------------------------------
+    reset()
+    Timers.IngestNWBTimers({ layers = { [1] = { f6 = t - 5 } } })
+    tcheck(pops()[6] == t - 5 and Timers._nodeTrust["flower6"] == "nwbLayer",
+        "layer fill in place before the local pick", fails)
+    tcheck(Timers.MarkNode("flower", 6, t, "local") == true,
+        "a local pick overrides a 5s-old layer fill with no guard", fails)
+    tcheck(pops()[6] == t, "the local epoch is what the node now holds", fails)
+    tcheck(Timers._nodeTrust["flower6"] == "local", "and the node upgrades to local trust", fails)
+    -- ...after which the layer data cannot take it back.
+    local f2 = Timers.IngestNWBTimers({ layers = { [1] = { f6 = t + 20 } } })
+    tcheck(pops()[6] == t, "layer data cannot reclaim a node we just picked", fails)
+    tcheck((f2.rejGuard or 0) == 1, "the reclaim attempt is counted as a guard refusal", fails)
+
+    ------------------------------------------------------------------
+    -- MarkNode's refusal reasons, which the counters above are built on.
+    ------------------------------------------------------------------
+    reset()
+    timersStore.flower[8] = t - 100
+    Timers._nodeTrust["flower8"] = "nwb"
+    local ok, why = Timers.MarkNode("flower", 8, t - 200, "nwb", netNodeOpts())
+    tcheck(ok == false and why == "older", "MarkNode reports 'older'", fails)
+    ok, why = Timers.MarkNode("flower", 8, t - 95, "nwb", netNodeOpts())
+    tcheck(ok == false and why == "minNewer", "MarkNode reports 'minNewer'", fails)
+    Timers._nodeTrust["flower8"] = "local"
+    ok, why = Timers.MarkNode("flower", 8, t, "nwb", netNodeOpts())
+    tcheck(ok == false and why == "localHold", "MarkNode reports 'localHold'", fails)
+    Timers._nodeTrust["flower8"] = "nwb"
+    ok, why = Timers.MarkNode("flower", 8, t, "nwb", { overwriteGuard = NODE_RESPAWN })
+    tcheck(ok == false and why == "overwriteGuard", "MarkNode reports 'overwriteGuard'", fails)
+    tcheck(select("#", Timers.MarkNode("flower", 8, t, "nwb")) >= 1,
+        "a successful MarkNode still returns true first", fails)
+    tcheck(Timers.MarkNode("flower", 8, t + 100, "nwb") == true,
+        "the extra return value does not disturb == true callers", fails)
 
     reset()
 end
@@ -5679,6 +6092,7 @@ function Timers.RunSelfTests(verbose)
         { name = "ingest parsers",    fn = testIngestParsers },
         { name = "rehydrate from store", fn = testRehydrateFromStore },
         { name = "nwb payload ingest", fn = testNWBIngest },
+        { name = "nwb layered songflowers", fn = testNWBLayerFlowers },
         -- Buff-drop pipeline audit (F1/F2/F6/F7/F12/F13).
         { name = "anchor rewind by trust",   fn = testAnchorRewind },
         { name = "announcer-only kills",     fn = testAnnouncerOnlyKills },

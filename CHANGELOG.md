@@ -12,6 +12,28 @@
   60s per account — but until every account has reloaded there is avoidable mesh
   chatter. Reload (or relog) all of your accounts once, together, and it stops.
 
+- Fixed: **the Songflower grid said "No data" forever on a layered realm.** Whitemane
+  is layered, and on a layered realm the songflower timers do not arrive as plain
+  fields — they arrive nested one level down, in a per-layer map. Nexus was reading
+  only the flat, top-level fields and skipping that map entirely, so on your realm it
+  was skipping *every* songflower timer the network carries. All ten cells sat empty
+  no matter how long you listened.
+
+  Nexus now reads them. A node it has never seen is filled in; a node holding your
+  own pick is left completely alone for the full 25-minute respawn (walking up to a
+  flower and watching it get picked still beats anything second-hand); and once a
+  node is filled, later reports follow the usual newest-wins rule with the 10-second
+  duplicate guard. Where several layers report the same node, the newest of them is
+  used, and only once — not one write per layer.
+
+  **The honest caveat:** Nexus does not know which layer you are on, and the data
+  does not say. A filled cell reflects a pick that happened on *some* layer, so it
+  can be off — the flower may already be up, or still be down when the timer says
+  it is up. That is a deliberate trade: some data beats none, and the moment you
+  pick a flower yourself, your own observation takes that node over outright. Node
+  sources are visible in `/nexus debug timers`, and `/nexus debug nwb` now prints a
+  running songflower tally (heard, applied, filled, and why anything was refused).
+
 - Fixed: **a duplicate character card that no amount of reloading would clear.** Nexus
   keeps one bucket of characters per account, and exactly one of them is flagged as
   *this* account — the flag that makes your own roster untouchable, so nothing
