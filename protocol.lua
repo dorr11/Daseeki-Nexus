@@ -547,7 +547,15 @@ local function testRoundTrip()
         return false, "decode failed: " .. tostring(err), #bytes
     end
     local ok, why = recordsMatch(rec, decoded)
-    return ok, why, #bytes
+    if not ok then return ok, why, #bytes end
+    -- The v2 tail is not just byte-equal, it is still USABLE at the far end: a
+    -- peer's decoded record must satisfy the gate the instance log's Rest view
+    -- reads it through (xpMax > 0), or the mesh delivers em-dashes to every peer.
+    if ns.Store.RestedPercent(decoded) ~= 25 then
+        return false, "decoded record lost its rested percent: "
+            .. tostring(ns.Store.RestedPercent(decoded)), #bytes
+    end
+    return true, nil, #bytes
 end
 
 local function testTokenBucket()
