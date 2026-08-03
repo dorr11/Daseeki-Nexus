@@ -859,6 +859,18 @@ end
 -- source, so this accepts every plausible one: an array of member tables, an
 -- array of bare names, a name->table map, or a name->level map. Returns our
 -- normalized { {name=, level=}, ... } or nil. Pure.
+-- ROUND-26 Part A.3: pull a class TAG out of a NIT group-member table. The source is not
+-- consistent about the key or the case, so accept the common spellings and normalise to the
+-- upper-case tag our own snapshot uses (and that Dashboard.ClassColor keys on). Returns nil
+-- when absent, which is exactly what keeps a legacy member class-less rather than guessing.
+function Import._NITClassTag(v)
+    if type(v) ~= "table" then return nil end
+    local c = v.classTag or v.englishClass or v.classFile or v.class
+    if type(c) ~= "string" or c == "" then return nil end
+    c = c:upper():gsub("[^A-Z]", "")
+    return c ~= "" and c or nil
+end
+
 function Import._NormalizeNITGroup(g, selfName)
     if type(g) ~= "table" then return nil end
     local out = {}
@@ -867,7 +879,8 @@ function Import._NormalizeNITGroup(g, selfName)
         if type(v) == "table" then
             local nm = v.name or v.playerName or v.unitName or v[1]
             if type(nm) == "string" and nm ~= "" then
-                out[#out + 1] = { name = nm, level = tonumber(v.level) or 0 }
+                out[#out + 1] = { name = nm, level = tonumber(v.level) or 0,
+                                  classTag = Import._NITClassTag(v) }
             end
         elseif type(v) == "string" and v ~= "" then
             out[#out + 1] = { name = v, level = 0 }
@@ -877,7 +890,8 @@ function Import._NormalizeNITGroup(g, selfName)
         for k, v in pairs(g) do
             if type(k) == "string" and k ~= "" then
                 if type(v) == "table" then
-                    out[#out + 1] = { name = k, level = tonumber(v.level) or 0 }
+                    out[#out + 1] = { name = k, level = tonumber(v.level) or 0,
+                                      classTag = Import._NITClassTag(v) }
                 elseif type(v) == "number" then
                     out[#out + 1] = { name = k, level = v }
                 elseif v ~= nil then
@@ -1017,6 +1031,23 @@ function Import._MapInstanceEntry(run)
     -- Level the character entered at.
     local lvl = tonumber(run.enteredLevel)
     if lvl and lvl > 0 then entry.enteredLevel = math.floor(lvl); detail.level = true end
+    -- ROUND-26 Part A.3: the source's `rep` field, previously carried-but-unused, maps onto
+    -- the entry. Accepts either a plain number (a net total) or a faction -> amount MAP,
+    -- which is summed into the total while the breakdown is kept in repBy — the same shape
+    -- live capture produces, so the tooltip has one model to read.
+    local rep = run.rep
+    if type(rep) == "number" and rep ~= 0 then
+        entry.rep = math.floor(rep); detail.rep = true
+    elseif type(rep) == "table" then
+        local total, by = 0, {}
+        for who, amt in pairs(rep) do
+            local n = tonumber(amt)
+            if type(who) == "string" and n and n ~= 0 then total = total + n; by[who] = n end
+        end
+        if total ~= 0 then
+            entry.rep, entry.repBy = math.floor(total), by; detail.rep = true
+        end
+    end
     -- Group snapshot + average, encoded into our compact stored form.
     local members = Import._NormalizeNITGroup(run.group, run.playerName)
     if members and ns.Instances and ns.Instances.EncodeGroup then
@@ -1056,7 +1087,7 @@ function Import._MapNITData(nitDB, ownerIndex, selfAID)
         runs = 0, skipped = 0, pvpSkipped = 0, chars = 0,
         attributed = 0, orphaned = 0, lootFieldHits = 0, xpFieldHits = 0,
         pvpBy = { id = 0, type = 0, flag = 0, stripped = 0 },
-        detail = { level = 0, group = 0, mob = 0, trades = 0, tradeRecords = 0 },
+        detail = { level = 0, group = 0, mob = 0, trades = 0, tradeRecords = 0, rep = 0 },
         perAccount = {}, orphanAID = orphanAID,
     }
     local g = (type(nitDB) == "table") and nitDB.global
@@ -1667,8 +1698,16 @@ local function selfTest(verbose)
     check("nit mobXP <- mobCount", bwl and bwl.mobXP == 900)
     check("nit mobKill <- mobCountFromKill", bwl and bwl.mobKill == 912)
     check("nit enteredLevel imported", bwl and bwl.enteredLevel == 60)
-    check("nit group encoded, self marked, name-sorted",
-        bwl and bwl.group == "*Artaeum:60|Bramble:59")
+    -- ROUND-26: the encoded group now carries the per-member CLASS from the NIT source
+    -- (its group field documents level/class/guild, and this fixture supplies MAGE/ROGUE).
+    -- This is the end-to-end proof that A.3 maps class through to the stored snapshot.
+    check("nit group encoded with class, self marked, name-sorted",
+        bwl and bwl.group == "*Artaeum:60:MAGE|Bramble:59:ROGUE")
+    -- ...and it must still DECODE, with the class surfacing per member.
+    local dec = ns.Instances and ns.Instances.DecodeGroup and ns.Instances.DecodeGroup(bwl and bwl.group)
+    check("nit group decodes back with class tags",
+        dec and #dec == 2 and dec[1].classTag == "MAGE" and dec[2].classTag == "ROGUE"
+        and dec[1].isSelf == true)
     check("nit groupAvg <- groupAverage", bwl and bwl.groupAvg == 59.5)
     check("nit stamps import provenance", bwl and bwl.src == "nit")
     -- Trades: inside the window AND located to this instance.

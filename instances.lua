@@ -291,7 +291,16 @@ function Instances.EncodeGroup(members)
             if nm ~= "" then
                 local lvl = math.floor(tonumber(m.level) or 0)
                 if lvl < 0 then lvl = 0 end
-                parts[#parts + 1] = (m.isSelf and "*" or "") .. nm .. ":" .. lvl
+                -- ROUND-26 Part A.1: the member token grows an optional THIRD field, the
+                -- class tag ("*Name:60:ROGUE"). Additive by construction — a two-field
+                -- token still decodes, so historical rows and old peers are unaffected.
+                -- The tag is sanitised the same way the name is; an absent/blank class
+                -- simply emits the old two-field form rather than a trailing colon.
+                local cls = m.classTag
+                if type(cls) == "string" then cls = cls:gsub("[|:*]", "") else cls = nil end
+                local tok = (m.isSelf and "*" or "") .. nm .. ":" .. lvl
+                if cls and cls ~= "" then tok = tok .. ":" .. cls end
+                parts[#parts + 1] = tok
             end
         end
     end
@@ -304,12 +313,20 @@ function Instances.DecodeGroup(str)
     local out = {}
     if type(str) ~= "string" or str == "" then return out end
     for part in string.gmatch(str, "([^|]+)") do
-        local nm, lvl = part:match("^(.-):(%d+)$")
+        -- ROUND-26: TOLERANT decode. Try the enriched three-field token first
+        -- ("Name:60:ROGUE"), then fall back to the legacy two-field ("Name:60"), then to a
+        -- bare name. Historical entries keep decoding exactly as before, just with a nil
+        -- classTag — which is what marks them "legacy" for the roster-match fallback.
+        local nm, lvl, cls = part:match("^(.-):(%d+):(%a+)$")
+        if not nm then
+            nm, lvl = part:match("^(.-):(%d+)$")
+        end
         if not nm then nm, lvl = part, "0" end
         local isSelf = false
         if nm:sub(1, 1) == "*" then isSelf, nm = true, nm:sub(2) end
         if nm ~= "" then
-            out[#out + 1] = { name = nm, level = tonumber(lvl) or 0, isSelf = isSelf }
+            out[#out + 1] = { name = nm, level = tonumber(lvl) or 0, isSelf = isSelf,
+                              classTag = cls }
         end
     end
     return out
@@ -347,9 +364,16 @@ function Instances.UnionGroup(prevStr, members)
                     local lvl = math.floor(tonumber(m.level) or 0)
                     if lvl > 0 then have.level = lvl end      -- valid values only
                     if m.isSelf then have.isSelf = true end
+                    -- ROUND-26: a later snapshot may know a class the first one did not
+                    -- (unit not yet loaded at entry), so class UPGRADES nil -> known and is
+                    -- never cleared back to nil by a subsequent class-less sample.
+                    if type(m.classTag) == "string" and m.classTag ~= "" then
+                        have.classTag = m.classTag
+                    end
                 elseif #list < MAX_GROUP then
                     local rec = { name = nm, level = math.floor(tonumber(m.level) or 0),
-                                  isSelf = m.isSelf and true or false }
+                                  isSelf = m.isSelf and true or false,
+                                  classTag = m.classTag }
                     list[#list + 1] = rec
                     idx[nm] = rec
                 end
@@ -419,6 +443,13 @@ function Instances.ApplySerial(entries, serial, guid, source)
         prev.xp       = (prev.xp or 0)       + (newest.xp or 0)
         prev.mobXP    = (prev.mobXP or 0)    + (newest.mobXP or 0)
         prev.mobKill  = (prev.mobKill or 0)  + (newest.mobKill or 0)
+        -- ROUND-26: rep folds in like the other takings — a corpse run back into the same
+        -- live instance is one run, so its rep belongs to the survivor's total.
+        if newest.rep then prev.rep = (prev.rep or 0) + newest.rep end
+        if newest.repBy then
+            prev.repBy = prev.repBy or {}
+            for who, amt in pairs(newest.repBy) do prev.repBy[who] = (prev.repBy[who] or 0) + amt end
+        end
         -- Entry level / entry XP / entry money on the survivor are deliberately
         -- NOT overwritten (spec §2.4 — overwriting them was a bug there too).
         -- The GROUP is unioned rather than kept, though: someone who joined during
@@ -622,8 +653,10 @@ function Instances.MergeEntryList(existing, incoming)
         if e and e.t ~= nil then byT[e.t] = e end
     end
     local added = 0
+    -- ROUND-26: `rep` / `repBy` join the additive optional fields — filled from an inbound
+    -- copy when we lack them, never overwriting what we already hold.
     local FILL = { "serial", "prevSerial", "exitT", "goldLoot", "mobXP", "mobKill", "mapID",
-                   "enteredLevel", "group", "groupAvg", "trades", "src" }
+                   "enteredLevel", "group", "groupAvg", "trades", "src", "rep", "repBy" }
     for i = 1, #incoming do
         local e = incoming[i]
         if e and e.t ~= nil then
@@ -766,7 +799,16 @@ local function readGroupMembers()
     if not UnitName then return nil end
     local selfName = UnitName("player")
     if type(selfName) ~= "string" or selfName == "" then return nil end
-    local members = { { name = selfName, level = sampleLevel() or 0, isSelf = true } }
+    -- ROUND-26 Part A.1: capture the CLASS TAG alongside name/level. UnitClass returns
+    -- (localisedName, TAG) — we store the TAG (locale-independent, and what
+    -- Dashboard.ClassColor keys on). Guarded so a headless/older client just omits it.
+    local function classOf(unit)
+        if not UnitClass then return nil end
+        local _, tag = UnitClass(unit)
+        return (type(tag) == "string" and tag ~= "") and tag or nil
+    end
+    local members = { { name = selfName, level = sampleLevel() or 0, isSelf = true,
+                        classTag = classOf("player") } }
     local n = (GetNumGroupMembers and tonumber(GetNumGroupMembers())) or 0
     if n > 1 then
         local inRaid = (IsInRaid and IsInRaid()) and true or false
@@ -778,7 +820,8 @@ local function readGroupMembers()
             local nm = UnitName(unit)
             local isMe = inRaid and UnitIsUnit and UnitIsUnit(unit, "player")
             if type(nm) == "string" and nm ~= "" and not isMe then
-                members[#members + 1] = { name = nm, level = (UnitLevel and tonumber(UnitLevel(unit))) or 0 }
+                members[#members + 1] = { name = nm, level = (UnitLevel and tonumber(UnitLevel(unit))) or 0,
+                                          classTag = classOf(unit) }
             end
         end
     end
@@ -1004,6 +1047,60 @@ function Instances._onXPGain(text)
     e.mobXP = (e.mobXP or 0) + 1
 end
 
+-- ROUND-26 Part A.2: REPUTATION for the run.
+-- MODEL CHOICE (documented per the brief): NET rep accumulated from the faction-change
+-- messages, not an enter-vs-exit sweep of every faction. Reasons: (a) it matches how gold
+-- and xp are already captured in this file, so there is one accumulation model rather than
+-- two; (b) an enter/exit sweep has to iterate the whole faction list twice per run and
+-- still misses rep earned then partly lost within the run; (c) the message carries the
+-- faction NAME, so a per-faction breakdown stays available later without a schema change.
+-- Stored as a single compact total `e.rep` (net across factions) plus `e.repBy` (a
+-- name -> amount map) — the tooltip renders the total and the map is there if the owner
+-- later wants the breakdown. Both are additive and absent on historical rows.
+-- The message is localised, so the pattern is built from Blizzard's own global strings the
+-- same way the money patterns are, with a literal English fallback.
+local _repPats
+function Instances.RepPatterns(reset)
+    if _repPats and not reset then return _repPats end
+    local function pat(s, fallback)
+        s = (type(s) == "string" and s ~= "") and s or fallback
+        -- escape magic chars, then turn the %s / %d placeholders into captures
+        s = s:gsub("([%^%$%(%)%.%[%]%*%+%-%?])", "%%%1")
+        s = s:gsub("%%%%s", "(.+)"):gsub("%%%%d", "(%%d+)")
+        return s
+    end
+    _repPats = {
+        inc = pat(rawget(_G, "FACTION_STANDING_INCREASED"),
+                  "Your reputation with %s has increased by %d."),
+        dec = pat(rawget(_G, "FACTION_STANDING_DECREASED"),
+                  "Your reputation with %s has decreased by %d."),
+    }
+    return _repPats
+end
+
+-- Parse a faction-change line into (factionName, delta) with delta SIGNED. Pure given
+-- the patterns, so the whole thing is headless-testable.
+function Instances.ParseRepChange(text, pats)
+    if type(text) ~= "string" then return nil end
+    pats = pats or Instances.RepPatterns()
+    local who, amt = text:match(pats.inc)
+    if who and amt then return who, tonumber(amt) or 0 end
+    who, amt = text:match(pats.dec)
+    if who and amt then return who, -(tonumber(amt) or 0) end
+    return nil
+end
+
+function Instances._onRepChange(text)
+    local sample = Instances._openSample
+    local e = sample and sample.entry
+    if not e then return end
+    local who, delta = Instances.ParseRepChange(text)
+    if not who or not delta or delta == 0 then return end
+    e.rep = (e.rep or 0) + delta
+    e.repBy = e.repBy or {}
+    e.repBy[who] = (e.repBy[who] or 0) + delta
+end
+
 -- CHAT_MSG_MONEY: the loot-only coin accumulator. Spend-proof, unlike the wallet
 -- delta, which is kept in parallel as e.gold.
 function Instances._onMoney(text)
@@ -1182,6 +1279,8 @@ Instances._Handlers = {
     TRADE_ACCEPT_UPDATE      = function(p, t) Instances._onTradeAccept(p, t) end,
     TRADE_REQUEST_CANCEL     = function() Instances._onTradeCancel() end,
     TRADE_CLOSED             = function() Instances._onTradeClosed() end,
+    -- ROUND-26 Part A.2: reputation accrual for the open run.
+    CHAT_MSG_COMBAT_FACTION_CHANGE = function(text) Instances._onRepChange(text) end,
 }
 
 function Instances.OnLogin()

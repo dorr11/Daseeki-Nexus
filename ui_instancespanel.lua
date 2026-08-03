@@ -19,6 +19,10 @@ local ADDON, ns = ...
 local UI = DaseekiUI                 -- nil under the headless harness; only ever
 local Dashboard = ns.Dashboard       -- dereferenced inside function bodies below.
 
+-- ROUND-26: hoisted. It used to be declared beside ExpRow (~line 787), which meant every
+-- function defined ABOVE that point — RowTooltip among them — captured the GLOBAL EMDASH
+-- (nil) instead of this local. The tooltip's absent-value em-dashes were silently nil.
+local EMDASH = "\226\128\148"
 local InstancesUI = {}
 ns.InstancesUI = InstancesUI
 local InstancesPanel = {}
@@ -413,6 +417,12 @@ function InstancesUI.RowModel(entry, nameRealm, classTag, nowE, isOpen, visits)
         goldToken = (gold < 0) and "danger" or "muted",
         xp        = xp,
         xpText    = (xp ~= 0) and ("+" .. xp .. " xp") or nil,
+        -- ROUND-26: reputation for the run. Signed, because rep CAN go down (a run that
+        -- costs you standing is real information); nil when the entry predates capture, so
+        -- the icon strip shows an em-dash rather than a misleading "0".
+        rep       = entry.rep,
+        repText   = (entry.rep and entry.rep ~= 0)
+                    and ((entry.rep > 0 and "+" or "") .. entry.rep .. " rep") or nil,
         merged    = (entry.merged or (visitList ~= nil)) and true or false,
         -- ── the hover block ──
         serial       = entry.serial,
@@ -518,6 +528,44 @@ end
 -- The group roster as a TWO-COLUMN name list: { {left, right}, ... }, each cell
 -- "Bramble 57" and the character's own row annotated. Capped, with a "+N more"
 -- tail so a 40-man raid cannot grow a tooltip past the screen. Pure.
+-- ROUND-26 Part B: the group roster as an N-COLUMN grid of CELLS (not pre-joined strings),
+-- so the renderer can colour each name by class. Each cell is
+--   { text = "60 Name", classTag = "ROGUE"|nil, isSelf = bool, more = bool }
+-- LEVEL sits LEFT of the name (owner). classTag comes from the enriched snapshot; for
+-- LEGACY rows (encoded before round-26, so class-less) the caller can pass `classBy`, a
+-- short-name -> classTag map built from the mesh roster, and we fall back to that. A name
+-- in neither renders PLAIN rather than guessed — an unknown class is not a grey class.
+-- Pure.
+function InstancesUI.GroupGrid(members, cols, cap, classBy)
+    cols = cols or 4
+    cap  = cap or 40
+    members = members or {}
+    local cells, over = {}, 0
+    for i = 1, #members do
+        local m = members[i] or {}
+        if #cells >= cap then over = over + 1
+        else
+            local lvl = tonumber(m.level) or 0
+            local nm = tostring(m.name)
+            local txt = (lvl > 0) and (lvl .. " " .. nm) or nm
+            if m.isSelf then txt = txt .. " (you)" end
+            local cls = m.classTag
+            if (not cls or cls == "") and classBy then cls = classBy[nm] end
+            cells[#cells + 1] = { text = txt, classTag = cls, isSelf = m.isSelf and true or false }
+        end
+    end
+    if over > 0 then cells[#cells + 1] = { text = "+" .. over .. " more", more = true } end
+    local rows = {}
+    for i = 1, #cells, cols do
+        local row = {}
+        for j = 0, cols - 1 do row[j + 1] = cells[i + j] end
+        rows[#rows + 1] = row
+    end
+    return rows
+end
+
+-- Legacy two-column string form. Retained: the round-15 tests pin it, and it is the
+-- shape any older consumer expects. GroupGrid is what the tooltip renders now.
 function InstancesUI.GroupPairs(members, cap)
     cap = cap or 20
     members = members or {}
@@ -571,24 +619,54 @@ function InstancesUI.RowTooltip(model, nowE)
     local lines = {}
     local function add(label, value) lines[#lines + 1] = { label, value } end
 
-    if model.serial then add("Instance ID", tostring(model.serial)) end
-    if model.enteredText then add("Entered", model.enteredText) end
-    add("Left", model.leftText or "still inside")
-    add("Time inside", model.durText or "")
-    if (model.mobCount or 0) > 0 then add("Mobs killed", tostring(model.mobCount)) end
-    add("Gold from mobs", (model.goldFullText or "")
-        .. (model.goldFromLoot and " (looted)" or " (wallet delta)"))
-    if model.xpText then add("XP", model.xpText) end
-    if model.enteredLevel then add("Entered level", tostring(model.enteredLevel)) end
-    if model.groupAvg then add("Average group level", string.format("%.1f", model.groupAvg)) end
-    add("When", model.agoText or "")
+    -- ROUND-26 Part B: the upper section is a 2-COLUMN GRID of paired fields rather than a
+    -- long single-column list, the instance ID moves onto the header line, and gold/xp/rep
+    -- move out to their own icon strip. Pairings put naturally-related fields side by side
+    -- (the two clock fields, the two "how much happened" fields, the two level fields), so
+    -- each row reads as one idea.
+    local function pair(l1, v1, l2, v2)
+        if v1 == nil and v2 == nil then return end
+        lines[#lines + 1] = { l1, v1, l2, v2 }
+    end
+    pair("Entered", model.enteredText, "Left", model.leftText or "still inside")
+    pair("Time inside", model.durText,
+         "Mobs killed", (model.mobCount or 0) > 0 and tostring(model.mobCount) or nil)
+    pair("Entered level", model.enteredLevel and tostring(model.enteredLevel) or nil,
+         "Avg group level", model.groupAvg and string.format("%.1f", model.groupAvg) or nil)
+    pair("When", model.agoText or "", nil, nil)
 
-    local tip = { title = model.instance or "?", character = model.name, lines = lines }
+    local tip = {
+        title = model.instance or "?", character = model.name, lines = lines,
+        -- The instance ID rides the header line, right-aligned and RED (owner).
+        serialText = model.serial and tostring(model.serial) or nil,
+    }
 
-    local roster = InstancesUI.GroupPairs(model.group, 20)
+    -- ROUND-26: the 3-column icon strip between the upper grid and the group.
+    -- ICON CHOICES (documented): gold uses the coin art the money frame uses; XP uses the
+    -- XP-bar art; rep uses the reputation tab art. All are shipped Blizzard textures, so
+    -- nothing is added to our own texture set. Absent values render an em-dash rather than
+    -- vanishing, so the strip keeps a stable three-cell shape.
+    tip.stats = {
+        -- The gold cell KEEPS its provenance suffix. Moving gold to the strip must not
+        -- quietly drop "(looted)" vs "(wallet delta)" — that distinction says whether the
+        -- number is loot-true or just a wallet difference, which is why it was added.
+        { key = "gold", icon = "Interface\\MoneyFrame\\UI-GoldIcon",
+          value = model.goldFullText
+                  and (model.goldFullText .. (model.goldFromLoot and " (looted)" or " (wallet delta)"))
+                  or EMDASH },
+        { key = "xp",   icon = "Interface\\Icons\\XPBonus_Icon",
+          value = model.xpText or EMDASH },
+        { key = "rep",  icon = "Interface\\Icons\\Achievement_Reputation_01",
+          value = model.repText or EMDASH },
+    }
+
+    -- Group: FOUR columns, class-coloured, level LEFT of the name. The cap rises from 20 to
+    -- 40 now that four columns make a full raid ten rows instead of twenty.
+    local roster = InstancesUI.GroupGrid(model.group, 4, 40)
     if #roster > 0 then
         tip.groupHeader = "Group (" .. #(model.group or {}) .. ")"
-        tip.groupPairs = roster
+        tip.groupRows = roster
+        tip.groupPairs = roster   -- retained alias for any older consumer
     end
 
     if model.trades and #model.trades > 0 then
@@ -710,7 +788,6 @@ end
 -- GUARDEDLY — an absent field renders "—" so this is safe before the engine lands.
 -- A level-60 character shows just "Level 60" (no xp / rested). Rested% is restedXP as a
 -- percent of xpMax, "N% (Max)" at >= 150%. Pure/headless-tested.
-local EMDASH = "\226\128\148"
 function InstancesUI.ExpRow(rec, nameRealm, classTag)
     rec = rec or {}
     local D = ns.Dashboard
@@ -1176,20 +1253,61 @@ function InstancesPanel.Attach(host)
             local tip = self._tip
             if not (tip and GameTooltip) then return end
             GameTooltip:SetOwner(self, "ANCHOR_RIGHT")   -- SetOwner clears the tooltip
-            GameTooltip:AddLine(tip.title, UI.Color("accent"))
-            if tip.character then GameTooltip:AddLine(tip.character, UI.Color("muted")) end
             local tr, tg, tb = UI.Color("muted")
             local vr, vg, vb = UI.Color("text")
             local hr, hg, hb = UI.Color("accent")
-            for _, ln in ipairs(tip.lines) do
-                GameTooltip:AddDoubleLine(ln[1], ln[2], tr, tg, tb, vr, vg, vb)
+            local dr, dg, db = UI.Color("danger")
+            -- ROUND-26: the instance ID rides the HEADER line, right-aligned and RED.
+            if tip.serialText then
+                GameTooltip:AddDoubleLine(tip.title, tip.serialText, hr, hg, hb, dr, dg, db)
+            else
+                GameTooltip:AddLine(tip.title, hr, hg, hb)
             end
-            -- Roster: a two-column name list, one AddDoubleLine per pair.
-            if tip.groupPairs then
+            if tip.character then GameTooltip:AddLine(tip.character, tr, tg, tb) end
+            -- Upper section: a 2-COLUMN grid. AddDoubleLine gives two columns, so each
+            -- grid row packs its pair as "Label value" on each side; a row with only a
+            -- left pair falls back to a plain double line so nothing renders "nil".
+            for _, ln in ipairs(tip.lines) do
+                local l1, v1, l2, v2 = ln[1], ln[2], ln[3], ln[4]
+                if l2 and v2 then
+                    GameTooltip:AddDoubleLine(l1 .. "  " .. Dashboard.Colored(v1 or EMDASH, "text"),
+                                              l2 .. "  " .. Dashboard.Colored(v2, "text"),
+                                              tr, tg, tb, tr, tg, tb)
+                else
+                    GameTooltip:AddDoubleLine(l1, v1 or EMDASH, tr, tg, tb, vr, vg, vb)
+                end
+            end
+            -- ROUND-26: the 3-column Gold · Exp · Rep icon strip. Textures are inlined into
+            -- the string so the whole strip is ONE tooltip line (a tooltip cannot host real
+            -- child textures without a custom frame, and |T…|t is the sanctioned way).
+            if tip.stats then
+                local cells = {}
+                for _, s in ipairs(tip.stats) do
+                    cells[#cells + 1] = ("|T%s:14:14:0:0|t %s"):format(s.icon, s.value)
+                end
+                GameTooltip:AddLine(" ")
+                GameTooltip:AddDoubleLine(cells[1], cells[2] .. "   " .. cells[3],
+                                          vr, vg, vb, vr, vg, vb)
+            end
+            -- Roster: FOUR columns, each name in its class colour. A tooltip line only has
+            -- two native columns, so the four cells are packed into two — each side holding
+            -- a colour-coded pair — which keeps the class tint per NAME rather than per line.
+            if tip.groupRows then
                 GameTooltip:AddLine(" ")
                 GameTooltip:AddLine(tip.groupHeader, hr, hg, hb)
-                for _, pr in ipairs(tip.groupPairs) do
-                    GameTooltip:AddDoubleLine(pr[1], pr[2], vr, vg, vb, vr, vg, vb)
+                local function cell(c)
+                    if not c then return "" end
+                    if c.more then return Dashboard.Colored(c.text, "muted") end
+                    local cr, cg, cb = Dashboard.ClassColor(c.classTag)
+                    if not c.classTag or not cr then return Dashboard.Colored(c.text, "text") end
+                    return ("|cff%02x%02x%02x%s|r"):format(
+                        math.floor(cr * 255 + 0.5), math.floor(cg * 255 + 0.5),
+                        math.floor(cb * 255 + 0.5), c.text)
+                end
+                for _, row in ipairs(tip.groupRows) do
+                    GameTooltip:AddDoubleLine(cell(row[1]) .. "   " .. cell(row[2]),
+                                              cell(row[3]) .. "   " .. cell(row[4]),
+                                              vr, vg, vb, vr, vg, vb)
                 end
             end
             if tip.tradeLines then
@@ -1620,6 +1738,7 @@ local function testInstancesUI(fails)
     local function tipVal(tip, label)
         for _, ln in ipairs((tip and tip.lines) or {}) do
             if ln[1] == label then return ln[2] end
+            if ln[3] == label then return ln[4] end   -- round-26: 2-column grid rows
         end
         return nil
     end
@@ -1627,9 +1746,15 @@ local function testInstancesUI(fails)
     local tip = IU.RowTooltip(rCells, T)
     ck(tip.title == "Blackrock Depths", "tooltip: titled with the instance")
     ck(tipVal(tip, "Time inside") == rCells.durText, "tooltip: full duration text")
-    ck(tipVal(tip, "Gold from mobs") == "4g 80s 0c (looted)",
-        "tooltip: exact coin + source (got " .. tostring(tipVal(tip, "Gold from mobs")) .. ")")
-    ck(tipVal(tip, "XP") == "+12400 xp", "tooltip: exact xp")
+    -- ROUND-26: gold / xp / rep left the label grid for the ICON STRIP.
+    local function statVal(t, key)
+        for _, s in ipairs((t and t.stats) or {}) do if s.key == key then return s.value end end
+    end
+    ck(statVal(tip, "gold") == "4g 80s 0c (looted)",
+        "tooltip: gold moved to the icon strip (got " .. tostring(statVal(tip, "gold")) .. ")")
+    ck(statVal(tip, "xp") == "+12400 xp", "tooltip: xp in the icon strip")
+    ck(statVal(tip, "rep") == EMDASH, "tooltip: absent rep renders an em-dash, not a 0 (got " .. tostring(statVal(tip, "rep")) .. ")")
+    ck(#tip.stats == 3, "tooltip: the strip always has three cells")
     ck(tipVal(tip, "When") == rCells.agoText, "tooltip: full ago text")
     ck(tipVal(tip, "Left") == "still inside", "tooltip: an unclosed run says so")
     ck(tipVal(tip, "Entered") ~= nil, "tooltip: entered clock time present")
@@ -1648,18 +1773,23 @@ local function testInstancesUI(fails)
     ck(rFull.mobCount == 312, "row: mob count prefers the XP-derived counter")
     ck(#rFull.group == 3, "row: group decoded from the stored snapshot")
     local tipF = IU.RowTooltip(rFull, T)
-    ck(tipVal(tipF, "Instance ID") == "5501", "tooltip: the serial the row is grouped on")
+    -- ROUND-26: the serial moved OUT of the label grid onto the header line (red).
+    ck(tipF.serialText == "5501", "tooltip: serial rides the header line")
+    ck(tipVal(tipF, "Instance ID") == nil, "tooltip: serial is no longer a grid row")
     ck(tipVal(tipF, "Mobs killed") == "312", "tooltip: mob count")
-    ck(tipVal(tipF, "Gold from mobs") == "48g 23s 10c (looted)",
-        "tooltip: raw mob coin in full (got " .. tostring(tipVal(tipF, "Gold from mobs")) .. ")")
+    ck(statVal(tipF, "gold") == "48g 23s 10c (looted)",
+        "tooltip: raw mob coin in the strip (got " .. tostring(statVal(tipF, "gold")) .. ")")
     ck(tipVal(tipF, "Entered level") == "58", "tooltip: level walked in at")
-    ck(tipVal(tipF, "Average group level") == "58.3", "tooltip: average group level")
+    ck(tipVal(tipF, "Avg group level") == "58.3", "tooltip: average group level")
     ck(tipVal(tipF, "Left") ~= "still inside", "tooltip: a closed run reports its exit clock")
     ck(tipF.groupHeader == "Group (3)", "tooltip: roster header carries the count")
-    ck(#tipF.groupPairs == 2, "tooltip: 3 members -> 2 two-column rows")
-    ck(tipF.groupPairs[1][1] == "Tester 58 (you)", "tooltip: the character's own row is annotated")
-    ck(tipF.groupPairs[1][2] == "Bramble 57", "tooltip: second column filled")
-    ck(tipF.groupPairs[2][2] == "", "tooltip: an odd member count leaves the last cell empty")
+    -- ROUND-26: FOUR columns, level LEFT of name, cells carry their own class tag.
+    ck(#tipF.groupRows == 1, "tooltip: 3 members -> ONE four-column row")
+    ck(tipF.groupRows[1][1].text == "58 Tester (you)",
+        "tooltip: level LEFT of name, own row annotated (got "
+        .. tostring(tipF.groupRows[1][1].text) .. ")")
+    ck(tipF.groupRows[1][2].text == "57 Bramble", "tooltip: second cell filled")
+    ck(tipF.groupRows[1][4] == nil, "tooltip: a short last row simply has no 4th cell")
     ck(#tipF.tradeLines == 2, "tooltip: both trades listed")
     ck(tipF.tradeLines[1]:find("Gave 50g 0s 0c to Bramble", 1, true) ~= nil,
         "tooltip: trade phrasing (got " .. tostring(tipF.tradeLines[1]) .. ")")
@@ -1682,7 +1812,7 @@ local function testInstancesUI(fails)
     ck(IU.FormatMoneyFull(0) == "0c", "full coin: zero")
     local tipW = IU.RowTooltip(IU.RowModel({ t = T - 60, name = "Zul'Gurub", gold = 7000 },
                                             "Alt-Realm", "ROGUE", T), T)
-    ck(tipW.lines and tipVal(tipW, "Gold from mobs"):find("wallet delta") ~= nil,
+    ck(statVal(tipW, "gold"):find("wallet delta", 1, true) ~= nil,
         "tooltip: wallet-sourced coin is labelled as such")
 
     -- Clock text: shape only (the value is the harness machine's timezone).
@@ -1987,11 +2117,12 @@ end
 if ns.RegisterSelfTest then
     ns:RegisterSelfTest("instancesui", function(verbose)
         local fails = {}
-        local ok = pcall(testInstancesUI, fails)
+        local ok, perr = pcall(testInstancesUI, fails)
+        if not ok then fails[#fails + 1] = "ERROR: " .. tostring(perr) end
         local passed = ok and #fails == 0
         if verbose and ns and ns.Print then
             if passed then ns:Print("  PASS instancesui/view model")
-            elseif not ok then ns:Print("  FAIL instancesui/view model :: error in test")
+            elseif not ok then ns:Print("  FAIL instancesui/view model :: error in test :: " .. tostring(perr))   -- round-26: surface the message, not just "error"
             else for _, f in ipairs(fails) do ns:Print("  FAIL instancesui/view model :: " .. f) end end
         end
         return passed
