@@ -2,6 +2,7 @@
 ## Title: Daseeki Nexus
 ## Notes: Cross-account character dashboard, world-buff timers, and mesh coordination for the Daseeki suite.
 ## Author: Daseeki
+## X-License: All Rights Reserved
 ## Version: 0.1.0-n1
 ## SavedVariables: DaseekiNexusDB, DaseekiNexusData
 ## Dependencies: Daseeki-Core

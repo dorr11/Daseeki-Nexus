@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Added: **a LICENSE file — Daseeki Nexus ships All Rights Reserved**, matching the rest of the suite; the embedded LibStub, LibSerialize and LibDeflate keep their own upstream licenses.
+
 - Fixed: **the first world-buff pull timer could throw a Lua error if you updated Nexus
   but not Daseeki Core.** The pull bar is drawn with a bar widget that arrived in Core
   2.2.0, and it was being used without checking that the installed Core actually has it —

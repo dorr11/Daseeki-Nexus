@@ -1,0 +1,11 @@
+All Rights Reserved
+
+Copyright (c) 2026 Daseeki
+
+This software is provided for personal use only. You may not redistribute,
+modify, sublicense, or create derivative works of this addon without
+explicit written permission from the copyright holder. Hosting this addon
+on platforms such as CurseForge for end-user download/update purposes is
+permitted under those platforms' standard terms of service.
+
+Embedded libraries under libs/ (LibStub, LibSerialize, LibDeflate) are licensed separately by their upstream authors — see each file's own header.
