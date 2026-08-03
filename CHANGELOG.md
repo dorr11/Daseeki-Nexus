@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Changed: **the three mesh preferences on Setup now share one row.** "Suppress
+  mesh-disabled alert", "Auto-leave standard chat channels" and "Hard-throttle mesh sends"
+  were split across two lines — one, then two; they now sit side by side on the same three
+  columns as the Account ID / Channel / Token fields above, and drop to even spacing rather
+  than colliding if a larger text size or a wider font makes a label outgrow its column.
+
 - Fixed: **"Battle Shout (Boon)" was a state the game cannot produce.** A chronoboon
   cannot hold a Battle Shout or Fire Festival Fury — the Displacer will not take them —
   but the code that reads a chronoboon's tooltip checked all ten tracked buffs instead of

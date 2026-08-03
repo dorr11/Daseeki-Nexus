@@ -1226,27 +1226,105 @@ local function buildMesh(flow)
 
     flow:Hint("Generate credentials on your first account, Copy the bundle, then Paste it on each other account (Setup guide walks you through it). The Account ID stays unique per account and is never shared in the bundle.")
 
-    -- Suppress mesh-disabled alert — a notification preference. It formerly shared the
-    -- Enable row; since Enable now leads the section alone, this keeps its own row
-    -- rather than crowding a third checkbox onto the transport-toggle row below.
-    local suppRow = flow:AddRow({ vAlign = "center" })
-    register("mesh", suppRow:Checkbox({
-        label = "Suppress mesh-disabled alert",
-        get = function() local db = DB(); return db and db.mesh.optOut end,
-        set = function(v) local db = DB(); if db then db.mesh.optOut = v and true or false end end,
-    }).Refresh)
+    ------------------------------------------------------------------
+    -- THE PREFERENCE ROW (owner layout pass): Suppress alert · Auto-leave ·
+    -- Hard-throttle, all three on ONE row. They previously sat on two rows —
+    -- Suppress alone, then Auto-leave + Hard-throttle — which read as a ragged
+    -- orphan above a pair.
+    --
+    -- Hand-arranged rather than a plain flow row for the same reason the identity
+    -- block above is: the flow row packs items left-to-right at a fixed 8px gap,
+    -- so three toggles bunch against the left edge and leave a dead third of the
+    -- row. This block divides the row's width itself and re-divides it on every
+    -- layout pass.
+    --
+    -- RHYTHM: the Account / Channel / Token block above is three equal columns
+    -- separated by ID_COL_GAP, so these boxes take the SAME column stops whenever
+    -- every label fits its column — the two blocks then line up vertically.
+    -- FALLBACK: these labels are uneven (24–33 chars) and MakeCheckbox gives the
+    -- label FontString width 0 (auto-size, never truncates), so a label that
+    -- outgrows its column would run UNDER the next checkbox rather than clip.
+    -- That is reachable — fontScale goes to 1.3 and the font picker can hand us a
+    -- wide face — so when any label does not fit, the block switches to a
+    -- justified layout: intrinsic widths, leftover width split into equal gutters.
+    -- Even spacing without collision beats strict column alignment (owner's
+    -- tiebreak), and NEITHER branch can place two boxes on top of each other.
+    ------------------------------------------------------------------
+    do
+        local CHK_ROW_H   = 20   -- MakeCheckbox's own uiHeight
+        local CHK_MIN_GAP = 16   -- gutter floor for the justified branch
+        local CHK_MIN_COL = 60   -- below this a "column" is too thin to be one
 
-    local alRow = flow:AddRow({ vAlign = "center" })
-    register("mesh", alRow:Checkbox({
-        label = "Auto-leave standard chat channels",
-        get = function() local db = DB(); return db and db.mesh.autoLeaveChannel end,
-        set = function(v) local db = DB(); if db then db.mesh.autoLeaveChannel = v and true or false end end,
-    }).Refresh)
-    register("mesh", alRow:Checkbox({
-        label = "Hard-throttle mesh sends",
-        get = function() local db = DB(); return db and db.hardThrottle end,
-        set = function(v) local db = DB(); if db then db.hardThrottle = v and true or false end end,
-    }).Refresh)
+        local host = CreateFrame("Frame", nil, flow.pane.child)
+        host:SetHeight(CHK_ROW_H)
+
+        local prefs = {
+            {   label = "Suppress mesh-disabled alert",
+                get = function() local db = DB(); return db and db.mesh.optOut end,
+                set = function(v) local db = DB(); if db then db.mesh.optOut = v and true or false end end },
+            {   label = "Auto-leave standard chat channels",
+                get = function() local db = DB(); return db and db.mesh.autoLeaveChannel end,
+                set = function(v) local db = DB(); if db then db.mesh.autoLeaveChannel = v and true or false end end },
+            {   label = "Hard-throttle mesh sends",
+                get = function() local db = DB(); return db and db.hardThrottle end,
+                set = function(v) local db = DB(); if db then db.hardThrottle = v and true or false end end },
+        }
+
+        local boxes = {}
+        for i, spec in ipairs(prefs) do
+            local cb = UI.MakeCheckbox(host, spec)
+            -- MakeCheckbox bakes uiWidth from the label's string width AT CONSTRUCTION.
+            -- Remember that measurement so arrange can re-derive the intrinsic width
+            -- from the LIVE string width (font scale / picked face can change after
+            -- this page is built) without copying the factory's box+gap constants here.
+            cb._builtLabelW = (cb._label and cb._label.GetStringWidth and cb._label:GetStringWidth()) or 0
+            boxes[i] = cb
+            register("mesh", cb.Refresh)
+        end
+
+        local function intrinsicW(cb)
+            local w  = cb.uiWidth or 0
+            local lw = (cb._label and cb._label.GetStringWidth and cb._label:GetStringWidth()) or 0
+            if lw > 0 and (cb._builtLabelW or 0) > 0 then w = w + (lw - cb._builtLabelW) end
+            return math.max(40, math.floor(w + 0.5))
+        end
+
+        host.arrange = function(width)
+            host:SetWidth(math.max(width, 1)); host:SetHeight(CHK_ROW_H)
+
+            local n = #boxes
+            local iw, total = {}, 0
+            for i = 1, n do iw[i] = intrinsicW(boxes[i]); total = total + iw[i] end
+
+            -- Preferred branch: the identity block's equal columns.
+            local colW = math.floor((width - ID_COL_GAP * (n - 1)) / n)
+            local fits = colW >= CHK_MIN_COL
+            for i = 1, n do if iw[i] > colW then fits = false end end
+
+            -- Justified branch: leftover width split evenly between the boxes. The
+            -- CHK_MIN_GAP clamp means a pane too narrow for the row runs PAST the
+            -- right edge (visible, and the scroll pane is width-capped so it cannot
+            -- happen in the hub) instead of stacking boxes on one another.
+            local gutter = 0
+            if not fits and n > 1 then
+                gutter = math.max(CHK_MIN_GAP, math.floor((width - total) / (n - 1)))
+            end
+
+            local x = 0
+            for i = 1, n do
+                local cb = boxes[i]
+                cb:ClearAllPoints()
+                cb:SetPoint("LEFT", host, "LEFT", x, 0)
+                cb:SetWidth(iw[i])   -- click target (and any tooltip anchor) stays on box + label
+                x = x + (fits and (colW + ID_COL_GAP) or (iw[i] + gutter))
+            end
+            return CHK_ROW_H
+        end
+
+        flow.pane:AddBlock(host, host.arrange)   -- default topGap (rowGap) + zero indent
+        for _, cb in ipairs(boxes) do cb:Refresh() end
+        Options._meshPrefBoxes = boxes   -- self-test / diagnostic handle
+    end
 
     -- ── Active accounts table (round-3 item 32) ───────────────────────────────
     local acc = flow:AddSection("Accounts")
