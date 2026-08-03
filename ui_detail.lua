@@ -797,8 +797,8 @@ function Detail.Attach(parent)
     noteBox:SetPoint("TOPLEFT", rightCol, "TOPLEFT", 0, -(LOCK_LBL_H + 4))
     noteBox:SetPoint("RIGHT", rightCol, "RIGHT", 0, 0)
     -- ROUND-19 priority 3: RAID LOCKOUTS vacated the right column, so NOTE claimed the
-    -- space and became MULTI-LINE. Enter still commits (the OnEnterPressed handler below
-    -- clears focus), so the interaction is unchanged.
+    -- space and became MULTI-LINE. (Round-28: Enter now inserts a newline rather than
+    -- committing — see the handler block below for the full commit semantics.)
     -- ROUND-23 (owner's green outline): NOTE fills the right column's whole upper area
     -- instead of a fixed 66px box — from under its label down to just above the COOLDOWNS
     -- block, full column width. Anchored TOP (label) and BOTTOM (the cooldown label) rather
@@ -820,7 +820,14 @@ function Detail.Attach(parent)
     end)
     local function noteGet(nr) if ns.Store and ns.Store.GetNote then return ns.Store.GetNote(nr) end end
     local function noteSet(nr, t) if ns.Store and ns.Store.SetNote then ns.Store.SetNote(nr, t) end end
-    noteBox:SetScript("OnEnterPressed", function(self) self:ClearFocus() end)
+    -- ROUND-28 addendum (owner): Enter inserts a NEWLINE. The OnEnterPressed override that
+    -- committed-and-blurred is REMOVED, not replaced — a multi-line EditBox handles Enter
+    -- natively once nothing intercepts it, so removing the handler IS the feature.
+    -- Commit semantics after this:
+    --   Enter        -> newline (no save, no blur)
+    --   focus lost   -> SAVES (unchanged; clicking away or Escape both route through it)
+    --   Escape       -> reverts to the stored note, then blurs (unchanged)
+    -- Nothing else committed on Enter, so no save path is lost.
     noteBox:SetScript("OnEscapePressed", function(self) self:SetText(noteGet(D._current or "") or ""); self:ClearFocus() end)
     noteBox:SetScript("OnEditFocusLost", function(self)
         if D._current then local t = self:GetText(); noteSet(D._current, (t ~= "" and t) or nil) end

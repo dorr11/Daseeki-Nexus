@@ -802,19 +802,34 @@ function InstancesUI.ExpRow(rec, nameRealm, classTag)
                  or (nameRealm and nameRealm:match("^([^%-]+)")) or nameRealm
     local level = rec.level or 0
     local maxed = level >= 60
-    local xpText, restedText
+    -- ROUND-28 (owner): the three value columns get compact formats.
+    --   XP   -> a PERCENT of the level ("50%"), not the raw "8000/16000" fraction. FLOORED,
+    --           not rounded: 99.6% of a level is not 100%, and showing 100% for a character
+    --           who has not dinged would be a lie the rounding introduces.
+    --   REST -> the bare percent; the "(Max)" suffix is dropped and the MAXED state is
+    --           carried as COLOUR instead (restedToken), which is what frees the width.
+    -- Absent fields still render the em-dash, unchanged.
+    local xpText, restedText, restedToken
     if not maxed then
         local xp, xpMax, rested = rec.xp, rec.xpMax, rec.restedXP
-        if xp and xpMax and xpMax > 0 then xpText = ("%d/%d"):format(xp, xpMax) else xpText = EMDASH end
+        if xp and xpMax and xpMax > 0 then
+            xpText = math.floor(xp / xpMax * 100) .. "%"
+        else
+            xpText = EMDASH
+        end
         if rested and xpMax and xpMax > 0 then
             local pct = math.floor(rested / xpMax * 100 + 0.5)
-            restedText = (pct >= 150) and (pct .. "% (Max)") or (pct .. "%")
+            restedText = pct .. "%"
+            -- At/above 150% the rested pool is FULL — green says "capped, go spend it".
+            restedToken = (pct >= 150) and "ok" or "muted"
         else
             restedText = EMDASH
         end
     end
     return { nameRealm = nameRealm, classTag = classTag, name = name, level = level,
-             maxed = maxed, levelText = "Level " .. level, xpText = xpText, restedText = restedText }
+             -- Bare number: "Level 41" was ellipsizing inside the LVL cell (owner's shot).
+             maxed = maxed, levelText = tostring(level),
+             xpText = xpText, restedText = restedText, restedToken = restedToken }
 end
 
 -- All characters { nameRealm, classTag, level } ordered by LEVEL desc then name asc,
@@ -942,7 +957,13 @@ local COL_XP, COL_AGO             = RC.xp, RC.ago
 local COL_GAP, COL_PAD            = RC.gap, RC.pad
 -- ROUND-25b: the REST view's own right-aligned column chain, mirrored by its captions.
 --   content 344 = name (flex ~118) + LVL 46 + XP 84 + REST 78 + 3 x gap 5
-local REST_LVL_W, REST_XP_W, REST_REST_W = 46, 84, 78
+-- ROUND-28: the value columns narrow to their new compact formats and the reclaimed
+-- width goes to the flexing NAME (the only cell that was actually truncating).
+--   LVL  46 -> 26  ("41" not "Level 41" — two digits at the numeral font is ~14px)
+--   XP   84 -> 46  ("50%" not "8000/16000")
+--   REST 78 -> 46  ("150%" — the "(Max)" suffix is now colour, not text)
+-- Name flex therefore gains 90px: 344 - (26+46+46) - 3*gap 5 - pads 12 = 199 (was 109).
+local REST_LVL_W, REST_XP_W, REST_REST_W = 26, 46, 46
 
 local function tag(frame, id)
     if ns.Audit and ns.Audit.Tag and frame then ns.Audit.Tag(frame, id) end
@@ -1516,7 +1537,8 @@ function InstancesPanel.Attach(host)
                 if cr then r.name:SetTextColor(cr, cg, cb) else r.name:SetTextColor(UI.Color("text")) end
                 r.lvl:SetText(m.levelText)
                 r.xp:SetText(m.xpText or ""); r.xp:SetTextColor(UI.Color("muted"))
-                r.rested:SetText(m.restedText or ""); r.rested:SetTextColor(UI.Color("muted"))
+                -- ROUND-28: rested carries its MAXED state as colour (ok at >=150%).
+                r.rested:SetText(m.restedText or ""); r.rested:SetTextColor(UI.Color(m.restedToken or "muted"))
                 r:Show()
                 y = y + REC_H + REC_GAP
             end
@@ -1732,7 +1754,7 @@ local function testInstancesUI(fails)
         "cols: gold/xp still computed for the tooltip after leaving the row")
 
     -- REST column chain sums to the same content budget as the Logs chain.
-    ck(46 + 84 + 78 + 3 * RCOL.gap + 56 + 2 * RCOL.pad <= RCOL.content,
+    ck(REST_LVL_W + REST_XP_W + REST_REST_W + 3 * RCOL.gap + RCOL.name + 2 * RCOL.pad <= RCOL.content,
         "rest cols: LVL/XP/REST + name + pads fit the 344 budget")
     ck(IU.InstanceFlexWidth() >= 90,
         "cols: the instance name keeps at least 90px -- 'Blackrock Depths' must fit")
@@ -2012,14 +2034,21 @@ local function testInstancesUI(fails)
     -- ExpRow (round-10 item 2): guards absent engine fields; level-60 = just Level 60.
     local EM = "\226\128\148"
     local r60 = IU.ExpRow({ level = 60, xp = 1, xpMax = 2, restedXP = 3 }, "Max-R", "WARRIOR")
-    ck(r60.maxed == true and r60.levelText == "Level 60", "exp: level 60 -> maxed / Level 60")
+    ck(r60.maxed == true and r60.levelText == "60", "exp: level 60 -> maxed / bare '60'")
     ck(r60.xpText == nil and r60.restedText == nil, "exp: level 60 has no xp/rested")
     local rMid = IU.ExpRow({ level = 40, xp = 8000, xpMax = 16000, restedXP = 24000 }, "Mid-R", "MAGE")
-    ck(rMid.levelText == "Level 40", "exp: level text")
-    ck(rMid.xpText == "8000/16000", "exp: xp cur/total")
-    ck(rMid.restedText == "150% (Max)", "exp: rested 24000/16000 = 150% (Max)")
+    -- ROUND-28 formats: bare level, XP as a floored percent, rested percent with no "(Max)".
+    ck(rMid.levelText == "40", "exp: LVL is a bare number (no 'Level ' prefix)")
+    ck(rMid.xpText == "50%", "exp: XP is a percent (8000/16000 -> 50%)")
+    ck(rMid.restedText == "150%", "exp: rested drops the (Max) suffix")
+    ck(rMid.restedToken == "ok", "exp: at 150% the rested state is carried as ok GREEN")
     local rLow = IU.ExpRow({ level = 20, xp = 500, xpMax = 4000, restedXP = 800 }, "Low-R", "ROGUE")
     ck(rLow.restedText == "20%", "exp: rested 800/4000 = 20%")
+    ck(rLow.restedToken == "muted", "exp: below 150% keeps the muted token")
+    ck(rLow.xpText == "12%", "exp: XP percent FLOORS (500/4000 = 12.5 -> 12)")
+    -- Flooring matters: 99.x% of a level must not read as a ding that has not happened.
+    ck(IU.ExpRow({ level = 30, xp = 3999, xpMax = 4000 }, "N-R").xpText == "99%",
+        "exp: 3999/4000 floors to 99%, never 100%")
     local rNone = IU.ExpRow({ level = 30 }, "None-R", "PRIEST")   -- engine fields absent
     ck(rNone.xpText == EM and rNone.restedText == EM, "exp: absent engine fields -> em-dash")
 
@@ -2079,8 +2108,8 @@ local function testInstancesUI(fails)
     ck(#IU.RestRows(d24, "1", "Dee-R") == 0, "rest: char not in the account -> empty")
     -- The rest row still carries the NIT information set.
     local cee = IU.RestRows(d24, "1")[1]
-    ck(cee.levelText == "Level 42" and cee.xpText == "100/400", "rest: level + XP cur/max")
-    ck(cee.restedText == "150% (Max)", "rest: rested percent with the (Max) marker")
+    ck(cee.levelText == "42" and cee.xpText == "25%", "rest: bare level + XP percent")
+    ck(cee.restedText == "150%" and cee.restedToken == "ok", "rest: bare percent, maxed shown as green")
 
     -- CASCADE: changing account resets the character unless it belongs to the new account.
     ck(IU.ResolveCharSelection(d24, "1", "Cee-R") == "Cee-R", "cascade: char kept when it belongs")
@@ -2119,7 +2148,7 @@ local function testInstancesUI(fails)
     local byName = {}; for _, r in ipairs(rowsAbsent) do byName[r.nameRealm] = r end
     ck(byName["NoData-R"].xpText == EMDASH and byName["NoData-R"].restedText == EMDASH,
         "rest: absent xp data renders the em-dash on BOTH cells (designed path)")
-    ck(byName["HasData-R"].xpText == "100/400" and byName["HasData-R"].restedText == "50%",
+    ck(byName["HasData-R"].xpText == "25%" and byName["HasData-R"].restedText == "50%",
         "rest: present xp data formats normally -- so the em-dash is data, not a bug")
 end
 
