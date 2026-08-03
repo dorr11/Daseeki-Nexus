@@ -261,8 +261,19 @@ Dashboard.Now = now
 -- Inline color escape sourced FROM a theme token (so mixed-content strings stay
 -- tokens-only — no hardcoded hex — per the style guide). Rebuilt each refresh,
 -- so it tracks the active theme.
+-- THEME-LESS FALLBACK: the pure display layer (Detail.TallyText et al.) is documented
+-- as headless-testable, and _test_detail.lua exercises it with DaseekiUI ABSENT on
+-- purpose — that's the frameless/deferred-render contract. So HexColor must not hard-
+-- require the live theme: with no UI (or no UI.Color) it emits white. In-game DaseekiUI
+-- is a hard dependency, so the branch never triggers there; it exists so the pure
+-- helpers stay callable without a theme.
 function Dashboard.HexColor(token)
-    local r, g, b = UI.Color(token)
+    local r, g, b
+    if UI and type(UI.Color) == "function" then
+        r, g, b = UI.Color(token)
+    else
+        r, g, b = 1, 1, 1
+    end
     return ("|cff%02x%02x%02x"):format(
         math.floor(r * 255 + 0.5), math.floor(g * 255 + 0.5), math.floor(b * 255 + 0.5))
 end
