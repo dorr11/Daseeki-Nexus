@@ -8,6 +8,13 @@
   columns as the Account ID / Channel / Token fields above, and drop to even spacing rather
   than colliding if a larger text size or a wider font makes a label outgrow its column.
 
+- Changed: **the Instance Log's Logs view is spaced like its Rest view.** Character,
+  Instance, Dur and Ago now take 40% / 20% / 20% / 20% of the list's width instead of the
+  hand-tuned pixel widths they had, so the columns are evenly spread rather than bunched
+  against the right edge, and the headers sit over them. Both views share one splitter,
+  so they cannot drift apart again. An instance name too long for its column is shortened
+  with an ellipsis; hovering the row still shows it in full.
+
 - Fixed: **"Battle Shout (Boon)" was a state the game cannot produce.** A chronoboon
   cannot hold a Battle Shout or Fire Festival Fury — the Displacer will not take them —
   but the code that reads a chronoboon's tooltip checked all ten tracked buffs instead of
@@ -124,7 +131,6 @@
   required / optional / ignored per faction, exactly like the other rules.
   Existing installs get the new defaults automatically on the next login — nothing to
   re-tick — and if you had already set Fengus' classes by hand, your choices are kept.
->>>>>>> e8f919c (fix(nexus/auras): Fengus' Ferocity is a per-class rule (casters stop reading Missing))
 
 - Fixed: **an old Daseeki Core could take the dashboard down with it.** Three places
   drew their divider rules with a Core 2.2.0 drawing call, unguarded — on an older
