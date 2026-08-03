@@ -1177,11 +1177,12 @@ function InstancesPanel.Attach(host)
         end
     end
 
-    -- Recent-entries scroll list below the meters (name · instance · dur · gold · xp · ago).
-    local recLbl = microLabel(host, "RECENT")
-    P.recLbl = recLbl
-
-    -- Column captions, riding the RECENT label line (no extra row height). They
+    -- Recent-entries scroll list below the meters.
+    -- ROUND-26b: the standalone "RECENT"/"RESTED" section label is DELETED. Round-25b gave
+    -- both views a real caption row whose first cell (CHAR) sits at the SAME anchor this
+    -- label used — (PAD, -listTop) — so the two drew over each other into mangled text.
+    -- The per-view caption row IS the section header now; there is no separate label.
+    -- Column captions (no extra row height). They
     -- use the SAME right-anchored chain and widths as the row cells, so the
     -- caption sits exactly over its column. INSTANCES view only.
     local cols = CreateFrame("Frame", nil, host)
@@ -1456,9 +1457,7 @@ function InstancesPanel.Attach(host)
         local metersH = n * METER_H + math.max(0, n - 1) * METER_GAP
         local listTop = P._metersTop + metersH + 8
         local isExp = (P.view == "rest")   -- round-24: "logs" | "rest"
-        recLbl:SetText(isExp and "RESTED" or "RECENT")
-        recLbl:ClearAllPoints(); recLbl:SetPoint("TOPLEFT", host, "TOPLEFT", PAD, -listTop)
-        -- Column captions ride the label line; they describe the INSTANCES columns only.
+        -- ROUND-26b: no standalone section label any more — the caption row below IS it.
         -- ROUND-25b: the caption row is SWAPPED per view, not hidden in Rest.
         --   Logs : CHAR · INSTANCE (left) + DUR · AGO (right chain)
         --   Rest : CHAR (left) + LVL · XP · REST (right chain)
