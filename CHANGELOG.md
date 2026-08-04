@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.1.0 — 2026-08-04
 
 <!-- RELEASE NOTE: the cross-account tooltips below are a new user-facing FEATURE, not a
      fix — this Unreleased section is 1.1.0-worthy rather than 1.0.2. The version bump
