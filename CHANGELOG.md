@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.0.1 — 2026-08-04
 
 - **Fixed:** cross-account item counts stopped updating after the Daseeki Bags 2.0
   upgrade — an alt's bags would show whatever they held at the moment you upgraded, and
