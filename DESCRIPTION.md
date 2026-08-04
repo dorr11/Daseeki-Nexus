@@ -2,7 +2,7 @@
 
 <!-- Canonical CurseForge project description. Update here first, then paste to
      https://www.curseforge.com/wow/addons/daseeki-nexus (project 1638357).
-     Last synced: 2026-08-03 (v1.0.0). -->
+     Last synced: 2026-08-04 (v1.1.0). -->
 
 Daseeki Nexus is a cross-account character dashboard for WoW Classic Era. Every character on every account you run appears as a card — world buffs held (including what's stored in a chronoboon), raid lockouts and attunements, rest and XP, gold, cooldowns, and notes — kept current live over a lightweight sync mesh between your accounts.
 
@@ -15,7 +15,7 @@ Daseeki Nexus is a cross-account character dashboard for WoW Classic Era. Every 
 - **Online & Summoners tabs** — see who's logged in across your accounts and who can summon
 - **Minimap button**: left-click invites all your online characters to a group, right-click opens the dashboard
 - **Importers** for ShadowNetwork and Nova Instance Tracker data, so you start with your history instead of from zero
-- Cross-account **inventory & gold** module (system of record for Daseeki Bags' tooltips and totals)
+- Cross-account **inventory & gold** — hover any item or your money to see every character's counts and gold across all your accounts, **right in the default Blizzard bags** (no Daseeki Bags required; when Daseeki Bags is installed it renders these instead)
 
 ## Chat Commands
 - `/nexus` — toggle the dashboard
