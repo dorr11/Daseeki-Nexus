@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- **Fixed:** the NEXUS wordmark in the dashboard titlebar kept the old theme's colour
+  after switching themes; it now re-tints live like the rest of the window.
+
 ## 1.0.0 — 2026-08-03
 
 First public release. Daseeki Nexus is a cross-account character dashboard for WoW

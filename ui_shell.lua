@@ -1470,10 +1470,21 @@ local function buildHeader(w)
 
     -- Wordmark: just NEXUS (accent), in the ceremonial face — the emblem carries the
     -- suite brand now.
+    -- COLOUR: the accent goes through UI.Skin rather than baked into the string as a
+    -- |cff escape. The escape was resolved ONCE at build time, so a live theme switch
+    -- (Stormwind, Felwood, …) left the wordmark wearing the PREVIOUS theme's accent
+    -- until the window was rebuilt. UI.Skin re-runs on every ThemeChanged, which is the
+    -- shipped idiom for exactly this lockup — Core hub.lua's "Daseeki Suite" titlebar
+    -- wordmark and Raid Prep's checklist title both paint this way, so all three headers
+    -- now track the theme together. Ordering is what makes it safe: SetTheme runs
+    -- applyFonts() BEFORE fireThemeChanged(), so this per-FontString colour lands after
+    -- the shared ceremonial FontObject's re-tint and wins. The ceremonial FACE is
+    -- brand-locked and untouched (BRAND_SPEC §3/§7) — colour only.
     local wordmark = header:CreateFontString(nil, "OVERLAY")
     wordmark:SetFontObject(UI.fonts.ceremonial or UI.fonts.header)
     wordmark:SetPoint("LEFT", logo, "RIGHT", 10, 0)
-    wordmark:SetText(Dashboard.HexColor("accent") .. "NEXUS|r")
+    wordmark:SetText("NEXUS")
+    UI.Skin(wordmark, function(self) self:SetTextColor(UI.Color("accent")) end)
 
     -- Close (far right). ROUND-19b (owner: "update the 'x' button to be the same style as
     -- the others"): the TEXT "X" becomes a 22x22 white-mask icon button skinned exactly
