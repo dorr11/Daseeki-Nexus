@@ -1,5 +1,24 @@
 # Changelog
 
+## Unreleased
+
+- **Fixed:** Nexus threw a stream of "AddOn 'Daseeki-Nexus' tried to call the protected
+  function 'SetEveryoneIsAssistant()'" errors while you were raiding in *someone else's*
+  raid. Two things were wrong and both are fixed. First, "Auto-promote assistant" tried to
+  flip the raid's All Assist switch — that switch is protected, meaning Blizzard reserves
+  it for you personally and no addon has ever been allowed to touch it, so the attempt
+  could only ever fail. Second, Nexus was running its group-assembly routine on *every*
+  roster change in *any* group, including raids it had nothing to do with.
+- **Changed:** the "Auto-promote assistant" option is now **"Remind me to set All Assist"**.
+  Your existing setting carries over. When Nexus finishes assembling your own mesh raid and
+  All Assist is still off, it prints one line reminding you to tick it in the raid menu —
+  the one thing an addon is actually permitted to do here.
+- **Changed:** invite-and-convert now only acts on a group *you* asked Nexus to build. The
+  automatic raid convert runs only when all of the following hold: you started the invite
+  from the minimap button, the dashboard, or `/nexus invite` within the last minute; you are
+  the group leader; and the people in the group are your own mesh characters. Joining or
+  leading anyone else's group is completely inert — Nexus does not even look at the roster.
+
 ## 1.0.1 — 2026-08-04
 
 - **Fixed:** cross-account item counts stopped updating after the Daseeki Bags 2.0

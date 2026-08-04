@@ -2,7 +2,7 @@
 -- Wave N4a: AUTOMATIONS (engine spec §5 + §7).
 --
 -- No-click automation: invite accept/send by trust category, mass alt
--- invite, raid-convert + assist-all, summon acceptance with the fresh-buff
+-- invite, raid-convert, summon acceptance with the fresh-buff
 -- gate, gossip (DMT / BWL / Sayge), quest turn-ins (E'ko / ZG coins / zanza
 -- / R.O.I.D.S.) and auto-repair. Every subsystem is gated on the per-faction
 -- settings block owned by store.lua.
@@ -11,9 +11,14 @@
 -- addon from a functional spec only. No third-party code or identifiers.
 --
 -- API discipline (target Interface 11509 only, every call catalog-verified):
---   * Group:   C_PartyInfo.InviteUnit / .SetEveryoneIsAssistant  (C_ members)
+--   * Group:   C_PartyInfo.InviteUnit                             (C_ member)
 --              ConvertToRaid / AcceptGroup / LeaveParty           (GLOBALS —
 --              NOT C_PartyInfo members in the 1.15.9 catalog).
+--              READ-ONLY group state: GetNumGroupMembers, IsInRaid,
+--              UnitIsGroupLeader, UnitName, IsEveryoneAssistant.
+--              NO PROTECTED group API is called from this file — see the
+--              "Mesh-assembly gate" block for why, and harness.lua's
+--              "protected-API gate" for the rule that keeps it that way.
 --   * Summon:  C_SummonInfo.ConfirmSummon / .CancelSummon /
 --              .GetSummonReason ; UnitOnTaxi ; InCombatLockdown.
 --   * Gossip:  C_GossipInfo.GetOptions / .SelectOption / .CloseGossip.
@@ -261,13 +266,167 @@ function Auto.OnWhisper(text, playerName)
     end
 end
 
+----------------------------------------------------------------------
+-- MESH-ASSEMBLY GATE  (1.0.2 — fixes the live 1.0.1 raid defect)
+--
+-- 1.0.1 wired GROUP_ROSTER_UPDATE straight into the convert+assist pass, so
+-- every roster tick of ANY group the player happened to be in ran it. In a
+-- 40-man raid the owner had merely JOINED, that fired the all-assist step over
+-- and over and the client answered:
+--
+--     [ADDON_ACTION_BLOCKED] AddOn 'Daseeki-Nexus' tried to call the
+--     protected function 'SetEveryoneIsAssistant()'.
+--
+-- Two independent defects, fixed together.
+--
+-- (1) PROTECTED CALL. SetEveryoneIsAssistant is protected on 1.15.9 — the block
+--     is the proof. pcall / ns:SafeCall CANNOT launder a protected call:
+--     ADDON_ACTION_BLOCKED is a client refusal, not a Lua error, so the pcall
+--     returns "success" while nothing happened and the attempt spreads taint.
+--     The API catalog records existence + signatures only and carries no
+--     protection flags, so there is no VERIFIED-unprotected per-member
+--     substitute to swap in either (PromoteToAssistant et al. exist, but their
+--     protection status is unverified — shipping an unverified alternative
+--     would just move the same block one function along). The step is therefore
+--     deleted outright: no protected group API is called from this addon at
+--     all, and the autoAssistAll toggle now prints a one-time hint instead.
+--     harness.lua's "protected-API gate" fails the build if the name ever
+--     reappears in call form anywhere in the .toc.
+--
+-- (2) CONTEXT MISFIRE. The pass now hard-gates on ALL THREE of:
+--       * ARMED — our own InviteOnline flow started an assembly this session
+--                 and the window has not expired (self-clearing, so a stale
+--                 flag can never adopt a later unrelated group),
+--       * LEADER — UnitIsGroupLeader("player"),
+--       * OURS  — the other members are (mostly) mesh-owned characters.
+--     In somebody else's raid nothing is armed, so the handler returns on its
+--     first line: zero group API touched, zero attempts, zero events acted on.
+----------------------------------------------------------------------
+
+-- How long an armed assembly stays live. Invites trickle in over several
+-- seconds; a minute is generous, and expiry is checked lazily so no timer is
+-- needed to take the flag back down.
+Auto.ASSEMBLY_WINDOW = 60
+
+-- At least this share of the OTHER group members must be mesh-owned before we
+-- accept the group as one of ours.
+Auto.ASSEMBLY_MESH_SHARE = 0.5
+
+Auto._assemblyUntil   = nil     -- GetTime() deadline; nil = not armed
+Auto._assistHintShown = false   -- one hint per armed episode
+
+local function nowSecs()
+    return (GetTime and GetTime()) or 0
+end
+
+-- Arm the assembly window. ONLY Auto.InviteOnline calls this — it is the single
+-- point at which the player says "build my group", and nothing else in the
+-- addon may open the gate.
+function Auto.ArmAssembly()
+    Auto._assemblyUntil   = nowSecs() + Auto.ASSEMBLY_WINDOW
+    Auto._assistHintShown = false
+end
+
+function Auto.DisarmAssembly()
+    Auto._assemblyUntil = nil
+end
+
+-- Armed AND unexpired. Expiry self-clears on read. `t` is injectable so the
+-- self-tests can drive the window without a clock.
+function Auto.IsAssemblyArmed(t)
+    if not Auto._assemblyUntil then return false end
+    t = t or nowSecs()
+    if t > Auto._assemblyUntil then
+        Auto._assemblyUntil = nil
+        return false
+    end
+    return true
+end
+
+-- Canonical Name-Realm of every OTHER group member. Raid tokens in a raid,
+-- party tokens otherwise (party1..N-1 excludes the player; raid1..N does not,
+-- so our own name is filtered out either way). READ-ONLY API throughout.
+function Auto.GroupMemberNames()
+    local out = {}
+    local n = (GetNumGroupMembers and GetNumGroupMembers()) or 0
+    if n <= 1 then return out end
+    local raid = (IsInRaid and IsInRaid()) and true or false
+    local me = selfNameRealm()
+    local last = raid and n or (n - 1)
+    for i = 1, last do
+        local unit = (raid and "raid" or "party") .. i
+        local nm, rlm = UnitName and UnitName(unit)
+        if nm and nm ~= "" then
+            local full = (rlm and rlm ~= "") and (nm .. "-" .. rlm)
+                          or Auto.NormalizeName(nm)
+            if full ~= me then out[#out + 1] = full end
+        end
+    end
+    return out
+end
+
+-- Share of `names` the mesh owns. Pure over (names, isRoster) so the self-test
+-- drives it with a fake predicate. Returns (share 0..1, owned, total).
+function Auto.MeshShare(names, isRoster)
+    local total = names and #names or 0
+    if total == 0 then return 0, 0, 0 end
+    local owned = 0
+    for i = 1, total do
+        if isRoster(names[i]) then owned = owned + 1 end
+    end
+    return owned / total, owned, total
+end
+
+-- Pure gate decision. ctx:
+--   armed     -- our InviteOnline flow armed this session, window still open
+--   inGroup   -- GetNumGroupMembers() > 1
+--   isLeader  -- UnitIsGroupLeader("player")
+--   meshOwned -- count of OTHER members the mesh owns
+--   meshShare -- that count as a share of the other members (0..1)
+-- Returns (ok:boolean, reason:string). Every rejection has its own reason so a
+-- failing self-test names the gate that fired.
+function Auto.DecideAssembly(ctx)
+    if not ctx.armed    then return false, "not-armed"       end
+    if not ctx.inGroup  then return false, "no-group"        end
+    if not ctx.isLeader then return false, "not-leader"      end
+    if (ctx.meshOwned or 0) < 1 then return false, "no-mesh-members" end
+    if (ctx.meshShare or 0) < Auto.ASSEMBLY_MESH_SHARE then
+        return false, "foreign-group"
+    end
+    return true, "ours"
+end
+
+-- Live wrapper. Reads the ARMED flag first and bails before touching any group
+-- API — that first line is what makes an external raid completely inert.
+function Auto.MayAssemble()
+    if not Auto.IsAssemblyArmed() then return false, "not-armed" end
+    local names = Auto.GroupMemberNames()
+    local share, owned = Auto.MeshShare(names, Auto.IsRoster)
+    return Auto.DecideAssembly({
+        armed     = true,
+        inGroup   = ((GetNumGroupMembers and GetNumGroupMembers()) or 0) > 1,
+        isLeader  = (UnitIsGroupLeader and UnitIsGroupLeader("player")) and true or false,
+        meshOwned = owned,
+        meshShare = share,
+    })
+end
+
+----------------------------------------------------------------------
+-- Invite automation, continued
+----------------------------------------------------------------------
+
 -- Mass-invite every online mesh character. Source of truth is the mesh peer
 -- table: each online peer's `name` is that account's currently-logged-in
--- character. After the invites settle, auto-convert + assist (unless the caller
--- opts out or the global toggles are off).
+-- character. Unless the caller opts out, this ARMS the assembly window (see the
+-- gate block above) and schedules the convert pass once the invites settle.
 --
--- Public surface: dashboard "Invite Online" button and /dsn invite call this.
+-- Public surface: minimap left-click, dashboard "Invite Online", /dsn invite.
 function Auto.InviteOnline(skipConvert)
+    -- Arm BEFORE the invites go out: the roster updates they provoke arrive
+    -- while the invites are still landing, and those are exactly the ticks the
+    -- convert pass needs to see.
+    if not skipConvert then Auto.ArmAssembly() end
+
     local invited = 0
     local me = selfNameRealm()
     local peers = ns.Mesh and ns.Mesh.peers or nil
@@ -295,21 +454,51 @@ function Auto.InviteOnline(skipConvert)
     return invited
 end
 
--- Convert the party to a raid + set everyone assistant, each gated on its
--- global toggle. Idempotent: safe to call repeatedly as members trickle in.
+-- All-Assist is a PROTECTED switch: Blizzard reserves it for the player, from
+-- the raid menu. The most an addon may legally do is say so — once, and only
+-- while WE are the ones assembling the group (callers reach here through the
+-- assembly gate). Nothing here calls a protected function.
+function Auto.MaybeAssistHint(db)
+    db = db or globalToggles()
+    if not db.autoAssistAll then return false end
+    if Auto._assistHintShown then return false end
+    if not (IsInRaid and IsInRaid()) then return false end
+    if IsEveryoneAssistant and IsEveryoneAssistant() then return false end
+    Auto._assistHintShown = true
+    ns:Print("raid is up — tick |cffffd200All Assist|r in the raid menu. "
+          .. "That switch is protected: only you can flip it, no addon may.")
+    return true
+end
+
+-- Convert the party to a raid, gated on its global toggle AND on the whole
+-- mesh-assembly gate. Idempotent: safe to call repeatedly as members trickle
+-- in. Returns the gate reason so the self-tests can assert WHY it did nothing.
 function Auto.MaybeConvertRaid()
+    local ok, reason = Auto.MayAssemble()
+    if not ok then return false, reason end
+
     local db = globalToggles()
     if db.autoConvertToRaid
        and not (IsInRaid and IsInRaid())
        and GetNumGroupMembers and GetNumGroupMembers() > 1 then
         if ConvertToRaid then ConvertToRaid() end   -- GLOBAL (see header note)
     end
-    if db.autoAssistAll and C_PartyInfo and C_PartyInfo.SetEveryoneIsAssistant then
-        -- Only meaningful once we are actually in a raid.
-        if IsInRaid and IsInRaid() then
-            C_PartyInfo.SetEveryoneIsAssistant(true)
-        end
-    end
+
+    Auto.MaybeAssistHint(db)
+
+    -- Once the raid exists the assembly is finished — everything still
+    -- outstanding (All Assist) belongs to the player — so drop the flag
+    -- immediately rather than leaving it live for the rest of the window.
+    if IsInRaid and IsInRaid() then Auto.DisarmAssembly() end
+    return true, reason
+end
+
+-- GROUP_ROSTER_UPDATE entry point. The armed check is deliberately the FIRST
+-- statement: in somebody else's group (the overwhelmingly common case) this
+-- returns having read one addon-local field and nothing else.
+function Auto.OnRosterUpdate()
+    if not Auto.IsAssemblyArmed() then return false end
+    return (Auto.MaybeConvertRaid())
 end
 
 ----------------------------------------------------------------------
@@ -737,8 +926,11 @@ function Auto.OnLogin()
     ns:RegisterEvent("CHAT_MSG_WHISPER", function(_, text, playerName)
         ns:SafeCall(Auto.OnWhisper, text, playerName)
     end)
+    -- Roster ticks are acted on ONLY inside an armed mesh assembly of our own
+    -- (see the gate block): joining someone else's raid must be completely
+    -- inert. Auto.OnRosterUpdate owns that check.
     ns:RegisterEvent("GROUP_ROSTER_UPDATE", function()
-        ns:SafeCall(Auto.MaybeConvertRaid)
+        ns:SafeCall(Auto.OnRosterUpdate)
     end)
 
     ns:RegisterEvent("CONFIRM_SUMMON", function()
@@ -843,6 +1035,99 @@ local function testTrustTruthTable()
     return true
 end
 
+-- The mesh-assembly gate (1.0.2 defect fix). Pure layer only; harness.lua's
+-- "assembly-gate live-path" section drives the real event entry point against
+-- stubbed group API for the end-to-end scenarios.
+local function testAssemblyGate()
+    local S = Auto.ASSEMBLY_MESH_SHARE
+
+    -- The live defect: not armed (we merely JOINED a raid) -> refuse first,
+    -- before leader or membership is even consulted.
+    local ok, why = Auto.DecideAssembly({
+        armed = false, inGroup = true, isLeader = true,
+        meshOwned = 39, meshShare = 1,
+    })
+    if ok or why ~= "not-armed" then return false, "unarmed group must be refused" end
+
+    -- Armed but a member, not the leader -> refuse.
+    ok, why = Auto.DecideAssembly({
+        armed = true, inGroup = true, isLeader = false,
+        meshOwned = 3, meshShare = 1,
+    })
+    if ok or why ~= "not-leader" then return false, "non-leader must be refused" end
+
+    -- Armed + leader but the group is strangers -> refuse.
+    ok, why = Auto.DecideAssembly({
+        armed = true, inGroup = true, isLeader = true,
+        meshOwned = 1, meshShare = 0.1,
+    })
+    if ok or why ~= "foreign-group" then return false, "foreign group must be refused" end
+
+    -- Armed + leader but not a single mesh character present -> refuse.
+    ok, why = Auto.DecideAssembly({
+        armed = true, inGroup = true, isLeader = true,
+        meshOwned = 0, meshShare = 0,
+    })
+    if ok or why ~= "no-mesh-members" then return false, "mesh-free group must be refused" end
+
+    -- Armed + leader but still solo -> refuse (nothing to convert yet).
+    ok, why = Auto.DecideAssembly({
+        armed = true, inGroup = false, isLeader = true,
+        meshOwned = 0, meshShare = 0,
+    })
+    if ok or why ~= "no-group" then return false, "solo must be refused" end
+
+    -- All three gates satisfied -> the allowed path runs.
+    ok, why = Auto.DecideAssembly({
+        armed = true, inGroup = true, isLeader = true,
+        meshOwned = 4, meshShare = 1,
+    })
+    if not (ok and why == "ours") then return false, "our own assembly must be allowed" end
+
+    -- Exactly at the share threshold is enough; a hair under is not.
+    ok = Auto.DecideAssembly({ armed = true, inGroup = true, isLeader = true,
+                               meshOwned = 2, meshShare = S })
+    if not ok then return false, "share exactly at threshold admits" end
+    ok = Auto.DecideAssembly({ armed = true, inGroup = true, isLeader = true,
+                               meshOwned = 2, meshShare = S - 0.01 })
+    if ok then return false, "share below threshold refuses" end
+
+    -- MeshShare arithmetic over an injected predicate.
+    local mesh = { ["A-R"] = true, ["B-R"] = true }
+    local pred = function(n) return mesh[n] == true end
+    local share, owned, total = Auto.MeshShare({ "A-R", "B-R", "Pug-R", "Pug2-R" }, pred)
+    if not (owned == 2 and total == 4 and share == 0.5) then
+        return false, "MeshShare counts"
+    end
+    share, owned, total = Auto.MeshShare({}, pred)
+    if not (share == 0 and owned == 0 and total == 0) then
+        return false, "MeshShare on an empty group"
+    end
+    return true
+end
+
+-- Arming lifecycle: only InviteOnline opens the window, it self-clears on
+-- expiry, and DisarmAssembly shuts it immediately.
+local function testAssemblyArming()
+    local saved = Auto._assemblyUntil
+    Auto.DisarmAssembly()
+    if Auto.IsAssemblyArmed(0) then return false, "starts disarmed" end
+
+    Auto._assemblyUntil = 100
+    if not Auto.IsAssemblyArmed(50) then return false, "armed inside the window" end
+    if not Auto.IsAssemblyArmed(100) then return false, "armed at the deadline" end
+    if Auto.IsAssemblyArmed(101) then return false, "expired past the deadline" end
+    -- ... and the expired read must have CLEARED the flag, not just answered no.
+    if Auto._assemblyUntil ~= nil then return false, "expiry self-clears the flag" end
+
+    Auto._assemblyUntil = 100
+    Auto.DisarmAssembly()
+    if Auto.IsAssemblyArmed(50) then return false, "disarm takes effect immediately" end
+
+    Auto._assemblyUntil = saved
+    return true
+end
+
 local function testSummonMatrix()
     local W = 19
     -- disabled -> never.
@@ -922,6 +1207,8 @@ end
 function Auto.RunSelfTests(verbose)
     local suite = {
         { name = "trust truth table",   fn = testTrustTruthTable },
+        { name = "assembly gate",       fn = testAssemblyGate },
+        { name = "assembly arming",     fn = testAssemblyArming },
         { name = "summon gate matrix",  fn = testSummonMatrix },
         { name = "keyword matcher",     fn = testKeywordMatcher },
         { name = "roster membership",   fn = testRosterMembership },

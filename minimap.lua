@@ -33,9 +33,11 @@
 -- "left-click the ball, everyone gets invited". This is an OWNER OVERRIDE of
 -- BRAND_SPEC §8's "mass-invite is NEVER an unmodified single click" law, scoped
 -- to this button only; see the dated amendment in BRAND_SPEC.md §8):
---   Left            invite all online mesh characters, then raid-convert +
---                   assist-all per the global toggles (ns.Auto.InviteOnline())
---   Shift+Left      invite WITHOUT raid convert / assist-all
+--   Left            invite all online mesh characters, then raid-convert per the
+--                   global toggles (ns.Auto.InviteOnline()). This click is also
+--                   what ARMS the mesh-assembly gate — see auto.lua's gate block;
+--                   nothing else in the addon may act on a roster change.
+--   Shift+Left      invite WITHOUT raid convert (and without arming)
 --                   (ns.Auto.InviteOnline(true) — same semantic as
 --                    /nexus invite noconvert)
 --   Right           toggle dashboard
@@ -185,8 +187,9 @@ end
 -- Soft-guarded actions (parallel agents own ns.Auto / ns.UI)
 ----------------------------------------------------------------------
 
--- skipConvert=true suppresses the post-invite raid convert + assist-all pass
--- (auto.lua honours it exactly as /nexus invite noconvert does).
+-- skipConvert=true suppresses the post-invite raid convert pass AND leaves the
+-- mesh-assembly gate disarmed (auto.lua honours it exactly as
+-- /nexus invite noconvert does).
 local function inviteAll(skipConvert)
     -- Real engine entry point is ns.Auto.InviteOnline(skipConvert) (auto.lua).
     if ns.Auto and ns.Auto.InviteOnline then

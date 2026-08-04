@@ -693,8 +693,12 @@ local function buildGeneral(flow)
         get = function() local db = DB(); return db and db.autoConvertToRaid end,
         set = function(v) local db = DB(); if db then db.autoConvertToRaid = v and true or false end end,
     }).Refresh)
+    -- 1.0.2: this used to CALL SetEveryoneIsAssistant, which is a protected
+    -- function — the client blocked it and no addon can ever do it. The stored
+    -- key is unchanged (SavedVariables compatibility); what it now buys you is a
+    -- one-line reminder when Nexus finishes assembling YOUR raid.
     register("general", r2:Checkbox({
-        label = "Auto-promote assistant",
+        label = "Remind me to set All Assist",
         get = function() local db = DB(); return db and db.autoAssistAll end,
         set = function(v) local db = DB(); if db then db.autoAssistAll = v and true or false end end,
     }).Refresh)
