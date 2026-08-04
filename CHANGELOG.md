@@ -2,8 +2,19 @@
 
 ## Unreleased
 
-- **Fixed:** the NEXUS wordmark in the dashboard titlebar kept the old theme's colour
-  after switching themes; it now re-tints live like the rest of the window.
+- **Fixed:** cross-account item counts stopped updating after the Daseeki Bags 2.0
+  upgrade — an alt's bags would show whatever they held at the moment you upgraded, and
+  never change again. Nexus decides whether Bags is already publishing your inventory
+  before it starts publishing itself, and that check was reading the *addon folder name*.
+  Bags 2.0 keeps the same folder name as 1.x, so every account read as "Bags is already
+  publishing" and nobody published anything. Nexus now looks for the Bags 1.x publisher
+  itself, which 2.0 does not ship.
+- **Fixed:** accounts already stuck by the above repair themselves. The first time each
+  account logs in after this update, Nexus notices it was wrongly held back, resumes
+  publishing, and says so once in chat. Counts for each character refresh the next time
+  you play it — one login per account is enough.
+- **Changed:** `/nexus inventory` now also reports which publisher (if any) was detected
+  and whether this account has been repaired, for diagnosing sync problems.
 
 ## 1.0.0 — 2026-08-03
 

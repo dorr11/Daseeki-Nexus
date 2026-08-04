@@ -31,10 +31,20 @@
 --             ignores anything it does not know, so the addition is inert there.
 --
 --   COEXIST   Two local publishers on one namespace would fight over one owner
---             key. If Daseeki-Bags is loaded AND still carries its SyncBridge
---             publisher module, this account goes CONSUME-ONLY: we import and
---             store, we do not capture and do not publish. Bags owns the wire;
---             we own the graph. Decided once, at login. See EvaluateMode.
+--             key. If a LIVE Daseeki-Bags 1.x PUBLISHER MODULE is present, this
+--             account goes CONSUME-ONLY: we import and store, we do not capture
+--             and do not publish. Bags owns the wire; we own the graph. Decided
+--             once, at login. See EvaluateMode.
+--
+--             THE PROBE TESTS FOR A PUBLISHER, NEVER FOR THE FOLDER. Bags 2.0
+--             ships under the SAME folder name (Daseeki-Bags) as 1.x — that was
+--             a deliberate identity decision at the cutover — so
+--             IsAddOnLoaded("Daseeki-Bags") is true on a 2.0 install that has no
+--             publisher at all. Generation 1 of this probe treated "loaded but
+--             its table is unreadable" as "a publisher is present", and 2.0
+--             creates no addon-table global whatsoever: every account went
+--             consume-only, nobody published, and every peer's counts froze at
+--             the cutover. See PROBE_GEN and NeedsPublishHeal.
 --
 -- MAIL SUMMARY: mail *attachments* are folded into itemCounts exactly as 1.x
 -- does (its BuildSelfSnapshot aggregates player.mail into the same map), so the
@@ -69,8 +79,37 @@ Inventory.NS_KEY = NS_KEY
 -- table at _G[<folder name>], and NewModule stores each module at
 -- Addon.<ModuleName> — that is what makes _G["Daseeki-Bags"].SyncBridge a
 -- reliable, guarded probe rather than a guess.
+--
+-- IT IS NOT AN IDENTITY TEST. The folder name survived the 1.x -> 2.0 cutover
+-- unchanged, so it says nothing about whether a publisher exists; only the
+-- module names below do. This constant exists to reach the WildAddon global and
+-- to fill the diagnostic line, and for nothing else.
 local BAGS_ADDON = "Daseeki-Bags"
 Inventory.BAGS_ADDON = BAGS_ADDON
+
+-- The 1.x publisher modules, and the whole of the evidence the mode decision is
+-- allowed to rest on. Every one of these was created by `Addon:NewModule(...)`
+-- in the tree Bags deleted at the 2.0 cutover (commit "THE CUTOVER"):
+--   SyncBridge     — the `bags` namespace publisher (the N5 cutover module)
+--   MeshInventory  \
+--   MeshSync        > its predecessor, Bags' bespoke DBAG mesh
+--   MeshTransport  /
+-- Bags 2.0 is not a WildAddon addon and publishes NO addon-table global, so a
+-- 2.0 install matches none of them. A 1.x install matches at least one from the
+-- moment WildAddon builds the addon table, before any of them decides whether
+-- it is "active" — which is the point: an inactive SyncBridge means Bags fell
+-- back to its own DBAG mesh and is still the account's publisher.
+local LEGACY_PUBLISHERS = { "SyncBridge", "MeshInventory", "MeshSync", "MeshTransport" }
+Inventory.LEGACY_PUBLISHERS = LEGACY_PUBLISHERS
+
+-- Generation of the coexistence probe that last wrote this save, persisted on
+-- the inventory area. Bumped whenever the probe's SEMANTICS change, so a save
+-- written by an older generation is recognisable and can be healed.
+--   gen 1  the pre-cutover probe: "the Daseeki-Bags FOLDER is loaded" counted as
+--          "a publisher is present", which is exactly what Bags 2.0 satisfies.
+--   gen 2  publisher-module evidence only.
+local PROBE_GEN = 2
+Inventory.PROBE_GEN = PROBE_GEN
 
 local PUBLISH_DEBOUNCE  = 3     -- coalesce rapid local edits before publishing
 local INITIAL_PUBLISH   = 6     -- seconds after activation: first capture+publish
@@ -89,6 +128,7 @@ local EMPTY = {}
 Inventory._mode        = nil     -- "publish" | "consume" (sticky per session)
 Inventory._modeReason  = nil
 Inventory._activated   = false
+Inventory._healed      = false   -- this session unlatched a gen-1 consume-only save
 Inventory._dirtyTimer  = nil
 Inventory._ticker      = nil
 Inventory._bankOpen    = false
@@ -499,46 +539,59 @@ end
 -- COEXISTENCE
 ----------------------------------------------------------------------
 
+-- PURE. Returns the name of the live 1.x publisher module hanging off a Bags
+-- addon table, or nil. Guarded with rawget so a metatable cannot invent one.
+function Inventory.LegacyPublisherIn(bagsTable)
+    if type(bagsTable) ~= "table" then return nil end
+    for i = 1, #LEGACY_PUBLISHERS do
+        local name = LEGACY_PUBLISHERS[i]
+        if type(rawget(bagsTable, name)) == "table" then return name end
+    end
+    return nil
+end
+
 -- PURE. probe = {
---   bagsLoaded = bool,          -- C_AddOns.IsAddOnLoaded("Daseeki-Bags")
---   bagsTable  = table|nil,     -- _G["Daseeki-Bags"] (WildAddon publishes it there)
+--   bagsLoaded = bool,          -- C_AddOns.IsAddOnLoaded("Daseeki-Bags") — DIAGNOSTIC ONLY
+--   bagsTable  = table|nil,     -- _G["Daseeki-Bags"] (WildAddon 1.x publishes it there)
 --   nsProvider = bool,          -- a `bags` PROVIDER is registered that is not ours
 -- }
 -- Returns mode ("consume"|"publish"), reason.
 --
--- The decisive marker is the PRESENCE of Bags' SyncBridge module, not whether it
+-- ONLY POSITIVE EVIDENCE OF A LIVE PUBLISHER YIELDS CONSUME-ONLY, and there are
+-- exactly two kinds of it:
+--   1. somebody else has already registered a `bags` PROVIDER with Daseeki.Sync
+--      — whoever that is, they own the wire, and it is not us;
+--   2. the 1.x addon table carries one of LEGACY_PUBLISHERS.
+-- Anything else publishes. `bagsLoaded` DELIBERATELY DOES NOT PARTICIPATE: the
+-- folder name is shared by 1.x and 2.0, so it carries no information about a
+-- publisher, and gen 1's "loaded but its table is unreadable => assume it
+-- publishes" was not a conservative default but a permanent false positive
+-- against every Bags 2.0 install.
+--
+-- The decisive marker is the PRESENCE of a publisher module, not whether it
 -- reports itself active. An inactive SyncBridge means Bags fell back to its own
 -- legacy DBAG mesh — it is still the account's inventory publisher, and Bags
--- 2.0 retires the module outright, which is precisely when we take over. Testing
--- `active` instead would hand us the wire while Bags is still on it.
---
--- AMBIGUITY RESOLVES TO CONSUME-ONLY. The two failure directions are not
--- symmetric: wrongly consuming costs this account nothing (Bags is publishing
--- our character anyway and we still store everything), while wrongly publishing
--- puts two local writers on one owner key and makes each other's revisions
--- stale. So "the addon is loaded but we cannot read its table" is treated as a
--- publisher being present, not absent.
+-- 2.0 retires all four modules outright, which is precisely when we take over.
+-- Testing `active` instead would hand us the wire while Bags is still on it.
 function Inventory.EvaluateMode(probe)
     probe = probe or {}
     if probe.nsProvider then
         return "consume", "a `bags` provider is already registered locally"
     end
-    local B = probe.bagsTable
-    if type(B) == "table" then
-        local SB = rawget(B, "SyncBridge")
-        if type(SB) == "table" then
-            if SB.active == true then
-                return "consume", "Daseeki-Bags SyncBridge is publishing"
-            end
-            return "consume", "Daseeki-Bags carries its SyncBridge publisher"
+    local publisher = Inventory.LegacyPublisherIn(probe.bagsTable)
+    if publisher then
+        local SB = rawget(probe.bagsTable, publisher)
+        if SB.active == true then
+            return "consume", "Daseeki-Bags 1.x " .. publisher .. " is publishing"
         end
-        -- The addon table is readable and holds no publisher module: Bags 2.0
-        -- has retired it, so the wire is ours.
-        return "publish", "Daseeki-Bags is loaded but has no publisher module"
+        return "consume", "Daseeki-Bags 1.x carries its " .. publisher .. " publisher"
+    end
+    if type(probe.bagsTable) == "table" then
+        return "publish", "Daseeki-Bags is loaded and carries no 1.x publisher module"
     end
     if probe.bagsLoaded then
-        -- Loaded, but its table is unreadable — assume it publishes.
-        return "consume", "Daseeki-Bags is loaded but could not be inspected"
+        -- Bags 2.0: same folder, no WildAddon addon-table global, no publisher.
+        return "publish", "Daseeki-Bags 2.0 is loaded and publishes nothing"
     end
     return "publish", "no local inventory publisher"
 end
@@ -579,6 +632,49 @@ end
 
 function Inventory.IsConsumeOnly() return Inventory._mode == "consume" end
 function Inventory.Mode()          return Inventory._mode, Inventory._modeReason end
+
+----------------------------------------------------------------------
+-- SELF-HEAL: the gen-1 consume-only latch
+--
+-- The house pattern (Conduit's migrate.lua, tracker's ledger repair): name an
+-- IMPOSSIBLE state, detect it from the save, fix it once behind a marker, say
+-- one line about it.
+--
+-- The impossible state here: this account is publishing (gen 2 found no 1.x
+-- publisher) and yet its save was last written by gen 1, which — on a Bags 2.0
+-- install, i.e. every install — could only ever have decided consume-only. So
+-- this character captured nothing and published nothing for the whole gen-1
+-- era, and every peer's copy of it is frozen at the last 1.x publish.
+--
+-- DETECTED FROM THE SAVE, NOT FROM A SESSION FLAG: gen 1 persisted no mode at
+-- all, so there is no latch to read. `probeGen` is the marker, and its ABSENCE
+-- is the signal. The third condition — a self record already in the owners
+-- graph — is what keeps a genuinely new account quiet: a first-ever login has
+-- no record under its own key yet, so it stamps the marker and says nothing.
+--
+-- Idempotent by construction: the heal stamps probeGen, and every later login
+-- reads it back equal and returns false. Stamping happens on EVERY activation,
+-- healed or not, so a fresh save can never drift into a late false heal.
+----------------------------------------------------------------------
+
+-- PURE.
+function Inventory.NeedsPublishHeal(area, mode, selfKey)
+    if mode ~= "publish" then return false end
+    if type(area) ~= "table" then return false end
+    if tonumber(area.probeGen) == PROBE_GEN then return false end
+    if type(selfKey) ~= "string" or selfKey == "" then return false end
+    local owners = area.owners
+    if type(owners) ~= "table" then return false end
+    return owners[selfKey] ~= nil
+end
+
+-- Stamp the marker. Returns true when it actually changed.
+function Inventory.StampProbeGen(area)
+    if type(area) ~= "table" then return false end
+    if tonumber(area.probeGen) == PROBE_GEN then return false end
+    area.probeGen = PROBE_GEN
+    return true
+end
 
 ----------------------------------------------------------------------
 -- PROJECTION: namespace store -> owners graph
@@ -908,6 +1004,13 @@ function Inventory.Activate()
     local mode, reason = Inventory.EvaluateMode(Inventory.ProbeEnvironment())
     Inventory._mode, Inventory._modeReason = mode, reason
 
+    -- Read the heal BEFORE anything writes to the area, then stamp the marker
+    -- unconditionally so the question is asked exactly once per save.
+    local S = ns.Store
+    local area = S and S.InventoryArea and S.InventoryArea()
+    Inventory._healed = Inventory.NeedsPublishHeal(area, mode, Inventory.SelfKey())
+    Inventory.StampProbeGen(area)
+
     -- First-enable import, in BOTH modes: the graph is ours either way.
     Inventory.MigrateFromBags()
 
@@ -924,6 +1027,12 @@ function Inventory.Activate()
                 Inventory.Publish()
             end
         end)
+    end
+
+    if Inventory._healed and ns.Print then
+        ns:Print("inventory: cross-account publishing was stuck off after the Bags 2.0"
+              .. " upgrade -- resuming. Each character's counts refresh the next time"
+              .. " you play it.")
     end
 end
 
@@ -1048,6 +1157,12 @@ ns:RegisterDebugCommand("inventory", function()
     ns:Print(string.format("  migrated=%s activated=%s ticker=%s",
         tostring(area and area.migrated), tostring(Inventory._activated),
         Inventory._ticker and "running" or "stopped"))
+    local probe = Inventory.ProbeEnvironment()
+    ns:Print(string.format("  probeGen=%s (current %d) | bagsLoaded=%s 1.x publisher=%s"
+        .. " foreign provider=%s | healed=%s",
+        tostring(area and area.probeGen), PROBE_GEN, tostring(probe.bagsLoaded),
+        tostring(Inventory.LegacyPublisherIn(probe.bagsTable) or "none"),
+        tostring(probe.nsProvider), tostring(Inventory._healed)))
 end)
 
 ----------------------------------------------------------------------
@@ -1184,10 +1299,103 @@ local function selfTest(verbose)
 
     ------------------------------------------------------------------
     -- 3) COEXISTENCE MATRIX
+    --
+    -- The load-bearing case is 3a: the world as Bags 2.0 actually shapes it.
+    -- Gen 1 of this probe read that world as "a publisher is present" and put
+    -- every account on the suite consume-only, so nobody published and every
+    -- peer's item counts froze at the cutover. It is asserted first and from
+    -- both directions (mode AND the fact that a publish actually happens).
     ------------------------------------------------------------------
-    local m, why = Inventory.EvaluateMode({ bagsLoaded = false })
-    ck("no Bags -> publish", m == "publish")
-    ck("no Bags -> reason given", type(why) == "string" and why ~= "")
+    local m, why
+
+    -- 3a) THE 2.0-SHAPED WORLD: the folder is loaded (same folder name as 1.x),
+    --     and there is no addon-table global at all because 2.0 is not a
+    --     WildAddon addon. This MUST publish.
+    m, why = Inventory.EvaluateMode({ bagsLoaded = true, bagsTable = nil })
+    ck("Bags 2.0 shape (folder loaded, no publisher global) -> PUBLISH", m == "publish")
+    ck("Bags 2.0 shape -> reason names 2.0, not ambiguity",
+        type(why) == "string" and why ~= "" and why:find("2.0", 1, true) ~= nil)
+
+    -- ...and it is not merely a label. THE FULL BROKEN LINK, end to end, in the
+    -- world Bags 2.0 actually presents: a live bag scan picks an item up,
+    -- capture folds it into the payload, the payload reaches the wire under our
+    -- own key, and projecting the wire lands it in the owners graph — which is
+    -- the exact chain that produces a peer's tooltip line. The item id is one
+    -- the fixture has never seen before, so nothing here can pass on stale data.
+    do
+        local NEWITEM = 13442      -- Mighty Rage Potion
+        local savedM   = Inventory._mode
+        local savedNSS = (_G.Daseeki and _G.Daseeki.Sync
+                          and _G.Daseeki.Sync._namespaces[NS_KEY]) or nil
+        local savedC   = _G.C_Container
+        local savedGIL = _G.GetInventoryItemLink
+
+        -- A carried backpack holding two stacks of the new item and nothing else.
+        _G.C_Container = {
+            GetContainerNumSlots  = function(bag) return bag == 0 and 4 or 0 end,
+            GetContainerItemID    = function(bag, slot)
+                if bag == 0 and (slot == 1 or slot == 2) then return NEWITEM end
+                return nil
+            end,
+            GetContainerItemInfo  = function(bag, slot)
+                if bag == 0 and slot == 1 then return { stackCount = 3 } end
+                if bag == 0 and slot == 2 then return { stackCount = 1 } end
+                return nil
+            end,
+        }
+        _G.GetInventoryItemLink = function() return nil end
+
+        Inventory._mode = Inventory.EvaluateMode({ bagsLoaded = true, bagsTable = nil })
+        Inventory._enteredWorldAt = nil
+        local selfKey = Inventory.SelfKey()
+        S.SyncNS()[NS_KEY][selfKey] = nil
+        area.owners[selfKey] = nil
+
+        local captured = Inventory.BuildPayload(1700005000)
+        ck("2.0-shaped world: capture sees the new item id",
+            type(captured) == "table" and type(captured.itemCounts) == "table"
+            and captured.itemCounts[NEWITEM] == 4)
+
+        ck("2.0-shaped world: the namespace registers", Inventory.RegisterNamespace() == true)
+        ck("2.0-shaped world: Publish() puts a payload on the wire",
+            Inventory.Publish() == true)
+
+        local wire = S.SyncNSGet(NS_KEY, selfKey)
+        ck("2.0-shaped world: the wire entry exists under our own key",
+            wire ~= nil and type(wire.data) == "table")
+        ck("2.0-shaped world: the wire payload carries the new item id",
+            wire ~= nil and type(wire.data.itemCounts) == "table"
+            and wire.data.itemCounts[NEWITEM] == 4)
+        ck("2.0-shaped world: the wire rev is a real revision",
+            wire ~= nil and tonumber(wire.rev) ~= nil and tonumber(wire.rev) > 0)
+
+        local mineNow = S.InventoryGet(selfKey)
+        ck("2.0-shaped world: the owners graph received the new item id",
+            mineNow ~= nil and type(mineNow.data) == "table"
+            and type(mineNow.data.itemCounts) == "table"
+            and mineNow.data.itemCounts[NEWITEM] == 4)
+
+        -- ...and the same account under a LIVE 1.x publisher stays off the wire.
+        S.SyncNS()[NS_KEY][selfKey] = nil
+        Inventory._mode = Inventory.EvaluateMode({ bagsLoaded = true,
+                                                   bagsTable = { SyncBridge = {} } })
+        ck("1.x publisher present: the same capture never reaches the wire",
+            Inventory.Publish() == false and S.SyncNSGet(NS_KEY, selfKey) == nil)
+
+        _G.C_Container, _G.GetInventoryItemLink = savedC, savedGIL
+        if _G.Daseeki and _G.Daseeki.Sync then
+            _G.Daseeki.Sync._namespaces[NS_KEY] = savedNSS
+        end
+        Inventory._mode = savedM
+    end
+
+    -- 3b) A synthetic LIVE 1.x publisher, one case per retired module name.
+    for _, modName in ipairs(Inventory.LEGACY_PUBLISHERS) do
+        m, why = Inventory.EvaluateMode({ bagsLoaded = true, bagsTable = { [modName] = {} } })
+        ck("1.x " .. modName .. " present -> consume-only", m == "consume")
+        ck("1.x " .. modName .. " -> reason names the module",
+            type(why) == "string" and why:find(modName, 1, true) ~= nil)
+    end
 
     m = Inventory.EvaluateMode({ bagsLoaded = true, bagsTable = { SyncBridge = { active = true } } })
     ck("Bags publisher ACTIVE -> consume-only", m == "consume")
@@ -1198,20 +1406,49 @@ local function selfTest(verbose)
     m = Inventory.EvaluateMode({ bagsLoaded = true, bagsTable = { SyncBridge = {} } })
     ck("Bags publisher present, state unknown -> consume-only", m == "consume")
 
-    m = Inventory.EvaluateMode({ bagsLoaded = true, bagsTable = { Owners = {} } })
-    ck("Bags 2.0 (publisher retired) -> we publish", m == "publish")
-
-    -- Ambiguity resolves to the safe direction.
-    m = Inventory.EvaluateMode({ bagsLoaded = true, bagsTable = nil })
-    ck("Bags loaded but its table is unreadable -> consume-only (safe default)", m == "consume")
-
     m = Inventory.EvaluateMode({ bagsLoaded = false, bagsTable = { SyncBridge = { active = true } } })
     ck("publisher table present even without the loaded flag -> consume-only", m == "consume")
 
+    -- 3c) A Bags addon table that carries NO publisher module is not a publisher,
+    --     whatever else it holds.
+    m = Inventory.EvaluateMode({ bagsLoaded = true, bagsTable = { Owners = {}, Frame = {} } })
+    ck("a Bags table with no publisher module -> we publish", m == "publish")
+    ck("LegacyPublisherIn finds nothing in a publisher-less table",
+        Inventory.LegacyPublisherIn({ Owners = {}, Frame = {} }) == nil)
+    ck("LegacyPublisherIn ignores a non-table module slot",
+        Inventory.LegacyPublisherIn({ SyncBridge = true }) == nil)
+    ck("LegacyPublisherIn survives a non-table argument",
+        Inventory.LegacyPublisherIn("Daseeki-Bags") == nil)
+    ck("LegacyPublisherIn names the module it found",
+        Inventory.LegacyPublisherIn({ MeshSync = {} }) == "MeshSync")
+
+    -- 3d) The FOLDER NAME MUST NOT DECIDE ANYTHING. Same table, both values of
+    --     bagsLoaded, same verdict — in both directions.
+    ck("bagsLoaded cannot turn a publisher-less world into consume-only",
+        Inventory.EvaluateMode({ bagsLoaded = true })
+        == Inventory.EvaluateMode({ bagsLoaded = false }))
+    ck("bagsLoaded cannot turn a live publisher into publish",
+        Inventory.EvaluateMode({ bagsLoaded = false, bagsTable = { SyncBridge = {} } })
+        == Inventory.EvaluateMode({ bagsLoaded = true, bagsTable = { SyncBridge = {} } }))
+
+    -- 3e) A foreign registered provider still wins: somebody else owns the wire.
     m = Inventory.EvaluateMode({ bagsLoaded = false, nsProvider = true })
     ck("a foreign `bags` provider -> consume-only regardless of Bags", m == "consume")
+    m = Inventory.EvaluateMode({ bagsLoaded = true, bagsTable = nil, nsProvider = true })
+    ck("a foreign provider outranks the 2.0 shape", m == "consume")
 
+    m, why = Inventory.EvaluateMode({ bagsLoaded = false })
+    ck("no Bags at all -> publish", m == "publish")
+    ck("no Bags -> reason given", type(why) == "string" and why ~= "")
     ck("EvaluateMode survives a nil probe", Inventory.EvaluateMode(nil) == "publish")
+
+    -- The live probe reports the shape it read without deciding on the folder.
+    do
+        local p = Inventory.ProbeEnvironment()
+        ck("ProbeEnvironment returns a probe table", type(p) == "table")
+        ck("ProbeEnvironment reports bagsLoaded as a boolean", type(p.bagsLoaded) == "boolean")
+        ck("ProbeEnvironment reports nsProvider as a boolean", type(p.nsProvider) == "boolean")
+    end
 
     -- Consume-only really does not publish, and never registers (which would
     -- replace the other publisher's spec).
@@ -1220,6 +1457,52 @@ local function selfTest(verbose)
     ck("consume-only refuses to mark dirty", Inventory.MarkDirty() == false)
     ck("consume-only still projects", type(Inventory.Refresh()) == "number")
     Inventory._mode = "publish"
+
+    ------------------------------------------------------------------
+    -- 3f) THE GEN-1 CONSUME-ONLY HEAL
+    --
+    --     Impossible state: publishing now, but the save was last written by a
+    --     probe generation that could only ever have said consume-only here.
+    --     Fires ONCE, behind the probeGen marker, and stays silent for an
+    --     account that never ran under gen 1.
+    ------------------------------------------------------------------
+    local SELF = "Healer-Whitemane"
+    local function genArea(probeGen, withSelf)
+        local a = { owners = {}, probeGen = probeGen }
+        if withSelf then a.owners[SELF] = { rev = 1, updatedAt = 1, data = {} } end
+        return a
+    end
+
+    ck("gen-1 save with a self record and a publishing verdict -> HEAL",
+        Inventory.NeedsPublishHeal(genArea(nil, true), "publish", SELF) == true)
+    ck("heal does not fire when we are consume-only",
+        Inventory.NeedsPublishHeal(genArea(nil, true), "consume", SELF) == false)
+    ck("heal does not fire on a save already stamped with this generation",
+        Inventory.NeedsPublishHeal(genArea(Inventory.PROBE_GEN, true), "publish", SELF) == false)
+    ck("heal does not fire on a first-ever login (no self record)",
+        Inventory.NeedsPublishHeal(genArea(nil, false), "publish", SELF) == false)
+    ck("heal does not fire on a peer-only graph",
+        Inventory.NeedsPublishHeal(
+            { owners = { ["Someone-Else"] = { rev = 1 } } }, "publish", SELF) == false)
+    ck("heal tolerates a missing area", Inventory.NeedsPublishHeal(nil, "publish", SELF) == false)
+    ck("heal tolerates an empty self key",
+        Inventory.NeedsPublishHeal(genArea(nil, true), "publish", "") == false)
+    ck("heal tolerates a malformed owners table",
+        Inventory.NeedsPublishHeal({ owners = "nope" }, "publish", SELF) == false)
+
+    -- Marker: stamped once, then idempotent, and the heal never fires twice.
+    local healArea = genArea(nil, true)
+    ck("stamping a gen-1 save changes it", Inventory.StampProbeGen(healArea) == true)
+    ck("the stamp records the current generation", healArea.probeGen == Inventory.PROBE_GEN)
+    ck("re-stamping is a no-op", Inventory.StampProbeGen(healArea) == false)
+    ck("a stamped save no longer needs the heal",
+        Inventory.NeedsPublishHeal(healArea, "publish", SELF) == false)
+    ck("StampProbeGen tolerates a missing area", Inventory.StampProbeGen(nil) == false)
+
+    -- An older generation number still heals (the marker is a generation, not a
+    -- boolean), and a future one does not re-trigger.
+    ck("an older probeGen still heals",
+        Inventory.NeedsPublishHeal(genArea(1, true), "publish", SELF) == true)
 
     ------------------------------------------------------------------
     -- 4) MIGRATION — idempotence + rev-awareness, on the owner's real shape
