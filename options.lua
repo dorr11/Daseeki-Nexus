@@ -729,6 +729,50 @@ local function buildGeneral(flow)
         end,
     }).Refresh)
 
+    -- Cross-account wealth TOOLTIPS (tooltips.lua). DEFAULT ON, absent key reads ON
+    -- (Tooltips.IsEnabled owns that rule). The row is indented under the inventory
+    -- checkbox because it is a display surface for that module's data, and it is
+    -- INERT while Daseeki Bags is installed — Bags renders these tooltips itself, so
+    -- Nexus stands down to keep every hover from carrying the block twice. The note
+    -- row below says so in words rather than leaving a ticked box that does nothing.
+    local r3b = sec:AddRow({ vAlign = "center" })
+    r3b._indent = r3b._indent + 20
+    register("general", r3b:Checkbox({
+        label = "Cross-account tooltips",
+        tooltip = "Show cross-character item counts on item tooltips and a gold "
+               .. "breakdown on the money frame, for the default Blizzard bags. "
+               .. "Inactive while Daseeki Bags is installed (Bags draws its own).",
+        get = function()
+            local T = ns.Tooltips
+            if T and T.IsEnabled then return T.IsEnabled() end
+            local db = DB()
+            return not db or db.wealthTooltips ~= false
+        end,
+        set = function(v)
+            local db = DB()
+            if db then db.wealthTooltips = v and true or false end
+            local T = ns.Tooltips
+            if T and T.Invalidate then T.Invalidate() end
+        end,
+    }).Refresh)
+
+    local tipStatusRow = sec:AddRow()
+    tipStatusRow._indent = tipStatusRow._indent + 20
+    local tipStatus = tipStatusRow:Label("")
+    register("general", function()
+        local T = ns.Tooltips
+        if not (T and T.Status) then
+            tipStatus._label:SetText("")
+            return
+        end
+        local active, why = T.Status()
+        if active then
+            tipStatus._label:SetText("|cff66dd66Cross-account tooltips are live on item and money tooltips.|r")
+        else
+            tipStatus._label:SetText("|cffddaa44Inactive — " .. tostring(why) .. ".|r")
+        end
+    end)
+
     -- Location-data status line (round-3 item 16): green when every own
     -- active-faction level-60 has a usable location, amber when some are missing.
     local locStatus = sec:AddRow():Label("")

@@ -1144,6 +1144,13 @@ local function defaultSettings()
         -- a SavedVariables file written before this key existed behaves exactly
         -- like a fresh one. ADDITIVE — no settingsVersion bump needed.
         inventoryEnabled  = true,
+        -- Cross-account wealth TOOLTIPS (tooltips.lua): the item-count block on an
+        -- item tooltip and the gold breakdown on the money frame, for players who
+        -- run the default Blizzard bags. Default ON, and Tooltips.IsEnabled treats
+        -- an ABSENT key as ON as well. ADDITIVE — one boolean, no settingsVersion
+        -- bump. Inert by design while Daseeki-Bags is installed: Bags draws these
+        -- itself, so tooltips.lua stands down and this key changes nothing.
+        wealthTooltips    = true,
         accountID         = "",           -- user sets via /dsn account
         minimap = {
             hide = false,

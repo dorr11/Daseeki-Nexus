@@ -26,6 +26,7 @@ auto.lua
 options.lua
 syncns.lua
 inventory.lua
+tooltips.lua
 import.lua
 ui_shell.lua
 ui_detail.lua

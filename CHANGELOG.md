@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+<!-- RELEASE NOTE: the cross-account tooltips below are a new user-facing FEATURE, not a
+     fix — this Unreleased section is 1.1.0-worthy rather than 1.0.2. The version bump
+     itself is the release coordinator's call; nothing here forces it. -->
+
+- **Added:** cross-account tooltips for players who use the **default Blizzard bags**.
+  Hover an item and Nexus now lists every character across every account in your mesh
+  that holds it, with a grand total on top and a dimmed "Other Accounts" section for
+  characters on your other accounts. Hover the gold amount on your backpack (or at a
+  vendor, mailbox or bank) and you get the same breakdown for money, capped at five
+  characters per group with the rest rolled into "Others" and a grand total at the
+  bottom. This is exactly the block Daseeki Bags has always shown — same layout, same
+  portraits, same colours — so you no longer need Bags installed just to see it.
+  One difference by design: Bags can tell you *where* each stack sits (equipped, bags,
+  bank) because it stores every slot. Nexus stores per-character totals only, so it
+  shows the count with no location icons rather than guessing at one.
+- **Added:** a **"Cross-account tooltips"** checkbox under Cross-account inventory & gold
+  in Settings → General, on by default. The line beneath it tells you whether the
+  tooltips are live and, if not, why.
+- **Note:** if you have **Daseeki Bags installed, nothing changes.** Bags draws these
+  tooltips itself, so Nexus stays completely out of the way — you will never see the
+  block twice — and the new checkbox reads as inactive with the reason spelled out.
 - **Fixed:** Nexus threw a stream of "AddOn 'Daseeki-Nexus' tried to call the protected
   function 'SetEveryoneIsAssistant()'" errors while you were raiding in *someone else's*
   raid. Two things were wrong and both are fixed. First, "Auto-promote assistant" tried to
