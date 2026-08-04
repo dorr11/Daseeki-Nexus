@@ -174,6 +174,31 @@ function Dashboard.WBRowContent(st, imminent)
     elseif state == "cd" then
         local rem = st.remaining or 0
         local imm = (rem <= imminent)
+        -- F-KILL — A DEAD ANNOUNCER OUTRANKS THE COOLDOWN FOR THE HEADLINE.
+        --
+        -- `state` answers "when can this buff drop", and F3 correctly gives that
+        -- to whichever gate clears LAST, so a fresh kill under a longer cooldown
+        -- still reads "cd". But that made the row identical to a row with no kill
+        -- at all: when the owner's raid killed a mind-controlled Overlord Runthak
+        -- on 2026-08-03 with ~19 minutes of Onyxia cooldown left, this row just
+        -- kept counting down and the kill was invisible. Detection had worked
+        -- perfectly; the dashboard simply never said so.
+        --
+        -- Both references give the kill its own readout (NWB §3.3, SN §8.7's
+        -- `Killed Mm SSs`), so while the announcer is actually down that is the
+        -- headline, and the cooldown it displaced moves into the tooltip rather
+        -- than being lost. It is a bounded takeover: at most the 360s certain-dead
+        -- phase plus the 120s random window, after which the cooldown returns to
+        -- the numeral on its own.
+        if st.killActive then
+            local killRem = st.killRemaining or 0
+            local head = (killRem > 0)
+                and ("Killed \194\183 " .. Dashboard.FormatMSS(killRem))
+                or  "Killed \194\183 due back"
+            local tip = "Announcer back by " .. date("%H:%M", st.windowEndsAt or st.nextAt)
+                        .. " \194\183 off cooldown at " .. date("%H:%M", st.cdEndsAt or st.nextAt)
+            return head, "warn", false, tip
+        end
         return Dashboard.FormatDuration(rem), imm and "danger" or "warn", imm,
                "Off cooldown at " .. date("%H:%M", st.nextAt)
     end
@@ -955,6 +980,33 @@ local function testWBRow(fails)
     ck(stamp == "Respawns at " .. date("%H:%M", T0), "killed tip -> 'Respawns at HH:MM'")
     txt = Dashboard.WBRowContent({ state = "killed", remaining = 359, nextAt = T0 })
     ck(txt == "Killed \194\183 5:59", "killed just after the kill -> '5:59'")
+
+    -- F-KILL: a cd row whose announcer is DOWN shows the kill, not a bare
+    -- countdown. This is the 2026-08-03 miss: Runthak was killed with ~19 minutes
+    -- of Onyxia cooldown left, `state` stayed "cd" (correctly — F3), and the row
+    -- gave no hint whatsoever that the kill had been detected.
+    txt, tok, pulse, stamp = Dashboard.WBRowContent({
+        state = "cd", remaining = 1175, nextAt = T0 + 1175,
+        killActive = true, killRemaining = 358,
+        windowEndsAt = T0 + 478, cdEndsAt = T0 + 1175,
+    })
+    ck(txt == "Killed \194\183 5:58", "a live kill under a longer cd -> 'Killed \194\183 5:58'")
+    ck(tok == "warn", "the kill overlay reads warn")
+    ck(pulse == false, "the kill overlay never pulses, even inside the imminent window")
+    ck(stamp == "Announcer back by " .. date("%H:%M", T0 + 478)
+              .. " \194\183 off cooldown at " .. date("%H:%M", T0 + 1175),
+       "the displaced cooldown is preserved in the tooltip, not lost")
+    -- ...and past the certain-dead phase but still inside the random window it
+    -- says so rather than showing a 0:00 countdown.
+    txt = Dashboard.WBRowContent({
+        state = "cd", remaining = 1175, nextAt = T0 + 1175,
+        killActive = true, killRemaining = 0,
+        windowEndsAt = T0 + 60, cdEndsAt = T0 + 1175,
+    })
+    ck(txt == "Killed \194\183 due back", "inside the random window -> 'Killed \194\183 due back'")
+    -- A cd row with NO live kill is untouched.
+    txt = Dashboard.WBRowContent({ state = "cd", remaining = 1175, nextAt = T0, killActive = nil })
+    ck(txt == Dashboard.FormatDuration(1175), "a cd row with no live kill is unchanged")
 
     -- cd: FormatDuration + the existing imminent rule (danger + pulse at/below).
     txt, tok, pulse, stamp = Dashboard.WBRowContent({ state = "cd", remaining = 3 * 3600, nextAt = T0 })

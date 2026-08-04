@@ -481,25 +481,62 @@ function Timers.BuffStatus(buffKey, t)
 
     local cdLive   = cdEndsAt > t
     local killLive = killEndsAt > t
+
+    -- F-KILL — A KILL MUST NEVER BE SWALLOWED BY A LONGER COOLDOWN.
+    --
+    -- F3 was right that the CD wins the AVAILABILITY question (`state`): a kill
+    -- says nothing about a cooldown that is still running, and letting the kill
+    -- win there made "killed, back in 6 minutes" appear while the buff was
+    -- genuinely six hours away. But `state` was the kill's ONLY channel, so
+    -- whenever the cooldown outlived the 360s respawn the kill disappeared from
+    -- every consumer in the addon.
+    --
+    -- That is exactly what happened on 2026-08-03. The owner's raid killed a
+    -- mind-controlled Overlord Runthak at 22:39:33 with ~19 minutes left on the
+    -- Onyxia cooldown. Local detection fired, `killedAt` was stamped and the
+    -- `killed` log entry persisted — and the dashboard row went on counting the
+    -- cooldown down as though nothing had happened, so the kill read to the owner
+    -- as "not detected at all".
+    --
+    -- Both references keep kill and drop as two INDEPENDENT facts and surface the
+    -- kill in its own right (NWB §3.3 shows "<Buff> NPC (<name>) was killed
+    -- <time> ago"; SN §8.7's status bar carries a dedicated `Killed Mm SSs`
+    -- readout with its own pulse). So the kill now rides EVERY return as additive
+    -- fields, and `state` keeps its F3 meaning untouched:
+    --   killedAt       the stamp itself (nil when there is no kill)
+    --   killActive     the announcer is down AND the kill is the newest event
+    --   killRemaining  seconds of the certain-dead phase left (0 once elapsed)
+    --   cdEndsAt       so a consumer that promotes the kill to the headline can
+    --                  still show the cooldown it displaced
+    --
+    -- `killActive` requires the kill to be at least as new as the pop because a
+    -- drop is proof the announcer is BACK — he is the NPC who yells. (Record also
+    -- clears a superseded stamp outright; this is the belt to that pair of
+    -- braces, and it also covers state rehydrated from an older build's log.)
+    local killActive    = (killed > 0) and (killed >= pop) and (t < windowEndsAt)
+    local killRemaining = (killEndsAt > t) and (killEndsAt - t) or 0
+
+    local out
     if cdLive and (not killLive or cdEndsAt >= killEndsAt) then
-        return { state = "cd", remaining = cdEndsAt - t, nextAt = cdEndsAt,
-                 phase = phase, windowEndsAt = (killed > 0) and windowEndsAt or nil,
-                 windowRemaining = windowRemaining }
-    end
-    if killLive then
-        return { state = "killed", remaining = killEndsAt - t, nextAt = killEndsAt,
-                 phase = phase, windowEndsAt = windowEndsAt,
-                 windowRemaining = windowRemaining }
-    end
-    -- Both gates clear. A cooldown-disabled buff with no kill has nothing to say
-    -- (its pop, if one ever reached state, models no countdown at all).
-    if cdEndsAt <= 0 and killed <= 0 then
+        out = { state = "cd", remaining = cdEndsAt - t, nextAt = cdEndsAt }
+    elseif killLive then
+        out = { state = "killed", remaining = killEndsAt - t, nextAt = killEndsAt }
+    elseif cdEndsAt <= 0 and killed <= 0 then
+        -- Both gates clear. A cooldown-disabled buff with no kill has nothing to
+        -- say (its pop, if one ever reached state, models no countdown at all).
         return { state = "nodata", remaining = 0, nextAt = 0 }
+    else
+        out = { state = "canpop", remaining = 0, nextAt = math.max(cdEndsAt, killEndsAt) }
     end
-    return { state = "canpop", remaining = 0,
-             nextAt = math.max(cdEndsAt, killEndsAt),
-             phase = phase, windowEndsAt = (killed > 0) and windowEndsAt or nil,
-             windowRemaining = windowRemaining }
+
+    out.phase           = phase
+    out.windowEndsAt    = (killed > 0) and windowEndsAt or nil
+    out.windowRemaining = windowRemaining
+    out.killedAt        = (killed > 0) and killed or nil
+    out.killActive      = killActive or nil
+    out.killRemaining   = killRemaining
+    out.cdEndsAt        = (cdEndsAt > 0) and cdEndsAt or nil
+    return out
 end
 
 -- False-positive gate (pure). A fresh POP within a full CD of the current
@@ -693,6 +730,12 @@ function Timers.Record(buffKey, epoch, trust, who, kind, zone, pullDuration, yel
         s.killedAt = epoch
     else
         s.lastPop = epoch
+        -- NWB §3.3, the half we never implemented: "Setting a new drop timer
+        -- resets the kill timestamp to 0." A drop is positive proof the announcer
+        -- is BACK — he is the NPC who yells the buff — so a kill older than the
+        -- drop is spent history. Left standing it would keep asserting "the
+        -- announcer is down" straight through the respawn it already outlived.
+        if (s.killedAt or 0) <= epoch then s.killedAt = 0 end
     end
     s.trust = trust
     s.who = who
@@ -995,15 +1038,56 @@ end
 -- the detector working even where the numeric id is uncertain.
 ----------------------------------------------------------------------
 
--- Capital zones where announcer events are valid. ONLY the two capitals that
--- actually host announcers (A3.2) — the four extra capitals we used to accept
--- could trip on same-named mobs elsewhere.
-local CAPITAL_ZONES = {
-    ["orgrimmar"]      = true,
+-- Zones where an announcer death is valid, PER ANNOUNCER (NWB §2.9: Runthak and
+-- Saurfang are accepted in zones 1454/1411 — Orgrimmar and Durotar — while
+-- Mattingly, Afrasiabi and Stonebridge are accepted in 1453/1429 — Stormwind
+-- City and Elwynn Forest). The surrounding zone belongs in the set because
+-- GetRealZoneText reads the PARENT zone at the city edge, which is exactly where
+-- a raid fighting its way in is standing.
+--
+-- THE PAIRING IS THE POINT, and the old flat set did not pair: it accepted any
+-- announcer in any capital, so a "Major Mattingly" death reported from Orgrimmar
+-- counted as an Alliance-Onyxia announcer kill. Each announcer is now believed
+-- only in its own city.
+local HORDE_ANNOUNCER_ZONES = {
+    ["orgrimmar"] = true,
+    ["durotar"]   = true,
+}
+local ALLIANCE_ANNOUNCER_ZONES = {
     ["stormwind city"] = true,
     ["stormwind"]      = true,
+    ["elwynn forest"]  = true,
 }
+Timers._hordeAnnouncerZones    = HORDE_ANNOUNCER_ZONES
+Timers._allianceAnnouncerZones = ALLIANCE_ANNOUNCER_ZONES
+
+-- Union of the two, kept because `Timers._capitalZones` is a published surface.
+local CAPITAL_ZONES = {}
+for z in pairs(HORDE_ANNOUNCER_ZONES)    do CAPITAL_ZONES[z] = true end
+for z in pairs(ALLIANCE_ANNOUNCER_ZONES) do CAPITAL_ZONES[z] = true end
 Timers._capitalZones = CAPITAL_ZONES
+
+-- May `zone` legally host `buffKey`'s announcer dying? Pure, so the self-tests
+-- drive the whole matrix headless.
+--
+-- THE H/A SUFFIX IS THE ANNOUNCER'S FACTION, NEVER THE WITNESS'S. Runthak is
+-- `onyH` whoever watches him die, and both ways round happen for real: an
+-- Alliance raid pushing into Orgrimmar to deny the buff, and — the way it
+-- actually happened on 2026-08-03 — an Alliance priest MIND-CONTROLLING Runthak
+-- so a HORDE raid could kill their own announcer and force the respawn. Nothing
+-- in this detector may consult the witness's faction, and nothing may consult
+-- the target's reaction or attackability either: under mind control Runthak is a
+-- friendly, charmed NPC and he is still the announcer. Creature id and name are
+-- the only things that survive a charm, so they are the only things we read.
+-- (The reference is aware of the trick — NWB §2.9 has a whole SPELL_DISPEL path
+-- for Mind Control on the announcers — but states no reaction filter either way,
+-- so we exceed it deliberately and on purpose.)
+function Timers.AnnouncerZoneOK(buffKey, zone)
+    if not buffKey then return false end
+    local set = (buffKey:sub(-1) == "A") and ALLIANCE_ANNOUNCER_ZONES
+                                          or HORDE_ANNOUNCER_ZONES
+    return set[tostring(zone or ""):lower()] == true
+end
 
 -- Announcer NPC-id table -> buffKey (spec §10.3). Matched alongside destName so
 -- a mislabelled id never blocks a valid name hit.
@@ -1042,11 +1126,6 @@ local function npcIDFromGUID(guid)
 end
 Timers._npcIDFromGUID = npcIDFromGUID
 
-local function inCapital()
-    local zone = GetRealZoneText and GetRealZoneText() or ""
-    return CAPITAL_ZONES[zone:lower()] == true
-end
-
 -- Combat-log fan-out. TWO independent consumers ride this event now: the capital
 -- announcer-death detector here, and the Felwood presence / songflower witness
 -- engine further down the file. The old early `if not inCapital() then return`
@@ -1069,12 +1148,25 @@ local function onCombatLog()
     end
 
     if subevent ~= "UNIT_DIED" and subevent ~= "PARTY_KILL" then return end
-    if not inCapital() then return end
+    -- Resolve the announcer FIRST, then gate on that announcer's own city. The
+    -- old order asked "am I in a capital" before knowing whose death this was,
+    -- which is how any announcer came to be believed in any capital.
+    --
+    -- destFlags is read off the payload above and deliberately IGNORED here: the
+    -- reaction bits flip when the NPC is mind-controlled, and an MC'd announcer
+    -- dying is a first-class case, not an anomaly (see AnnouncerZoneOK).
     local npcID = npcIDFromGUID(destGUID)
     local buffKey = announcerBuffFor(npcID, destName)
     if not buffKey then return end
+    if not Timers.AnnouncerZoneOK(buffKey, GetRealZoneText and GetRealZoneText() or "") then
+        return
+    end
     Timers.OnAnnouncerDeath(buffKey, destName)
 end
+-- Exposed so the self-tests can drive a synthetic combat-log death end-to-end
+-- (stubbed CombatLogGetCurrentEventInfo + GetRealZoneText) rather than calling
+-- OnAnnouncerDeath directly and leaving the gates themselves untested.
+Timers._onCombatLog = onCombatLog
 
 -- Generation token per buff for the armed respawn alert (F6). A second kill of
 -- the same announcer must cancel the first arm rather than fire two alerts.
@@ -1575,6 +1667,58 @@ local function dropBuffKey(base)
     return factionKey(base)
 end
 
+-- ANNOUNCER-DEATH EPOCHS ON THE WIRE (NWB §5.6): `x` = the Onyxia announcer,
+-- `D` = the Nefarian announcer. We read NEITHER, so every kill an NWB-compat peer
+-- broadcast was heard, decoded, and dropped on the floor — the receive half of
+-- the same hole the local detector covers on the transmit side.
+--
+-- FACTION RESOLUTION IS DELIBERATELY DIFFERENT FROM THE LOCAL DETECTOR. NWB
+-- carries ONE Onyxia announcer field and the receiver's own faction names it,
+-- which is sound here because addon traffic is faction-segregated — a payload can
+-- only have reached us from a same-faction player. So this path uses factionKey,
+-- exactly as the DROP path beside it does. The local combat-log detector is the
+-- opposite case: it is watching a specific NPC die in front of it and keys off
+-- the ANNOUNCER's faction, because the witness may be either faction (or, as on
+-- 2026-08-03, the same faction killing its own mind-controlled announcer).
+local NWB_KILL_FIELDS = {
+    { base = "ony", field = "x", word = "onyNpcDied" },
+    { base = "nef", field = "D", word = "nefNpcDied" },
+}
+Timers._nwbKillFields = NWB_KILL_FIELDS
+
+-- Receive rules for a RELAYED kill (NWB §3.4), all three of them:
+--   * act only on a death 0..1800s old — older is history, not news;
+--   * ignore it if we already hold a kill within 60s — the same event, relayed;
+--   * ignore it if the buff DROPPED within the last 600s — something that drops
+--     the buff cannot simultaneously be lying dead, so the report is stale or
+--     wrong whichever way round it is.
+-- Returns ok:boolean, reason:string. The reason is what `/nexus debug nwb` shows.
+local NWB_KILL_MAX_AGE       = 1800
+local NWB_KILL_DUP_WINDOW    = 60
+local NWB_KILL_DROP_SUPPRESS = 600
+Timers.NWB_KILL_MAX_AGE       = NWB_KILL_MAX_AGE
+Timers.NWB_KILL_DUP_WINDOW    = NWB_KILL_DUP_WINDOW
+Timers.NWB_KILL_DROP_SUPPRESS = NWB_KILL_DROP_SUPPRESS
+
+function Timers.NWBKillAcceptable(buffKey, epoch, t)
+    t = t or now()
+    if not ANNOUNCER_BUFFS[buffKey] then return false, "not an announcer buff" end
+    local age = t - (epoch or 0)
+    if age < 0 then return false, "kill reported in the future" end
+    if age > NWB_KILL_MAX_AGE then return false, "kill older than 1800s" end
+    local s = Timers.state[buffKey]
+    if s then
+        if (s.killedAt or 0) > 0
+           and math.abs(epoch - s.killedAt) <= NWB_KILL_DUP_WINDOW then
+            return false, "duplicate of a kill we already hold"
+        end
+        if (s.lastPop or 0) > 0 and (t - s.lastPop) < NWB_KILL_DROP_SUPPRESS then
+            return false, "the buff dropped within 600s (announcer is back)"
+        end
+    end
+    return true, "ok"
+end
+
 -- Validate ONE data table's world-buff drops. Returns a result table:
 --   { ok = boolean, reason = string|nil,
 --     accept = { rend = epoch, ony = epoch, nef = epoch },
@@ -1860,6 +2004,32 @@ local function readNWBTimerFields(tbl, applied, t, nodeMode, flowerAcc)
     end
 
     Timers.IngestNWBTimerLog(tbl, applied, t)
+
+    -- ANNOUNCER DEATHS (NWB §3.4). Merged here, ALONGSIDE the timer log and
+    -- BEFORE the drop-anchor validation below, because the whole-payload
+    -- rejection is specifically about a drop epoch arriving without its witnessing
+    -- stage-1 yell (NWB §5.7). A kill epoch has no yell to pair with and is not
+    -- what that rule adjudicates — it merges on the same footing as the log.
+    --
+    -- Every outcome is counted so a dropped kill is VISIBLE in `/nexus debug nwb`
+    -- instead of looking like a silent no-op, which is precisely how this gap
+    -- stayed invisible: heard, decoded, discarded, nothing to see.
+    for i = 1, #NWB_KILL_FIELDS do
+        local kf = NWB_KILL_FIELDS[i]
+        local killKey = dropBuffKey(kf.base)
+        local killAt = nwbEpoch(tbl[kf.field], killKey, t)
+                       or nwbEpoch(tbl[kf.word], killKey, t)
+        if killAt then
+            applied.killHeard = (applied.killHeard or 0) + 1
+            local okKill, whyKill = Timers.NWBKillAcceptable(killKey, killAt, t)
+            if okKill and Timers.Record(killKey, killAt, "nwb", "NWB", "killed") then
+                applied.kill = (applied.kill or 0) + 1
+            else
+                applied.killRejected = (applied.killRejected or 0) + 1
+                applied.killRejectReason = kf.base .. ": " .. (whyKill or "refused by Record")
+            end
+        end
+    end
 
     -- Drop-anchor validation. Unchanged rules, now scoped to the three world-buff
     -- drop epochs it was always about: a whole-table rejection stops the ANCHORS,
@@ -3047,27 +3217,53 @@ function Timers.RehydrateFromStore()
     for buffKey, logKey in pairs(STORE_LOG_KEY) do
         local list = logs[logKey]
         if list and list[1] then
-            local newest = list[1]
-            local epoch = newest.epoch or 0
             local cd = CD[buffKey]
-            -- Ignore entries older than a full CD (no live countdown to show).
-            if epoch > 0 and cd and (t - epoch) < cd then
-                local s = stateOf(buffKey)
-                if newest.killed then
-                    -- F2 backstop on PERSISTED data: only an announcer buff may
-                    -- carry a kill. A `killed` entry on Rend is legacy debris
-                    -- from the old DBM boss-kill mapping (a boss kill written as
-                    -- an announcer death) and is skipped entirely rather than
-                    -- rehydrated — it is neither a respawn nor a pop.
-                    if ANNOUNCER_BUFFS[buffKey] then
-                        s.killedAt = math.max(s.killedAt or 0, epoch)
-                        s.trust = s.trust or newest.trust or "local"
-                        seeded = seeded + 1
-                        ns:Fire("TIMER_UPDATED", buffKey)
+            -- WALK THE WHOLE LOG FOR THE NEWEST POP AND THE NEWEST KILL,
+            -- INDEPENDENTLY. Reading only `list[1]` meant whichever KIND happened
+            -- to be newest silently erased the other, and the two are separate
+            -- anchors that both persist (A3.1).
+            --
+            -- This is not theoretical. On 2026-08-03 the owner's raid killed
+            -- Overlord Runthak, which pushed a `killed` entry to the head of the
+            -- onyH log with the live six-hour Onyxia pop sitting right behind it
+            -- at [2]. On the next login this loop would have seeded `killedAt`,
+            -- never looked at [2], and the real cooldown — with hours left to run
+            -- — would have vanished into "Open".
+            local newestPop, newestKill
+            for i = 1, #list do
+                local e = list[i]
+                local epoch = e and e.epoch or 0
+                if epoch > 0 then
+                    if e.killed then
+                        if not newestKill or epoch > (newestKill.epoch or 0) then newestKill = e end
+                    elseif not newestPop or epoch > (newestPop.epoch or 0) then
+                        newestPop = e
                     end
-                else
-                    s.lastPop = math.max(s.lastPop or 0, epoch)
-                    s.trust = s.trust or newest.trust or "local"
+                end
+            end
+
+            local s = stateOf(buffKey)
+            -- Entries older than a full CD are ignored (the buff is long
+            -- available = no meaningful countdown).
+            local function fresh(e) return e and cd and (t - e.epoch) < cd end
+
+            if fresh(newestPop) then
+                s.lastPop = math.max(s.lastPop or 0, newestPop.epoch)
+                s.trust = s.trust or newestPop.trust or "local"
+                seeded = seeded + 1
+                ns:Fire("TIMER_UPDATED", buffKey)
+            end
+            -- F2 backstop on PERSISTED data: only an announcer buff may carry a
+            -- kill. A `killed` entry on Rend is legacy debris from the old DBM
+            -- boss-kill mapping (a boss kill written as an announcer death) and is
+            -- skipped entirely rather than rehydrated — it is neither a respawn
+            -- nor a pop.
+            if fresh(newestKill) and ANNOUNCER_BUFFS[buffKey] then
+                -- ...and a kill the newest pop already superseded stays dead, the
+                -- same rule Record applies on the live path (NWB §3.3).
+                if not (newestPop and newestPop.epoch >= newestKill.epoch) then
+                    s.killedAt = math.max(s.killedAt or 0, newestKill.epoch)
+                    s.trust = s.trust or newestKill.trust or "local"
                     seeded = seeded + 1
                     ns:Fire("TIMER_UPDATED", buffKey)
                 end
@@ -6065,6 +6261,297 @@ local function testResetState(fails)
     Timers.state = {}
 end
 
+----------------------------------------------------------------------
+-- F-KILL — LOCAL ANNOUNCER-DEATH DETECTION, driven end to end.
+--
+-- These run through the REAL combat-log handler with a stubbed
+-- CombatLogGetCurrentEventInfo and GetRealZoneText, so the gates themselves are
+-- under test rather than just OnAnnouncerDeath. Every case is a mutation target:
+-- keying off the witness's faction, dropping the per-announcer zone pairing,
+-- consulting the CLEU reaction flags, or accepting any creature id all turn one
+-- of these red.
+----------------------------------------------------------------------
+
+-- A Classic-Era creature GUID carrying `npcID` in the id field.
+local function fakeCreatureGUID(npcID)
+    return "Creature-0-4379-1-197-" .. tostring(npcID) .. "-00003F4CFB"
+end
+
+-- Fire ONE synthetic combat-log event through the live handler.
+--   zone      what GetRealZoneText answers
+--   faction   what UnitFactionGroup answers — the WITNESS's faction
+--   destFlags the CLEU flag word (a charmed announcer reads friendly; see (c))
+local function fireDeath(npcID, destName, zone, faction, destFlags, subevent)
+    local savedCLEU = _G.CombatLogGetCurrentEventInfo
+    local savedZone = _G.GetRealZoneText
+    local savedFac  = _G.UnitFactionGroup
+    _G.GetRealZoneText  = function() return zone end
+    _G.UnitFactionGroup = function() return faction or "Horde" end
+    _G.CombatLogGetCurrentEventInfo = function()
+        return now(), subevent or "UNIT_DIED", false,
+               "Player-4379-0000AAAA", "Someone", 0, 0,
+               npcID and fakeCreatureGUID(npcID) or nil, destName,
+               destFlags or 0, 0, nil
+    end
+    Timers._onCombatLog()
+    _G.CombatLogGetCurrentEventInfo = savedCLEU
+    _G.GetRealZoneText  = savedZone
+    _G.UnitFactionGroup = savedFac
+end
+
+local function testLocalAnnouncerDetection(fails)
+    local RUNTHAK, MATTINGLY, SAURFANG = 14392, 14394, 14720
+
+    -- (a) THE CASE THE OWNER REPORTED: a Runthak death in Orgrimmar stamps
+    -- killedAt on onyH through the normal trust machinery, and starts no cooldown.
+    Timers.state = {}
+    fireDeath(RUNTHAK, "Overlord Runthak", "Orgrimmar", "Horde")
+    local s = Timers.state.onyH
+    tcheck(s and (s.killedAt or 0) > 0,
+        "a Runthak UNIT_DIED in Orgrimmar stamps killedAt on onyH", fails)
+    tcheck(s and s.trust == "local", "...at local trust", fails)
+    tcheck((s and s.lastPop or 0) == 0, "...and starts no cooldown (A3.1)", fails)
+
+    -- (b) THE KEY IS THE ANNOUNCER'S FACTION, NEVER THE WITNESS'S. Both
+    -- directions are real: an Alliance raid pushing in to deny the buff, and — as
+    -- happened on 2026-08-03 — a HORDE raid killing its own announcer after an
+    -- Alliance priest mind-controlled him.
+    for _, witness in ipairs({ "Alliance", "Horde" }) do
+        Timers.state = {}
+        fireDeath(RUNTHAK, "Overlord Runthak", "Orgrimmar", witness)
+        tcheck(Timers.state.onyH and (Timers.state.onyH.killedAt or 0) > 0,
+            "a " .. witness .. " witness writes the HORDE announcer's key", fails)
+        tcheck(Timers.state.onyA == nil,
+            "...and never the " .. witness .. " witness's own faction key", fails)
+    end
+
+    -- (c) CHARM-AGNOSTIC. Under mind control the announcer's CLEU flags read
+    -- REACTION_FRIENDLY (0x10) + CONTROL_PLAYER (0x100) + AFFILIATION_RAID (0x4).
+    -- He is still the announcer and his death is still the respawn event, so the
+    -- flag word is read off the payload and deliberately never consulted.
+    Timers.state = {}
+    fireDeath(RUNTHAK, "Overlord Runthak", "Orgrimmar", "Horde", 0x114)
+    tcheck(Timers.state.onyH and (Timers.state.onyH.killedAt or 0) > 0,
+        "a MIND-CONTROLLED announcer's death still records (2026-08-03)", fails)
+
+    -- (d) WRONG ZONE is ignored...
+    Timers.state = {}
+    fireDeath(RUNTHAK, "Overlord Runthak", "Ironforge", "Horde")
+    tcheck(Timers.state.onyH == nil, "a Runthak death in Ironforge is ignored", fails)
+    Timers.state = {}
+    fireDeath(RUNTHAK, "Overlord Runthak", "Felwood", "Horde")
+    tcheck(Timers.state.onyH == nil, "...and one in Felwood", fails)
+
+    -- ...and the gate is PER ANNOUNCER, not one flat capital list.
+    Timers.state = {}
+    fireDeath(MATTINGLY, "Major Mattingly", "Orgrimmar", "Horde")
+    tcheck(Timers.state.onyA == nil,
+        "Mattingly dying in ORGRIMMAR is not an Alliance announcer kill", fails)
+    Timers.state = {}
+    fireDeath(MATTINGLY, "Major Mattingly", "Stormwind City", "Horde")
+    tcheck(Timers.state.onyA and (Timers.state.onyA.killedAt or 0) > 0,
+        "...but Mattingly in Stormwind City is", fails)
+
+    -- The surrounding zone counts (NWB §2.9 accepts 1411 / 1429): GetRealZoneText
+    -- reads the PARENT zone at the city edge, where a raid fighting in is stood.
+    Timers.state = {}
+    fireDeath(SAURFANG, "High Overlord Saurfang", "Durotar", "Horde")
+    tcheck(Timers.state.nefH and (Timers.state.nefH.killedAt or 0) > 0,
+        "Durotar is a legal witness zone for a Horde announcer", fails)
+
+    -- (e) WRONG CREATURE, right city, real death: nothing at all.
+    Timers.state = {}
+    fireDeath(12345, "Some Orgrimmar Grunt", "Orgrimmar", "Horde")
+    tcheck(next(Timers.state) == nil,
+        "a non-announcer death in Orgrimmar records nothing", fails)
+
+    -- (f) NAME FALLBACK — Stonebridge carries no id in the table at all, which is
+    -- the whole reason the fallback exists.
+    Timers.state = {}
+    fireDeath(99999, "Field Marshal Stonebridge", "Stormwind City", "Alliance")
+    tcheck(Timers.state.nefA and (Timers.state.nefA.killedAt or 0) > 0,
+        "Stonebridge resolves through the NAME fallback", fails)
+
+    -- (g) a non-death subevent on the announcer records nothing.
+    Timers.state = {}
+    fireDeath(RUNTHAK, "Overlord Runthak", "Orgrimmar", "Horde", 0, "SPELL_DAMAGE")
+    tcheck(Timers.state.onyH == nil, "SPELL_DAMAGE on the announcer records nothing", fails)
+
+    -- The pure zone predicate, stated directly.
+    tcheck(Timers.AnnouncerZoneOK("onyH", "Orgrimmar") == true, "onyH ok in Orgrimmar", fails)
+    tcheck(Timers.AnnouncerZoneOK("onyH", "Stormwind City") == false,
+        "onyH is NOT ok in Stormwind", fails)
+    tcheck(Timers.AnnouncerZoneOK("onyA", "Elwynn Forest") == true, "onyA ok in Elwynn", fails)
+    tcheck(Timers.AnnouncerZoneOK("nefH", "Durotar") == true, "nefH ok in Durotar", fails)
+    tcheck(Timers.AnnouncerZoneOK(nil, "Orgrimmar") == false, "no buff key -> not ok", fails)
+
+    Timers.state = {}
+    if ns.Store and ns.Store.GetTimers then
+        local logs = ns.Store.GetTimers().logs
+        logs.onyH, logs.onyA = {}, {}
+    end
+end
+
+----------------------------------------------------------------------
+-- F-KILL — a kill must survive a longer cooldown, and a drop must retire it.
+----------------------------------------------------------------------
+local function testKillVisibility(fails)
+    local t = 1600000000
+
+    -- THE 2026-08-03 REGRESSION, reproduced to the minute. The announcer dies
+    -- ~19 minutes before the Onyxia cooldown expires. F3 correctly keeps `state`
+    -- at "cd" (the buff really is 19 minutes away) — but the kill has to remain
+    -- READABLE, or every consumer shows a plain countdown and the kill looks to
+    -- the owner like it was never detected.
+    Timers.state = {}
+    Timers.Record("onyH", t, "local", "yeller", "pop")
+    local killAt = t + CD.onyH - 1175
+    Timers.Record("onyH", killAt, "local", "Overlord Runthak", "killed")
+    local st = Timers.BuffStatus("onyH", killAt + 2)
+    tcheck(st.state == "cd", "the longer cooldown still owns `state` (F3 intact)", fails)
+    tcheck(st.killActive == true, "...and the kill is STILL VISIBLE alongside it", fails)
+    tcheck(st.killedAt == killAt, "killedAt rides the readout", fails)
+    tcheck(math.abs((st.killRemaining or 0) - 358) < 2,
+        "killRemaining counts the certain-dead phase", fails)
+    tcheck((st.cdEndsAt or 0) > killAt, "the displaced cooldown end rides along too", fails)
+
+    -- The takeover is BOUNDED: once the 480s window shuts the kill stops claiming
+    -- the row, even though the cooldown is still running.
+    local later = Timers.BuffStatus("onyH", killAt + 481)
+    tcheck(later.state == "cd", "still on cooldown past the respawn window", fails)
+    tcheck(not later.killActive, "...but the kill no longer claims the row", fails)
+
+    -- A bare kill with no cooldown behind it is unchanged.
+    Timers.state = {}
+    Timers.Record("onyH", t, "local", "Overlord Runthak", "killed")
+    tcheck(Timers.BuffStatus("onyH", t + 60).killActive == true, "a bare kill is active", fails)
+
+    -- A NEWER DROP RETIRES THE KILL (NWB §3.3). The announcer is the NPC who
+    -- yells, so a drop is proof he is back on his feet.
+    Timers.state = {}
+    Timers.Record("onyH", t, "local", "Overlord Runthak", "killed")
+    tcheck(Timers.state.onyH.killedAt == t, "kill stamped", fails)
+    Timers.Record("onyH", t + 400, "local", "yeller", "pop")
+    tcheck((Timers.state.onyH.killedAt or 0) == 0,
+        "a drop after the kill clears the kill stamp", fails)
+    tcheck(not Timers.BuffStatus("onyH", t + 401).killActive,
+        "...so nothing goes on claiming the announcer is down", fails)
+
+    -- ...but a drop OLDER than the kill leaves it standing.
+    Timers.state = {}
+    Timers.Record("onyH", t + 400, "local", "Overlord Runthak", "killed")
+    Timers.Record("onyH", t, "local", "yeller", "pop")
+    tcheck(Timers.state.onyH.killedAt == t + 400,
+        "an older drop does not retire a newer kill", fails)
+
+    Timers.state = {}
+end
+
+----------------------------------------------------------------------
+-- F-KILL — NWB-compat announcer-death ingestion (`x` / `D`), NWB §3.4.
+----------------------------------------------------------------------
+local function testNWBKillIngest(fails)
+    local t = now()
+    local onyKey = factionKey("ony")
+
+    tcheck(Timers._nwbKillFields[1].field == "x" and Timers._nwbKillFields[2].field == "D",
+        "the wire keys are x (Onyxia) and D (Nefarian)", fails)
+
+    -- HEARD AND INGESTED. Until now `x` was decoded and dropped on the floor.
+    Timers.state = {}
+    local a = Timers.IngestNWBTimers({ x = t - 30 })
+    tcheck((a.killHeard or 0) == 1, "an inbound `x` is HEARD", fails)
+    tcheck((a.kill or 0) == 1, "...and ingested", fails)
+    tcheck(Timers.state[onyKey] and Timers.state[onyKey].killedAt == t - 30,
+        "the announcer death lands on the faction-resolved Onyxia key", fails)
+    tcheck(Timers.state[onyKey] and Timers.state[onyKey].trust == "nwb",
+        "...at nwb trust", fails)
+
+    -- RULE 1: 0..1800s only.
+    Timers.state = {}
+    a = Timers.IngestNWBTimers({ x = t - 2000 })
+    tcheck((a.killHeard or 0) == 1 and (a.kill or 0) == 0,
+        "a kill older than 1800s is heard but not ingested", fails)
+    tcheck((a.killRejected or 0) == 1, "...and counted as rejected", fails)
+    tcheck(Timers.state[onyKey] == nil, "nothing is recorded for it", fails)
+
+    -- RULE 2: within 60s of a kill we already hold = the same event, relayed.
+    Timers.state = {}
+    Timers.Record(onyKey, t - 100, "local", "Overlord Runthak", "killed")
+    a = Timers.IngestNWBTimers({ x = t - 80 })
+    tcheck((a.kill or 0) == 0, "a relay within 60s of our own kill is a duplicate", fails)
+    tcheck(Timers.state[onyKey].killedAt == t - 100, "...and our own stamp stands", fails)
+
+    -- RULE 3: suppressed if the buff dropped inside the last 600s — something
+    -- that drops the buff cannot simultaneously be lying dead.
+    Timers.state = {}
+    Timers.Record(onyKey, t - 120, "local", "yeller", "pop")
+    a = Timers.IngestNWBTimers({ x = t - 60 })
+    tcheck((a.kill or 0) == 0, "a kill is suppressed by a drop within 600s", fails)
+
+    -- The pure predicate, stated directly.
+    Timers.state = {}
+    tcheck(Timers.NWBKillAcceptable(onyKey, t - 30, t) == true, "a fresh relay is acceptable", fails)
+    tcheck(Timers.NWBKillAcceptable(onyKey, t + 60, t) == false, "a future kill is not", fails)
+    tcheck(Timers.NWBKillAcceptable("rend", t - 30, t) == false,
+        "Rend has no announcer, so it can never take a relayed kill (F2)", fails)
+
+    Timers.state = {}
+end
+
+----------------------------------------------------------------------
+-- F-KILL — rehydration must seed the newest POP and the newest KILL separately.
+----------------------------------------------------------------------
+local function testRehydrateKillAndPop(fails)
+    if not (ns.Store and ns.Store.GetTimers) then
+        fails[#fails + 1] = "store absent for rehydrate kill/pop test"; return
+    end
+    local logs = ns.Store.GetTimers().logs
+    local t = now()
+
+    -- THE EXACT SHAPE THE OWNER'S LOG WAS LEFT IN on 2026-08-03: a fresh `killed`
+    -- entry at the head, with the live six-hour Onyxia pop right behind it. The
+    -- old newest-entry-only rehydrate read [1], never looked at [2], and the real
+    -- cooldown — hours still to run — silently became "Open" on the next login.
+    Timers.state = {}
+    logs.onyH = {
+        { epoch = t - 60,    who = "Overlord Runthak", trust = "local", killed = true },
+        { epoch = t - 20425, who = "NWB",              trust = "nwb" },
+    }
+    Timers.RehydrateFromStore()
+    local s = Timers.state.onyH
+    tcheck(s and s.killedAt == t - 60, "the newest KILL rehydrates", fails)
+    tcheck(s and s.lastPop == t - 20425,
+        "...and the older POP behind it rehydrates TOO (it did not before)", fails)
+    local st = Timers.BuffStatus("onyH", t)
+    tcheck(st.state == "cd", "so the live cooldown survives the relog", fails)
+    tcheck(st.killActive == true, "...and so does the kill", fails)
+
+    -- Reversed order in the log must give the identical answer — the walk is by
+    -- epoch, not by position.
+    Timers.state = {}
+    logs.onyH = {
+        { epoch = t - 20425, who = "NWB",              trust = "nwb" },
+        { epoch = t - 60,    who = "Overlord Runthak", trust = "local", killed = true },
+    }
+    Timers.RehydrateFromStore()
+    tcheck(Timers.state.onyH.killedAt == t - 60 and Timers.state.onyH.lastPop == t - 20425,
+        "log order does not change what is seeded", fails)
+
+    -- A kill the newest pop already superseded stays retired (NWB §3.3), exactly
+    -- as it would on the live Record path.
+    Timers.state = {}
+    logs.onyH = {
+        { epoch = t - 100, who = "yeller",           trust = "local" },
+        { epoch = t - 900, who = "Overlord Runthak", trust = "local", killed = true },
+    }
+    Timers.RehydrateFromStore()
+    tcheck((Timers.state.onyH.killedAt or 0) == 0,
+        "a kill older than the newest drop does not rehydrate", fails)
+
+    logs.onyH, Timers.state = {}, {}
+end
+
 function Timers.RunSelfTests(verbose)
     local suites = {
         { name = "cd derivation",     fn = testCDDerivation },
@@ -6100,6 +6587,11 @@ function Timers.RunSelfTests(verbose)
         { name = "hand-in unification",      fn = testHandinUnification },
         { name = "local buff gain",          fn = testLocalBuffGain },
         { name = "reset state",              fn = testResetState },
+        -- F-KILL: the announcer-kill detection + visibility audit (2026-08-03).
+        { name = "local announcer detection", fn = testLocalAnnouncerDetection },
+        { name = "kill visibility vs cooldown", fn = testKillVisibility },
+        { name = "nwb announcer-death ingest", fn = testNWBKillIngest },
+        { name = "rehydrate kill AND pop",   fn = testRehydrateKillAndPop },
     }
     local allPass = true
     for _, suite in ipairs(suites) do

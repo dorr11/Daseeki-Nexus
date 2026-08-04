@@ -19,6 +19,29 @@
   the group leader; and the people in the group are your own mesh characters. Joining or
   leading anyone else's group is completely inert — Nexus does not even look at the roster.
 
+- **Fixed:** killing a world-buff announcer looked like it had not been noticed at all.
+  If the buff's own cooldown had longer to run than the announcer's 6-minute respawn,
+  the timer row simply kept counting the cooldown down and never mentioned the kill —
+  so a raid that had just killed Overlord Runthak saw no sign Nexus had seen it. The
+  kill was in fact detected and recorded the whole time; it had nowhere to appear.
+  While the announcer is down, the row now says so ("Killed · 5:58") and the cooldown
+  it displaced moves to the hover tooltip, so nothing is lost either way.
+- **Fixed:** an announcer kill could wipe out a live cooldown on your next login. The
+  timers were rebuilt from only the newest entry in each log, so a fresh kill hid the
+  buff drop sitting behind it — a real six-hour Onyxia cooldown would come back as
+  "Open". Drops and kills are now restored independently.
+- **Fixed:** announcer deaths broadcast by NovaWorldBuffs users were being received and
+  then discarded. Nexus now reads them, with the same freshness and duplicate rules the
+  reference uses, so a kill someone else witnessed reaches your timers.
+- **Fixed:** an announcer was believed in the wrong city — a Stormwind announcer's death
+  reported from Orgrimmar counted. Each announcer is now only trusted in its own capital,
+  and the surrounding zone (Durotar, Elwynn Forest) now counts as well, so a kill at the
+  city gates is no longer missed.
+- **Fixed:** a buff drop now clears an older announcer kill, so the timers cannot go on
+  reporting an announcer as dead after he has demonstrably come back and yelled.
+- **Note:** announcer-kill detection works whoever lands the killing blow — either
+  faction, and including a mind-controlled announcer killed by his own side.
+
 ## 1.0.1 — 2026-08-04
 
 - **Fixed:** cross-account item counts stopped updating after the Daseeki Bags 2.0

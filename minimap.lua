@@ -170,6 +170,13 @@ local function statusFor(st)
     -- A kill is a respawn countdown, not a cooldown — amber, seconds resolution.
     if state == "killed" then return "Killed \194\183 respawns " .. fmtMSS(st.remaining), "warn" end
     if state == "cd" then
+        -- F-KILL: the same rule the dashboard row uses. A cooldown longer than the
+        -- respawn keeps `state` at "cd" (F3), so without this the minimap tooltip
+        -- silently omitted a kill that had in fact been detected and recorded.
+        if st.killActive then
+            return "Killed \194\183 respawns " .. fmtMSS(st.killRemaining or 0)
+                   .. " \194\183 CD " .. fmtRemaining(st.remaining or 0), "warn"
+        end
         -- pulse semantics live in the dashboard; the tooltip just states time.
         local token = ((st.remaining or 0) <= 20 * 60) and "danger" or "accent"
         return fmtRemaining(st.remaining or 0), token
