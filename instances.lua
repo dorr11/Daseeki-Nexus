@@ -747,6 +747,15 @@ function Instances.MergeInbound(aid, incoming)
     local added = 0
     for nameRealm, crec in pairs(incoming) do
         local inc = crec and crec.entries
+        -- OWN-ACCOUNT AUTHORITY (store.lua). The account-level check above only
+        -- catches a ledger ADDRESSED to our own account id; a peer relaying a
+        -- ledger for one of OUR characters under ITS OWN aid slips past it, the
+        -- same misattribution that let phantom character records in. Our own
+        -- lockouts are ours to capture.
+        if Store and Store.RejectInboundOwnCharacter
+           and Store.RejectInboundOwnCharacter(nameRealm) then
+            inc = nil
+        end
         if type(inc) == "table" then
             local drec = dest[nameRealm]
             if type(drec) ~= "table" then drec = { entries = {} }; dest[nameRealm] = drec end

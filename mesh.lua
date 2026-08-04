@@ -1640,6 +1640,23 @@ end
 local function handleState(f, sender, isRelay)
     local rec, err = Protocol.DecodeCharacter(f.payload)
     if not rec then return end
+    -- OWNER ATTRIBUTION IS INFERRED, NOT CARRIED. The binary STATE frame has no
+    -- owner-account field, so we guess: first from the record's own name, then
+    -- from whoever sent it. Both rungs are lossy and the failure is systematic:
+    --   * `aidForName` scans Mesh.peers, and Mesh.CanAdmitPeer refuses to admit
+    --     our own account id — so a record about one of OUR OWN characters can
+    --     NEVER match rung 1 and always falls through to the sender;
+    --   * on a RELAY the sender is the FORWARDER, not the owner, so a
+    --     store-and-forwarded record is attributed to the wrong account.
+    -- Net effect: a peer relaying our own character files it under the peer's
+    -- bucket as a phantom second copy, which then competed with our own capture
+    -- for the roster card (Dashboard.RosterCandidateBetter ranks on raw
+    -- ownerEpoch, no self preference). Store.RejectInboundOwnCharacter closes
+    -- that at the arbitration boundary on OWNERSHIP rather than on epochs —
+    -- epochs cannot referee it, because a relayed copy honestly carries the
+    -- ORIGINAL capture epoch and therefore ties rather than loses.
+    -- Carrying the true owner id (and an owner-vs-relay flag) on the wire is
+    -- the schema v3 work; this local rule is its precursor.
     local ownerAID = aidForName(rec.nameRealm) or aidForName(sender) or ""
     -- Owner-wins / epoch / lowest-account-ID tiebreak lives in the store.
     local senderAID = aidForName(sender)
@@ -4412,6 +4429,119 @@ local function testInboundRepaintPump()
 end
 
 ----------------------------------------------------------------------
+-- OWN-ACCOUNT AUTHORITY, at the wire.
+--
+-- Drives REAL frames through Mesh.Dispatch, because the whole defect lived in
+-- the gap between what the frame says and what the store is asked to do:
+-- handleState infers the owner account from the peer table, so a peer relaying
+-- one of OUR characters gets it filed under the PEER's bucket and the old
+-- self-immunity check (which asks about the destination bucket) never fired.
+--
+-- Also pins the honest-epoch property that makes newest-wins safe for third
+-- parties: a forwarded record must carry the ORIGINAL capture epoch, never a
+-- fresh send-time stamp.
+----------------------------------------------------------------------
+local function testOwnAccountAuthorityWire()
+    local savedAccounts = Store.data.accounts
+    local savedPeers    = Mesh.peers
+    local savedAID      = ns.GetAccountID
+    local savedSeen     = Mesh.SeenBefore
+    local savedFresh    = Mesh.FreshSeq
+    local savedEnqueue  = Mesh.Enqueue
+    local savedNameFor  = Mesh.NameForAID
+    local savedAuth     = Store._ownAuthority
+    local T = 1700000000
+
+    ns.GetAccountID = function() return "1" end
+    Mesh.peers = { ["9"] = { aid = "9", name = "Peer-R", online = true, lastSeen = T } }
+    Mesh.SeenBefore = function() return false end
+    Mesh.FreshSeq   = function() return true end
+    Store._ownAuthority = { drops = 0, names = {} }
+
+    local function newBucket(isSelf)
+        return { isSelf = isSelf or false, characters = {}, homeless = {},
+                 segments = { sixties = {}, summoners = {}, norole = {} }, segmentHashes = {} }
+    end
+    local function rec(nameRealm, epoch, boon)
+        local r = Store.NewCharacterRecord(nameRealm)
+        r.level = 60
+        r.ownerEpoch, r.lastDataUpdate, r.lastSeen = epoch, epoch, epoch
+        r.boonCount = boon or 0
+        return r
+    end
+
+    Store.data.accounts = { ["1"] = newBucket(true), ["9"] = newBucket(false) }
+    Store.data.accounts["1"].characters["Mine-R"] = rec("Mine-R", T, 7)
+
+    local ok, why = true, nil
+    local function ck(c, m) if ok and not c then ok, why = false, m end end
+
+    -- 1) THE BUG, end to end. Peer "9" relays OUR OWN character back at us with a
+    --    FRESHER epoch and no buffs. handleState will address it to bucket "9".
+    local frame = Mesh.BuildFrame(OP.STATE, Protocol.EncodeCharacter(rec("Mine-R", T + 5000, 0)), { seq = 1 })
+    pcall(Mesh.Dispatch, Protocol.PREFIX.STATE, frame, "Peer-R")
+    ck(Store.data.accounts["9"].characters["Mine-R"] == nil,
+        "a peer's relayed copy of OUR OWN character became a phantom under the peer's bucket")
+    ck(Store.data.accounts["1"].characters["Mine-R"].boonCount == 7,
+        "our own capture was altered by a relayed copy")
+    ck(Store.data.accounts["1"].characters["Mine-R"].ownerEpoch == T,
+        "our own record's epoch was moved by a relayed copy")
+
+    -- 2) The SEGMENT (bulk) path obeys the same rule, and only for our own
+    --    characters — the peer's genuine records in the same batch still land.
+    local recs = { ["Mine-R"] = rec("Mine-R", T + 9000, 0), ["Theirs-R"] = rec("Theirs-R", T + 10, 3) }
+    local segPayload = Mesh.Pack({ aid = "9", area = "sixties", records = recs })
+    if segPayload then
+        pcall(Mesh.Dispatch, Protocol.PREFIX.SYNC,
+            Mesh.BuildFrame(OP.SEGMENT, segPayload, { seq = 2 }), "Peer-R")
+    end
+    ck(Store.data.accounts["9"].characters["Mine-R"] == nil,
+        "the bulk SEGMENT path let a copy of our own character through")
+    ck(Store.data.accounts["9"].characters["Theirs-R"] ~= nil,
+        "the authority rule wrongly dropped the peer's OWN record from the same segment")
+    ck((Store._ownAuthority.drops or 0) >= 2,
+        "wire-path drops were not counted")
+
+    -- 3) HONEST EPOCHS on store-and-forward. A relayed frame must re-emit the
+    --    ORIGINAL capture epoch; if the forwarder re-stamped it at send time,
+    --    every third-party observer's newest-wins would pick the relay over the
+    --    owner's own fresher data. Capture what the forward actually enqueues.
+    local captured = nil
+    Mesh.NameForAID = function(aid) local p = Mesh.peers[aid]; return p and p.name or nil end
+    Mesh.Enqueue = function(prefix, fr, meta)
+        if meta and meta.op == "relay" then captured = fr end
+        return true
+    end
+    local CAPTURE_EPOCH = T + 1234
+    local relayFrame = Mesh.BuildFrame(OP.STATE,
+        Protocol.EncodeCharacter(rec("Theirs-R", CAPTURE_EPOCH, 3)),
+        { seq = 3, relayTo = "Third-R" })
+    pcall(Mesh.Dispatch, Protocol.PREFIX.STATE, relayFrame, "Peer-R")
+    ck(captured ~= nil, "the relay hop enqueued nothing to forward")
+    if captured then
+        local pf = Mesh.ParseFrame(captured)
+        local decoded = pf and Protocol.DecodeCharacter(pf.payload)
+        ck(decoded ~= nil, "the forwarded relay frame did not decode")
+        if decoded then
+            ck(decoded.ownerEpoch == CAPTURE_EPOCH,
+                "RELAY RE-STAMPED THE EPOCH: forwarded ownerEpoch=" ..
+                tostring(decoded.ownerEpoch) .. " expected the original " .. tostring(CAPTURE_EPOCH))
+            ck(decoded.lastDataUpdate == CAPTURE_EPOCH,
+                "relay re-stamped lastDataUpdate instead of preserving the capture stamp")
+        end
+    end
+
+    Store.data.accounts = savedAccounts
+    Mesh.peers          = savedPeers
+    ns.GetAccountID     = savedAID
+    Mesh.SeenBefore, Mesh.FreshSeq = savedSeen, savedFresh
+    Mesh.Enqueue        = savedEnqueue
+    Mesh.NameForAID     = savedNameFor
+    Store._ownAuthority = savedAuth
+    return ok, why
+end
+
+----------------------------------------------------------------------
 -- HASH-AFTER-SEND: Mesh.PushState must report how many targets it reached.
 ----------------------------------------------------------------------
 local function testPushDeliveryCount()
@@ -5050,6 +5180,7 @@ function Mesh.RunSelfTests(verbose)
         { name = "state content hash", fn = testStateHash },
         { name = "push suppressor",    fn = testPushSuppressor },
         { name = "inbound repaint pump", fn = testInboundRepaintPump },
+        { name = "own-account authority (wire)", fn = testOwnAccountAuthorityWire },
         { name = "push delivery count",  fn = testPushDeliveryCount },
         { name = "segment content fingerprint (§9.6)", fn = testSegmentFingerprint },
         { name = "canonical peer names", fn = testCanonicalPeerNames },

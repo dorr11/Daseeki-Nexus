@@ -3148,6 +3148,21 @@ function Tracker.DebugSanity()
         S.ATTUNE_MIN_LEVEL or 0, S.DMT_MIN_LEVEL or 0))
     ns:Print(string.format("  nameless inbound dropped: %d",
         S._droppedNamelessInbound or 0))
+    -- Own-account authority: inbound copies of OUR OWN characters, refused at
+    -- the arbitration boundary regardless of epoch. A non-zero count is normal
+    -- and healthy on a multi-account mesh — it is the relay traffic this
+    -- account is correctly declining to believe about itself.
+    local oa = S._ownAuthority
+    if type(oa) == "table" then
+        local worst, worstN = nil, 0
+        for nr, n in pairs(oa.names or {}) do
+            if n > worstN then worst, worstN = nr, n end
+        end
+        ns:Print(string.format(
+            "  own-account authority: %d inbound record(s) about OUR characters dropped%s",
+            oa.drops or 0,
+            worst and string.format(" (most: %s x%d)", worst, worstN) or ""))
+    end
     ns:Print(string.format("  tooltip lines naming an unboonable buff, ignored: %d",
         Tracker._boonScopeRejects or 0))
     local done = S.data and S.data[Tracker.AURA_REPAIR_KEY]

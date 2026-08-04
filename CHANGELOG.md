@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+- **Fixed:** your own characters could be overwritten on screen by another account's
+  second-hand copy of them. If you played Poonyx on account 1 while account 2 was also
+  online, account 2's older idea of Poonyx could take over the Poonyx card — showing
+  stale or missing world buffs for a character you were *sitting on* — and another
+  account's alt could likewise show buffs it did not really have. **Each account is now
+  the source of truth for its own characters:** Nexus refuses mesh data about a character
+  that belongs to this account, no matter how recent that data claims to be, so what you
+  captured yourself always wins. Data about *other* accounts' characters syncs exactly as
+  before, newest-first.
+- **Note:** nothing was lost. The overwrite only ever affected the live display and the
+  synced copy of a character; your **notes are stored separately and were never touched**,
+  and any character that looked wrong corrects itself the next time you log into it.
+- **Added:** `/nexus debug sanity` now reports how many inbound records about your own
+  characters were refused. A number above zero is normal and healthy on a multi-account
+  setup — it is this account correctly declining to be told about itself.
+
 ## 1.1.0 — 2026-08-04
 
 <!-- RELEASE NOTE: the cross-account tooltips below are a new user-facing FEATURE, not a

@@ -1746,9 +1746,100 @@ function Store.GetSelfAccount(createIfMissing)
 end
 
 -- Is this account bucket ours? Inbound mesh data must never overwrite it.
+--
+-- HARDENED (own-account authority): the old body asked the STORE ("is there a
+-- bucket under this id and is it flagged self?"), which answers FALSE for our
+-- own account id whenever the bucket does not exist yet — the exact state a
+-- fresh install is in when the first inbound frame arrives, and
+-- WriteInboundCharacter's very next line creates that bucket with isSelf=true
+-- and writes the peer's record into it. Ask our IDENTITY first; the bucket flag
+-- stays as the second source of truth (an owner who re-set this account up
+-- under a new id keeps the old bucket flagged self, and that bucket is still
+-- ours).
 function Store.IsSelfAccount(aid)
+    local selfID = ns.GetAccountID and ns:GetAccountID() or ""
+    if aid ~= nil and aid ~= "" and aid == selfID then return true end
     local bucket = Store.data.accounts[aid or ""]
     return bucket ~= nil and bucket.isSelf == true
+end
+
+----------------------------------------------------------------------
+-- OWN-ACCOUNT AUTHORITY (owner rule, 2026-08-04)
+--
+-- THE RULE, ABSOLUTE: this account is the source of truth for its own
+-- characters. A record that arrives over the mesh describing a character of
+-- OUR OWN account is DROPPED — always, no matter how new its epoch claims to
+-- be, no matter which bucket the frame asks us to file it under.
+--
+-- WHY THE EXISTING SELF-IMMUNITY GUARD WAS NOT ENOUGH. Store.IsSelfAccount
+-- answers a question about the DESTINATION BUCKET, and the destination bucket
+-- is chosen by mesh.lua's handleState from
+--     ownerAID = aidForName(rec.nameRealm) or aidForName(sender) or ""
+-- `aidForName` scans Mesh.peers, and Mesh.CanAdmitPeer refuses to admit our own
+-- account id — so OUR OWN characters are never in the peer table and the first
+-- lookup ALWAYS misses for them. The fallback then attributes the record to
+-- whoever RELAYED it. Our own character therefore lands in the relayer's bucket
+-- as a phantom second copy, and the self-immunity check never fires because by
+-- then the write is not aimed at the self bucket at all.
+--
+-- That phantom is not inert. Dashboard.RosterCandidates (ui_shell.lua) gathers
+-- EVERY bucket holding a Name-Realm and Dashboard.RosterCandidateBetter ranks
+-- them by raw ownerEpoch first, with no preference for the self bucket — so a
+-- peer's second-hand copy of our own character can win the roster card and the
+-- detail pane away from the capture we took ourselves. That is the owner's
+-- report: "acct 2 shouldn't be sending data about acct 1 to acct 1 and acct 1
+-- treating that as more relevant than the acct 1 data it read itself."
+--
+-- WHY OWNERSHIP AND NOT EPOCHS. Epochs cannot referee this. A relayed copy
+-- carries the ORIGINAL capture epoch (verified: forwardRelay re-emits the
+-- payload bytes verbatim, Mesh.SendSegment ships stored records unchanged, and
+-- Mesh.LogoutRecord deliberately leaves ownerEpoch alone), so at best it TIES
+-- our own record and lingers forever — ReconcileStaleTwins only retires
+-- STRICTLY older twins. Ownership is the only stable answer.
+--
+-- Name-Realm is globally unique in WoW, so "this name is in our self bucket"
+-- IS the ownership claim. Records only ever enter the self bucket via
+-- WriteSelfCharacter / EnsureSelfCharacter — i.e. we literally played that
+-- character on this account.
+--
+-- KNOWN, ACCEPTED EDGE: if a character is deleted here and its name recreated
+-- on a DIFFERENT account, our stale self-bucket record keeps claiming the name
+-- and we will drop the new owner's pushes. The owner-facing remove (options.lua
+-- roster delete) clears the stale record and restores sync. Accepted: the rule
+-- is deliberately absolute, and a silently-wrong roster is the worse failure.
+----------------------------------------------------------------------
+
+-- Counters surfaced by /nexus debug sanity.
+Store._ownAuthority = { drops = 0, names = {} }
+
+-- Is `nameRealm` a character of OUR OWN account? Checks the real table and the
+-- homeless table (a self-owned key with no manifest slot is still ours — the
+-- owner's directive names "homeless self-owned keys" explicitly).
+function Store.IsOwnCharacter(nameRealm)
+    if type(nameRealm) ~= "string" or nameRealm == "" then return false end
+    local accounts = Store.data and Store.data.accounts
+    if type(accounts) ~= "table" then return false end
+    local selfID = ns.GetAccountID and ns:GetAccountID() or ""
+    for aid, bucket in pairs(accounts) do
+        if type(bucket) == "table"
+           and (bucket.isSelf == true or (aid ~= "" and aid == selfID)) then
+            if (bucket.characters and bucket.characters[nameRealm] ~= nil)
+               or (bucket.homeless and bucket.homeless[nameRealm] ~= nil) then
+                return true
+            end
+        end
+    end
+    return false
+end
+
+-- THE ARBITRATION BOUNDARY for the rule. Every inbound/bulk character write
+-- calls this first and drops on true. Counts the drop for diagnostics.
+function Store.RejectInboundOwnCharacter(nameRealm)
+    if not Store.IsOwnCharacter(nameRealm) then return false end
+    local c = Store._ownAuthority
+    c.drops = (c.drops or 0) + 1
+    c.names[nameRealm] = (c.names[nameRealm] or 0) + 1
+    return true
 end
 
 ----------------------------------------------------------------------
@@ -2105,6 +2196,15 @@ function Store.WriteInboundCharacter(aid, nameRealm, record, senderAID)
     end
     if Store.IsSelfAccount(aid) then
         return false   -- never overwrite our own data from the wire
+    end
+    -- OWN-ACCOUNT AUTHORITY. The guard above only asks "is the DESTINATION
+    -- bucket ours" — and a relayed copy of our own character is addressed to
+    -- the RELAYER's bucket, so it sails straight past. Ask the question that
+    -- actually matters: is this character OURS? If so the wire has nothing to
+    -- tell us about it, whatever epoch it carries. See the OWN-ACCOUNT
+    -- AUTHORITY block above for the full evidence.
+    if Store.RejectInboundOwnCharacter(nameRealm) then
+        return false
     end
     -- A9.1 DECODE BOUNDARY. Every inbound record — binary STATE frames (u16
     -- remaining) and whole-table SEGMENT records alike — funnels through here, so
@@ -5784,6 +5884,121 @@ local function testBagsImportMarker(fails)
     if Store.data.syncNamespaces then Store.data.syncNamespaces.bags = savedNS end
 end
 
+----------------------------------------------------------------------
+-- OWN-ACCOUNT AUTHORITY — the owner rule
+--
+-- Locks in: an account NEVER applies inbound mesh data to its own characters,
+-- even when the inbound epoch is higher; other accounts still merge normally by
+-- epoch; the bulk/segment path obeys the same rule; and relayed records keep
+-- their ORIGINAL capture epoch (the property that makes newest-wins honest for
+-- third-party observers).
+----------------------------------------------------------------------
+local function testOwnAccountAuthority(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local T = 1700000000
+
+    local savedAccounts = Store.data.accounts
+    local savedGetAID   = ns.GetAccountID
+    local savedAuth     = Store._ownAuthority
+    local savedLog      = Store._ghostLog
+    Store._ghostLog     = function() end
+
+    local function bucket(chars, isSelf, homeless)
+        return { isSelf = isSelf or false, characters = chars or {},
+                 homeless = homeless or {}, segments = {}, segmentHashes = {} }
+    end
+    local function wire(nameRealm, epoch, level)
+        local r = Store.NewCharacterRecord(nameRealm)
+        r.ownerEpoch, r.lastDataUpdate, r.lastSeen = epoch, epoch, epoch
+        r.level = level or 60
+        return r
+    end
+
+    ns.GetAccountID = function() return "1" end
+    Store._ownAuthority = { drops = 0, names = {} }
+    Store.data.accounts = {
+        ["1"] = bucket({ ["Poonyx-Whitemane"] = wire("Poonyx-Whitemane", T, 60) }, true,
+                       { ["Homeless-Whitemane"] = wire("Homeless-Whitemane", T, 60) }),
+        ["2"] = bucket({ ["Puunyx-Whitemane"] = wire("Puunyx-Whitemane", T, 60) }),
+    }
+    Store.data.accounts["1"].characters["Poonyx-Whitemane"].boonCount = 4
+
+    -- (1) THE BUG. Account 2 relays OUR Poonyx back to us. mesh.lua attributes it
+    -- to the relayer, so it is addressed to bucket "2", NOT the self bucket —
+    -- the old self-immunity check never fired. Epoch is deliberately HIGHER.
+    local relayed = wire("Poonyx-Whitemane", T + 5000, 60)
+    relayed.boonCount = 0
+    ck(Store.WriteInboundCharacter("2", "Poonyx-Whitemane", relayed, "2") == false,
+        "THE BUG: a relayed copy of our OWN character is refused (higher epoch and all)")
+    ck(Store.data.accounts["2"].characters["Poonyx-Whitemane"] == nil,
+        "...and no phantom copy is created under the relayer's bucket")
+    ck(Store.data.accounts["1"].characters["Poonyx-Whitemane"].boonCount == 4,
+        "...and our own capture is untouched")
+    ck(Store.data.accounts["1"].characters["Poonyx-Whitemane"].ownerEpoch == T,
+        "...including its epoch (no re-stamp from the loser)")
+
+    -- (2) Addressed at the self bucket directly: still refused (belt and braces).
+    ck(Store.WriteInboundCharacter("1", "Poonyx-Whitemane", wire("Poonyx-Whitemane", T + 9000), "2") == false,
+        "an inbound write aimed straight at the self bucket is refused")
+
+    -- (3) Homeless self-owned keys are ours too.
+    ck(Store.WriteInboundCharacter("2", "Homeless-Whitemane", wire("Homeless-Whitemane", T + 5000), "2") == false,
+        "a self-owned HOMELESS key is protected by the same rule")
+
+    -- (4) The counter moved, once per drop. Note case (2) is NOT counted here:
+    -- a write addressed at the self bucket is caught one line earlier by the
+    -- older IsSelfAccount guard and never reaches the authority check. The
+    -- counter therefore measures exactly what it claims — records that got past
+    -- bucket-level self-immunity because they were misattributed to a peer.
+    ck(Store._ownAuthority.drops == 2,
+        "every misattributed refusal is counted for /nexus debug sanity (got "
+        .. tostring(Store._ownAuthority.drops) .. ")")
+    ck(Store._ownAuthority.names["Poonyx-Whitemane"] == 1,
+        "...and counted per character")
+    ck(Store._ownAuthority.names["Homeless-Whitemane"] == 1,
+        "...including the homeless self-owned key")
+
+    -- (5) REGRESSION GUARD: other accounts still merge normally, by epoch.
+    ck(Store.WriteInboundCharacter("2", "Puunyx-Whitemane", wire("Puunyx-Whitemane", T + 100), "2") == true,
+        "another account's NEWER record still merges")
+    ck(Store.data.accounts["2"].characters["Puunyx-Whitemane"].ownerEpoch == T + 100,
+        "...and it really landed")
+    ck(Store.WriteInboundCharacter("2", "Puunyx-Whitemane", wire("Puunyx-Whitemane", T - 100), "2") == false,
+        "another account's OLDER record is still rejected by the epoch guard")
+    ck(Store.WriteInboundCharacter("3", "Newpeer-Whitemane", wire("Newpeer-Whitemane", T), "3") == true,
+        "a brand-new peer character is still adopted")
+
+    -- (6) The self bucket is decided by IDENTITY, not just the stored flag: a
+    -- fresh install whose self bucket does not exist yet must still be immune.
+    Store.data.accounts = { ["2"] = bucket({}) }
+    ck(Store.IsSelfAccount("1") == true,
+        "our own account id is self even before its bucket exists")
+    ck(Store.WriteInboundCharacter("1", "Anything-Whitemane", wire("Anything-Whitemane", T), "2") == false,
+        "...so a first-contact frame cannot seed our self bucket from the wire")
+    ck(Store.data.accounts["1"] == nil,
+        "...and no self bucket was conjured to hold it")
+
+    -- (7) MUTATION TEST. Neuter the authority check and prove the suite notices —
+    -- a check that cannot fail is not a check.
+    local realReject = Store.RejectInboundOwnCharacter
+    Store.RejectInboundOwnCharacter = function() return false end
+    ns.GetAccountID = function() return "1" end
+    Store.data.accounts = {
+        ["1"] = bucket({ ["Poonyx-Whitemane"] = wire("Poonyx-Whitemane", T, 60) }, true),
+        ["2"] = bucket({}),
+    }
+    local leaked = Store.WriteInboundCharacter("2", "Poonyx-Whitemane", wire("Poonyx-Whitemane", T + 5000), "2")
+    Store.RejectInboundOwnCharacter = realReject
+    ck(leaked == true and Store.data.accounts["2"].characters["Poonyx-Whitemane"] ~= nil,
+        "MUTATION: with the authority check disabled the phantom DOES appear "
+        .. "(so test (1) is really exercising the guard)")
+
+    ns.GetAccountID     = savedGetAID
+    Store.data.accounts = savedAccounts
+    Store._ownAuthority = savedAuth
+    Store._ghostLog     = savedLog
+end
+
 function Store.RunSelfTests(verbose)
     local suites = {
         { name = "defaults",        fn = testDefaults },
@@ -5805,6 +6020,7 @@ function Store.RunSelfTests(verbose)
         { name = "manifest ghost cleanup (B4)", fn = testManifestGhostCleanup },
         { name = "stale-twin reconciliation (B5)", fn = testStaleTwins },
         { name = "self-bucket sanity (B5.1)", fn = testSelfBucketSanity },
+        { name = "own-account authority", fn = testOwnAccountAuthority },
         { name = "timer log dedup (F10)", fn = testTimerLogDedup },
         { name = "coordinate overrides (A17.3)", fn = testCoordinateOverrides },
     }
