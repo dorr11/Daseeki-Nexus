@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.1.1 — 2026-08-04
 
 - **Fixed:** your own characters could be overwritten on screen by another account's
   second-hand copy of them. If you played Poonyx on account 1 while account 2 was also
