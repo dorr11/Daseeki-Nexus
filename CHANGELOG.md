@@ -1,5 +1,27 @@
 # Changelog
 
+## Unreleased
+
+- **Fixed:** a **gold-only change could go missing on your other accounts.** Take money
+  out of the mailbox (or sell to a vendor, finish a trade, collect an auction) and nothing
+  moves except your gold — no bags change, nothing is equipped. Nexus captured the new
+  amount correctly on the character itself, but the update could sit unsent for minutes
+  behind a queue of bulk catch-up traffic, so the other accounts' cards and tooltips kept
+  showing the old number. **A gold change is now published like any other change and gets
+  ahead of the bulk backfill**, so the new amount reaches your other accounts within
+  seconds. This is the behaviour Daseeki Bags had before the rebuild, where gold had its
+  own dedicated push.
+- **Fixed:** Nexus republished your whole inventory record every time *anything* nudged
+  it, even when nothing had actually changed. That churn is what filled the queue the
+  gold update was stuck behind. **Nexus now compares what it just captured with what it
+  last sent and stays quiet when they match** — gold is part of that comparison, so a
+  gold-only change always counts as a change. Less traffic, and real updates arrive
+  sooner.
+- **Added:** `/nexus debug inventory` now shows the money side of the story on one line —
+  the gold your record currently holds, the gold a fresh look would find, and whether
+  Nexus considers that a change worth sending. `/nexus debug inventory push` forces a
+  republish of the character you are on.
+
 ## 1.1.1 — 2026-08-04
 
 - **Fixed:** your own characters could be overwritten on screen by another account's

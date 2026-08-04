@@ -53,6 +53,41 @@
 -- summary the contract has no room for. Optional by construction — every reader
 -- must tolerate its absence, because a 1.x publisher never sends it.
 --
+-- DELTA DETECTOR (restored from the 1.x design): a dirty signal is a HINT that
+-- something MAY have moved, never a statement that it did. 1.x split the job in
+-- two and both halves detected a delta before they spent a frame on the wire:
+--
+--   * money        Bags/core/features/meshSync.lua registered PLAYER_MONEY and
+--                  debounced 4s into PushGold() — money had its OWN tiny
+--                  253-byte push, independent of the item machinery, so a
+--                  gold-only change (a mailbox pickup, a vendor sale, a trade)
+--                  always propagated on its own.
+--   * items/currency
+--                  Bags/core/features/meshInventory.lua debounced its dirty
+--                  signals 3s into Recompute(), which Diff()ed the new maps
+--                  against the stored ones and RETURNED EARLY when nothing
+--                  changed — no rev bump, no broadcast.
+--
+-- Nexus folds money INTO the one `bags` payload, so both halves collapse into a
+-- single question that must be asked before every publish: DID THE PAYLOAD
+-- CONTENT CHANGE? Inventory.PayloadSignature answers it, and MONEY IS A
+-- FIRST-CLASS TERM in that signature — a mail-gold pickup moves nothing but
+-- `money`, and a signature that skipped it would swallow the very case this
+-- detector exists for. `ts` is deliberately NOT in the signature: it moves on
+-- every capture, and including it is identical to having no detector at all.
+--
+-- Both directions matter and each fixes a real failure:
+--   changed   -> rev bumps, the payload reaches the wire, peers see the gold.
+--   unchanged -> NO rev bump and NO push. Without this, every incidental dirty
+--                signal re-revved us, which churned the namespace rev hash the
+--                mesh heartbeat advertises; a churning hash makes every peer
+--                pull the WHOLE namespace on every heartbeat, and those bulk
+--                answers are what a genuinely fresh payload then queues behind.
+--
+-- THROTTLE: unchanged — PUBLISH_DEBOUNCE (3s), restartable, so a burst of money
+-- events coalesces into one publish. That is 1.x's DIRTY_DEBOUNCE exactly, and
+-- one second tighter than the 4s its gold push used. No per-copper spam.
+--
 -- TEARDOWN: C_Container / GetMoney / the mail API all read cold during logout
 -- and behind a loading screen. tracker.lua learned this the hard way (its latch
 -- header is the long version); this is the cheap mirror of the same discipline —
@@ -112,6 +147,7 @@ local PROBE_GEN = 2
 Inventory.PROBE_GEN = PROBE_GEN
 
 local PUBLISH_DEBOUNCE  = 3     -- coalesce rapid local edits before publishing
+                                -- (1.x meshInventory's DIRTY_DEBOUNCE exactly)
 local INITIAL_PUBLISH   = 6     -- seconds after activation: first capture+publish
 local MODE_DELAY        = 2     -- seconds after LOGIN before deciding the mode
 local REFRESH_INTERVAL  = 30    -- seconds between namespace -> owners projections
@@ -120,6 +156,53 @@ local ENTERING_WORLD_GRACE = 2  -- seconds after PLAYER_ENTERING_WORLD that a sc
 local EQUIP_SLOTS       = 19    -- Classic Era paper-doll inventory slots
 
 local EMPTY = {}
+
+-- Exposed so the diagnostic line and the self-tests can state the throttle
+-- rather than restating the number.
+Inventory.PUBLISH_DEBOUNCE = PUBLISH_DEBOUNCE
+
+----------------------------------------------------------------------
+-- The dirty-signal set, AS DATA
+--
+-- The wiring at the bottom of this file registers PLAIN_DIRTY_EVENTS in a loop,
+-- so "is PLAYER_MONEY a dirty signal?" is a question about a table a self-test
+-- can read and mutate — not a claim about a closure buried in an event
+-- handler. That matters here specifically: 1.x carried the money signal in a
+-- DIFFERENT module (meshSync's own PLAYER_MONEY -> PushGold), so folding money
+-- into the one `bags` payload silently made this list load-bearing for gold.
+-- Drop PLAYER_MONEY from it and a mailbox gold pickup never publishes.
+--
+-- PLAIN   nothing to re-read first; the live scan in BuildPayload already sees
+--         the change, so the handler is just "coalesce and publish".
+-- REFRESH a cold component (bank / mail) has to be re-scanned into the stored
+--         parts WHILE its frame is open, so these keep bespoke handlers. They
+--         are listed here so the two sets together are the whole registration.
+----------------------------------------------------------------------
+
+Inventory.MONEY_EVENT = "PLAYER_MONEY"
+
+Inventory.PLAIN_DIRTY_EVENTS = {
+    "PLAYER_MONEY",              -- gold: mail pickup, vendor, trade, quest, AH
+    "PLAYER_EQUIPMENT_CHANGED",
+}
+
+Inventory.REFRESH_DIRTY_EVENTS = {
+    "BAG_UPDATE_DELAYED",
+    "BANKFRAME_OPENED", "PLAYERBANKSLOTS_CHANGED", "BANKFRAME_CLOSED",
+    "MAIL_INBOX_UPDATE", "MAIL_CLOSED",
+}
+
+-- PURE. Is `event` one of the signals that marks the publisher dirty? Both
+-- lists may be overridden by the caller, which is what lets a mutation test ask
+-- "what would happen if PLAYER_MONEY were not in the set?".
+function Inventory.IsDirtyEvent(event, plain, refresh)
+    if type(event) ~= "string" or event == "" then return false end
+    plain   = plain   or Inventory.PLAIN_DIRTY_EVENTS
+    refresh = refresh or Inventory.REFRESH_DIRTY_EVENTS
+    for i = 1, #plain   do if plain[i]   == event then return true end end
+    for i = 1, #refresh do if refresh[i] == event then return true end end
+    return false
+end
 
 ----------------------------------------------------------------------
 -- Session state
@@ -132,6 +215,8 @@ Inventory._healed      = false   -- this session unlatched a gen-1 consume-only 
 Inventory._dirtyTimer  = nil
 Inventory._ticker      = nil
 Inventory._bankOpen    = false
+Inventory._lastSig     = nil     -- signature of the payload we last PUBLISHED
+Inventory._pending     = nil     -- payload handed straight to provide() (see Publish)
 
 -- Teardown latch (see the header).
 Inventory._leavingWorld   = false
@@ -508,6 +593,80 @@ function Inventory.BuildPayload(now)
         -- ---- additive, optional; absent on every 1.x payload ----
         mail       = { n = tonumber(parts.mailN) or 0, money = tonumber(parts.mailMoney) or 0 },
     }
+end
+
+----------------------------------------------------------------------
+-- DELTA DETECTOR: the payload's content signature
+--
+-- See the DELTA DETECTOR block in the file header for why this exists. Two
+-- properties are load-bearing and both are asserted in the self-tests:
+--
+--   MONEY IS A TERM. The mail-gold case moves `money` and nothing else, so a
+--   signature that skipped money would report "unchanged" for exactly the
+--   change the owner reported missing. Same for the additive mail summary,
+--   whose `money` field is the copper still sitting attached in the inbox.
+--
+--   `ts` IS NOT A TERM. BuildPayload stamps it from time() on every capture;
+--   folding it in would make every signature unique, which is the same as
+--   having no detector.
+--
+-- PURE, deterministic, and order-independent: the count maps are folded through
+-- a sorted id list, because pairs() order is not stable across sessions and a
+-- signature that depended on it would report a change that never happened.
+----------------------------------------------------------------------
+
+local function foldCountSig(out, tag, map)
+    local ids = {}
+    local byId = {}
+    if type(map) == "table" then
+        for id, n in pairs(map) do
+            local ni, nn = tonumber(id), tonumber(n)
+            if ni and nn and nn ~= 0 then
+                ids[#ids + 1] = ni
+                byId[ni] = nn
+            end
+        end
+    end
+    table.sort(ids)
+    local buf = { tag }
+    for i = 1, #ids do buf[#buf + 1] = ids[i] .. ":" .. byId[ids[i]] end
+    out[#out + 1] = table.concat(buf, ",")
+end
+
+-- PURE.
+function Inventory.PayloadSignature(p)
+    if type(p) ~= "table" then return "" end
+    local mail = (type(p.mail) == "table") and p.mail or EMPTY
+    local out = {
+        "money=" .. tostring(tonumber(p.money) or 0),
+        "mailn=" .. tostring(tonumber(mail.n) or 0),
+        "mailm=" .. tostring(tonumber(mail.money) or 0),
+        "level=" .. tostring(tonumber(p.level) or 0),
+        "sex="   .. tostring(tonumber(p.sex) or 0),
+        "class=" .. tostring(p.class or ""),
+        "race="  .. tostring(p.race or ""),
+        "fac="   .. tostring(p.faction or ""),
+    }
+    foldCountSig(out, "ic", p.itemCounts)
+    foldCountSig(out, "cur", p.currency)
+    return table.concat(out, "|")
+end
+
+-- The signature of what we last put on the wire. Falls back to the payload the
+-- namespace store ALREADY holds under our key, which is what makes a login with
+-- no offline change a no-op instead of a gratuitous rev bump plus fan-out —
+-- 1.x's `(cache.mesh.rev or 0) > 0` early return, expressed against our store.
+-- nil means "we have never published this character", and nil never compares
+-- equal to a real signature, so the first publish of a fresh character always
+-- goes out.
+function Inventory.LastPublishedSignature(ownerKey)
+    if Inventory._lastSig ~= nil then return Inventory._lastSig end
+    local S = ns.Store
+    local e = S and S.SyncNSGet and S.SyncNSGet(NS_KEY, ownerKey)
+    if e and type(e.data) == "table" then
+        return Inventory.PayloadSignature(e.data)
+    end
+    return nil
 end
 
 ----------------------------------------------------------------------
@@ -907,7 +1066,18 @@ end
 
 -- provide() for the namespace. Held in a local so ProbeEnvironment can tell our
 -- own registration apart from a foreign one.
+--
+-- Publish stashes the payload it already built in `_pending` and Sync.MarkDirty
+-- calls us back SYNCHRONOUSLY, so the handoff hands over the exact bytes the
+-- delta detector just judged — one container scan per publish, and no window in
+-- which the stored payload could differ from the one we compared. Any other
+-- caller (Sync.Get) finds `_pending` empty and gets a fresh capture.
 local function provideSelf()
+    local p = Inventory._pending
+    if p ~= nil then
+        Inventory._pending = nil
+        return p
+    end
     return Inventory.BuildPayload()
 end
 Inventory._provideFn = provideSelf
@@ -934,20 +1104,46 @@ function Inventory.RegisterNamespace()
     return true
 end
 
--- Capture + publish + mirror into the owners graph. Returns true when a fresh
--- payload was stored.
-function Inventory.Publish()
+-- Capture, run the delta detector, publish, mirror into the owners graph.
+--
+-- THREE outcomes, and the caller must tell the last two apart:
+--   true          the payload CHANGED: rev bumped, stored, handed to the mesh.
+--   "unchanged"   the payload is byte-for-byte what we already published. A
+--                 SETTLED state, not a failure — retrying would only re-ask the
+--                 same question and re-answer it the same way.
+--   false         we could not answer: disabled, consume-only, a cold/teardown
+--                 world, or no suite Sync. Worth retrying.
+--
+-- `force` skips the detector (the one caller is the diagnostic republish).
+function Inventory.Publish(force)
     if not Inventory.IsEnabled() then return false end
     if Inventory._mode == "consume" then return false end
     if not Inventory.CaptureAllowed() then return false end
     local S = suiteSync()
     if not S then return false end
-    if S.MarkDirty(NS_KEY) ~= true then return false end
-    Inventory.ProjectOwner(Inventory.SelfKey())
+
+    local ownerKey = Inventory.SelfKey()
+    local payload  = Inventory.BuildPayload()
+    if payload == nil then return false end
+
+    local sig = Inventory.PayloadSignature(payload)
+    if not force and sig == Inventory.LastPublishedSignature(ownerKey) then
+        Inventory._lastSig = sig
+        return "unchanged"
+    end
+
+    Inventory._pending = payload
+    local ok = S.MarkDirty(NS_KEY)
+    Inventory._pending = nil          -- belt: MarkDirty consumes it synchronously
+    if ok ~= true then return false end
+
+    Inventory._lastSig = sig
+    Inventory.ProjectOwner(ownerKey)
     return true
 end
 
--- Debounced publish, driven by the dirty signals.
+-- Debounced publish, driven by the dirty signals. Restartable, so a burst of
+-- money events inside the window coalesces into exactly one publish.
 function Inventory.MarkDirty()
     if not Inventory.IsEnabled() then return false end
     if Inventory._mode == "consume" then return false end
@@ -958,7 +1154,9 @@ function Inventory.MarkDirty()
     end
     Inventory._dirtyTimer = C_Timer.NewTimer(PUBLISH_DEBOUNCE, function()
         Inventory._dirtyTimer = nil
-        if not Inventory.Publish() then
+        -- ONLY a hard `false` re-arms. "unchanged" is an answered question, and
+        -- re-arming on it would spin the debounce forever on a quiet character.
+        if Inventory.Publish() == false then
             -- A cold or teardown moment: try once more after the grace expires
             -- rather than dropping the edit on the floor.
             if not Inventory.IsTeardown() and Inventory.IsEnabled()
@@ -1078,10 +1276,18 @@ ns:RegisterEvent("PLAYER_LOGOUT", function()
     stopTimers()
 end)
 
--- Dirty signals — the same set the 1.x publisher reacts to.
+-- Dirty signals — the same set the 1.x publisher reacts to, plus PLAYER_MONEY,
+-- which 1.x carried in its OTHER publisher (meshSync's PLAYER_MONEY -> 4s ->
+-- PushGold). Folding money into the one `bags` payload moved that signal here.
 local function dirty()
     if not Inventory.IsEnabled() then return end
     Inventory.MarkDirty()
+end
+
+-- Registered from the table, not one line per event, so the table IS the
+-- wiring and Inventory.IsDirtyEvent can be trusted (and mutated) by a test.
+for i = 1, #Inventory.PLAIN_DIRTY_EVENTS do
+    ns:RegisterEvent(Inventory.PLAIN_DIRTY_EVENTS[i], dirty)
 end
 
 ns:RegisterEvent("BAG_UPDATE_DELAYED", function()
@@ -1089,8 +1295,6 @@ ns:RegisterEvent("BAG_UPDATE_DELAYED", function()
     if Inventory._bankOpen then Inventory.RefreshBank() end
     Inventory.MarkDirty()
 end)
-ns:RegisterEvent("PLAYER_MONEY", dirty)
-ns:RegisterEvent("PLAYER_EQUIPMENT_CHANGED", dirty)
 
 ns:RegisterEvent("BANKFRAME_OPENED", function()
     Inventory._bankOpen = true
@@ -1138,8 +1342,18 @@ end)
 -- Diagnostics
 ----------------------------------------------------------------------
 
-ns:RegisterDebugCommand("inventory", function()
+ns:RegisterDebugCommand("inventory", function(args)
     local S = ns.Store
+
+    -- `/nexus debug inventory push` — republish THIS character past the delta
+    -- detector. The detector is deliberately hard to talk out of, so this is
+    -- the supported way to prove the wire end of the money path by hand.
+    if type(args) == "string" and args:match("^%s*push%s*$") then
+        local res = Inventory.Publish(true)
+        ns:Print("inventory: forced republish -> " .. tostring(res))
+        return
+    end
+
     local area = S and S.InventoryArea and S.InventoryArea()
     local owners, withMoney, gold = 0, 0, 0
     if area then
@@ -1163,6 +1377,24 @@ ns:RegisterDebugCommand("inventory", function()
         tostring(area and area.probeGen), PROBE_GEN, tostring(probe.bagsLoaded),
         tostring(Inventory.LegacyPublisherIn(probe.bagsTable) or "none"),
         tostring(probe.nsProvider), tostring(Inventory._healed)))
+
+    -- The money path, end to end, in one line: what our own record holds right
+    -- now, what a fresh capture would hold, and whether the detector would call
+    -- that a change. "would publish=false" with a gold delta is the bug this
+    -- block exists to make visible.
+    local selfKey = Inventory.SelfKey()
+    local mineNS  = S and S.SyncNSGet and S.SyncNSGet(NS_KEY, selfKey)
+    local live    = Inventory.BuildPayload()
+    local liveSig = live and Inventory.PayloadSignature(live) or nil
+    ns:Print(string.format("  self=%s | stored money=%s rev=%s | live money=%s"
+        .. " | would publish=%s | dirty signals=%d, debounce=%ds",
+        selfKey ~= "" and selfKey or "?",
+        tostring(mineNS and mineNS.data and mineNS.data.money),
+        tostring(mineNS and mineNS.rev),
+        tostring(live and live.money),
+        tostring(liveSig ~= nil and liveSig ~= Inventory.LastPublishedSignature(selfKey)),
+        #Inventory.PLAIN_DIRTY_EVENTS + #Inventory.REFRESH_DIRTY_EVENTS,
+        PUBLISH_DEBOUNCE))
 end)
 
 ----------------------------------------------------------------------
@@ -1193,6 +1425,7 @@ local function selfTest(verbose)
     local savedNS = S.SyncNS()[NS_KEY]
     local db = S.GetSettings and S.GetSettings()
     local savedEnabled = db and db.inventoryEnabled
+    local savedSig     = Inventory._lastSig
 
     area.owners   = {}
     area.migrated = false
@@ -1200,6 +1433,7 @@ local function selfTest(verbose)
     Inventory._mode, Inventory._activated = nil, false
     Inventory._leavingWorld, Inventory._loggingOut = false, false
     Inventory._enteredWorldAt = nil    -- math.huge since EW => not in grace
+    Inventory._lastSig = nil
     if db then db.inventoryEnabled = true end
 
     ------------------------------------------------------------------
@@ -1295,6 +1529,227 @@ local function selfTest(verbose)
         ck("payload carries the additive mail summary",
             type(mine.mail) == "table" and type(mine.mail.n) == "number"
             and type(mine.mail.money) == "number")
+    end
+
+    ------------------------------------------------------------------
+    -- 2b) THE MAIL-GOLD CASE — a MONEY-ONLY delta, end to end.
+    --
+    --     The reported break: gold taken out of the mailbox on one account
+    --     never showed up on the others. Nothing moves in that scenario except
+    --     `money` (and, once the inbox row is gone, the additive mail summary),
+    --     so every link below has to treat money as a change ON ITS OWN:
+    --     PLAYER_MONEY has to be in the dirty set, the delta detector has to
+    --     have money as a term, the rev has to move, and the payload that
+    --     reaches the wire has to carry the NEW copper.
+    --
+    --     Each assertion is paired with a MUTATION that removes exactly the one
+    --     thing it is about, so none of them can pass by accident.
+    ------------------------------------------------------------------
+    do
+        local savedM    = Inventory._mode
+        local savedNSS  = (_G.Daseeki and _G.Daseeki.Sync
+                           and _G.Daseeki.Sync._namespaces[NS_KEY]) or nil
+        local savedC    = _G.C_Container
+        local savedGIL  = _G.GetInventoryItemLink
+        local savedGM   = _G.GetMoney
+        local savedCurM = _G.GetCursorMoney
+        local savedTrM  = _G.GetPlayerTradeMoney
+        local savedSigF = Inventory.PayloadSignature
+        local savedPush = ns.Mesh and ns.Mesh.PushNamespace
+
+        -- A world in which the ONLY thing that can move is gold: no bags, no
+        -- equipment, no mail rows.
+        local GOLD = 151441920
+        _G.GetMoney            = function() return GOLD end
+        _G.GetCursorMoney      = function() return 0 end
+        _G.GetPlayerTradeMoney = function() return 0 end
+        _G.C_Container = {
+            GetContainerNumSlots = function() return 0 end,
+            GetContainerItemID   = function() return nil end,
+            GetContainerItemInfo = function() return nil end,
+        }
+        _G.GetInventoryItemLink = function() return nil end
+
+        local pushes = 0
+        if ns.Mesh then
+            ns.Mesh.PushNamespace = function() pushes = pushes + 1 end
+        end
+
+        Inventory._mode = "publish"
+        Inventory._enteredWorldAt = nil
+        Inventory._lastSig = nil
+        local selfKey = Inventory.SelfKey()
+        S.SyncNS()[NS_KEY][selfKey] = nil
+        area.owners[selfKey] = nil
+        ck("mail-gold: the namespace registers", Inventory.RegisterNamespace() == true)
+
+        -- --- the event side: PLAYER_MONEY really is a dirty signal ----------
+        ck("mail-gold: PLAYER_MONEY is a dirty signal",
+            Inventory.IsDirtyEvent("PLAYER_MONEY") == true)
+        ck("mail-gold: PLAYER_MONEY is in the PLAIN list the wiring loops over",
+            (function()
+                for i = 1, #Inventory.PLAIN_DIRTY_EVENTS do
+                    if Inventory.PLAIN_DIRTY_EVENTS[i] == Inventory.MONEY_EVENT then return true end
+                end
+                return false
+            end)())
+        ck("mail-gold: MAIL_CLOSED and MAIL_INBOX_UPDATE are dirty signals too",
+            Inventory.IsDirtyEvent("MAIL_CLOSED") and Inventory.IsDirtyEvent("MAIL_INBOX_UPDATE"))
+        -- MUTATION: take PLAYER_MONEY out of the set and the predicate must say
+        -- no. That is the regression the missing gold looked like.
+        ck("mail-gold MUTATION: without PLAYER_MONEY in the set nothing is dirty",
+            Inventory.IsDirtyEvent("PLAYER_MONEY", { "PLAYER_EQUIPMENT_CHANGED" }, {}) == false)
+        ck("mail-gold: an unrelated event is not a dirty signal",
+            Inventory.IsDirtyEvent("PLAYER_REGEN_ENABLED") == false)
+
+        -- --- the detector: money is a term, ts is not -----------------------
+        local base = { money = 100, itemCounts = { [4306] = 2 }, currency = {},
+                       mail = { n = 0, money = 0 }, ts = 1 }
+        local richer = { money = 200, itemCounts = { [4306] = 2 }, currency = {},
+                         mail = { n = 0, money = 0 }, ts = 1 }
+        local later  = { money = 100, itemCounts = { [4306] = 2 }, currency = {},
+                         mail = { n = 0, money = 0 }, ts = 999999 }
+        ck("signature: a money-only delta CHANGES the signature",
+            Inventory.PayloadSignature(base) ~= Inventory.PayloadSignature(richer))
+        ck("signature: a ts-only delta does NOT change the signature",
+            Inventory.PayloadSignature(base) == Inventory.PayloadSignature(later))
+        ck("signature: mail-summary copper is a term",
+            Inventory.PayloadSignature(base) ~= Inventory.PayloadSignature(
+                { money = 100, itemCounts = { [4306] = 2 }, currency = {},
+                  mail = { n = 0, money = 500 }, ts = 1 }))
+        ck("signature: an item delta still changes the signature",
+            Inventory.PayloadSignature(base) ~= Inventory.PayloadSignature(
+                { money = 100, itemCounts = { [4306] = 3 }, currency = {},
+                  mail = { n = 0, money = 0 }, ts = 1 }))
+        ck("signature: identical content signs identically regardless of key order",
+            Inventory.PayloadSignature({ money = 5, itemCounts = { [9] = 1, [2] = 3 } })
+            == Inventory.PayloadSignature({ itemCounts = { [2] = 3, [9] = 1 }, money = 5 }))
+        ck("signature: a non-table signs empty", Inventory.PayloadSignature(nil) == "")
+
+        -- --- the pipeline: first publish, then a MONEY-ONLY change ----------
+        ck("mail-gold: the first publish goes out", Inventory.Publish() == true)
+        local first = S.SyncNSGet(NS_KEY, selfKey)
+        ck("mail-gold: the first payload carries the pre-mail gold",
+            first ~= nil and first.data.money == GOLD)
+        local rev0, pushes0 = first and first.rev or 0, pushes
+
+        -- Nothing moved: the detector must settle, WITHOUT a rev bump or a push.
+        ck("mail-gold: an unchanged republish reports 'unchanged'",
+            Inventory.Publish() == "unchanged")
+        local same = S.SyncNSGet(NS_KEY, selfKey)
+        ck("mail-gold: an unchanged republish does not move the rev",
+            same ~= nil and same.rev == rev0)
+        ck("mail-gold: an unchanged republish pushes nothing", pushes == pushes0)
+
+        -- 7000 gold out of the mailbox. Nothing else in the world changed.
+        GOLD = GOLD + 70000000
+        ck("mail-gold: a MONEY-ONLY change publishes", Inventory.Publish() == true)
+        local after = S.SyncNSGet(NS_KEY, selfKey)
+        ck("mail-gold: the rev moved on a money-only change",
+            after ~= nil and after.rev > rev0)
+        ck("mail-gold: the payload on the wire carries the NEW gold",
+            after ~= nil and after.data.money == GOLD)
+        ck("mail-gold: the money-only change was handed to the mesh", pushes > pushes0)
+        local mineNow = S.InventoryGet(selfKey)
+        ck("mail-gold: the owners graph carries the new gold",
+            mineNow ~= nil and type(mineNow.data) == "table" and mineNow.data.money == GOLD)
+
+        -- MUTATION: a detector that leaves money out — the exact "content hash
+        -- that excludes money" failure — must swallow the very same change.
+        do
+            local revBefore = S.SyncNSGet(NS_KEY, selfKey).rev
+            Inventory.PayloadSignature = function(p)
+                if type(p) ~= "table" then return "" end
+                return savedSigF({ itemCounts = p.itemCounts, currency = p.currency,
+                                   level = p.level, class = p.class, race = p.race,
+                                   sex = p.sex, faction = p.faction })
+            end
+            Inventory._lastSig = nil
+            GOLD = GOLD + 12340000
+            ck("mail-gold MUTATION: a money-blind signature swallows the change",
+                Inventory.Publish() == "unchanged")
+            ck("mail-gold MUTATION: ...and the wire still holds the OLD gold",
+                S.SyncNSGet(NS_KEY, selfKey).rev == revBefore)
+            Inventory.PayloadSignature = savedSigF
+            Inventory._lastSig = nil
+            ck("mail-gold: the real signature publishes what the mutant swallowed",
+                Inventory.Publish() == true
+                and S.SyncNSGet(NS_KEY, selfKey).data.money == GOLD)
+        end
+
+        -- --- the throttle: a burst of money events coalesces into ONE -------
+        do
+            local savedTimer = _G.C_Timer
+            local timers = {}
+            _G.C_Timer = {
+                After     = function() return { Cancel = function() end } end,
+                NewTicker = function() return { Cancel = function() end } end,
+                NewTimer  = function(d, f)
+                    local t = { d = d, f = f, cancelled = false }
+                    t.Cancel = function() t.cancelled = true end
+                    timers[#timers + 1] = t
+                    return t
+                end,
+            }
+            Inventory._dirtyTimer = nil
+            GOLD = GOLD + 1
+            ck("throttle: MarkDirty arms a timer", Inventory.MarkDirty() == true)
+            Inventory.MarkDirty()
+            Inventory.MarkDirty()
+            local live, delay = 0, nil
+            for i = 1, #timers do
+                if not timers[i].cancelled then live = live + 1; delay = timers[i].d end
+            end
+            ck("throttle: three dirty signals leave exactly ONE live timer", live == 1)
+            ck("throttle: the window is the documented debounce",
+                delay == Inventory.PUBLISH_DEBOUNCE)
+
+            local before = S.SyncNSGet(NS_KEY, selfKey).rev
+            for i = 1, #timers do if not timers[i].cancelled then timers[i].f() end end
+            ck("throttle: the coalesced burst produced exactly one rev bump",
+                S.SyncNSGet(NS_KEY, selfKey).rev == before + 1)
+
+            -- ...and a debounce that lands on a no-op must SETTLE, not re-arm
+            -- forever on a character standing still in a city.
+            timers = {}
+            Inventory._dirtyTimer = nil
+            Inventory.MarkDirty()
+            local armed = #timers
+            timers[1].f()
+            ck("throttle: an 'unchanged' publish does not re-arm the debounce",
+                #timers == armed and Inventory._dirtyTimer == nil)
+
+            -- The other direction: a genuinely COLD moment (still inside the
+            -- post-loading-screen grace, so NOT teardown) still re-arms, and a
+            -- real edit is never dropped because the world was mid-load.
+            timers = {}
+            Inventory._dirtyTimer = nil
+            Inventory.MarkDirty()
+            local armedCold = #timers
+            Inventory._enteredWorldAt = (GetTime and GetTime()) or 0
+            ck("throttle: the grace really does make the world read cold",
+                Inventory.CaptureAllowed() == false and Inventory.IsTeardown() == false)
+            timers[1].f()
+            Inventory._enteredWorldAt = nil
+            ck("throttle: a COLD publish does re-arm the debounce",
+                #timers > armedCold and Inventory._dirtyTimer ~= nil)
+            Inventory._dirtyTimer = nil
+
+            _G.C_Timer = savedTimer
+        end
+
+        -- --- restore --------------------------------------------------------
+        Inventory.PayloadSignature = savedSigF
+        if ns.Mesh then ns.Mesh.PushNamespace = savedPush end
+        _G.GetMoney, _G.GetCursorMoney, _G.GetPlayerTradeMoney = savedGM, savedCurM, savedTrM
+        _G.C_Container, _G.GetInventoryItemLink = savedC, savedGIL
+        if _G.Daseeki and _G.Daseeki.Sync then
+            _G.Daseeki.Sync._namespaces[NS_KEY] = savedNSS
+        end
+        S.SyncNS()[NS_KEY][selfKey] = nil
+        area.owners[selfKey] = nil
+        Inventory._mode = savedM
+        Inventory._lastSig = nil
     end
 
     ------------------------------------------------------------------
@@ -1760,6 +2215,8 @@ local function selfTest(verbose)
     S.SyncNS()[NS_KEY] = savedNS
     Inventory._mode, Inventory._activated = savedMode, savedActivated
     Inventory._enteredWorldAt, Inventory._leavingWorld = savedEntered, savedLeaving
+    Inventory._lastSig = savedSig
+    Inventory._pending = nil
     if db then db.inventoryEnabled = savedEnabled end
     stopTimers()
 

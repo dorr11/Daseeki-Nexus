@@ -110,9 +110,9 @@ Mesh.BUCKET_REFILL = 1
 Mesh.OP_COST = {
     timer = 1, state = 1, heartbeat = 1, discovery = 1,
     relay = 1, sync = 1, settings = 1, ack = 1,
-    nspayload = 1, nsreq = 1,
+    nspayload = 1, nspush = 1, nsreq = 1,
 }
-Mesh.OP_MAX_BURST = { relay = 3, sync = 6, settings = 6, nspayload = 6 }
+Mesh.OP_MAX_BURST = { relay = 3, sync = 6, settings = 6, nspayload = 6, nspush = 4 }
 
 -- Frame operation codes (single chars keep the header tiny).
 local OP = {
@@ -147,12 +147,25 @@ Mesh.OP = OP
 
 -- Priority tiers (lower = served first). Keyed by the semantic op-name strings
 -- carried in a queued item's meta.op (NOT the single-char wire codes).
+-- `nspush` vs `nspayload`: SAME WIRE OP (OP.NSPAYLOAD), different urgency. A
+-- fresh push of OUR OWN owner is one or two chunks and is what a peer's tooltip
+-- is waiting on right now; a pull answer (Mesh.SendNamespace) is every owner we
+-- hold — ~70 chunks for a real roster — and is pure backfill. They shared a
+-- priority, so a gold change published a few seconds after login queued behind
+-- the login-time backfill and, on the SYNC prefix's 1-msg/sec sustained drain,
+-- could still be unsent minutes later. The op names are LOCAL SCHEDULER
+-- METADATA only (meta.op never reaches the wire), so this is not a protocol
+-- change and no peer can tell the difference.
 local PRIO = {
     timer = 1, discovery = 2, ack = 2,
     state = 3, heartbeat = 3,
-    relay = 4, sync = 4, nsreq = 4,
+    relay = 4, sync = 4, nsreq = 4, nspush = 4,
     settings = 6, nspayload = 6,
 }
+
+-- Read accessor for the scheduling self-test (PRIO stays a file-local so no
+-- caller can quietly re-rank the queue at runtime).
+function Mesh.PRIO_FOR(op) return PRIO[op] end
 
 ----------------------------------------------------------------------
 -- Pure string helpers (no WoW globals; harness-portable)
@@ -2337,8 +2350,10 @@ local function suiteSync()
     return _G and _G.Daseeki and _G.Daseeki.Sync or nil
 end
 
--- Build + enqueue one owner's namespace payload to a single target.
-local function sendNSPayloadTo(target, nsKey, ownerKey)
+-- Build + enqueue one owner's namespace payload to a single target. `opName` is
+-- the SCHEDULER class only ("nspush" for a fresh local delta, "nspayload" for
+-- bulk backfill); the wire op is OP.NSPAYLOAD either way.
+local function sendNSPayloadTo(target, nsKey, ownerKey, opName)
     if not target then return false end
     local Sync = suiteSync()
     local S = Store
@@ -2350,10 +2365,11 @@ local function sendNSPayloadTo(target, nsKey, ownerKey)
     local seq = Mesh._outSeq + 1
     local frame = Mesh.BuildFrame(OP.NSPAYLOAD, payload, { seq = seq })
     Mesh.Enqueue(Protocol.PREFIX.SYNC, frame, {
-        op = "nspayload", chatType = "WHISPER", target = target, seq = seq,
+        op = opName or "nspayload", chatType = "WHISPER", target = target, seq = seq,
     })
     return true
 end
+Mesh._sendNSPayloadTo = sendNSPayloadTo   -- exposed for the scheduling self-test
 
 -- Push one owner's namespace payload to every online peer, debounced so a burst
 -- of MarkDirty calls coalesces into one propagation.
@@ -2367,7 +2383,7 @@ function Mesh.PushNamespace(nsKey, ownerKey)
         if not Mesh.IsEnabled() then return end
         for _, p in pairs(Mesh.peers) do
             if p.online and p.name then
-                sendNSPayloadTo(p.name, nsKey, ownerKey)
+                sendNSPayloadTo(p.name, nsKey, ownerKey, "nspush")
             end
         end
     end
@@ -4087,6 +4103,28 @@ local function testNamespaceDiff()
     return true
 end
 
+-- A fresh push of our OWN owner must outrank bulk namespace backfill in the
+-- scheduler. They share the wire op (OP.NSPAYLOAD) and used to share a
+-- priority, so a gold change published just after login queued behind the
+-- login-time backfill -- ~70 chunks on a real roster, draining at the SYNC
+-- prefix's sustained 1 msg/sec. Both classes must still be known to the
+-- bucket/burst tables, or DrainTick would charge them a default cost.
+local function testNSPushPriority()
+    local push, bulk = Mesh.PRIO_FOR("nspush"), Mesh.PRIO_FOR("nspayload")
+    if not push or not bulk then return false, "nspush/nspayload priority missing" end
+    if not (push < bulk) then
+        return false, string.format("a fresh push (%d) does not outrank backfill (%d)", push, bulk)
+    end
+    -- ...but it must not jump ahead of presence/state traffic: a peer that does
+    -- not know we are online has nowhere to put the payload.
+    if push < Mesh.PRIO_FOR("heartbeat") then
+        return false, "a fresh push outranks the heartbeat"
+    end
+    if not Mesh.OP_COST.nspush then return false, "nspush has no token cost" end
+    if not Mesh.OP_MAX_BURST.nspush then return false, "nspush has no burst cap" end
+    return true
+end
+
 -- A10.1 — the change-filter hash recipe. Everything the reference calls a data
 -- change must move the hash; everything it calls volatile must NOT.
 local function testStateHash()
@@ -5194,6 +5232,7 @@ function Mesh.RunSelfTests(verbose)
         { name = "relay assignment", fn = testRelayPlan },
         { name = "hash diff",        fn = testHashDiff },
         { name = "namespace hash diff", fn = testNamespaceDiff },
+        { name = "fresh ns push outranks bulk backfill", fn = testNSPushPriority },
         { name = "instances hash",   fn = testInstancesHash },
         { name = "dedup window",     fn = testDedupWindow },
         { name = "frame round-trip", fn = testFrameRoundTrip },
