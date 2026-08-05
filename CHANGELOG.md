@@ -2,6 +2,57 @@
 
 ## Unreleased
 
+- **Fixed:** **releasing a chronoboon could auto-accept the next summon.** When you popped your
+  displacer, all seven buffs came back at once — and Nexus read that as seven brand-new world
+  buffs and armed the "you just got buffed, take the summon" gate. Any summon that landed in
+  the next 19 seconds was accepted for you, from anywhere, whether you wanted it or not. Buffs
+  coming back out of a boon are now recognised as *restored*, never as freshly gained, and the
+  three seconds either side of the release are covered too.
+- **Fixed:** **a re-applied buff never counted as fresh.** Only going from *no buff* to *buff*
+  did — so standing under the Songflower you just picked up, or taking a second Rend, did
+  nothing for auto-accept. A buff whose timer jumps forward by more than 75 seconds now counts,
+  which is what "fresh" was always supposed to mean.
+- **Fixed:** **one fresh buff could accept every summon for 19 seconds.** The fresh-buff flag
+  was never cleared, so a second (or third) summon inside the same window rode in on the same
+  buff. Accepting now uses the flag up: the next summon needs a genuinely new buff.
+- **Fixed:** **the Fire Festival Fury trigger could never fire.** It was looking for a buff
+  name that does not exist in the game, so ticking that box did nothing — in the summon
+  triggers and on the HUD's cancel button alike. Both now use the real name.
+- **Changed:** the auto-accept message now names **which buffs** triggered it instead of a
+  single word, so you can tell why your character just left town.
+- **Changed:** buff triggers are now matched by **spell ID first**, so they work on a
+  non-English client instead of silently matching nothing.
+- **Changed:** **"Drop on taxi / PvP" now ships OFF,** which is what it was always meant to be.
+  Left on, it accepts *any* summon that arrives while you are on a flight path, buffs or no
+  buffs — the one automation default that erred toward doing more. If you never touched the
+  box it will be switched off once; if you deliberately turned it on, it stays on.
+- **Fixed:** **mass invites went out all at once.** Every invite fired in a single frame, which
+  is exactly the burst the client throttles, and the raid conversion could race the fifth
+  invite. Invites now go out 60 ms apart with the fifth held back to 700 ms, the way the
+  timing was designed.
+- **Fixed:** **"Invite Online" missed characters and included the wrong ones.** It only ever
+  looked at live mesh peers — so an online alt that was not currently a peer never got asked —
+  and it did not check faction, did not skip people already standing in your group, and went
+  out in whatever order the table happened to be in. The target list is now your database and
+  your mesh roster together, filtered to your faction, minus yourself and anyone already
+  grouped, in alphabetical order.
+- **Added:** **the reverse invite.** If every single invite comes back "already in a group" and
+  you are on your own, Nexus now drops your empty party and whispers your invite keyword to
+  the first of them, so whoever already built the group invites *you* instead of the run just
+  reporting failure.
+- **Fixed:** **the leader hand-off never worked.** When someone whispered your keyword but you
+  could not invite — in a raid without assist, or in a party you do not lead — Nexus was
+  supposed to point them at whoever actually holds the group. It was reading a setting that
+  had no default and no box anywhere in the options, so it was never anything but empty. It
+  now finds the real group leader, and hands the name over **only if that leader is one of
+  your own mesh characters** — a stranger leading your pug is never named to a stranger
+  whispering you.
+- **Fixed:** **copying automation settings between factions overwrote things it should not
+  have.** The destination faction's invite-whitelist master switch could be silently flipped,
+  and the one-time "defaults already seeded" markers were reset — which meant a whitelist you
+  had deliberately cleared, or buff triggers you had deliberately unticked, could come back on
+  your next login. The copy now leaves all of that alone; it copies settings, not history.
+
 - **Fixed:** **"accept invites from guild members" and "from friends" never accepted anyone.**
   Both boxes ship ticked, and both were reading a list of your guildmates and friends that
   nothing in the addon ever filled in — so the answer was always "I don't know them". A
