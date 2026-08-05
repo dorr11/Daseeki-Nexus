@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.1.3 — 2026-08-05
 
 - **Fixed:** **one character's bags could stay wrong on another account for hours, even
   with both accounts logged in the whole time.** A character published new bags (gold up
