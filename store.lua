@@ -1272,9 +1272,28 @@ local function defaultData()
         locationsParked    = nil,     -- { coordinateOverrides = {...}, manualLocations = {...} }
         instances = {},         -- [aid] = { ["Name-Realm"] = { entries = { {t,name,mapID,dur,gold,xp,merged}, ... capped 60 } } }
                                 -- instance-entry ledger (NEXUS_INSTANCES_DESIGN). ADDITIVE; version-wipe-preserved like notes.
+        -- SOCIAL TRUST SETS — the data behind spec §12.2 gates 3 and 4 ("sender
+        -- is a guild member" / "sender is a friend or Battle.net friend") and
+        -- their §12.3 keyword-invite twins. auto.lua's Auto.IsGuild/Auto.IsFriend
+        -- are the ONLY readers; social.lua is the ONLY writer.
+        --
+        -- KEY SHAPE = the canonical social key, Auto.SocialKey:
+        --   "<lowered base name>-<lowered realm, punctuation and spaces stripped>"
+        -- i.e. friends.lua's Friends.Key spelling (so the mesh auto-friend ledger,
+        -- Daseeki-Conduit's ledger and these sets are one convention), with the
+        -- realm additionally punctuation-folded because the names that reach the
+        -- gate have passed through GetNormalizedRealmName ("Nek'Rosh" -> "NekRosh").
+        --
+        -- WRITE DISCIPLINE (Store.SetSocialSet): a set is replaced WHOLESALE and
+        -- only from a CONFIRMED read. A dark read — the server has not answered
+        -- yet — writes nothing at all, so the gate keeps consulting the previous
+        -- snapshot instead of reading "you have no guild and no friends".
         social = {
-            guild   = {},       -- ["Name-Realm"] = true
-            friends = {},       -- ["Name-Realm"] = true
+            guild     = {},     -- [socialKey] = true
+            friends   = {},     -- [socialKey] = true
+            guildName = "",     -- guild the snapshot is OF ("" = none / unknown)
+            guildAt   = 0,      -- server epoch of the last CONFIRMED guild read
+            friendsAt = 0,      -- server epoch of the last CONFIRMED friends read
         },
         deletedAIDs = {},       -- [aid] = tombstoneEpoch (local-only, never broadcast)
         -- Suite-namespace store (Daseeki.Sync v2, wave N5). Each consuming
@@ -3899,7 +3918,62 @@ function Store.GetInstancesForAID(aid)
     local all = Store.data.instances
     return all and all[aid or ""] or nil
 end
-function Store.GetSocial()        return Store.data.social end
+-- Nil-safe on purpose: the invite trust gates call this on a whisper that can
+-- arrive before Store.Init has run (a fresh install, mid-load). "No table" must
+-- read as "nobody is trusted", never as a Lua error in an event handler.
+function Store.GetSocial()        return Store.data and Store.data.social end
+
+----------------------------------------------------------------------
+-- SOCIAL TRUST SETS — the one writer (see defaultData's `social` block).
+--
+-- Replaces one set WHOLESALE from a confirmed read. Callers hand over a
+-- freshly built { [socialKey] = true } table; nothing is merged, because a
+-- merge could never forget a guildmate who left the guild.
+--
+-- Only reached with a CONFIRMED read — social.lua refuses to call this at all
+-- when the server has not answered — so an empty set here means "you really
+-- have no guildmates / friends", never "we have not been told yet".
+--
+-- Returns changed(bool), count(n). `changed` is false when the new set is
+-- byte-for-byte the previous one, which is what keeps a FRIENDLIST_UPDATE
+-- storm (friends logging on and off fire it) from rewriting SavedVariables.
+----------------------------------------------------------------------
+
+-- Headless discipline: a corrupt or absurd roster can never grow the saved
+-- variables without bound. Far above any real Classic guild.
+Store.SOCIAL_MAX = 800
+
+local SOCIAL_SETS = { guild = true, friends = true }
+
+local function socialSetsEqual(a, b)
+    if type(a) ~= "table" then return false end
+    for k in pairs(a) do if not b[k] then return false end end
+    for k in pairs(b) do if not a[k] then return false end end
+    return true
+end
+Store.SocialSetsEqual = socialSetsEqual
+
+function Store.SetSocialSet(which, set, at, label)
+    if not SOCIAL_SETS[which] then return false, 0 end
+    if type(set) ~= "table" then return false, 0 end
+    local social = Store.data and Store.data.social
+    if type(social) ~= "table" then return false, 0 end
+
+    local clean, n = {}, 0
+    for k, v in pairs(set) do
+        if type(k) == "string" and k ~= "" and v then
+            if n >= Store.SOCIAL_MAX then break end
+            clean[k] = true
+            n = n + 1
+        end
+    end
+
+    local changed = not socialSetsEqual(social[which], clean)
+    if changed then social[which] = clean end
+    social[which .. "At"] = tonumber(at) or 0
+    if which == "guild" then social.guildName = label or "" end
+    return changed, n
+end
 function Store.GetManualLocation(nameRealm)
     return Store.data.manualLocations[nameRealm]
 end
