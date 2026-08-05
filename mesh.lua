@@ -591,11 +591,48 @@ Mesh._sessionId = 0      -- randomised at login to prefix message ids
 Mesh._timerCodec = nil   -- N2b handoff codec (see §Timer handoff)
 Mesh._timerHandler = nil -- N2b handoff receive callback
 Mesh._nsPushPending = {} -- [nsKey.."\1"..ownerKey] = true while a debounced push is queued
-Mesh._nsReqSeen = {}     -- [sender.."\1"..nsKey] = expiry (pull-request dedup)
+Mesh._nsReqSeen = {}     -- [sender.."\1"..nsKey] = expiry (ANSWER-side pull dedup)
+Mesh._nsReqAsked = {}    -- [target.."\1"..nsKey] = expiry (REQUESTER-side ask dedup)
+Mesh._nsQueued  = {}     -- [target.."\1"..ns.."\1"..owner] = { rev, gen, left, at }
+                         --   in-flight backfill payloads (queue duplicate suppression)
+Mesh._nsQueueGen = 0     -- monotonic generation stamp for _nsQueued records
 
--- Suite-namespace transport tunables (wave N5).
+-- Suite-namespace backfill telemetry (surfaced by /dsn debug mesh so the owner
+-- can confirm the targeted-backfill refinement is live on a real roster).
+Mesh._nsAnswersTargeted = 0  -- NSREQ answers that carried a rev manifest (filtered)
+Mesh._nsAnswersFull     = 0  -- NSREQ answers from a manifest-less (older) requester
+Mesh._nsOwnersSent      = 0  -- owner payloads actually enqueued by those answers
+Mesh._nsOwnersSkipped   = 0  -- owner payloads the manifest filter suppressed
+Mesh._nsQueueDedup      = 0  -- enqueues suppressed because the same rev was pending
+Mesh._nsAskGated        = 0  -- NSREQs suppressed by the requester-side cooldown
+
+-- Suite-namespace transport tunables (wave N5; backfill rework 2026-08).
 Mesh.NS_PUSH_DEBOUNCE = 3    -- seconds to coalesce rapid MarkDirty pushes
-Mesh.NS_REQ_DEDUP     = 15   -- seconds to suppress repeated pull answers to a peer
+-- ANSWER-side: how long after answering a peer's pull we refuse to answer again.
+-- This was 15s, which is SHORTER THAN THE ANSWER ITSELF: a full-namespace answer
+-- is one chunked inventory payload per owner (~44 owners on this roster) draining
+-- at the SYNC prefix's sustained 1 msg/sec, i.e. many minutes. The next heartbeat
+-- (17-23s) therefore re-triggered a fresh full blast behind the one still in
+-- flight, the queue grew faster than it drained, and `pairs()` re-randomised the
+-- owner order every time — convergence became a lottery. 120s is comfortably
+-- longer than a *targeted* answer now takes and still repairs a genuinely
+-- dropped answer within a couple of minutes.
+Mesh.NS_REQ_DEDUP     = 120
+-- REQUESTER-side twin of the above: do not re-ask the same (peer, namespace)
+-- inside this window. Without it, only the answerer throttled — every heartbeat
+-- still spent an NSREQ frame, and any answerer whose dedup map had been pruned
+-- (relog, /reload) restarted the blast. Deliberately equal to NS_REQ_DEDUP so the
+-- two sides agree on the repair cadence.
+Mesh.NS_REQ_ASK_COOLDOWN = 120
+-- TTL for the in-queue duplicate-suppression records. A backfill payload aimed at
+-- a peer that went offline mid-drain can sit in the queue behind a target skip;
+-- the record must not pin that (target, ns, owner) forever, so the prune sweep
+-- drops anything older than this and a later ask may re-queue it.
+Mesh.NS_QUEUED_TTL    = 300
+-- Iteration ceilings (headless discipline: every loop over peer-supplied or
+-- store-sized data is bounded). A real roster is ~44 owners; these are ~10x that.
+Mesh.NS_MANIFEST_MAX     = 500  -- owners packed into an outgoing NSREQ manifest
+Mesh.NS_ANSWER_SCAN_CAP  = 500  -- owners scanned while answering one NSREQ
 
 -- Channel-join retry state machine + discovery telemetry (see §Channel join).
 Mesh._joinState = nil    -- { chanName, attempts, index, joined, gaveUp, pingedOnJoin }
@@ -1053,6 +1090,19 @@ function Mesh.PruneDedup(t)
     for k, exp in pairs(Mesh._nsReqSeen) do
         if exp <= t then Mesh._nsReqSeen[k] = nil end
     end
+    for k, exp in pairs(Mesh._nsReqAsked) do
+        if exp <= t then Mesh._nsReqAsked[k] = nil end
+    end
+    -- In-queue backfill dedup records: normally cleared when the frame's last
+    -- chunk leaves the queue (Mesh.ReleaseNSQueued). This TTL is the backstop for
+    -- the frame that never leaves — a target that went offline mid-drain keeps
+    -- its chunks parked behind the skip window, and without this sweep that
+    -- (target, ns, owner) could never be re-queued again this session.
+    for k, rec in pairs(Mesh._nsQueued) do
+        if type(rec) ~= "table" or (t - (rec.at or 0)) > Mesh.NS_QUEUED_TTL then
+            Mesh._nsQueued[k] = nil
+        end
+    end
     Mesh.PruneAckWait(t)
     Mesh.PruneInSeq(t)
 end
@@ -1274,7 +1324,12 @@ end
 Mesh._rawSend = rawSend   -- exposed for the transmit-safety self-test
 
 -- Enqueue a fully-built frame for a prefix, chunking as needed.
--- meta = { op, chatType, target, priority, cost }
+-- meta = { op, chatType, target, priority, cost, nsPendKey, nsPendGen }
+--
+-- `nsPendKey`/`nsPendGen` are OPTIONAL scheduler bookkeeping for the suite-
+-- namespace queue-dedup set (see sendNSPayloadTo). They are stamped onto every
+-- chunk of the frame and never reach the wire; DrainTick uses them to release the
+-- pending record once the frame's LAST chunk has left the queue.
 function Mesh.Enqueue(prefix, frame, meta)
     -- Defense in depth: a forbidden SN prefix can never even enter the queue.
     -- (rawSend guards the wire; this guards the scheduler.)
@@ -1296,11 +1351,15 @@ function Mesh.Enqueue(prefix, frame, meta)
             op       = meta.op,
             cost     = meta.cost or (meta.op and Mesh.OP_COST[meta.op]) or 1,
             big      = big,
+            nsPendKey = meta.nsPendKey,
+            nsPendGen = meta.nsPendGen,
         })
     end
     -- Additive: true = the frame is queued for the drain ticker. Callers that
     -- need a delivery count (Mesh.PushState) treat this as "confirmed enqueue".
-    return true
+    -- The SECOND return is the chunk count (extra returns are invisible to the
+    -- existing callers); sendNSPayloadTo uses it to size its pending record.
+    return true, #chunks
 end
 
 -- Drain one message per prefix per tick, honouring buckets, target skips and
@@ -1341,6 +1400,11 @@ function Mesh.DrainTick(t)
                 if ok then Mesh.NoteSuccess(picked.target)
                 else Mesh.NoteFailure(picked.target, t) end
             end
+            -- Release the suite-namespace queue-dedup hold REGARDLESS of `ok`:
+            -- the chunk has left the queue either way (a failed rawSend drops it,
+            -- it is not requeued), so holding the key would block the retry that
+            -- the next pull is supposed to make.
+            Mesh.ReleaseNSQueued(picked)
         end
     end
     Mesh.PruneDedup(t)
@@ -2350,9 +2414,40 @@ local function suiteSync()
     return _G and _G.Daseeki and _G.Daseeki.Sync or nil
 end
 
+-- The (target, namespace, owner) key of one in-flight backfill payload.
+function Mesh.NSQueueKey(target, nsKey, ownerKey)
+    return tostring(target) .. "\1" .. tostring(nsKey) .. "\1" .. tostring(ownerKey)
+end
+
+-- Release one chunk's hold on the queue-dedup record, clearing the record when
+-- its LAST chunk has left the queue. The generation check is what makes
+-- supersession safe: when a NEWER rev replaces a pending record, the older
+-- frame's chunks are still queued and will still drain, but their stale `gen`
+-- no longer matches, so they can never clear the newer record early.
+function Mesh.ReleaseNSQueued(item)
+    if type(item) ~= "table" or not item.nsPendKey then return false end
+    local rec = Mesh._nsQueued[item.nsPendKey]
+    if not rec or rec.gen ~= item.nsPendGen then return false end
+    rec.left = (rec.left or 1) - 1
+    if rec.left <= 0 then Mesh._nsQueued[item.nsPendKey] = nil end
+    return true
+end
+
 -- Build + enqueue one owner's namespace payload to a single target. `opName` is
 -- the SCHEDULER class only ("nspush" for a fresh local delta, "nspayload" for
 -- bulk backfill); the wire op is OP.NSPAYLOAD either way.
+--
+-- IN-QUEUE DUPLICATE SUPPRESSION. The SYNC prefix drains at ~1 msg/sec, so a
+-- chunked inventory payload sits in the queue for a while; anything that asks
+-- for the same (target, ns, owner) again in that window used to enqueue a second
+-- identical copy, and a third, and so on — the queue grew faster than it drained.
+-- We now keep a pending record per (target, ns, owner) holding the QUEUED REV:
+--   * same-or-older rev while one is pending  -> suppressed (telemetry counter)
+--   * strictly NEWER rev                       -> queued, superseding the record
+--   * record cleared when the frame's last chunk is sent, or by the TTL sweep
+-- This applies to the fresh `nspush` path too, and is safe there: MarkDirty bumps
+-- the rev, so a genuine delta always carries a newer rev and always goes out —
+-- only a byte-identical re-send of an already-queued rev is dropped.
 local function sendNSPayloadTo(target, nsKey, ownerKey, opName)
     if not target then return false end
     local Sync = suiteSync()
@@ -2360,13 +2455,30 @@ local function sendNSPayloadTo(target, nsKey, ownerKey, opName)
     if not (Sync and S and S.SyncNSGet) then return false end
     local entry = S.SyncNSGet(nsKey, ownerKey)
     if not entry then return false end
+    local rev = tonumber(entry.rev) or 0
+    local pendKey = Mesh.NSQueueKey(target, nsKey, ownerKey)
+    local pend = Mesh._nsQueued[pendKey]
+    if pend and (tonumber(pend.rev) or 0) >= rev then
+        Mesh._nsQueueDedup = (Mesh._nsQueueDedup or 0) + 1
+        return false
+    end
     local payload = Mesh.Pack({ ns = nsKey, o = ownerKey, r = entry.rev, d = entry.data })
     if not payload then return false end
     local seq = Mesh._outSeq + 1
     local frame = Mesh.BuildFrame(OP.NSPAYLOAD, payload, { seq = seq })
-    Mesh.Enqueue(Protocol.PREFIX.SYNC, frame, {
+    Mesh._nsQueueGen = (Mesh._nsQueueGen or 0) + 1
+    local rec = { rev = rev, gen = Mesh._nsQueueGen, at = now(), left = 1 }
+    Mesh._nsQueued[pendKey] = rec
+    local ok, nChunks = Mesh.Enqueue(Protocol.PREFIX.SYNC, frame, {
         op = opName or "nspayload", chatType = "WHISPER", target = target, seq = seq,
+        nsPendKey = pendKey, nsPendGen = rec.gen,
     })
+    if not ok then
+        -- Never leave a hold behind for a frame that was refused entry.
+        if Mesh._nsQueued[pendKey] == rec then Mesh._nsQueued[pendKey] = nil end
+        return false
+    end
+    rec.left = tonumber(nChunks) or 1
     return true
 end
 Mesh._sendNSPayloadTo = sendNSPayloadTo   -- exposed for the scheduling self-test
@@ -2394,27 +2506,123 @@ function Mesh.PushNamespace(nsKey, ownerKey)
     end
 end
 
--- Answer a peer's pull for a namespace: send every owner entry we hold for it
--- (the receiver rev-gates + dedups). Guarded by a short per-(sender,ns) window
--- so repeated heartbeat mismatches don't re-blast the whole namespace.
-function Mesh.SendNamespace(target, nsKey)
-    if not Mesh.IsEnabled() or not target then return end
+-- PURE: should we answer a pull with this owner's entry?
+--
+-- `manifest` is the requester's owner->rev map from the NSREQ (`req.m`), or nil.
+-- nil means the requester is an OLDER CLIENT that does not send one — we then
+-- answer with everything, exactly as this transport always did.
+--
+-- Rules (each one is a harness row):
+--   manifest == nil            -> send (legacy full blast)
+--   owner absent from manifest -> send (they hold nothing for this owner)
+--   their rev non-numeric      -> treated as 0 -> send unless ours is 0 too
+--   ours >  theirs             -> send (the real repair case)
+--   ours == theirs             -> skip (nothing to say)
+--   ours <  theirs             -> skip (NEVER answer a pull with stale data;
+--                                 their next heartbeat makes US the puller)
+function Mesh.NSOwnerIsBehind(manifest, ownerKey, entry)
+    if manifest == nil then return true end
+    local theirsRaw = manifest[ownerKey]
+    if theirsRaw == nil then return true end
+    local theirs = tonumber(theirsRaw) or 0
+    local mine   = tonumber(entry and entry.rev) or 0
+    return mine > theirs
+end
+
+-- PURE-ish (reads the store, no side effects): our owner->rev manifest for one
+-- namespace, as carried in an outgoing NSREQ. Numbers only — the whole point is
+-- that this stays a few dozen small integers next to the KBs of inventory the
+-- unfiltered answer would otherwise cost.
+function Mesh.BuildNSManifest(nsKey)
+    local out = {}
     local S = Store
-    if not (S and S.SyncNSAll) then return end
-    for ownerKey in pairs(S.SyncNSAll(nsKey)) do
-        sendNSPayloadTo(target, nsKey, ownerKey)
+    if not (S and S.SyncNSAll) then return out end
+    local n = 0
+    for ownerKey, entry in pairs(S.SyncNSAll(nsKey)) do
+        if type(ownerKey) == "string" then
+            out[ownerKey] = tonumber(entry and entry.rev) or 0
+            n = n + 1
+            if n >= Mesh.NS_MANIFEST_MAX then break end   -- iteration ceiling
+        end
     end
+    return out
+end
+
+-- Answer a peer's pull for a namespace. `manifest` (optional) is the requester's
+-- owner->rev map: when present we send ONLY the owners whose local rev beats
+-- theirs; when absent we send every owner we hold, as before.
+--
+-- THE BUG THIS FIXES. Answering was all-or-nothing: a ONE-REV gap on ONE owner
+-- cost a full re-send of every owner in the namespace (~44 chunked inventory
+-- payloads on this roster) at ~1 msg/sec — many minutes — while the answer-side
+-- dedup was only 15s, so the next heartbeat queued another full blast behind the
+-- one still draining. `pairs()` re-randomised the order each time, so which owner
+-- actually landed was a lottery and a stale entry could persist for many hours.
+-- Returns the number of owner payloads enqueued (harness-observable).
+function Mesh.SendNamespace(target, nsKey, manifest)
+    if not Mesh.IsEnabled() or not target then return 0 end
+    local S = Store
+    if not (S and S.SyncNSAll) then return 0 end
+    if manifest ~= nil and type(manifest) ~= "table" then manifest = nil end
+    local sent, scanned = 0, 0
+    for ownerKey, entry in pairs(S.SyncNSAll(nsKey)) do
+        scanned = scanned + 1
+        if scanned > Mesh.NS_ANSWER_SCAN_CAP then break end   -- iteration ceiling
+        if Mesh.NSOwnerIsBehind(manifest, ownerKey, entry) then
+            if sendNSPayloadTo(target, nsKey, ownerKey) then sent = sent + 1 end
+        else
+            Mesh._nsOwnersSkipped = (Mesh._nsOwnersSkipped or 0) + 1
+        end
+    end
+    if manifest then
+        Mesh._nsAnswersTargeted = (Mesh._nsAnswersTargeted or 0) + 1
+    else
+        Mesh._nsAnswersFull = (Mesh._nsAnswersFull or 0) + 1
+    end
+    Mesh._nsOwnersSent = (Mesh._nsOwnersSent or 0) + sent
+    return sent
+end
+
+-- PURE: may we ask this (target, namespace) for a backfill right now?
+-- Stamps the cooldown when it says yes.
+function Mesh.NSAskAllowed(target, nsKey, t)
+    t = t or now()
+    local key = tostring(target) .. "\1" .. tostring(nsKey)
+    local exp = Mesh._nsReqAsked[key]
+    if exp and exp > t then
+        Mesh._nsAskGated = (Mesh._nsAskGated or 0) + 1
+        return false
+    end
+    Mesh._nsReqAsked[key] = t + Mesh.NS_REQ_ASK_COOLDOWN
+    return true
 end
 
 -- Request a namespace from a peer whose advertised rev hash diverged from ours.
+--
+-- ADDITIVE WIRE FIELD `m`: our owner->rev manifest, so the answerer can send only
+-- what we are actually behind on. Both directions stay compatible:
+--   * a NEW answerer + OLD requester (no `m`) -> full blast, as today
+--   * an OLD answerer + NEW requester         -> `m` is an unknown key in the
+--     unpacked table and is simply never read; it full-blasts and our receive
+--     side rev-gates the surplus exactly as it always did
+-- No PROTO/SCHEMA version bump: same op, same frame layout, one extra table key.
 function Mesh.RequestNamespace(target, nsKey)
-    if not Mesh.IsEnabled() or not target then return end
-    local payload = Mesh.Pack({ ns = nsKey })
-    if not payload then return end
+    if not Mesh.IsEnabled() or not target then return false end
+    -- Requester-side dedup: the heartbeat fires every 17-23s and the rev hash
+    -- stays diverged until the answer lands, so without this we spent an NSREQ
+    -- per heartbeat forever.
+    if not Mesh.NSAskAllowed(target, nsKey) then return false end
+    local payload = Mesh.Pack({ ns = nsKey, m = Mesh.BuildNSManifest(nsKey) })
+    if not payload then
+        -- Nothing went out, so do not burn the window: hand the slot back.
+        Mesh._nsReqAsked[tostring(target) .. "\1" .. tostring(nsKey)] = nil
+        return false
+    end
     local frame = Mesh.BuildFrame(OP.NSREQ, payload, {})
     Mesh.Enqueue(Protocol.PREFIX.SYNC, frame, {
         op = "nsreq", chatType = "WHISPER", target = target,
     })
+    return true
 end
 
 -- PURE: given our namespace hashes and a peer's advertised hashes, return the
@@ -2443,6 +2651,10 @@ function Mesh.HandleNSPayload(f, sender)
     -- avoids the fan-out storm a naive relay would cause.
 end
 
+-- Answer a pull. `req.m` (optional, additive) is the requester's owner->rev
+-- manifest: present -> targeted answer, absent (older client) -> full blast.
+-- Anything that is not a table is treated as absent, so a malformed/garbage `m`
+-- degrades to the old behaviour rather than silencing the answer.
 function Mesh.HandleNSReq(f, sender)
     local req = Mesh.Unpack(f.payload)
     if not req or type(req.ns) ~= "string" then return end
@@ -2451,7 +2663,7 @@ function Mesh.HandleNSReq(f, sender)
     local exp = Mesh._nsReqSeen[dkey]
     if exp and exp > t then return end   -- already answered this peer recently
     Mesh._nsReqSeen[dkey] = t + Mesh.NS_REQ_DEDUP
-    Mesh.SendNamespace(sender, req.ns)
+    Mesh.SendNamespace(sender, req.ns, type(req.m) == "table" and req.m or nil)
 end
 
 ----------------------------------------------------------------------
@@ -3419,6 +3631,22 @@ local function debugMesh()
     ns:Print(string.format(
         "  maps: dedup=%d inSeq=%d ackWait=%d sendCooldowns=%d | sendsGated=%d bcastCancelled=%d",
         seen, inSeqN, ackN, cdN, Mesh._sendGated or 0, Mesh._bcastCancelled or 0))
+
+    -- Suite-namespace backfill telemetry. This is the line that CONFIRMS the
+    -- targeted-backfill refinement is live: on two synced accounts `answers
+    -- targeted` should climb while `full` stays at 0 (a non-zero `full` means a
+    -- peer is running a pre-fix build), `owners sent` should be a small number
+    -- next to `skipped`, and `queueDedup` counts the redundant re-enqueues that
+    -- used to be the flood.
+    local pendN = 0
+    for _ in pairs(Mesh._nsQueued) do pendN = pendN + 1 end
+    ns:Print(string.format(
+        "  ns-backfill: answers targeted=%d full=%d | owners sent=%d skipped=%d"
+        .. " | queueDedup=%d pending=%d | asksGated=%d (reask %ds/%ds)",
+        Mesh._nsAnswersTargeted or 0, Mesh._nsAnswersFull or 0,
+        Mesh._nsOwnersSent or 0, Mesh._nsOwnersSkipped or 0,
+        Mesh._nsQueueDedup or 0, pendN, Mesh._nsAskGated or 0,
+        Mesh.NS_REQ_ASK_COOLDOWN, Mesh.NS_REQ_DEDUP))
 end
 
 ----------------------------------------------------------------------
@@ -4101,6 +4329,311 @@ local function testNamespaceDiff()
         return false, "nil remote produced diffs"
     end
     return true
+end
+
+----------------------------------------------------------------------
+-- SUITE-NAMESPACE TARGETED BACKFILL (2026-08 backfill rework).
+--
+-- THE FIELD BUG. Puucons-Whitemane published bags rev 76 (22,144g); account 1
+-- still held rev 75 (15,144g), published 10 seconds earlier. The live nspush for
+-- 76 was simply missed (peer offline / dropped frame — normal loss), and the
+-- catch-up path then failed to repair a ONE-REV gap across ~18 hours of overlap.
+-- Why: the heartbeat's namespace rev hash diverged, account 1 sent NSREQ, and the
+-- answer was EVERY owner in the namespace (~44 chunked inventory payloads)
+-- draining at the SYNC prefix's ~1 msg/sec — many minutes — while the answer-side
+-- dedup was only 15s, so the NEXT heartbeat queued another full blast behind the
+-- one still in flight. The queue grew faster than it drained and pairs()
+-- re-randomised the owner order every round: convergence was a lottery.
+--
+-- WHAT THE ROWS BELOW PIN (one assertion per rule):
+--   1. NSREQ carries `m` = { [ownerKey] = rev }; the answer sends ONLY owners
+--      whose local rev beats the requester's.
+--   2. Re-ask suppression on BOTH sides (NS_REQ_DEDUP answer-side,
+--      NS_REQ_ASK_COOLDOWN requester-side).
+--   3. In-queue duplicate suppression per (target, ns, owner) keyed by rev.
+--
+-- MIXED-VERSION MATRIX. All four combinations are safe; the two that can be
+-- executed headless are asserted, the other two are argued from the wire
+-- contract because they need a pre-fix build to run:
+--   new requester -> new answerer : targeted answer                  [ASSERTED]
+--   old requester -> new answerer : req.m absent -> full blast       [ASSERTED]
+--   new requester -> old answerer : `m` is just an extra key in the unpacked
+--       table; the old HandleNSReq reads only req.ns, so it full-blasts exactly
+--       as it does today and our receive side rev-gates the surplus. Additive.
+--   old requester -> old answerer : nothing on either side changed.
+-- No PROTO_VERSION / SCHEMA_VERSION bump: same op letters, same frame layout.
+----------------------------------------------------------------------
+local function testNSTargetedBackfill()
+    local ok, why = true, nil
+    local function ck(c, m) if ok and not c then ok, why = false, m end end
+
+    local savedData    = Store.data
+    local savedEnabled = Mesh.IsEnabled
+    local savedEnqueue = Mesh.Enqueue
+    local savedSeen    = Mesh._nsReqSeen
+    local savedAsked   = Mesh._nsReqAsked
+    local savedQueued  = Mesh._nsQueued
+    local savedDaseeki = _G.Daseeki
+    _G.Daseeki = _G.Daseeki or {}
+    local restoreSync = (_G.Daseeki.Sync == nil)
+    _G.Daseeki.Sync = _G.Daseeki.Sync or {}
+    Mesh.IsEnabled = function() return true end
+
+    -- Every Enqueue is captured; namespace payloads are decoded off the REAL
+    -- wire frame, so these rows exercise Pack/BuildFrame/ParseFrame/Unpack too.
+    local caught = {}
+    Mesh.Enqueue = function(prefix, frame, meta)
+        caught[#caught + 1] = { prefix = prefix, frame = frame, meta = meta }
+        return true, 1
+    end
+    local function reset()
+        caught = {}
+        Mesh._nsReqSeen, Mesh._nsReqAsked, Mesh._nsQueued = {}, {}, {}
+    end
+    -- Owner payloads enqueued by the last answer, as { [ownerKey] = rev }.
+    local function answered()
+        local out, n = {}, 0
+        for i = 1, #caught do
+            local c = caught[i]
+            if c.meta and (c.meta.op == "nspayload" or c.meta.op == "nspush") then
+                local pf = Mesh.ParseFrame(c.frame)
+                local blob = pf and Mesh.Unpack(pf.payload)
+                if blob and blob.o then out[blob.o] = blob.r; n = n + 1 end
+            end
+        end
+        return out, n
+    end
+    local function bags(puuconsRev, extra)
+        local t = {
+            ["Puucons-Whitemane"] = { rev = puuconsRev, data = { g = puuconsRev } },
+            ["Alt-One"]           = { rev = 12, data = { g = 12 } },
+            ["Alt-Two"]           = { rev = 5,  data = { g = 5 } },
+            ["Alt-Three"]         = { rev = 40, data = { g = 40 } },
+        }
+        if extra then for k, v in pairs(extra) do t[k] = v end end
+        return { syncNamespaces = { bags = t } }
+    end
+    -- Drive one whole pull: build the NSREQ from the REQUESTER's store through
+    -- the real Mesh.RequestNamespace, then answer it from the ANSWERER's store
+    -- through the real Mesh.HandleNSReq. `mutate` may edit the packed request
+    -- (used for the legacy no-manifest row).
+    local function pull(reqStore, ansStore, sender, mutate)
+        reset()
+        Store.data = reqStore
+        Mesh.RequestNamespace(sender or "Peer-R", "bags")
+        local reqFrame = caught[1] and caught[1].frame
+        if mutate then reqFrame = mutate(reqFrame) end
+        caught = {}
+        Store.data = ansStore
+        local pf = reqFrame and Mesh.ParseFrame(reqFrame)
+        if pf then Mesh.HandleNSReq(pf, sender or "Peer-R") end
+        return answered()
+    end
+
+    ------------------------------------------------------------------
+    -- 1. THE PUUCONS FIXTURE, VERBATIM. Requester holds 75 and is level with
+    --    every other owner; the answerer holds 76. EXACTLY ONE owner payload
+    --    may be enqueued, and it must be Puucons at rev 76.
+    ------------------------------------------------------------------
+    local got, n = pull(bags(75), bags(76))
+    ck(n == 1, "the one-rev gap enqueued " .. tostring(n) .. " owner payloads (expected exactly 1)")
+    ck(got["Puucons-Whitemane"] == 76,
+        "the answer did not carry Puucons at rev 76 (got " .. tostring(got["Puucons-Whitemane"]) .. ")")
+    ck(got["Alt-One"] == nil and got["Alt-Two"] == nil and got["Alt-Three"] == nil,
+        "level owners were re-sent alongside the one that diverged")
+
+    ------------------------------------------------------------------
+    -- 2. THE MANIFEST FILTER, ROW BY ROW (pure predicate, no wire).
+    ------------------------------------------------------------------
+    local M = { ["Puucons-Whitemane"] = 75, ["Zero-Owner"] = 0, ["Junk-Owner"] = "seventy" }
+    ck(Mesh.NSOwnerIsBehind(M, "Puucons-Whitemane", { rev = 76 }) == true,
+        "behind: ours 76 vs theirs 75 was not sent")
+    ck(Mesh.NSOwnerIsBehind(M, "Puucons-Whitemane", { rev = 75 }) == false,
+        "equal: an identical rev was re-sent")
+    ck(Mesh.NSOwnerIsBehind(M, "Puucons-Whitemane", { rev = 74 }) == false,
+        "AHEAD: we answered a pull with data older than the requester's")
+    ck(Mesh.NSOwnerIsBehind(M, "Absent-Owner", { rev = 1 }) == true,
+        "absent from the manifest: the requester holds nothing and got nothing")
+    ck(Mesh.NSOwnerIsBehind(M, "Junk-Owner", { rev = 3 }) == true,
+        "garbage rev: a non-numeric manifest value was not treated as 0")
+    ck(Mesh.NSOwnerIsBehind(M, "Zero-Owner", { rev = 1 }) == true,
+        "explicit 0: a rev-1 entry was withheld from a requester sitting at 0")
+    ck(Mesh.NSOwnerIsBehind(nil, "Anything", { rev = 0 }) == true,
+        "no manifest (older client): the legacy full blast was suppressed")
+
+    ------------------------------------------------------------------
+    -- 3. OLD REQUESTER -> NEW ANSWERER. An NSREQ with no `m` field must still
+    --    get the whole namespace. Built by re-packing the request without `m`,
+    --    which is byte-for-byte what a pre-fix client emits.
+    ------------------------------------------------------------------
+    got, n = pull(bags(75), bags(76), "Legacy-R", function()
+        return (Mesh.BuildFrame(OP.NSREQ, Mesh.Pack({ ns = "bags" }), {}))
+    end)
+    ck(n == 4, "a manifest-less (older) requester got " .. tostring(n)
+        .. " owners instead of the full 4-owner blast")
+    ck(got["Puucons-Whitemane"] == 76 and got["Alt-Two"] == 5,
+        "the legacy blast dropped owners")
+
+    ------------------------------------------------------------------
+    -- 4. ADVERSARIAL ROWS.
+    ------------------------------------------------------------------
+    -- 4a. A peer asking for OUR OWN live owner entry still gets it. Self-immunity
+    --     lives on the RECEIVE side (Sync.ApplyInbound / DeliverRemote skip our
+    --     own ownerKey); the answerer must never withhold its own record, or the
+    --     owner's freshest data would be the one thing that never propagates.
+    got, n = pull(bags(0, { ["Me-Whitemane"] = nil }),
+                  bags(0, { ["Me-Whitemane"] = { rev = 9, data = { g = 9 } } }))
+    ck(got["Me-Whitemane"] == 9, "the answerer withheld its OWN live owner entry")
+
+    -- 4b. A manifest naming owners we do not hold: no send, no error. (We iterate
+    --     OUR store, never theirs, so a hostile manifest cannot make us fabricate.)
+    reset()
+    Store.data = bags(76)
+    local sent = Mesh.SendNamespace("Peer-R", "bags", {
+        ["Puucons-Whitemane"] = 76, ["Alt-One"] = 12, ["Alt-Two"] = 5, ["Alt-Three"] = 40,
+        ["Ghost-One"] = 3, ["Ghost-Two"] = 999,
+    })
+    ck(sent == 0, "a manifest listing unknown owners produced " .. tostring(sent) .. " sends")
+
+    -- 4c. Repeated NSREQ inside the answer window -> exactly ONE answer. This is
+    --     the flood gate: it used to be 15s, shorter than the answer it guarded.
+    reset()
+    Store.data = bags(75)
+    Mesh.RequestNamespace("Peer-R", "bags")
+    local reqFrame = caught[1] and caught[1].frame
+    caught = {}
+    Store.data = bags(76)
+    local pf = Mesh.ParseFrame(reqFrame)
+    Mesh.HandleNSReq(pf, "Peer-R")
+    local _, firstN = answered()
+    Mesh.HandleNSReq(pf, "Peer-R")
+    Mesh.HandleNSReq(pf, "Peer-R")
+    local _, afterN = answered()
+    ck(firstN == 1, "the first answer sent " .. tostring(firstN) .. " owners")
+    ck(afterN == firstN, "a re-ask inside the dedup window produced a second answer")
+    ck(Mesh.NS_REQ_DEDUP >= 120, "NS_REQ_DEDUP is back under the answer's own drain time")
+
+    -- 4d. Requester-side ask cooldown: one NSREQ per (peer, ns) per window, even
+    --     though the heartbeat re-detects the divergence every 17-23s.
+    reset()
+    Store.data = bags(75)
+    ck(Mesh.RequestNamespace("Peer-R", "bags") == true, "the first ask was refused")
+    ck(Mesh.RequestNamespace("Peer-R", "bags") == false, "a second ask inside the cooldown was sent")
+    ck(Mesh.RequestNamespace("Other-R", "bags") == true, "a DIFFERENT peer was gated by the first peer's ask")
+    ck(Mesh.RequestNamespace("Peer-R", "other") == true, "a DIFFERENT namespace was gated by the bags ask")
+    ck(Mesh.NS_REQ_ASK_COOLDOWN >= 120, "NS_REQ_ASK_COOLDOWN is shorter than the heartbeat storm it exists to stop")
+
+    -- 4e. The manifest we emit is numbers-only and complete.
+    Store.data = bags(75)
+    local man = Mesh.BuildNSManifest("bags")
+    ck(type(man) == "table" and man["Puucons-Whitemane"] == 75 and man["Alt-Three"] == 40,
+        "BuildNSManifest did not report our stored revs")
+    local nonNum = 0
+    for _, v in pairs(man) do if type(v) ~= "number" then nonNum = nonNum + 1 end end
+    ck(nonNum == 0, "the manifest carried " .. tostring(nonNum) .. " non-numeric revs")
+    ck(type(Mesh.BuildNSManifest("no-such-ns")) == "table",
+        "an unknown namespace did not yield an empty manifest")
+
+    ------------------------------------------------------------------
+    -- 5. TELEMETRY the owner reads in /dsn debug mesh: a manifest-bearing answer
+    --    counts as targeted, a manifest-less one as a full blast, and the
+    --    filtered owners are counted as skipped.
+    ------------------------------------------------------------------
+    reset()
+    local t0, f0, s0 = Mesh._nsAnswersTargeted, Mesh._nsAnswersFull, Mesh._nsOwnersSkipped
+    Store.data = bags(76)
+    Mesh.SendNamespace("Peer-R", "bags", { ["Alt-One"] = 12, ["Alt-Two"] = 5, ["Alt-Three"] = 40 })
+    ck(Mesh._nsAnswersTargeted == t0 + 1, "a targeted answer was not counted")
+    ck(Mesh._nsOwnersSkipped == s0 + 3, "the filtered owners were not counted as skipped")
+    reset()
+    Store.data = bags(76)
+    Mesh.SendNamespace("Peer-R", "bags", nil)
+    ck(Mesh._nsAnswersFull == f0 + 1, "a legacy full blast was not counted")
+
+    Store.data  = savedData
+    Mesh.IsEnabled, Mesh.Enqueue = savedEnabled, savedEnqueue
+    Mesh._nsReqSeen, Mesh._nsReqAsked, Mesh._nsQueued = savedSeen, savedAsked, savedQueued
+    if restoreSync then _G.Daseeki.Sync = nil end
+    _G.Daseeki = savedDaseeki
+    return ok, why
+end
+
+----------------------------------------------------------------------
+-- IN-QUEUE DUPLICATE SUPPRESSION for namespace payloads.
+--
+-- The SYNC prefix drains at ~1 msg/sec, so a chunked inventory payload sits in
+-- the queue for a while. Anything asking for the same (target, ns, owner) in
+-- that window used to enqueue a second identical copy — that is how a queue grew
+-- faster than it drained. A pending record per (target, ns, owner) now holds the
+-- QUEUED REV: an equal-or-older rev is dropped, a NEWER rev supersedes, and the
+-- record clears when the frame's last chunk leaves the queue (or by TTL sweep).
+--
+-- This row drives the REAL queue and the REAL DrainTick; C_ChatInfo is stubbed
+-- for the duration so running the suite in-game cannot put a byte on the wire.
+----------------------------------------------------------------------
+local function testNSQueueDedup()
+    local ok, why = true, nil
+    local function ck(c, m) if ok and not c then ok, why = false, m end end
+
+    local savedData    = Store.data
+    local savedEnabled = Mesh.IsEnabled
+    local savedSched   = Mesh._sched
+    local savedQueued  = Mesh._nsQueued
+    local savedPeers   = Mesh.peers
+    local savedDaseeki = _G.Daseeki
+    local savedSend    = C_ChatInfo and C_ChatInfo.SendAddonMessage
+    _G.Daseeki = _G.Daseeki or {}
+    local restoreSync = (_G.Daseeki.Sync == nil)
+    _G.Daseeki.Sync = _G.Daseeki.Sync or {}
+    Mesh.IsEnabled = function() return true end
+    Mesh._sched, Mesh._nsQueued, Mesh.peers = {}, {}, {}
+    if C_ChatInfo then C_ChatInfo.SendAddonMessage = function() return 0 end end
+
+    local OWNER = "Puucons-Whitemane"
+    local function setRev(r)
+        Store.data = { syncNamespaces = { bags = { [OWNER] = { rev = r, data = { g = r } } } } }
+    end
+    local send = Mesh._sendNSPayloadTo
+    local dedup0 = Mesh._nsQueueDedup or 0
+
+    setRev(76)
+    ck(send("A-Realm", "bags", OWNER) == true, "the first enqueue was refused")
+    ck(send("A-Realm", "bags", OWNER) == false, "the same (target,ns,owner,rev) enqueued twice")
+    ck((Mesh._nsQueueDedup or 0) == dedup0 + 1, "the suppression was not counted for the owner's debug line")
+    ck(send("B-Realm", "bags", OWNER) == true, "a second target was blocked by the first target's hold")
+
+    setRev(77)
+    ck(send("A-Realm", "bags", OWNER) == true, "a NEWER rev did not supersede the pending one")
+    ck(send("A-Realm", "bags", OWNER) == false, "the superseding rev did not take the hold")
+    setRev(76)
+    ck(send("A-Realm", "bags", OWNER) == false, "an OLDER rev slipped past the pending hold")
+    setRev(77)
+
+    -- Drain the queue and prove the hold is RELEASED by the send: a third
+    -- enqueue after the frame has gone out must succeed.
+    local s = Mesh._sched[Protocol.PREFIX.SYNC]
+    ck(s ~= nil, "nothing reached the SYNC scheduler")
+    local base, guard = now(), 0
+    while s and not s.queue:IsEmpty() and guard < 60 do   -- iteration ceiling
+        guard = guard + 1
+        Mesh.DrainTick(base + guard)
+    end
+    ck(guard < 60, "the drain loop hit its iteration ceiling with frames still queued")
+    ck(next(Mesh._nsQueued) == nil, "a pending hold survived a fully drained queue")
+    ck(send("A-Realm", "bags", OWNER) == true, "the key was still held after its frame was sent")
+
+    -- TTL backstop: a hold for a peer that never drains must not pin the key
+    -- forever (PruneDedup runs on the existing drain cadence).
+    Mesh._nsQueued = { ["C-Realm\1bags\1" .. OWNER] = { rev = 99, gen = -1, left = 1, at = base } }
+    Mesh.PruneDedup(base + Mesh.NS_QUEUED_TTL + 1)
+    ck(next(Mesh._nsQueued) == nil, "the TTL sweep did not release a stranded hold")
+
+    Store.data, Mesh.IsEnabled = savedData, savedEnabled
+    Mesh._sched, Mesh._nsQueued, Mesh.peers = savedSched, savedQueued, savedPeers
+    if C_ChatInfo then C_ChatInfo.SendAddonMessage = savedSend end
+    if restoreSync then _G.Daseeki.Sync = nil end
+    _G.Daseeki = savedDaseeki
+    return ok, why
 end
 
 -- A fresh push of our OWN owner must outrank bulk namespace backfill in the
@@ -5232,6 +5765,8 @@ function Mesh.RunSelfTests(verbose)
         { name = "relay assignment", fn = testRelayPlan },
         { name = "hash diff",        fn = testHashDiff },
         { name = "namespace hash diff", fn = testNamespaceDiff },
+        { name = "ns targeted backfill (rev manifest)", fn = testNSTargetedBackfill },
+        { name = "ns queue duplicate suppression", fn = testNSQueueDedup },
         { name = "fresh ns push outranks bulk backfill", fn = testNSPushPriority },
         { name = "instances hash",   fn = testInstancesHash },
         { name = "dedup window",     fn = testDedupWindow },
