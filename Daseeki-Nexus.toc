@@ -25,6 +25,7 @@ snbridge.lua
 auto.lua
 options.lua
 syncns.lua
+friends.lua
 inventory.lua
 tooltips.lua
 import.lua

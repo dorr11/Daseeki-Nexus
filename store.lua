@@ -1151,6 +1151,15 @@ local function defaultSettings()
         -- bump. Inert by design while Daseeki-Bags is installed: Bags draws these
         -- itself, so tooltips.lua stands down and this key changes nothing.
         wealthTooltips    = true,
+        -- Mesh-wide auto-friend (friends.lua): every mesh character on ANOTHER
+        -- account, same faction and realm, is put on this character's friends
+        -- list once. Default ON, and MeshFriends.IsEnabled treats an ABSENT key
+        -- as ON too, so a SavedVariables file written before this key existed
+        -- behaves exactly like a fresh one. ADDITIVE — one boolean, no
+        -- settingsVersion bump. Turning it off stops FUTURE passes only: no
+        -- friend is ever removed, and the never-re-add ledger is left intact so
+        -- re-enabling resumes exactly where it stopped.
+        autoFriendMesh    = true,
         accountID         = "",           -- user sets via /dsn account
         minimap = {
             hide = false,
@@ -1274,6 +1283,20 @@ local function defaultData()
             owners   = {},
             parts    = {},
             migrated = false,
+        },
+        -- Mesh auto-friend NEVER-RE-ADD LEDGER (friends.lua). ADDITIVE and
+        -- schema-versioned independently of STORAGE_VERSION.
+        --   chars[<my Name-Realm>][<key>] = { s, ts, n, why }
+        --   key = "<lowered base name>-<lowered space-stripped realm>" — the
+        --         same shape Daseeki-Conduit's own ledger uses, so its entries
+        --         can be honoured with our keys.
+        --   s   = "pending" | "added" | "preexisting" | "blocked"
+        -- Scoped per LOGGED-IN CHARACTER because the friends list is. "blocked"
+        -- is terminal: it records that the owner deliberately removed a friend
+        -- we (or Conduit) put there, and nothing ever re-adds that name.
+        meshFriends = {
+            schema = 1,
+            chars  = {},
         },
     }
 end
