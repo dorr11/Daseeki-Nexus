@@ -15,10 +15,16 @@
 --              ConvertToRaid / AcceptGroup / LeaveParty           (GLOBALS —
 --              NOT C_PartyInfo members in the 1.15.9 catalog).
 --              READ-ONLY group state: GetNumGroupMembers, IsInRaid,
---              UnitIsGroupLeader, UnitName, IsEveryoneAssistant.
+--              UnitIsGroupLeader, UnitIsGroupAssistant, UnitName,
+--              IsEveryoneAssistant. UnitIsGroupAssistant is globals.txt +
+--              functions.txt for 1.15.9.68808 (unit:UnitToken -> bool) and is
+--              read-only: it answers the spec §12.3 "can I invite from here?"
+--              question, it does not change anything.
 --              NO PROTECTED group API is called from this file — see the
 --              "Mesh-assembly gate" block for why, and harness.lua's
 --              "protected-API gate" for the rule that keeps it that way.
+--   * Chat:    SendChatMessage (GLOBAL). CHAT_MSG_SYSTEM (Event.ChatInfo.
+--              ChatMsgSystem) is the spec's invite-failure evidence, §12.1.
 --   * Summon:  C_SummonInfo.ConfirmSummon / .CancelSummon /
 --              .GetSummonReason ; UnitOnTaxi ; InCombatLockdown.
 --   * Gossip:  C_GossipInfo.GetOptions / .SelectOption / .CloseGossip.
@@ -314,15 +320,80 @@ function Auto.MatchKeyword(text, keyword)
     return first == keyword
 end
 
--- Whisper handler: keyword auto-invite + the leader-redirect protocol.
+----------------------------------------------------------------------
+-- THE LEADER REDIRECT  (spec §12.3, audit divergence 8 / rows 29-31)
 --
--- Leader-redirect ("DSN:LEAD:Name-Realm") is OUR OWN protocol tag (not the
--- spec source's). Two directions:
+-- "DSN:LEAD:Name-Realm" is OUR OWN protocol tag (not the spec source's), in two
+-- directions:
 --   inbound  "DSN:LEAD:X" — a peer tells us the real inviter is X, so we
 --            re-whisper the keyword to X and route ourselves onto their group.
---   outbound when someone whispers our keyword but a redirectLeader is
---            configured (and it isn't us), we answer "DSN:LEAD:<leader>" so the
---            requester's client re-routes to that leader instead of us.
+--   outbound someone whispers our keyword and WE CANNOT INVITE — so we answer
+--            "DSN:LEAD:<leader>" and their client re-routes to whoever is
+--            actually holding the group.
+--
+-- The outbound half used to key off `ag.redirectLeader`: a settings key with no
+-- store default and no options control anywhere, so it read nil forever and the
+-- branch was unreachable dead code. The audit's verdict on it is MISSING, and
+-- the fix is not to give the dead key a UI — the spec never describes a
+-- configured leader. It describes a LIVE one: "if we cannot invite (in a raid
+-- without leader/assist, or in a party without lead), the addon finds the group
+-- leader and — only if that leader is in our mesh — whispers the requester a
+-- machine-readable redirect." So the key is gone and the live lookup is here.
+--
+-- The mesh test is the safety rule, not a nicety: without it we would hand a
+-- stranger's name and realm to whoever whispered us, on their behalf, unasked.
+----------------------------------------------------------------------
+
+-- Can we actually issue an invite right now? Pure over group state.
+function Auto.CanInviteIn(ctx)
+    ctx = ctx or {}
+    if not ctx.inGroup then return true end                        -- solo: always
+    if ctx.inRaid then return (ctx.isLeader or ctx.isAssistant) and true or false end
+    return ctx.isLeader and true or false
+end
+
+function Auto.CanInvite()
+    return Auto.CanInviteIn({
+        inGroup     = ((GetNumGroupMembers and GetNumGroupMembers()) or 0) > 1,
+        inRaid      = (IsInRaid and IsInRaid()) and true or false,
+        isLeader    = (UnitIsGroupLeader and UnitIsGroupLeader("player")) and true or false,
+        isAssistant = (UnitIsGroupAssistant and UnitIsGroupAssistant("player")) and true or false,
+    })
+end
+
+-- Canonical Name-Realm of the current group leader, or nil. READ-ONLY API.
+function Auto.GroupLeaderName()
+    local n = (GetNumGroupMembers and GetNumGroupMembers()) or 0
+    if n <= 1 then return nil end
+    if UnitIsGroupLeader and UnitIsGroupLeader("player") then return selfNameRealm() end
+    local raid = (IsInRaid and IsInRaid()) and true or false
+    local last = raid and n or (n - 1)
+    for i = 1, last do
+        local unit = (raid and "raid" or "party") .. i
+        if UnitIsGroupLeader and UnitIsGroupLeader(unit) then
+            local nm, rlm = UnitName and UnitName(unit)
+            if nm and nm ~= "" then
+                return (rlm and rlm ~= "") and (nm .. "-" .. rlm) or Auto.NormalizeName(nm)
+            end
+        end
+    end
+    return nil
+end
+
+-- Pure routing decision for an incoming keyword whisper.
+-- ctx = { canInvite, leader, leaderInMesh, me }
+-- Returns "invite" | "redirect" | "ignore" (plus the leader for "redirect").
+function Auto.DecideWhisperRoute(ctx)
+    ctx = ctx or {}
+    if ctx.canInvite then return "invite" end
+    local leader = ctx.leader
+    if leader and leader ~= "" and leader ~= ctx.me and ctx.leaderInMesh then
+        return "redirect", leader
+    end
+    return "ignore"
+end
+
+-- Whisper handler: keyword auto-invite + the leader-redirect protocol.
 function Auto.OnWhisper(text, playerName)
     text = text or ""
     local ag = agBlock()
@@ -342,18 +413,29 @@ function Auto.OnWhisper(text, playerName)
     if not Auto.MatchKeyword(text, ag.inviteKeyword or "inv") then return end
     local nameRealm = Auto.NormalizeName(playerName)
 
-    -- Outbound redirect: hand the requester off to the designated leader.
-    local redirect = ag.redirectLeader
-    if type(redirect) == "string" and redirect ~= "" and redirect ~= selfNameRealm() then
+    -- Trust gate first: someone we would not invite gets no answer at all, not
+    -- even the name of our group leader.
+    local ok, cat = Auto.ShouldInviteKeyword(nameRealm)
+    if not ok then return end
+
+    local leader = Auto.GroupLeaderName()
+    local route, to = Auto.DecideWhisperRoute({
+        canInvite    = Auto.CanInvite(),
+        leader       = leader,
+        leaderInMesh = leader and Auto.IsRoster(leader) or false,
+        me           = selfNameRealm(),
+    })
+
+    if route == "redirect" then
         if SendChatMessage then
-            SendChatMessage("DSN:LEAD:" .. redirect, "WHISPER", nil, nameRealm)
+            SendChatMessage("DSN:LEAD:" .. to, "WHISPER", nil, nameRealm)
         end
+        ns:Print(("cannot invite — pointed %s at %s."):format(nameRealm, to))
         return
     end
+    if route ~= "invite" then return end
 
-    -- We handle it: invite the requester if they clear the send gate.
-    local ok, cat = Auto.ShouldInviteKeyword(nameRealm)
-    if ok and C_PartyInfo and C_PartyInfo.InviteUnit then
+    if C_PartyInfo and C_PartyInfo.InviteUnit then
         C_PartyInfo.InviteUnit(nameRealm)
         ns:Print(("keyword invite -> %s (%s)."):format(nameRealm, cat or "?"))
     end
@@ -508,10 +590,220 @@ end
 -- Invite automation, continued
 ----------------------------------------------------------------------
 
--- Mass-invite every online mesh character. Source of truth is the mesh peer
--- table: each online peer's `name` is that account's currently-logged-in
--- character. Unless the caller opts out, this ARMS the assembly window (see the
--- gate block above) and schedules the convert pass once the invites settle.
+----------------------------------------------------------------------
+-- THE INVITE RUN  (spec §12.1, audit divergence 6)
+--
+-- What used to be here walked ns.Mesh.peers and fired every invite in one
+-- frame. Six of the spec's rules were simply absent: the local-database half of
+-- the target set, the active-faction filter, the already-in-group filter, the
+-- alphabetical sort, the 60 ms spacing with its 700 ms pin on the 5th, and the
+-- whole reverse-invite recovery. A burst of 8-20 simultaneous InviteUnit calls
+-- is exactly the shape the client throttles, and a group that is already
+-- assembled under somebody else never got the reverse invite.
+--
+-- KEPT AS-IS, DELIBERATELY: the assembly gate (60 s armed window + leader +
+-- mesh-share) instead of the spec's flat 5 s. That is documented hardening
+-- after a live ADDON_ACTION_BLOCKED incident (see the gate block above) and the
+-- audit marks it APPROXIMATED-BY-DESIGN, not a defect. This rebuild does not
+-- touch it; the convert pass is simply re-timed to fire after the ladder has
+-- finished rather than a flat 2 s after the run started.
+----------------------------------------------------------------------
+
+Auto.INVITE_SPACING       = 0.06   -- spec: invites 60 ms apart
+Auto.INVITE_FIFTH_INDEX   = 5      -- spec: …and the 5th is additionally delayed
+Auto.INVITE_FIFTH_DELAY   = 0.70   -- …so it lands no earlier than 700 ms in
+Auto.REVERSE_INVITE_DELAY = 0.30   -- spec: leave party, wait 0.3 s, then whisper
+-- OURS. The spec says WHAT decides the reverse invite (every invite failed) but
+-- not WHEN we stop waiting for the server to say so. One second past the last
+-- invite is comfortably longer than a same-realm invite round-trip and short
+-- enough to still feel like part of the same click. Judging early is not a
+-- correctness risk in any case: FinishInviteRun re-reads the group at judge
+-- time, so a straggler who joined blocks the reverse path on the "alone" test.
+Auto.INVITE_JUDGE_DELAY   = 1.0
+Auto.INVITE_SETTLE_DELAY  = 2      -- OURS: convert pass, after the ladder ends
+
+-- Injectable scheduler. Everything timed in this file goes through it so the
+-- headless self-tests can drive the ladder on a simulated clock — the harness
+-- stubs C_Timer.After as a no-op, and a test that needs a real timer is a test
+-- that never runs.
+function Auto.After(delay, fn)
+    if Auto._after then return Auto._after(delay, fn) end
+    if C_Timer and C_Timer.After then return C_Timer.After(delay, fn) end
+    return fn()
+end
+
+-- Spec §12.1 target set, pure over injected state. ctx:
+--   accounts  -- Store data accounts table (the LOCAL DATABASE half)
+--   peers     -- ns.Mesh.peers (the MESH ROSTER half)
+--   faction   -- our active faction; DB characters must match it
+--   me        -- our own Name-Realm
+--   inGroup   -- { [nameRealm] = true } for everyone already grouped with us
+--   isOnline  -- fn(nameRealm, rec, aid) -> boolean
+-- Returns an alphabetically sorted array of Name-Realm.
+--
+-- FACTION NOTE. Mesh peers carry no faction field and need none: custom chat
+-- channels are faction-bound, so the mesh channel can only ever hold
+-- same-faction characters (mesh.lua's same-faction constraint). The filter
+-- therefore applies to the database half, where a stored record really can be
+-- the other side's. A DB record with NO faction stamped is not admitted on that
+-- evidence — but if it is also a live mesh peer, the roster half admits it.
+function Auto.BuildInviteTargets(ctx)
+    ctx = ctx or {}
+    local me      = ctx.me
+    local inGroup = ctx.inGroup or {}
+    local isOnline = ctx.isOnline or function() return false end
+
+    local seen, out = {}, {}
+    local function add(nameRealm)
+        if not nameRealm or nameRealm == "" then return end
+        if nameRealm == me then return end            -- not yourself
+        if inGroup[nameRealm] then return end         -- not already in your group
+        if seen[nameRealm] then return end
+        seen[nameRealm] = true
+        out[#out + 1] = nameRealm
+    end
+
+    -- Roster half first, so a mesh name is admitted even when the local record
+    -- for it is stale, foreign-faction-looking or absent entirely.
+    local roster = {}
+    for _, p in pairs(ctx.peers or {}) do
+        if p and p.online and p.name then roster[p.name] = true end
+    end
+
+    for aid, bucket in pairs(ctx.accounts or {}) do
+        local function consider(nameRealm, rec)
+            if rec and rec.faction ~= ctx.faction then return end
+            if isOnline(nameRealm, rec, aid) or roster[nameRealm] then add(nameRealm) end
+        end
+        for nameRealm, rec in pairs((bucket and bucket.characters) or {}) do
+            consider(nameRealm, rec)
+        end
+        for nameRealm, rec in pairs((bucket and bucket.homeless) or {}) do
+            consider(nameRealm, rec)
+        end
+    end
+
+    -- …plus every mesh-roster name not present in the local database at all.
+    for nameRealm in pairs(roster) do add(nameRealm) end
+
+    table.sort(out)
+    return out
+end
+
+-- Live target set. Online-ness is the dashboard's answer when the UI layer is
+-- loaded; headless (or with DaseekiUI absent, where ui_shell.lua top-level
+-- returns) it falls back to the same 15 s last-seen recency the spec's §2.1
+-- step 3 describes.
+Auto.ONLINE_WINDOW = 15
+
+function Auto.InviteTargets()
+    local data  = Store.GetData()
+    local peers = ns.Mesh and ns.Mesh.peers or nil
+    local D     = ns.Dashboard
+    local nowE  = (Store.Now and Store.Now()) or 0
+    local isOnline
+    if D and D.IsOnline then
+        isOnline = function(nameRealm, rec, aid) return D.IsOnline(rec, nameRealm, aid) and true or false end
+    else
+        isOnline = function(_, rec)
+            return rec ~= nil and (nowE - (rec.lastSeen or 0)) <= Auto.ONLINE_WINDOW
+        end
+    end
+    local inGroup = {}
+    for _, nm in ipairs(Auto.GroupMemberNames()) do inGroup[nm] = true end
+    local faction = UnitFactionGroup and UnitFactionGroup("player") or nil
+    return Auto.BuildInviteTargets({
+        accounts = data and data.accounts,
+        peers    = peers,
+        faction  = faction,
+        me       = selfNameRealm(),
+        inGroup  = inGroup,
+        isOnline = isOnline,
+    })
+end
+
+-- Spec §12.1 pacing: invites 60 ms apart, with the 5th pinned to land no
+-- earlier than 700 ms after the run started. The ladder stays MONOTONE past the
+-- pin — invites 6..n continue 60 ms behind the delayed 5th rather than
+-- overtaking it, which is the only reading under which the 5th is still 5th.
+-- Pure; returns delays in seconds from run start.
+function Auto.InviteSchedule(n)
+    local out, t = {}, 0
+    for i = 1, (n or 0) do
+        if i > 1 then t = t + Auto.INVITE_SPACING end
+        if i == Auto.INVITE_FIFTH_INDEX and t < Auto.INVITE_FIFTH_DELAY then
+            t = Auto.INVITE_FIFTH_DELAY
+        end
+        out[i] = t
+    end
+    return out
+end
+
+-- Spec §12.1 failure counting: a system chat line containing "already" AND
+-- either "group" or "party". Pure; case-insensitive.
+function Auto.IsAlreadyInGroupMessage(msg)
+    local m = lower(msg or "")
+    if not m:find("already", 1, true) then return false end
+    return (m:find("group", 1, true) or m:find("party", 1, true)) and true or false
+end
+
+-- Spec §12.1 outcome: EVERY invite failed with already-in-a-group, and we are
+-- alone -> recover by asking for a reverse invite. Otherwise report success.
+-- Pure over ctx = { sent, failures, alone }.
+function Auto.DecideInviteOutcome(ctx)
+    ctx = ctx or {}
+    local sent     = ctx.sent or 0
+    local failures = ctx.failures or 0
+    if sent > 0 and failures >= sent and ctx.alone then return "reverse" end
+    return "done"
+end
+
+-- Live run state. One at a time; a second invite run replaces the first.
+Auto._inviteRun = nil
+
+-- CHAT_MSG_SYSTEM sink. Only counts while a run is open, so the addon is not
+-- parsing every system line the client ever prints.
+function Auto.OnSystemMessage(msg)
+    local run = Auto._inviteRun
+    if not run or run.closed then return false end
+    if not Auto.IsAlreadyInGroupMessage(msg) then return false end
+    run.failures = run.failures + 1
+    return true
+end
+
+-- Close the run and act on the outcome.
+function Auto.FinishInviteRun()
+    local run = Auto._inviteRun
+    if not run or run.closed then return nil end
+    run.closed = true
+
+    local alone = ((GetNumGroupMembers and GetNumGroupMembers()) or 0) <= 1
+    local outcome = Auto.DecideInviteOutcome({
+        sent = run.sent, failures = run.failures, alone = alone,
+    })
+
+    if outcome ~= "reverse" then
+        ns:Print(("All invites sent! (%d)"):format(run.sent))
+        return outcome
+    end
+
+    -- Everyone we asked is already grouped up somewhere and we are on our own:
+    -- drop whatever party shell we are in, let the server settle, then whisper
+    -- the keyword at the first target so THEY invite US instead.
+    local target = run.targets[1]
+    if LeaveParty then LeaveParty() end
+    Auto.After(Auto.REVERSE_INVITE_DELAY, function()
+        if target and SendChatMessage then
+            SendChatMessage(run.keyword, "WHISPER", nil, target)
+            ns:Print(("everyone is already grouped — asked %s for an invite."):format(target))
+        end
+    end)
+    return outcome
+end
+
+-- Mass-invite every eligible character (spec §12.1). Unless the caller opts
+-- out, this ARMS the assembly window (see the gate block above) and schedules
+-- the convert pass once the invites settle.
 --
 -- Public surface: minimap left-click, dashboard "Invite Online", /dsn invite.
 function Auto.InviteOnline(skipConvert)
@@ -520,31 +812,49 @@ function Auto.InviteOnline(skipConvert)
     -- convert pass needs to see.
     if not skipConvert then Auto.ArmAssembly() end
 
-    local invited = 0
-    local me = selfNameRealm()
-    local peers = ns.Mesh and ns.Mesh.peers or nil
-    if peers and C_PartyInfo and C_PartyInfo.InviteUnit then
-        for _, p in pairs(peers) do
-            if p.online and p.name and p.name ~= me then
-                C_PartyInfo.InviteUnit(p.name)
-                invited = invited + 1
+    local targets = Auto.InviteTargets()
+    local n = #targets
+    if n == 0 then
+        Auto._inviteRun = nil
+        ns:Print("no eligible characters to invite.")
+        return 0
+    end
+
+    local schedule = Auto.InviteSchedule(n)
+    Auto._inviteRun = {
+        targets  = targets,
+        sent     = n,
+        failures = 0,
+        closed   = false,
+        keyword  = agBlock().inviteKeyword or "inv",
+    }
+    local run = Auto._inviteRun
+
+    for i = 1, n do
+        local name = targets[i]
+        Auto.After(schedule[i], function()
+            -- A newer run supersedes this one; never fire its stragglers.
+            if Auto._inviteRun ~= run then return end
+            if C_PartyInfo and C_PartyInfo.InviteUnit then
+                C_PartyInfo.InviteUnit(name)
             end
-        end
+        end)
     end
-    if invited > 0 then
-        ns:Print(("invited %d online mesh character(s)."):format(invited))
-    else
-        ns:Print("no online mesh characters to invite.")
-    end
+
+    local tail = schedule[n] or 0
+    -- Give the server a beat past the last invite to answer, then judge the run.
+    Auto.After(tail + Auto.INVITE_JUDGE_DELAY, function()
+        if Auto._inviteRun ~= run then return end
+        ns:SafeCall(Auto.FinishInviteRun)
+    end)
+
     if not skipConvert then
-        -- Let the invites land before converting the group.
-        if C_Timer and C_Timer.After then
-            C_Timer.After(2, function() ns:SafeCall(Auto.MaybeConvertRaid) end)
-        else
-            Auto.MaybeConvertRaid()
-        end
+        -- Let the whole ladder land before converting the group.
+        Auto.After(tail + Auto.INVITE_SETTLE_DELAY, function()
+            ns:SafeCall(Auto.MaybeConvertRaid)
+        end)
     end
-    return invited
+    return n
 end
 
 -- All-Assist is a PROTECTED switch: Blizzard reserves it for the player, from
@@ -605,51 +915,267 @@ end
 -- All 10 world buffs are summon triggers (item 23): the reference gates summon
 -- acceptance on holding ANY of DMF, Ony, ZG, DMT AP/SP/STAM, Songflower, Rend,
 -- Battle Shout, FFF. (Prior build had only 7 — no dmf/battleShout/fff.)
+-- `slot` is the TRACKER's slot index (tracker.lua BUFF_SLOTS / BUFF_SPELL_IDS),
+-- which is how identity is resolved now: spell ID first, apostrophe-normalized
+-- name prefix as the fallback, both through Tracker.MatchAura. The `prefix` here
+-- is kept ONLY as the last-ditch matcher for a build with no tracker loaded, and
+-- `label` is what the accept line prints (spec §13: "prints which buffs
+-- triggered it", not the reason word).
 Auto.SUMMON_TRIGGER_BUFFS = {
-    { key = "dragonslayer", prefix = "rallying cry of the dragonslayer" },
-    { key = "warchief",     prefix = "warchief's blessing" },
-    { key = "zandalar",     prefix = "spirit of zandalar" },
-    { key = "songflower",   prefix = "songflower serenade" },
-    { key = "fengus",       prefix = "fengus' ferocity" },
-    { key = "moldar",       prefix = "mol'dar's moxie" },
-    { key = "slipkik",      prefix = "slip'kik's savvy" },
-    { key = "dmf",          prefix = "sayge's dark fortune" },
-    { key = "battleShout",  prefix = "battle shout" },
-    { key = "fff",          prefix = "fervor of the first feast" },  -- seasonal [verify prefix]
+    { key = "dragonslayer", slot = 1,  label = "Rallying Cry of the Dragonslayer",
+      prefix = "rallying cry of the dragonslayer" },
+    { key = "warchief",     slot = 2,  label = "Warchief's Blessing",
+      prefix = "warchief's blessing" },
+    { key = "zandalar",     slot = 3,  label = "Spirit of Zandalar",
+      prefix = "spirit of zandalar" },
+    { key = "songflower",   slot = 4,  label = "Songflower Serenade",
+      prefix = "songflower serenade" },
+    { key = "fengus",       slot = 6,  label = "Fengus' Ferocity",
+      prefix = "fengus' ferocity" },
+    { key = "moldar",       slot = 7,  label = "Mol'dar's Moxie",
+      prefix = "mol'dar's moxie" },
+    { key = "slipkik",      slot = 8,  label = "Slip'kik's Savvy",
+      prefix = "slip'kik's savvy" },
+    { key = "dmf",          slot = 5,  label = "Sayge's Dark Fortune",
+      prefix = "sayge's dark fortune" },
+    { key = "battleShout",  slot = 9,  label = "Battle Shout",
+      prefix = "battle shout" },
+    -- SEASONAL FFF. The prefix used to read "fervor of the first feast", which
+    -- is not the name of anything: spec §4.1 names slot 10 **Fire Festival
+    -- Fury** (29338 / 29846), and tracker.lua has carried the correct string
+    -- all along. The trigger therefore could never match, so ticking the FFF box
+    -- did nothing at all (audit divergence 5 / row 58).
+    { key = "fff",          slot = 10, label = "Fire Festival Fury",
+      prefix = "fire festival fury" },
 }
 
--- Most-recent trigger-buff gain timestamp (GetTime seconds). Refreshed as
--- configured trigger buffs newly appear on the player.
-Auto._lastTriggerGain = nil
-Auto._triggerPresent  = {}   -- [key] = true while the aura is up
+-- Trigger key -> tracker slot, and the boonable subset. A chronoboon suspends
+-- slots 1-8 only; Battle Shout (9) and FFF (10) are NOT boonable (spec §4.1), so
+-- they are the two slots the unboon-window exclusion must NOT swallow.
+Auto.TRIGGER_SLOT     = {}
+Auto.TRIGGER_BOONABLE = {}
+for _, def in ipairs(Auto.SUMMON_TRIGGER_BUFFS) do
+    Auto.TRIGGER_SLOT[def.key]     = def.slot
+    Auto.TRIGGER_BOONABLE[def.key] = (def.slot <= 8) or nil
+end
 
--- Rescan player auras; stamp a gain time when a *configured* trigger buff
--- transitions absent->present. Cheap (fires off UNIT_AURA, already debounced by
--- WoW's own coalescing for the player unit).
-function Auto.ScanTriggerBuffs()
-    local triggers = asBlock().triggers or {}
-    if not (C_UnitAuras and C_UnitAuras.GetBuffDataByIndex) then return end
-    local nowUp = {}
+-- Spec §13: a `live -> live` refresh only counts as fresh when the remaining
+-- duration JUMPED by more than this. Anything smaller is the same buff ticking
+-- (or a rounding wobble between two captures), not a re-application.
+Auto.FRESH_REFRESH_JUMP = 75
+
+-- Most-recent trigger-buff gain timestamp (GetTime seconds) and the names that
+-- caused it. Both are cleared on accept (spec §13: "clears the fresh-buff
+-- flags, and only then clicks accept").
+Auto._lastTriggerGain  = nil
+Auto._lastTriggerNames = nil
+-- [key] = { state = "absent"|"live"|"booned", duration = seconds }
+Auto._triggerState = {}
+
+----------------------------------------------------------------------
+-- FRESH-BUFF DETECTION  (spec §13, audit divergence 5)
+--
+-- What used to be here stamped a gain on `absent -> present` and nothing else,
+-- over a private localised name-prefix scan with no notion of duration and no
+-- notion of the chronoboon. Three of the spec's four clauses were missing, and
+-- the missing ones are the dangerous ones:
+--
+--   * a `live -> live` refresh whose duration jumps by > 75 s is fresh — so a
+--     Songflower or Rend re-application never armed the gate at all;
+--   * `booned -> live` is NEVER fresh — but with no chronoboon awareness,
+--     RELEASING A BOON read as a batch of brand-new buffs;
+--   * boonable slots gained inside the 3 s unboon window are excluded — the
+--     same hole from the other side, for the scan that lands mid-restore.
+--
+-- The consequence was the sharpest finding in the conformance audit: **pop your
+-- chronoboon and the next summon is auto-accepted**, because unbooning looked
+-- exactly like walking out of Orgrimmar with seven fresh world buffs.
+--
+-- The fix reads the state the tracker already maintains rather than inventing a
+-- parallel one:
+--   * LIVE + duration comes from the aura list, frame-fresh, matched through
+--     Tracker.MatchAura (spell ID first — so this path is no longer broken on a
+--     non-enUS client, audit row 57).
+--   * BOONED comes from the store record's own `auraStates[slot].source == BOON`
+--     cells. It CANNOT come from the aura list: a booned buff is not an aura at
+--     all, which is precisely why the old scan could not see the difference
+--     between "restored from a boon" and "just picked up".
+--   * The unboon window comes from Tracker.InUnboonWindow(), which tracker.lua
+--     has exposed (and flagged as unconsumed) since the chronoboon batch.
+--
+-- Everything below the readers is pure over injected tables, so the whole matrix
+-- — including the unboon case — is driven headless with a fixture store.
+----------------------------------------------------------------------
+
+-- Live trigger auras RIGHT NOW: [key] = remaining seconds (>= 0). Identity is
+-- resolved by the tracker's shared matcher; `auraFn` is injectable for tests.
+function Auto.ReadLiveTriggerAuras(auraFn)
+    local out = {}
+    auraFn = auraFn or (C_UnitAuras and C_UnitAuras.GetBuffDataByIndex)
+    if not auraFn then return out end
+    local T = ns.Tracker
+    local slotToKey = {}
+    for _, def in ipairs(Auto.SUMMON_TRIGGER_BUFFS) do slotToKey[def.slot] = def.key end
     for i = 1, 40 do
-        local aura = C_UnitAuras.GetBuffDataByIndex("player", i)
+        local aura = auraFn("player", i)
         if not aura then break end
-        local nm = lower(aura.name)
-        for _, def in ipairs(Auto.SUMMON_TRIGGER_BUFFS) do
-            if nm:find(def.prefix, 1, true) == 1 then
-                nowUp[def.key] = true
-                if triggers[def.key] and not Auto._triggerPresent[def.key] then
-                    Auto._lastTriggerGain = GetTime()
-                end
+        local slot
+        if T and T.MatchAura then
+            slot = T.MatchAura(aura.spellId or aura.spellID, aura.name)
+        else
+            -- Tracker-less fallback: the catalog's own prefixes.
+            local nm = lower(aura.name)
+            for _, def in ipairs(Auto.SUMMON_TRIGGER_BUFFS) do
+                if nm:find(def.prefix, 1, true) == 1 then slot = def.slot break end
             end
         end
+        local key = slot and slotToKey[slot]
+        if key then
+            -- Same arithmetic as tracker.lua's auraRemaining: floored whole
+            -- seconds off expirationTime, 0 when the client reports none. The
+            -- two readings MUST agree or the 75 s jump test would see phantom
+            -- movement every time the sources swapped.
+            local exp = tonumber(aura.expirationTime) or 0
+            local rem = 0
+            if exp > 0 then
+                rem = exp - ((GetTime and GetTime()) or 0)
+                if rem < 0 then rem = 0 end
+                rem = math.floor(rem)
+            end
+            -- A slot can appear twice (variant re-application); keep the longest.
+            if (out[key] or -1) < rem then out[key] = rem end
+        end
     end
-    Auto._triggerPresent = nowUp
+    return out
+end
+
+-- Trigger keys the STORE says are suspended in a chronoboon. Pure over `rec`.
+function Auto.BoonedTriggersIn(rec)
+    local out = {}
+    local states = rec and rec.auraStates
+    if type(states) ~= "table" then return out end
+    local boonSrc = (ns.Store and ns.Store.AURA_SOURCE and ns.Store.AURA_SOURCE.BOON) or 2
+    for _, def in ipairs(Auto.SUMMON_TRIGGER_BUFFS) do
+        local cell = states[def.slot]
+        if type(cell) == "table" and (tonumber(cell.source) or 0) == boonSrc then
+            out[def.key] = true
+        end
+    end
+    return out
+end
+
+-- Fold the two readings into one state per trigger key. The aura list wins when
+-- a slot is both up and marked booned (that is the tail of a restore, and the
+-- live aura is the newer evidence).
+function Auto.BuildTriggerStates(liveDurations, boonedKeys)
+    liveDurations, boonedKeys = liveDurations or {}, boonedKeys or {}
+    local out = {}
+    for _, def in ipairs(Auto.SUMMON_TRIGGER_BUFFS) do
+        local key = def.key
+        local dur = liveDurations[key]
+        if dur ~= nil then
+            out[key] = { state = "live", duration = dur }
+        elseif boonedKeys[key] then
+            out[key] = { state = "booned", duration = 0 }
+        else
+            out[key] = { state = "absent", duration = 0 }
+        end
+    end
+    return out
+end
+
+-- THE SPEC §13 FRESH-BUFF TEST. Pure over (prev, cur, ctx); returns the sorted
+-- list of trigger keys that just became fresh.
+--   ctx.triggers        -- the user's enabled trigger set
+--   ctx.inUnboonWindow  -- Tracker.InUnboonWindow()
+function Auto.ClassifyTriggerGains(prev, cur, ctx)
+    prev, cur, ctx = prev or {}, cur or {}, ctx or {}
+    local triggers = ctx.triggers or {}
+    local fresh = {}
+    for _, def in ipairs(Auto.SUMMON_TRIGGER_BUFFS) do
+        local key = def.key
+        local c = cur[key]
+        if triggers[key] and c and c.state == "live" then
+            local p     = prev[key]
+            local pstate = (p and p.state) or "absent"
+            local isFresh
+            if pstate == "booned" then
+                -- Releasing a chronoboon RESTORES a buff you already had. Never
+                -- fresh, no matter how long it has left.
+                isFresh = false
+            elseif pstate == "live" then
+                isFresh = ((c.duration or 0) - (p.duration or 0)) > Auto.FRESH_REFRESH_JUMP
+            else
+                isFresh = true                      -- absent -> live
+            end
+            -- The same protection from the other side: for the 3 s after an
+            -- unboon, a boonable slot appearing is the restore landing, not a
+            -- gain. Battle Shout and FFF are not boonable and stay eligible.
+            if isFresh and ctx.inUnboonWindow and Auto.TRIGGER_BOONABLE[key] then
+                isFresh = false
+            end
+            if isFresh then fresh[#fresh + 1] = key end
+        end
+    end
+    table.sort(fresh)
+    return fresh
+end
+
+-- Is the tracker inside its post-unboon grace? Tolerates a tracker-less build.
+function Auto.InUnboonWindow()
+    local T = ns.Tracker
+    if T and T.InUnboonWindow then return T.InUnboonWindow() and true or false end
+    return false
+end
+
+-- The self record, read-only. nil when the store has nothing yet (pre-login).
+local function selfRecord()
+    if not (Store and Store.GetCharacter) then return nil end
+    local ok, rec = pcall(Store.GetCharacter, selfNameRealm())
+    return ok and rec or nil
+end
+
+-- Rescan player auras and stamp a gain time when a *configured* trigger buff
+-- becomes fresh by the §13 definition. Bound to UNIT_AURA (already coalesced by
+-- the client for the player unit).
+function Auto.ScanTriggerBuffs()
+    local cur = Auto.BuildTriggerStates(
+        Auto.ReadLiveTriggerAuras(),
+        Auto.BoonedTriggersIn(selfRecord()))
+    local fresh = Auto.ClassifyTriggerGains(Auto._triggerState, cur, {
+        triggers       = asBlock().triggers or {},
+        inUnboonWindow = Auto.InUnboonWindow(),
+    })
+    Auto._triggerState = cur
+    if #fresh > 0 then
+        Auto._lastTriggerGain  = (GetTime and GetTime()) or 0
+        Auto._lastTriggerNames = fresh
+    end
+    return fresh
 end
 
 -- Age (seconds) of the most-recent trigger-buff gain, or nil if none seen.
 function Auto.TriggerBuffAge()
     if not Auto._lastTriggerGain then return nil end
-    return GetTime() - Auto._lastTriggerGain
+    return ((GetTime and GetTime()) or 0) - Auto._lastTriggerGain
+end
+
+-- Human-readable names of the buffs behind the current fresh flag.
+function Auto.TriggerBuffLabels()
+    local keys = Auto._lastTriggerNames
+    if type(keys) ~= "table" or #keys == 0 then return nil end
+    local byKey = {}
+    for _, def in ipairs(Auto.SUMMON_TRIGGER_BUFFS) do byKey[def.key] = def.label end
+    local out = {}
+    for i = 1, #keys do out[i] = byKey[keys[i]] or keys[i] end
+    return table.concat(out, ", ")
+end
+
+-- Drop the fresh-buff flags. Spec §13 clears them as part of accepting, so a
+-- SECOND summon inside the same window needs a NEW buff to be auto-accepted.
+function Auto.ClearTriggerGain()
+    Auto._lastTriggerGain  = nil
+    Auto._lastTriggerNames = nil
 end
 
 -- Pure summon-gate decision matrix (spec §5). `ctx`:
@@ -683,16 +1209,31 @@ function Auto.EvaluateSummon()
     })
 end
 
--- Perform the accept: snapshot state first (auras are unreliable across the
--- teleport), then confirm through the catalog API.
+-- Perform the accept, in the spec §13 order: snapshot to the database (the
+-- accept fires an instant teleport and the aura APIs are unreliable across it),
+-- print WHICH BUFFS triggered it, CLEAR the fresh-buff flags, and only then
+-- click accept.
+--
+-- The clear is not cosmetic (audit divergence 5 / row 52). Without it the gain
+-- timestamp stays armed for the rest of the 19 s window, so a second summon
+-- landing inside that window — from anyone, for any reason — was auto-accepted
+-- off the same buff. One fresh buff now buys exactly one accept.
 function Auto.AcceptSummon(reason)
     -- Pre-teleport snapshot so the dashboard keeps our buffs/location.
     if ns.Tracker and ns.Tracker.Capture then ns:SafeCall(ns.Tracker.Capture) end
+
+    local labels = Auto.TriggerBuffLabels()
+    if labels then
+        ns:Print(("auto-accepted summon (%s: %s)."):format(reason or "?", labels))
+    else
+        ns:Print(("auto-accepted summon (%s)."):format(reason or "?"))
+    end
+    Auto.ClearTriggerGain()
+
     if C_SummonInfo and C_SummonInfo.ConfirmSummon then
         C_SummonInfo.ConfirmSummon()
     end
     if StaticPopup_Hide then StaticPopup_Hide("CONFIRM_SUMMON") end
-    ns:Print(("auto-accepted summon (%s)."):format(reason or "?"))
 end
 
 Auto._pendingSummon = false
@@ -1987,6 +2528,13 @@ function Auto.OnLogin()
     ns:RegisterEvent("CHAT_MSG_WHISPER", function(_, text, playerName)
         ns:SafeCall(Auto.OnWhisper, text, playerName)
     end)
+    -- Spec §12.1 failure counting: the client answers a doomed invite with a
+    -- system line, and that line is the ONLY evidence there is. The sink is
+    -- inert unless an invite run is open (Auto.OnSystemMessage returns on its
+    -- first statement), so this is not a general system-chat parser.
+    ns:RegisterEvent("CHAT_MSG_SYSTEM", function(_, text)
+        ns:SafeCall(Auto.OnSystemMessage, text)
+    end)
     -- Roster ticks are acted on ONLY inside an armed mesh assembly of our own
     -- (see the gate block): joining someone else's raid must be completely
     -- inert. Auto.OnRosterUpdate owns that check.
@@ -2023,10 +2571,11 @@ function Auto.OnLogin()
     ns:RegisterEvent("MERCHANT_SHOW", function() ns:SafeCall(Auto.OnMerchantShow) end)
     ns:RegisterEvent("ZONE_CHANGED_NEW_AREA", function() ns:SafeCall(Auto.OnZoneChanged) end)
 
-    -- Seed trigger-buff presence so a buff already up at login isn't counted
-    -- as a fresh gain.
+    -- Seed trigger-buff state so a buff already up at login isn't counted as a
+    -- fresh gain (spec §4.3: fresh-buff detection is suppressed until the first
+    -- scan has stabilised — login fires aura-applied for every existing buff).
     ns:SafeCall(Auto.ScanTriggerBuffs)
-    Auto._lastTriggerGain = nil
+    Auto.ClearTriggerGain()
 end
 
 ----------------------------------------------------------------------
@@ -2219,6 +2768,456 @@ local function testSummonMatrix()
     -- nothing -> reject.
     ok = Auto.DecideSummon({ enabled = true, window = W })
     if ok then return false, "no trigger rejects" end
+    return true
+end
+
+----------------------------------------------------------------------
+-- SPEC §13 FRESH-BUFF RULE TABLE — one assertion per clause.
+--
+-- Every row here is a rule the shipped detector did not have. The unboon row is
+-- the adversarial one: run it against the pre-fix code and it goes green on the
+-- WRONG answer, because absent->live was the whole test.
+--
+-- Headless discipline: no timers, no aura API, no live store. The BOON facts
+-- come from a fixture record shaped exactly like the tracker's own
+-- rec.auraStates (source = Store.AURA_SOURCE.BOON = 2 on the boonable slots),
+-- read through the same Auto.BoonedTriggersIn the live path uses.
+----------------------------------------------------------------------
+
+-- All ten triggers on, so a row that fails fails on the RULE, not on config.
+local function allTriggers()
+    local t = {}
+    for _, def in ipairs(Auto.SUMMON_TRIGGER_BUFFS) do t[def.key] = true end
+    return t
+end
+
+local function hasKey(list, key)
+    for i = 1, #list do if list[i] == key then return true end end
+    return false
+end
+
+local function testFreshBuffRules()
+    local T = allTriggers()
+    local function classify(prev, cur, unboon)
+        return Auto.ClassifyTriggerGains(prev, cur, { triggers = T, inUnboonWindow = unboon })
+    end
+    local A = { state = "absent", duration = 0 }
+    local function live(d) return { state = "live", duration = d } end
+    local function boon(d) return { state = "booned", duration = d or 0 } end
+
+    -- 1. absent -> live is fresh (the one clause the old code did have).
+    local f = classify({ songflower = A }, { songflower = live(3600) })
+    if not hasKey(f, "songflower") then return false, "absent->live must be fresh" end
+
+    -- 2. live -> live with the duration TICKING DOWN is not a gain.
+    f = classify({ songflower = live(3600) }, { songflower = live(3500) })
+    if hasKey(f, "songflower") then return false, "live->live tick-down must not be fresh" end
+
+    -- 3. live -> live jumping by MORE than 75 s is a refresh, and is fresh.
+    f = classify({ songflower = live(600) }, { songflower = live(676) })
+    if not hasKey(f, "songflower") then return false, "live->live +76s must be fresh" end
+
+    -- 4. …and exactly 75 s is not more than 75 s. Boundary, both sides.
+    f = classify({ songflower = live(600) }, { songflower = live(675) })
+    if hasKey(f, "songflower") then return false, "live->live +75s must NOT be fresh" end
+
+    -- 5. booned -> live is NEVER fresh. Releasing a chronoboon gives you back
+    --    buffs you already had; it is not a pickup, at any duration.
+    f = classify({ songflower = boon(3600) }, { songflower = live(3600) })
+    if hasKey(f, "songflower") then return false, "booned->live must never be fresh" end
+    f = classify({ warchief = boon(100) }, { warchief = live(3600) })
+    if hasKey(f, "warchief") then return false, "booned->live is not fresh even on a jump" end
+
+    -- 6. THE UNBOON WINDOW. Inside the tracker's 3 s post-unboon grace, a
+    --    BOONABLE slot appearing is the restore landing — not a gain — even when
+    --    the previous state read absent (the scan that catches the restore
+    --    mid-flight sees exactly that).
+    f = classify({ songflower = A, warchief = A, dragonslayer = A },
+                 { songflower = live(3600), warchief = live(3600), dragonslayer = live(3600) },
+                 true)
+    if #f > 0 then return false, "unboon window must exclude every boonable gain" end
+
+    -- 7. …but Battle Shout and FFF are NOT boonable (spec §4.1), so a real one
+    --    landing during that same 3 s is still a real gain.
+    f = classify({ battleShout = A, fff = A },
+                 { battleShout = live(1800), fff = live(3600) }, true)
+    if not (hasKey(f, "battleShout") and hasKey(f, "fff")) then
+        return false, "unboon window must not swallow the non-boonable slots"
+    end
+
+    -- 8. A buff going away is not a gain, and an unconfigured trigger never is.
+    f = classify({ songflower = live(600) }, { songflower = A })
+    if #f > 0 then return false, "live->absent must not be fresh" end
+    f = Auto.ClassifyTriggerGains({ songflower = A }, { songflower = live(3600) },
+                                  { triggers = {} })
+    if #f > 0 then return false, "an unticked trigger never counts" end
+
+    -- 9. The state reader folds the store's BOON cells and the live aura list
+    --    into the states the classifier consumes. This is the seam the fix turns
+    --    on, so it is asserted against a real-shaped record, not a hand table.
+    local BOON = (ns.Store and ns.Store.AURA_SOURCE and ns.Store.AURA_SOURCE.BOON) or 2
+    local rec = { auraStates = {
+        [4] = { duration = 3600, option = 0, source = BOON },   -- Songflower, booned
+        [2] = { duration = 3000, option = 0, source = BOON },   -- Rend, booned
+        [9] = { duration = 1800, option = 0, source = 0    },   -- Battle Shout, live
+    } }
+    local booned = Auto.BoonedTriggersIn(rec)
+    if not (booned.songflower and booned.warchief) then
+        return false, "BoonedTriggersIn must read source==BOON cells"
+    end
+    if booned.battleShout then return false, "a LIVE cell must not read as booned" end
+
+    local states = Auto.BuildTriggerStates({ battleShout = 1800 }, booned)
+    if states.songflower.state ~= "booned" then return false, "booned slot -> booned state" end
+    if states.battleShout.state ~= "live"  then return false, "live aura -> live state" end
+    if states.fff.state ~= "absent"        then return false, "unseen slot -> absent state" end
+
+    -- 10. THE HEADLINE CASE, end to end. Seven buffs are in the boon; the player
+    --     pops the displacer; every one of them flips to live in the same beat.
+    --     Pre-fix this produced seven fresh gains and armed the summon gate.
+    local before = Auto.BuildTriggerStates({}, booned)
+    local afterLive = {}
+    for _, k in ipairs({ "songflower", "warchief" }) do afterLive[k] = 3600 end
+    local after = Auto.BuildTriggerStates(afterLive, {})
+    f = Auto.ClassifyTriggerGains(before, after, { triggers = T, inUnboonWindow = true })
+    if #f > 0 then return false, "unbooning must produce ZERO fresh gains" end
+    -- …and it stays zero even if the unboon window has already elapsed, because
+    -- booned->live carries the exclusion on its own.
+    f = Auto.ClassifyTriggerGains(before, after, { triggers = T, inUnboonWindow = false })
+    if #f > 0 then return false, "unbooning is not fresh even outside the 3s window" end
+
+    return true
+end
+
+-- The whole point of the freshness gate is what it does to the SUMMON. Drives
+-- the real gain state through the real decision matrix on a simulated clock.
+local function testSummonFreshnessGate()
+    local saveGain, saveNames = Auto._lastTriggerGain, Auto._lastTriggerNames
+    local saveTime = _G.GetTime
+    local clock = 1000
+    _G.GetTime = function() return clock end
+
+    local W = 19
+    local function decide()
+        return Auto.DecideSummon({ enabled = true, triggerAge = Auto.TriggerBuffAge(), window = W })
+    end
+    local function restore()
+        _G.GetTime = saveTime
+        Auto._lastTriggerGain, Auto._lastTriggerNames = saveGain, saveNames
+    end
+
+    -- A plain fresh gain inside the window opens the gate.
+    Auto._lastTriggerGain, Auto._lastTriggerNames = clock, { "songflower" }
+    clock = 1005
+    local ok, why = decide()
+    if not (ok and why == "freshbuff") then restore(); return false, "fresh gain within 19s accepts" end
+
+    -- The same gain, stale, does not.
+    clock = 1000 + W + 1
+    if decide() then restore(); return false, "a gain older than the window must not accept" end
+
+    -- ACCEPTING CLEARS THE FLAG (spec §13). A second summon inside the same
+    -- window has to wait for a NEW buff — this is the row that stops one
+    -- Songflower buying every summon for 19 seconds.
+    clock = 1000
+    Auto._lastTriggerGain, Auto._lastTriggerNames = clock, { "songflower" }
+    clock = 1002
+    if not (decide()) then restore(); return false, "first summon accepts" end
+    Auto.ClearTriggerGain()
+    if Auto.TriggerBuffAge() ~= nil then restore(); return false, "clear drops the gain age" end
+    if decide() then restore(); return false, "second summon inside the window must NOT accept" end
+    if Auto.TriggerBuffLabels() ~= nil then restore(); return false, "clear drops the labels too" end
+
+    -- The accept line names the buffs, not the reason word (spec §13).
+    Auto._lastTriggerNames = { "songflower", "warchief" }
+    local labels = Auto.TriggerBuffLabels() or ""
+    if not (labels:find("Songflower Serenade", 1, true)
+            and labels:find("Warchief's Blessing", 1, true)) then
+        restore(); return false, "TriggerBuffLabels must name the buffs"
+    end
+
+    restore()
+    return true
+end
+
+-- Spec §4.1 slot 10 is Fire Festival Fury (29338 / 29846). The catalog carried
+-- "fervor of the first feast", which is the name of nothing, so the FFF trigger
+-- could never match anything the client reported.
+local function testTriggerCatalog()
+    local byKey = {}
+    for _, def in ipairs(Auto.SUMMON_TRIGGER_BUFFS) do
+        byKey[def.key] = def
+        if not def.slot or not def.label then return false, "catalog row missing slot/label" end
+    end
+    if byKey.fff.prefix ~= "fire festival fury" then
+        return false, "FFF prefix must be Fire Festival Fury"
+    end
+    if byKey.fff.slot ~= 10 or byKey.battleShout.slot ~= 9 then
+        return false, "FFF/Battle Shout must be tracker slots 10/9"
+    end
+    -- …and those two are the ONLY non-boonable triggers.
+    if Auto.TRIGGER_BOONABLE.fff or Auto.TRIGGER_BOONABLE.battleShout then
+        return false, "slots 9/10 must not be boonable"
+    end
+    for _, k in ipairs({ "dragonslayer", "warchief", "zandalar", "songflower",
+                         "dmf", "fengus", "moldar", "slipkik" }) do
+        if not Auto.TRIGGER_BOONABLE[k] then return false, k .. " must be boonable" end
+    end
+    -- Identity resolves through the tracker's spell-ID-first matcher, so every
+    -- catalog slot must be a slot the tracker actually knows.
+    if ns.Tracker and ns.Tracker.MatchAura then
+        if ns.Tracker.MatchAura(29338, nil) ~= 10 then return false, "29338 -> slot 10" end
+        if ns.Tracker.MatchAura(nil, "Fire Festival Fury") ~= 10 then
+            return false, "FFF name -> slot 10"
+        end
+        if ns.Tracker.MatchAura(15366, nil) ~= 4 then return false, "15366 -> slot 4" end
+    end
+    if Auto.FRESH_REFRESH_JUMP ~= 75 then return false, "the refresh jump must be 75s" end
+    return true
+end
+
+----------------------------------------------------------------------
+-- SPEC §12.1 INVITE-RUN RULE TABLE.
+--
+-- The ladder is driven through Auto._after, the injected scheduler, so the test
+-- reads the DELAYS the run asked for rather than waiting for any of them. The
+-- harness stubs C_Timer.After as a no-op; a test that relied on it would assert
+-- nothing at all.
+----------------------------------------------------------------------
+
+local function testInviteTargets()
+    -- Two accounts of ours, one of them holding an offline alt and a
+    -- wrong-faction character; one live mesh peer with no local record at all;
+    -- one alt already standing in the group; and ourselves.
+    local accounts = {
+        ["1"] = { characters = {
+            ["Zeta-R"]    = { faction = "Horde", lastSeen = 100 },
+            ["Alpha-R"]   = { faction = "Horde", lastSeen = 100 },
+            ["Offline-R"] = { faction = "Horde", lastSeen = 0 },
+            ["Ally-R"]    = { faction = "Alliance", lastSeen = 100 },
+            ["Me-R"]      = { faction = "Horde", lastSeen = 100 },
+        }, homeless = {
+            ["Homie-R"] = { faction = "Horde", lastSeen = 100 },
+        } },
+        ["2"] = { characters = {
+            ["Grouped-R"] = { faction = "Horde", lastSeen = 100 },
+        }, homeless = {} },
+    }
+    local peers = {
+        ["3"] = { name = "Peer-R",    online = true },
+        ["4"] = { name = "Dropped-R", online = false },
+    }
+    local targets = Auto.BuildInviteTargets({
+        accounts = accounts, peers = peers, faction = "Horde", me = "Me-R",
+        inGroup  = { ["Grouped-R"] = true },
+        isOnline = function(_, rec) return (rec.lastSeen or 0) > 0 end,
+    })
+
+    local want = { "Alpha-R", "Homie-R", "Peer-R", "Zeta-R" }
+    if #targets ~= #want then
+        return false, "target count: got " .. #targets .. " want " .. #want
+    end
+    for i = 1, #want do
+        -- ALPHABETICAL. The old run used pairs(), so the order was whatever the
+        -- hash gave it — non-deterministic between two runs on the same data.
+        if targets[i] ~= want[i] then
+            return false, "sorted targets[" .. i .. "] = " .. tostring(targets[i])
+        end
+    end
+    return true
+end
+
+local function testInvitePacing()
+    -- 60 ms apart, and the 5th pinned to 700 ms.
+    local s = Auto.InviteSchedule(8)
+    local function near(a, b) return math.abs(a - b) < 1e-9 end
+    if not near(s[1], 0)    then return false, "first invite is immediate" end
+    if not near(s[2], 0.06) then return false, "2nd at 60ms" end
+    if not near(s[3], 0.12) then return false, "3rd at 120ms" end
+    if not near(s[4], 0.18) then return false, "4th at 180ms" end
+    if not near(s[5], 0.70) then return false, "5th pinned to 700ms" end
+    -- …and the ladder stays monotone past the pin: the 6th does not overtake it.
+    if not near(s[6], 0.76) then return false, "6th continues 60ms behind the 5th" end
+    if not near(s[7], 0.82) then return false, "7th at 820ms" end
+    for i = 2, 8 do
+        if s[i] <= s[i - 1] then return false, "schedule must be strictly increasing" end
+    end
+    -- A run shorter than five invites never reaches the pin.
+    local short = Auto.InviteSchedule(3)
+    if #short ~= 3 or not near(short[3], 0.12) then return false, "short run keeps 60ms spacing" end
+    if #Auto.InviteSchedule(0) ~= 0 then return false, "empty run schedules nothing" end
+    return true
+end
+
+local function testInviteFailureParse()
+    local yes = {
+        "Zeta is already in a group.",
+        "ALREADY IN A PARTY",
+        "That player is already in another group",
+    }
+    for _, m in ipairs(yes) do
+        if not Auto.IsAlreadyInGroupMessage(m) then return false, "should match: " .. m end
+    end
+    local no = {
+        "Zeta is not online.",
+        "You have already learned that spell.",   -- "already", no group/party
+        "You have joined the group.",             -- group, no "already"
+        "", nil,
+    }
+    for _, m in ipairs(no) do
+        if Auto.IsAlreadyInGroupMessage(m) then return false, "should not match: " .. tostring(m) end
+    end
+
+    -- Outcome: only "every one failed, and we are alone" earns the fallback.
+    if Auto.DecideInviteOutcome({ sent = 4, failures = 4, alone = true }) ~= "reverse" then
+        return false, "all-failed + alone -> reverse invite"
+    end
+    if Auto.DecideInviteOutcome({ sent = 4, failures = 3, alone = true }) ~= "done" then
+        return false, "one invite landed -> no reverse"
+    end
+    if Auto.DecideInviteOutcome({ sent = 4, failures = 4, alone = false }) ~= "done" then
+        return false, "already in a group -> no reverse"
+    end
+    if Auto.DecideInviteOutcome({ sent = 0, failures = 0, alone = true }) ~= "done" then
+        return false, "an empty run never reverses"
+    end
+    return true
+end
+
+-- The whole run, on the injected scheduler: what got invited, in what order,
+-- at what delay, and what the failure path did.
+local function testInviteRunLive()
+    local saveAfter   = Auto._after
+    local saveTargets = Auto.InviteTargets
+    -- C_PartyInfo is a real-client namespace the headless world does not carry;
+    -- stand one up for the run and take it back down afterwards.
+    local savePartyInfo = _G.C_PartyInfo
+    _G.C_PartyInfo = _G.C_PartyInfo or {}
+    local saveInvite  = _G.C_PartyInfo.InviteUnit
+    local saveLeave   = _G.LeaveParty
+    local saveWhisper = _G.SendChatMessage
+    local saveMembers = _G.GetNumGroupMembers
+    local saveRun     = Auto._inviteRun
+
+    local queue, invited, left, whispers = {}, {}, 0, {}
+    Auto._after = function(delay, fn) queue[#queue + 1] = { delay = delay, fn = fn } end
+    -- The target set has its own rule table above (testInviteTargets); this
+    -- scenario is about the LADDER, so it is fed a fixed, already-sorted list
+    -- rather than whatever the shared harness store happens to hold.
+    Auto.InviteTargets = function() return { "Alpha-TestRealm", "Zeta-TestRealm" } end
+    _G.C_PartyInfo.InviteUnit = function(n) invited[#invited + 1] = n end
+    _G.LeaveParty = function() left = left + 1 end
+    _G.SendChatMessage = function(msg, chan, _, to)
+        whispers[#whispers + 1] = { msg = msg, chan = chan, to = to }
+    end
+    _G.GetNumGroupMembers = function() return 0 end
+
+    local function drain()
+        -- Fire in scheduled order, exactly once each. Bounded by the queue we
+        -- built, so this cannot loop.
+        local pending = queue
+        queue = {}
+        table.sort(pending, function(a, b) return a.delay < b.delay end)
+        for i = 1, #pending do pending[i].fn() end
+    end
+    local function restore()
+        Auto._after = saveAfter
+        Auto.InviteTargets = saveTargets
+        _G.C_PartyInfo.InviteUnit = saveInvite
+        _G.C_PartyInfo = savePartyInfo
+        _G.LeaveParty, _G.SendChatMessage = saveLeave, saveWhisper
+        _G.GetNumGroupMembers = saveMembers
+        Auto._inviteRun = saveRun
+    end
+
+    -- 1. NOTHING FIRES IN THE CALLING FRAME. The old run pushed every invite in
+    --    one burst, which is the shape the client throttles.
+    local n = Auto.InviteOnline(true)
+    if n ~= 2 then restore(); return false, "two targets -> two invites, got " .. tostring(n) end
+    if #invited ~= 0 then restore(); return false, "invites must be scheduled, not sent inline" end
+    if #queue < 2 then restore(); return false, "the ladder must schedule one call per target" end
+    if not (queue[1].delay == 0 and math.abs(queue[2].delay - 0.06) < 1e-9) then
+        restore(); return false, "live ladder must use the 60ms spacing"
+    end
+
+    drain()
+    if not (invited[1] == "Alpha-TestRealm" and invited[2] == "Zeta-TestRealm") then
+        restore(); return false, "live run must invite in alphabetical order"
+    end
+
+    -- 2. THE REVERSE INVITE. Every invite comes back "already in a group" and we
+    --    are on our own -> leave, then whisper the keyword to the first target.
+    invited, left, whispers = {}, 0, {}
+    Auto.InviteOnline(true)
+    local kw = Auto._inviteRun.keyword
+    for _ = 1, 2 do Auto.OnSystemMessage("Alpha-TestRealm is already in a group.") end
+    drain()          -- ladder + the run-close callback
+    drain()          -- the 0.3s post-LeaveParty whisper
+    if left ~= 1 then restore(); return false, "reverse path must leave the party once" end
+    if #whispers ~= 1 then restore(); return false, "reverse path must whisper exactly once" end
+    if whispers[1].to ~= "Alpha-TestRealm" or whispers[1].msg ~= kw
+       or whispers[1].chan ~= "WHISPER" then
+        restore(); return false, "reverse whisper must send the keyword to the first target"
+    end
+
+    -- 3. One invite landing is enough to call the run a success: no leave, no
+    --    whisper, however many of the others bounced.
+    invited, left, whispers = {}, 0, {}
+    Auto.InviteOnline(true)
+    Auto.OnSystemMessage("Alpha-TestRealm is already in a group.")
+    drain(); drain()
+    if left ~= 0 or #whispers ~= 0 then
+        restore(); return false, "a partly-successful run must not reverse-invite"
+    end
+
+    -- 4. The system sink is inert once the run is closed — it is not a general
+    --    system-chat parser.
+    if Auto.OnSystemMessage("someone is already in a group") ~= false then
+        restore(); return false, "system sink must be inert outside a run"
+    end
+
+    restore()
+    return true
+end
+
+-- Spec §12.3: when we cannot invite, point the requester at the live group
+-- leader — and only when that leader is one of ours.
+local function testWhisperRedirect()
+    -- Can-invite truth table.
+    if not Auto.CanInviteIn({ inGroup = false }) then return false, "solo can invite" end
+    if not Auto.CanInviteIn({ inGroup = true, isLeader = true }) then
+        return false, "party leader can invite"
+    end
+    if Auto.CanInviteIn({ inGroup = true, isLeader = false }) then
+        return false, "party member without lead cannot invite"
+    end
+    if Auto.CanInviteIn({ inGroup = true, inRaid = true, isLeader = false, isAssistant = false }) then
+        return false, "raid member without lead/assist cannot invite"
+    end
+    if not Auto.CanInviteIn({ inGroup = true, inRaid = true, isAssistant = true }) then
+        return false, "raid assistant can invite"
+    end
+
+    -- Routing.
+    local r = Auto.DecideWhisperRoute({ canInvite = true, leader = "Boss-R", leaderInMesh = true })
+    if r ~= "invite" then return false, "if we can invite, we invite" end
+    local to
+    r, to = Auto.DecideWhisperRoute({
+        canInvite = false, leader = "Boss-R", leaderInMesh = true, me = "Me-R" })
+    if not (r == "redirect" and to == "Boss-R") then return false, "mesh leader -> redirect" end
+    -- THE PRIVACY RULE: a leader who is NOT in our mesh is a stranger, and we do
+    -- not hand a stranger's name out to whoever whispered us.
+    r = Auto.DecideWhisperRoute({
+        canInvite = false, leader = "Stranger-R", leaderInMesh = false, me = "Me-R" })
+    if r ~= "ignore" then return false, "non-mesh leader must not be leaked" end
+    r = Auto.DecideWhisperRoute({ canInvite = false, leader = nil, me = "Me-R" })
+    if r ~= "ignore" then return false, "no leader -> ignore" end
+    r = Auto.DecideWhisperRoute({
+        canInvite = false, leader = "Me-R", leaderInMesh = true, me = "Me-R" })
+    if r ~= "ignore" then return false, "never redirect to ourselves" end
+
+    -- The dead key is GONE: nothing in this file may read it again.
+    if Auto.RedirectLeader ~= nil then return false, "redirectLeader must not come back" end
     return true
 end
 
@@ -3192,6 +4191,17 @@ function Auto.RunSelfTests(verbose)
         { name = "assembly gate",       fn = testAssemblyGate },
         { name = "assembly arming",     fn = testAssemblyArming },
         { name = "summon gate matrix",  fn = testSummonMatrix },
+        { name = "summon: §13 fresh-buff rules (75s / boon / unboon)",
+                                        fn = testFreshBuffRules },
+        { name = "summon: freshness -> gate, and accept clears it",
+                                        fn = testSummonFreshnessGate },
+        { name = "summon: trigger catalog (FFF identity, boonable set)",
+                                        fn = testTriggerCatalog },
+        { name = "invite: §12.1 target set + alphabetical sort", fn = testInviteTargets },
+        { name = "invite: §12.1 pacing (60ms, 700ms 5th)",       fn = testInvitePacing },
+        { name = "invite: failure parse + reverse-invite outcome", fn = testInviteFailureParse },
+        { name = "invite: live run on the injected scheduler",   fn = testInviteRunLive },
+        { name = "whisper: can-invite + live leader redirect",   fn = testWhisperRedirect },
         { name = "keyword matcher",     fn = testKeywordMatcher },
         { name = "roster membership",   fn = testRosterMembership },
         { name = "gossip: DMT npc gate + komcrush guard", fn = testDmtGate },

@@ -1959,8 +1959,11 @@ end
 
 -- Engine tracked-aura layout (matches tracker's BUFF_SLOTS names). R3 item 36
 -- adds Battle Shout + seasonal FFF as trailing slots 9/10. The grid geometry is
--- derived from #CANCEL_AURAS, so it auto-reflows to the new count. The FFF prefix
--- is a best-guess PLACEHOLDER the owner confirms in-game (mirrors tracker.lua).
+-- derived from #CANCEL_AURAS, so it auto-reflows to the new count. The FFF row
+-- carried a placeholder prefix ("fervor of the first feast") that matches no
+-- aura in the game — spec §4.1 names slot 10 Fire Festival Fury (29338/29846),
+-- which is the string tracker.lua has always used. Corrected here so the HUD's
+-- cancel button can actually find the buff.
 local CANCEL_AURAS = {
     { label = "Ony",         prefix = "rallying cry of the dragonslayer", icon = "Interface\\Icons\\INV_Misc_Head_Dragon_01" },
     { label = "Rend",        prefix = "warchief's blessing",              icon = "Interface\\Icons\\Ability_Warrior_WarCry" },
@@ -1971,7 +1974,7 @@ local CANCEL_AURAS = {
     { label = "Mol'dar",     prefix = "mol'dar's moxie",                  icon = "Interface\\Icons\\Ability_Warrior_Charge" },
     { label = "Slip'kik",    prefix = "slip'kik's savvy",                 icon = "Interface\\Icons\\Spell_Nature_MoonKey" },
     { label = "Battle Shout", prefix = "battle shout",                    icon = "Interface\\Icons\\Ability_Warrior_BattleShout" },
-    { label = "FFF",         prefix = "fervor of the first feast",        icon = "Interface\\Icons\\INV_Misc_Food_15" },  -- [verify prefix]
+    { label = "FFF",         prefix = "fire festival fury",               icon = "Interface\\Icons\\INV_Misc_Food_15" },
 }
 
 local CHRONOBOON_ITEM_ID = 184937

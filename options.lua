@@ -953,6 +953,68 @@ end
 -- rend rule to Horde" is a no-op by construction. Copying the (parked, unread)
 -- per-faction auraOpts would be worse than a no-op: it would look like it did
 -- something while the display kept reading the global table.
+-- THE COPY ITSELF, pure over two settings blocks — no frames, no SavedVariables,
+-- no confirmation dialog. It lives outside the onAccept closure so the
+-- preservation rules below can be asserted headlessly; the closure could not be
+-- reached by any test, which is exactly how two of them went missing.
+--
+-- PRESERVED ON THE DESTINATION (spec §12.3, audit divergence 10 / rows 34-36):
+--   * autoGroup.whitelist         — the list itself (was already preserved),
+--   * autoGroup.whitelistEnabled  — its master gate. Copying it silently
+--     re-enables, or disables, a whitelist the destination had deliberately set
+--     the other way.
+--   * autoGroup.defaultsApplied   — the STICKY one-time seeding guard. Reset it
+--     and the next login re-seeds a list the user had cleared.
+--   * autoSummon.defaultsApplied  — the same guard for the seven trigger seeds:
+--     clearing it lets a later login resurrect triggers the destination had
+--     unticked. (Not named in the audit; same class of bug, same one-line fix.)
+--   * autoGossip.dmf.buffType.PALADIN / .SHAMAN — faction-exclusive classes.
+-- All of these describe the DESTINATION's own history or its faction-exclusive
+-- rows. "Copy this faction's automation settings" does not reach them, and a
+-- guard flag is not a setting.
+--
+-- auraOpts is NOT copied at all (see the header).
+function Options.ApplyFactionCopy(src, dst)
+    if type(src) ~= "table" or type(dst) ~= "table" then return false end
+    local function clone(t)
+        if type(t) ~= "table" then return t end
+        local o = {}; for k, v in pairs(t) do o[k] = clone(v) end; return o
+    end
+
+    if type(dst.autoGroup) == "table" then
+        local keepWL       = dst.autoGroup.whitelist
+        local keepWLOn     = dst.autoGroup.whitelistEnabled
+        local keepWLSeeded = dst.autoGroup.defaultsApplied
+        dst.autoGroup = clone(src.autoGroup)
+        dst.autoGroup.whitelist        = keepWL
+        dst.autoGroup.whitelistEnabled = keepWLOn
+        dst.autoGroup.defaultsApplied  = keepWLSeeded
+    end
+
+    if type(dst.autoSummon) == "table" then
+        local keepSummonSeeded = dst.autoSummon.defaultsApplied
+        dst.autoSummon = clone(src.autoSummon)
+        dst.autoSummon.defaultsApplied = keepSummonSeeded
+        -- A copy IS an expressed choice about the taxi/PvP rule, so the copied
+        -- value must not be healed away by MigrateTaxiPvpDefault next login.
+        dst.autoSummon.dropOnTaxiPvpChosen = true
+    end
+
+    if type(dst.autoGossip) == "table" then
+        local bt = dst.autoGossip.dmf and dst.autoGossip.dmf.buffType or {}
+        local keepPal, keepSha = bt.PALADIN, bt.SHAMAN
+        dst.autoGossip = clone(src.autoGossip)
+        if type(dst.autoGossip) == "table" and type(dst.autoGossip.dmf) == "table"
+           and type(dst.autoGossip.dmf.buffType) == "table" then
+            dst.autoGossip.dmf.buffType.PALADIN = keepPal
+            dst.autoGossip.dmf.buffType.SHAMAN  = keepSha
+        end
+    end
+
+    dst.autoQuest = clone(src.autoQuest)
+    return true
+end
+
 function Options.CopyFaction(from, to)
     local db = DB(); if not db then return end
     local src, dst = db.factionSettings[from], db.factionSettings[to]
@@ -963,25 +1025,7 @@ function Options.CopyFaction(from, to)
                "? (Buff class rules are global and unaffected; Paladin/Shaman gossip rows and the invite whitelist are preserved.)",
         acceptText = "Copy", danger = true,
         onAccept = function()
-            -- Deep-ish copy of the copyable sub-blocks.
-            local function clone(t)
-                if type(t) ~= "table" then return t end
-                local o = {}; for k, v in pairs(t) do o[k] = clone(v) end; return o
-            end
-            -- autoGroup: everything except the whitelist.
-            local keepWL = dst.autoGroup.whitelist
-            dst.autoGroup = clone(src.autoGroup)
-            dst.autoGroup.whitelist = keepWL
-            dst.autoSummon = clone(src.autoSummon)
-            -- autoGossip: copy but keep Paladin/Shaman buffType rows on the target.
-            local keepPal = dst.autoGossip.dmf.buffType.PALADIN
-            local keepSha = dst.autoGossip.dmf.buffType.SHAMAN
-            dst.autoGossip = clone(src.autoGossip)
-            dst.autoGossip.dmf.buffType.PALADIN = keepPal
-            dst.autoGossip.dmf.buffType.SHAMAN = keepSha
-            dst.autoQuest = clone(src.autoQuest)
-            -- auraOpts is NOT copied (see the header): the class rules that used
-            -- to live there are global now, and the parked table has no readers.
+            Options.ApplyFactionCopy(src, dst)
             ns:Print(from .. " → " .. to .. " automation copied.")
             refreshPage("general")
         end,
@@ -1981,7 +2025,15 @@ local function buildAutomation(flow)
     register("automation", asr:Checkbox({
         label = "Drop on taxi / PvP",
         get = function() local fs = FS(); return fs and fs.autoSummon.dropOnTaxiPvp end,
-        set = function(v) local fs = FS(); if fs then fs.autoSummon.dropOnTaxiPvp = v and true or false end end,
+        -- Stamping `dropOnTaxiPvpChosen` is what makes Store.MigrateTaxiPvpDefault
+        -- safe: the heal only touches an install still carrying our old shipped
+        -- ON with nobody's decision behind it. Touching the box EITHER WAY is a
+        -- decision, so the flag is set on both edges, not just on true.
+        set = function(v)
+            local fs = FS(); if not fs then return end
+            fs.autoSummon.dropOnTaxiPvp       = v and true or false
+            fs.autoSummon.dropOnTaxiPvpChosen = true
+        end,
     }).Refresh)
 
     local win = asx:AddRow({ vAlign = "center" })
@@ -2848,6 +2900,75 @@ ns:RegisterSelfTest("options", function(verbose)
     -- subset of the Mesh page's refreshers.
     ck(type(refreshers.meshLive) == "table", "meshLive registry exists")
     ck(#refreshers.meshLive <= #refreshers.mesh, "meshLive is a subset of mesh")
+
+    ----------------------------------------------------------------------
+    -- FACTION COPY: WHAT IT MUST NOT TAKE WITH IT (spec §12.3, audit rows 34-36).
+    --
+    -- The copy is a bulk overwrite the user asks for, so the interesting rows
+    -- are the ones it must LEAVE ALONE: the destination's own whitelist state
+    -- and the two sticky seeding guards. Getting those wrong is a data-safety
+    -- bug, not a preference bug — a cleared whitelist comes back, or a
+    -- deliberately-off whitelist silently switches on.
+    ----------------------------------------------------------------------
+    local src = {
+        autoGroup = {
+            whitelist = { ["Src-R"] = true }, whitelistEnabled = false,
+            defaultsApplied = true, inviteKeyword = "grp", sendToGuild = true,
+        },
+        autoSummon = {
+            enabled = true, defaultsApplied = true, dropOnTaxiPvp = true,
+            triggers = { songflower = true },
+        },
+        autoGossip = { dmt = true, dmf = { enabled = true,
+            buffType = { PALADIN = "damage", SHAMAN = "damage", MAGE = "intellect" } } },
+        autoQuest = { autoRepair = true },
+    }
+    local dst = {
+        autoGroup = {
+            whitelist = { ["Dst-R"] = true }, whitelistEnabled = true,
+            defaultsApplied = false, inviteKeyword = "inv", sendToGuild = false,
+        },
+        autoSummon = {
+            enabled = false, defaultsApplied = false, dropOnTaxiPvp = false,
+            triggers = {},
+        },
+        autoGossip = { dmt = false, dmf = { enabled = false,
+            buffType = { PALADIN = "armor", SHAMAN = "spirit", MAGE = "damage" } } },
+        autoQuest = { autoRepair = false },
+    }
+    ck(Options.ApplyFactionCopy(src, dst) == true, "faction copy runs")
+
+    -- IN scope: the automation settings really do copy.
+    ck(dst.autoGroup.inviteKeyword == "grp", "copy: keyword copied")
+    ck(dst.autoGroup.sendToGuild == true,    "copy: send gate copied")
+    ck(dst.autoSummon.enabled == true,       "copy: summon enable copied")
+    ck(dst.autoSummon.triggers.songflower == true, "copy: triggers copied")
+    ck(dst.autoGossip.dmt == true,           "copy: gossip toggle copied")
+    ck(dst.autoQuest.autoRepair == true,     "copy: quest block copied")
+    ck(dst.autoGossip.dmf.buffType.MAGE == "intellect", "copy: non-exclusive class row copied")
+
+    -- OUT of scope: the destination's own state survives, all five rows.
+    ck(dst.autoGroup.whitelist["Dst-R"] == true and dst.autoGroup.whitelist["Src-R"] == nil,
+       "copy preserves the destination whitelist")
+    ck(dst.autoGroup.whitelistEnabled == true,
+       "copy preserves the destination whitelistEnabled (row 35)")
+    ck(dst.autoGroup.defaultsApplied == false,
+       "copy preserves the destination autoGroup defaultsApplied (row 36)")
+    ck(dst.autoSummon.defaultsApplied == false,
+       "copy preserves the destination autoSummon seeding guard")
+    ck(dst.autoGossip.dmf.buffType.PALADIN == "armor"
+       and dst.autoGossip.dmf.buffType.SHAMAN == "spirit",
+       "copy preserves the faction-exclusive Paladin/Shaman rows")
+
+    -- A copy IS a decision about the taxi rule, so the migration must not undo it.
+    ck(dst.autoSummon.dropOnTaxiPvp == true, "copy: taxi rule copied")
+    ck(dst.autoSummon.dropOnTaxiPvpChosen == true, "copy marks the taxi rule as chosen")
+
+    -- Deep copy, not aliasing: editing the source afterwards must not move the
+    -- destination.
+    src.autoSummon.triggers.songflower = nil
+    ck(dst.autoSummon.triggers.songflower == true, "copy is a deep copy, not a reference")
+    ck(Options.ApplyFactionCopy(nil, dst) == false, "faction copy refuses bad input")
 
     ----------------------------------------------------------------------
     -- AUTO-REPAIR LABEL HONESTY (1.1.4 conformance wave).

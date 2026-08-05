@@ -233,7 +233,14 @@ local function defaultFactionBlock()
             -- every trigger the owner unchecked on the next login (the options
             -- UI writes an unchecked box as nil, so "off" IS absence here).
             triggers       = {},             -- ["triggerKey"] = true
-            dropOnTaxiPvp  = true,
+            -- Spec §13 ships this OFF. We shipped it ON — the one default in the
+            -- whole automation tree that erred toward doing MORE (audit
+            -- divergence 9 / row 54). "Any summon during any flight is accepted"
+            -- is a wide door, so it now ships as the spec has it and
+            -- Store.MigrateTaxiPvpDefault heals the installs that already have
+            -- the old value without a choice behind it.
+            dropOnTaxiPvp       = false,
+            dropOnTaxiPvpChosen = false,     -- set true the moment the user ticks it
             -- Sticky one-time seeding guard, mirroring auraOpts.defaultsApplied.
             defaultsApplied = false,
         },
@@ -1473,6 +1480,47 @@ function Store.MigrateSongflowerDefaults(db)
 end
 
 ----------------------------------------------------------------------
+-- autoSummon.dropOnTaxiPvp — heal to the spec default (conformance wave).
+--
+-- Spec §13 ships the taxi/PvP-drop rule OFF. We shipped it ON, which is the one
+-- automation default in the whole tree that errs toward doing MORE rather than
+-- less: with it on, ANY summon that arrives while you are on a flight path is
+-- auto-accepted, buffs or no buffs. Flipping the seed alone heals nobody who has
+-- already logged in, because their SavedVariables carries the old value.
+--
+-- MATCH-BY-VALUE + userChose, the standing pattern (cf. MigrateSongflowerDefaults
+-- and MigrateCoordinateOverrides). A stored block is rewritten ONLY when both:
+--   * the value is still exactly the old shipped default (true), and
+--   * `dropOnTaxiPvpChosen` is not set — options.lua stamps that flag the moment
+--     the checkbox is touched, either way, so a deliberate ON survives.
+-- Anyone who expressed an intent is left completely alone. Idempotent (after
+-- the rewrite the value no longer matches) and safe to run unconditionally.
+--
+-- KNOWN AND ACCEPTED LIMIT: an install that ticked the box BEFORE this build has
+-- no `chosen` flag to prove it — the flag cannot be applied retroactively — so
+-- that user is healed to OFF once and has to re-tick. The heal only ever moves
+-- toward the safer, spec'd behaviour and only ever runs once, which is the right
+-- side to be wrong on for a rule whose failure mode is an unwanted teleport.
+----------------------------------------------------------------------
+
+function Store.MigrateTaxiPvpDefault(db)
+    if type(db) ~= "table" then return 0 end
+    local fsAll = db.factionSettings
+    if type(fsAll) ~= "table" then return 0 end
+    local healed = 0
+    for _, faction in ipairs({ "Alliance", "Horde" }) do
+        local fs = fsAll[faction]
+        local as = type(fs) == "table" and fs.autoSummon or nil
+        if type(as) == "table" and as.dropOnTaxiPvp == true
+           and not as.dropOnTaxiPvpChosen then
+            as.dropOnTaxiPvp = false
+            healed = healed + 1
+        end
+    end
+    return healed
+end
+
+----------------------------------------------------------------------
 -- A17.3 — coordinate-override box correction.
 --
 -- The three seeded rules shipped with rectangles ~12x the reference's ±0.02
@@ -1825,6 +1873,12 @@ function Store.Init()
     -- A17.3: shrink the three oversized seeded coordinate boxes to the reference
     -- ±0.02 tolerance. Match-by-value, so user-edited boxes are never touched.
     Store.MigrateCoordinateOverrides(DaseekiNexusDB)
+    -- Conformance wave: heal autoSummon.dropOnTaxiPvp to the spec §13 default
+    -- (OFF) for anyone still carrying our old shipped ON with no choice behind
+    -- it. Must run BEFORE applyDefaults, like the two above: the backfill would
+    -- otherwise be a no-op on the key and the heal would read a value that had
+    -- just been (re)installed rather than the one the user actually stored.
+    Store.MigrateTaxiPvpDefault(DaseekiNexusDB)
 
     applyDefaults(DaseekiNexusDB, defaultSettings())
     DaseekiNexusDB.settingsVersion = Store.SETTINGS_VERSION
@@ -4016,6 +4070,13 @@ local function testDefaults(fails)
     ck(ag.sendToGuild == false and ag.sendToFriends == false
         and ag.sendToAnyone == false, "per-category send gates default off")
     ck(ag.whitelistEnabled == true, "whitelistEnabled default true")
+    -- SPEC §13: the taxi/PvP-drop rule ships OFF. We shipped it ON, which meant
+    -- ANY summon during ANY flight was auto-accepted out of the box.
+    for _, faction in ipairs({ "Alliance", "Horde" }) do
+        local as = s.factionSettings[faction].autoSummon
+        ck(as.dropOnTaxiPvp == false, faction .. " dropOnTaxiPvp defaults OFF per spec §13")
+        ck(as.dropOnTaxiPvpChosen == false, faction .. " dropOnTaxiPvp starts unchosen")
+    end
     -- RULE (spec §14): Sayge's buff type defaults to Damage for EVERY class.
     -- The store used to ship {} while the options dropdown painted "damage" as
     -- its own fallback, so the UI showed a value the engine could not read and
@@ -4486,6 +4547,45 @@ local function testAutoSummonSeeds(fails)
             ck(ui[k] == true, "options TRIGGER_DEFS offers a checkbox for '" .. k .. "'")
         end
     end
+end
+
+-- The taxi/PvP default heal: match-by-value + userChose (spec §13, audit row 54).
+local function testTaxiPvpMigration(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local function block(v, chosen)
+        return { factionSettings = {
+            Alliance = { autoSummon = { dropOnTaxiPvp = v, dropOnTaxiPvpChosen = chosen } },
+            Horde    = { autoSummon = { dropOnTaxiPvp = v, dropOnTaxiPvpChosen = chosen } },
+        } }
+    end
+
+    -- 1. NEVER TOUCHED: still carrying our old shipped ON -> healed to the spec
+    --    default, both factions.
+    local db = block(true, nil)
+    ck(Store.MigrateTaxiPvpDefault(db) == 2, "heals both factions")
+    ck(db.factionSettings.Alliance.autoSummon.dropOnTaxiPvp == false, "Alliance healed to OFF")
+    ck(db.factionSettings.Horde.autoSummon.dropOnTaxiPvp == false, "Horde healed to OFF")
+
+    -- 2. …and it is idempotent: nothing left to heal on the second pass.
+    ck(Store.MigrateTaxiPvpDefault(db) == 0, "migration is idempotent")
+
+    -- 3. USER CHOSE ON: the flag options.lua stamps is the whole protection.
+    --    This value survives, forever.
+    db = block(true, true)
+    ck(Store.MigrateTaxiPvpDefault(db) == 0, "a chosen ON is not healed")
+    ck(db.factionSettings.Alliance.autoSummon.dropOnTaxiPvp == true, "chosen ON preserved")
+
+    -- 4. Already OFF (chosen or not) is left exactly alone.
+    db = block(false, nil)
+    ck(Store.MigrateTaxiPvpDefault(db) == 0, "an OFF value is not touched")
+    ck(db.factionSettings.Alliance.autoSummon.dropOnTaxiPvp == false, "OFF stays OFF")
+
+    -- 5. Robustness: malformed input must not throw.
+    Store.MigrateTaxiPvpDefault(nil)
+    Store.MigrateTaxiPvpDefault({})
+    Store.MigrateTaxiPvpDefault({ factionSettings = "nope" })
+    Store.MigrateTaxiPvpDefault({ factionSettings = { Alliance = {} } })
+    ck(true, "MigrateTaxiPvpDefault survives malformed input")
 end
 
 local function testSongflowerMigration(fails)
@@ -6460,6 +6560,7 @@ function Store.RunSelfTests(verbose)
         { name = "retirements: locations / colors / thresholds (items 1+4)", fn = testRetirements },
         { name = "autosummon seeds", fn = testAutoSummonSeeds },
         { name = "songflower migration", fn = testSongflowerMigration },
+        { name = "taxi/pvp default heal (spec §13)", fn = testTaxiPvpMigration },
         { name = "notes",           fn = testNotes },
         { name = "inbound name guard", fn = testInboundNameGuard },
         { name = "inbound sanity guard", fn = testInboundSanityGuard },
