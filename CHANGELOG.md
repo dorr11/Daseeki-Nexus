@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.1.4 — 2026-08-05
 
 - **Changed:** **the buff automations now ship switched ON.** Dire Maul tribute, the BWL Orb of
   Command, Sayge's Dark Fortune, Winterspring E'ko, Blasted Lands R.O.I.D.S. and the Zanza

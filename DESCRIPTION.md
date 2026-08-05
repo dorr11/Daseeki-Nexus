@@ -2,7 +2,7 @@
 
 <!-- Canonical CurseForge project description. Update here first, then paste to
      https://www.curseforge.com/wow/addons/daseeki-nexus (project 1638357).
-     Last synced: 2026-08-05 (v1.1.3). -->
+     Last synced: 2026-08-05 (v1.1.4). -->
 
 Daseeki Nexus is a cross-account character dashboard for WoW Classic Era. Every character on every account you run appears as a card — world buffs held (including what's stored in a chronoboon), raid lockouts and attunements, rest and XP, gold, cooldowns, and notes — kept current live over a lightweight sync mesh between your accounts.
 
@@ -17,6 +17,7 @@ Daseeki Nexus is a cross-account character dashboard for WoW Classic Era. Every 
 - **Importers** for ShadowNetwork and Nova Instance Tracker data, so you start with your history instead of from zero
 - Cross-account **inventory & gold** — hover any item or your money to see every character's counts and gold across all your accounts, **right in the default Blizzard bags** (no Daseeki Bags required; when Daseeki Bags is installed it renders these instead)
 - **Auto-friend across accounts** — your characters automatically friend each other across your linked accounts (same faction/realm), so cross-account mail never trips the "unknown recipient" confirmation; anyone you remove stays removed, and Nexus never deletes a friend
+- **No-click automations** (each individually toggleable): Dire Maul tribute and BWL orb gossip, Sayge's Darkmoon fortune with a per-class buff choice, repeatable turn-ins done right at the NPC — Zanza buffs (pick which flasks), Winterspring E'ko, Blasted Lands R.O.I.D.S., Zul'Gurub coins — plus invite/summon helpers and auto-repair at vendors. Every automation is locked to its exact NPC and quest IDs: nothing outside what you enabled is ever touched, and holding Shift skips any of it
 
 ## Chat Commands
 - `/nexus` — toggle the dashboard
