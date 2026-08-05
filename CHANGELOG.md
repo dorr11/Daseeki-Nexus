@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+- **Fixed:** **a fully booned character could suddenly show no world buffs at all.** Every
+  so often the character you were logged in as dropped its whole rack in Nexus — all the
+  world-buff tiles empty — even though the chronoboon was still holding seven buffs, and
+  hovering the chronoboon brought them straight back. Nexus reads what is inside your boon
+  off the chronoboon's tooltip, and a tooltip that has not finished loading shows its
+  title and nothing else. Nexus could not tell that apart from a boon that had genuinely
+  been emptied, so it believed the empty reading, wiped the buffs from your record and
+  published the wipe to your other accounts. **An empty reading is no longer allowed to
+  delete anything unless the emptiness is provable** — the chronoboon really is gone from
+  your bags and bank, or the tooltip really did load and really does list nothing. A
+  reading Nexus cannot trust keeps the buffs it already had instead of erasing them, and
+  quietly asks the game to load the item so the next look is honest.
+- **Fixed:** the same protection now guards the record itself, not just the tooltip read.
+  While the Chronoboon Displacement buff is on your character the stored buffs are, by the
+  rules of the game, still in there — so **a capture that has lost its own copy of the
+  list now rebuilds it from your record rather than writing you down as unbuffed.** This
+  covers the case where the list is missing for any reason at all, including the first
+  moments after a login.
+- **Added:** `/nexus debug sanity` reports the new rule — how many empty chronoboon
+  readings were refused (and how many of those were provably a cold tooltip), how many
+  were honoured, and whether the buff list Nexus is currently holding is a fresh reading
+  or preserved evidence.
 - **Added:** **Felwood node timers now show on the minimap**, not just on the world map.
   Songflower, tuber and Night Dragon's Breath minimap pins each carry the same dark
   countdown chip the world map pins got — sitting just above the pin, in the same colour
