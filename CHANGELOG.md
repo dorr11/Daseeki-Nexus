@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+- **Fixed:** **"accept invites from guild members" and "from friends" never accepted anyone.**
+  Both boxes ship ticked, and both were reading a list of your guildmates and friends that
+  nothing in the addon ever filled in — so the answer was always "I don't know them". A
+  guildmate or a friend inviting you was silently ignored, with the setting showing as on,
+  and the same two categories were dead for whisper-keyword invites. Nexus now captures your
+  guild roster and your friends list (including a Battle.net friend's current character) and
+  keeps them current, so those four settings finally do what they say.
+- **Added:** the capture **refuses to guess.** Both lists live on the server and read as empty
+  for the first seconds after you log in — that is "not told yet", not "you have no friends".
+  Nexus writes a snapshot only once the server has actually answered; until then it keeps
+  using the last one it confirmed, so a slow login can never quietly revoke everybody's
+  trust for a session. Leaving a guild, by contrast, drops that roster immediately.
+- **Added:** `/dsn debug social` — how many names are in each list, how long ago they were
+  captured, and (with a name after it) exactly what the invite gate would decide about that
+  person and why.
+- **Changed:** Nexus now asks the server for your friends list on login even when
+  "auto-friend mesh characters" is switched off. Asking changes nothing on its own; it used
+  to be skipped with that setting, which left the friends trust list permanently in the dark.
 - **Fixed:** **the Dire Maul and Blackwing Lair gossip options could fire at any NPC in the
   game.** With either box ticked, Nexus looked for words like "spare", "free" and "enter"
   in the menu of *whatever* you were talking to — and those are ordinary words that turn up

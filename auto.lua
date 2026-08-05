@@ -151,14 +151,73 @@ function Auto.IsRoster(nameRealm)
     return Auto.IsRosterIn(nameRealm, data and data.accounts, peers)
 end
 
-function Auto.IsGuild(nameRealm)
+----------------------------------------------------------------------
+-- THE CANONICAL SOCIAL KEY  (spec §3 "Name-Realm — canonical key; realm
+-- normalized", §2.1 "name-realm match, case-insensitive, realm normalized")
+--
+-- ONE convention for the guild/friends trust sets: base name lowered, realm
+-- lowered and folded. It is deliberately friends.lua's Friends.Key spelling —
+-- the same key the mesh auto-friend ledger and Daseeki-Conduit's ledger use —
+-- so this module adds no second naming convention to the addon. The splitter
+-- itself is friends.lua's, borrowed at call time; the inline twin only covers
+-- the (impossible in the shipped .toc) case of that file being absent, and the
+-- suite asserts the two agree row for row.
+--
+-- ONE DELIBERATE DELTA from Friends.Key: the realm is stripped of ALL
+-- non-alphanumerics, not only spaces. Every name that reaches these gates has
+-- passed through Auto.NormalizeName, which appends GetNormalizedRealmName() —
+-- and that API drops apostrophes ("Nek'Rosh" -> "NekRosh"). Folding spaces
+-- alone would make an apostrophe realm a permanent non-match, which is the
+-- exact failure mode this whole capture exists to end. Asserted below.
+----------------------------------------------------------------------
+
+local function foldRealm(realm)
+    return (tostring(realm or ""):gsub("[^%w]", "")):lower()
+end
+Auto._FoldRealm = foldRealm
+
+function Auto.SocialKey(name, defaultRealm)
+    name = trim(name)
+    if name == "" then return nil end
+
+    local base, realm
+    local F = ns.MeshFriends
+    if F and F.SplitNameRealm then
+        base, realm = F.SplitNameRealm(name)
+    else
+        base, realm = name:match("^([^%-]+)%-(.+)$")
+        if not base then base, realm = name, nil end
+        base  = trim(base)
+        realm = realm and trim(realm) or nil
+    end
+    if not base or base == "" then return nil end
+
+    if realm == nil or realm == "" then
+        realm = defaultRealm or selfRealm()
+    end
+    return base:lower() .. "-" .. foldRealm(realm)
+end
+
+-- Read one social trust set. The stored key is the canonical social key; a
+-- literal "Name-Realm" key is honoured too, so a set written by an older build
+-- or hand-placed in the SavedVariables still matches rather than silently
+-- reading as "no match" — the failure this module exists to end.
+local function socialHas(which, nameRealm)
     local social = Store.GetSocial()
-    return social and social.guild and social.guild[nameRealm] == true
+    local set = social and social[which]
+    if type(set) ~= "table" then return false end
+    if set[nameRealm] == true then return true end
+    local key = Auto.SocialKey(nameRealm)
+    return (key ~= nil and set[key] == true) or false
+end
+Auto._SocialHas = socialHas
+
+function Auto.IsGuild(nameRealm)
+    return socialHas("guild", nameRealm)
 end
 
 function Auto.IsFriend(nameRealm)
-    local social = Store.GetSocial()
-    return social and social.friends and social.friends[nameRealm] == true
+    return socialHas("friends", nameRealm)
 end
 
 -- Pure decision function for the invite-accept truth table. `ctx` carries the

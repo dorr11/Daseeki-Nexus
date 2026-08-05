@@ -694,12 +694,27 @@ function Friends.RequestList()
     pcall(C.ShowFriends)
 end
 
+-- Public read of the refusal gate's state. social.lua (the §12.2 friends trust
+-- set) needs the same "is this list real or dark?" answer this module needed
+-- first, and must not keep a second copy of it.
+function Friends.ListConfirmed()
+    return Friends._listConfirmed and true or false
+end
+
+-- REQUESTING IS NOT GATED ON THE AUTO-FRIEND SETTING.
+--
+-- It used to be, and that quietly coupled two features: with "auto-friend mesh
+-- characters" off, ShowFriends was never called, FRIENDLIST_UPDATE never
+-- confirmed anything, and any other consumer of the confirmed list (social.lua's
+-- friends trust set) was dark forever. Asking the server for the friends list is
+-- what the default UI does when you open the social pane — it adds, removes and
+-- decides nothing. The PASS is still gated: RunPass refuses when the setting is
+-- off, and the ledger is untouched.
 ns:RegisterEvent("PLAYER_LOGIN", function()
     Friends._listConfirmed = false
     Friends._requested     = false
     Friends._attempted     = {}
     Friends._known         = nil
-    if not Friends.IsEnabled() then return end
     for _, at in ipairs(REQUEST_AT) do
         if _G.C_Timer and C_Timer.After then
             C_Timer.After(at, function()
@@ -712,8 +727,14 @@ end)
 
 ns:RegisterEvent("FRIENDLIST_UPDATE", function()
     if not Friends._requested then return end       -- not an answer to us (yet)
+    local first = not Friends._listConfirmed
     Friends._listConfirmed = true
-    Friends.SchedulePass(1)
+    -- Announced on the bus so a consumer never has to race this handler's
+    -- registration order to learn the list went live. Fired before the pass so
+    -- the trust set is captured from the list as it stands, not as our own
+    -- AddFriend calls are about to leave it.
+    if first then ns:Fire("FRIENDS_LIST_CONFIRMED") end
+    if Friends.IsEnabled() then Friends.SchedulePass(1) end
 end)
 
 ----------------------------------------------------------------------

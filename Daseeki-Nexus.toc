@@ -26,6 +26,7 @@ auto.lua
 options.lua
 syncns.lua
 friends.lua
+social.lua
 inventory.lua
 tooltips.lua
 import.lua
