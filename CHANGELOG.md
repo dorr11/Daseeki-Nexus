@@ -2,6 +2,41 @@
 
 ## Unreleased
 
+- **Fixed:** **the Dire Maul and Blackwing Lair gossip options could fire at any NPC in the
+  game.** With either box ticked, Nexus looked for words like "spare", "free" and "enter"
+  in the menu of *whatever* you were talking to — and those are ordinary words that turn up
+  in ordinary Classic gossip. An innkeeper, a quest giver or a vendor could have their first
+  matching option clicked for you, which at worst means accepting a quest or starting an
+  escort you never asked for. Nexus now checks **who you are talking to** before it does
+  anything: the four Dire Maul tribute guards, Captain Komcrush and the Orb of Command, by
+  ID. If it cannot tell who the NPC is, it does nothing. The word-matching is gone entirely.
+- **Added:** the guards those two features were always supposed to have. Captain Komcrush is
+  only auto-answered when his menu has **exactly one** option, so the flow can no longer eat
+  the quest he offers, and the **Orb of Command** is only used when it presents a single
+  option *and* you are not on any of the three quests that conflict with it.
+- **Fixed:** **Sayge's fortune could not be configured.** The per-class dropdown showed
+  "Damage" as if that were your setting, but nothing was actually stored, so the automation
+  looked your class up, found nothing, and quietly did nothing at all. Damage is now the
+  real, stored default for all nine classes — and if the setting is ever missing, the
+  automation falls back to Damage rather than going silent.
+- **Fixed:** Sayge is now answered by **which option is where on the page**, the way the
+  fortune actually works, instead of by searching his answers for the word "armor" or
+  "spirit" — his answers are riddles and mostly do not contain the word at all. Damage takes
+  the fast path; every other buff is picked by position on each of the two pages.
+- **Added:** **Sayge refuses rather than guesses.** If his menu ever comes up in a shape
+  Nexus does not recognise, it takes no fortune, says so in chat, and points you at
+  `/dsn debug gossip` — which prints the exact options so the mismatch can be fixed. The
+  fortune is permanent for the day, so a missed one costs you a click and a wrong one costs
+  you the day.
+- **Changed:** holding **Shift** as you open a gossip window now demonstrably skips the Dire
+  Maul, Orb and Sayge handlers too, not just the quest turn-ins — one modifier, no
+  exceptions to remember.
+- **Changed:** **"Auto-repair at Rin'wosho" is now "Auto-repair at vendors",** because that
+  is what it does. It repairs at any vendor window you open, anywhere — that behaviour is
+  staying, but the old label described a scope the feature never had.
+- **Added:** auto-repair now **prints what it spent**, and says **"not enough gold"** with
+  the price when it cannot afford the bill. It used to do neither, so an unaffordable repair
+  was indistinguishable from a broken feature.
 - **Fixed:** **a flask you unticked could still be handed to you.** The per-flask
   checkboxes and the automation were storing your choices in two different formats: an
   older build saved them as a list of yes/no answers, the current one saves the ticked
