@@ -178,6 +178,25 @@ Store.LastWeeklyResetBoundary = lastWeeklyResetBoundary
 -- Defaults trees
 ----------------------------------------------------------------------
 
+-- Sayge's Dark Fortune buff type, per class (spec §14: "picks a per-class buff
+-- type — default Damage for every class").
+--
+-- WHY THIS IS A REAL TREE AND NOT LEFT EMPTY. It is the exact inverse of the
+-- auraOpts.thresholds / autoSummon.triggers case above and below, and the
+-- difference is what the options UI writes. Those two encode "off" as ABSENCE,
+-- so a defaults tree would resurrect every row the owner cleared. buffType is a
+-- DROPDOWN: it always writes one of the eight buff-type strings and can never
+-- write nil, so applyDefaults (which only ever fills a key that is nil) cannot
+-- overwrite an owner choice. Shipping it empty was the defect — the engine
+-- looked the class up, got nil, and bailed, while the options dropdown painted
+-- "damage" as its own fallback. The UI showed a value the store did not have.
+local function defaultSaygeBuffTypes()
+    local out = {}
+    for _, class in ipairs(Store.CLASS_ORDER) do out[class] = "damage" end
+    return out
+end
+Store.DefaultSaygeBuffTypes = defaultSaygeBuffTypes
+
 -- Per-faction settings block. Horde receives threshold overrides applied
 -- after this base is copied (see buildFactionSettings).
 local function defaultFactionBlock()
@@ -223,7 +242,9 @@ local function defaultFactionBlock()
             bwl = false,                     -- Orb of Command
             dmf = {                          -- Sayge's Dark Fortune
                 enabled   = false,
-                buffType  = {},              -- ["CLASS"] = "damage"/"stats"/...
+                -- ["CLASS"] = one of the eight spec §14 buff types. Seeded to
+                -- "damage" for all nine classes — see defaultSaygeBuffTypes.
+                buffType  = defaultSaygeBuffTypes(),
                 skipCookie = false,
             },
         },
@@ -3921,6 +3942,17 @@ local function testDefaults(fails)
     ck(ag.sendToGuild == false and ag.sendToFriends == false
         and ag.sendToAnyone == false, "per-category send gates default off")
     ck(ag.whitelistEnabled == true, "whitelistEnabled default true")
+    -- RULE (spec §14): Sayge's buff type defaults to Damage for EVERY class.
+    -- The store used to ship {} while the options dropdown painted "damage" as
+    -- its own fallback, so the UI showed a value the engine could not read and
+    -- HandleSayge bailed on the nil. Assert all nine, both factions.
+    for _, faction in ipairs({ "Alliance", "Horde" }) do
+        local bt = s.factionSettings[faction].autoGossip.dmf.buffType
+        for _, class in ipairs(Store.CLASS_ORDER) do
+            ck(bt[class] == "damage",
+                faction .. " sayge buffType." .. class .. " defaults to damage")
+        end
+    end
     local fw = s.timerSettings.felwood
     ck(fw.flowerUpDuration == 0, "songflower UP? default indefinite (0)")
     ck(fw.flowerMinusDuration == 1500, "songflower minus default 1500s (25m)")

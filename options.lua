@@ -220,6 +220,23 @@ local SOUND_CHANNELS = { "Master", "SFX", "Music", "Ambience", "Dialog" }
 -- (Interact NPCs table removed — the Interact feature is cut suite-wide, owner
 -- feedback 2b.)
 
+-- AUTO-REPAIR LABEL — say what it does (1.1.4 honesty fix).
+--
+-- This checkbox used to read "Auto-repair at Rin'wosho" while auto.lua repaired
+-- on ANY merchant window the player opened, anywhere in the world. The
+-- behaviour is owner-approved (waiver 2026-08-05, "im fine with auto repairing
+-- at any vendor"); the LABEL was the defect — a setting that misdescribes its
+-- own blast radius is worse than no setting, because the owner ticks it
+-- believing it is scoped to one NPC in Yojamba Isle.
+--
+-- Exported so the options self-test can assert the text: an assertion on a
+-- string buried in a UI builder closure is not reachable, and this label going
+-- stale again is precisely the kind of drift the conformance audit found.
+Options.REPAIR_LABEL = "Auto-repair at vendors"
+Options.REPAIR_HINT  =
+    "Auto-repair runs at |cffffd100any|r vendor whose window you open, not just Rin'wosho. "
+    .. "It spends your own gold and prints the cost."
+
 -- DMF Sayge fortune buff-types (spec §7 Gossip).
 local DMF_BUFF_TYPES = {
     "damage", "agility", "intellect", "spirit", "stamina", "strength", "armor", "resistance",
@@ -2117,10 +2134,11 @@ local function buildAutomation(flow)
         set = function(v) local fs = FS(); if fs then fs.autoQuest.roids = v and true or false end end,
     }).Refresh)
     register("automation", qb:Checkbox({
-        label = "Auto-repair at Rin'wosho",
+        label = Options.REPAIR_LABEL,
         get = function() local fs = FS(); return fs and fs.autoQuest.autoRepair end,
         set = function(v) local fs = FS(); if fs then fs.autoQuest.autoRepair = v and true or false end end,
     }).Refresh)
+    q:Hint(Options.REPAIR_HINT)
 
     -- Zanza parent + indented sub-picks (round-3 item 30).
     local zr = q:AddRow({ vAlign = "center" })
@@ -2830,6 +2848,45 @@ ns:RegisterSelfTest("options", function(verbose)
     -- subset of the Mesh page's refreshers.
     ck(type(refreshers.meshLive) == "table", "meshLive registry exists")
     ck(#refreshers.meshLive <= #refreshers.mesh, "meshLive is a subset of mesh")
+
+    ----------------------------------------------------------------------
+    -- AUTO-REPAIR LABEL HONESTY (1.1.4 conformance wave).
+    --
+    -- auto.lua's OnMerchantShow repairs at ANY vendor window the player opens —
+    -- owner-approved, but it means the checkbox must not name one NPC. These
+    -- assertions are what stops the old wording coming back: they fail loudly
+    -- the moment the label re-acquires an NPC name, and they are the only
+    -- reachable seam for a string that otherwise lives inside a UI closure.
+    ck(type(Options.REPAIR_LABEL) == "string" and Options.REPAIR_LABEL ~= "",
+       "repair label is a non-empty string")
+    ck(not Options.REPAIR_LABEL:lower():find("rin'wosho", 1, true),
+       "repair label must NOT claim to be scoped to Rin'wosho")
+    ck(Options.REPAIR_LABEL:lower():find("vendor", 1, true) ~= nil,
+       "repair label says 'vendor' -- what it actually does")
+    ck(type(Options.REPAIR_HINT) == "string"
+       and Options.REPAIR_HINT:lower():find("any", 1, true) ~= nil,
+       "repair hint spells out the any-vendor scope")
+
+    ----------------------------------------------------------------------
+    -- SAYGE DROPDOWN <-> ENGINE PAGE-MAP PARITY.
+    --
+    -- The dropdown offers eight buff types; auto.lua answers Sayge by looking
+    -- the chosen string up in the spec's two page maps. If those two lists ever
+    -- drift, the owner picks a buff the engine cannot resolve and the flow
+    -- silently refuses (or, before the shape guard, guessed). Assert every
+    -- offered value resolves on BOTH pages, and that the shipped default is one
+    -- of them.
+    if ns.Auto and ns.Auto.SAYGE_PAGE then
+        for _, t in ipairs(DMF_BUFF_TYPES) do
+            ck(ns.Auto.SAYGE_PAGE[4][t] ~= nil, "dropdown value '" .. t .. "' maps on Sayge page 1")
+            ck(ns.Auto.SAYGE_PAGE[3][t] ~= nil, "dropdown value '" .. t .. "' maps on Sayge page 2")
+        end
+        local defaultOffered = false
+        for _, t in ipairs(DMF_BUFF_TYPES) do
+            if t == ns.Auto.SAYGE_DEFAULT_BUFF then defaultOffered = true end
+        end
+        ck(defaultOffered, "the engine's default Sayge buff type is offered by the dropdown")
+    end
 
     ----------------------------------------------------------------------
     -- Class-rule KEY PARITY (owner bug: Slip'kik's Savvy stayed amber).

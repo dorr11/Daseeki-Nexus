@@ -31,6 +31,10 @@
 --              driver therefore reads `info.questID` off the list entry and
 --              passes THAT, falling back to the entry's ordinal only when the
 --              record carries no questID. See Auto.ReadGossipQuests.
+--   * QuestLog: C_QuestLog.IsOnQuest(questID) -> bool. Used by ONE guard, the
+--              Orb of Command's "not on 85556/85557/85558" test. Present in
+--              functions.txt AND globals.txt for 1.15.9.68808; the guard
+--              refuses (does not proceed) if it is ever absent.
 --   * Quest:   GetNumActiveQuests / GetActiveTitle / SelectActiveQuest ;
 --              GetNumAvailableQuests / GetAvailableTitle / SelectAvailableQuest ;
 --              AcceptQuest ; IsQuestCompletable / CompleteQuest ;
@@ -43,7 +47,8 @@
 --              global. Bank slots are read through ns.Inventory.ScanBank, which
 --              already owns the C_Container container walk.
 --   * Input:   IsShiftKeyDown ; UnitGUID (NPC identity).
---   * Repair:  CanMerchantRepair / GetRepairAllCost / RepairAllItems (globals).
+--   * Repair:  CanMerchantRepair / GetRepairAllCost / RepairAllItems / GetMoney
+--              / GetCoinTextureString (globals; all in globals.txt 1.15.9).
 --
 -- EVENTS (catalog events.txt, 1.15.9.68808): Event.GossipInfo.GossipShow /
 -- GossipClosed, Event.QuestOffer.QuestGreeting / QuestProgress / QuestFinished,
@@ -662,52 +667,81 @@ function Auto.OnRegenEnabled()
 end
 
 ----------------------------------------------------------------------
--- Gossip automation (spec §5) — C_GossipInfo namespace
+-- Gossip automation (spec §14) — C_GossipInfo namespace
+--
+-- NPC IDENTITY IS THE GATE (1.1.4 conformance wave, audit divergence 3).
+--
+-- What used to be here matched a pool of display-text KEYWORDS against the
+-- option list of ANY gossip NPC in the game. The pools carried "spare", "free"
+-- and "enter" — substrings that occur in unrelated Classic gossip — so ticking
+-- the Dire Maul or Orb box armed a fuzzy auto-clicker world-wide, able to
+-- accept a quest, start an escort or buy from a vendor at an NPC that has
+-- nothing to do with either feature.
+--
+-- The pools are GONE. Not narrowed: deleted. Spec §14 never describes keyword
+-- matching for these flows — it describes NPC identity plus an option INDEX
+-- ("auto-picks option 1"), and that is now the whole mechanism. Every handler
+-- below refuses unless UnitGUID("npc") parses to an ID the spec names.
+--
+-- UNKNOWN GUID REFUSES HERE. That is the opposite of the zanza gate, and
+-- deliberately so: zanza is backed by an exact quest-ID whitelist (8243 only
+-- exists at Rin'wosho), so an unparseable GUID there cannot cause a wrong
+-- action. These handlers have no such backstop — a positional click is
+-- evidence-free — so "I could not identify this NPC" must mean "do nothing".
 ----------------------------------------------------------------------
 
--- Dire Maul tribute guard buff options (Mol'dar / Fengus / Slip'kik plus the
--- Mizzle/Komcrush lines). Matched by keyword against option display text.
-local DMT_KEYWORDS = {
-    "moxie", "ferocity", "savvy", "mol'dar", "fengus", "slip'kik",
-    "mizzle", "komcrush", "spare", "free",
+-- Dire Maul tribute guards (spec §14). Option 1 at the four buff guards.
+Auto.DMT_NPCS = {
+    [14326] = "Mol'dar",
+    [14321] = "Fengus",
+    [14323] = "Slip'kik",
+    [14353] = "Mizzle the Crafty",
 }
--- BWL Orb of Command entry gossip.
-local BWL_KEYWORDS = { "orb of command", "enter", "blackwing" }
+-- Captain Komcrush is the exception: he also GIVES a quest, so option 1 is only
+-- safe when it is the ONLY option. This guard is the reason the flow does not
+-- eat a quest.
+Auto.DMT_NPC_KOMCRUSH = 14325
 
--- Map a Sayge buff-type setting to keyword fragments that appear in the fortune
--- option text. NOTE: Sayge's answer strings are philosophical statements; the
--- buff-type keyword may not literally appear, so the store may also hold the
--- literal option substring in buffType[CLASS]. In-game verification confirms
--- the exact strings (see deliverable notes).
-local SAYGE_TYPE_KEYWORDS = {
-    damage      = { "damage" },
-    resistance  = { "resist" },
-    resist      = { "resist" },
-    armor       = { "armor" },
-    spirit      = { "spirit" },
-    intellect   = { "intellect", "intelligence" },
-    intelligence= { "intellect", "intelligence" },
-    stamina     = { "stamina" },
-    strength    = { "strength" },
-    agility     = { "agility" },
-    stats       = { "stats", "all" },
+-- BWL Orb of Command (spec §14). A GameObject, not a creature — Auto.ParseNpcID
+-- already accepts the "GameObject-…" GUID kind.
+Auto.BWL_ORB = 179879
+-- The orb must not be used while any of these are in the quest log.
+Auto.BWL_BLOCKING_QUESTS = { 85556, 85557, 85558 }
+
+-- Darkmoon Faire fortune teller (spec §14).
+Auto.SAYGE_NPC           = 14822
+Auto.SAYGE_DEFAULT_BUFF  = "damage"     -- spec: default Damage for every class
+Auto.SAYGE_SPAM_REPEATS  = 100          -- spec: 100 repeats…
+Auto.SAYGE_SPAM_INTERVAL = 0.05         -- …at 50 ms
+Auto.SAYGE_REENTRY_LOCK  = 5            -- spec: 5 s re-entry lock
+
+-- Spec §14 page maps, keyed by the number of options the page presents. This is
+-- the whole selection mechanism for every buff type except Damage: an option
+-- COUNT identifies the page, the page names the INDEX. No string is read.
+Auto.SAYGE_PAGE = {
+    -- page 1 (4 options)
+    [4] = { damage = 1, resistance = 1, armor    = 1,
+            intellect = 2, spirit = 2,
+            agility = 3, stamina = 3, strength = 3 },
+    -- page 2 (3 options)
+    [3] = { damage = 1, spirit = 1, stamina  = 1,
+            resistance = 2, intellect = 2, strength = 2,
+            armor = 3, agility = 3 },
 }
+-- Tolerated spellings for a buffType value that did not come from our own
+-- dropdown (an imported profile, a hand-edited SavedVariables).
+Auto.SAYGE_ALIASES = { resist = "resistance", intelligence = "intellect" }
 
--- Select the first gossip option whose display name contains any keyword.
--- Returns true if a selection was made. Pure over the (options, keywords) pair
--- so the matcher is self-testable; the live SelectOption call is guarded.
-function Auto.FindOptionByKeywords(options, keywords)
-    if not options then return nil end
-    for _, opt in ipairs(options) do
-        local nm = lower(opt.name)
-        for _, kw in ipairs(keywords) do
-            if nm:find(kw, 1, true) then
-                return opt.gossipOptionID, opt
-            end
-        end
+-- Debug channel for this subsystem: `/dsn debug gossip`. Off by default; the
+-- shape-mismatch WARNING below prints regardless, because the owner cannot know
+-- to turn a flag on for a page shape nobody has seen yet.
+Auto.DEBUG_GOSSIP = false
+local function gdbg(fmt, ...)
+    if Auto.DEBUG_GOSSIP and ns and ns.Print then
+        ns:Print("|cff9999ff[gossip]|r " .. string.format(fmt, ...))
     end
-    return nil
 end
+Auto._gdbg = gdbg
 
 local function selectGossipOption(optionID)
     if optionID ~= nil and C_GossipInfo and C_GossipInfo.SelectOption then
@@ -717,59 +751,218 @@ local function selectGossipOption(optionID)
     return false
 end
 
--- Session guard so we don't re-trigger Sayge / close-cookie in a loop.
-Auto._saygeDone = false
+-- Resolve the API selector for the Nth option. Returns nil when the option or
+-- its ID is absent — callers treat that as "refuse", never as "use the index".
+local function optionSelector(options, index)
+    local opt = options and options[index]
+    if not opt then return nil end
+    return opt.gossipOptionID
+end
 
+-- PURE. Dire Maul tribute guard decision. ctx: enabled, npcID, optionCount.
+-- Returns (optionIndex|nil, reason). Every refusal names its own gate.
+function Auto.DecideDmtOption(ctx)
+    ctx = ctx or {}
+    if not ctx.enabled then return nil, "disabled" end
+    if ctx.npcID == nil then return nil, "unknown-npc" end
+    local n = tonumber(ctx.optionCount) or 0
+    if ctx.npcID == Auto.DMT_NPC_KOMCRUSH then
+        -- Exactly one option, or nothing. The anti-quest-eating guard.
+        if n ~= 1 then return nil, "komcrush-not-single" end
+        return 1, "komcrush-single"
+    end
+    if not Auto.DMT_NPCS[ctx.npcID] then return nil, "wrong-npc" end
+    if n < 1 then return nil, "no-options" end
+    return 1, "option-1"
+end
+
+-- PURE. Orb of Command decision. ctx: enabled, npcID, optionCount,
+-- onBlockingQuest. Returns (optionIndex|nil, reason).
+function Auto.DecideBwlOption(ctx)
+    ctx = ctx or {}
+    if not ctx.enabled then return nil, "disabled" end
+    if ctx.npcID == nil then return nil, "unknown-npc" end
+    if ctx.npcID ~= Auto.BWL_ORB then return nil, "wrong-npc" end
+    if (tonumber(ctx.optionCount) or 0) ~= 1 then return nil, "not-single-option" end
+    if ctx.onBlockingQuest then return nil, "blocking-quest" end
+    return 1, "option-1"
+end
+
+-- Is the player on any of 85556 / 85557 / 85558?
+--
+-- A MISSING API REFUSES. If C_QuestLog.IsOnQuest is not there we cannot answer
+-- the spec's question, and the safe answer to "may I advance the orb?" when the
+-- guard cannot be evaluated is no.
+function Auto.OnBwlBlockingQuest()
+    if not (C_QuestLog and C_QuestLog.IsOnQuest) then
+        gdbg("C_QuestLog.IsOnQuest unavailable -- orb guard refuses")
+        return true
+    end
+    for _, qid in ipairs(Auto.BWL_BLOCKING_QUESTS) do
+        local ok, on = pcall(C_QuestLog.IsOnQuest, qid)
+        if ok and on then return true, qid end
+    end
+    return false
+end
+
+----------------------------------------------------------------------
+-- Sayge (spec §14)
+----------------------------------------------------------------------
+
+Auto._saygeDone        = false   -- the fortune has been answered this visit
+Auto._saygeAt          = nil     -- GetTime() of that answer (5 s re-entry lock)
+Auto._saygeSpam        = 0       -- remaining ticks of the Damage spam ladder
+Auto._saygeShapeWarned = false   -- one unknown-shape chat line per visit
+Auto._saygeInteractAt  = nil     -- stamped on ANY Sayge gossip, setting or not
+
+-- The class default answer path. Spec: default Damage for every class. The
+-- store now seeds that for all nine classes, and this is the belt to that
+-- brace — a nil/empty/foreign value still resolves to Damage rather than
+-- silently disabling the feature the way it used to.
+function Auto.SaygeBuffType(dmf, classTag)
+    local want = dmf and dmf.buffType and classTag and dmf.buffType[classTag]
+    want = lower(trim(want or ""))
+    if want == "" then want = Auto.SAYGE_DEFAULT_BUFF end
+    return Auto.SAYGE_ALIASES[want] or want
+end
+
+function Auto.SaygeLocked(now)
+    if Auto._saygeAt == nil then return false end
+    return ((now or nowSecs()) - Auto._saygeAt) < Auto.SAYGE_REENTRY_LOCK
+end
+
+-- PURE. Spec's positional selection for a non-Damage buff type.
+-- Returns (optionIndex|nil, reason). "final" is true when answering this page
+-- completes the fortune (page 2), false while we are still walking pages.
+--
+-- SHAPE GUARD. Any option count the spec does not describe returns nil. This is
+-- the deliberately paranoid half of the feature: Sayge's fortune is a permanent
+-- daily buff, so refusing costs the owner one manual click, while a misclick
+-- costs a day. Row 75/76 of the audit are implemented from the spec's page maps
+-- and the "Damage is option 1 on both pages" premise is flagged
+-- UNKNOWN-NEEDS-INGAME-VERIFY — hence the guard rather than a best guess.
+function Auto.DecideSaygeOption(want, optionCount)
+    local n = tonumber(optionCount) or 0
+    if n == 1 then return 1, "transitional", false end   -- single-option page
+    local page = Auto.SAYGE_PAGE[n]
+    if not page then return nil, "unexpected-shape", false end
+    local idx = page[want]
+    if not idx then return nil, "unknown-bufftype", false end
+    if idx > n then return nil, "index-out-of-range", false end
+    return idx, "page-" .. n, (n == 3)
+end
+
+-- One chat line per visit when the page shape is not one the spec describes,
+-- plus the full detail on the debug channel so the owner can capture it.
+function Auto.SaygeShapeWarn(reason, options, want)
+    local n = options and #options or 0
+    if not Auto._saygeShapeWarned then
+        Auto._saygeShapeWarned = true
+        ns:Print(("Sayge: refused to answer — a %d-option page is not a shape spec §14 "
+            .. "describes (%s). No fortune was taken; choose it by hand. "
+            .. "Run |cffffd100/dsn debug gossip|r and re-open him to capture the options.")
+            :format(n, tostring(reason)))
+    end
+    gdbg("sayge shape mismatch: reason=%s options=%d want=%s", tostring(reason), n, tostring(want))
+    for i, opt in ipairs(options or {}) do
+        gdbg("  option %d: id=%s name=%s", i, tostring(opt.gossipOptionID), tostring(opt.name))
+    end
+end
+
+-- The Damage fast path (spec §14): option 1 is Damage on BOTH pages, so the
+-- flow blasts option 1 through the pages instead of waiting for a server
+-- round-trip per page — 100 repeats at 50 ms.
+--
+-- IDENTITY IS RE-CHECKED ON EVERY TICK. A blind 5 s ladder of "click option 1"
+-- is precisely the hazard this whole brief exists to remove: if the player
+-- walks away from Sayge and opens another NPC mid-ladder, an un-gated tick
+-- would click that NPC's first option. So each tick refuses (and stops) unless
+-- UnitGUID("npc") still parses to 14822. It never WAITS on anything, so the
+-- spec's reason for spamming is preserved.
+function Auto.SaygeSpamTick()
+    if (Auto._saygeSpam or 0) <= 0 then return end
+    Auto._saygeSpam = Auto._saygeSpam - 1
+
+    if Auto.NpcID() ~= Auto.SAYGE_NPC then
+        gdbg("sayge spam: NPC is no longer Sayge -- ladder stopped with %d tick(s) left",
+            Auto._saygeSpam)
+        Auto._saygeSpam = 0
+        return
+    end
+    local options = C_GossipInfo and C_GossipInfo.GetOptions and C_GossipInfo.GetOptions()
+    if options and options[1] then
+        selectGossipOption(optionSelector(options, 1))
+    end
+    if Auto._saygeSpam > 0 and C_Timer and C_Timer.After then
+        C_Timer.After(Auto.SAYGE_SPAM_INTERVAL, function() ns:SafeCall(Auto.SaygeSpamTick) end)
+    end
+end
+
+function Auto.StartSaygeSpam()
+    Auto._saygeSpam = Auto.SAYGE_SPAM_REPEATS
+    Auto.SaygeSpamTick()
+end
+
+-- Called ONLY from Auto.OnGossipShow, and only once the NPC is confirmed 14822.
 function Auto.HandleSayge(options, dmf)
-    -- If we already took the fortune this visit and skip-cookie is on, close.
-    if Auto._saygeDone then
-        if dmf.skipCookie and C_GossipInfo and C_GossipInfo.CloseGossip then
+    -- The spam ladder owns the window while it runs: a cookie-close here would
+    -- shut the gossip out from under it.
+    if (Auto._saygeSpam or 0) > 0 then return true end
+
+    -- Inside the 5 s re-entry lock the fortune is already answered. The only
+    -- thing left to do is close the fortune-cookie dialog (default on).
+    if Auto.SaygeLocked() then
+        if Auto._saygeDone and dmf.skipCookie
+           and C_GossipInfo and C_GossipInfo.CloseGossip then
             C_GossipInfo.CloseGossip()
         end
         return true
     end
 
-    -- Determine desired buff-type for our class.
     local _, classTag = UnitClass("player")
-    local want = dmf.buffType and dmf.buffType[classTag]
-    if not want or want == "" then return false end
+    local want = Auto.SaygeBuffType(dmf, classTag)
 
-    -- Build keyword set: mapped fragments plus the literal setting (allows the
-    -- user to store the exact option substring when the mapping is ambiguous).
-    local keywords = {}
-    local mapped = SAYGE_TYPE_KEYWORDS[lower(want)]
-    if mapped then for _, k in ipairs(mapped) do keywords[#keywords + 1] = k end end
-    keywords[#keywords + 1] = lower(want)
-
-    local optionID = Auto.FindOptionByKeywords(options, keywords)
-    if optionID == nil then
-        -- No buff-type match yet: advance a single "hear the fortune" style
-        -- option so the next GOSSIP_SHOW presents the buff choices.
-        if #options == 1 then
-            selectGossipOption(options[1].gossipOptionID)
-        end
-        return false
-    end
-    if selectGossipOption(optionID) then
+    if want == Auto.SAYGE_DEFAULT_BUFF then
+        Auto._saygeAt   = nowSecs()
         Auto._saygeDone = true
+        gdbg("sayge: Damage fast path -- spamming option 1 x%d", Auto.SAYGE_SPAM_REPEATS)
+        Auto.StartSaygeSpam()
         return true
     end
-    return false
+
+    local idx, why, final = Auto.DecideSaygeOption(want, #options)
+    if idx == nil then
+        Auto.SaygeShapeWarn(why, options, want)
+        return false
+    end
+    local selector = optionSelector(options, idx)
+    if selector == nil then
+        Auto.SaygeShapeWarn("no-option-id", options, want)
+        return false
+    end
+    if not selectGossipOption(selector) then return false end
+    gdbg("sayge: want=%s options=%d -> option %d (%s)", want, #options, idx, why)
+    if final then
+        -- Page 2 is the last page: the buff is chosen. Arm the lock so the
+        -- fortune-cookie page that follows is closed, not answered.
+        Auto._saygeAt   = nowSecs()
+        Auto._saygeDone = true
+    end
+    return true
 end
 
 -- GOSSIP_SHOW entry point.
 --
 -- ORDER MATTERS (1.1.4 defect fix). The gossip-window QUEST path runs FIRST,
--- ahead of every keyword-matched option, and it only ever fires on an exact
--- quest-ID match — which is unambiguous evidence, where an option keyword is a
--- fuzzy substring test. That precedence is what stops a keyword pool (DMT's
--- carries "spare"/"free") from eating the interaction at a quest-giving gossip
--- NPC, and it is the shape the spec's "auto-repair only when the zanza flow is
--- idle" rule needs: a pickable turn-in wins the one interaction we get.
+-- ahead of every option handler, and it only ever fires on an exact quest-ID
+-- match. A pickable turn-in wins the one interaction we get — which is also the
+-- shape the spec's "auto-repair only when the zanza flow is idle" rule needs.
 --
 -- Shift is checked before anything else: spec §14 / §19.23 — holding Shift while
 -- opening gossip skips the whole flow (and auto-repair) at Mau'ari, Vinchaxa,
--- Rin'wosho and Drazial.
+-- Rin'wosho and Drazial. It is the FIRST statement so the escape hatch covers
+-- the DMT, Orb and Sayge handlers too, not just the four NPCs §19.23 names:
+-- one modifier, one rule, no exceptions to remember.
 function Auto.OnGossipShow()
     if IsShiftKeyDown and IsShiftKeyDown() then return end
     if Auto.HandleGossipQuests() then return end
@@ -779,15 +972,33 @@ function Auto.OnGossipShow()
     local options = C_GossipInfo.GetOptions()
     if not options or #options == 0 then return end
 
-    if ago.dmt then
-        local id = Auto.FindOptionByKeywords(options, DMT_KEYWORDS)
-        if id ~= nil then selectGossipOption(id) return end
+    local npcID = Auto.NpcID()
+    local n     = #options
+
+    -- Spec §14: "Interacting with Sayge is timestamped regardless of the
+    -- setting." Stamped before the dmf.enabled test for exactly that reason.
+    if npcID == Auto.SAYGE_NPC then Auto._saygeInteractAt = nowSecs() end
+
+    local idx, why = Auto.DecideDmtOption({
+        enabled = ago.dmt, npcID = npcID, optionCount = n,
+    })
+    if idx then
+        if selectGossipOption(optionSelector(options, idx)) then return end
+    elseif ago.dmt and (Auto.DMT_NPCS[npcID or -1] or npcID == Auto.DMT_NPC_KOMCRUSH) then
+        gdbg("dmt: refused at %s -- %s (%d option(s))", tostring(npcID), tostring(why), n)
     end
-    if ago.bwl then
-        local id = Auto.FindOptionByKeywords(options, BWL_KEYWORDS)
-        if id ~= nil then selectGossipOption(id) return end
+
+    local onBlocking = (npcID == Auto.BWL_ORB) and Auto.OnBwlBlockingQuest() or false
+    idx, why = Auto.DecideBwlOption({
+        enabled = ago.bwl, npcID = npcID, optionCount = n, onBlockingQuest = onBlocking,
+    })
+    if idx then
+        if selectGossipOption(optionSelector(options, idx)) then return end
+    elseif ago.bwl and npcID == Auto.BWL_ORB then
+        gdbg("bwl orb: refused -- %s (%d option(s))", tostring(why), n)
     end
-    if ago.dmf and ago.dmf.enabled then
+
+    if ago.dmf and ago.dmf.enabled and npcID == Auto.SAYGE_NPC then
         Auto.HandleSayge(options, ago.dmf)
     end
 end
@@ -1639,33 +1850,53 @@ function Auto.OnBankClosed()
 end
 
 ----------------------------------------------------------------------
--- Auto-repair (spec §5) — MERCHANT_SHOW + RepairAllItems (globals)
+-- Auto-repair — MERCHANT_SHOW + RepairAllItems (globals)
 --
--- SCOPE NOTE (1.1.4). Spec §14's "auto-repair at Rin'wosho" is a bigger flow
--- than what is here: it selects his VENDOR gossip option (icon file ID 132060)
--- when the zanza flow is idle, repairs on the merchant window IT opened, closes
--- it, and guards that with a 3 s disarm and a 5 s attempt cooldown. NONE of
--- that is shipped — what follows repairs on a merchant window the PLAYER
--- opened, at any vendor, and never touches gossip. That flow is deliberately
--- NOT added here (this build's remit is the zanza entry path), so there is no
--- idle-gate to compose with yet.
+-- OWNER WAIVER (2026-08-05). Spec §14 scopes auto-repair to Rin'wosho, entered
+-- by the addon selecting his vendor gossip option, and §19.21 states it as an
+-- absolute: "Auto-repair only ever touches a merchant window the addon itself
+-- opened." What ships here is the inverse — it repairs on a merchant window the
+-- PLAYER opened, at ANY vendor — and Drew has APPROVED that as the shipped
+-- behaviour ("im fine with auto repairing at any vendor"). It is a deliberate
+-- divergence from spec, recorded here so the next audit reads it as a decision
+-- and not as drift. Do not re-scope it to Rin'wosho without the owner.
 --
--- What this build DOES guarantee for it: Auto.OnGossipShow runs the quest-ID
--- path FIRST and returns the moment it selects, so when the Rin'wosho repair
--- flow is eventually built, a pickable zanza turn-in already wins the single
--- gossip interaction and the repair option cannot steal it. The "zanza flow is
--- idle" predicate it will need is Auto.ZanzaGateNow() returning false, plus
--- Auto.PlanGossipQuest returning nil.
+-- What the waiver did NOT cover is HONESTY, and that is what this function
+-- owes: the setting used to be labelled "Auto-repair at Rin'wosho" while
+-- repairing everywhere, the repair printed a bare line with no cost, and an
+-- unaffordable repair fell through in total silence — indistinguishable from a
+-- broken feature. All three are fixed (label lives in options.lua).
 ----------------------------------------------------------------------
+
+-- Money for humans. Prefers the client's coin-icon string; the plain-text
+-- fallback is what the headless harness and any stripped client see.
+function Auto.FormatMoney(copper)
+    copper = math.floor(tonumber(copper) or 0)
+    if GetCoinTextureString then
+        local ok, s = pcall(GetCoinTextureString, copper)
+        if ok and type(s) == "string" and s ~= "" then return s end
+    end
+    return string.format("%dg %ds %dc",
+        math.floor(copper / 10000),
+        math.floor((copper % 10000) / 100),
+        copper % 100)
+end
 
 function Auto.OnMerchantShow()
     if not aqBlock().autoRepair then return end
     if not (CanMerchantRepair and CanMerchantRepair()) then return end
-    local cost = GetRepairAllCost and GetRepairAllCost() or 0
-    if cost and cost > 0 and (GetMoney and GetMoney() or 0) >= cost then
-        if RepairAllItems then RepairAllItems() end
-        ns:Print("auto-repaired at vendor.")
+    local cost = math.floor(tonumber(GetRepairAllCost and GetRepairAllCost() or 0) or 0)
+    if cost <= 0 then return end                       -- nothing damaged: silent
+    local money = math.floor(tonumber(GetMoney and GetMoney() or 0) or 0)
+    if money < cost then
+        -- Spec §14's "not enough gold" line. Silence here used to look exactly
+        -- like the feature being broken.
+        ns:Print("auto-repair: not enough gold — repairing costs "
+            .. Auto.FormatMoney(cost) .. ", you have " .. Auto.FormatMoney(money) .. ".")
+        return
     end
+    if RepairAllItems then RepairAllItems() end
+    ns:Print("auto-repaired for " .. Auto.FormatMoney(cost) .. ".")
 end
 
 ----------------------------------------------------------------------
@@ -1673,7 +1904,13 @@ end
 ----------------------------------------------------------------------
 
 function Auto.OnZoneChanged()
-    Auto._saygeDone = false
+    Auto._saygeDone        = false
+    Auto._saygeShapeWarned = false
+    -- The spam ladder is torn down on a zone change: its per-tick NPC check
+    -- would stop it anyway, this just does not wait for the next tick. The 5 s
+    -- re-entry lock (_saygeAt) is NOT cleared — spec makes it a time guard, and
+    -- clearing it on zone change is the very approximation this wave removed.
+    Auto._saygeSpam = 0
     -- Walking away ends any dialog we were holding open. The rejection stamps
     -- are NOT cleared: they are a 30 s time-based guard, not a location one.
     Auto._zanzaChoices = nil
@@ -1949,15 +2186,522 @@ local function testRosterMembership()
     return true
 end
 
-local function testOptionMatcher()
-    local options = {
-        { name = "Kill King Gordok",        gossipOptionID = 10 },
-        { name = "Spare King Gordok",       gossipOptionID = 11 },
+----------------------------------------------------------------------
+-- NPC-GATED GOSSIP RULE TABLE (spec §14) — one assertion per rule.
+--
+-- This block replaces testOptionMatcher, which asserted that the DMT keyword
+-- pool picked "Spare King Gordok" out of an option list with no NPC context at
+-- all. That test PASSED for the entire life of the defect: it codified the
+-- divergence (the audit's row 64) instead of catching it. What follows asserts
+-- identity first and index second, which is what the spec actually says.
+----------------------------------------------------------------------
+
+-- RULE: DMT is scoped to 14326 / 14321 / 14323 / 14353 and picks option 1;
+-- Komcrush (14325) picks option 1 ONLY when exactly one option is present.
+local function testDmtGate()
+    for id, who in pairs(Auto.DMT_NPCS) do
+        local idx, why = Auto.DecideDmtOption({ enabled = true, npcID = id, optionCount = 3 })
+        if idx ~= 1 then return false, who .. " (" .. id .. ") must pick option 1, got " .. tostring(why) end
+    end
+    -- The four IDs the spec names, spelled out so a typo in the table is caught.
+    for _, id in ipairs({ 14326, 14321, 14323, 14353 }) do
+        if not Auto.DMT_NPCS[id] then return false, "spec NPC " .. id .. " missing from DMT_NPCS" end
+    end
+    if Auto.DMT_NPCS[Auto.DMT_NPC_KOMCRUSH] then
+        return false, "Komcrush must NOT be in the plain option-1 set"
+    end
+    if Auto.DMT_NPC_KOMCRUSH ~= 14325 then return false, "Komcrush is NPC 14325" end
+
+    -- Komcrush: exactly one option, or nothing. The anti-quest-eating guard.
+    local idx, why = Auto.DecideDmtOption({ enabled = true, npcID = 14325, optionCount = 1 })
+    if idx ~= 1 then return false, "Komcrush with one option picks it, got " .. tostring(why) end
+    idx, why = Auto.DecideDmtOption({ enabled = true, npcID = 14325, optionCount = 2 })
+    if idx ~= nil or why ~= "komcrush-not-single" then
+        return false, "Komcrush with TWO options must refuse (it would eat a quest)"
+    end
+    idx = Auto.DecideDmtOption({ enabled = true, npcID = 14325, optionCount = 0 })
+    if idx ~= nil then return false, "Komcrush with no options must refuse" end
+
+    -- Identity gates.
+    if Auto.DecideDmtOption({ enabled = false, npcID = 14326, optionCount = 1 }) ~= nil then
+        return false, "disabled must refuse"
+    end
+    if Auto.DecideDmtOption({ enabled = true, npcID = 99999, optionCount = 1 }) ~= nil then
+        return false, "an unrelated NPC must refuse"
+    end
+    local _, r = Auto.DecideDmtOption({ enabled = true, npcID = nil, optionCount = 1 })
+    if r ~= "unknown-npc" then return false, "an unparseable GUID must refuse, got " .. tostring(r) end
+    return true
+end
+
+-- RULE: the Orb is object 179879, picks option 1 only when exactly one option
+-- exists, and only when not on 85556 / 85557 / 85558.
+local function testBwlGate()
+    if Auto.BWL_ORB ~= 179879 then return false, "the Orb is object 179879" end
+    local want = { [85556] = true, [85557] = true, [85558] = true }
+    local seen = {}
+    for _, q in ipairs(Auto.BWL_BLOCKING_QUESTS) do
+        if not want[q] then return false, "unexpected blocking quest " .. tostring(q) end
+        seen[q] = true
+    end
+    for q in pairs(want) do
+        if not seen[q] then return false, "blocking quest " .. q .. " missing" end
+    end
+
+    local base = { enabled = true, npcID = 179879, optionCount = 1, onBlockingQuest = false }
+    local function with(over)
+        local c = {}
+        for k, v in pairs(base) do c[k] = v end
+        for k, v in pairs(over or {}) do c[k] = v end
+        return Auto.DecideBwlOption(c)
+    end
+    if with(nil) ~= 1 then return false, "single option, no blocking quest -> option 1" end
+    local idx, why = Auto.DecideBwlOption({ enabled = true, npcID = 179879,
+                                            optionCount = 2, onBlockingQuest = false })
+    if idx ~= nil or why ~= "not-single-option" then
+        return false, "TWO options must refuse (single-option guard)"
+    end
+    idx, why = Auto.DecideBwlOption({ enabled = true, npcID = 179879,
+                                       optionCount = 1, onBlockingQuest = true })
+    if idx ~= nil or why ~= "blocking-quest" then
+        return false, "on 85556/85557/85558 the orb must refuse"
+    end
+    if with({ enabled = false }) ~= nil then return false, "disabled must refuse" end
+    if with({ npcID = 14326 }) ~= nil then return false, "a DMT NPC must not drive the orb" end
+    -- Spelled out rather than routed through with(): a nil in the override table
+    -- is invisible to pairs(), so it would silently test the wrong thing.
+    local _, r = Auto.DecideBwlOption({ enabled = true, npcID = nil,
+                                        optionCount = 1, onBlockingQuest = false })
+    if r ~= "unknown-npc" then return false, "an unparseable GUID must refuse" end
+    return true
+end
+
+-- RULE: Sayge's two page maps (spec §14) are positional, and ANY page shape the
+-- spec does not describe is refused rather than guessed.
+local function testSaygePageMaps()
+    local page1 = { damage = 1, resistance = 1, armor = 1,
+                    intellect = 2, spirit = 2,
+                    agility = 3, stamina = 3, strength = 3 }
+    for want, expect in pairs(page1) do
+        local idx, why, final = Auto.DecideSaygeOption(want, 4)
+        if idx ~= expect then
+            return false, ("page 1: %s -> %s, expected %d (%s)")
+                :format(want, tostring(idx), expect, tostring(why))
+        end
+        if final then return false, "page 1 is not the final page" end
+    end
+    local page2 = { damage = 1, spirit = 1, stamina = 1,
+                    resistance = 2, intellect = 2, strength = 2,
+                    armor = 3, agility = 3 }
+    for want, expect in pairs(page2) do
+        local idx, _, final = Auto.DecideSaygeOption(want, 3)
+        if idx ~= expect then
+            return false, ("page 2: %s -> %s, expected %d"):format(want, tostring(idx), expect)
+        end
+        if not final then return false, "page 2 IS the final page (it arms the lock)" end
+    end
+
+    -- A single-option transitional page always picks 1, and does NOT count as
+    -- the final answer (arming the lock there would block the real buff page).
+    local idx, why, final = Auto.DecideSaygeOption("armor", 1)
+    if idx ~= 1 or why ~= "transitional" or final then
+        return false, "a single-option page picks 1 and is not final"
+    end
+
+    -- THE SHAPE GUARD. Refusing costs one manual click; a misclick costs a
+    -- permanent daily buff. Every unknown shape refuses.
+    for _, n in ipairs({ 0, 2, 5, 6, 12 }) do
+        local i, r = Auto.DecideSaygeOption("damage", n)
+        if i ~= nil or r ~= "unexpected-shape" then
+            return false, ("a %d-option page must be refused, got %s/%s"):format(n, tostring(i), tostring(r))
+        end
+    end
+    local i, r = Auto.DecideSaygeOption("nonsense", 4)
+    if i ~= nil or r ~= "unknown-bufftype" then return false, "an unmappable buff type refuses" end
+
+    -- The class-default answer path: nil / "" / an alias all resolve.
+    if Auto.SaygeBuffType({ buffType = {} }, "MAGE") ~= "damage" then
+        return false, "an unset class defaults to damage"
+    end
+    if Auto.SaygeBuffType({ buffType = { MAGE = "" } }, "MAGE") ~= "damage" then
+        return false, "an empty string defaults to damage"
+    end
+    if Auto.SaygeBuffType(nil, nil) ~= "damage" then return false, "a nil block defaults to damage" end
+    if Auto.SaygeBuffType({ buffType = { MAGE = "Resist" } }, "MAGE") ~= "resistance" then
+        return false, "'resist' is tolerated as resistance"
+    end
+    if Auto.SaygeBuffType({ buffType = { MAGE = "intelligence" } }, "MAGE") ~= "intellect" then
+        return false, "'intelligence' is tolerated as intellect"
+    end
+    return true
+end
+
+----------------------------------------------------------------------
+-- LIVE PATH. Every rule above, re-asserted through Auto.OnGossipShow itself
+-- against a stubbed gossip API — because the defect this replaces was never in
+-- the matcher, it was in the ABSENCE of a caller-side gate. A pure test of a
+-- pure function could not have caught it, and did not.
+--
+-- The adversarial fixture is the audit's own headline: an unrelated NPC whose
+-- option list contains "Spare King Gordok", "Free the prisoner" and "Enter
+-- Blackwing Lair" — every keyword the deleted pools carried. Nothing may fire.
+--
+-- Every global is saved and restored, including C_Timer (so the Damage spam
+-- ladder cannot escape the test and click at a real NPC afterwards).
+----------------------------------------------------------------------
+local function testGossipLivePath()
+    local SAVE = {}
+    local NAMES = { "C_GossipInfo", "C_QuestLog", "UnitGUID", "IsShiftKeyDown",
+                    "UnitClass", "GetTime", "C_Timer", "print" }
+    for _, k in ipairs(NAMES) do SAVE[k] = _G[k] end
+
+    local fs  = Auto.FactionSettings and Auto.FactionSettings() or nil
+    if type(fs) ~= "table" or type(fs.autoGossip) ~= "table" then
+        return false, "the live autoGossip block is reachable"
+    end
+    local savedAGO = fs.autoGossip
+    local savedSayge = { Auto._saygeDone, Auto._saygeAt, Auto._saygeSpam,
+                         Auto._saygeShapeWarned, Auto._saygeInteractAt }
+
+    -- The world.
+    local W = { guid = nil, shift = false, options = {}, onQuest = {}, class = "MAGE", clock = 5000 }
+    local CALLS, said
+    local function reset()
+        CALLS = { select = {}, close = 0, getOptions = 0 }
+        said  = {}
+    end
+    reset()
+
+    _G.GetTime        = function() return W.clock end
+    _G.IsShiftKeyDown = function() return W.shift end
+    _G.UnitGUID       = function(unit) if unit == "npc" then return W.guid end return nil end
+    _G.UnitClass      = function() return "Mage", W.class end
+    _G.C_QuestLog     = { IsOnQuest = function(q) return W.onQuest[q] == true end }
+    _G.C_Timer        = { After = function() end }      -- the ladder cannot escape
+    _G.print          = function(...)
+        local p = {}
+        for i = 1, select("#", ...) do p[i] = tostring((select(i, ...))) end
+        said[#said + 1] = table.concat(p, "\t")
+    end
+    _G.C_GossipInfo = {
+        GetAvailableQuests = function() return {} end,
+        GetActiveQuests    = function() return {} end,
+        SelectAvailableQuest = function(id) CALLS.select[#CALLS.select + 1] = "quest:" .. tostring(id) end,
+        SelectActiveQuest    = function(id) CALLS.select[#CALLS.select + 1] = "quest:" .. tostring(id) end,
+        GetOptions = function() CALLS.getOptions = CALLS.getOptions + 1; return W.options end,
+        SelectOption = function(id) CALLS.select[#CALLS.select + 1] = id end,
+        CloseGossip  = function() CALLS.close = CALLS.close + 1 end,
     }
-    local id = Auto.FindOptionByKeywords(options, DMT_KEYWORDS)
-    if id ~= 11 then return false, "DMT spare option" end
-    id = Auto.FindOptionByKeywords(options, { "nothing" })
-    if id ~= nil then return false, "no match returns nil" end
+
+    -- Option-list builders. IDs are deliberately NOT 1..n so an index/ID mixup
+    -- in the engine shows up as a wrong value rather than an accidental pass.
+    local function opts(...)
+        local out = {}
+        for i, name in ipairs({ ... }) do out[i] = { name = name, gossipOptionID = 100 + i } end
+        return out
+    end
+    -- Every keyword the deleted pools carried, in one list.
+    local function poisonList()
+        return opts("Spare King Gordok", "Free the prisoner", "Enter Blackwing Lair",
+                    "I want to browse your goods")
+    end
+
+    local GUID = {
+        moldar   = "Creature-0-3299-0-14-14326-0000027FA1",
+        fengus   = "Creature-0-3299-0-14-14321-0000027FA2",
+        slipkik  = "Creature-0-3299-0-14-14323-0000027FA3",
+        mizzle   = "Creature-0-3299-0-14-14353-0000027FA4",
+        komcrush = "Creature-0-3299-0-14-14325-0000027FA5",
+        orb      = "GameObject-0-3299-469-11-179879-0000027FA6",
+        sayge    = "Creature-0-3299-0-14-14822-0000027FA7",
+        innkeep  = "Creature-0-3299-0-14-6740-0000027FA8",   -- an unrelated NPC
+        garbage  = "not-a-guid",
+    }
+
+    local fail = nil
+    local function ck(cond, why) if not fail and not cond then fail = why end end
+    local function scene(t)
+        reset()
+        W.guid, W.shift, W.options, W.onQuest = nil, false, {}, {}
+        W.class, W.clock = "MAGE", 5000
+        Auto._saygeDone, Auto._saygeAt, Auto._saygeSpam = false, nil, 0
+        Auto._saygeShapeWarned, Auto._saygeInteractAt = false, nil
+        for k, v in pairs(t or {}) do W[k] = v end
+    end
+    local function picked() return CALLS.select[1] end
+    local function saidMatching(frag)
+        for _, l in ipairs(said) do if l:lower():find(frag, 1, true) then return true end end
+        return false
+    end
+
+    fs.autoGossip = { dmt = true, bwl = true,
+                      dmf = { enabled = true, skipCookie = true,
+                              buffType = { MAGE = "damage" } } }
+
+    ------------------------------------------------------------------
+    -- 1. DMT: the right NPC and the right option.
+    ------------------------------------------------------------------
+    for who, guid in pairs({ moldar = GUID.moldar, fengus = GUID.fengus,
+                             slipkik = GUID.slipkik, mizzle = GUID.mizzle }) do
+        scene({ guid = guid, options = opts("Moxie for me", "No thanks", "Goodbye") })
+        Auto.OnGossipShow()
+        ck(picked() == 101, who .. ": must select option 1 (id 101), selected " .. tostring(picked()))
+        ck(#CALLS.select == 1, who .. ": exactly one selection")
+    end
+
+    ------------------------------------------------------------------
+    -- 2. THE ADVERSARIAL FIXTURE. The audit's headline case: an unrelated NPC
+    --    whose options carry every keyword the old pools matched. With BOTH
+    --    boxes ticked, nothing may be touched.
+    ------------------------------------------------------------------
+    scene({ guid = GUID.innkeep, options = poisonList() })
+    Auto.OnGossipShow()
+    ck(#CALLS.select == 0,
+       "wrong NPC with 'spare'/'free'/'enter' options: selected " .. tostring(picked()) .. ", must select nothing")
+    ck(CALLS.close == 0, "wrong NPC: the gossip window must not be closed either")
+
+    -- …and the same list at an NPC we cannot identify at all.
+    scene({ guid = GUID.garbage, options = poisonList() })
+    Auto.OnGossipShow()
+    ck(#CALLS.select == 0, "unparseable GUID + poison options must select nothing")
+    scene({ guid = nil, options = poisonList() })
+    Auto.OnGossipShow()
+    ck(#CALLS.select == 0, "no NPC GUID at all + poison options must select nothing")
+
+    ------------------------------------------------------------------
+    -- 3. KOMCRUSH. Two options (the shape that means a quest is on offer) is
+    --    the case the guard exists for.
+    ------------------------------------------------------------------
+    scene({ guid = GUID.komcrush, options = opts("Spare Captain Komcrush") })
+    Auto.OnGossipShow()
+    ck(picked() == 101, "Komcrush with ONE option selects it, got " .. tostring(picked()))
+    scene({ guid = GUID.komcrush, options = opts("Spare Captain Komcrush", "I need a job") })
+    Auto.OnGossipShow()
+    ck(#CALLS.select == 0, "Komcrush with TWO options must not eat the quest")
+
+    ------------------------------------------------------------------
+    -- 4. THE ORB. Single option, and not on 85556/85557/85558.
+    ------------------------------------------------------------------
+    scene({ guid = GUID.orb, options = opts("Enter Blackwing Lair") })
+    Auto.OnGossipShow()
+    ck(picked() == 101, "orb, one option, no blocking quest -> option 1")
+    scene({ guid = GUID.orb, options = opts("Enter Blackwing Lair", "Something else") })
+    Auto.OnGossipShow()
+    ck(#CALLS.select == 0, "orb with two options must refuse")
+    for _, q in ipairs({ 85556, 85557, 85558 }) do
+        scene({ guid = GUID.orb, options = opts("Enter Blackwing Lair"), onQuest = { [q] = true } })
+        Auto.OnGossipShow()
+        ck(#CALLS.select == 0, "orb while on quest " .. q .. " must refuse")
+    end
+    -- A missing quest API cannot be read as "not on the quest".
+    scene({ guid = GUID.orb, options = opts("Enter Blackwing Lair") })
+    _G.C_QuestLog = nil
+    Auto.OnGossipShow()
+    ck(#CALLS.select == 0, "orb refuses when C_QuestLog.IsOnQuest is unavailable")
+    _G.C_QuestLog = { IsOnQuest = function(q) return W.onQuest[q] == true end }
+
+    ------------------------------------------------------------------
+    -- 5. PER-TOGGLE. Each box only arms its own NPC set.
+    ------------------------------------------------------------------
+    fs.autoGossip.dmt = false
+    scene({ guid = GUID.moldar, options = opts("Moxie", "No") })
+    Auto.OnGossipShow()
+    ck(#CALLS.select == 0, "DMT disabled: Mol'dar must be left alone")
+    scene({ guid = GUID.orb, options = opts("Enter Blackwing Lair") })
+    Auto.OnGossipShow()
+    ck(picked() == 101, "DMT disabled does not disarm the orb")
+    fs.autoGossip.dmt, fs.autoGossip.bwl = true, false
+    scene({ guid = GUID.orb, options = opts("Enter Blackwing Lair") })
+    Auto.OnGossipShow()
+    ck(#CALLS.select == 0, "orb disabled: the orb must be left alone")
+    fs.autoGossip.bwl = true
+
+    ------------------------------------------------------------------
+    -- 6. SAYGE, expected shapes, answered per the class config.
+    ------------------------------------------------------------------
+    fs.autoGossip.dmf.buffType = { MAGE = "intellect" }
+    scene({ guid = GUID.sayge, options = opts("A", "B", "C", "D") })   -- page 1
+    Auto.OnGossipShow()
+    ck(picked() == 102, "sayge page 1, intellect -> option 2 (id 102), got " .. tostring(picked()))
+    ck(Auto._saygeAt == nil, "page 1 does not arm the 5 s lock -- page 2 still needs answering")
+    scene({ guid = GUID.sayge, options = opts("A", "B", "C") })        -- page 2
+    Auto.OnGossipShow()
+    ck(picked() == 102, "sayge page 2, intellect -> option 2 (id 102), got " .. tostring(picked()))
+    ck(Auto._saygeAt == 5000, "page 2 IS the answer: the 5 s re-entry lock arms")
+    -- The fortune-cookie page that follows is CLOSED, not answered.
+    CALLS.select, CALLS.close = {}, 0
+    W.options = opts("Take a fortune cookie")
+    Auto.OnGossipShow()
+    ck(#CALLS.select == 0 and CALLS.close == 1, "inside the lock the cookie page is closed, not answered")
+    -- …and the lock is a TIME guard, not a session flag.
+    W.clock = 5006
+    ck(Auto.SaygeLocked() == false, "the re-entry lock expires after 5 s")
+
+    -- A class with no stored value still answers: the class default is Damage.
+    fs.autoGossip.dmf.buffType = {}
+    scene({ guid = GUID.sayge, options = opts("A", "B", "C", "D") })
+    Auto.OnGossipShow()
+    ck(picked() == 101, "an unconfigured class takes the Damage path (option 1), got " .. tostring(picked()))
+    ck(Auto._saygeSpam >= 0 and Auto._saygeDone == true, "the Damage fast path answers immediately")
+
+    -- Damage explicitly configured -> the spam ladder, bounded and NPC-checked.
+    fs.autoGossip.dmf.buffType = { MAGE = "damage" }
+    scene({ guid = GUID.sayge, options = opts("A", "B", "C", "D") })
+    Auto.OnGossipShow()
+    ck(picked() == 101, "damage spams option 1")
+    ck(Auto.SAYGE_SPAM_REPEATS == 100 and Auto.SAYGE_SPAM_INTERVAL == 0.05,
+       "spec's spam shape is 100 repeats at 50 ms")
+    -- The ladder refuses to click once the NPC is no longer Sayge.
+    Auto._saygeSpam = 5
+    W.guid = GUID.innkeep
+    CALLS.select = {}
+    Auto.SaygeSpamTick()
+    ck(#CALLS.select == 0 and Auto._saygeSpam == 0,
+       "the spam ladder stops dead when the NPC is no longer Sayge")
+
+    ------------------------------------------------------------------
+    -- 7. SAYGE, UNEXPECTED SHAPE -> refuse + a debug line the owner can act on.
+    --    (Spec's page maps rest on an in-game premise the audit flags UNKNOWN.)
+    ------------------------------------------------------------------
+    fs.autoGossip.dmf.buffType = { MAGE = "armor" }
+    scene({ guid = GUID.sayge, options = opts("A", "B", "C", "D", "E") })   -- 5 options
+    Auto.OnGossipShow()
+    ck(#CALLS.select == 0, "an unknown Sayge page shape must NOT be answered")
+    ck(saidMatching("refused to answer"), "an unknown shape prints a line the owner can capture")
+    ck(saidMatching("5-option"), "the printed line names the shape it saw")
+    -- One line per visit, not one per GOSSIP_SHOW.
+    local before = #said
+    Auto.OnGossipShow()
+    ck(#said == before, "the unknown-shape line does not repeat inside a visit")
+
+    ------------------------------------------------------------------
+    -- 8. SAYGE IS TIMESTAMPED REGARDLESS OF THE SETTING (spec §14).
+    ------------------------------------------------------------------
+    fs.autoGossip.dmf.enabled = false
+    scene({ guid = GUID.sayge, options = opts("A", "B", "C", "D") })
+    Auto.OnGossipShow()
+    ck(Auto._saygeInteractAt == 5000, "Sayge interaction is stamped even with the setting off")
+    ck(#CALLS.select == 0, "…but with the setting off nothing is selected")
+    scene({ guid = GUID.innkeep, options = opts("A", "B", "C", "D") })
+    Auto.OnGossipShow()
+    ck(Auto._saygeInteractAt == nil, "a non-Sayge NPC does not stamp a Sayge interaction")
+    fs.autoGossip.dmf.enabled = true
+
+    ------------------------------------------------------------------
+    -- 9. SHIFT. §19.23's escape hatch covers every one of these NPCs, and it
+    --    means ZERO gossip API touches — not "selects nothing".
+    ------------------------------------------------------------------
+    for _, guid in ipairs({ GUID.moldar, GUID.komcrush, GUID.orb, GUID.sayge }) do
+        scene({ guid = guid, shift = true, options = opts("A") })
+        Auto.OnGossipShow()
+        ck(#CALLS.select == 0 and CALLS.close == 0 and CALLS.getOptions == 0,
+           "held Shift at " .. guid:match("%-(%d+)%-[^%-]*$") .. ": the gossip API must not be touched")
+        ck(Auto._saygeInteractAt == nil, "held Shift stamps nothing either")
+    end
+
+    ------------------------------------------------------------------
+    -- 10. THE POOLS ARE GONE, not merely unused. A keyword matcher left in the
+    --     file is a keyword matcher waiting to be re-wired.
+    ------------------------------------------------------------------
+    ck(Auto.FindOptionByKeywords == nil,
+       "the gossip-option keyword matcher must not exist any more")
+
+    -- Restore.
+    fs.autoGossip = savedAGO
+    Auto._saygeDone, Auto._saygeAt, Auto._saygeSpam = savedSayge[1], savedSayge[2], 0
+    Auto._saygeShapeWarned, Auto._saygeInteractAt = savedSayge[4], savedSayge[5]
+    for _, k in ipairs(NAMES) do _G[k] = SAVE[k] end
+
+    if fail then return false, fail end
+    return true
+end
+
+----------------------------------------------------------------------
+-- AUTO-REPAIR HONESTY (owner waiver 2026-08-05).
+--
+-- The waived behaviour — repairing at ANY vendor window the player opens — is
+-- asserted here as INTENDED, deliberately and explicitly, so the next audit
+-- reads this assertion as the owner's decision and not as a test that codified
+-- a divergence by accident. What the waiver did not cover is honesty, and the
+-- other three rows are that: the cost is printed, an unaffordable repair says
+-- so instead of failing silently, and (in the options suite) the label no
+-- longer names an NPC it does not confine itself to.
+----------------------------------------------------------------------
+local function testRepairHonesty()
+    local SAVE = {}
+    local NAMES = { "CanMerchantRepair", "GetRepairAllCost", "RepairAllItems",
+                    "GetMoney", "GetCoinTextureString", "print" }
+    for _, k in ipairs(NAMES) do SAVE[k] = _G[k] end
+
+    local aq = Auto.AQBlock and Auto.AQBlock() or nil
+    if type(aq) ~= "table" then return false, "the live autoQuest block is reachable" end
+    local savedRepair = aq.autoRepair
+
+    local W = { canRepair = true, cost = 12345, money = 999999 }
+    local said, repaired
+    _G.print = function(...)
+        local p = {}
+        for i = 1, select("#", ...) do p[i] = tostring((select(i, ...))) end
+        said[#said + 1] = table.concat(p, "\t")
+    end
+    _G.CanMerchantRepair    = function() return W.canRepair end
+    _G.GetRepairAllCost     = function() return W.cost end
+    _G.GetMoney             = function() return W.money end
+    _G.RepairAllItems       = function() repaired = repaired + 1 end
+    _G.GetCoinTextureString = nil          -- exercise the plain-text fallback
+    local function run(t)
+        for k, v in pairs(t or {}) do W[k] = v end
+        said, repaired = {}, 0
+        Auto.OnMerchantShow()
+    end
+    local function saidMatching(frag)
+        for _, l in ipairs(said) do if l:lower():find(frag, 1, true) then return true end end
+        return false
+    end
+
+    local fail = nil
+    local function ck(cond, why) if not fail and not cond then fail = why end end
+
+    aq.autoRepair = true
+
+    -- OWNER-WAIVED BEHAVIOUR, ASSERTED AS INTENDED: this fires on a merchant
+    -- window the PLAYER opened, at an arbitrary vendor, with no NPC gate and no
+    -- armed flag. Spec §19.21 says otherwise; Drew approved this on 2026-08-05.
+    run({})
+    ck(repaired == 1, "auto-repair fires at an arbitrary vendor (owner-waived, INTENDED)")
+    ck(saidMatching("1g 23s 45c"), "the repair cost is printed, got: " .. tostring(said[1]))
+
+    -- Not enough gold: a plain line, not silence.
+    run({ money = 100 })
+    ck(repaired == 0, "an unaffordable repair does not repair")
+    ck(saidMatching("not enough gold"), "an unaffordable repair prints a plain line")
+    ck(saidMatching("1g 23s 45c"), "…naming the cost it could not pay")
+
+    -- Exactly affordable is affordable.
+    run({ money = 12345 })
+    ck(repaired == 1, "exactly enough gold repairs")
+
+    -- Nothing damaged: silent, as before.
+    run({ money = 999999, cost = 0 })
+    ck(repaired == 0 and #said == 0, "a zero-cost repair is silent")
+
+    -- The vendor cannot repair at all.
+    run({ cost = 12345, canRepair = false })
+    ck(repaired == 0 and #said == 0, "a non-repair vendor is silent")
+
+    -- The toggle is the only gate there is.
+    aq.autoRepair = false
+    run({})
+    ck(repaired == 0 and #said == 0, "the toggle off means nothing happens")
+
+    -- Money formatting is exact at the boundaries.
+    ck(Auto.FormatMoney(0) == "0g 0s 0c", "0 copper formats")
+    ck(Auto.FormatMoney(99) == "0g 0s 99c", "sub-silver formats")
+    ck(Auto.FormatMoney(10000) == "1g 0s 0c", "one gold formats")
+
+    aq.autoRepair = savedRepair
+    for _, k in ipairs(NAMES) do _G[k] = SAVE[k] end
+    if fail then return false, fail end
     return true
 end
 
@@ -2391,7 +3135,11 @@ function Auto.RunSelfTests(verbose)
         { name = "summon gate matrix",  fn = testSummonMatrix },
         { name = "keyword matcher",     fn = testKeywordMatcher },
         { name = "roster membership",   fn = testRosterMembership },
-        { name = "gossip option match", fn = testOptionMatcher },
+        { name = "gossip: DMT npc gate + komcrush guard", fn = testDmtGate },
+        { name = "gossip: BWL orb gate",  fn = testBwlGate },
+        { name = "gossip: sayge page maps + shape guard", fn = testSaygePageMaps },
+        { name = "gossip: npc-gated live path (adversarial)", fn = testGossipLivePath },
+        { name = "auto-repair honesty",  fn = testRepairHonesty },
         { name = "quest title + reward", fn = testTitleAndReward },
         { name = "keyword pools disjoint", fn = testKeywordPools },
         { name = "forbidden quests",    fn = testForbiddenQuests },
@@ -2427,6 +3175,27 @@ end
 
 if ns.RegisterSelfTest then
     ns:RegisterSelfTest("auto", Auto.RunSelfTests)
+end
+
+-- /dsn debug gossip -> narrate the NPC-gated gossip handlers.
+--
+-- This exists for one purpose above all others: spec §14's Sayge page maps rest
+-- on the premise that Damage is option 1 on BOTH pages, and the conformance
+-- audit flags that premise UNKNOWN-NEEDS-INGAME-VERIFY. When Sayge presents a
+-- page shape the maps do not describe, Auto.SaygeShapeWarn refuses out loud and
+-- this channel prints the option list so the owner can capture the real thing.
+if ns.RegisterDebugCommand then
+    ns:RegisterDebugCommand("gossip", function()
+        Auto.DEBUG_GOSSIP = not Auto.DEBUG_GOSSIP
+        ns:Print("gossip debug " .. (Auto.DEBUG_GOSSIP and "ON" or "OFF")
+            .. " -- DMT/Orb/Sayge gates narrate their refusals.")
+        if Auto.DEBUG_GOSSIP then
+            ns:Print(("  sayge: last interaction %s ; re-entry lock %s")
+                :format(Auto._saygeInteractAt and (string.format("%.1fs ago",
+                        nowSecs() - Auto._saygeInteractAt)) or "never this session",
+                    Auto.SaygeLocked() and "ACTIVE" or "clear"))
+        end
+    end)
 end
 
 -- /dsn invite -> mass alt-invite (overrides the N1 stub).
