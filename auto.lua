@@ -1017,28 +1017,43 @@ end
 -- with Rin'wosho's zanza flow. Their presence in the zanza pool meant a coin
 -- title matched the zanza category and dragged the zanza reward priority onto a
 -- coin turn-in. The two pools are now disjoint, and the self-test asserts it.
+--
+-- SHRUNK (1.1.4, audit divergence 4). E'ko and R.O.I.D.S. used to be NOTHING
+-- BUT these keywords — they now have full ID tables (below) and both entry
+-- paths steer by quest ID, so the pools are cut back to a last-resort fallback
+-- for the one place no ID exists: the greeting list itself (1.15.9 exposes
+-- GetActiveTitle / GetAvailableTitle and no quest ID beside them — catalog
+-- 11509 has no GetActiveQuestID / GetAvailableQuestID). Dropped: the bare
+-- "eko" and bare "roids", both loose substrings of unrelated words. Added:
+-- "rage of ages", which is the spec's own name for quest 2582 (§14 heading
+-- "Rage of Ages / R.O.I.D.S."), so the fallback names the quest rather than
+-- its reward item. Every keyword here is now either an apostrophised or a
+-- dotted form, or a full multi-word quest name.
 local QUEST_KEYWORDS = {
-    eko     = { "e'ko", "eko" },                         -- Winterspring E'ko
+    eko     = { "e'ko" },                                -- Winterspring E'ko
     zgCoins = { "coin", "bijou", "gurubashi", "vilebranch",
                 "witherbark", "sandfury", "skullsplitter", "bloodscalp",
                 "zulian", "razzashi", "hakkari" },
     zanza   = { "zanza", "honor token" },
-    roids   = { "r.o.i.d.s", "roids" },
+    roids   = { "r.o.i.d.s", "rage of ages" },
 }
 
--- Which categories are enabled right now (as a keyword pool + a flag map).
-local function activeQuestCategories()
+-- Which categories are enabled right now.
+--
+-- This used to return a flat KEYWORD POOL alongside the flags, and that pool
+-- was the thing every path steered by. It is gone (1.1.4): a flat pool is
+-- un-gated by construction — it cannot say "E'ko, but only at Mau'ari, and only
+-- when you hold three" — and leaving it here would invite its reuse. The
+-- greeting path builds GATED groups instead (Auto.GreetingGroups); everything
+-- else steers by quest ID.
+local function activeQuestFlags()
     local aq = aqBlock()
-    local pool, flags = {}, {}
-    local function add(name, on)
-        flags[name] = on
-        if on then for _, k in ipairs(QUEST_KEYWORDS[name]) do pool[#pool + 1] = k end end
-    end
-    add("eko",     aq.eko == true)
-    add("zgCoins", aq.zgCoins == true)
-    add("zanza",   aq.zanza and aq.zanza.enabled == true)
-    add("roids",   aq.roids == true)
-    return pool, flags
+    return {
+        eko     = aq.eko == true,
+        zgCoins = aq.zgCoins == true,
+        zanza   = (aq.zanza and aq.zanza.enabled == true) or false,
+        roids   = aq.roids == true,
+    }
 end
 
 -- Does a quest title match any enabled category? Pure helper (self-tested).
@@ -1080,8 +1095,16 @@ Auto.ZANZA_REWARDS = {
     { key = "sheen",     itemID = 20080, name = "sheen of zanza"     },
 }
 
+-- THE HOUSE TURN-IN CONSTANTS. Named for zanza because that is where they were
+-- built; spec §14 hands the SAME two numbers to R.O.I.D.S. ("Same 30 s
+-- rejection cooldown and bag verifier as zanza") and the 1.1.4 conformance wave
+-- extends the machinery to E'ko as well. One number, three families — the
+-- zanza-prefixed names are kept because the shipped gates and the external
+-- harness assert on them.
 Auto.ZANZA_REJECT_COOLDOWN  = 30       -- seconds, per reward item
 Auto.ZANZA_DELIVERY_TIMEOUT = 5        -- seconds, backstop on the bag verifier
+Auto.REJECT_COOLDOWN        = Auto.ZANZA_REJECT_COOLDOWN
+Auto.DELIVERY_TIMEOUT       = Auto.ZANZA_DELIVERY_TIMEOUT
 
 -- Zul'Gurub coin turn-ins at Vinchaxa, in spec priority order. Each needs one
 -- of each of its three coins. 8240 is absent on purpose (see QUEST_NEVER).
@@ -1089,6 +1112,55 @@ Auto.ZG_COIN_SETS = {
     { questID = 8238, items = { 19701, 19702, 19703 } },  -- Gurubashi/Vilebranch/Witherbark
     { questID = 8239, items = { 19704, 19705, 19706 } },  -- Sandfury/Skullsplitter/Bloodscalp
     { questID = 8195, items = { 19698, 19699, 19700 } },  -- Zulian/Razzashi/Hakkari
+}
+
+----------------------------------------------------------------------
+-- WINTERSPRING E'KO (spec §14) — audit divergence 4, rows 81-87.
+--
+-- What shipped before 1.1.4 was the two title keywords `{"e'ko", "eko"}` and
+-- NOTHING else: no NPC identity, no holding threshold, and not one of the
+-- fourteen IDs below. The flow turned in whatever title matched first, at any
+-- stack size, at any NPC.
+--
+-- The spec's sentence is one rule with three clauses, and all three are here:
+--   "turns in THE FIRST E'ko type the player holds >= 3 of, IN THIS ORDER"
+-- — a threshold (EKO_NEED), an ORDER (the array below is the spec's order,
+-- verbatim, and Auto.PickEkoTurnIn walks it top-down), and a scope (EKO_NPC).
+----------------------------------------------------------------------
+
+Auto.EKO_NPC  = 10307                  -- Witch Doctor Mau'ari
+Auto.EKO_NEED = 3                      -- spec: "the first E'ko type held >= 3 of"
+
+-- SPEC ORDER. Do not sort, do not re-key by item ID: the array index IS the
+-- priority, exactly as ZG_COIN_SETS is. `name` is the spec's own word for the
+-- type and is used only as a greeting-title hint (see Auto.GreetingGroups).
+Auto.EKO_SETS = {
+    { itemID = 12436, questID = 4806, name = "frostmaul"   },
+    { itemID = 12431, questID = 4802, name = "winterfall"  },
+    { itemID = 12434, questID = 4804, name = "chillwind"   },
+    { itemID = 12432, questID = 4803, name = "shardtooth"  },
+    { itemID = 12435, questID = 4805, name = "ice thistle" },
+    { itemID = 12433, questID = 4807, name = "wildkin"     },
+    { itemID = 12430, questID = 4801, name = "frostsaber"  },
+}
+
+----------------------------------------------------------------------
+-- RAGE OF AGES / R.O.I.D.S. (spec §14) — audit divergence 4, rows 88-100.
+--
+-- Also two keywords and nothing else before 1.1.4. The spec gives a quest, an
+-- NPC, three reagents with COUNTS, a reward item, a two-step shape, and a bag
+-- rule that is the zanza bag rule generalised from one required stack to three.
+----------------------------------------------------------------------
+
+Auto.ROIDS_NPC    = 7505               -- Bloodmage Drazial
+Auto.ROIDS_QUEST  = 2582
+Auto.ROIDS_REWARD = 8410               -- R.O.I.D.S.
+
+-- Counts are the point: holding one Snickerfang Jowl is not holding three.
+Auto.ROIDS_REAGENTS = {
+    { itemID = 8391, count = 3, name = "snickerfang jowl"  },
+    { itemID = 8392, count = 2, name = "blasted boar lung" },
+    { itemID = 8393, count = 1, name = "scorpok pincer"    },
 }
 
 -- Enabled zanza picks in the spec's canonical order.
@@ -1269,17 +1341,36 @@ end
 -- ZANZA GATES (spec §14) — all pure, all individually asserted.
 ----------------------------------------------------------------------
 
--- Bag-space guard WITH the exact-token-count exception: a full bag is fine when
--- the player holds exactly the required token count, because the turn-in
--- consumes that stack and frees the slot in time for the reward. Holding MORE
--- than the required count means the stack survives the turn-in, so a full bag
--- really is full. PURE.
-function Auto.DecideBagSpace(freeSlots, tokenCount, needed)
+-- THE HOUSE BAG RULE, generalised (1.1.4). Spec §14 states it twice:
+--   zanza     — "unless the player holds exactly the required token count (1),
+--                in which case the turn-in frees the slot in time"
+--   R.O.I.D.S.— "Bag-full is allowed only if AT LEAST ONE reagent is held in
+--                exactly the required count"
+-- One rule over a list of (have, need) pairs: a free slot always proceeds;
+-- otherwise ANY stack held at exactly its required count will be consumed whole
+-- by the turn-in and frees a slot in time. Holding MORE than the required count
+-- means that stack survives, so it frees nothing. Zanza is the one-entry case.
+--
+-- A `need` of zero can never license a full bag (nothing is consumed), which is
+-- why the equality test is guarded — the old two-argument form would have read
+-- have=0/need=0 as "exact". No caller passes zero; the guard is there so a
+-- future one cannot open the bag rule by accident. PURE.
+function Auto.DecideBagSpaceFor(freeSlots, held)
     if (tonumber(freeSlots) or 0) > 0 then return true, "free-slot" end
-    if (tonumber(tokenCount) or 0) == (tonumber(needed) or Auto.ZANZA_TOKEN_NEED) then
-        return true, "exact-token"
+    for _, h in ipairs(held or {}) do
+        local need = tonumber(h.need) or 0
+        if need > 0 and (tonumber(h.have) or 0) == need then return true, "exact-count" end
     end
     return false, "bag-full"
+end
+
+-- Zanza's original signature, kept verbatim (shipped gates and the external
+-- harness call it): one required stack, and its own reason word.
+function Auto.DecideBagSpace(freeSlots, tokenCount, needed)
+    local need = tonumber(needed) or Auto.ZANZA_TOKEN_NEED
+    local ok, why = Auto.DecideBagSpaceFor(freeSlots, { { have = tokenCount, need = need } })
+    if ok and why == "exact-count" then why = "exact-token" end
+    return ok, why
 end
 
 -- The full entry gate. ctx:
@@ -1289,17 +1380,44 @@ end
 -- An UNKNOWN npcID admits: the quest-ID whitelist is the real guard (8243 only
 -- exists at Rin'wosho), so a GUID we could not parse must not disable the flow.
 -- A KNOWN and wrong npcID refuses.
-function Auto.DecideZanzaGate(ctx)
+-- THE HOUSE ENTRY GATE, generalised (1.1.4). All three §14 turn-in families ask
+-- the same four questions in the same order — enabled? Shift? right NPC? do I
+-- hold the goods, and will the reward fit? — so there is one implementation and
+-- three thin callers. ctx:
+--   enabled, shift, npcID (nil = unknown), wantNpc,
+--   held      = array of { have, need }  (every required stack)
+--   freeSlots, shortReason (the refusal word when a stack is short),
+--   skipBagRule (E'ko: spec states no bag rule for it — see Auto.EkoGateNow)
+-- Returns (ok:boolean, reason:string). Every refusal names its own gate.
+function Auto.DecideTurnInGate(ctx)
     if not ctx.enabled then return false, "disabled" end
     if ctx.shift then return false, "shift-skip" end
-    if ctx.npcID ~= nil and ctx.npcID ~= (ctx.wantNpc or Auto.ZANZA_NPC) then
+    if ctx.npcID ~= nil and ctx.wantNpc ~= nil and ctx.npcID ~= ctx.wantNpc then
         return false, "wrong-npc"
     end
-    local need = ctx.tokenNeed or Auto.ZANZA_TOKEN_NEED
-    if (ctx.tokenCount or 0) < need then return false, "no-token" end
-    local ok, why = Auto.DecideBagSpace(ctx.freeSlots, ctx.tokenCount, need)
-    if not ok then return false, why end
+    for _, h in ipairs(ctx.held or {}) do
+        if (tonumber(h.have) or 0) < (tonumber(h.need) or 0) then
+            return false, ctx.shortReason or "short"
+        end
+    end
+    if not ctx.skipBagRule then
+        local ok, why = Auto.DecideBagSpaceFor(ctx.freeSlots, ctx.held)
+        if not ok then return false, why end
+    end
     return true, "ok"
+end
+
+function Auto.DecideZanzaGate(ctx)
+    local need = ctx.tokenNeed or Auto.ZANZA_TOKEN_NEED
+    return Auto.DecideTurnInGate({
+        enabled     = ctx.enabled,
+        shift       = ctx.shift,
+        npcID       = ctx.npcID,
+        wantNpc     = ctx.wantNpc or Auto.ZANZA_NPC,
+        held        = { { have = ctx.tokenCount or 0, need = need } },
+        freeSlots   = ctx.freeSlots,
+        shortReason = "no-token",
+    })
 end
 
 -- Walk the enabled picks in canonical order and return the first that is
@@ -1324,8 +1442,7 @@ function Auto.NextZanzaPick(ctx)
             sawOffered = true
             if not owned[key] then
                 sawUnowned = true
-                local stamp = stamps[key]
-                if not (stamp and (now - stamp) < cd) then
+                if not Auto.IsCooling(stamps, key, now, cd) then
                     return key, "pick"
                 end
             end
@@ -1336,16 +1453,33 @@ function Auto.NextZanzaPick(ctx)
     return nil, "all-cooling"
 end
 
--- PURE delivery verdict. `pending` is { itemID, before, at, key }.
+-- PURE delivery verdict. `pending` is { itemID, before, at, key, dir }.
+--
+-- DIRECTION (1.1.4). Zanza and R.O.I.D.S. watch a REWARD arrive, so the bag
+-- delta they wait for is upward on the reward's item ID. E'ko has no reward
+-- item ID in the spec (§14 says only "takes the reward"), but it does have an
+-- exact, spec-given consumption: three of the E'ko type leave the bags. So the
+-- E'ko family arms `dir = "down"` on the E'ko item and the same verifier
+-- confirms the same fact — the turn-in really happened — from the other side.
+-- Absent `dir` means "up", which is every pre-existing caller.
 function Auto.JudgeDelivery(pending, nowCount, now, timeout)
     if not pending then return "idle" end
-    if (tonumber(nowCount) or 0) > (tonumber(pending.before) or 0) then
-        return "delivered"
-    end
+    local before, n = (tonumber(pending.before) or 0), (tonumber(nowCount) or 0)
+    local moved
+    if pending.dir == "down" then moved = (n < before) else moved = (n > before) end
+    if moved then return "delivered" end
     if ((now or 0) - (pending.at or 0)) >= (timeout or Auto.ZANZA_DELIVERY_TIMEOUT) then
         return "timeout"
     end
     return "pending"
+end
+
+-- PURE: is `key` inside its rejection cooldown? The shared read behind every
+-- family's "walk to the next candidate instead of retrying the failing one".
+function Auto.IsCooling(stamps, key, now, cooldown)
+    local stamp = stamps and stamps[key]
+    if not stamp then return false end
+    return ((now or 0) - stamp) < (cooldown or Auto.REJECT_COOLDOWN)
 end
 
 -- PURE: highest-priority coin quest whose whole three-coin set is held.
@@ -1357,6 +1491,90 @@ function Auto.PickCoinQuest(count)
             if (tonumber(count(id)) or 0) < 1 then holdsAll = false break end
         end
         if holdsAll then return set.questID end
+    end
+    return nil
+end
+
+----------------------------------------------------------------------
+-- E'KO GATES (spec §14) — all pure, all individually asserted.
+----------------------------------------------------------------------
+
+-- PURE: the FIRST E'ko type held >= 3 of, walked in the spec's order.
+--
+-- `count` is a function(itemID) -> number. `opts` is optional and carries the
+-- cooldown walk: { cooldowns = {key->stamp}, now = , cooldown = }. A type whose
+-- quest is inside its 30 s rejection stamp is stepped over and the walk
+-- continues down the spec order — the same behaviour zanza's NextZanzaPick has
+-- across its reward priority, here across the seven E'ko types.
+-- Returns (entry, reason). entry is a row of Auto.EKO_SETS.
+function Auto.PickEkoTurnIn(count, opts)
+    opts = opts or {}
+    local sawEnough = false
+    for _, e in ipairs(Auto.EKO_SETS) do
+        if (tonumber(count(e.itemID)) or 0) >= Auto.EKO_NEED then
+            sawEnough = true
+            if not Auto.IsCooling(opts.cooldowns, Auto.EkoKey(e.questID),
+                                  opts.now, opts.cooldown) then
+                return e, "pick"
+            end
+        end
+    end
+    if sawEnough then return nil, "all-cooling" end
+    return nil, "below-threshold"
+end
+
+-- The rejection-cooldown key for an E'ko quest. Namespaced so the three
+-- families share one stamp table without any chance of collision.
+function Auto.EkoKey(questID) return "eko:" .. tostring(questID) end
+
+-- PURE: the E'ko row a quest ID belongs to, or nil.
+function Auto.EkoByQuestID(questID)
+    for _, e in ipairs(Auto.EKO_SETS) do
+        if e.questID == questID then return e end
+    end
+    return nil
+end
+
+----------------------------------------------------------------------
+-- R.O.I.D.S. GATES (spec §14) — all pure, all individually asserted.
+----------------------------------------------------------------------
+
+-- PURE: the (have, need) list for the three reagents, plus whether the whole
+-- set is held. `count` is a function(itemID) -> number.
+-- Returns (complete:boolean, held:array of { itemID, have, need }, short:name|nil).
+function Auto.RoidsReagentState(count)
+    local held, complete, short = {}, true, nil
+    for _, r in ipairs(Auto.ROIDS_REAGENTS) do
+        local have = tonumber(count(r.itemID)) or 0
+        held[#held + 1] = { itemID = r.itemID, have = have, need = r.count, name = r.name }
+        if have < r.count then
+            complete = false
+            short = short or r.name
+        end
+    end
+    return complete, held, short
+end
+
+-- PURE two-step shape (spec §14: "accept on the first interaction, complete on
+-- the second"). The quest log is what actually carries the state between the
+-- two interactions — 2582 moves from the NPC's AVAILABLE list to his ACTIVE
+-- list the moment it is accepted — so the step is READ from the world rather
+-- than remembered, and it therefore survives a reload, a zone change, and any
+-- number of intervening events. `activeIDs` / `availableIDs` are sets.
+-- Returns "complete" | "accept" | nil.
+function Auto.RoidsStep(activeIDs, availableIDs)
+    if activeIDs and activeIDs[Auto.ROIDS_QUEST] then return "complete" end
+    if availableIDs and availableIDs[Auto.ROIDS_QUEST] then return "accept" end
+    return nil
+end
+
+-- PURE: the reward choice whose item ID is `itemID`, or nil. R.O.I.D.S. is a
+-- single fixed reward (8410) rather than a choice board, so this normally finds
+-- nothing to choose between — but taking the reward BY ID rather than by index
+-- is what turns audit row 93 from "correct by luck" into "correct by rule".
+function Auto.PickRewardByItemID(choices, itemID)
+    for _, c in ipairs(choices or {}) do
+        if c.itemID == itemID then return c.index end
     end
     return nil
 end
@@ -1431,13 +1649,22 @@ end
 -- Build the allowed-ID set from live settings + world state. IMPURE by design:
 -- every reading it does is funnelled into the pure planner above.
 --
--- E'ko (Mau'ari) and R.O.I.D.S. (Drazial) are deliberately NOT here. Spec §14
--- is silent on whether those two NPCs use the gossip window, and the remit is
--- "leave their entry as-is if the spec does not say" — they keep the greeting
--- path they have always used. Adding IDs here for them would change their
--- behaviour on no evidence.
+-- E'KO AND R.O.I.D.S. ARE NOW HERE (1.1.4, audit divergence 4). They were left
+-- out on the reasoning that spec §14 is silent on whether Mau'ari (10307) and
+-- Drazial (7505) present through the gossip window or the quest greeting, so
+-- their inherited greeting-only entry was not to be changed on no evidence.
+-- That reasoning is what left the zanza flow dead at Rin'wosho for a release:
+-- silence about the ENTRY is not evidence that the greeting is the entry, and
+-- a flow that never starts is indistinguishable from a broken toggle.
+--
+-- So both entries are wired and the question is made moot rather than guessed.
+-- Nothing is lost by being on the gossip list as well: an ID only reaches this
+-- set when its own category is enabled AND its own NPC gate, threshold and
+-- reagent counts have already passed, and the planner selects an ID or nothing
+-- at all. The owner's in-game check (audit UNKNOWN A/B) is still worth doing —
+-- it would let one of the two paths be retired — but nothing waits on it.
 function Auto.AllowedGossipQuestIDs()
-    local _, flags = activeQuestCategories()
+    local flags = activeQuestFlags()
     local allowed = {}
 
     if flags.zanza then
@@ -1448,6 +1675,25 @@ function Auto.AllowedGossipQuestIDs()
     if flags.zgCoins then
         local qid = Auto.PickCoinQuest(function(id) return Auto.OwnedCount(id) end)
         if qid then allowed[qid] = true end
+    end
+
+    -- E'ko: exactly ONE quest ID may enter — the first type held >= 3 of, in
+    -- the spec's order. The other six stay out even when they are also held,
+    -- which is what makes the ORDER observable on the gossip path.
+    if flags.eko then
+        local entry, why = Auto.EkoTurnInNow()
+        if entry then allowed[entry.questID] = true
+        else gdbg("e'ko: no turn-in -- %s", tostring(why)) end
+    end
+
+    -- R.O.I.D.S.: one quest, two steps. 2582 is allowed for BOTH — the planner
+    -- takes it off the ACTIVE list (complete) in preference to the AVAILABLE
+    -- list (accept), which is the two-step shape falling out of the ordering
+    -- rule that was already there.
+    if flags.roids then
+        local ok, why = Auto.RoidsGateNow()
+        if ok then allowed[Auto.ROIDS_QUEST] = true
+        else gdbg("r.o.i.d.s.: refused -- %s", tostring(why)) end
     end
 
     -- Belt to the whitelist's braces: nothing the spec forbids may ever survive
@@ -1469,6 +1715,61 @@ function Auto.ZanzaGateNow()
     })
 end
 
+-- Live E'ko gate: enabled, not Shift, at Mau'ari (or an unidentifiable NPC).
+-- NO BAG RULE. Spec §14 gives the bag-space exception to zanza and to
+-- R.O.I.D.S. and says nothing of the kind for E'ko, so none is invented here —
+-- `skipBagRule` records that as a decision rather than an omission.
+function Auto.EkoGateNow()
+    local aq = aqBlock()
+    return Auto.DecideTurnInGate({
+        enabled     = aq.eko == true,
+        shift       = IsShiftKeyDown and IsShiftKeyDown() or false,
+        npcID       = Auto.NpcID(),
+        wantNpc     = Auto.EKO_NPC,
+        held        = {},
+        skipBagRule = true,
+    })
+end
+
+-- The gated E'ko pick: the gate, then the threshold + order + cooldown walk.
+-- Returns the Auto.EKO_SETS row, or nil (plus the refusal reason).
+function Auto.EkoTurnInNow()
+    local ok, why = Auto.EkoGateNow()
+    if not ok then return nil, why end
+    return Auto.PickEkoTurnIn(function(id) return Auto.OwnedCount(id) end, {
+        cooldowns = Auto._zanzaCooldown,
+        now       = nowSecs(),
+        cooldown  = Auto.REJECT_COOLDOWN,
+    })
+end
+
+-- Live R.O.I.D.S. gate: enabled, not Shift, at Drazial (or unidentifiable),
+-- the FULL reagent set held, and the bag rule — which for this family means a
+-- full bag proceeds only when at least one reagent sits at exactly its
+-- required count, because that is the stack the turn-in consumes whole.
+--
+-- The reagent test is applied to BOTH steps, accept included: accepting 2582
+-- with nothing to hand it in with would leave the owner carrying a quest the
+-- addon opened and cannot close.
+function Auto.RoidsGateNow()
+    local aq = aqBlock()
+    local _, held = Auto.RoidsReagentState(function(id) return Auto.OwnedCount(id) end)
+    local ok, why = Auto.DecideTurnInGate({
+        enabled     = aq.roids == true,
+        shift       = IsShiftKeyDown and IsShiftKeyDown() or false,
+        npcID       = Auto.NpcID(),
+        wantNpc     = Auto.ROIDS_NPC,
+        held        = held,
+        freeSlots   = Auto.FreeBagSlots(),
+        shortReason = "short-reagents",
+    })
+    if not ok then return false, why end
+    if Auto.IsCooling(Auto._zanzaCooldown, "roids", nowSecs(), Auto.REJECT_COOLDOWN) then
+        return false, "cooling"
+    end
+    return true, "ok"
+end
+
 -- The gossip-window driver. Returns true when it consumed the interaction.
 function Auto.HandleGossipQuests()
     if not (C_GossipInfo and C_GossipInfo.GetAvailableQuests
@@ -1477,6 +1778,17 @@ function Auto.HandleGossipQuests()
     end
     local available = Auto.ReadGossipQuests(C_GossipInfo.GetAvailableQuests)
     local active    = Auto.ReadGossipQuests(C_GossipInfo.GetActiveQuests)
+
+    -- ENTRY-SHAPE NARRATION. The conformance audit's UNKNOWN A and B ask which
+    -- window Mau'ari (10307) and Drazial (7505) actually use. Both paths are
+    -- wired so the answer is not needed — but one visit with this channel on
+    -- settles it for good, because only ONE of these two lines can appear.
+    local npcID = Auto.NpcID()
+    if npcID == Auto.EKO_NPC or npcID == Auto.ROIDS_NPC then
+        gdbg("ENTRY SHAPE = GOSSIP window at npc %d -- %d available, %d active quest(s)",
+             npcID, #available, #active)
+    end
+
     if #available == 0 and #active == 0 then return false end
 
     local plan = Auto.PlanGossipQuest(active, available, Auto.AllowedGossipQuestIDs())
@@ -1506,33 +1818,91 @@ function Auto.CurrentQuestID()
     return nil
 end
 
--- QUEST_GREETING: a multi-quest greeting NPC (E'ko / coin / token turn-ins).
--- This is the CLASSIC path, and the only one that still matches titles: the
--- greeting API exposes no quest IDs, so a keyword pool is all there is. Select
--- the first active quest whose title matches an enabled category; then handle
--- available quests (accept) the same way.
+-- The GATED keyword groups for the greeting list, in the order to try them.
+-- IMPURE (reads settings + world); every decision it makes is a gate that is
+-- written and asserted elsewhere.
+--
+-- WHY GROUPS AND NOT ONE FLAT POOL (1.1.4). The greeting list is the one place
+-- in the addon where no quest ID exists — 1.15.9 exposes GetActiveTitle /
+-- GetAvailableTitle and nothing beside them (catalog 11509 carries no
+-- GetActiveQuestID / GetAvailableQuestID). One flat pool therefore selected
+-- whichever title came first in the NPC's list, which for E'ko silently
+-- discarded the spec's ORDER. Groups fix both halves:
+--
+--   1. E'ko leads with the NAME OF THE TYPE THE ORDER PICKED ("winterfall"),
+--      falling back to the generic "e'ko" if that title shape is not what this
+--      client shows. The greeting path now honours the same order the gossip
+--      path does.
+--   2. A category's keywords are emitted only when that category's OWN gate
+--      passed — enabled, Shift clear, right NPC, threshold met, reagents held.
+--      An E'ko keyword cannot select anything at Vinchaxa, and no keyword at
+--      all is emitted when nothing is holdable.
+--
+-- Whatever the greeting selects, the quest frame that opens is judged by ID
+-- (Auto.QuestFrameInScope). The title steers; the ID decides.
+function Auto.GreetingGroups()
+    local flags = activeQuestFlags()
+    local groups = {}
+    local function group(words) if words and #words > 0 then groups[#groups + 1] = words end end
+
+    if flags.eko then
+        local entry = Auto.EkoTurnInNow()
+        if entry then
+            group({ entry.name })                  -- the type the ORDER picked
+            group(QUEST_KEYWORDS.eko)              -- generic fallback
+        end
+    end
+    if flags.roids then
+        local ok = Auto.RoidsGateNow()
+        if ok then group(QUEST_KEYWORDS.roids) end
+    end
+    -- Coins and zanza keep exactly the pools and the un-gated behaviour they
+    -- shipped with: neither is part of this brief, and zanza rides the gossip
+    -- window rather than the greeting.
+    if flags.zgCoins then group(QUEST_KEYWORDS.zgCoins) end
+    if flags.zanza   then group(QUEST_KEYWORDS.zanza)   end
+    return groups
+end
+
+-- QUEST_GREETING: a multi-quest greeting NPC (E'ko / coin / R.O.I.D.S.).
+-- Turn-ins (active) are tried before pickups (available) — a turn-in always
+-- wins at the same NPC — and within each half the groups are walked in
+-- priority order.
 --
 -- Shift skips it, same as the gossip window (spec §19.23 names all four NPCs).
 function Auto.OnQuestGreeting()
     if IsShiftKeyDown and IsShiftKeyDown() then return end
-    local pool = activeQuestCategories()
-    if #pool == 0 then return end
+
+    -- The other half of the entry-shape narration (see Auto.HandleGossipQuests).
+    local npcID = Auto.NpcID()
+    if npcID == Auto.EKO_NPC or npcID == Auto.ROIDS_NPC then
+        gdbg("ENTRY SHAPE = QUEST GREETING at npc %d -- %d available, %d active quest(s)",
+             npcID, GetNumAvailableQuests and GetNumAvailableQuests() or 0,
+             GetNumActiveQuests and GetNumActiveQuests() or 0)
+    end
+
+    local groups = Auto.GreetingGroups()
+    if #groups == 0 then return end
 
     local nActive = GetNumActiveQuests and GetNumActiveQuests() or 0
-    for i = 1, nActive do
-        local title = GetActiveTitle and GetActiveTitle(i)
-        if title and Auto.TitleMatches(title, pool) then
-            if SelectActiveQuest then SelectActiveQuest(i) end
-            return
+    for _, words in ipairs(groups) do
+        for i = 1, nActive do
+            local title = GetActiveTitle and GetActiveTitle(i)
+            if title and Auto.TitleMatches(title, words) then
+                if SelectActiveQuest then SelectActiveQuest(i) end
+                return
+            end
         end
     end
 
     local nAvail = GetNumAvailableQuests and GetNumAvailableQuests() or 0
-    for i = 1, nAvail do
-        local title = GetAvailableTitle and GetAvailableTitle(i)
-        if title and Auto.TitleMatches(title, pool) then
-            if SelectAvailableQuest then SelectAvailableQuest(i) end
-            return
+    for _, words in ipairs(groups) do
+        for i = 1, nAvail do
+            local title = GetAvailableTitle and GetAvailableTitle(i)
+            if title and Auto.TitleMatches(title, words) then
+                if SelectAvailableQuest then SelectAvailableQuest(i) end
+                return
+            end
         end
     end
 end
@@ -1542,13 +1912,27 @@ end
 -- QUEST-ID-FIRST. When GetQuestID answers, the ID decides — and QUEST_NEVER
 -- refuses before anything else, so 8196 / 8246 / 8240 are never accepted,
 -- completed or rewarded no matter how they got on screen (including a manual
--- click while an enabled category is on). Only an absent ID falls back to the
--- title keyword pool, which is what keeps the greeting-driven E'ko and
--- R.O.I.D.S. flows working unchanged.
+-- click while an enabled category is on).
+--
+-- E'KO AND R.O.I.D.S. HAVE TABLES NOW (1.1.4). They used to fall through this
+-- branch to the title test — "an ID with no table of ours" — which is exactly
+-- what audit rows 82/89/90-92 measured: the frame was judged by a fuzzy string
+-- and every count guard was absent. Their IDs are matched here, and their
+-- category gate is the FULL gate, re-run at the frame:
+--
+--   * E'ko  — the frame's own quest must be the type the spec's order picked,
+--             AND that type must still be held >= 3. So a frame reached by any
+--             route (a manual click, an already-accepted quest, a greeting that
+--             matched a title we did not steer to) is measured against the
+--             threshold, not waved through.
+--   * ROIDS — the full reagent set, the NPC and the bag rule, re-run for the
+--             same reason zanza re-runs its token guard on the reward step:
+--             this frame is reachable without passing our entry.
+--
+-- Only a genuinely unknown ID falls back to the (now gated) title groups.
 -- Returns (inScope:boolean, questID:number|nil, category:string|nil).
 function Auto.QuestFrameInScope()
-    local pool, flags = activeQuestCategories()
-    if #pool == 0 then return false end
+    local flags = activeQuestFlags()
     local qid = Auto.CurrentQuestID()
     if qid then
         if Auto.QUEST_NEVER[qid] then return false, qid, "never" end
@@ -1558,19 +1942,53 @@ function Auto.QuestFrameInScope()
         for _, set in ipairs(Auto.ZG_COIN_SETS) do
             if set.questID == qid then return flags.zgCoins == true, qid, "zgCoins" end
         end
-        -- An ID with no table of ours (E'ko, R.O.I.D.S.): fall through to the
-        -- title test rather than refusing, so those flows are untouched.
+        if Auto.EkoByQuestID(qid) then
+            local entry = Auto.EkoTurnInNow()
+            return (entry ~= nil and entry.questID == qid), qid, "eko"
+        end
+        if qid == Auto.ROIDS_QUEST then
+            local ok = Auto.RoidsGateNow()
+            return ok == true, qid, "roids"
+        end
+        -- A KNOWN id that matches NONE of our tables is not ours. It used to
+        -- fall through to the title test, which was defensible only while E'ko
+        -- and R.O.I.D.S. had no tables to match against; now that all four
+        -- categories carry IDs, falling through means a quest we have
+        -- positively identified as foreign can still be accepted because its
+        -- title happens to share a word with one of ours. (This gate's own
+        -- forbidden-quest row caught exactly that: quest 4808 titled like the
+        -- R.O.I.D.S. quest was being accepted and completed.) REFUSE.
+        return false, qid, "unknown-id"
     end
+    -- NO ID AT ALL — the greeting list, where 1.15.9 exposes none. The
+    -- last-resort title test, over the GATED groups, so an E'ko or R.O.I.D.S.
+    -- keyword can only match where its own gate has already passed.
     local title = GetTitleText and GetTitleText()
-    if title and Auto.TitleMatches(title, pool) then return true, qid end
+    if not title then return false, qid end
+    for _, words in ipairs(Auto.GreetingGroups()) do
+        if Auto.TitleMatches(title, words) then return true, qid end
+    end
     return false, qid
 end
 
+-- Session record of the R.O.I.D.S. accept step. The quest log is the real
+-- carrier of the two-step state (2582 moves from AVAILABLE to ACTIVE the moment
+-- it is accepted, and Auto.RoidsStep reads that back from the world); this
+-- stamp is the addon's own memory of having driven the first step, and it is
+-- what the harness watches to prove the state survives BETWEEN events.
+Auto._roidsAcceptedAt = nil
+
 -- QUEST_DETAIL: a quest is being offered. Accept it if it belongs to an
--- enabled category (R.O.I.D.S. accept, coin/token re-pickups).
+-- enabled category (R.O.I.D.S. step 1, coin/token re-pickups).
 function Auto.OnQuestDetail()
-    if not Auto.QuestFrameInScope() then return end
+    local inScope, qid, category = Auto.QuestFrameInScope()
+    if not inScope then return end
     if AcceptQuest then AcceptQuest() end
+    if category == "roids" or qid == Auto.ROIDS_QUEST then
+        -- Step 1 of 2 done. Nothing else happens on this interaction: spec §14
+        -- is explicit that the completion is the SECOND one.
+        Auto._roidsAcceptedAt = nowSecs()
+    end
 end
 
 -- QUEST_PROGRESS: turn-in requirements screen. Complete when the game says the
@@ -1599,16 +2017,31 @@ function Auto.PickReward(choices, priority)
 end
 
 ----------------------------------------------------------------------
--- ZANZA REWARD MACHINERY (spec §14)
+-- THE TURN-IN REWARD MACHINERY (spec §14)
 --
--- State is all session-local. `_zanzaCooldown` is the per-item 30 s rejection
+-- State is all session-local. `_zanzaCooldown` is the per-key 30 s rejection
 -- stamp; `_zanzaPending` is the in-flight delivery verification; `_zanzaChoices`
 -- is the reward list captured off the open QUEST_COMPLETE frame; `_zanzaWatch`
 -- is the "every enabled flask already owned, dialog left open" bag watcher.
+--
+-- SHARED BY THREE FAMILIES (1.1.4). Spec §14 hands R.O.I.D.S. "the same 30 s
+-- rejection cooldown and bag verifier as zanza", and the conformance wave gives
+-- E'ko the same treatment. Rather than a second and third copy of the stamp
+-- table and the verifier, the two zanza-named fields ARE the house store and
+-- every family writes NAMESPACED keys into them:
+--
+--     zanza  -> "swiftness" / "spirit" / "sheen"   (bare, unchanged)
+--     E'ko   -> "eko:4806" … "eko:4801"            (Auto.EkoKey)
+--     ROIDS  -> "roids"
+--
+-- so three families cannot collide, and there is exactly one implementation of
+-- "stamp before the request, clear on confirmed delivery, re-stamp on a
+-- timeout". The names stay zanza-prefixed because the shipped gates and the
+-- external harness assert on them; the comment is the correction.
 ----------------------------------------------------------------------
 
-Auto._zanzaCooldown = {}      -- key -> GetTime() stamp
-Auto._zanzaPending  = nil     -- { key, itemID, before, at }
+Auto._zanzaCooldown = {}      -- key -> GetTime() stamp (all three families)
+Auto._zanzaPending  = nil     -- { key, itemID, before, at, dir, label, what }
 Auto._zanzaChoices  = nil     -- array of { index, itemID, name, key }
 Auto._zanzaWatch    = false
 
@@ -1706,22 +2139,9 @@ function Auto.ZanzaPickAndRequest()
 
     -- SPEC: stamp the rejection cooldown BEFORE the reward request goes out, so
     -- a rapid re-open walks to the NEXT priority instead of retrying the pick
-    -- that just failed. Cleared below on confirmed delivery.
-    Auto._zanzaCooldown[key] = now
+    -- that just failed. Cleared on confirmed delivery. (Shared machinery.)
     Auto._zanzaWatch = false
-
-    if choice.itemID then
-        Auto._zanzaPending = {
-            key = key, itemID = choice.itemID,
-            before = Auto.OwnedCount(choice.itemID), at = now,
-        }
-    else
-        -- No resolvable item ID means no honest bag delta to watch for. Rather
-        -- than let the backstop fire a false rejection, drop the stamp and take
-        -- the reward unverified.
-        Auto._zanzaCooldown[key] = nil
-        Auto._zanzaPending = nil
-    end
+    Auto.ArmTurnInDelivery({ key = key, itemID = choice.itemID, label = "zanza" }, now)
 
     if GetQuestReward then GetQuestReward(choice.index) end
 
@@ -1736,26 +2156,56 @@ function Auto.ZanzaPickAndRequest()
     return true, key
 end
 
--- Event-driven delivery verification with the 5 s backstop.
--- Success clears the stamp and prints; failure re-stamps and prints.
-function Auto.ZanzaDeliveryTick(now)
+-- Arm a delivery verification, stamping the rejection cooldown FIRST.
+--
+-- THE ORDER IS THE RULE (spec §14): the stamp is written BEFORE the reward
+-- request goes out, so a rapid re-open walks to the next candidate instead of
+-- retrying the pick that just failed. Cleared on confirmed delivery.
+-- `p` = { key, itemID, label, what, dir, timeoutMsg }.
+function Auto.ArmTurnInDelivery(p, now)
+    now = now or nowSecs()
+    Auto._zanzaCooldown[p.key] = now
+    if not p.itemID then
+        -- No resolvable item ID means no honest bag delta to watch for. Rather
+        -- than let the backstop fire a false rejection, drop the stamp and take
+        -- the reward unverified.
+        Auto._zanzaCooldown[p.key] = nil
+        Auto._zanzaPending = nil
+        return false
+    end
+    Auto._zanzaPending = {
+        key = p.key, itemID = p.itemID, dir = p.dir,
+        label = p.label or "zanza", what = p.what or p.key,
+        retryMsg = p.retryMsg,
+        before = Auto.OwnedCount(p.itemID), at = now,
+    }
+    return true
+end
+
+-- Event-driven delivery verification with the 5 s backstop, shared by all three
+-- §14 turn-in families. Success clears the stamp and prints; failure re-stamps
+-- and prints. `Auto.ZanzaDeliveryTick` is kept as its historical name.
+function Auto.DeliveryTick(now)
     local p = Auto._zanzaPending
     if not p then return "idle" end
     now = now or nowSecs()
+    local label, what = p.label or "zanza", p.what or p.key
     local verdict = Auto.JudgeDelivery(p, Auto.OwnedCount(p.itemID), now,
-                                       Auto.ZANZA_DELIVERY_TIMEOUT)
+                                       Auto.DELIVERY_TIMEOUT)
     if verdict == "delivered" then
         Auto._zanzaCooldown[p.key] = nil
         Auto._zanzaPending = nil
-        ns:Print(("zanza: %s delivered."):format(p.key))
+        ns:Print(("%s: %s delivered."):format(label, what))
     elseif verdict == "timeout" then
         Auto._zanzaCooldown[p.key] = now      -- re-stamp: 30 s from the failure
         Auto._zanzaPending = nil
-        ns:Print(("zanza: %s did not arrive — trying the next priority for the "
-               .. "next %ds."):format(p.key, Auto.ZANZA_REJECT_COOLDOWN))
+        ns:Print(("%s: %s did not arrive — %s for the next %ds.")
+            :format(label, what, p.retryMsg or "trying the next priority",
+                    Auto.REJECT_COOLDOWN))
     end
     return verdict
 end
+Auto.ZanzaDeliveryTick = Auto.DeliveryTick
 
 -- The armed bag watcher: a flask was drunk while the reward dialog stayed open.
 function Auto.ZanzaWatchTick()
@@ -1770,12 +2220,64 @@ function Auto.OnQuestFinished()
     Auto._zanzaWatch   = false
 end
 
--- QUEST_COMPLETE: take the reward. Zanza runs the full gated machinery above;
--- every other category keeps the simple "one fixed reward, or honour the
--- priority list" path it has always had.
+-- QUEST_COMPLETE: take the reward. Zanza, E'ko and R.O.I.D.S. each run their
+-- own §14 gates through the shared machinery; every other category keeps the
+-- simple "one fixed reward, or honour the priority list" path it has had.
 function Auto.OnQuestComplete()
     local inScope, qid, category = Auto.QuestFrameInScope()
     if not inScope then return end
+
+    -- E'KO (spec §14: "then auto-completes and takes the reward").
+    --
+    -- QuestFrameInScope has already re-run the gate — this frame's quest IS the
+    -- type the spec's order picked and it IS still held >= 3 — so what is left
+    -- is the reward and the verification. The spec names no reward item for
+    -- E'ko, so the bag delta watched is the one the spec DOES name: three of
+    -- the E'ko type leaving the bags. Same 30 s stamp, same 5 s backstop.
+    if category == "eko" then
+        local entry = Auto.EkoByQuestID(qid)
+        if not entry then return end
+        local now = nowSecs()
+        Auto.ArmTurnInDelivery({
+            key = Auto.EkoKey(entry.questID), itemID = entry.itemID, dir = "down",
+            label = "e'ko", what = entry.name,
+            retryMsg = "trying the next E'ko type",
+        }, now)
+        if GetQuestReward then GetQuestReward(1) end
+        if Auto._zanzaPending and C_Timer and C_Timer.After then
+            C_Timer.After(Auto.DELIVERY_TIMEOUT, function()
+                ns:SafeCall(Auto.DeliveryTick)
+            end)
+        end
+        return
+    end
+
+    -- R.O.I.D.S. (spec §14: quest 2582, reward item 8410).
+    --
+    -- BY ID, NOT BY INDEX. Audit row 93 called the shipped behaviour "correct
+    -- by luck (one reward), not by ID": index 1 happens to be 8410 because
+    -- Drazial offers nothing else. The reward is now looked up by item ID and
+    -- index 1 is the fallback for the fixed-reward frame that offers no choice
+    -- list at all.
+    if category == "roids" then
+        local choices = Auto.ReadRewardChoices()
+        local idx = Auto.PickRewardByItemID(choices, Auto.ROIDS_REWARD)
+                    or (#choices > 0 and choices[1].index or 1)
+        local now = nowSecs()
+        Auto.ArmTurnInDelivery({
+            key = "roids", itemID = Auto.ROIDS_REWARD,
+            label = "r.o.i.d.s", what = "rage of ages",
+            retryMsg = "backing off",
+        }, now)
+        Auto._roidsAcceptedAt = nil            -- the two-step round is closed
+        if GetQuestReward then GetQuestReward(idx) end
+        if Auto._zanzaPending and C_Timer and C_Timer.After then
+            C_Timer.After(Auto.DELIVERY_TIMEOUT, function()
+                ns:SafeCall(Auto.DeliveryTick)
+            end)
+        end
+        return
+    end
 
     if category == "zanza" or qid == Auto.ZANZA_QUEST then
         -- Re-run the token + bag-space guard on the REWARD step, not just at
@@ -1799,7 +2301,7 @@ function Auto.OnQuestComplete()
         return
     end
 
-    local _, flags = activeQuestCategories()
+    local flags = activeQuestFlags()
     local nChoices = GetNumQuestChoices and GetNumQuestChoices() or 0
     local rewardIndex = 1
     if nChoices > 1 then
@@ -2730,18 +3232,47 @@ end
 
 -- RULE: the keyword pools are disjoint. zulian/razzashi/hakkari are the coin
 -- set of 8195, never zanza.
+--
+-- EXTENDED (1.1.4) to all FOUR pools, and from "no shared entry" to "no entry
+-- of one pool is a SUBSTRING of an entry of another" — a title match is a
+-- substring test, so a shared substring is a shared match. This is the
+-- assertion the new E'ko and R.O.I.D.S. tables have to keep passing.
 local function testKeywordPools()
-    local zanza, coins = {}, {}
-    for _, k in ipairs(QUEST_KEYWORDS.zanza)   do zanza[k] = true end
-    for _, k in ipairs(QUEST_KEYWORDS.zgCoins) do coins[k] = true end
-    for k in pairs(zanza) do
-        if coins[k] then return false, "zanza n zgCoins must be empty, shared: " .. k end
+    local NAMES = { "eko", "zgCoins", "zanza", "roids" }
+    local sets = {}
+    for _, n in ipairs(NAMES) do
+        sets[n] = {}
+        for _, k in ipairs(QUEST_KEYWORDS[n]) do sets[n][k] = true end
+    end
+    for _, a in ipairs(NAMES) do
+        for _, b in ipairs(NAMES) do
+            if a ~= b then
+                for ka in pairs(sets[a]) do
+                    for kb in pairs(sets[b]) do
+                        if ka == kb then
+                            return false, ("%s n %s must be empty, shared: %s"):format(a, b, ka)
+                        end
+                        if ka:find(kb, 1, true) then
+                            return false, ("%s keyword %q contains %s keyword %q")
+                                :format(a, ka, b, kb)
+                        end
+                    end
+                end
+            end
+        end
     end
     for _, k in ipairs({ "zulian", "razzashi", "hakkari" }) do
-        if not coins[k] then return false, k .. " belongs to the coin pool (quest 8195)" end
-        if zanza[k] then return false, k .. " must not be in the zanza pool" end
+        if not sets.zgCoins[k] then return false, k .. " belongs to the coin pool (quest 8195)" end
+        if sets.zanza[k] then return false, k .. " must not be in the zanza pool" end
     end
-    if not zanza["zanza"] then return false, "zanza pool keeps its own keyword" end
+    if not sets.zanza["zanza"] then return false, "zanza pool keeps its own keyword" end
+    -- SHRUNK: the two loose bare substrings are gone (quest-ID-first everywhere).
+    if sets.eko["eko"] then return false, "the bare \"eko\" substring must be gone" end
+    if sets.roids["roids"] then return false, "the bare \"roids\" substring must be gone" end
+    if not sets.eko["e'ko"] then return false, "the E'ko fallback keyword survives" end
+    if not sets.roids["rage of ages"] then
+        return false, "spec §14 names quest 2582 \"Rage of Ages\" — keep it as the fallback"
+    end
     return true
 end
 
@@ -3116,6 +3647,463 @@ local function testRewardKeying()
     return true
 end
 
+----------------------------------------------------------------------
+-- E'KO RULE TABLE (spec §14, audit rows 81-87) — one assertion per rule.
+----------------------------------------------------------------------
+
+-- RULE (row 83): the seven type/quest pairs, and the spec's ORDER.
+-- RULE (row 81): scoped to NPC 10307. RULE (row 82): the >= 3 threshold.
+local function testEkoTable()
+    -- The spec's list, verbatim and in order: item, quest.
+    local SPEC = {
+        { 12436, 4806 },   -- Frostmaul
+        { 12431, 4802 },   -- Winterfall
+        { 12434, 4804 },   -- Chillwind
+        { 12432, 4803 },   -- Shardtooth
+        { 12435, 4805 },   -- Ice Thistle
+        { 12433, 4807 },   -- Wildkin
+        { 12430, 4801 },   -- Frostsaber
+    }
+    if #Auto.EKO_SETS ~= 7 then return false, "seven E'ko types, got " .. #Auto.EKO_SETS end
+    for i, want in ipairs(SPEC) do
+        local got = Auto.EKO_SETS[i]
+        if got.itemID ~= want[1] or got.questID ~= want[2] then
+            return false, ("order slot %d is %s/%s, spec says %s/%s")
+                :format(i, tostring(got.itemID), tostring(got.questID), want[1], want[2])
+        end
+        if Auto.EkoByQuestID(want[2]) ~= got then
+            return false, "EkoByQuestID must find quest " .. want[2]
+        end
+    end
+    if Auto.EKO_NPC ~= 10307 then return false, "Mau'ari is NPC 10307" end
+    if Auto.EKO_NEED ~= 3 then return false, "the threshold is 3" end
+    if Auto.EkoByQuestID(8243) ~= nil then return false, "a foreign quest ID matches nothing" end
+
+    -- EACH of the seven types, held alone at exactly 3, selects ITS OWN quest.
+    for i, want in ipairs(SPEC) do
+        local bag = { [want[1]] = 3 }
+        local entry = Auto.PickEkoTurnIn(function(id) return bag[id] or 0 end)
+        if not (entry and entry.questID == want[2] and entry.itemID == want[1]) then
+            return false, ("type %d (item %d) selected %s, expected quest %d")
+                :format(i, want[1], entry and tostring(entry.questID) or "nothing", want[2])
+        end
+    end
+    return true
+end
+
+-- RULE (row 82): the FIRST type held >= 3 of. Two is not three.
+local function testEkoThreshold()
+    local bag = {}
+    local count = function(id) return bag[id] or 0 end
+    local e, why = Auto.PickEkoTurnIn(count)
+    if e ~= nil or why ~= "below-threshold" then return false, "an empty bag turns nothing in" end
+
+    bag[12431] = 2                                   -- two Winterfall
+    e, why = Auto.PickEkoTurnIn(count)
+    if e ~= nil or why ~= "below-threshold" then
+        return false, "TWO E'ko must NOT be turned in (got " .. tostring(e and e.questID) .. ")"
+    end
+    bag[12431] = 3                                   -- the third arrives
+    e = Auto.PickEkoTurnIn(count)
+    if not (e and e.questID == 4802) then return false, "three E'ko fires quest 4802" end
+    bag[12431] = 9                                   -- more than enough still fires
+    e = Auto.PickEkoTurnIn(count)
+    if not (e and e.questID == 4802) then return false, "a big stack still fires" end
+    return true
+end
+
+-- RULE (row 83): the ORDER decides between two eligible types.
+local function testEkoOrder()
+    local bag = { [12431] = 3, [12434] = 5 }         -- Winterfall + Chillwind
+    local count = function(id) return bag[id] or 0 end
+    local e = Auto.PickEkoTurnIn(count)
+    if not (e and e.questID == 4802) then
+        return false, "Winterfall (order 2) beats Chillwind (order 4), got "
+            .. tostring(e and e.questID)
+    end
+    bag[12436] = 3                                   -- Frostmaul is order 1
+    e = Auto.PickEkoTurnIn(count)
+    if not (e and e.questID == 4806) then return false, "Frostmaul leads the order" end
+    -- The LAST type alone still wins when it is the only one held.
+    local only = { [12430] = 3 }
+    e = Auto.PickEkoTurnIn(function(id) return only[id] or 0 end)
+    if not (e and e.questID == 4801) then return false, "Frostsaber alone is selected" end
+    return true
+end
+
+-- RULE (shared with zanza): the 30 s rejection stamp walks to the next
+-- candidate — here, the next E'ko TYPE — instead of retrying the failing one.
+local function testEkoCooldownWalk()
+    local bag = { [12431] = 3, [12434] = 3 }         -- Winterfall + Chillwind
+    local count = function(id) return bag[id] or 0 end
+    local stamps = { [Auto.EkoKey(4802)] = 100 }
+    local e = Auto.PickEkoTurnIn(count, { cooldowns = stamps, now = 105, cooldown = 30 })
+    if not (e and e.questID == 4804) then
+        return false, "a cooling Winterfall walks to Chillwind, got " .. tostring(e and e.questID)
+    end
+    e = Auto.PickEkoTurnIn(count, { cooldowns = stamps, now = 131, cooldown = 30 })
+    if not (e and e.questID == 4802) then return false, "the stamp expires at 30 s" end
+    stamps[Auto.EkoKey(4804)] = 100
+    local none, why = Auto.PickEkoTurnIn(count, { cooldowns = stamps, now = 105, cooldown = 30 })
+    if none ~= nil or why ~= "all-cooling" then
+        return false, "every eligible type cooling is its own verdict"
+    end
+    -- ... and "all cooling" is NOT the same verdict as "nothing held".
+    local empty = {}
+    local _, why2 = Auto.PickEkoTurnIn(function(id) return empty[id] or 0 end,
+                                       { cooldowns = stamps, now = 105, cooldown = 30 })
+    if why2 ~= "below-threshold" then return false, "nothing held is below-threshold" end
+    -- The key namespace cannot collide with zanza's bare reward keys.
+    if Auto.EkoKey(4802) == "swiftness" or Auto.EkoKey(4802):find(":", 1, true) == nil then
+        return false, "E'ko cooldown keys are namespaced"
+    end
+    return true
+end
+
+----------------------------------------------------------------------
+-- R.O.I.D.S. RULE TABLE (spec §14, audit rows 88-100).
+----------------------------------------------------------------------
+
+-- RULE (rows 88, 89, 90-92, 93): the IDs and the counts.
+local function testRoidsTable()
+    if Auto.ROIDS_NPC ~= 7505 then return false, "Bloodmage Drazial is NPC 7505" end
+    if Auto.ROIDS_QUEST ~= 2582 then return false, "quest 2582" end
+    if Auto.ROIDS_REWARD ~= 8410 then return false, "reward item 8410" end
+    local SPEC = { { 8391, 3 }, { 8392, 2 }, { 8393, 1 } }
+    if #Auto.ROIDS_REAGENTS ~= 3 then return false, "three reagents" end
+    for i, want in ipairs(SPEC) do
+        local got = Auto.ROIDS_REAGENTS[i]
+        if got.itemID ~= want[1] or got.count ~= want[2] then
+            return false, ("reagent %d is %sx%s, spec says %dx%d")
+                :format(i, tostring(got.count), tostring(got.itemID), want[2], want[1])
+        end
+    end
+    if Auto.QUEST_NEVER[Auto.ROIDS_QUEST] then return false, "2582 must be allowed" end
+    for _, e in ipairs(Auto.EKO_SETS) do
+        if Auto.QUEST_NEVER[e.questID] then return false, "E'ko quests must be allowed" end
+    end
+    return true
+end
+
+-- RULE (rows 90-92): the complete set fires; ANY short reagent does not.
+local function testRoidsReagentGate()
+    local function gate(bag)
+        local complete, held = Auto.RoidsReagentState(function(id) return bag[id] or 0 end)
+        local ok, why = Auto.DecideTurnInGate({
+            enabled = true, shift = false, npcID = Auto.ROIDS_NPC,
+            wantNpc = Auto.ROIDS_NPC, held = held, freeSlots = 5,
+            shortReason = "short-reagents",
+        })
+        return complete, ok, why
+    end
+    local ROWS = {
+        { "complete set",        { [8391] = 3, [8392] = 2, [8393] = 1 }, true  },
+        { "surplus of each",     { [8391] = 9, [8392] = 4, [8393] = 2 }, true  },
+        { "one jowl short",      { [8391] = 2, [8392] = 2, [8393] = 1 }, false },
+        { "one lung short",      { [8391] = 3, [8392] = 1, [8393] = 1 }, false },
+        { "no pincer",           { [8391] = 3, [8392] = 2, [8393] = 0 }, false },
+        { "one of each (counts ignored would pass)",
+                                 { [8391] = 1, [8392] = 1, [8393] = 1 }, false },
+        { "empty bags",          {},                                     false },
+    }
+    for _, row in ipairs(ROWS) do
+        local complete, ok, why = gate(row[2])
+        if complete ~= row[3] or ok ~= row[3] then
+            return false, ("%s -> complete=%s ok=%s (%s), want %s")
+                :format(row[1], tostring(complete), tostring(ok), tostring(why), tostring(row[3]))
+        end
+        if not row[3] and why ~= "short-reagents" then
+            return false, row[1] .. " must refuse as short-reagents, got " .. tostring(why)
+        end
+    end
+    return true
+end
+
+-- RULE (row 95): bag-full is allowed ONLY if at least one reagent is held in
+-- exactly the required count — and the generalised rule still gives zanza its
+-- own one-stack answer.
+local function testRoidsBagRule()
+    local function bagOk(free, bag)
+        local _, held = Auto.RoidsReagentState(function(id) return bag[id] or 0 end)
+        return Auto.DecideBagSpaceFor(free, held)
+    end
+    -- Exactly the required count on ALL three: consumed whole -> proceeds.
+    if not bagOk(0, { [8391] = 3, [8392] = 2, [8393] = 1 }) then
+        return false, "bag full + every reagent at exactly its count must proceed"
+    end
+    -- Only the pincer is exact; the other two have spares -> STILL proceeds
+    -- ("at least one reagent ... in exactly the required count").
+    if not bagOk(0, { [8391] = 5, [8392] = 4, [8393] = 1 }) then
+        return false, "bag full + ONE exact reagent must proceed"
+    end
+    -- Every stack has spares -> nothing is freed -> refuses.
+    local ok, why = bagOk(0, { [8391] = 5, [8392] = 4, [8393] = 3 })
+    if ok or why ~= "bag-full" then return false, "bag full + all spares must refuse" end
+    -- A free slot always proceeds, whatever is held.
+    if not bagOk(2, { [8391] = 5, [8392] = 4, [8393] = 3 }) then
+        return false, "a free slot always proceeds"
+    end
+    -- The zanza one-stack case is unchanged by the generalisation.
+    if not Auto.DecideBagSpace(0, 1, 1) then return false, "zanza exact-token still proceeds" end
+    if Auto.DecideBagSpace(0, 2, 1) then return false, "zanza spare token still refuses" end
+    local _, zwhy = Auto.DecideBagSpace(0, 1, 1)
+    if zwhy ~= "exact-token" then return false, "zanza keeps its own reason word" end
+    -- A zero requirement can never license a full bag.
+    if Auto.DecideBagSpaceFor(0, { { have = 0, need = 0 } }) then
+        return false, "a zero requirement frees nothing"
+    end
+    return true
+end
+
+-- RULE (row 94): two-step — accept on the first interaction, complete on the
+-- second — and the step is READ from the world, so it survives anything.
+local function testRoidsTwoStep()
+    local Q = Auto.ROIDS_QUEST
+    if Auto.RoidsStep({}, { [Q] = true }) ~= "accept" then
+        return false, "offered but not held -> accept (step 1)"
+    end
+    if Auto.RoidsStep({ [Q] = true }, {}) ~= "complete" then
+        return false, "already in the log -> complete (step 2)"
+    end
+    -- Both lists carrying it (a client that lists an accepted quest twice):
+    -- the turn-in wins, exactly as PlanGossipQuest orders it.
+    if Auto.RoidsStep({ [Q] = true }, { [Q] = true }) ~= "complete" then
+        return false, "an active turn-in beats an available pickup"
+    end
+    if Auto.RoidsStep({}, {}) ~= nil then return false, "absent from both lists -> nothing" end
+    if Auto.RoidsStep({ [8243] = true }, { [8238] = true }) ~= nil then
+        return false, "other quests do not look like R.O.I.D.S."
+    end
+    -- The same shape through the real planner: available first, then active.
+    local plan = Auto.PlanGossipQuest({}, { { questID = Q, selector = Q } }, { [Q] = true })
+    if not (plan and plan.kind == "available" and plan.questID == Q) then
+        return false, "step 1 selects 2582 off the AVAILABLE list"
+    end
+    plan = Auto.PlanGossipQuest({ { questID = Q, selector = Q, isComplete = true } },
+                                { { questID = Q, selector = Q } }, { [Q] = true })
+    if not (plan and plan.kind == "active") then
+        return false, "step 2 selects 2582 off the ACTIVE list"
+    end
+    return true
+end
+
+-- RULE (row 93): the reward is taken BY ITEM ID, not by index.
+local function testRoidsRewardByID()
+    local choices = {
+        { index = 1, itemID = 12345, name = "Something Else" },
+        { index = 2, itemID = Auto.ROIDS_REWARD, name = "R.O.I.D.S." },
+    }
+    if Auto.PickRewardByItemID(choices, Auto.ROIDS_REWARD) ~= 2 then
+        return false, "8410 is found at index 2, not blindly at index 1"
+    end
+    if Auto.PickRewardByItemID(choices, 99999) ~= nil then
+        return false, "an absent reward ID picks nothing (caller falls back)"
+    end
+    if Auto.PickRewardByItemID({}, Auto.ROIDS_REWARD) ~= nil then
+        return false, "an empty choice list picks nothing"
+    end
+    return true
+end
+
+-- RULE (rows 96, 97 / shared): the delivery verifier judges BOTH directions —
+-- a reward arriving (zanza, R.O.I.D.S.) and reagents leaving (E'ko).
+local function testDeliveryDirection()
+    local up = { key = "roids", itemID = 8410, before = 0, at = 100 }
+    if Auto.JudgeDelivery(up, 1, 101, 5) ~= "delivered" then return false, "8410 arrived" end
+    if Auto.JudgeDelivery(up, 0, 101, 5) ~= "pending" then return false, "nothing yet" end
+    if Auto.JudgeDelivery(up, 0, 105, 5) ~= "timeout" then return false, "5 s backstop" end
+
+    local down = { key = Auto.EkoKey(4802), itemID = 12431, before = 3, at = 100, dir = "down" }
+    if Auto.JudgeDelivery(down, 0, 101, 5) ~= "delivered" then
+        return false, "three E'ko left the bags = the turn-in happened"
+    end
+    if Auto.JudgeDelivery(down, 3, 101, 5) ~= "pending" then
+        return false, "the stack is still there = not yet"
+    end
+    if Auto.JudgeDelivery(down, 4, 101, 5) ~= "pending" then
+        return false, "a stack that GREW is not an E'ko delivery"
+    end
+    if Auto.JudgeDelivery(down, 3, 105, 5) ~= "timeout" then return false, "backstop both ways" end
+    -- The cooldown read the walks share.
+    if Auto.IsCooling({ a = 100 }, "a", 105, 30) ~= true then return false, "inside the stamp" end
+    if Auto.IsCooling({ a = 100 }, "a", 130, 30) ~= false then return false, "the stamp expires" end
+    if Auto.IsCooling({}, "a", 105, 30) ~= false then return false, "no stamp, not cooling" end
+    return true
+end
+
+-- RULE (rows 81, 88, 85, 98): the ENTRY PATHS. Both shapes are driven through
+-- the real functions — Auto.AllowedGossipQuestIDs (the gossip window) and
+-- Auto.OnQuestGreeting (the classic greeting) — against a stubbed world.
+local function testEkoRoidsEntryPaths()
+    local block = Auto.AQBlock and Auto.AQBlock() or nil
+    if type(block) ~= "table" then return false, "the live autoQuest block is reachable" end
+
+    local SAVE = { UnitGUID = _G.UnitGUID, IsShiftKeyDown = _G.IsShiftKeyDown,
+                   GetQuestID = _G.GetQuestID, GetTitleText = _G.GetTitleText,
+                   GetNumActiveQuests = _G.GetNumActiveQuests,
+                   GetNumAvailableQuests = _G.GetNumAvailableQuests,
+                   GetActiveTitle = _G.GetActiveTitle,
+                   GetAvailableTitle = _G.GetAvailableTitle,
+                   SelectActiveQuest = _G.SelectActiveQuest,
+                   SelectAvailableQuest = _G.SelectAvailableQuest }
+    local savedEko, savedRoids = block.eko, block.roids
+    local savedOwned, savedFree = Auto.OwnedCount, Auto.FreeBagSlots
+    local savedCd = Auto._zanzaCooldown
+
+    local W = { npc = Auto.EKO_NPC, shift = false, bag = {}, free = 5,
+                active = {}, available = {}, questID = nil, title = "" }
+    local PICKED
+    _G.UnitGUID = function(u)
+        if u ~= "npc" then return "Player-4395-01C7B4D5" end
+        return W.npc and ("Creature-0-3299-0-14-" .. W.npc .. "-0000027FA6") or nil
+    end
+    _G.IsShiftKeyDown        = function() return W.shift end
+    _G.GetQuestID            = function() return W.questID or 0 end
+    _G.GetTitleText          = function() return W.title or "" end
+    _G.GetNumActiveQuests    = function() return #W.active end
+    _G.GetNumAvailableQuests = function() return #W.available end
+    _G.GetActiveTitle        = function(i) return W.active[i] end
+    _G.GetAvailableTitle     = function(i) return W.available[i] end
+    _G.SelectActiveQuest     = function(i) PICKED = "active:" .. i end
+    _G.SelectAvailableQuest  = function(i) PICKED = "available:" .. i end
+    Auto.OwnedCount   = function(id) return W.bag[id] or 0 end
+    Auto.FreeBagSlots = function() return W.free end
+
+    local fail
+    local function ck(cond, why) if not fail and not cond then fail = why end end
+    local function allowed() return Auto.AllowedGossipQuestIDs() end
+    local function greet(t)
+        for k, v in pairs(t or {}) do W[k] = v end
+        PICKED = nil
+        Auto.OnQuestGreeting()
+        return PICKED
+    end
+
+    block.eko, block.roids = true, false
+    Auto._zanzaCooldown = {}
+
+    -- GOSSIP PATH, E'ko: three Winterfall at Mau'ari -> 4802 and ONLY 4802.
+    W.bag = { [12431] = 3, [12434] = 3 }
+    local a = allowed()
+    ck(a[4802] == true, "gossip: 4802 must be allowed with three Winterfall")
+    ck(a[4804] == nil, "gossip: only the ORDER's pick may enter the allowed set")
+
+    -- ... two held -> nothing at all.
+    W.bag = { [12431] = 2 }
+    ck(next(allowed()) == nil, "gossip: two E'ko must allow nothing")
+
+    -- ... right quests, WRONG NPC -> untouched.
+    W.bag, W.npc = { [12431] = 3 }, 15070          -- Vinchaxa
+    ck(next(allowed()) == nil, "gossip: E'ko at the wrong NPC must allow nothing")
+
+    -- ... an unidentifiable NPC still admits (the quest-ID whitelist is the
+    -- real guard, exactly as for zanza).
+    W.npc = nil
+    ck(allowed()[4802] == true, "gossip: an unknown GUID must not disable E'ko")
+
+    -- ... Shift skips.
+    W.npc, W.shift = Auto.EKO_NPC, true
+    ck(next(allowed()) == nil, "gossip: held Shift skips E'ko")
+    W.shift = false
+
+    -- GREETING PATH, E'ko: the ORDER's type is preferred over the other held
+    -- one even when the other is listed first.
+    W.bag = { [12431] = 3, [12434] = 3 }
+    ck(greet({ active = { "Chillwind E'ko", "Winterfall E'ko" } }) == "active:2",
+       "greeting: the spec ORDER picks Winterfall even when listed second")
+    -- ... and the generic fallback still selects when the type word is absent.
+    ck(greet({ active = { "Some Localised E'ko Errand" } }) == "active:1",
+       "greeting: the e'ko fallback keyword still matches")
+    -- ... nothing is selected at the wrong NPC.
+    W.npc = 15070
+    ck(greet({ active = { "Winterfall E'ko" } }) == nil,
+       "greeting: E'ko at the wrong NPC selects nothing")
+    W.npc = Auto.EKO_NPC
+    -- ... nor below the threshold.
+    W.bag = { [12431] = 2 }
+    ck(greet({ active = { "Winterfall E'ko" } }) == nil,
+       "greeting: two E'ko selects nothing")
+    -- ... nor with Shift held.
+    W.bag, W.shift = { [12431] = 3 }, true
+    ck(greet({ active = { "Winterfall E'ko" } }) == nil, "greeting: held Shift skips E'ko")
+    W.shift = false
+
+    -- R.O.I.D.S., both paths.
+    block.eko, block.roids = false, true
+    W.npc, W.bag = Auto.ROIDS_NPC, { [8391] = 3, [8392] = 2, [8393] = 1 }
+    ck(allowed()[Auto.ROIDS_QUEST] == true, "gossip: 2582 allowed with the full reagent set")
+    ck(greet({ available = { "Rage of Ages" }, active = {} }) == "available:1",
+       "greeting: step 1 selects the R.O.I.D.S. pickup")
+    ck(greet({ available = { "Rage of Ages" }, active = { "Rage of Ages" } }) == "active:1",
+       "greeting: step 2 prefers the turn-in over the pickup")
+    W.bag = { [8391] = 2, [8392] = 2, [8393] = 1 }
+    ck(next(allowed()) == nil, "gossip: one jowl short allows nothing")
+    ck(greet({ available = { "Rage of Ages" }, active = {} }) == nil,
+       "greeting: one jowl short selects nothing")
+    W.bag, W.npc = { [8391] = 3, [8392] = 2, [8393] = 1 }, 10307   -- Mau'ari
+    ck(next(allowed()) == nil, "gossip: R.O.I.D.S. at the wrong NPC allows nothing")
+    W.npc = Auto.ROIDS_NPC
+    -- Bag rule, both ways, through the live gate.
+    W.free, W.bag = 0, { [8391] = 3, [8392] = 2, [8393] = 1 }
+    ck(allowed()[Auto.ROIDS_QUEST] == true, "gossip: bag full + exact counts proceeds")
+    W.bag = { [8391] = 5, [8392] = 4, [8393] = 3 }
+    ck(next(allowed()) == nil, "gossip: bag full + all spares refuses")
+    W.free, W.bag = 5, { [8391] = 3, [8392] = 2, [8393] = 1 }
+    -- The 30 s rejection stamp closes the entry, then reopens it.
+    Auto._zanzaCooldown = { roids = (GetTime and GetTime() or 0) }
+    ck(next(allowed()) == nil, "gossip: a cooling R.O.I.D.S. must not re-enter")
+    Auto._zanzaCooldown = {}
+    ck(allowed()[Auto.ROIDS_QUEST] == true, "gossip: a cleared stamp re-enters")
+
+    -- FORBIDDEN-QUEST DISCIPLINE, at its widest. Both families on, everything
+    -- held, and an UNIDENTIFIABLE NPC — the one state in which neither NPC gate
+    -- can refuse, so nothing but the tables themselves is holding the line. The
+    -- allowed set must still be EXACTLY the two IDs the tables name: the E'ko
+    -- type the ORDER picked and 2582. Never a second E'ko type, never one of
+    -- QUEST_NEVER, never anything else.
+    block.eko = true
+    W.npc = nil
+    W.bag = { [12431] = 3, [12434] = 3, [12430] = 3,
+              [8391] = 3, [8392] = 2, [8393] = 1 }
+    local final, n = allowed(), 0
+    for qid in pairs(final) do
+        n = n + 1
+        if Auto.QUEST_NEVER[qid] then fail = fail or ("forbidden quest " .. qid .. " entered") end
+        if qid ~= 4802 and qid ~= Auto.ROIDS_QUEST then
+            fail = fail or ("unexpected quest " .. qid .. " entered the allowed set")
+        end
+    end
+    ck(n == 2, "exactly two quest IDs may be allowed here, got " .. n)
+
+    -- QUEST-ID-FIRST AT THE FRAME. A quest whose ID answers and matches NONE
+    -- of the four tables is refused outright — its title is never consulted.
+    -- (The live gate found this: a foreign quest sharing a title word with
+    -- R.O.I.D.S. was being accepted through the title fallback.)
+    W.npc, W.bag = Auto.ROIDS_NPC, { [8391] = 3, [8392] = 2, [8393] = 1 }
+    W.title = "Rage of Ages"
+    W.questID = 4808                                   -- not in any table
+    local inScope, _, cat = Auto.QuestFrameInScope()
+    ck(inScope == false and cat == "unknown-id",
+       "a known-but-foreign quest ID is refused, not title-matched")
+    W.questID = Auto.ROIDS_QUEST
+    ck((Auto.QuestFrameInScope()) == true, "2582 itself is still in scope")
+    -- ... and with NO id at all the title fallback is what carries the
+    -- greeting path, still only over the GATED groups.
+    W.questID = nil
+    ck((Auto.QuestFrameInScope()) == true, "no ID: the gated title fallback matches")
+    W.npc = Auto.EKO_NPC                               -- R.O.I.D.S. gate now fails
+    ck((Auto.QuestFrameInScope()) == false,
+       "no ID: the title fallback is gated by NPC identity too")
+    W.title, W.questID = "", nil
+
+    block.eko, block.roids = savedEko, savedRoids
+    Auto.OwnedCount, Auto.FreeBagSlots = savedOwned, savedFree
+    Auto._zanzaCooldown = savedCd
+    for k, v in pairs(SAVE) do _G[k] = v end
+    if fail then return false, fail end
+    return true
+end
+
 -- RULE: NPC identity parse (the belt to the quest-ID braces).
 local function testNpcParse()
     if Auto.ParseNpcID("Creature-0-3299-0-14-14921-0000027FA6") ~= 14921 then
@@ -3156,6 +4144,17 @@ function Auto.RunSelfTests(verbose)
         { name = "coin priority",       fn = testCoinPriority },
         { name = "reward keying",       fn = testRewardKeying },
         { name = "npc guid parse",      fn = testNpcParse },
+        { name = "e'ko: 7 type/quest pairs + spec order", fn = testEkoTable },
+        { name = "e'ko: >= 3 threshold", fn = testEkoThreshold },
+        { name = "e'ko: order decides",  fn = testEkoOrder },
+        { name = "e'ko: cooldown walks to the next type", fn = testEkoCooldownWalk },
+        { name = "roids: quest/npc/reward/reagent IDs", fn = testRoidsTable },
+        { name = "roids: reagent count gate", fn = testRoidsReagentGate },
+        { name = "roids: bag rule (>=1 reagent at exactly its count)", fn = testRoidsBagRule },
+        { name = "roids: two-step accept then complete", fn = testRoidsTwoStep },
+        { name = "roids: reward taken by item ID 8410", fn = testRoidsRewardByID },
+        { name = "delivery verifier: both directions", fn = testDeliveryDirection },
+        { name = "e'ko + roids: gossip AND greeting entry paths", fn = testEkoRoidsEntryPaths },
     }
     local allPass = true
     for _, t in ipairs(suite) do
@@ -3188,7 +4187,8 @@ if ns.RegisterDebugCommand then
     ns:RegisterDebugCommand("gossip", function()
         Auto.DEBUG_GOSSIP = not Auto.DEBUG_GOSSIP
         ns:Print("gossip debug " .. (Auto.DEBUG_GOSSIP and "ON" or "OFF")
-            .. " -- DMT/Orb/Sayge gates narrate their refusals.")
+            .. " -- DMT/Orb/Sayge gates narrate their refusals, and Mau'ari"
+            .. " (10307) / Drazial (7505) print which WINDOW they used.")
         if Auto.DEBUG_GOSSIP then
             ns:Print(("  sayge: last interaction %s ; re-entry lock %s")
                 :format(Auto._saygeInteractAt and (string.format("%.1fs ago",

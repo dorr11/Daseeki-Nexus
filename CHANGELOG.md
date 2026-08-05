@@ -86,6 +86,39 @@
   Rin'wosho; a coin hand-in could pull the Zanza reward priority onto it. They now live
   with the other coins, and the coin turn-ins pick by quest ID with the priority the coins
   you are actually carrying decide — highest-priority complete set first.
+- **Fixed:** **the Winterspring E'ko and R.O.I.D.S. turn-ins were two words each and
+  nothing else.** Both features were steered entirely by looking for a word in a quest
+  title — "e'ko" for one, "roids" for the other — with no idea which NPC they were talking
+  to, how many E'ko you were carrying, or which quest was which. Both now know exactly what
+  they are doing, by quest ID.
+- **Added:** **E'ko is turned in the way it is meant to be:** the first type you are
+  carrying **three or more** of, in the order Frostmaul → Winterfall → Chillwind →
+  Shardtooth → Ice Thistle → Wildkin → Frostsaber, and only at **Witch Doctor Mau'ari**.
+  Two of a type is no longer enough to start a turn-in that cannot finish, and holding
+  several types no longer means whichever one Mau'ari happened to list first.
+- **Added:** **R.O.I.D.S. checks that you can actually complete it before it starts.** It
+  needs **3 Snickerfang Jowls, 2 Blasted Boar Lungs and 1 Scorpok Pincer** — the counts
+  matter, one of each is not enough — it only runs at **Bloodmage Drazial**, it takes the
+  **two interactions** the quest really needs (accept on the first, hand in on the second),
+  and it takes the R.O.I.D.S. itself by item, not by "whatever is first on the board".
+- **Added:** a **full bag** no longer costs you the reward. R.O.I.D.S. proceeds on a full
+  bag only when at least one of the three reagents is held at exactly the required count —
+  that stack is used up by the turn-in and frees the slot in time — and refuses when every
+  stack has spares and nothing would be freed.
+- **Added:** both turn-ins now use the same safety net as the Zanza flow. A hand-in that
+  the server refuses is set aside for **30 seconds**, and for E'ko an immediate re-open
+  walks to the **next type** you are carrying rather than retrying the one that just
+  failed. Delivery is confirmed by actually watching your bags — the R.O.I.D.S. arriving,
+  or the three E'ko leaving — with a 5-second backstop, and you get a chat line either way.
+- **Fixed:** **both features could have been doing nothing at all in-game.** They only ever
+  looked at the older "quest greeting" list; if Mau'ari or Drazial hand their quests out
+  through the **gossip** window instead — which is exactly what turned out to be true of
+  Rin'wosho — the flow was never entered. Both windows are now wired for both NPCs, so it
+  no longer matters which one they use.
+- **Changed:** holding **Shift** as you open either window still skips both flows, and
+  quests these features do not own are now left strictly alone: with a quest on screen that
+  Nexus can identify as not one of its own, it will not accept, complete or take a reward
+  for it, whatever the quest happens to be called.
 
 ## 1.1.3 — 2026-08-05
 
