@@ -1,5 +1,42 @@
 # Changelog
 
+## Unreleased
+
+- **Fixed:** **the Zanza buff turn-in never ran at Rin'wosho.** Rin'wosho hands his quests
+  out through the *gossip* window — the same menu his vendor option sits on — but Nexus
+  only ever picked quests off the older "quest greeting" list, and its gossip handler knew
+  about Dire Maul, Blackwing Lair and Sayge and nothing else. So the flow was not refusing
+  to run, or running and failing: it was **never starting**. Nexus now reads the quest
+  lists on the gossip window itself and takes the turn-in from there, so walking up to
+  Rin'wosho with a Zandalar Honor Token does what the checkbox always promised.
+- **Added:** the whole set of guards the turn-in is supposed to carry. It only ever touches
+  quest **8243** — the two other quests Rin'wosho offers are never auto-progressed — and it
+  needs a Zandalar Honor Token in hand. Rewards go **Swiftness → Spirit → Sheen**, each one
+  individually tickable, and that order is now fixed no matter what order you ticked the
+  boxes in. **Leaving all three unticked means all three**, so turning the feature on is
+  the only setup it needs.
+- **Added:** **flasks sitting in your bank count as owned.** Nexus takes a snapshot of your
+  bank whenever you open it and keeps it for the rest of the session, so it will not hand
+  you a second Swiftness when one is already banked. That snapshot is **never written to
+  disk** — a reload or relog forgets it entirely, and it comes back the next time you
+  visit a bank.
+- **Added:** a full bag guards nothing when you are holding exactly one token (the turn-in
+  frees the slot in time), but a full bag with a **spare** token correctly refuses.
+- **Added:** if the server refuses a reward, that flask is set aside for 30 seconds and an
+  immediate re-open walks to the **next** one on your list instead of retrying the one that
+  just failed. Delivery is confirmed by watching for the item to actually land, with a
+  5-second backstop — you get a chat line either way.
+- **Added:** if you already hold **every** flask you have enabled, the reward window is
+  **left open** and Nexus watches your bags — drink one and the replacement is taken
+  automatically, with no need to talk to Rin'wosho again.
+- **Added:** holding **Shift** as you open the gossip window skips the whole thing, exactly
+  as it does at Mau'ari, Vinchaxa and Drazial.
+- **Fixed:** "zulian", "razzashi" and "hakkari" were being treated as Zanza keywords. They
+  are the three **coins** of the third Zul'Gurub coin turn-in and have nothing to do with
+  Rin'wosho; a coin hand-in could pull the Zanza reward priority onto it. They now live
+  with the other coins, and the coin turn-ins pick by quest ID with the priority the coins
+  you are actually carrying decide — highest-priority complete set first.
+
 ## 1.1.3 — 2026-08-05
 
 - **Fixed:** **one character's bags could stay wrong on another account for hours, even
