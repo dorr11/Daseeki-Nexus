@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.1.2 — 2026-08-04
 
 - **Fixed:** a **gold-only change could go missing on your other accounts.** Take money
   out of the mailbox (or sell to a vendor, finish a trade, collect an auction) and nothing
