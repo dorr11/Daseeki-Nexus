@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+- **Added:** **Felwood node timers now show on the minimap**, not just on the world map.
+  Songflower, tuber and Night Dragon's Breath minimap pins each carry the same dark
+  countdown chip the world map pins got — sitting just above the pin, in the same colour
+  the timers panel uses for that node, so a glance at the minimap tells you how long a
+  flower has left without opening the map. The chip is sized down to suit the minimap, and
+  a pin sitting right at the top edge puts its chip underneath itself instead of off the
+  minimap. Pins with nothing to count down (available, or no data) show no chip at all,
+  exactly as before.
+- **Fixed:** the Felwood pin-size sliders could appear to do nothing on some profiles. The
+  sliders read your saved size from three possible keys, but the pins themselves only ever
+  read the first one — so a size carried in from an import (or written by an older build)
+  showed in the slider while the pins stayed at the default. **The pins now read the size
+  the same way the slider does.**
+
 ## 1.1.2 — 2026-08-04
 
 - **Fixed:** a **gold-only change could go missing on your other accounts.** Take money

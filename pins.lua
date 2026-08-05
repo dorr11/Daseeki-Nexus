@@ -28,6 +28,12 @@
 --      icon resolvers. Three pin kinds exist and all three are covered: flower
 --      (10 nodes), tuber (6), dragon (4).
 --
+-- ROUND-29 (owner screenshot of the Felwood MINIMAP): the ROUND-28 chip landed on
+-- the world map ONLY — minimap pins had the real icon and the state ring but no
+-- countdown. The chip now renders on minimap pins too, on the same model at
+-- derived (smaller) metrics, for every pin kind the minimap draws. See the CHIP
+-- GEOMETRY block below for the scaling rule and the overflow decision.
+--
 -- Clean-room build: functional reimplementation from spec; no third-party code.
 
 local ADDON, ns = ...
@@ -169,6 +175,107 @@ function Pins.TimerToken(st)
 end
 
 ----------------------------------------------------------------------
+-- CHIP GEOMETRY + CONTENT (pure; above the DaseekiUI guard so the headless suite
+-- covers it).
+--
+-- ROUND-29 (owner screenshot of the Felwood MINIMAP): ROUND-28 gave the countdown
+-- chip to the WORLD MAP only — minimap pins drew the real icon and the state ring
+-- but carried no timer at all, deliberately. The owner wants the timer there too,
+-- so the same chip now renders on the minimap, scaled for the space.
+--
+-- ONE MODEL, TWO SIZES. The minimap chip is NOT a second design with its own
+-- numbers: every minimap value below is the world value put through the single
+-- ratio MINI_CHIP_SCALE. Retune the world chip and the minimap chip follows it,
+-- which is the whole reason no fresh magic numbers appear here.
+--
+-- OVERFLOW — DECISION: the minimap chip is NOT clipped to the minimap circle.
+--   * Minimap does not clip its children in the first place; enforcing a clip
+--     would mean wrapping the pins in a masked/scroll container, which would clip
+--     the ICONS and RINGS too — a much larger change to fix a cosmetic edge case.
+--   * A clipped chip renders as truncated numerals, which is precisely the
+--     unreadability the owner reported in ROUND-28. Half a timer is worse than a
+--     timer poking a few pixels past the rim.
+--   * Overflowing badges at the rim is what every mainstream minimap-pin addon
+--     already does, so it reads as normal rather than broken.
+-- The one case that WOULD look broken — a pin at the very top of the minimap
+-- throwing its chip clear off the minimap and over the zone text — is handled by
+-- position instead of by clipping: Pins.ChipSide flips the chip BELOW the pin in
+-- that band. What remains is a few pixels of deliberate spill.
+----------------------------------------------------------------------
+
+local CHIP_PAD_X, CHIP_PAD_Y = 4, 2   -- text padding inside the chip
+local CHIP_GAP               = 3      -- gap between the chip and the icon
+local CHIP_MIN_W, CHIP_MIN_H = 16, 11 -- floor, so a "5s" chip is not a sliver
+local CHIP_FILL_ALPHA        = 0.94
+local CHIP_EDGE_ALPHA        = 0.9
+local CHIP_LEVEL_LIFT        = 5      -- frame levels above the pin
+
+-- The single ratio the minimap chip is derived through.
+local MINI_CHIP_SCALE = 0.8
+-- Font floor: the options timer-font slider's own lower bound (6-20pt). The scaled
+-- minimap size is clamped to THAT rather than to a freshly invented minimum.
+local CHIP_FONT_MIN = 6
+
+local function miniScale(v)
+    local s = math.floor(v * MINI_CHIP_SCALE + 0.5)
+    if s < 1 then s = 1 end
+    return s
+end
+
+-- Read-only metric tables, one per surface. Fields are the same names on both, so
+-- every consumer below is surface-agnostic.
+local CHIP_METRICS = {
+    world = {
+        padX = CHIP_PAD_X, padY = CHIP_PAD_Y, gap = CHIP_GAP,
+        minW = CHIP_MIN_W, minH = CHIP_MIN_H,
+    },
+    minimap = {
+        padX = miniScale(CHIP_PAD_X), padY = miniScale(CHIP_PAD_Y), gap = miniScale(CHIP_GAP),
+        minW = miniScale(CHIP_MIN_W), minH = miniScale(CHIP_MIN_H),
+    },
+}
+
+-- Chip metrics for a surface ("world" | "minimap"). Unknown surfaces get the world
+-- chip, which is the conservative answer (bigger, always legible).
+function Pins.ChipMetrics(surface)
+    return CHIP_METRICS[surface] or CHIP_METRICS.world
+end
+
+-- Chip font size in points. The world chip uses the user's configured size
+-- verbatim; the minimap chip uses that same size through the ratio, never below
+-- the slider's own floor — so the minimap timer still tracks the slider.
+function Pins.ChipFontSize(surface, worldPt)
+    worldPt = tonumber(worldPt) or 10
+    if surface ~= "minimap" then return worldPt end
+    local pt = math.floor(worldPt * MINI_CHIP_SCALE + 0.5)
+    if pt < CHIP_FONT_MIN then pt = CHIP_FONT_MIN end
+    return pt
+end
+
+-- Which side of a MINIMAP pin its chip sits on. Above by default (matching the
+-- world map); below when an above-chip would leave the minimap entirely.
+--   pinTopY  offset of the pin's TOP edge from the minimap centre (+ = up)
+--   radius   the minimap's radius in pixels
+function Pins.ChipSide(pinTopY, chipH, gap, radius)
+    pinTopY = tonumber(pinTopY) or 0
+    chipH   = tonumber(chipH) or 0
+    gap     = tonumber(gap) or 0
+    radius  = tonumber(radius) or 0
+    if pinTopY + gap + chipH > radius then return "below" end
+    return "above"
+end
+
+-- Chip CONTENT for a surface. The `surface` argument deliberately does NOT change
+-- the answer: a minimap chip and a world chip for the same node state must read
+-- the same and ink the same — only their GEOMETRY differs. It exists so the
+-- self-test can state the dock-agreement gate once PER SURFACE, and so any future
+-- attempt to give one surface its own colour rule has to be a visible edit here
+-- rather than a quiet divergence in a refresh loop.
+function Pins.ChipContent(surface, st)
+    return Pins.TimerText(st), Pins.TimerToken(st)
+end
+
+----------------------------------------------------------------------
 -- Pure minimap projection (registered ABOVE the DaseekiUI guard so the
 -- fixture self-test runs headless).
 --
@@ -248,6 +355,34 @@ ns:RegisterSelfTest("pins", function(verbose)
         check(Pins.TimerToken({ state = "down", remaining = 300 }) == "warn", "5min   -> yellow (inclusive-below)")
         check(Pins.TimerToken({ state = "down", remaining = 899 }) == "warn", "<15min -> yellow")
         check(Pins.TimerToken({ state = "down", remaining = 900 }) == "danger","15min  -> red (inclusive-below)")
+
+        --------------------------------------------------------------
+        -- ROUND-29: THE AGREEMENT GATE COVERS THE MINIMAP CHIP TOO.
+        -- The minimap chip is a second RENDER of the same content, so the
+        -- dock-ink agreement above has to hold for it as well. These go through
+        -- Pins.ChipContent(surface, ...) — the exact call BOTH refresh loops make
+        -- — so a surface that ever grew its own colour rule breaks here.
+        --------------------------------------------------------------
+        for _, surface in ipairs({ "world", "minimap" }) do
+            for _, rem in ipairs(sweep) do
+                local text, token = Pins.ChipContent(surface, { state = "down", remaining = rem })
+                check(token == D.SongflowerCountdownToken(rem),
+                    surface .. " chip ink == dock ink @ " .. rem .. "s remaining")
+                check(text == Pins.TimerText({ state = "down", remaining = rem }),
+                    surface .. " chip text == the shared countdown text @ " .. rem .. "s")
+            end
+        end
+        -- ...and the two surfaces cannot disagree with EACH OTHER either: same
+        -- node state, same numerals, same ink, on the map and on the minimap.
+        for _, rem in ipairs(sweep) do
+            local wText, wTok = Pins.ChipContent("world",   { state = "down", remaining = rem })
+            local mText, mTok = Pins.ChipContent("minimap", { state = "down", remaining = rem })
+            check(wText == mText and wTok == mTok,
+                "world and minimap chips agree @ " .. rem .. "s remaining")
+        end
+        local eW, ekW = Pins.ChipContent("world",   { state = "expired", remaining = -125 })
+        local eM, ekM = Pins.ChipContent("minimap", { state = "expired", remaining = -125 })
+        check(eW == eM and ekW == ekM and ekM == "ok", "expired chip agrees across surfaces (green)")
     end
 
     -- Chip text + the no-chip contract (unchanged from the pre-chip label rules:
@@ -260,8 +395,62 @@ ns:RegisterSelfTest("pins", function(verbose)
     for _, s in ipairs({ "up", "stale", "unknown", "brand-new-state" }) do
         check(Pins.TimerText({ state = s }) == nil, s .. " -> no chip (text)")
         check(Pins.TimerToken({ state = s }) == nil, s .. " -> no chip (ink)")
+        -- ROUND-29: the no-chip contract is per SURFACE — a state that draws no
+        -- world chip must draw no minimap chip either (nil text => setChipText
+        -- hides the frame outright on both).
+        for _, surface in ipairs({ "world", "minimap" }) do
+            local text, token = Pins.ChipContent(surface, { state = s })
+            check(text == nil and token == nil, s .. " -> no " .. surface .. " chip")
+        end
     end
     check(Pins.TimerText(nil) == nil and Pins.TimerToken(nil) == nil, "nil state -> no chip")
+    do
+        local nText, nTok = Pins.ChipContent("minimap", nil)
+        check(nText == nil and nTok == nil, "nil state -> no minimap chip")
+    end
+
+    ------------------------------------------------------------------
+    -- ROUND-29: minimap chip GEOMETRY — derived from the world chip, not invented.
+    -- Every assertion is RELATIVE (smaller than the world chip, still usable),
+    -- so retuning the world chip or the ratio keeps the suite honest instead of
+    -- pinning a number that would have to be edited in two places.
+    ------------------------------------------------------------------
+    local CW, CM = Pins.ChipMetrics("world"), Pins.ChipMetrics("minimap")
+    check(type(CW) == "table" and type(CM) == "table", "chip metrics exist for both surfaces")
+    check(Pins.ChipMetrics("nonsense") == CW, "unknown surface falls back to the world chip")
+    check(Pins.ChipMetrics(nil) == CW, "nil surface falls back to the world chip")
+    for _, k in ipairs({ "padX", "padY", "gap", "minW", "minH" }) do
+        check(type(CM[k]) == "number" and CM[k] >= 1, "minimap chip " .. k .. " is a usable number")
+        check(type(CW[k]) == "number" and CW[k] >= 1, "world chip " .. k .. " is a usable number")
+        check(CM[k] <= CW[k], "minimap chip " .. k .. " never exceeds the world chip's " .. k)
+    end
+    check(CM.padX < CW.padX and CM.minW < CW.minW and CM.minH < CW.minH,
+        "the minimap chip is genuinely smaller (padding + floor box)")
+
+    -- Chip FONT: world verbatim, minimap scaled, never below the options slider's
+    -- own 6pt floor, and still tracking the slider across its range.
+    check(Pins.ChipFontSize("world", 14) == 14, "world chip uses the configured font size verbatim")
+    check(Pins.ChipFontSize("minimap", 14) < 14, "minimap chip font is smaller than the world's")
+    check(Pins.ChipFontSize("minimap", 6) == 6, "minimap chip font never drops below the 6pt slider floor")
+    check(Pins.ChipFontSize("minimap", 20) > Pins.ChipFontSize("minimap", 10),
+        "minimap chip font still tracks the slider")
+    check(Pins.ChipFontSize("minimap", nil) == Pins.ChipFontSize("minimap", 10),
+        "minimap chip font defaults from the world default (10pt)")
+    check(Pins.ChipFontSize("minimap", "bogus") == Pins.ChipFontSize("minimap", 10),
+        "minimap chip font survives a junk setting")
+
+    -- Chip SIDE (the overflow decision: never clipped, flipped instead). A pin at
+    -- the top of the minimap would throw an above-chip clear off the minimap, so
+    -- the chip goes below it there; everywhere else it sits above, as on the map.
+    do
+        local R, H, G = 70, CM.minH, CM.gap
+        check(Pins.ChipSide(0, H, G, R) == "above", "pin at the centre -> chip above")
+        check(Pins.ChipSide(-R + 4, H, G, R) == "above", "pin near the bottom rim -> chip above")
+        check(Pins.ChipSide(R - 1, H, G, R) == "below", "pin at the top rim -> chip flips below")
+        check(Pins.ChipSide(R - G - H, H, G, R) == "above", "a chip that exactly fits stays above")
+        check(Pins.ChipSide(R - G - H + 1, H, G, R) == "below", "one pixel past the fit flips it below")
+        check(Pins.ChipSide(nil, nil, nil, R) == "above", "junk geometry degrades to the map's own side")
+    end
 
     ------------------------------------------------------------------
     -- ROUND-28: pin ART. This asserts the CONTRACT, not a fixed value — in a live
@@ -323,8 +512,19 @@ local function kindEnabled(kind)
     return c.showTuberPins ~= false
 end
 
-local function worldPinSize()   return felwoodCfg().worldPinSize   or 14 end
-local function minimapPinSize() return felwoodCfg().minimapPinSize or 12 end
+-- Pin sizes. options.lua's two merged sliders WRITE the legacy base key AND both
+-- split keys (flower + tuber), and READ base -> split -> default. These mirror
+-- that same chain, so a profile carrying only a split key (an NWB import, or a
+-- value written by an older build) sizes its pins the way the slider displays them
+-- instead of silently falling back to the default.
+local function worldPinSize()
+    local c = felwoodCfg()
+    return c.worldPinSize or c.worldFlowerSize or c.worldTuberSize or 14
+end
+local function minimapPinSize()
+    local c = felwoodCfg()
+    return c.minimapPinSize or c.minimapFlowerSize or c.minimapTuberSize or 12
+end
 -- World-map pin countdown font size, pt (round-12 restore 3a: the options slider
 -- writes felwood.worldTimerFont but nothing read it — the pin timer used a fixed
 -- font object). Clamped to the slider's 6-20 range; default 10.
@@ -457,20 +657,22 @@ end
 --
 -- COST: created ONCE per pin, then only SetText/SetSize/colour per refresh. No
 -- per-tick frame or texture creation.
+--
+-- ROUND-29: the same chip is now built for MINIMAP pins too, at the scaled
+-- metrics from Pins.ChipMetrics("minimap"). The chip is a CHILD of its pin and
+-- anchored to it, so a minimap pin being re-anchored every second as the player
+-- moves carries its chip along for free — no second position to keep in sync.
 ----------------------------------------------------------------------
 
-local CHIP_PAD_X, CHIP_PAD_Y = 4, 2   -- text padding inside the chip
-local CHIP_GAP                = 3     -- gap between the chip's bottom and the icon's top
-local CHIP_FILL_ALPHA         = 0.94
-local CHIP_EDGE_ALPHA         = 0.9
-local CHIP_LEVEL_LIFT         = 5     -- frame levels above the pin
-
-local function ensureChip(pin)
+-- Build the chip for `pin` at `surface`'s metrics. The surface is fixed for the
+-- life of the pin (world pins and minimap pins are different frames).
+local function ensureChip(pin, surface)
     if pin._chip then return pin._chip end
+    local m = Pins.ChipMetrics(surface)
     local chip = CreateFrame("Frame", nil, pin, "BackdropTemplate")
     chip:SetFrameStrata("HIGH")
     chip:SetFrameLevel((tonumber(pin.GetFrameLevel and pin:GetFrameLevel()) or 1) + CHIP_LEVEL_LIFT)
-    chip:SetPoint("BOTTOM", pin, "TOP", 0, CHIP_GAP)
+    chip:SetPoint("BOTTOM", pin, "TOP", 0, m.gap)
     chip:Hide()
 
     -- Near-black halo, one pixel proud of the chip on every side.
@@ -492,25 +694,59 @@ local function ensureChip(pin)
     timer:SetPoint("CENTER", chip, "CENTER", 0, 0)
     chip._timer = timer
 
-    pin._chip  = chip
-    pin._timer = timer
+    pin._chip     = chip
+    pin._timer    = timer
+    pin._chipM    = m
+    pin._chipSide = "above"
     return chip
 end
 
 -- Apply text + ink and size the chip to fit; nil text hides it outright (the
--- "no chip when there is no timer" contract). Returns nothing.
+-- "no chip when there is no timer" contract, identical on both surfaces).
 local function setChipText(pin, text, token)
     local chip = pin._chip
     if not chip then return end
     if not text then chip:Hide(); return end
+    local m = pin._chipM or Pins.ChipMetrics("world")
     local timer = pin._timer
     timer:SetText(text)
     timer:SetTextColor(UI.Color(token or "text"))
     local w = tonumber(timer.GetStringWidth and timer:GetStringWidth()) or 0
     local h = tonumber(timer.GetStringHeight and timer:GetStringHeight()) or 0
-    chip:SetSize(math.max(16, math.floor(w + 0.5) + CHIP_PAD_X * 2),
-                 math.max(11, math.floor(h + 0.5) + CHIP_PAD_Y * 2))
+    chip:SetSize(math.max(m.minW, math.floor(w + 0.5) + m.padX * 2),
+                 math.max(m.minH, math.floor(h + 0.5) + m.padY * 2))
     chip:Show()
+end
+
+-- (Re)anchor the chip above or below its pin. Idempotent and cheap: the current
+-- side is remembered, so the 1s minimap refresh only re-runs SetPoint on a change.
+local function setChipSide(pin, side)
+    local chip = pin._chip
+    if not chip or pin._chipSide == side then return end
+    local m = pin._chipM or Pins.ChipMetrics("world")
+    chip:ClearAllPoints()
+    if side == "below" then
+        chip:SetPoint("TOP", pin, "BOTTOM", 0, -m.gap)
+    else
+        chip:SetPoint("BOTTOM", pin, "TOP", 0, m.gap)
+    end
+    pin._chipSide = side
+end
+
+-- Push the surface's chip font onto the pin's timer string. Core's PICKED face is
+-- read from UI.fonts.small so a live font-picker change reaches the chip, and the
+-- result is cached by face+size (round-12 restore 3a / round-14; ROUND-29 makes it
+-- surface-aware so the minimap gets the scaled size off the same slider).
+local function applyChipFont(pin, surface)
+    if not pin._timer then return end
+    local base = UI and UI.fonts and UI.fonts.small
+    local face, _, fl = base and base:GetFont()
+    if not face then return end
+    local fsz = Pins.ChipFontSize(surface, worldTimerFont())
+    if pin._timerSz ~= fsz or pin._timerFace ~= face then
+        pin._timer:SetFont(face, fsz, fl)
+        pin._timerSz, pin._timerFace = fsz, face
+    end
 end
 
 ----------------------------------------------------------------------
@@ -543,7 +779,7 @@ local function ensureWorldPin(kind, index, node)
     pin:SetSize(pinBox(sz), pinBox(sz))
     pin:SetFrameStrata("HIGH")
     stylePin(pin, kind, sz)
-    ensureChip(pin)
+    ensureChip(pin, "world")
 
     pin:SetScript("OnEnter", function(self)
         GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
@@ -600,23 +836,15 @@ local function refreshWorldPins()
                     local sz = worldPinSize()
                     pin:SetSize(pinBox(sz), pinBox(sz))
                     stylePin(pin, kind, sz)
-                    -- Apply the configured world-map timer font size on Core's PICKED face
-                    -- (round-12 restore 3a; round-14: read the face from UI.fonts.small so a
-                    -- live font-picker change reaches the pin — cached by face+size).
-                    local base = UI and UI.fonts and UI.fonts.small
-                    local face, _, fl = base and base:GetFont()
-                    local fsz = worldTimerFont()
-                    if face and (pin._timerSz ~= fsz or pin._timerFace ~= face) then
-                        pin._timer:SetFont(face, fsz, fl); pin._timerSz = fsz; pin._timerFace = face
-                    end
+                    applyChipFont(pin, "world")
                     pin:ClearAllPoints()
                     pin:SetPoint("CENTER", canvas, "TOPLEFT", node.x * cw, -node.y * ch)
                     local st = nodeState(kind, index)
                     tintPin(pin, st.state)
                     -- ROUND-28: chip above the icon, inked by the DOCK's songflower
-                    -- rule (Pins.TimerToken). nil text => no chip, which is exactly
-                    -- what the old empty label rendered as.
-                    setChipText(pin, Pins.TimerText(st), Pins.TimerToken(st))
+                    -- rule (through Pins.ChipContent -> Pins.TimerToken). nil text =>
+                    -- no chip, which is exactly what the old empty label rendered as.
+                    setChipText(pin, Pins.ChipContent("world", st))
                     pin:Show()
                 end
             else
@@ -693,6 +921,9 @@ local function ensureMinimapPin(kind, index, node)
     pin:SetSize(pinBox(sz), pinBox(sz))
     pin:SetFrameStrata("HIGH")
     stylePin(pin, kind, sz)
+    -- ROUND-29: minimap pins carry the countdown chip too, at scaled metrics.
+    -- Parented to the PIN, so it tracks every re-anchor as the player moves.
+    ensureChip(pin, "minimap")
     minimapPins[key] = pin
     return pin
 end
@@ -745,7 +976,19 @@ local function refreshMinimapPins()
                     if dist <= radius then
                         pin:ClearAllPoints()
                         pin:SetPoint("CENTER", Minimap, "CENTER", dx, dy)
-                        tintPin(pin, nodeState(kind, index).state)
+                        local st = nodeState(kind, index)
+                        tintPin(pin, st.state)
+                        -- ROUND-29: the countdown chip, same content and same ink
+                        -- as the world map's (Pins.ChipContent), scaled geometry.
+                        applyChipFont(pin, "minimap")
+                        local text, token = Pins.ChipContent("minimap", st)
+                        setChipText(pin, text, token)
+                        if text then
+                            local m = pin._chipM or Pins.ChipMetrics("minimap")
+                            local chipH = tonumber(pin._chip and pin._chip.GetHeight
+                                                   and pin._chip:GetHeight()) or m.minH
+                            setChipSide(pin, Pins.ChipSide(dy + pinBox(sz) / 2, chipH, m.gap, radius))
+                        end
                         pin:Show()
                     else
                         pin:Hide()   -- outside the minimap view
