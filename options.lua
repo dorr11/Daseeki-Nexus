@@ -2908,6 +2908,56 @@ ns:RegisterSelfTest("options", function(verbose)
     withFaction("Alliance", function()
         ck(ScopeFaction() == "Alliance", "an Alliance player opens on Alliance")
     end)
+
+    ----------------------------------------------------------------------
+    -- SAME-TABLE ASSERTION (owner bug 1.1.4, zanza pick list).
+    --
+    -- The owner's SavedVariables carried two faction blocks with two different
+    -- generations of zanza shape, which raises the obvious question: is the
+    -- Quest section writing into one faction block while auto.lua reads the
+    -- other? It is not. This page reaches the block through
+    -- Store.GetFactionSettings(ScopeFaction()) and auto.lua through
+    -- Store.GetFactionSettings(UnitFactionGroup("player")); both resolve to the
+    -- player's own faction, so both hand back the SAME table — asserted here by
+    -- identity, on both factions, against the shared harness store.
+    --
+    -- The ONE way they can diverge is the Faction segmented control at the top
+    -- of this page, which is a deliberate, labelled, session-only control for
+    -- inspecting the off-faction settings. That divergence is asserted too, so
+    -- the day it stops being deliberate the harness says so.
+    ----------------------------------------------------------------------
+    local AQ = ns.Auto and ns.Auto.AQBlock
+    ck(type(AQ) == "function", "auto.lua exposes its autoQuest accessor for this assertion")
+    if type(AQ) == "function" then
+        for _, f in ipairs({ "Horde", "Alliance" }) do
+            withFaction(f, function()
+                local fs, engine = FS(), AQ()
+                ck(fs ~= nil and engine ~= nil and rawequal(fs.autoQuest, engine),
+                   ("%s: the options page and the engine share ONE autoQuest table"):format(f))
+                if fs and engine then
+                    ck(rawequal(fs.autoQuest.zanza, engine.zanza),
+                       ("%s: ...and ONE zanza block, so a tick lands where the engine reads")
+                       :format(f))
+                    -- Drive it the way the checkbox does and read it back the
+                    -- way Auto.ZanzaPickAndRequest does.
+                    local saved = fs.autoQuest.zanza.priority
+                    fs.autoQuest.zanza.priority = { "swiftness" }
+                    local picks = ns.Auto.ZanzaEnabledPicks(engine.zanza.priority)
+                    ck(#picks == 1 and picks[1] == "swiftness",
+                       ("%s: a tick written by the UI is what the engine picks up"):format(f))
+                    fs.autoQuest.zanza.priority = saved
+                end
+            end)
+        end
+        -- The deliberate exception: an explicit off-faction toggle.
+        withFaction("Horde", function()
+            SetScopeFaction("Alliance")
+            local fs, engine = FS(), AQ()
+            ck(fs and engine and not rawequal(fs.autoQuest, engine),
+               "the Faction toggle deliberately points the page at the OTHER faction block")
+            SetScopeFaction(nil)
+        end)
+    end
     -- Unresolvable faction (pre-login): fall back, but do NOT cache the fallback,
     -- or one early call would pin the wrong faction for the whole session.
     withFaction(nil, function()

@@ -1201,6 +1201,9 @@ local function defaultSettings()
         auraRulesMerged      = false,   -- faction class rules folded into auraRules
         classColorsRetired   = false,   -- classColors parked + cleared
         auraThresholdsRetired = false,  -- auraOpts.thresholds parked + cleared
+        -- autoQuest.zanza.priority normalized from the legacy map/hybrid shapes
+        -- to the canonical array (see Store.MigrateZanzaPriorityShape).
+        zanzaPriorityShapeFixed = false,
         factionSettings     = buildFactionSettings(),
         timerSettings       = defaultTimerSettings(),
         ui = {
@@ -1494,6 +1497,173 @@ function Store.MigrateCoordinateOverrides(db)
 end
 
 ----------------------------------------------------------------------
+-- Zanza pick-list SHAPE migration (owner bug, 1.1.4)
+--
+-- THE BUG, from the owner's own SavedVariables. `autoQuest.zanza.priority` is
+-- supposed to be an ARRAY of ticked reward keys. His file held TWO generations
+-- of shape at once, one per faction block:
+--
+--   Horde     priority = { ["sheen"]=false, ["spirit"]=true, ["swiftness"]=true }
+--   Alliance  priority = { "swiftness", "spirit",
+--                          ["sheen"]=true, ["spirit"]=true, ["swiftness"]=true }
+--
+-- The first is a pure MAP of booleans written by an older options build; the
+-- `sheen=false` in it IS his recorded opt-out. The second is a HYBRID: the
+-- current options.lua appends/removes ARRAY entries (options.lua ~2135) on top
+-- of the older build's stray map keys.
+--
+-- Auto.ZanzaEnabledPicks walks only the ARRAY part, and treats an EMPTY array as
+-- "all three enabled" (deliberate, and kept: Store.ApplyDefaults recurses into
+-- tables, so seeding the three keys as defaults would resurrect an unticked pick
+-- on every single login). On a map-shaped table the array part is empty, so the
+-- engine read "all three" and dispensed the Sheen he had explicitly unticked.
+--
+-- This one-shot pass normalizes every faction block to the canonical array.
+-- Marker-guarded and stamp-don't-wipe, exactly like the tracker's repair keys.
+--
+-- MEMBERSHIP RULES (each one is a harness row):
+--   * ARRAY entries win wherever the array has any recognised key — those are
+--     the newer UI's writes — and the stray map keys are then STRIPPED.
+--   * A map key that is explicitly FALSE is an opt-out and is NEVER a member,
+--     whichever shape it arrives in.
+--   * A MAP-ONLY table starts from all three and removes the explicit falses.
+--     JUDGEMENT CALL: an ABSENT key in a map-shaped table is treated as ON, not
+--     off. The old build wrote a key only when it was touched, and the OLD
+--     ENGINE read every map-shaped table as "all three" — so "on" is the state
+--     the owner actually observed. Reading absence as "off" would silently
+--     switch off flasks he never turned off (`{ sheen=false }` alone would
+--     disable the entire feature). The only behaviour this migration changes is
+--     that opt-outs are now honoured.
+--   * EVERY reward explicitly false has no honest array form: `{}` means "all
+--     three" to the reader, which would resurrect exactly what he turned off.
+--     That block gets `zanza.enabled = false` and `priority = {}` instead — the
+--     same behaviour, stated honestly — and the migration says so in chat.
+--   * A genuinely fresh `{}` is left alone: no map keys, nothing to convert.
+----------------------------------------------------------------------
+
+-- Canonical order, spec §14. auto.lua's Auto.ZANZA_REWARDS is the other copy of
+-- this list; the auto suite asserts the two agree key-for-key, so a change to
+-- either one that is not made to both turns the harness red.
+Store.ZANZA_PRIORITY_ORDER = { "swiftness", "spirit", "sheen" }
+Store.ZANZA_SHAPE_MARKER   = "zanzaPriorityShapeFixed"
+
+local ZANZA_PRIORITY_KEYS = {}
+for _, k in ipairs(Store.ZANZA_PRIORITY_ORDER) do ZANZA_PRIORITY_KEYS[k] = true end
+
+-- Is `k` a plain array index of a table with `n` array entries?
+local function isArrayIndex(k, n)
+    return type(k) == "number" and k % 1 == 0 and k >= 1 and k <= n
+end
+
+-- PURE: table in -> (canonical array, changed, allOff). Never mutates its input.
+--   changed = the stored table is not already exactly this array
+--   allOff  = every reward is explicitly opted out (caller turns the parent off)
+function Store.NormalizeZanzaPriority(priority)
+    local out = {}
+    if type(priority) ~= "table" then
+        return out, priority ~= nil, false
+    end
+
+    local n = #priority
+
+    -- Array part: recognised keys only (junk entries are dropped, and cannot be
+    -- produced by the options UI, which only ever writes the three keys).
+    local arrayHas, arrayN = {}, 0
+    for i = 1, n do
+        local v = priority[i]
+        if type(v) == "string" then
+            local key = v:lower()
+            if ZANZA_PRIORITY_KEYS[key] and not arrayHas[key] then
+                arrayHas[key] = true
+                arrayN = arrayN + 1
+            end
+        end
+    end
+
+    -- Map part: every non-array key, recognised or not (an unrecognised stray
+    -- still has to be stripped, so it still counts as "this is not canonical").
+    local mapFalse, mapKeys = {}, 0
+    for k, v in pairs(priority) do
+        if not isArrayIndex(k, n) then
+            mapKeys = mapKeys + 1
+            if type(k) == "string" and v == false then mapFalse[k:lower()] = true end
+        end
+    end
+
+    -- Genuinely fresh: no array content, no map keys. Leave it empty — the
+    -- reader's "empty means all three" rule is the spec default.
+    if arrayN == 0 and mapKeys == 0 then
+        return out, n > 0, false
+    end
+
+    for _, key in ipairs(Store.ZANZA_PRIORITY_ORDER) do
+        local member
+        if arrayN > 0 then member = arrayHas[key] == true    -- array wins
+        else               member = true end                 -- map-only: absent = on
+        if member and not mapFalse[key] then out[#out + 1] = key end
+    end
+
+    local allOff = (#out == 0)
+
+    local changed = (mapKeys > 0) or (#out ~= n)
+    if not changed then
+        for i = 1, n do
+            if priority[i] ~= out[i] then changed = true break end
+        end
+    end
+
+    return out, changed, allOff
+end
+
+-- The one-shot driver. Rewrites IN PLACE (the options page holds no cached
+-- reference, but identity is free to preserve and cheaper to reason about) and
+-- stamps its marker whether or not anything needed fixing, so it costs one
+-- boolean read on every later login. Returns (blocksFixed, parentsDisabled).
+function Store.MigrateZanzaPriorityShape(db)
+    db = db or Store.db
+    if type(db) ~= "table" then return 0, 0 end
+    if db[Store.ZANZA_SHAPE_MARKER] then return 0, 0 end
+
+    local fsAll = type(db.factionSettings) == "table" and db.factionSettings or nil
+    local fixed, disabled = 0, 0
+
+    if fsAll then
+        for _, fs in pairs(fsAll) do
+            local aq = type(fs) == "table" and fs.autoQuest or nil
+            local z  = type(aq) == "table" and aq.zanza or nil
+            if type(z) == "table" then
+                local out, changed, allOff = Store.NormalizeZanzaPriority(z.priority)
+                if changed then
+                    if type(z.priority) == "table" then
+                        for k in pairs(z.priority) do z.priority[k] = nil end
+                        for i = 1, #out do z.priority[i] = out[i] end
+                    else
+                        z.priority = out
+                    end
+                    fixed = fixed + 1
+                end
+                if allOff then
+                    if z.enabled == true then disabled = disabled + 1 end
+                    z.enabled = false
+                end
+            end
+        end
+    end
+
+    db[Store.ZANZA_SHAPE_MARKER] = true
+
+    if fixed > 0 and ns and ns.Print then
+        ns:Print(("|cffffc020Zanza pick list repaired|r in %d faction block(s) — the flasks "
+            .. "you unticked are honoured again%s"):format(
+            fixed, disabled > 0
+                and "; Zanza automation was switched OFF where every flask was unticked"
+                or ""))
+    end
+
+    return fixed, disabled
+end
+
+----------------------------------------------------------------------
 -- Notes migration (replaces the per-character location-override concept).
 --
 -- The manual-location override is retired in favour of a free-text note. This
@@ -1630,6 +1800,12 @@ function Store.Init()
     -- applyDefaults so factionSettings/autoSummon exists -- and self-disables via
     -- autoSummon.defaultsApplied. Does NOT enable auto-accept (owner decision).
     Store.SeedAutoSummonDefaults(DaseekiNexusDB)
+
+    -- One-shot shape repair of autoQuest.zanza.priority (owner bug 1.1.4: a
+    -- map-shaped pick list read as "all three" and dispensed an unticked flask).
+    -- Runs AFTER applyDefaults for the same reason the seeds do — the faction
+    -- blocks have to exist — and self-disables via its own sticky marker.
+    Store.MigrateZanzaPriorityShape(DaseekiNexusDB)
 
     -- SETTINGS-REWORK ITEM 6: fold the two faction class-rule tables into the
     -- single global db.auraRules. Runs AFTER SeedAuraDefaults so a first-run
@@ -6022,6 +6198,145 @@ local function testOwnAccountAuthority(fails)
     Store._ghostLog     = savedLog
 end
 
+----------------------------------------------------------------------
+-- Zanza pick-list shape migration (owner bug 1.1.4).
+--
+-- Rule per rule, plus the owner's TWO verbatim SavedVariables blocks. Every row
+-- states the shape, the canonical array it must become, and whether the parent
+-- toggle has to be switched off because the honest answer is "none".
+----------------------------------------------------------------------
+local function testZanzaPriorityShape(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+
+    local function arr(t) return table.concat(t, ",") end
+
+    -- name, input, expected array, expected changed, expected allOff
+    local ROWS = {
+        { "fresh empty (a real new install) is left alone",
+          {}, "", false, false },
+        { "map, all true -> all three in spec order",
+          { swiftness = true, spirit = true, sheen = true }, "swiftness,spirit,sheen", true, false },
+        { "OWNER'S HORDE BLOCK (verbatim): map with sheen=false",
+          { ["sheen"] = false, ["spirit"] = true, ["swiftness"] = true }, "swiftness,spirit", true, false },
+        { "OWNER'S ALLIANCE BLOCK (verbatim): hybrid, array wins, strays stripped",
+          { "swiftness", "spirit", ["sheen"] = true, ["spirit"] = true, ["swiftness"] = true },
+          "swiftness,spirit", true, false },
+        { "map, every reward explicitly false -> nothing survives",
+          { swiftness = false, spirit = false, sheen = false }, "", true, true },
+        { "map with ONE opt-out and the rest absent -> absent reads as ON",
+          { sheen = false }, "swiftness,spirit", true, false },
+        { "canonical array is already canonical",
+          { "swiftness", "spirit", "sheen" }, "swiftness,spirit,sheen", false, false },
+        { "array ticked out of order is re-imposed in spec order",
+          { "sheen", "swiftness" }, "swiftness,sheen", true, false },
+        { "an explicit false beats an array entry (a recorded opt-out is never resurrected)",
+          { "sheen", ["sheen"] = false }, "", true, true },
+        { "case is normalised on the way in",
+          { "Swiftness" }, "swiftness", true, false },
+        { "unrecognised stray keys are stripped without changing membership",
+          { "spirit", ["nonsense"] = true }, "spirit", true, false },
+    }
+
+    for _, row in ipairs(ROWS) do
+        local name, input, want, wantChanged, wantAllOff = row[1], row[2], row[3], row[4], row[5]
+        local out, changed, allOff = Store.NormalizeZanzaPriority(input)
+        ck(arr(out) == want, ("%s -> got {%s}, want {%s}"):format(name, arr(out), want))
+        ck(changed == wantChanged, ("%s -> changed=%s, want %s"):format(name, tostring(changed), tostring(wantChanged)))
+        ck(allOff == wantAllOff, ("%s -> allOff=%s, want %s"):format(name, tostring(allOff), tostring(wantAllOff)))
+        -- IDEMPOTENCE, per row: feeding the output back changes nothing.
+        local out2, changed2 = Store.NormalizeZanzaPriority(out)
+        ck(changed2 == false and arr(out2) == want, name .. " -> second pass is a no-op")
+    end
+
+    -- Non-tables never explode.
+    local nilOut, nilChanged = Store.NormalizeZanzaPriority(nil)
+    ck(#nilOut == 0 and nilChanged == false, "nil priority normalises to an empty array, no change")
+    local junkOut, junkChanged = Store.NormalizeZanzaPriority("garbage")
+    ck(#junkOut == 0 and junkChanged == true, "a non-table priority is replaced with an empty array")
+
+    -- The two order tables must not drift apart.
+    if ns.Auto and type(ns.Auto.ZANZA_REWARDS) == "table" then
+        local same = #ns.Auto.ZANZA_REWARDS == #Store.ZANZA_PRIORITY_ORDER
+        if same then
+            for i, r in ipairs(ns.Auto.ZANZA_REWARDS) do
+                if r.key ~= Store.ZANZA_PRIORITY_ORDER[i] then same = false break end
+            end
+        end
+        ck(same, "Store.ZANZA_PRIORITY_ORDER matches Auto.ZANZA_REWARDS key-for-key")
+    end
+
+    ------------------------------------------------------------------
+    -- The driver, against a store shaped exactly like the owner's file.
+    ------------------------------------------------------------------
+    local db = {
+        factionSettings = {
+            Horde = { autoQuest = { zanza = { enabled = true,
+                priority = { ["sheen"] = false, ["spirit"] = true, ["swiftness"] = true } } } },
+            Alliance = { autoQuest = { zanza = { enabled = true,
+                priority = { "swiftness", "spirit",
+                             ["sheen"] = true, ["spirit"] = true, ["swiftness"] = true } } } },
+        },
+    }
+    local hordePri = db.factionSettings.Horde.autoQuest.zanza.priority
+    local fixed, disabled = Store.MigrateZanzaPriorityShape(db)
+    ck(fixed == 2 and disabled == 0, ("both faction blocks repaired, none disabled (got %d/%d)")
+        :format(fixed, disabled))
+    ck(arr(db.factionSettings.Horde.autoQuest.zanza.priority) == "swiftness,spirit",
+       "owner's Horde block -> {swiftness,spirit} (Sheen stays out)")
+    ck(arr(db.factionSettings.Alliance.autoQuest.zanza.priority) == "swiftness,spirit",
+       "owner's Alliance block -> {swiftness,spirit} (stray sheen=true stripped)")
+    ck(db.factionSettings.Horde.autoQuest.zanza.priority.sheen == nil
+        and db.factionSettings.Alliance.autoQuest.zanza.priority.sheen == nil,
+       "no map key survives the rewrite in either block")
+    ck(rawequal(hordePri, db.factionSettings.Horde.autoQuest.zanza.priority),
+       "the rewrite happens IN PLACE (table identity preserved)")
+    ck(db.factionSettings.Horde.autoQuest.zanza.enabled == true,
+       "a block with surviving picks keeps its parent toggle on")
+    ck(db[Store.ZANZA_SHAPE_MARKER] == true, "the marker is stamped once the pass has run")
+
+    -- Marker guard: a second run is a no-op even if the shape rots again.
+    db.factionSettings.Horde.autoQuest.zanza.priority = { sheen = true }
+    local fixed2 = Store.MigrateZanzaPriorityShape(db)
+    ck(fixed2 == 0, "the stamped marker makes a second run a no-op")
+    ck(db.factionSettings.Horde.autoQuest.zanza.priority.sheen == true,
+       "...and it does not touch the store (stamp, do not wipe)")
+
+    -- All-false block: no honest array exists, so the PARENT goes off.
+    local off = { factionSettings = { Horde = { autoQuest = { zanza = {
+        enabled = true, priority = { swiftness = false, spirit = false, sheen = false } } } } } }
+    local offFixed, offDisabled = Store.MigrateZanzaPriorityShape(off)
+    local oz = off.factionSettings.Horde.autoQuest.zanza
+    ck(offFixed == 1 and offDisabled == 1, "an all-false block is repaired and its parent disabled")
+    ck(#oz.priority == 0 and oz.enabled == false,
+       "all-false -> priority {} AND enabled=false (empty alone would resurrect all three)")
+
+    -- Fresh install: nothing to convert, nothing said, marker still stamped.
+    local fresh = { factionSettings = { Alliance = { autoQuest = { zanza =
+        { enabled = false, priority = {} } } } } }
+    local freshFixed = Store.MigrateZanzaPriorityShape(fresh)
+    ck(freshFixed == 0, "a fresh install reports no repairs")
+    ck(fresh.factionSettings.Alliance.autoQuest.zanza.enabled == false
+        and #fresh.factionSettings.Alliance.autoQuest.zanza.priority == 0,
+       "a fresh empty pick list is left exactly as it was")
+    ck(fresh[Store.ZANZA_SHAPE_MARKER] == true, "the marker stamps even when nothing needed fixing")
+
+    -- Malformed stores must not throw.
+    ck(select(1, Store.MigrateZanzaPriorityShape(nil)) == 0, "a nil db is a no-op")
+    ck(select(1, Store.MigrateZanzaPriorityShape({})) == 0, "a db with no factionSettings is a no-op")
+    ck(select(1, Store.MigrateZanzaPriorityShape({ factionSettings = { Horde = 7 } })) == 0,
+       "a junk faction block is skipped, not crashed on")
+
+    -- The shipped default carries the marker key (so applyDefaults installs it
+    -- as false and the pass runs exactly once on an existing save).
+    ck(defaultSettings()[Store.ZANZA_SHAPE_MARKER] == false,
+       "the marker ships as false in the settings defaults")
+
+    -- WIRING: Store.Init must actually call the pass. Without this the whole
+    -- migration can be perfect and never run on a single real login.
+    ck(type(Store.db) == "table" and Store.db[Store.ZANZA_SHAPE_MARKER] == true,
+       "Store.Init ran the pass on the live settings db (marker stamped)")
+end
+
 function Store.RunSelfTests(verbose)
     local suites = {
         { name = "defaults",        fn = testDefaults },
@@ -6046,6 +6361,7 @@ function Store.RunSelfTests(verbose)
         { name = "own-account authority", fn = testOwnAccountAuthority },
         { name = "timer log dedup (F10)", fn = testTimerLogDedup },
         { name = "coordinate overrides (A17.3)", fn = testCoordinateOverrides },
+        { name = "zanza pick-list shape migration", fn = testZanzaPriorityShape },
     }
     local allPass = true
     for _, suite in ipairs(suites) do

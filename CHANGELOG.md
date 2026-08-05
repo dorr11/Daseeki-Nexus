@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- **Fixed:** **a flask you unticked could still be handed to you.** The per-flask
+  checkboxes and the automation were storing your choices in two different formats: an
+  older build saved them as a list of yes/no answers, the current one saves the ticked
+  names, and a save that had been through both ended up holding a mixture. The engine only
+  understood one of those formats, read the other as "nothing recorded", and fell back to
+  its "no picks means all three" rule — so a Sheen you had deliberately unticked came back.
+  Nexus now repairs the stored list **once**, on the next login, in every faction's
+  settings, and tells you in chat when it does. Your unticks survive the repair; that is
+  the whole point of it. If it turns out every flask was unticked, the **Zanza buffs**
+  parent checkbox is switched off rather than silently re-enabling all three, and the chat
+  line says so.
+- **Fixed:** the automation also reads the old formats directly now, so an unticked flask is
+  refused even in the one session where the repair has not run yet, and the generic
+  "choose the reward that matches your priorities" path can no longer fall through to
+  "just take the first one on the board" when it meets an old-format list.
 - **Fixed:** **the Zanza buff turn-in never ran at Rin'wosho.** Rin'wosho hands his quests
   out through the *gossip* window — the same menu his vendor option sits on — but Nexus
   only ever picked quests off the older "quest greeting" list, and its gossip handler knew

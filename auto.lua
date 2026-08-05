@@ -101,6 +101,14 @@ local function asBlock()  return factionSettings().autoSummon end
 local function agoBlock() return factionSettings().autoGossip end
 local function aqBlock()  return factionSettings().autoQuest  end
 
+-- Diagnostic / self-test hook. The options page reaches the very same block
+-- through Store.GetFactionSettings(ScopeFaction()); the options suite asserts
+-- the two accessors land on the SAME table for the logged-in faction, because a
+-- UI that edits one faction block while the engine reads the other is exactly
+-- the class of bug that hid inside the owner's zanza pick list.
+Auto.AQBlock          = aqBlock
+Auto.FactionSettings  = factionSettings
+
 local function globalToggles() return Store.GetSettings() end
 
 ----------------------------------------------------------------------
@@ -879,17 +887,67 @@ Auto.ZG_COIN_SETS = {
 -- three keys there would resurrect a pick the owner deliberately unticked on
 -- every login (the same trap documented on autoSummon.triggers). Treating empty
 -- as the full spec default gives a fresh install the spec's behaviour from the
--- one parent checkbox, with no store migration and no resurrection. PURE.
+-- one parent checkbox, with no resurrection. PURE.
+--
+-- SHAPE HARDENING (owner bug, 1.1.4). The stored list is supposed to be an
+-- ARRAY of ticked keys, and Store.MigrateZanzaPriorityShape now guarantees that
+-- on every login. It did not always: an older options build wrote a MAP of
+-- booleans (`{ sheen = false, spirit = true, swiftness = true }`), and the
+-- current one appends ARRAY entries on top of whatever map keys were already
+-- there. Walking only the array part read a map-shaped table as EMPTY, empty
+-- meant "all three", and the owner was handed the Sheen he had unticked.
+--
+-- So this reader is now shape-tolerant as well, belt to the migration's braces —
+-- if the rewrite ever fails to run (a read-only save, a crash before logout, a
+-- hand-edited file) the engine still refuses to dispense a flask the owner
+-- opted out of:
+--   * an explicitly FALSE map key is NEVER enabled, in any shape;
+--   * where the array part carries recognised keys, it decides membership (it
+--     is the newer UI's write) and stray map keys are ignored;
+--   * a MAP-ONLY table starts from all three and removes the explicit falses,
+--     matching Store.NormalizeZanzaPriority exactly, so what the engine does
+--     before the migration and after it are the same thing;
+--   * "all three" is reserved for a table with NO array content and NO map keys
+--     at all — a genuinely fresh `{}`, which is the only shape that has never
+--     recorded a preference.
 function Auto.ZanzaEnabledPicks(priority)
     local out = {}
-    if type(priority) ~= "table" or #priority == 0 then
+    local function allThree()
         for _, r in ipairs(Auto.ZANZA_REWARDS) do out[#out + 1] = r.key end
         return out
     end
-    local want = {}
-    for _, k in ipairs(priority) do want[lower(k)] = true end
+    if type(priority) ~= "table" then return allThree() end
+
+    local n = #priority
+
+    -- Array part, recognised keys only.
+    local known, arrayHas, arrayN = {}, {}, 0
+    for _, r in ipairs(Auto.ZANZA_REWARDS) do known[r.key] = true end
+    for i = 1, n do
+        local v = priority[i]
+        if type(v) == "string" then
+            local k = lower(v)
+            if known[k] and not arrayHas[k] then arrayHas[k] = true; arrayN = arrayN + 1 end
+        end
+    end
+
+    -- Map part: every non-array key counts as "a preference was recorded here",
+    -- and an explicit false is an opt-out.
+    local mapFalse, mapKeys = {}, 0
+    for k, v in pairs(priority) do
+        if not (type(k) == "number" and k % 1 == 0 and k >= 1 and k <= n) then
+            mapKeys = mapKeys + 1
+            if type(k) == "string" and v == false then mapFalse[lower(k)] = true end
+        end
+    end
+
+    if arrayN == 0 and mapKeys == 0 then return allThree() end
+
     for _, r in ipairs(Auto.ZANZA_REWARDS) do
-        if want[r.key] then out[#out + 1] = r.key end
+        local member
+        if arrayN > 0 then member = (arrayHas[r.key] == true)   -- the array decides
+        else               member = true end                    -- map-only: absent reads as on
+        if member and not mapFalse[r.key] then out[#out + 1] = r.key end
     end
     return out
 end
@@ -1539,7 +1597,15 @@ function Auto.OnQuestComplete()
             local name = GetQuestItemInfo and select(1, GetQuestItemInfo("choice", i)) or nil
             choices[#choices + 1] = { index = i, name = name or "" }
         end
-        local priority = flags.zanza and aqBlock().zanza and aqBlock().zanza.priority or nil
+        -- SHAPE (1.1.4): feed PickReward the ENABLED PICKS, never the raw stored
+        -- list. PickReward walks its priority with ipairs, so a map-shaped store
+        -- handed it nothing and it silently fell through to "take choice 1" —
+        -- the same shape bug as the zanza reader, one call site over, and choice
+        -- 1 can be a flask the owner unticked. ZanzaEnabledPicks normalises the
+        -- shape AND re-imposes the spec order, and its keys ("swiftness", ...)
+        -- are exactly the substrings PickReward matches reward names on.
+        local stored = flags.zanza and aqBlock().zanza and aqBlock().zanza.priority or nil
+        local priority = stored and Auto.ZanzaEnabledPicks(stored) or nil
         rewardIndex = Auto.PickReward(choices, priority) or 1
         for _, c in ipairs(choices) do
             if c.index == rewardIndex then Auto._expectedReward = lower(c.name) end
@@ -2009,6 +2075,170 @@ local function testZanzaPriority()
     return true
 end
 
+-- RULE (owner bug 1.1.4): the reader tolerates the legacy MAP and HYBRID shapes,
+-- and an explicitly unticked flask is never enabled in ANY of them. "All three"
+-- is reserved for a table that has recorded no preference at all.
+local function testZanzaShapeTolerance()
+    local function arr(t) return table.concat(t, ",") end
+
+    -- The owner's two SavedVariables blocks, verbatim.
+    local hordeMap = { ["sheen"] = false, ["spirit"] = true, ["swiftness"] = true }
+    local allianceHybrid = { "swiftness", "spirit",
+                             ["sheen"] = true, ["spirit"] = true, ["swiftness"] = true }
+
+    -- WHY the bug existed: the array part of a map-shaped table is empty, which
+    -- the pre-1.1.4 reader took as "all three".
+    if #hordeMap ~= 0 then return false, "the owner's map block has no array part (premise)" end
+
+    local ROWS = {
+        { "owner HORDE map (sheen=false)", hordeMap,                "swiftness,spirit" },
+        { "owner ALLIANCE hybrid",         allianceHybrid,          "swiftness,spirit" },
+        { "fresh empty",                   {},                      "swiftness,spirit,sheen" },
+        { "canonical array",               { "swiftness", "sheen" },"swiftness,sheen" },
+        { "map, all true",                 { swiftness = true, spirit = true, sheen = true },
+                                                                    "swiftness,spirit,sheen" },
+        { "map, all false",                { swiftness = false, spirit = false, sheen = false }, "" },
+        { "map, one opt-out only",         { sheen = false },       "swiftness,spirit" },
+        { "false beats an array entry",    { "sheen", ["sheen"] = false }, "" },
+        { "stray true never resurrects",   { "spirit", ["sheen"] = true }, "spirit" },
+        { "case-insensitive array",        { "Sheen" },             "sheen" },
+    }
+    for _, row in ipairs(ROWS) do
+        local got = arr(Auto.ZanzaEnabledPicks(row[2]))
+        if got ~= row[3] then
+            return false, ("%s -> {%s}, want {%s}"):format(row[1], got, row[3])
+        end
+    end
+    if arr(Auto.ZanzaEnabledPicks(nil)) ~= "swiftness,spirit,sheen" then
+        return false, "a missing priority table still means all three"
+    end
+
+    -- READ-THROUGH EQUIVALENCE: what the engine dispenses must not change when
+    -- the store's one-shot rewrite lands. For every shape, reading the RAW table
+    -- and reading the MIGRATED table have to give the same answer.
+    --
+    -- The one shape where the stored array cannot say it on its own is
+    -- "everything is off": `{}` reads as all three, so the migration flags
+    -- allOff and Store.MigrateZanzaPriorityShape switches the parent toggle off
+    -- instead of storing a lie. Those rows are asserted that way instead.
+    if ns.Store and ns.Store.NormalizeZanzaPriority then
+        for _, row in ipairs(ROWS) do
+            local normalized, _, allOff = ns.Store.NormalizeZanzaPriority(row[2])
+            if row[3] == "" then
+                if not allOff then
+                    return false, row[1] .. ": an empty result must flag the parent off"
+                end
+            else
+                if allOff then return false, row[1] .. ": allOff flagged with picks surviving" end
+                local after = arr(Auto.ZanzaEnabledPicks(normalized))
+                if after ~= row[3] then
+                    return false, ("%s: reads {%s} before the migration and {%s} after")
+                        :format(row[1], row[3], after)
+                end
+            end
+        end
+    end
+    return true
+end
+
+-- RULE (owner bug 1.1.4, end to end): with the owner's stored shape and all
+-- three flasks on the reward board, Sheen is NEVER requested — not through the
+-- zanza machinery, and not through the generic reward picker either.
+local function testZanzaSheenNeverRequested()
+    local block = Auto.AQBlock and Auto.AQBlock() or nil
+    if type(block) ~= "table" or type(block.zanza) ~= "table" then
+        return false, "the live autoQuest.zanza block is reachable"
+    end
+
+    local SHEEN, SWIFT, SPIRIT = 20080, 20081, 20079
+    local choices = {
+        { index = 1, itemID = SHEEN,  name = "Sheen of Zanza",     key = "sheen"     },
+        { index = 2, itemID = SWIFT,  name = "Swiftness of Zanza", key = "swiftness" },
+        { index = 3, itemID = SPIRIT, name = "Spirit of Zanza",    key = "spirit"    },
+    }
+
+    -- Save every piece of live state this test drives.
+    local savedPri, savedEnabled = block.zanza.priority, block.zanza.enabled
+    local savedChoices, savedWatch = Auto._zanzaChoices, Auto._zanzaWatch
+    local savedPending, savedCd    = Auto._zanzaPending, Auto._zanzaCooldown
+    local savedOwned, savedGQR     = Auto.OwnedCount, _G.GetQuestReward
+
+    local requested = {}
+    _G.GetQuestReward = function(i) requested[#requested + 1] = i end
+
+    local ownedIDs = {}
+    Auto.OwnedCount = function(id) return ownedIDs[id] or 0 end
+
+    local function attempt(owned)
+        ownedIDs = owned
+        requested = {}
+        Auto._zanzaChoices  = choices
+        Auto._zanzaWatch    = false
+        Auto._zanzaPending  = nil
+        Auto._zanzaCooldown = {}
+        local ok, key = Auto.ZanzaPickAndRequest()
+        return ok, key, requested
+    end
+
+    -- The owner's exact stored shape.
+    block.zanza.enabled  = true
+    block.zanza.priority = { ["sheen"] = false, ["spirit"] = true, ["swiftness"] = true }
+
+    local fail = nil
+
+    -- 1. Both enabled flasks already in the bags — the live symptom. The old
+    --    reader said "all three", found Sheen unowned, and took it.
+    local _, reason, req = attempt({ [SWIFT] = 1, [SPIRIT] = 1 })
+    if req[1] ~= nil then fail = "Sheen was requested when both enabled flasks were owned" end
+    if not fail and reason ~= "all-owned" then
+        fail = "expected all-owned (dialog left open), got " .. tostring(reason)
+    end
+
+    -- 2. Nothing owned: it must take Swiftness first, and still never Sheen.
+    if not fail then
+        local ok2, key2, req2 = attempt({})
+        if not (ok2 and key2 == "swiftness" and req2[1] == 2 and #req2 == 1) then
+            fail = "an empty bag takes Swiftness (index 2), got " .. tostring(key2)
+        end
+    end
+
+    -- 3. Swiftness owned: walk to Spirit, never to Sheen.
+    if not fail then
+        local ok3, key3, req3 = attempt({ [SWIFT] = 1 })
+        if not (ok3 and key3 == "spirit" and req3[1] == 3 and #req3 == 1) then
+            fail = "with Swiftness owned it takes Spirit (index 3), got " .. tostring(key3)
+        end
+    end
+
+    -- 4. The generic reward picker (the other call site) with the same shape.
+    if not fail then
+        local named = { { index = 1, name = "Sheen of Zanza" },
+                        { index = 2, name = "Swiftness of Zanza" },
+                        { index = 3, name = "Spirit of Zanza" } }
+        local picked = Auto.PickReward(named, Auto.ZanzaEnabledPicks(block.zanza.priority))
+        if picked ~= 2 then
+            fail = "PickReward on the map shape must choose Swiftness, got " .. tostring(picked)
+        end
+    end
+
+    -- 5. Post-migration the very same block behaves identically.
+    if not fail and ns.Store and ns.Store.NormalizeZanzaPriority then
+        block.zanza.priority = (ns.Store.NormalizeZanzaPriority(block.zanza.priority))
+        local _, reason5, req5 = attempt({ [SWIFT] = 1, [SPIRIT] = 1 })
+        if req5[1] ~= nil or reason5 ~= "all-owned" then
+            fail = "the migrated array shape must behave exactly like the raw map"
+        end
+    end
+
+    block.zanza.priority, block.zanza.enabled = savedPri, savedEnabled
+    Auto._zanzaChoices, Auto._zanzaWatch      = savedChoices, savedWatch
+    Auto._zanzaPending, Auto._zanzaCooldown   = savedPending, savedCd
+    Auto.OwnedCount,    _G.GetQuestReward     = savedOwned, savedGQR
+
+    if fail then return false, fail end
+    return true
+end
+
 -- RULE: bag space free, UNLESS holding exactly the required token count.
 local function testBagSpaceGuard()
     if not Auto.DecideBagSpace(3, 1, 1) then return false, "free slots proceed" end
@@ -2167,6 +2397,9 @@ function Auto.RunSelfTests(verbose)
         { name = "forbidden quests",    fn = testForbiddenQuests },
         { name = "gossip plan order",   fn = testGossipPlanOrder },
         { name = "zanza priority",      fn = testZanzaPriority },
+        { name = "zanza pick-list shape tolerance", fn = testZanzaShapeTolerance },
+        { name = "zanza: sheen never requested (owner shape, end to end)",
+                                        fn = testZanzaSheenNeverRequested },
         { name = "bag-space guard",     fn = testBagSpaceGuard },
         { name = "zanza entry gate",    fn = testZanzaGate },
         { name = "next-pick walk",      fn = testNextPick },
