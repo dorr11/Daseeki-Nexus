@@ -773,6 +773,39 @@ local function buildGeneral(flow)
         end
     end)
 
+    -- Mesh auto-friend (friends.lua). DEFAULT ON, and an ABSENT key reads as ON
+    -- too, so this box shows ticked on a SavedVariables file written before the
+    -- module existed. Turning it off stops future passes ONLY: no friend is ever
+    -- removed, and the never-re-add ledger is untouched, so re-enabling resumes
+    -- where it stopped. Reads fall back to the raw key so the row still renders
+    -- if friends.lua somehow failed to load.
+    local r4 = sec:AddRow({ vAlign = "center" })
+    register("general", r4:Checkbox({
+        label = "Automatically friend your other accounts' characters",
+        tooltip = "Add every mesh character on your OTHER accounts (same faction, "
+               .. "same realm) to this character's friends list, so mail and "
+               .. "whispers never need a confirmation. Never removes a friend, and "
+               .. "never re-adds one you have removed yourself.",
+        get = function()
+            local F = ns.MeshFriends
+            if F and F.IsEnabled then return F.IsEnabled() end
+            local db = DB()
+            return not db or db.autoFriendMesh ~= false
+        end,
+        set = function(v)
+            local F = ns.MeshFriends
+            if F and F.SetEnabled then F.SetEnabled(v and true or false)
+            else
+                local db = DB()
+                if db then db.autoFriendMesh = v and true or false end
+            end
+            -- Switching it ON mid-session should not wait for the next login,
+            -- but it still may not run against an unconfirmed friends list —
+            -- SchedulePass -> RunPass enforces that itself.
+            if v and F and F.SchedulePass then F.SchedulePass(1) end
+        end,
+    }).Refresh)
+
     -- Location-data status line (round-3 item 16): green when every own
     -- active-faction level-60 has a usable location, amber when some are missing.
     local locStatus = sec:AddRow():Label("")

@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+- **Added:** **every character in your mesh is now on every character's friends list,
+  automatically.** Shortly after you log in, Nexus adds each mesh character that belongs
+  to one of your OTHER accounts — same faction, same realm — to this character's friends
+  list, once. Nothing has to be configured and nothing has to be mailed first: by the time
+  you want to send something, the recipient is already a friend, so Blizzard's "are you
+  sure you want to mail this stranger?" confirmation never appears for any of your own
+  characters. New characters joining the mesh later are picked up as they appear. It is
+  under **General → "Automatically friend your other accounts' characters"** and ships on.
+- **Added:** the auto-friend pass **never re-adds anyone you have removed.** If you take
+  one of these characters off your friends list, that is remembered permanently for that
+  character and Nexus leaves them alone from then on — and the same applies to anyone
+  Daseeki Conduit had already put there, whose record Nexus reads and honours. Nexus never
+  removes a friend, never touches your ignore list, and stops quietly if your friends list
+  is full. Characters on the account you are currently playing are excluded (that is
+  answered from the mesh's account map, never guessed from names), as is anyone whose
+  faction Nexus has not actually seen.
+- **Added:** `/nexus debug friends` shows the setting, whether the friends list has been
+  confirmed by the server yet, how full it is, how many names Conduit's record is holding
+  back, and exactly what the next pass would do to each mesh character, with the reason.
+
 - **Fixed:** **a fully booned character could suddenly show no world buffs at all.** Every
   so often the character you were logged in as dropped its whole rack in Nexus — all the
   world-buff tiles empty — even though the chronoboon was still holding seven buffs, and
