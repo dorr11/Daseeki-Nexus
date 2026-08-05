@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+- **Fixed:** **one character's bags could stay wrong on another account for hours, even
+  with both accounts logged in the whole time.** A character published new bags (gold up
+  from 15,144 to 22,144); the account that was meant to receive it missed that single
+  update — an ordinary dropped message — and then never caught up, holding the older
+  copy for the better part of a day. The catch-up path was the problem. Accounts notice
+  they disagree about a character, and the one that is behind asks for the data; the
+  answer used to be **every character in the namespace**, dozens of full bag payloads,
+  sent down a link that carries about one message a second. That takes many minutes, and
+  the "don't answer this again" window was only fifteen seconds — so every twenty seconds
+  another complete re-send piled up behind the one still going out, the queue grew faster
+  than it drained, and which character actually made it through was luck. **The account
+  that is behind now says exactly what it already has, and gets back only what it is
+  missing** — in the case above, one character's bags instead of forty-four. The two
+  "don't repeat yourself" windows either side are now two minutes, comfortably longer
+  than an answer takes, and the same payload can no longer be queued twice while a copy
+  of it is still waiting to go out.
+- **Added:** `/nexus debug mesh` prints an `ns-backfill` line — how many catch-up answers
+  were targeted versus full re-sends, how many characters were actually sent versus
+  skipped as already-current, and how many duplicate sends were suppressed. On two synced
+  accounts the targeted count should climb while the full-resend count stays at zero;
+  a non-zero full-resend count means a peer is still running an older build.
+- Older and newer builds interoperate in both directions with no version bump: an older
+  account asking for a catch-up still receives the full re-send it expects, and an older
+  account answering one still replies with everything, which the newer side filters on
+  arrival exactly as it always did.
+
 - **Fixed:** **a fully booned character could suddenly show no world buffs at all.** Every
   so often the character you were logged in as dropped its whole rack in Nexus — all the
   world-buff tiles empty — even though the chronoboon was still holding seven buffs, and
