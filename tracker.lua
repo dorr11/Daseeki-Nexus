@@ -358,7 +358,17 @@ Tracker._boonTooltipSeen  = 0
 Tracker._boonScopeRejects = 0
 -- Parsed boon snapshot: { slots = { [slot] = { duration=sec }, ... },
 --                         dmf = bool, count = n }.  Nil until first parse.
+-- A `stale = true` field means "these slots were NOT refreshed by the last read;
+-- they are preserved evidence" (see the evidence-preservation block below).
 Tracker._boonParsed = nil
+
+-- Diagnostics for the evidence-preservation rule, read with /nexus debug sanity.
+--   _boonReadsPreserved — empty reads refused because the boon is provably still there
+--   _boonReadsCleared   — empty reads honoured (the boon really is gone / really is empty)
+--   _boonReadsCold      — of the preserved ones, how many were provably COLD item data
+Tracker._boonReadsPreserved = 0
+Tracker._boonReadsCleared   = 0
+Tracker._boonReadsCold      = 0
 
 local BOON_SOURCE = 2   -- Store.AURA_SOURCE.BOON (kept local so the pure parser
                         -- runs even before Store loads in the self-test harness).
@@ -702,6 +712,158 @@ function Tracker.CollectBoonTooltipText(tip, lookup)
     return table.concat(parts, "\n")
 end
 
+----------------------------------------------------------------------
+-- THE EVIDENCE-PRESERVATION RULE  (house principle: EVIDENCE WINS, ABSENCE
+-- PRESERVES). This is the fix for the intermittent boon WIPE.
+--
+-- THE BUG IT REPAIRS. Owner report: "every so often the character I'm logged in
+-- as will drop all its buffs in Nexus even though I have a full rack booned up —
+-- they come back when I hover the chronoboon". His SavedVariables carry the
+-- proof: Poonyx-Whitemane's SELF record with chronoboonActive = true,
+-- boonCount = 4, dmfInBoon flipped true -> false, a FRESH lastSeen — and
+-- auraStates = {} — while the peers' older copies of the same character still
+-- hold all seven booned slots at source = BOON. The persisted
+-- caches.tooltipBoon["Poonyx-Whitemane"] entry was gone too, while eight other
+-- characters on the same account still had theirs.
+--
+-- HOW A CAPTURE READS ZERO. The chronoboon tooltip scan's only precondition was
+-- that GameTooltipTextLeft1 names the chronoboon. That title line is written
+-- SYNCHRONOUSLY by SetUnitAura; the suspended-effects BODY is not always there
+-- on the same frame — cold item data renders a PARTIAL tooltip that is title and
+-- little else. This is exactly the failure Armory's item scan hit on a cold
+-- SetItemByID, and the lesson is the same: a partial tooltip reads as an honest
+-- empty. ParseBoonBlock over a title-only block returns no slots, and
+-- ReconcileBoonSnapshot's phantom rule ("a cached slot the tooltip does not list
+-- was never really there") then dropped ALL of them, persistBoonCache dropped
+-- the disk cache, and the capture that followed wrote an empty record. Nothing
+-- upstream could catch it: the chronoboon aura itself makes the live scan see at
+-- least one buff, so captureAuras' PARTIAL guard is false and preserveSlots
+-- never runs. One bad frame is enough, and the next hover heals it — which is
+-- precisely what the owner sees.
+--
+-- THE PRECEDENCE TABLE. Applied top-down; the first row that matches decides.
+-- `parsed` = boonable slots this read resolved, `cached` = slots we already hold.
+--
+--  # CONDITION                                            VERDICT   WHY
+--  1 parsed >= 1                                          ADOPT     Positive evidence.
+--                                                                   Reconcile as before —
+--                                                                   phantom rule included,
+--                                                                   because a read that CAN
+--                                                                   see buffs is a read that
+--                                                                   would have seen this one.
+--  2 parsed == 0 and cached == 0                          CLEAR     Nothing to lose. (No-op.)
+--  3 parsed == 0 and the boon item is provably GONE       CLEAR     Used, sold or dropped.
+--    (bag+bank count is 0 on a trustworthy read)                    An empty read agrees with
+--                                                                   the bags: honour it.
+--  4 parsed == 0 and the item's data is NOT cached        PRESERVE  Cold tooltip. The read is
+--    (C_Item.IsItemDataCachedByID == false)                         not evidence of anything;
+--                                                                   request the data and keep
+--                                                                   what we have.
+--  5 parsed == 0 and we CANNOT prove the data is warm     PRESERVE  Belt and braces: no
+--    (no IsItemDataCachedByID on this client, or the                warmth proof means no
+--    bag API was unreadable)                                        trust. A client that
+--                                                                   cannot answer must not be
+--                                                                   able to delete data.
+--  6 parsed == 0, data warm, item present, but the        PRESERVE  A tooltip that rendered
+--    tooltip rendered NO BODY beyond its title                      only its title is partial
+--                                                                   by inspection, whatever
+--                                                                   the item cache says.
+--  7 parsed == 0, data warm, item present, body rendered  CLEAR     The genuine post-release
+--                                                                   state: a real, complete
+--                                                                   tooltip that lists nothing.
+--
+-- PRESERVE does NOT mean "pretend we read it". The kept snapshot is flagged
+-- `stale = true` (un-refreshed evidence, not a fresh observation), the disk cache
+-- is left exactly as it was rather than being nil'd, and no capture is requested
+-- — a preserved read is by definition not a change. The slots themselves stay
+-- verbatim, so what the mesh publishes is the last good reading and never an
+-- authoritative empty.
+--
+-- The classifier is PURE over its argument so the whole table is mutation-testable
+-- without a client; the impure probing lives in Tracker.BoonItemEvidence.
+----------------------------------------------------------------------
+
+Tracker.BOON_READ_ADOPT    = "ADOPT"
+Tracker.BOON_READ_CLEAR    = "CLEAR"
+Tracker.BOON_READ_PRESERVE = "PRESERVE"
+
+-- ctx = { parsedSlots, cachedSlots, itemPresent, itemKnown, dataCached, hasBody }
+--   dataCached: true / false / nil (nil = this client cannot tell us)
+--   itemKnown:  false when the bag API could not be read at all (teardown, cold)
+function Tracker.ClassifyBoonRead(ctx)
+    ctx = type(ctx) == "table" and ctx or {}
+    local parsed = tonumber(ctx.parsedSlots) or 0
+    local cached = tonumber(ctx.cachedSlots) or 0
+
+    if parsed > 0 then return Tracker.BOON_READ_ADOPT end          -- 1
+    if cached <= 0 then return Tracker.BOON_READ_CLEAR end         -- 2
+    if ctx.itemKnown and not ctx.itemPresent then                  -- 3
+        return Tracker.BOON_READ_CLEAR
+    end
+    if ctx.dataCached == false then return Tracker.BOON_READ_PRESERVE end  -- 4
+    if ctx.dataCached == nil or not ctx.itemKnown then             -- 5
+        return Tracker.BOON_READ_PRESERVE
+    end
+    if not ctx.hasBody then return Tracker.BOON_READ_PRESERVE end  -- 6
+    return Tracker.BOON_READ_CLEAR                                 -- 7
+end
+
+-- Probe the chronoboon ITEM: is one in the player's bags or bank, and is its item
+-- data warm? Returns present(bool), known(bool), dataCached(bool|nil).
+--
+-- The BANK COUNTS. A charged displacer parked in the bank is still a boon the
+-- character owns, and reading "no item" for it would let rule 3 clear a record
+-- that is perfectly intact. rec.boonCount deliberately stays bags-only ("do I
+-- have one on me right now"); this probe answers a different question and takes
+-- the wider count.
+--
+-- `known` is false during teardown and inside the post-loading-screen grace, the
+-- two windows where C_Item is documented to answer 0 for items that are really
+-- there — the same guard captureBoonItems and captureCooldowns already use.
+function Tracker.BoonItemEvidence()
+    if not (C_Item and C_Item.GetItemCount) then return false, false, nil end
+    if Tracker.IsTeardown() or Tracker.InEnteringWorldGrace(COOLDOWN_GRACE) then
+        return false, false, nil
+    end
+    local present = false
+    for i = 1, #CHRONOBOON_ITEMS do
+        -- (itemID, includeBank) — see above for why the bank is in.
+        if (tonumber(C_Item.GetItemCount(CHRONOBOON_ITEMS[i], true)) or 0) > 0 then
+            present = true
+            break
+        end
+    end
+    local dataCached = nil
+    if C_Item.IsItemDataCachedByID then
+        dataCached = false
+        for i = 1, #CHRONOBOON_ITEMS do
+            if C_Item.IsItemDataCachedByID(CHRONOBOON_ITEMS[i]) then
+                dataCached = true
+                break
+            end
+        end
+    end
+    return present, true, dataCached
+end
+
+-- Ask the client to warm the chronoboon's item data so the NEXT read is honest.
+local function requestBoonItemData()
+    if not (C_Item and C_Item.RequestLoadItemDataByID) then return end
+    for i = 1, #CHRONOBOON_ITEMS do
+        C_Item.RequestLoadItemDataByID(CHRONOBOON_ITEMS[i])
+    end
+end
+
+-- How many boonable slots a parsed snapshot holds (nil-safe).
+local function boonSlotCount(parsed)
+    local n = 0
+    if type(parsed) == "table" and type(parsed.slots) == "table" then
+        for _ in pairs(parsed.slots) do n = n + 1 end
+    end
+    return n
+end
+Tracker._boonSlotCount = boonSlotCount
+
 local function scanTooltipForStoredBuffs()
     if not GameTooltip or not GameTooltip.NumLines then return end
     local lines = GameTooltip:NumLines()
@@ -741,6 +903,43 @@ local function scanTooltipForStoredBuffs()
     -- Per-slot identity + duration from the whole block (see ParseBoonBlock).
     local slots, dmf = Tracker.ParseBoonBlock(block)
 
+    -- EVIDENCE-PRESERVATION GATE (see the precedence table above). An empty read
+    -- is only allowed to delete what we hold when the emptiness is PROVABLE.
+    local parsedSlots = 0
+    for _ in pairs(slots) do parsedSlots = parsedSlots + 1 end
+    -- Did the tooltip render anything at all beyond its title line? `title` is
+    -- the normalized TextLeft1 and `block` is the normalized whole tooltip, so a
+    -- block no longer than its own title is a title-only render — partial by
+    -- inspection (rule 6), whatever the item cache claims.
+    local hasBody = (#block > #title)
+    local present, known, dataCached = Tracker.BoonItemEvidence()
+    local verdict = Tracker.ClassifyBoonRead({
+        parsedSlots = parsedSlots,
+        cachedSlots = boonSlotCount(Tracker._boonParsed),
+        itemPresent = present, itemKnown = known,
+        dataCached  = dataCached, hasBody = hasBody,
+    })
+
+    if verdict == Tracker.BOON_READ_PRESERVE then
+        -- Keep every stored slot verbatim, mark the snapshot un-refreshed, leave
+        -- the persisted cache untouched, and request the item data so the next
+        -- read can be trusted. NO capture is fired: nothing changed.
+        Tracker._boonReadsPreserved = (Tracker._boonReadsPreserved or 0) + 1
+        if dataCached == false then
+            Tracker._boonReadsCold = (Tracker._boonReadsCold or 0) + 1
+        end
+        if type(Tracker._boonParsed) == "table" then
+            Tracker._boonParsed.stale   = true
+            Tracker._boonParsed.staleAt = (GetTime and GetTime()) or 0
+        end
+        Tracker._boonTooltipSeen = (GetTime and GetTime()) or 0
+        requestBoonItemData()
+        return
+    end
+    if verdict == Tracker.BOON_READ_CLEAR and parsedSlots == 0 then
+        Tracker._boonReadsCleared = (Tracker._boonReadsCleared or 0) + 1
+    end
+
     -- A7.5: the cast path (if it ran) already wrote the authoritative snapshot;
     -- this hover reconciles it rather than replacing it wholesale.
     local parsed = Tracker.ReconcileBoonSnapshot(
@@ -757,6 +956,10 @@ local function scanTooltipForStoredBuffs()
         Tracker.RequestCapture()   -- fold boon slots into the record + fire STATE_CHANGED
     end
 end
+
+-- Exposed for the evidence-preservation suite: the whole point of that suite is
+-- to drive the REAL scan against fake tooltips, not a re-implementation of it.
+Tracker._scanTooltipForStoredBuffs = scanTooltipForStoredBuffs
 
 local function installTooltipHooks()
     if Tracker._tooltipHooked then return end
@@ -1575,15 +1778,68 @@ local function captureAuras(rec)
         -- ParseBoonBlock rule 2) is not injected, because a frozen "0s (Boon)"
         -- tells the owner strictly less than showing nothing at all.
         local parsed = Tracker._boonParsed
+        local injected = 0
         if parsed then
             for slot, cell in pairs(parsed.slots) do
                 local dur = tonumber(cell.duration) or 0
                 if BOONABLE_SLOT[slot] and not slots[slot] and dur > 0 then
                     slots[slot] = { duration = dur,
                                     option = cell.option or 0, source = BOON_SOURCE }
+                    injected = injected + 1
                 end
             end
             if parsed.dmf then dmfInBoon = true end
+        end
+
+        -- EVIDENCE PRESERVATION, SECOND LAYER (see the precedence table above the
+        -- tooltip scan). The first layer stops a cold tooltip read from emptying
+        -- the boon cache; this one stops an ALREADY-empty cache from emptying the
+        -- RECORD, whatever emptied it — a login before the cache rehydrates, a
+        -- peer-relayed snapshot, a future path nobody has written yet.
+        --
+        -- THE PHYSICS IT LEANS ON: the chronoboon is all-or-nothing. While the
+        -- Chronoboon Displacement AURA is on the character the stored buffs are
+        -- inside it, frozen, and there is no game action that removes one of them
+        -- and leaves the aura up. So "the aura is present and the previous record
+        -- held boon-stored slots" is proof those slots are still stored, and an
+        -- injection that contributed NOTHING is proof only that we have lost our
+        -- own copy of the manifest.
+        --
+        -- NARROW ON PURPOSE: it fires only when the injection produced ZERO boon
+        -- slots. Any read that resolved even one slot is real evidence, and the
+        -- A7.5 phantom rule stays fully in force for it — a tooltip that lists
+        -- three of four booned buffs still drops the fourth.
+        if injected == 0 and type(prev) == "table" then
+            local carried = 0
+            for slot, cell in pairs(prev) do
+                if BOONABLE_SLOT[slot] and type(cell) == "table"
+                   and (cell.source or 0) == BOON_SOURCE
+                   and (tonumber(cell.duration) or 0) > 0
+                   and slots[slot] == nil then
+                    slots[slot] = { duration = math.floor(cell.duration),
+                                    option = cell.option or 0, source = BOON_SOURCE }
+                    carried = carried + 1
+                    if slot == SLOT_DMF then dmfInBoon = true end
+                end
+            end
+            if carried > 0 then
+                Tracker._boonReadsPreserved = (Tracker._boonReadsPreserved or 0) + 1
+                -- Re-seed the cache from the record so the NEXT capture, the
+                -- dashboard's "(Boon)" rows and a relog all agree again. Marked
+                -- stale: preserved evidence, not a fresh observation.
+                local reseed = { slots = {}, dmf = false, count = 0, stale = true }
+                for slot, cell in pairs(slots) do
+                    if (cell.source or 0) == BOON_SOURCE then
+                        reseed.slots[slot] = { duration = cell.duration,
+                                               option = cell.option or 0 }
+                        reseed.count = reseed.count + 1
+                        if slot == SLOT_DMF then reseed.dmf = true end
+                    end
+                end
+                Tracker._boonParsed       = reseed
+                Tracker._boonTooltipCount = reseed.count
+                persistBoonCache(rec.nameRealm or selfNameRealm(), reseed)
+            end
         end
     elseif partial then
         -- A6.2: "no chronoboon aura found" from a partial scan is not an unboon.
@@ -3165,6 +3421,21 @@ function Tracker.DebugSanity()
     end
     ns:Print(string.format("  tooltip lines naming an unboonable buff, ignored: %d",
         Tracker._boonScopeRejects or 0))
+    -- The evidence-preservation rule. "refused" counts empty reads that were NOT
+    -- allowed to delete stored slots (of which "cold item data" is the sub-count
+    -- that was provably a cold tooltip); "honoured" counts the empty reads that
+    -- really did mean the boon is gone or empty. A non-zero refusal count is the
+    -- wipe being caught, not a fault.
+    ns:Print(string.format(
+        "  boon empty-reads refused: %d (cold item data: %d) / honoured: %d",
+        Tracker._boonReadsPreserved or 0, Tracker._boonReadsCold or 0,
+        Tracker._boonReadsCleared or 0))
+    local bp = Tracker._boonParsed
+    if bp then
+        ns:Print(string.format("  boon snapshot: %d slot(s), dmf=%s%s",
+            Tracker._boonSlotCount(bp), tostring(bp.dmf and true or false),
+            bp.stale and " |cffffc020(PRESERVED — not refreshed by the last read)|r" or ""))
+    end
     local done = S.data and S.data[Tracker.AURA_REPAIR_KEY]
     ns:Print("  one-shot impossible-record repair: " .. (done and "already run" or "PENDING"))
     local boonDone = S.data and S.data[Tracker.BOON_SCOPE_REPAIR_KEY]
@@ -3639,6 +3910,344 @@ local function testSpellIDMatching(fails)
     slot, byID = Tracker.MatchAura(nil, "Songflower Serenade")
     ck(slot == 4 and byID == false, "nil id falls back to name -> slot 4")
     ck(Tracker.MatchAura(nil, "Some Random Buff") == nil, "no id, no name match -> nil")
+end
+
+----------------------------------------------------------------------
+-- THE EVIDENCE-PRESERVATION RULE — the boon WIPE suite.
+--
+-- Owner symptom: a fully booned 60 intermittently renders with every world-buff
+-- tile empty, and hovering the chronoboon brings them back. The SavedVariables
+-- showed the self record with chronoboonActive = true, boonCount = 4 and
+-- auraStates = {}, while the peers' older copies still held all seven booned
+-- slots — a WIPE written by our own capture, not lost in transit.
+--
+-- What this suite pins, in the order the precedence table states it:
+--   * a COLD tooltip read (title only, item data not cached) PRESERVES;
+--   * a read with the boon item genuinely GONE from bags AND bank CLEARS;
+--   * a WARM, complete, genuinely empty tooltip with the item still in bags
+--     CLEARS (the post-release state — the boon really is empty now);
+--   * the capture that follows a preserved read still writes the stored slots
+--     into the record, so the PUBLISH path can never ship a degraded read as an
+--     authoritative empty;
+--   * MUTATION TESTS: each guard is individually disabled and the suite proves
+--     the wipe comes straight back. A preservation rule that cannot fail is a
+--     preservation rule nobody is testing.
+----------------------------------------------------------------------
+local function testBoonEvidencePreservation(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local C = Tracker.ClassifyBoonRead
+    local ADOPT, CLEAR, PRESERVE =
+        Tracker.BOON_READ_ADOPT, Tracker.BOON_READ_CLEAR, Tracker.BOON_READ_PRESERVE
+
+    -- ---- 1) the precedence table, row by row, on the PURE classifier -------
+    -- Row 1: any positive evidence adopts, whatever else is true.
+    ck(C({ parsedSlots = 1, cachedSlots = 5, itemPresent = false, itemKnown = true,
+           dataCached = false, hasBody = false }) == ADOPT,
+       "row 1: a read that resolved a slot is EVIDENCE and is adopted")
+    -- Row 2: nothing cached, nothing to protect.
+    ck(C({ parsedSlots = 0, cachedSlots = 0, itemPresent = true, itemKnown = true,
+           dataCached = false }) == CLEAR,
+       "row 2: an empty read with an empty cache is a no-op CLEAR")
+    -- Row 3: the item is provably gone -> the empty read agrees with the bags.
+    ck(C({ parsedSlots = 0, cachedSlots = 7, itemPresent = false, itemKnown = true,
+           dataCached = true, hasBody = true }) == CLEAR,
+       "row 3: boon item gone from bags AND bank -> CLEAR")
+    ck(C({ parsedSlots = 0, cachedSlots = 7, itemPresent = false, itemKnown = true,
+           dataCached = nil, hasBody = false }) == CLEAR,
+       "row 3 beats rows 4-6: a gone item needs no tooltip warmth to be believed")
+    -- Row 4: cold item data -> the read is not evidence of anything.
+    ck(C({ parsedSlots = 0, cachedSlots = 7, itemPresent = true, itemKnown = true,
+           dataCached = false, hasBody = true }) == PRESERVE,
+       "row 4: COLD item data -> PRESERVE (the bug that bit the owner)")
+    -- Row 5: no warmth proof available at all.
+    ck(C({ parsedSlots = 0, cachedSlots = 7, itemPresent = true, itemKnown = true,
+           dataCached = nil, hasBody = true }) == PRESERVE,
+       "row 5: a client with no IsItemDataCachedByID cannot delete data")
+    ck(C({ parsedSlots = 0, cachedSlots = 7, itemPresent = false, itemKnown = false,
+           dataCached = true, hasBody = true }) == PRESERVE,
+       "row 5: an unreadable bag API is not proof the item is gone")
+    -- Row 6: warm by the item cache, but the tooltip plainly did not render.
+    ck(C({ parsedSlots = 0, cachedSlots = 7, itemPresent = true, itemKnown = true,
+           dataCached = true, hasBody = false }) == PRESERVE,
+       "row 6: a title-only tooltip is partial by inspection -> PRESERVE")
+    -- Row 7: the genuine post-release empty.
+    ck(C({ parsedSlots = 0, cachedSlots = 7, itemPresent = true, itemKnown = true,
+           dataCached = true, hasBody = true }) == CLEAR,
+       "row 7: warm + present + rendered + empty is a real CLEAR")
+    -- Degenerate input never throws and never deletes.
+    ck(C(nil) == CLEAR, "a nil context has nothing cached, so it CLEARs harmlessly")
+    ck(C({ cachedSlots = 3 }) == PRESERVE,
+       "an all-unknown context with a live cache PRESERVEs")
+
+    -- ---- 2) the LIVE scan against fake tooltips ---------------------------
+    local saved = {
+        tip      = _G.GameTooltip,
+        left1    = _G.GameTooltipTextLeft1,
+        item     = _G.C_Item,
+        getTime  = _G.GetTime,
+        unitName = _G.UnitName,
+        realm    = _G.GetRealmName,
+        parsed   = Tracker._boonParsed,
+        count    = Tracker._boonTooltipCount,
+        seen     = Tracker._boonTooltipSeen,
+        entered  = Tracker._enteredWorldAt,
+        leaving  = Tracker._leavingWorld,
+        logout   = Tracker._loggingOut,
+        auraAt   = Tracker._auraCapturedAt,
+        requests = Tracker.RequestCapture,
+        auras    = _G.C_UnitAuras,
+        now      = ns.Store and ns.Store.Now,
+    }
+    local FRAME, EPOCH = 50000, 1700000000
+    _G.GetTime = function() return FRAME end
+    ns.Store.Now = function() return EPOCH end
+    _G.UnitName = function() return "Poonyx" end
+    _G.GetRealmName = function() return "Whitemane" end
+    Tracker._leavingWorld, Tracker._loggingOut = false, false
+    Tracker._enteredWorldAt = FRAME - 600         -- long past every grace window
+
+    local captures = 0
+    Tracker.RequestCapture = function() captures = captures + 1 end
+
+    -- Item probe knobs.
+    local itemCount, itemWarm, hasCachedAPI, loadRequests = 1, true, true, 0
+    _G.C_Item = {
+        GetItemCount = function() return itemCount end,
+        IsItemDataCachedByID = function()
+            if not hasCachedAPI then return nil end
+            return itemWarm
+        end,
+        RequestLoadItemDataByID = function() loadRequests = loadRequests + 1 end,
+    }
+    -- The class-only build: no IsItemDataCachedByID at all.
+    local function dropCachedAPI()
+        hasCachedAPI = false
+        _G.C_Item.IsItemDataCachedByID = nil
+    end
+    local function restoreCachedAPI()
+        hasCachedAPI = true
+        _G.C_Item.IsItemDataCachedByID = function() return itemWarm end
+    end
+
+    -- Install a fake tooltip into the globals the scan actually reads.
+    local installed = {}
+    local function installTooltip(rows)
+        for name in pairs(installed) do _G[name] = nil end
+        installed = {}
+        local tip, lookup = fakeBoonTooltip(rows)
+        _G.GameTooltip = tip
+        for i = 1, #rows do
+            for _, side in ipairs({ "Left", "Right" }) do
+                local name = "GameTooltipText" .. side .. i
+                local fs = lookup(name)
+                if fs then _G[name] = fs; installed[name] = true end
+            end
+        end
+    end
+
+    local FULL_ROWS = {
+        { "Chronoboon Displacement" },
+        { "World effects suspended:" },
+        { "Rallying Cry of the Dragonslayer", "(115m)" },
+        { "Fengus' Ferocity", "(119m)" },
+    }
+    -- The COLD render: the title line landed, the body never did.
+    local COLD_ROWS = { { "Chronoboon Displacement" } }
+    -- The WARM EMPTY render: a complete tooltip that lists nothing (post-release).
+    local EMPTY_ROWS = {
+        { "Chronoboon Displacement" },
+        { "No world effects are suspended." },
+    }
+
+    local function seedCache()
+        Tracker._boonParsed = { slots = { [1] = { duration = 6900 },
+                                          [6] = { duration = 7140 } },
+                                dmf = false, count = 2 }
+        Tracker._boonTooltipCount = 2
+    end
+    local function slotsHeld()
+        return Tracker._boonSlotCount(Tracker._boonParsed)
+    end
+
+    local ok, err = pcall(function()
+
+    -- (a) COLD TOOLTIP -> the stored slots survive.
+    seedCache()
+    itemCount, itemWarm = 1, false
+    loadRequests, captures = 0, 0
+    installTooltip(COLD_ROWS)
+    Tracker._scanTooltipForStoredBuffs()
+    ck(slotsHeld() == 2, "cold tooltip: both stored slots PRESERVED")
+    ck(Tracker._boonParsed.slots[1].duration == 6900,
+       "cold tooltip: the preserved duration is kept verbatim")
+    ck(Tracker._boonParsed.stale == true,
+       "cold tooltip: the snapshot is flagged un-refreshed, not fresh")
+    ck(loadRequests > 0, "cold tooltip: the item data is requested for the next read")
+    ck(captures == 0, "cold tooltip: no capture is fired (nothing changed)")
+
+    -- (b) BOON ITEM GONE -> the read is believed and the slots clear.
+    seedCache()
+    itemCount, itemWarm = 0, true
+    captures = 0
+    installTooltip(COLD_ROWS)
+    Tracker._scanTooltipForStoredBuffs()
+    ck(slotsHeld() == 0, "item gone: an empty read legitimately CLEARS")
+    ck(captures == 1, "item gone: the clear is captured and published")
+
+    -- (c) WARM, COMPLETE, GENUINELY EMPTY -> clears.
+    seedCache()
+    itemCount, itemWarm = 1, true
+    captures = 0
+    installTooltip(EMPTY_ROWS)
+    Tracker._scanTooltipForStoredBuffs()
+    ck(slotsHeld() == 0, "warm empty tooltip: the post-release state CLEARS")
+    ck(captures == 1, "warm empty tooltip: the clear is captured")
+
+    -- (d) A REAL READ still adopts, and the A7.5 phantom rule still bites.
+    Tracker._boonParsed = { slots = { [1] = { duration = 6900 },
+                                      [4] = { duration = 900 } }, dmf = false, count = 2 }
+    itemCount, itemWarm = 1, true
+    installTooltip(FULL_ROWS)
+    Tracker._scanTooltipForStoredBuffs()
+    ck(Tracker._boonParsed.slots[1] ~= nil and Tracker._boonParsed.slots[6] ~= nil,
+       "real read: the listed slots are adopted")
+    ck(Tracker._boonParsed.slots[4] == nil,
+       "real read: the phantom rule still drops a slot the tooltip does not list")
+    ck(Tracker._boonParsed.stale == nil,
+       "real read: a fresh snapshot is NOT flagged stale")
+
+    -- (e) NO IsItemDataCachedByID (belt and braces) -> preserve.
+    seedCache()
+    dropCachedAPI()
+    itemCount = 1
+    installTooltip(COLD_ROWS)
+    Tracker._scanTooltipForStoredBuffs()
+    ck(slotsHeld() == 2, "no warmth API: an empty read cannot delete the cache")
+    restoreCachedAPI()
+
+    -- (f) THE RECORD SIDE — the capture that follows a preserved read.
+    -- captureAuras sees the chronoboon aura plus nothing else: exactly the live
+    -- reading a fully booned character produces. The record must come out
+    -- holding the booned slots, because that is what the mesh publishes.
+    local auraList = { { name = "Chronoboon Displacement", spellId = 349858,
+                         expirationTime = 0 } }
+    _G.C_UnitAuras = { GetBuffDataByIndex = function(_, i) return auraList[i] end }
+    seedCache()
+    Tracker._auraCapturedAt = EPOCH
+    local rec = { nameRealm = "Poonyx-Whitemane",
+                  auraStates = { [1] = { duration = 6900, option = 0, source = 2 },
+                                 [6] = { duration = 7140, option = 0, source = 2 } },
+                  chronoboonActive = true, boonCount = 4 }
+    Tracker._captureAuras(rec)
+    ck(rec.auraStates[1] and rec.auraStates[1].source == 2,
+       "publish: a preserved read still writes slot 1 as BOONED into the record")
+    ck(rec.auraStates[6] and rec.auraStates[6].duration == 7140,
+       "publish: the booned duration is frozen, not decayed")
+    ck(rec.chronoboonActive == true, "publish: the record still reads as booned")
+
+    -- ...and the SECOND layer: even with the cache emptied by some other path,
+    -- the record's own booned slots survive a capture. This is the guard that
+    -- makes an authoritative-empty publish unreachable.
+    Tracker._boonParsed = nil
+    Tracker._boonTooltipCount = 0
+    Tracker._auraCapturedAt = EPOCH
+    rec = { nameRealm = "Poonyx-Whitemane",
+            auraStates = { [1] = { duration = 6900, option = 0, source = 2 },
+                           [5] = { duration = 7140, option = 0, source = 2 },
+                           [6] = { duration = 7140, option = 0, source = 2 } },
+            chronoboonActive = true, boonCount = 4, dmfInBoon = true }
+    Tracker._captureAuras(rec)
+    local kept = 0
+    for _, cell in pairs(rec.auraStates) do
+        if (cell.source or 0) == 2 then kept = kept + 1 end
+    end
+    ck(kept == 3, "publish: an empty CACHE cannot empty a booned RECORD")
+    ck(rec.dmfInBoon == true, "publish: the booned fortune survives with its slot")
+    ck(Tracker._boonSlotCount(Tracker._boonParsed) == 3,
+       "publish: the cache is re-seeded from the record it just rescued")
+    ck(Tracker._boonParsed.stale == true,
+       "publish: the re-seeded cache is marked preserved evidence, not observed")
+
+    -- A LIVE world buff still wins over the preserved boon copy (an unboon that
+    -- landed between captures must not be shadowed by frozen state).
+    auraList = { { name = "Chronoboon Displacement", spellId = 349858, expirationTime = 0 },
+                 { name = "Rallying Cry of the Dragonslayer", spellId = 22888,
+                   expirationTime = FRAME + 1234 } }
+    Tracker._boonParsed = nil
+    Tracker._auraCapturedAt = EPOCH
+    rec = { nameRealm = "Poonyx-Whitemane",
+            auraStates = { [1] = { duration = 6900, option = 0, source = 2 } },
+            chronoboonActive = true }
+    Tracker._captureAuras(rec)
+    ck(rec.auraStates[1] and rec.auraStates[1].source == 0,
+       "publish: a LIVE reading of a slot beats the preserved booned copy")
+
+    -- ---- 3) MUTATION TESTS -----------------------------------------------
+    -- Disable each guard in turn and prove the wipe returns. If any of these
+    -- stops failing, the guard it names has become decorative.
+    auraList = { { name = "Chronoboon Displacement", spellId = 349858, expirationTime = 0 } }
+    local realClassify = Tracker.ClassifyBoonRead
+
+    -- Mutant 1: the classifier always trusts an empty read (the OLD behaviour).
+    Tracker.ClassifyBoonRead = function() return CLEAR end
+    seedCache()
+    itemCount, itemWarm = 1, false
+    installTooltip(COLD_ROWS)
+    Tracker._scanTooltipForStoredBuffs()
+    ck(slotsHeld() == 0,
+       "MUTANT 1: with the classifier defeated the cold read wipes the cache " ..
+       "(this is the shipped bug; if it does not wipe, the test is not reaching it)")
+    Tracker.ClassifyBoonRead = realClassify
+
+    -- Mutant 2: the classifier always preserves -> the genuine post-release
+    -- empty can never clear. Proves rows 3 and 7 are load-bearing, not padding.
+    Tracker.ClassifyBoonRead = function() return PRESERVE end
+    seedCache()
+    itemCount, itemWarm = 0, true
+    installTooltip(EMPTY_ROWS)
+    Tracker._scanTooltipForStoredBuffs()
+    ck(slotsHeld() == 2,
+       "MUTANT 2: a blanket-preserve classifier cannot clear a released boon")
+    Tracker.ClassifyBoonRead = realClassify
+    -- ...and the real classifier does clear it, in the same fixture.
+    seedCache()
+    Tracker._scanTooltipForStoredBuffs()
+    ck(slotsHeld() == 0, "MUTANT 2 control: the real rule DOES clear a released boon")
+
+    -- Mutant 3: defeat the record-side layer by claiming the character is not
+    -- booned. The booned slots must then legitimately go (this is the unboon
+    -- path, and it has to keep working).
+    Tracker._boonParsed = nil
+    Tracker._auraCapturedAt = EPOCH
+    auraList = { { name = "Ordinary Food Buff", spellId = 1, expirationTime = FRAME + 60 } }
+    rec = { nameRealm = "Poonyx-Whitemane",
+            auraStates = { [1] = { duration = 6900, option = 0, source = 2 } },
+            chronoboonActive = true }
+    Tracker._captureAuras(rec)
+    ck(rec.chronoboonActive == false and rec.auraStates[1] == nil,
+       "MUTANT 3: with the chronoboon aura GONE the booned slots clear as before")
+
+    end)
+
+    -- ---- restore ----------------------------------------------------------
+    for name in pairs(installed) do _G[name] = nil end
+    _G.GameTooltip            = saved.tip
+    _G.GameTooltipTextLeft1   = saved.left1
+    _G.C_Item                 = saved.item
+    _G.GetTime                = saved.getTime
+    _G.UnitName               = saved.unitName
+    _G.GetRealmName           = saved.realm
+    _G.C_UnitAuras            = saved.auras
+    ns.Store.Now              = saved.now
+    Tracker.RequestCapture    = saved.requests
+    Tracker._boonParsed       = saved.parsed
+    Tracker._boonTooltipCount = saved.count
+    Tracker._boonTooltipSeen  = saved.seen
+    Tracker._enteredWorldAt   = saved.entered
+    Tracker._leavingWorld     = saved.leaving
+    Tracker._loggingOut       = saved.logout
+    Tracker._auraCapturedAt   = saved.auraAt
+    if not ok then fails[#fails + 1] = "evidence preservation :: " .. tostring(err) end
 end
 
 -- Capture guards (A6.1, A6.2, A6.3, A17.2, A9.2). These drive the real capture
@@ -5940,6 +6549,7 @@ function Tracker.RunSelfTests(verbose)
         { name = "capture guards (A6.1/A6.2/A6.3/A17.2/A9.2)", fn = testCaptureGuards },
         { name = "boon cast lifecycle (A7.1/A7.2/A7.3/A7.4)", fn = testBoonCastLifecycle },
         { name = "boon tooltip reconciliation (A7.5)", fn = testBoonReconcile },
+        { name = "boon evidence preservation (the wipe)", fn = testBoonEvidencePreservation },
         { name = "DMF capture edges + debuff push (A8)", fn = testDMFCapture },
         { name = "raid attunement (quest matrix + RaidAttuned tri-state)", fn = testAttunement },
         { name = "coordinate override zone scoping", fn = testCoordinateOverride },
