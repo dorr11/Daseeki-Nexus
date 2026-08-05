@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+- **Changed:** **the buff automations now ship switched ON.** Dire Maul tribute, the BWL Orb of
+  Command, Sayge's Dark Fortune, Winterspring E'ko, Blasted Lands R.O.I.D.S. and the Zanza
+  turn-in were all off out of the box, so the feature you installed Nexus for did nothing until
+  you found six checkboxes. Every one of them is now scoped to its own NPC and steered by quest
+  ID — that work landed in this same release — so they only ever fire where they are supposed
+  to. If you had deliberately switched one of them off, it stays off; if you never touched it,
+  it is switched on once.
+- **Changed:** **Zanza ships asking for Swiftness and Spirit.** Sheen is not ticked by default —
+  tick it if you want it, and it will never untick itself. Everything the fortune, tribute and
+  turn-in flows do is still skipped by holding Shift as you click.
+- **Changed:** **an empty Zanza flask list now means "none", not "all three".** It used to mean
+  all three, which is why unticking every box silently gave you everything. Your picks are
+  stored properly now, so clearing them all switches the turn-in off, which is what it looks
+  like it does. Ticking a flask box also pins your choice, so nothing ever ticks one back on.
+- Untouched on purpose: **auto-repair, the Yojamba coin turn-in, "skip fortune cookie", and the
+  two "whisper my keyword to guild / friends" gates all still ship OFF.**
+
 - **Fixed:** **releasing a chronoboon could auto-accept the next summon.** When you popped your
   displacer, all seven buffs came back at once — and Nexus read that as seven brand-new world
   buffs and armed the "you just got buffed, take the summon" gate. Any summon that landed in

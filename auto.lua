@@ -1651,7 +1651,9 @@ local function activeQuestFlags()
     return {
         eko     = aq.eko == true,
         zgCoins = aq.zgCoins == true,
-        zanza   = (aq.zanza and aq.zanza.enabled == true) or false,
+        -- Parent AND pick list (1.1.4): an empty pick list is the same thing as
+        -- an unticked parent — see Auto.ZanzaAutomationOn.
+        zanza   = Auto.ZanzaAutomationOn(aq.zanza),
         roids   = aq.roids == true,
     }
 end
@@ -1763,43 +1765,66 @@ Auto.ROIDS_REAGENTS = {
     { itemID = 8393, count = 1, name = "scorpok pincer"    },
 }
 
--- Enabled zanza picks in the spec's canonical order.
+-- The owner's DEFAULT pick list (1.1.4 automation-defaults flip): Swiftness and
+-- Spirit, in the spec's fixed order. Sheen is NOT a default — it is the owner's
+-- call, not the spec's, which offers all three. Store.ZANZA_PRIORITY_SEEDS is
+-- the other copy (the store cannot depend on auto.lua's load order); the store
+-- suite asserts the two agree entry-for-entry.
+Auto.ZANZA_DEFAULT_PICKS = { "swiftness", "spirit" }
+
+-- Enabled zanza picks in the spec's canonical order. PURE.
 --
--- An EMPTY priority list means "all three" rather than "none": the store ships
--- `priority = {}` and Store.ApplyDefaults recurses into tables, so seeding the
--- three keys there would resurrect a pick the owner deliberately unticked on
--- every login (the same trap documented on autoSummon.triggers). Treating empty
--- as the full spec default gives a fresh install the spec's behaviour from the
--- one parent checkbox, with no resurrection. PURE.
+-- THE EMPTY-LIST RULE CHANGED IN 1.1.4, and this is the whole reconciliation.
 --
--- SHAPE HARDENING (owner bug, 1.1.4). The stored list is supposed to be an
--- ARRAY of ticked keys, and Store.MigrateZanzaPriorityShape now guarantees that
--- on every login. It did not always: an older options build wrote a MAP of
--- booleans (`{ sheen = false, spirit = true, swiftness = true }`), and the
--- current one appends ARRAY entries on top of whatever map keys were already
--- there. Walking only the array part read a map-shaped table as EMPTY, empty
--- meant "all three", and the owner was handed the Sheen he had unticked.
+-- It used to be: `{}` means ALL THREE. That was not a preference, it was a
+-- workaround. The store ships `priority = {}` because Store.ApplyDefaults
+-- recurses into tables and an array in the defaults tree would resurrect an
+-- unticked flask on every login (the trap documented on autoSummon.triggers), so
+-- "empty" was the only shape a fresh install could have — and reading it as
+-- "none" would have meant the parent checkbox did nothing. Reading it as "all
+-- three" bought a working fresh install at the price of a lie: a user who
+-- unticked all three in the options page ALSO stored `{}`, and got all three.
 --
--- So this reader is now shape-tolerant as well, belt to the migration's braces —
--- if the rewrite ever fails to run (a read-only save, a crash before logout, a
--- hand-edited file) the engine still refuses to dispense a flask the owner
--- opted out of:
---   * an explicitly FALSE map key is NEVER enabled, in any shape;
---   * where the array part carries recognised keys, it decides membership (it
---     is the newer UI's write) and stray map keys are ignored;
---   * a MAP-ONLY table starts from all three and removes the explicit falses,
---     matching Store.NormalizeZanzaPriority exactly, so what the engine does
---     before the migration and after it are the same thing;
---   * "all three" is reserved for a table with NO array content and NO map keys
---     at all — a genuinely fresh `{}`, which is the only shape that has never
---     recorded a preference.
+-- Store.SeedZanzaDefaults now writes the default list ONCE, behind a sticky
+-- per-block guard, so a fresh install arrives here holding {"swiftness",
+-- "spirit"} and never `{}`. That frees `{}` to mean what it says. The rule table
+-- as shipped:
+--
+--   stored priority                     | picks                    | why
+--   ------------------------------------|--------------------------|-------------
+--   not a table (nil / junk)            | swiftness, spirit        | the store has
+--     never written this key; answer as the seeder would have written it, so a
+--     hand-wiped or partially-migrated save behaves like a fresh install rather
+--     than silently doing nothing.
+--   `{}` — no array entries, no map keys | (none)                  | every pick is
+--     unticked. PARENT-OFF EQUIVALENCE: Auto.NextZanzaPick returns
+--     "none-enabled" and Auto.ZanzaAutomationOn reports the feature off, which is
+--     exactly what Store.MigrateZanzaPriorityShape already does to a block whose
+--     every flask was explicitly false (it stores `{}` AND unticks the parent).
+--     One rule now, stated once, in three places that agree.
+--   array of recognised keys            | those, in spec order     | membership is
+--     user-toggleable, order is the spec's — re-imposed here whatever order the
+--     checkboxes were clicked in.
+--   MAP-ONLY (legacy shape)             | all three minus explicit falses
+--     | pre-1.1.4 shape only. The old build wrote a key only when it was touched
+--     and the old engine read every map-shaped table as "all three", so ABSENT
+--     reads as ON — that is the state the user actually observed. Matches
+--     Store.NormalizeZanzaPriority exactly.
+--   HYBRID (array + stray map keys)     | array decides, explicit falses subtract
+--     | pre-1.1.4 shape only; the array is the newer UI's write.
+--
+-- SHAPE HARDENING (owner bug, 1.1.4) survives unchanged underneath all of that:
+-- Store.MigrateZanzaPriorityShape normalises the legacy shapes on login, and this
+-- reader stays tolerant of them as belt to that migration's braces — if the
+-- rewrite ever fails to run (a read-only save, a crash before logout, a
+-- hand-edited file) an explicitly FALSE map key is still never enabled, in any
+-- shape.
 function Auto.ZanzaEnabledPicks(priority)
     local out = {}
-    local function allThree()
-        for _, r in ipairs(Auto.ZANZA_REWARDS) do out[#out + 1] = r.key end
+    if type(priority) ~= "table" then
+        for _, key in ipairs(Auto.ZANZA_DEFAULT_PICKS) do out[#out + 1] = key end
         return out
     end
-    if type(priority) ~= "table" then return allThree() end
 
     local n = #priority
 
@@ -1824,7 +1849,9 @@ function Auto.ZanzaEnabledPicks(priority)
         end
     end
 
-    if arrayN == 0 and mapKeys == 0 then return allThree() end
+    -- Nothing recorded here at all: every pick is off. (Pre-1.1.4 this returned
+    -- all three — see the rule table above.)
+    if arrayN == 0 and mapKeys == 0 then return out end
 
     for _, r in ipairs(Auto.ZANZA_REWARDS) do
         local member
@@ -1833,6 +1860,15 @@ function Auto.ZanzaEnabledPicks(priority)
         if member and not mapFalse[r.key] then out[#out + 1] = r.key end
     end
     return out
+end
+
+-- Is zanza automation actually going to do anything? PARENT-OFF EQUIVALENCE: a
+-- ticked parent with an empty pick list can only ever reach "none-enabled" at the
+-- reward board, so it is the same thing as an unticked parent and every gate says
+-- so with one voice. PURE over the stored zanza block.
+function Auto.ZanzaAutomationOn(z)
+    if type(z) ~= "table" or z.enabled ~= true then return false end
+    return #Auto.ZanzaEnabledPicks(z.priority) > 0
 end
 
 function Auto.ZanzaReward(key)
@@ -2306,7 +2342,10 @@ end
 function Auto.ZanzaGateNow()
     local aq = aqBlock()
     return Auto.DecideZanzaGate({
-        enabled    = aq.zanza and aq.zanza.enabled == true,
+        -- Parent AND pick list — Auto.ZanzaAutomationOn, same rule as
+        -- activeQuestFlags, so the gossip gate and the greeting gate cannot
+        -- disagree about whether zanza is on.
+        enabled    = Auto.ZanzaAutomationOn(aq.zanza),
         shift      = IsShiftKeyDown and IsShiftKeyDown() or false,
         npcID      = Auto.NpcID(),
         tokenCount = Auto.OwnedCount(Auto.ZANZA_TOKEN),
@@ -4387,11 +4426,37 @@ local function testGossipPlanOrder()
 end
 
 -- RULE: reward priority is Swiftness -> Spirit -> Sheen, order fixed by spec,
--- membership user-toggleable, empty list = spec default (all three).
+-- membership user-toggleable. RE-BASED (1.1.4): an empty list means NONE, not
+-- all three — the default list is seeded into the store now, so `{}` is a user
+-- who unticked everything and is read as such. The mechanism the old assertion
+-- protected (a fresh install must not silently do nothing) is preserved, one
+-- layer down, by Store.SeedZanzaDefaults + Auto.ZANZA_DEFAULT_PICKS, both
+-- asserted below and in the store suite.
 local function testZanzaPriority()
-    local all = Auto.ZanzaEnabledPicks({})
-    if not (all[1] == "swiftness" and all[2] == "spirit" and all[3] == "sheen" and #all == 3) then
-        return false, "empty priority means all three in spec order"
+    local none = Auto.ZanzaEnabledPicks({})
+    if #none ~= 0 then
+        return false, "an empty priority list means NONE ticked, got " .. #none
+    end
+    -- ...and the shipped default that keeps a fresh install working is the
+    -- owner's two, in spec order, answered for a never-written key.
+    local dflt = Auto.ZanzaEnabledPicks(nil)
+    if not (dflt[1] == "swiftness" and dflt[2] == "spirit" and #dflt == 2) then
+        return false, "a never-written priority answers with the shipped default"
+    end
+    if not (Auto.ZANZA_DEFAULT_PICKS[1] == "swiftness"
+            and Auto.ZANZA_DEFAULT_PICKS[2] == "spirit"
+            and #Auto.ZANZA_DEFAULT_PICKS == 2) then
+        return false, "the default pick list is exactly {swiftness, spirit}"
+    end
+    -- PARENT-OFF EQUIVALENCE: a ticked parent with no picks is an off feature.
+    if Auto.ZanzaAutomationOn({ enabled = true, priority = {} }) then
+        return false, "enabled with an empty pick list must read as OFF"
+    end
+    if not Auto.ZanzaAutomationOn({ enabled = true, priority = { "spirit" } }) then
+        return false, "enabled with one pick must read as ON"
+    end
+    if Auto.ZanzaAutomationOn({ enabled = false, priority = { "spirit" } }) then
+        return false, "an unticked parent is off whatever the picks say"
     end
     -- Ticked out of order in the UI -> still returned in spec order.
     local reordered = Auto.ZanzaEnabledPicks({ "sheen", "swiftness" })
@@ -4423,18 +4488,22 @@ local function testZanzaShapeTolerance()
     -- the pre-1.1.4 reader took as "all three".
     if #hordeMap ~= 0 then return false, "the owner's map block has no array part (premise)" end
 
+    -- name, stored shape, picks, does the migration have to unstick the parent?
     local ROWS = {
-        { "owner HORDE map (sheen=false)", hordeMap,                "swiftness,spirit" },
-        { "owner ALLIANCE hybrid",         allianceHybrid,          "swiftness,spirit" },
-        { "fresh empty",                   {},                      "swiftness,spirit,sheen" },
-        { "canonical array",               { "swiftness", "sheen" },"swiftness,sheen" },
+        { "owner HORDE map (sheen=false)", hordeMap,                "swiftness,spirit", false },
+        { "owner ALLIANCE hybrid",         allianceHybrid,          "swiftness,spirit", false },
+        -- RE-BASED (1.1.4): `{}` is no longer "all three". Store.SeedZanzaDefaults
+        -- writes the shipped default into a fresh block, so nothing arrives here
+        -- holding `{}` unless the user emptied it — and then it means none.
+        { "empty list = nothing ticked",   {},                      "",                 false },
+        { "canonical array",               { "swiftness", "sheen" },"swiftness,sheen",  false },
         { "map, all true",                 { swiftness = true, spirit = true, sheen = true },
-                                                                    "swiftness,spirit,sheen" },
-        { "map, all false",                { swiftness = false, spirit = false, sheen = false }, "" },
-        { "map, one opt-out only",         { sheen = false },       "swiftness,spirit" },
-        { "false beats an array entry",    { "sheen", ["sheen"] = false }, "" },
-        { "stray true never resurrects",   { "spirit", ["sheen"] = true }, "spirit" },
-        { "case-insensitive array",        { "Sheen" },             "sheen" },
+                                                                    "swiftness,spirit,sheen", false },
+        { "map, all false",                { swiftness = false, spirit = false, sheen = false }, "", true },
+        { "map, one opt-out only",         { sheen = false },       "swiftness,spirit", false },
+        { "false beats an array entry",    { "sheen", ["sheen"] = false }, "",           true },
+        { "stray true never resurrects",   { "spirit", ["sheen"] = true }, "spirit",     false },
+        { "case-insensitive array",        { "Sheen" },             "sheen",            false },
     }
     for _, row in ipairs(ROWS) do
         local got = arr(Auto.ZanzaEnabledPicks(row[2]))
@@ -4442,32 +4511,40 @@ local function testZanzaShapeTolerance()
             return false, ("%s -> {%s}, want {%s}"):format(row[1], got, row[3])
         end
     end
-    if arr(Auto.ZanzaEnabledPicks(nil)) ~= "swiftness,spirit,sheen" then
-        return false, "a missing priority table still means all three"
+    -- A key the store has never written is the ONE case that still answers with
+    -- a list: the shipped default, so a hand-wiped save behaves like a fresh
+    -- install rather than silently doing nothing.
+    if arr(Auto.ZanzaEnabledPicks(nil)) ~= "swiftness,spirit" then
+        return false, "a missing priority table answers with the shipped default"
     end
 
     -- READ-THROUGH EQUIVALENCE: what the engine dispenses must not change when
     -- the store's one-shot rewrite lands. For every shape, reading the RAW table
     -- and reading the MIGRATED table have to give the same answer.
     --
-    -- The one shape where the stored array cannot say it on its own is
-    -- "everything is off": `{}` reads as all three, so the migration flags
-    -- allOff and Store.MigrateZanzaPriorityShape switches the parent toggle off
-    -- instead of storing a lie. Those rows are asserted that way instead.
+    -- This is now UNIVERSAL, which it could not be before. The old reader had one
+    -- shape it could not round-trip — "everything is off" normalises to `{}`, and
+    -- `{}` used to read as all three, so the migration had to switch the parent
+    -- off instead of storing a lie. `{}` tells the truth now, so every row
+    -- including the all-off ones reads the same before and after. The parent-off
+    -- half of that rule is still asserted (column 4): it is what the user SEES in
+    -- the options page, and belt to the reader's braces.
     if ns.Store and ns.Store.NormalizeZanzaPriority then
         for _, row in ipairs(ROWS) do
             local normalized, _, allOff = ns.Store.NormalizeZanzaPriority(row[2])
-            if row[3] == "" then
-                if not allOff then
-                    return false, row[1] .. ": an empty result must flag the parent off"
-                end
-            else
-                if allOff then return false, row[1] .. ": allOff flagged with picks surviving" end
-                local after = arr(Auto.ZanzaEnabledPicks(normalized))
-                if after ~= row[3] then
-                    return false, ("%s: reads {%s} before the migration and {%s} after")
-                        :format(row[1], row[3], after)
-                end
+            local after = arr(Auto.ZanzaEnabledPicks(normalized))
+            if after ~= row[3] then
+                return false, ("%s: reads {%s} before the migration and {%s} after")
+                    :format(row[1], row[3], after)
+            end
+            if allOff ~= row[4] then
+                return false, ("%s: allOff=%s, want %s"):format(row[1], tostring(allOff), tostring(row[4]))
+            end
+            -- Parent-off equivalence, stated over the normalised block: no picks
+            -- and the feature is off, whatever the parent checkbox says.
+            if Auto.ZanzaAutomationOn({ enabled = true, priority = normalized })
+               ~= (row[3] ~= "") then
+                return false, row[1] .. ": ZanzaAutomationOn disagrees with the pick list"
             end
         end
     end

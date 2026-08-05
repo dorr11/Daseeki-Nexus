@@ -968,6 +968,9 @@ end
 --   * autoSummon.defaultsApplied  — the same guard for the seven trigger seeds:
 --     clearing it lets a later login resurrect triggers the destination had
 --     unticked. (Not named in the audit; same class of bug, same one-line fix.)
+--   * autoQuest.zanza.defaultsApplied — the sticky pick-list SEED guard (1.1.4).
+--     Same class as the two above, and a copy is an expressed choice besides;
+--     see the note at the copy itself.
 --   * autoGossip.dmf.buffType.PALADIN / .SHAMAN — faction-exclusive classes.
 -- All of these describe the DESTINATION's own history or its faction-exclusive
 -- rows. "Copy this faction's automation settings" does not reach them, and a
@@ -1011,7 +1014,29 @@ function Options.ApplyFactionCopy(src, dst)
         end
     end
 
+    -- The zanza PICK-LIST SEED GUARD (1.1.4) joins the preserve list above, and
+    -- for both of its reasons at once. It is the destination's own history like
+    -- the two defaultsApplied guards — clearing it lets a later login re-seed
+    -- Swiftness + Spirit over a list the destination had emptied — AND a copy is
+    -- itself an expressed choice about the pick list, exactly as it is about the
+    -- taxi rule. So: keep a guard the destination had already stamped, and stamp
+    -- it when it had not. Either way Store.SeedZanzaDefaults can never run over
+    -- the list this copy just wrote.
+    local dq = type(dst.autoQuest) == "table" and dst.autoQuest or nil
+    local keepZanzaSeeded = dq and type(dq.zanza) == "table" and dq.zanza.defaultsApplied
     dst.autoQuest = clone(src.autoQuest)
+    if type(dst.autoQuest) == "table" and type(dst.autoQuest.zanza) == "table" then
+        dst.autoQuest.zanza.defaultsApplied = keepZanzaSeeded or true
+    end
+
+    -- The six flipped-default toggles have just been given the SOURCE's values,
+    -- which is an expressed choice about every one of them. Stamp them chosen so
+    -- Store.MigrateAutomationDefaults never heals a copied OFF back to ON.
+    if ns.Store and ns.Store.MarkAutomationChosen and ns.Store.AUTOMATION_DEFAULT_FLIPS then
+        for _, flip in ipairs(ns.Store.AUTOMATION_DEFAULT_FLIPS) do
+            ns.Store.MarkAutomationChosen(dst, flip.chosen)
+        end
+    end
     return true
 end
 
@@ -2108,25 +2133,42 @@ local function buildAutomation(flow)
     end
 
     -- ── Gossip ─────────────────────────────────────────────────────────────────
+    --
+    -- THE `chose` STAMP (1.1.4 automation-defaults flip). Six of the checkboxes
+    -- below (dmt, bwl, dmf, eko, roids, zanza) had their shipped default flipped
+    -- from OFF to ON, and Store.MigrateAutomationDefaults heals an existing save
+    -- that still carries the old false. It must not heal a false the USER chose,
+    -- so every one of those six records the click here — in EITHER direction,
+    -- which is the whole point: an OFF with a stamp behind it is a decision.
+    -- Same pattern as autoSummon.dropOnTaxiPvpChosen.
+    local function chose(fs, key)
+        if ns.Store and ns.Store.MarkAutomationChosen then
+            ns.Store.MarkAutomationChosen(fs, key)
+        end
+    end
+
     local gos = flow:AddSection("Gossip")
     gos:Hint("Automatically pick the right gossip option at these NPCs and portals.")
     local gr = gos:AddRow({ vAlign = "center" })
     register("automation", gr:Checkbox({
         label = "Dire Maul tribute",
         get = function() local fs = FS(); return fs and fs.autoGossip.dmt end,
-        set = function(v) local fs = FS(); if fs then fs.autoGossip.dmt = v and true or false end end,
+        set = function(v) local fs = FS(); if fs then
+            fs.autoGossip.dmt = v and true or false; chose(fs, "dmt") end end,
     }).Refresh)
     register("automation", gr:Checkbox({
         label = "BWL Orb of Command",
         get = function() local fs = FS(); return fs and fs.autoGossip.bwl end,
-        set = function(v) local fs = FS(); if fs then fs.autoGossip.bwl = v and true or false end end,
+        set = function(v) local fs = FS(); if fs then
+            fs.autoGossip.bwl = v and true or false; chose(fs, "bwl") end end,
     }).Refresh)
 
     local dr = gos:AddRow({ vAlign = "center" })
     register("automation", dr:Checkbox({
         label = "DMF: auto-select Sayge fortune",
         get = function() local fs = FS(); return fs and fs.autoGossip.dmf.enabled end,
-        set = function(v) local fs = FS(); if fs then fs.autoGossip.dmf.enabled = v and true or false end end,
+        set = function(v) local fs = FS(); if fs then
+            fs.autoGossip.dmf.enabled = v and true or false; chose(fs, "dmf") end end,
     }).Refresh)
     register("automation", dr:Checkbox({
         label = "Skip fortune cookie",
@@ -2172,7 +2214,8 @@ local function buildAutomation(flow)
     register("automation", qa:Checkbox({
         label = "Winterspring E'ko",
         get = function() local fs = FS(); return fs and fs.autoQuest.eko end,
-        set = function(v) local fs = FS(); if fs then fs.autoQuest.eko = v and true or false end end,
+        set = function(v) local fs = FS(); if fs then
+            fs.autoQuest.eko = v and true or false; chose(fs, "eko") end end,
     }).Refresh)
     register("automation", qa:Checkbox({
         label = "Yojamba coins",
@@ -2183,7 +2226,8 @@ local function buildAutomation(flow)
     register("automation", qb:Checkbox({
         label = "Blasted Lands R.O.I.D.S.",
         get = function() local fs = FS(); return fs and fs.autoQuest.roids end,
-        set = function(v) local fs = FS(); if fs then fs.autoQuest.roids = v and true or false end end,
+        set = function(v) local fs = FS(); if fs then
+            fs.autoQuest.roids = v and true or false; chose(fs, "roids") end end,
     }).Refresh)
     register("automation", qb:Checkbox({
         label = Options.REPAIR_LABEL,
@@ -2197,11 +2241,20 @@ local function buildAutomation(flow)
     register("automation", zr:Checkbox({
         label = "Zanza buffs",
         get = function() local fs = FS(); return fs and fs.autoQuest.zanza.enabled end,
-        set = function(v) local fs = FS(); if fs then fs.autoQuest.zanza.enabled = v and true or false end end,
+        set = function(v) local fs = FS(); if fs then
+            fs.autoQuest.zanza.enabled = v and true or false; chose(fs, "zanza") end end,
     }).Refresh)
     local zpick = q:AddRow({ vAlign = "center" })
     zpick._indent = zpick._indent + 20
     -- Zanza pick membership (priority list). Order fixed; membership toggled.
+    --
+    -- UNTICKING THE LAST ONE NOW MEANS SOMETHING. An empty list used to read as
+    -- "all three" (the store could not ship a default array without resurrecting
+    -- it every login), so clearing every box silently gave you everything. The
+    -- default list is seeded once now — Store.SeedZanzaDefaults — and an empty
+    -- list reads as NONE, which is why the seed guard is stamped on every click
+    -- here: the seeder must never re-install Swiftness + Spirit over a list the
+    -- user has just emptied on purpose.
     local function pickIndex(list, key) for i, k in ipairs(list or {}) do if k == key then return i end end return nil end
     for _, pick in ipairs(ZANZA_PICKS) do
         register("automation", zpick:Checkbox({
@@ -2213,6 +2266,7 @@ local function buildAutomation(flow)
                 local idx = pickIndex(pr, pick.key)
                 if v and not idx then pr[#pr + 1] = pick.key
                 elseif not v and idx then table.remove(pr, idx) end
+                fs.autoQuest.zanza.defaultsApplied = true
             end,
         }).Refresh)
     end
@@ -2921,7 +2975,8 @@ ns:RegisterSelfTest("options", function(verbose)
         },
         autoGossip = { dmt = true, dmf = { enabled = true,
             buffType = { PALADIN = "damage", SHAMAN = "damage", MAGE = "intellect" } } },
-        autoQuest = { autoRepair = true },
+        autoQuest = { autoRepair = true,
+            zanza = { enabled = true, priority = { "sheen" }, defaultsApplied = false } },
     }
     local dst = {
         autoGroup = {
@@ -2934,7 +2989,8 @@ ns:RegisterSelfTest("options", function(verbose)
         },
         autoGossip = { dmt = false, dmf = { enabled = false,
             buffType = { PALADIN = "armor", SHAMAN = "spirit", MAGE = "damage" } } },
-        autoQuest = { autoRepair = false },
+        autoQuest = { autoRepair = false,
+            zanza = { enabled = false, priority = {}, defaultsApplied = false } },
     }
     ck(Options.ApplyFactionCopy(src, dst) == true, "faction copy runs")
 
@@ -2963,6 +3019,33 @@ ns:RegisterSelfTest("options", function(verbose)
     -- A copy IS a decision about the taxi rule, so the migration must not undo it.
     ck(dst.autoSummon.dropOnTaxiPvp == true, "copy: taxi rule copied")
     ck(dst.autoSummon.dropOnTaxiPvpChosen == true, "copy marks the taxi rule as chosen")
+
+    ----------------------------------------------------------------------
+    -- 1.1.4 AUTOMATION-DEFAULTS FLIP: the two new pieces of history a copy must
+    -- not hand to the seeder or the heal.
+    ----------------------------------------------------------------------
+    -- The pick list copies (it is a setting)...
+    ck(table.concat(dst.autoQuest.zanza.priority, ",") == "sheen", "copy: zanza pick list copied")
+    -- ...but the SEED GUARD is stamped on the destination whatever either side
+    -- held, so Store.SeedZanzaDefaults can never re-install the default list over
+    -- a copied list — including a copy of an empty one.
+    ck(dst.autoQuest.zanza.defaultsApplied == true,
+       "copy stamps the destination zanza seed guard (never re-seed a copied list)")
+    local emptySrc = { autoQuest = { zanza = { enabled = true, priority = {}, defaultsApplied = false } } }
+    local emptyDst = { autoQuest = { zanza = { enabled = true, priority = { "spirit" }, defaultsApplied = true } } }
+    Options.ApplyFactionCopy(emptySrc, emptyDst)
+    ck(#emptyDst.autoQuest.zanza.priority == 0
+       and emptyDst.autoQuest.zanza.defaultsApplied == true,
+       "copying an EMPTY pick list leaves it empty and still guarded")
+    -- ...and every flipped toggle the copy just overwrote counts as chosen, so
+    -- the one-shot heal cannot turn a copied OFF back on.
+    if ns.Store and ns.Store.AUTOMATION_DEFAULT_FLIPS then
+        local allChosen = true
+        for _, flip in ipairs(ns.Store.AUTOMATION_DEFAULT_FLIPS) do
+            if not ns.Store.AutomationChosen(dst, flip.chosen) then allChosen = false end
+        end
+        ck(allChosen, "copy stamps all six flipped toggles as chosen on the destination")
+    end
 
     -- Deep copy, not aliasing: editing the source afterwards must not move the
     -- destination.

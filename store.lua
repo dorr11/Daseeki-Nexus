@@ -209,6 +209,11 @@ local function defaultFactionBlock()
             -- Per-category whisper-invite SEND gates (item 22). The N4a build
             -- collapsed sends to a single roster gate; the reference gates each
             -- trust category independently, matching the four accept-from gates.
+            --
+            -- STANDING WAIVER (1.1.4 automation-defaults flip): sendToGuild and
+            -- sendToFriends stay OFF. The owner's flip list named the gossip and
+            -- quest automations only; these two send unsolicited whispers to
+            -- people who are not you, which is a different kind of default.
             sendToRoster      = true,
             sendToGuild       = false,
             sendToFriends     = false,
@@ -244,24 +249,73 @@ local function defaultFactionBlock()
             -- Sticky one-time seeding guard, mirroring auraOpts.defaultsApplied.
             defaultsApplied = false,
         },
+        -- OWNER DECISION (1.1.4 automation-defaults flip). Six automations that
+        -- shipped OFF now ship ON: DMT tribute, BWL orb, Sayge's fortune, E'ko,
+        -- R.O.I.D.S. and Zanza. Audit divergence 9 (rows 63/68/87/100 and the
+        -- Sayge default row) recorded them as spec-on/shipped-off and said the
+        -- flip should wait for the guards; the guards landed in this same wave
+        -- (NPC scoping, page maps, ID tables, reagent counts), so the owner
+        -- called the flip. Store.MigrateAutomationDefaults heals installs that
+        -- already carry the old `false` with no choice behind it.
+        --
+        -- STANDING WAIVERS — deliberately NOT flipped, so their absence from the
+        -- list above is a decision and not an oversight:
+        --   * autoGossip.dmf.skipCookie — spec-default ON (audit row 78). The
+        --     owner's list named the fortune, not the cookie dialog.
+        --   * autoQuest.zgCoins — spec-default ON. Not in the owner's list.
+        --   * autoQuest.autoRepair — spec-default ON. Explicitly out of scope for
+        --     this flip; it spends gold, which is its own conversation.
+        --   * autoGroup.sendToGuild / .sendToFriends — the outbound keyword-send
+        --     gates above. Not in the owner's list; they whisper strangers.
+        --   * autoSummon.dropOnTaxiPvp — just set to the spec's OFF by the taxi
+        --     heal in this same wave. Untouched here.
         autoGossip = {
-            dmt = false,                     -- Dire Maul tribute guard
-            bwl = false,                     -- Orb of Command
+            dmt = true,                      -- Dire Maul tribute guard
+            bwl = true,                      -- Orb of Command
             dmf = {                          -- Sayge's Dark Fortune
-                enabled   = false,
+                -- DIVERGES FROM THE SPEC BY OWNER DECISION. Spec §14 (audit row
+                -- 71) ships this OFF and calls the fortune "fragile" — it is
+                -- permanent for the day and cannot be re-rolled. The owner asked
+                -- for "dmf" on anyway; the per-class buffType below now really
+                -- does hold a value (Damage for all nine), so an auto-fortune
+                -- picks the buff the options page shows rather than nothing.
+                enabled   = true,
                 -- ["CLASS"] = one of the eight spec §14 buff types. Seeded to
                 -- "damage" for all nine classes — see defaultSaygeBuffTypes.
                 buffType  = defaultSaygeBuffTypes(),
+                -- Waiver above: spec-on, shipped off, not in the owner's list.
                 skipCookie = false,
             },
         },
         autoQuest = {
-            eko       = false,
-            zgCoins   = false,
-            zanza     = { enabled = false, priority = {} },
-            roids     = false,
-            autoRepair = false,
+            eko       = true,
+            zgCoins   = false,               -- waiver above
+            zanza     = {
+                enabled  = true,
+                -- STILL EMPTY HERE ON PURPOSE — the resurrection trap. Store.
+                -- ApplyDefaults recurses into tables, so an array written into
+                -- this tree would re-grow index 1..n on every single login and
+                -- resurrect a flask the owner unticked (the same trap documented
+                -- on autoSummon.triggers and auraOpts.thresholds). The owner's
+                -- default pick list is installed ONCE by Store.SeedZanzaDefaults
+                -- under the sticky `defaultsApplied` guard below.
+                priority = {},
+                -- Sticky one-time seeding guard for `priority`, mirroring
+                -- autoSummon.defaultsApplied. Once true the seeder never looks at
+                -- this block again, so an unticked flask stays unticked forever.
+                defaultsApplied = false,
+            },
+            roids     = true,
+            autoRepair = false,              -- waiver above
         },
+        -- Per-key record of "the user touched this automation toggle", the
+        -- match-by-value + userChose half of the house heal pattern (cf.
+        -- autoSummon.dropOnTaxiPvpChosen). options.lua stamps a key here the
+        -- moment its checkbox is clicked, EITHER WAY, so a deliberate OFF is
+        -- never healed back on. Empty by default; applyDefaults only ever fills
+        -- an absent key of a table it is given, and this tree has no keys, so it
+        -- can never resurrect a stamp.
+        automationChosen = {},               -- ["dmt"|"bwl"|"dmf"|"eko"|"roids"|"zanza"] = true
         -- autoInteract removed: the Interact Buttons feature was cut pre-release.
         auraOpts = {
             -- per-aura normal/minimum duration thresholds (seconds).
@@ -1232,6 +1286,12 @@ local function defaultSettings()
         -- autoQuest.zanza.priority normalized from the legacy map/hybrid shapes
         -- to the canonical array (see Store.MigrateZanzaPriorityShape).
         zanzaPriorityShapeFixed = false,
+        -- The six automation toggles healed from the old shipped OFF to the
+        -- owner's new ON, once (see Store.MigrateAutomationDefaults). One-shot
+        -- rather than pure match-by-value BECAUSE THIS HEAL DOES MORE, not less:
+        -- if a `chosen` stamp ever failed to be written, a bare value match would
+        -- re-enable the same toggle on every login. It gets exactly one attempt.
+        automationDefaultsHealed = false,
         factionSettings     = buildFactionSettings(),
         timerSettings       = defaultTimerSettings(),
         ui = {
@@ -1521,6 +1581,110 @@ function Store.MigrateTaxiPvpDefault(db)
 end
 
 ----------------------------------------------------------------------
+-- The six automation toggles the owner flipped ON (1.1.4) — and the heal that
+-- carries an existing install across with it.
+--
+-- Flipping the seed alone heals nobody who has already logged in: their
+-- SavedVariables carries the old `false`, and applyDefaults never overwrites a
+-- key that exists. So this is the same MATCH-BY-VALUE + userChose heal as
+-- Store.MigrateTaxiPvpDefault, pointed the other way.
+--
+-- A stored value is rewritten ONLY when BOTH hold:
+--   * it is still exactly the old shipped default (false) — an already-true
+--     block is left completely alone, and so is a nil (applyDefaults installs
+--     the new default there a moment later), and
+--   * `automationChosen[key]` is not stamped. options.lua stamps that flag the
+--     moment the checkbox is clicked, in EITHER direction, so a deliberate OFF
+--     survives every future login.
+--
+-- ONE-SHOT, marker-guarded, unlike the taxi heal. That heal moved toward doing
+-- LESS, so re-running it was harmless; this one moves toward doing MORE, and a
+-- heal that can turn an automation back on more than once is a heal that can
+-- fight the user. It gets exactly one attempt, ever.
+--
+-- KNOWN AND ACCEPTED LIMIT, identical to the taxi heal's: an install that ticked
+-- one of these ON and then OFF again BEFORE this build has no `chosen` stamp to
+-- prove it — the flag cannot be applied retroactively — so that toggle is healed
+-- to ON once and has to be re-cleared. Every one of the six is now NPC-scoped and
+-- ID-gated (this same wave), so the failure mode is "an automation you had
+-- switched off runs at the one NPC it is scoped to", not a blast radius.
+--
+-- The keys live at two depths, so the table below carries the path rather than
+-- six bespoke accessors. `chosen` is the automationChosen key AND the options
+-- checkbox's identity; `path` walks from the faction block; `field` is the leaf.
+----------------------------------------------------------------------
+
+Store.AUTOMATION_HEAL_MARKER = "automationDefaultsHealed"
+
+Store.AUTOMATION_DEFAULT_FLIPS = {
+    { chosen = "dmt",   path = { "autoGossip" },          field = "dmt"     },
+    { chosen = "bwl",   path = { "autoGossip" },          field = "bwl"     },
+    { chosen = "dmf",   path = { "autoGossip", "dmf" },   field = "enabled" },
+    { chosen = "eko",   path = { "autoQuest"  },          field = "eko"     },
+    { chosen = "roids", path = { "autoQuest"  },          field = "roids"   },
+    { chosen = "zanza", path = { "autoQuest", "zanza" },  field = "enabled" },
+}
+
+-- Walk a flip's path from a faction block. Returns the CONTAINER table, or nil
+-- when any step is missing or not a table (a partially-migrated or hand-edited
+-- save is skipped, never created).
+local function flipContainer(fs, flip)
+    local t = fs
+    for _, step in ipairs(flip.path) do
+        if type(t) ~= "table" then return nil end
+        t = t[step]
+    end
+    if type(t) ~= "table" then return nil end
+    return t
+end
+Store._FlipContainer = flipContainer
+
+-- Record that the user expressed an intent about one of the six. Called by
+-- options.lua from every one of those checkboxes' `set`, whichever way it went.
+-- Creates the table if a legacy save has not got one yet.
+function Store.MarkAutomationChosen(fs, key)
+    if type(fs) ~= "table" or type(key) ~= "string" then return false end
+    if type(fs.automationChosen) ~= "table" then fs.automationChosen = {} end
+    fs.automationChosen[key] = true
+    return true
+end
+
+-- Has the user expressed an intent about this toggle?
+function Store.AutomationChosen(fs, key)
+    local c = type(fs) == "table" and fs.automationChosen or nil
+    return type(c) == "table" and c[key] == true
+end
+
+function Store.MigrateAutomationDefaults(db)
+    if type(db) ~= "table" then return 0 end
+    if db[Store.AUTOMATION_HEAL_MARKER] then return 0 end
+    local fsAll = db.factionSettings
+    -- No faction blocks at all = a brand-new install. Do NOT stamp the marker:
+    -- applyDefaults has not built the tree yet on this very call order, and a
+    -- fresh tree needs no heal. Leaving the marker unstamped costs one boolean
+    -- read next login and keeps the pass honest about what it has seen.
+    if type(fsAll) ~= "table" then return 0 end
+
+    local healed = 0
+    for _, faction in ipairs({ "Alliance", "Horde" }) do
+        local fs = fsAll[faction]
+        if type(fs) == "table" then
+            for _, flip in ipairs(Store.AUTOMATION_DEFAULT_FLIPS) do
+                local box = flipContainer(fs, flip)
+                if box and box[flip.field] == false
+                   and not Store.AutomationChosen(fs, flip.chosen) then
+                    box[flip.field] = true
+                    healed = healed + 1
+                end
+            end
+        end
+    end
+
+    db[Store.AUTOMATION_HEAL_MARKER] = true
+    return healed
+end
+
+----------------------------------------------------------------------
 -- A17.3 — coordinate-override box correction.
 --
 -- The three seeded rules shipped with rectangles ~12x the reference's ±0.02
@@ -1733,6 +1897,13 @@ function Store.MigrateZanzaPriorityShape(db)
                 if allOff then
                     if z.enabled == true then disabled = disabled + 1 end
                     z.enabled = false
+                    -- STAMP THE SEED GUARD TOO. This block's honest answer is
+                    -- "none", written as `priority = {}`, and that is exactly the
+                    -- shape Store.SeedZanzaDefaults treats as unseeded. Without
+                    -- this line the seeder would install Swiftness + Spirit one
+                    -- function call later and resurrect two of the three flasks
+                    -- the owner had just been proved to have opted out of.
+                    z.defaultsApplied = true
                 end
             end
         end
@@ -1749,6 +1920,90 @@ function Store.MigrateZanzaPriorityShape(db)
     end
 
     return fixed, disabled
+end
+
+----------------------------------------------------------------------
+-- Zanza DEFAULT PICK LIST — seeded once, never resurrected.
+--
+-- OWNER DECISION, and it is NOT the spec's: spec §14 offers all three flasks and
+-- the pre-1.1.4 reader treated an empty list as "all three". The owner asked for
+-- "zanza (spirit and swiftness)", so the shipped default is TWO — Swiftness and
+-- Spirit, in the spec's fixed priority order — and Sheen ships UNTICKED. A user
+-- who wants Sheen ticks it; nothing here ever unticks it again.
+--
+-- WHY A SEEDER AND NOT A DEFAULTS-TREE ARRAY. Store.ApplyDefaults recurses into
+-- tables and fills absent keys, so `priority = { "swiftness", "spirit" }` in
+-- defaultFactionBlock would re-grow index 1 and 2 on EVERY login and resurrect a
+-- flask the owner unticked — the exact trap documented on autoSummon.triggers
+-- and auraOpts.thresholds. So the tree ships `{}` and this pass installs the seed
+-- exactly once per faction block, behind the sticky `defaultsApplied` guard.
+--
+-- Same contract as Store.SeedAutoSummonDefaults — ADDITIVE ONLY, and sticky:
+--   * `zanza.defaultsApplied` already true -> do nothing at all. This is what
+--     keeps an unticked flask unticked forever, including the block the shape
+--     migration just proved was a full opt-out (it stamps this flag itself).
+--   * priority holds ANY content — a recognised array entry, or a stray map key
+--     from a legacy shape — -> left EXACTLY as-is. A preference is recorded
+--     there and we never merge into it.
+--   * priority genuinely empty (no array entries, no map keys) -> install the
+--     seed. This covers a fresh install AND an existing user who had zanza on
+--     and never opened the pick boxes: their `{}` used to read as "all three"
+--     and now reads as "none", so converting it to the shipped default at the
+--     same moment the semantics change is what keeps their feature alive. It is
+--     a NARROWING (three flasks becomes two), which is the safe direction, and
+--     it is the owner's stated default.
+--   * Then stamp defaultsApplied so this never runs again.
+--
+-- MUST RUN AFTER Store.MigrateZanzaPriorityShape: that pass turns the legacy map
+-- and hybrid shapes into arrays and stamps this guard on a full opt-out, so by
+-- the time we look, "empty" really does mean empty.
+--
+-- RESIDUAL, stated rather than hidden: an install that ran the shape migration on
+-- an EARLIER 1.1.4 dev build and had every flask unticked carries the shape
+-- marker already, so that run cannot stamp the new guard, and this pass will seed
+-- Swiftness + Spirit into its empty list. Its parent toggle is off (the migration
+-- switched it off), so nothing dispenses; only re-ticking the parent would show
+-- the two picks. Dev-build-only, parent-gated, and one-shot.
+----------------------------------------------------------------------
+
+-- The owner's default pick list, in Store.ZANZA_PRIORITY_ORDER order. auto.lua's
+-- Auto.ZANZA_DEFAULT_PICKS is the other copy (the engine cannot depend on load
+-- order); the store suite asserts the two agree entry-for-entry.
+Store.ZANZA_PRIORITY_SEEDS = { "swiftness", "spirit" }
+
+-- Does this pick list hold no recorded preference at all? Mirrors the "genuinely
+-- fresh `{}`" arm of Store.NormalizeZanzaPriority: no array entries AND no map
+-- keys. Anything else — even one stray key — means the owner's file has said
+-- something about zanza and seeding would be a merge, not an install.
+local function zanzaPriorityUnseeded(t)
+    if type(t) ~= "table" then return true end
+    if #t > 0 then return false end
+    return next(t) == nil
+end
+Store._zanzaPriorityUnseeded = zanzaPriorityUnseeded
+
+function Store.SeedZanzaDefaults(db)
+    if type(db) ~= "table" then return 0 end
+    local fsAll = db.factionSettings
+    if type(fsAll) ~= "table" then return 0 end
+
+    local seeded = 0
+    for _, faction in ipairs({ "Alliance", "Horde" }) do
+        local fs = fsAll[faction]
+        local aq = type(fs) == "table" and fs.autoQuest or nil
+        local z  = type(aq) == "table" and aq.zanza or nil
+        if type(z) == "table" and not z.defaultsApplied then
+            if type(z.priority) ~= "table" then z.priority = {} end
+            if zanzaPriorityUnseeded(z.priority) then
+                for i, key in ipairs(Store.ZANZA_PRIORITY_SEEDS) do
+                    z.priority[i] = key
+                end
+                seeded = seeded + 1
+            end
+            z.defaultsApplied = true
+        end
+    end
+    return seeded
 end
 
 ----------------------------------------------------------------------
@@ -1879,6 +2134,13 @@ function Store.Init()
     -- otherwise be a no-op on the key and the heal would read a value that had
     -- just been (re)installed rather than the one the user actually stored.
     Store.MigrateTaxiPvpDefault(DaseekiNexusDB)
+    -- 1.1.4 automation-defaults flip: heal the six toggles that shipped OFF and
+    -- now ship ON, for anyone still carrying the old false with no choice behind
+    -- it. BEFORE applyDefaults for the same reason as the taxi heal — after it,
+    -- an absent key would already have been filled with the NEW default and the
+    -- heal would be reading a value it had just installed rather than the one the
+    -- user actually stored.
+    Store.MigrateAutomationDefaults(DaseekiNexusDB)
 
     applyDefaults(DaseekiNexusDB, defaultSettings())
     DaseekiNexusDB.settingsVersion = Store.SETTINGS_VERSION
@@ -1900,6 +2162,14 @@ function Store.Init()
     -- Runs AFTER applyDefaults for the same reason the seeds do — the faction
     -- blocks have to exist — and self-disables via its own sticky marker.
     Store.MigrateZanzaPriorityShape(DaseekiNexusDB)
+
+    -- One-time, additive install of the owner's default zanza pick list
+    -- (Swiftness + Spirit). MUST run AFTER the shape repair above: that pass
+    -- converts the legacy map/hybrid shapes to arrays and stamps this seeder's
+    -- own guard on a block that turned out to be a full opt-out, so by the time
+    -- we look an empty list really is empty. Self-disables via
+    -- autoQuest.zanza.defaultsApplied (never re-seeds).
+    Store.SeedZanzaDefaults(DaseekiNexusDB)
 
     -- SETTINGS-REWORK ITEM 6: fold the two faction class-rule tables into the
     -- single global db.auraRules. Runs AFTER SeedAuraDefaults so a first-run
@@ -4077,6 +4347,38 @@ local function testDefaults(fails)
         ck(as.dropOnTaxiPvp == false, faction .. " dropOnTaxiPvp defaults OFF per spec §13")
         ck(as.dropOnTaxiPvpChosen == false, faction .. " dropOnTaxiPvp starts unchosen")
     end
+    -- OWNER DECISION (1.1.4): the six flipped automation defaults, per faction,
+    -- one assertion each. Fresh install -> ON, both sides.
+    for _, faction in ipairs({ "Alliance", "Horde" }) do
+        local fs = s.factionSettings[faction]
+        ck(fs.autoGossip.dmt == true,        faction .. " DMT tribute defaults ON")
+        ck(fs.autoGossip.bwl == true,        faction .. " BWL orb defaults ON")
+        ck(fs.autoGossip.dmf.enabled == true, faction .. " Sayge auto-fortune defaults ON")
+        ck(fs.autoQuest.eko == true,         faction .. " E'ko defaults ON")
+        ck(fs.autoQuest.roids == true,       faction .. " R.O.I.D.S. defaults ON")
+        ck(fs.autoQuest.zanza.enabled == true, faction .. " zanza defaults ON")
+        -- ...and the five that deliberately did NOT flip. Each is a waiver, so
+        -- each is pinned: a silent flip later is a test failure, not a surprise.
+        ck(fs.autoGossip.dmf.skipCookie == false,
+            faction .. " skipCookie stays OFF (waiver: not in the owner's list)")
+        ck(fs.autoQuest.zgCoins == false,
+            faction .. " ZG coins stay OFF (waiver: not in the owner's list)")
+        ck(fs.autoQuest.autoRepair == false,
+            faction .. " auto-repair stays OFF (waiver: out of scope, spends gold)")
+        ck(fs.autoGroup.sendToGuild == false and fs.autoGroup.sendToFriends == false,
+            faction .. " guild/friends keyword SEND gates stay OFF (standing waiver)")
+        -- The pick list itself is STILL empty in the tree — an array here would
+        -- be resurrected by applyDefaults on every login. The seeder owns it.
+        ck(type(fs.autoQuest.zanza.priority) == "table"
+            and #fs.autoQuest.zanza.priority == 0,
+            faction .. " zanza.priority ships EMPTY (seeded, never defaulted)")
+        ck(fs.autoQuest.zanza.defaultsApplied == false,
+            faction .. " zanza pick-list seed guard starts unstamped")
+        ck(type(fs.automationChosen) == "table" and next(fs.automationChosen) == nil,
+            faction .. " automationChosen ships empty")
+    end
+    ck(s[Store.AUTOMATION_HEAL_MARKER] == false,
+       "the automation-defaults heal marker ships as false")
     -- RULE (spec §14): Sayge's buff type defaults to Damage for EVERY class.
     -- The store used to ship {} while the options dropdown painted "damage" as
     -- its own fallback, so the UI showed a value the engine could not read and
@@ -6549,6 +6851,351 @@ local function testZanzaPriorityShape(fails)
        "the marker ships as false in the settings defaults")
 end
 
+----------------------------------------------------------------------
+-- The 1.1.4 automation-defaults flip: the heal that carries existing installs.
+--
+-- One row per behaviour the heal claims: match-by-value, userChose respected,
+-- already-on untouched, one-shot, malformed-safe. Both factions everywhere.
+----------------------------------------------------------------------
+local function testAutomationDefaultFlips(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+
+    -- An existing install: every faction block shaped like the OLD defaults.
+    local function oldInstall()
+        local function block()
+            return {
+                autoGossip = { dmt = false, bwl = false, dmf = { enabled = false } },
+                autoQuest  = { eko = false, roids = false,
+                               zanza = { enabled = false, priority = {} } },
+            }
+        end
+        return { factionSettings = { Alliance = block(), Horde = block() } }
+    end
+
+    ------------------------------------------------------------------
+    -- 1. Untouched old defaults heal to ON, both factions, all six keys.
+    ------------------------------------------------------------------
+    local db = oldInstall()
+    local healed = Store.MigrateAutomationDefaults(db)
+    ck(healed == 12, ("6 keys x 2 factions heal (got %d)"):format(healed))
+    for _, faction in ipairs({ "Alliance", "Horde" }) do
+        local fs = db.factionSettings[faction]
+        ck(fs.autoGossip.dmt == true,         faction .. " dmt healed to ON")
+        ck(fs.autoGossip.bwl == true,         faction .. " bwl healed to ON")
+        ck(fs.autoGossip.dmf.enabled == true, faction .. " sayge healed to ON")
+        ck(fs.autoQuest.eko == true,          faction .. " e'ko healed to ON")
+        ck(fs.autoQuest.roids == true,        faction .. " roids healed to ON")
+        ck(fs.autoQuest.zanza.enabled == true, faction .. " zanza healed to ON")
+    end
+    ck(db[Store.AUTOMATION_HEAL_MARKER] == true, "the heal stamps its marker")
+
+    ------------------------------------------------------------------
+    -- 2. ONE-SHOT: rot the values back and re-run. Nothing moves.
+    ------------------------------------------------------------------
+    db.factionSettings.Horde.autoGossip.dmt = false
+    ck(Store.MigrateAutomationDefaults(db) == 0, "the stamped marker makes a second run a no-op")
+    ck(db.factionSettings.Horde.autoGossip.dmt == false,
+       "...and it does not touch the store (stamp, do not wipe)")
+
+    ------------------------------------------------------------------
+    -- 3. A USER-CHOSEN false is never healed. One key chosen, the rest not.
+    ------------------------------------------------------------------
+    local chosen = oldInstall()
+    Store.MarkAutomationChosen(chosen.factionSettings.Horde, "dmt")
+    Store.MarkAutomationChosen(chosen.factionSettings.Horde, "zanza")
+    local healed3 = Store.MigrateAutomationDefaults(chosen)
+    ck(healed3 == 10, ("two chosen keys are skipped (got %d, want 10)"):format(healed3))
+    ck(chosen.factionSettings.Horde.autoGossip.dmt == false,
+       "a user-chosen OFF stays off")
+    ck(chosen.factionSettings.Horde.autoQuest.zanza.enabled == false,
+       "a user-chosen zanza OFF stays off")
+    ck(chosen.factionSettings.Horde.autoGossip.bwl == true,
+       "...and its neighbours in the same block still heal")
+    ck(chosen.factionSettings.Alliance.autoGossip.dmt == true,
+       "the stamp is per FACTION BLOCK, not global")
+
+    ------------------------------------------------------------------
+    -- 4. Already-ON is untouched and never counted.
+    ------------------------------------------------------------------
+    local on = oldInstall()
+    on.factionSettings.Alliance.autoQuest.eko = true
+    on.factionSettings.Horde.autoQuest.eko    = true
+    local healed4 = Store.MigrateAutomationDefaults(on)
+    ck(healed4 == 10, ("an already-true key is not a heal (got %d, want 10)"):format(healed4))
+    ck(on.factionSettings.Alliance.autoQuest.eko == true, "already-ON stays ON")
+
+    ------------------------------------------------------------------
+    -- 5. MALFORMED stores are skipped, never crashed on and never created.
+    ------------------------------------------------------------------
+    ck(Store.MigrateAutomationDefaults(7) == 0, "a non-table db is a no-op")
+    ck(Store.MigrateAutomationDefaults({}) == 0, "a db with no factionSettings is a no-op")
+    local junk = { factionSettings = { Horde = 7, Alliance = { autoQuest = 9 } } }
+    ck(Store.MigrateAutomationDefaults(junk) == 0, "junk faction blocks heal nothing")
+    local partial = { factionSettings = { Horde = { autoQuest = { eko = false } } } }
+    ck(Store.MigrateAutomationDefaults(partial) == 1,
+       "a partial block heals only the keys it actually has")
+    ck(partial.factionSettings.Horde.autoGossip == nil,
+       "...and the missing containers are NOT created")
+    -- A nil value is not the old default: applyDefaults installs the new one.
+    local absent = { factionSettings = { Horde = { autoGossip = {}, autoQuest = {} } } }
+    ck(Store.MigrateAutomationDefaults(absent) == 0, "an ABSENT key is not a false to heal")
+
+    ------------------------------------------------------------------
+    -- 6. A brand-new install (no factionSettings yet — the heal runs BEFORE
+    --    applyDefaults) reports nothing and does not stamp, so the pass gets a
+    --    real look at the tree on the next login instead of a blind stamp.
+    ------------------------------------------------------------------
+    local fresh = {}
+    Store.MigrateAutomationDefaults(fresh)
+    ck(fresh[Store.AUTOMATION_HEAL_MARKER] == nil,
+       "a db with no faction blocks yet is not stamped")
+
+    ------------------------------------------------------------------
+    -- 7. The flip table is the schema. Its keys must be the six the owner named
+    --    and each path must resolve on a real default block.
+    ------------------------------------------------------------------
+    local want = { dmt = true, bwl = true, dmf = true, eko = true, roids = true, zanza = true }
+    ck(#Store.AUTOMATION_DEFAULT_FLIPS == 6, "exactly six toggles were flipped")
+    local live = defaultSettings().factionSettings.Alliance
+    for _, flip in ipairs(Store.AUTOMATION_DEFAULT_FLIPS) do
+        ck(want[flip.chosen] == true, "flip key " .. tostring(flip.chosen) .. " is one of the six")
+        local box = Store._FlipContainer(live, flip)
+        ck(type(box) == "table" and box[flip.field] == true,
+           ("flip %s resolves on a fresh block and reads ON"):format(tostring(flip.chosen)))
+    end
+
+    -- MarkAutomationChosen / AutomationChosen contract.
+    ck(Store.MarkAutomationChosen(nil, "dmt") == false, "marking a non-table block is refused")
+    local blk = {}
+    ck(Store.MarkAutomationChosen(blk, "dmt") == true and Store.AutomationChosen(blk, "dmt"),
+       "the chosen table is created on demand and reads back")
+    ck(Store.AutomationChosen(blk, "bwl") == false, "an unstamped key reads unchosen")
+end
+
+----------------------------------------------------------------------
+-- The zanza DEFAULT PICK LIST seeder (1.1.4) — and the empty-array semantics
+-- that only became honest once the seeder existed.
+----------------------------------------------------------------------
+local function testZanzaSeeds(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local function arr(t) return table.concat(t or {}, ",") end
+
+    local function store(zanza)
+        return { factionSettings = {
+            Alliance = { autoQuest = { zanza = zanza } },
+            Horde    = { autoQuest = { zanza = { enabled = true, priority = {} } } },
+        } }
+    end
+
+    ------------------------------------------------------------------
+    -- 1. Fresh install: the seed lands in BOTH factions, in spec order, and it
+    --    is exactly the owner's two — Sheen is NOT a default.
+    ------------------------------------------------------------------
+    local db = store({ enabled = true, priority = {} })
+    local seeded = Store.SeedZanzaDefaults(db)
+    ck(seeded == 2, ("both faction blocks seeded (got %d)"):format(seeded))
+    for _, faction in ipairs({ "Alliance", "Horde" }) do
+        local z = db.factionSettings[faction].autoQuest.zanza
+        ck(arr(z.priority) == "swiftness,spirit",
+           faction .. " seeds exactly {swiftness, spirit} in spec order, got {" .. arr(z.priority) .. "}")
+        ck(z.defaultsApplied == true, faction .. " seed guard is stamped")
+    end
+
+    ------------------------------------------------------------------
+    -- 2. STICKINESS, the whole reason the guard exists. Untick Spirit, then
+    --    simulate a relog (run the seeder again). It stays unticked.
+    ------------------------------------------------------------------
+    local z = db.factionSettings.Alliance.autoQuest.zanza
+    table.remove(z.priority, 2)                       -- the options page's write
+    ck(arr(z.priority) == "swiftness", "premise: Spirit is unticked")
+    ck(Store.SeedZanzaDefaults(db) == 0, "a stamped block is never re-seeded")
+    ck(arr(z.priority) == "swiftness", "Spirit stays unticked across a relog")
+    -- ...and unticking the LAST one survives a relog too, which is the case the
+    -- old "empty means all three" reader could not express at all.
+    table.remove(z.priority, 1)
+    ck(Store.SeedZanzaDefaults(db) == 0 and #z.priority == 0,
+       "an emptied pick list is not re-seeded")
+
+    ------------------------------------------------------------------
+    -- 3. A block with ANY recorded content is left exactly as-is.
+    ------------------------------------------------------------------
+    local kept = store({ enabled = true, priority = { "sheen" } })
+    Store.SeedZanzaDefaults(kept)
+    ck(arr(kept.factionSettings.Alliance.autoQuest.zanza.priority) == "sheen",
+       "an existing pick list is never merged into")
+    ck(kept.factionSettings.Alliance.autoQuest.zanza.defaultsApplied == true,
+       "...and the guard is stamped so we never look again")
+    -- A legacy MAP shape counts as content too (it is a recorded preference).
+    local mapShaped = store({ enabled = true, priority = { sheen = false } })
+    Store.SeedZanzaDefaults(mapShaped)
+    local mp = mapShaped.factionSettings.Alliance.autoQuest.zanza.priority
+    ck(#mp == 0 and mp.sheen == false, "a map-shaped list is content, not an empty list")
+
+    ------------------------------------------------------------------
+    -- 4. THE ALL-OFF HAND-OFF. The shape migration proves a full opt-out and
+    --    stamps the seed guard itself, so the seeder cannot resurrect it.
+    ------------------------------------------------------------------
+    local off = { factionSettings = { Horde = { autoQuest = { zanza = {
+        enabled = true, priority = { swiftness = false, spirit = false, sheen = false } } } } } }
+    Store.MigrateZanzaPriorityShape(off)
+    local oz = off.factionSettings.Horde.autoQuest.zanza
+    ck(oz.enabled == false and #oz.priority == 0, "premise: the migration emptied it and unticked the parent")
+    ck(oz.defaultsApplied == true, "the migration stamps the seed guard on a full opt-out")
+    ck(Store.SeedZanzaDefaults(off) == 0, "the seeder refuses the block")
+    ck(#oz.priority == 0, "no flask is resurrected")
+
+    ------------------------------------------------------------------
+    -- 5. Malformed stores are safe, and a missing priority table is created
+    --    empty and then seeded (never left as junk for the reader).
+    ------------------------------------------------------------------
+    ck(Store.SeedZanzaDefaults(7) == 0, "a non-table db is a no-op")
+    ck(Store.SeedZanzaDefaults({}) == 0, "a db with no factionSettings is a no-op")
+    ck(Store.SeedZanzaDefaults({ factionSettings = { Horde = 7 } }) == 0, "a junk faction block is skipped")
+    local noList = { factionSettings = { Horde = { autoQuest = { zanza = { enabled = true } } } } }
+    ck(Store.SeedZanzaDefaults(noList) == 1, "a missing priority table is seeded")
+    ck(arr(noList.factionSettings.Horde.autoQuest.zanza.priority) == "swiftness,spirit",
+       "...with the shipped default")
+
+    ------------------------------------------------------------------
+    -- 6. The two copies of the default list must not drift.
+    ------------------------------------------------------------------
+    ck(arr(Store.ZANZA_PRIORITY_SEEDS) == "swiftness,spirit",
+       "the store's seed list is exactly {swiftness, spirit}")
+    if ns.Auto and type(ns.Auto.ZANZA_DEFAULT_PICKS) == "table" then
+        ck(arr(ns.Auto.ZANZA_DEFAULT_PICKS) == arr(Store.ZANZA_PRIORITY_SEEDS),
+           "Auto.ZANZA_DEFAULT_PICKS matches Store.ZANZA_PRIORITY_SEEDS entry-for-entry")
+    end
+    -- The seed must be a SUBSET of the canonical order, in that order.
+    local pos = {}
+    for i, k in ipairs(Store.ZANZA_PRIORITY_ORDER) do pos[k] = i end
+    local last = 0
+    for _, k in ipairs(Store.ZANZA_PRIORITY_SEEDS) do
+        ck(pos[k] ~= nil, "seed key " .. tostring(k) .. " is a real reward")
+        ck((pos[k] or 0) > last, "the seed follows the spec's fixed priority order")
+        last = pos[k] or last
+    end
+
+    ------------------------------------------------------------------
+    -- 7. THE OWNER'S OWN DATA, end to end, in Store.Init's real order:
+    --    shape migration -> seeder. His configured values must survive verbatim.
+    ------------------------------------------------------------------
+    local owner = {
+        factionSettings = {
+            Horde = { autoQuest = { zanza = { enabled = true,
+                priority = { ["sheen"] = false, ["spirit"] = true, ["swiftness"] = true } } } },
+            Alliance = { autoQuest = { zanza = { enabled = true,
+                priority = { "swiftness", "spirit",
+                             ["sheen"] = true, ["spirit"] = true, ["swiftness"] = true } } } },
+        },
+    }
+    Store.MigrateZanzaPriorityShape(owner)
+    local ownerSeeded = Store.SeedZanzaDefaults(owner)
+    ck(ownerSeeded == 0, "the owner's blocks already hold picks — nothing is seeded")
+    for _, faction in ipairs({ "Alliance", "Horde" }) do
+        local oz2 = owner.factionSettings[faction].autoQuest.zanza
+        ck(arr(oz2.priority) == "swiftness,spirit",
+           "owner " .. faction .. " keeps {swiftness, spirit} — Sheen never comes back")
+        ck(oz2.enabled == true, "owner " .. faction .. " keeps zanza ON")
+        ck(oz2.defaultsApplied == true, "owner " .. faction .. " guard stamped for future logins")
+    end
+    -- ...and a second login changes nothing at all.
+    Store.SeedZanzaDefaults(owner)
+    ck(arr(owner.factionSettings.Horde.autoQuest.zanza.priority) == "swiftness,spirit",
+       "the owner's Horde list is byte-identical after a second login")
+end
+
+----------------------------------------------------------------------
+-- THE OWNER'S SavedVariables, through the WHOLE Init pipeline.
+--
+-- The acid test for the defaults flip: his blocks carry the two legacy zanza
+-- shapes plus a mix of touched and untouched automation toggles, and every value
+-- he actually configured has to come out the other side verbatim.
+----------------------------------------------------------------------
+local function testOwnerAutomationFixture(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local function arr(t) return table.concat(t or {}, ",") end
+
+    -- His shapes, with a deliberate spread of "touched" states layered on:
+    --   Horde    — dmt deliberately OFF (stamped), bwl already ON, sayge/e'ko/
+    --              roids untouched OFF, zanza ON with the legacy MAP shape.
+    --   Alliance — everything untouched OFF except zanza (hybrid shape, ON).
+    local db = {
+        factionSettings = {
+            Horde = {
+                autoGossip = { dmt = false, bwl = true, dmf = { enabled = false } },
+                autoQuest  = { eko = false, roids = false, zgCoins = false, autoRepair = false,
+                               zanza = { enabled = true,
+                                   priority = { ["sheen"] = false, ["spirit"] = true,
+                                                ["swiftness"] = true } } },
+                automationChosen = { dmt = true },      -- he turned DMT off on purpose
+            },
+            Alliance = {
+                autoGossip = { dmt = false, bwl = false, dmf = { enabled = false } },
+                autoQuest  = { eko = false, roids = false, zgCoins = false, autoRepair = false,
+                               zanza = { enabled = true,
+                                   priority = { "swiftness", "spirit",
+                                                ["sheen"] = true, ["spirit"] = true,
+                                                ["swiftness"] = true } } },
+            },
+        },
+    }
+
+    -- Store.Init's order, exactly: heal -> (applyDefaults) -> shape -> seed.
+    Store.MigrateAutomationDefaults(db)
+    applyDefaults(db, defaultSettings())
+    Store.MigrateZanzaPriorityShape(db)
+    Store.SeedZanzaDefaults(db)
+
+    local H = db.factionSettings.Horde
+    local A = db.factionSettings.Alliance
+
+    -- His ONE deliberate opt-out survives, on both halves of the rule.
+    ck(H.autoGossip.dmt == false, "his stamped DMT OFF survives the flip verbatim")
+    ck(Store.AutomationChosen(H, "dmt") == true, "...and stays stamped")
+    -- His already-ON value is untouched (and was never a heal).
+    ck(H.autoGossip.bwl == true, "his BWL ON is untouched")
+    -- Everything he never touched arrives at the new default.
+    ck(H.autoGossip.dmf.enabled == true and A.autoGossip.dmf.enabled == true,
+       "untouched Sayge is ON in both blocks")
+    ck(H.autoQuest.eko == true and A.autoQuest.eko == true, "untouched E'ko is ON in both blocks")
+    ck(H.autoQuest.roids == true and A.autoQuest.roids == true, "untouched R.O.I.D.S. is ON in both blocks")
+    ck(A.autoGossip.dmt == true and A.autoGossip.bwl == true, "his Alliance gossip pair heals to ON")
+    -- The waivers stayed where they were.
+    ck(H.autoQuest.zgCoins == false and H.autoQuest.autoRepair == false,
+       "his ZG-coin and auto-repair OFFs are not touched by this flip")
+    ck(H.autoGossip.dmf.skipCookie == false and A.autoGossip.dmf.skipCookie == false,
+       "skipCookie stays off (backfilled at the shipped default, not flipped)")
+
+    -- THE PICK LIST: both legacy shapes converge on his two flasks, Sheen out.
+    ck(arr(H.autoQuest.zanza.priority) == "swiftness,spirit",
+       "his Horde map shape -> {swiftness, spirit}, got {" .. arr(H.autoQuest.zanza.priority) .. "}")
+    ck(arr(A.autoQuest.zanza.priority) == "swiftness,spirit",
+       "his Alliance hybrid shape -> {swiftness, spirit}, got {" .. arr(A.autoQuest.zanza.priority) .. "}")
+    ck(H.autoQuest.zanza.priority.sheen == nil and A.autoQuest.zanza.priority.sheen == nil,
+       "no stray map key survives in either block")
+    ck(H.autoQuest.zanza.enabled == true and A.autoQuest.zanza.enabled == true,
+       "zanza stays ON in both blocks")
+    ck(H.autoQuest.zanza.defaultsApplied == true and A.autoQuest.zanza.defaultsApplied == true,
+       "both pick lists are guarded against a future re-seed")
+
+    -- What the ENGINE reads off his store is his two flasks, in spec order.
+    if ns.Auto and ns.Auto.ZanzaEnabledPicks then
+        ck(arr(ns.Auto.ZanzaEnabledPicks(H.autoQuest.zanza.priority)) == "swiftness,spirit",
+           "the engine dispenses Swiftness then Spirit off his Horde block")
+        ck(ns.Auto.ZanzaAutomationOn(H.autoQuest.zanza) == true,
+           "...and reads his zanza automation as ON")
+    end
+
+    -- A SECOND LOGIN is a total no-op: every marker is stamped, nothing moves.
+    local before = arr(H.autoQuest.zanza.priority) .. "|" .. tostring(H.autoGossip.dmt)
+    Store.MigrateAutomationDefaults(db)
+    applyDefaults(db, defaultSettings())
+    Store.MigrateZanzaPriorityShape(db)
+    Store.SeedZanzaDefaults(db)
+    ck(arr(H.autoQuest.zanza.priority) .. "|" .. tostring(H.autoGossip.dmt) == before,
+       "a second login changes nothing in his blocks")
+end
+
 function Store.RunSelfTests(verbose)
     local suites = {
         { name = "defaults",        fn = testDefaults },
@@ -6575,6 +7222,9 @@ function Store.RunSelfTests(verbose)
         { name = "timer log dedup (F10)", fn = testTimerLogDedup },
         { name = "coordinate overrides (A17.3)", fn = testCoordinateOverrides },
         { name = "zanza pick-list shape migration", fn = testZanzaPriorityShape },
+        { name = "automation defaults flip: heal (1.1.4)", fn = testAutomationDefaultFlips },
+        { name = "zanza default pick list: seed + stickiness", fn = testZanzaSeeds },
+        { name = "OWNER fixture: automation defaults end to end", fn = testOwnerAutomationFixture },
     }
     local allPass = true
     for _, suite in ipairs(suites) do
