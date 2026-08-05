@@ -6210,6 +6210,16 @@ local function testZanzaPriorityShape(fails)
 
     local function arr(t) return table.concat(t, ",") end
 
+    -- WIRING, FIRST: Store.Init must actually call the pass, or the whole
+    -- migration can be perfect and never run on a single real login. This has
+    -- to be the FIRST assertion in the suite — Store.MigrateZanzaPriorityShape
+    -- falls back to the live Store.db when called with no argument (the house
+    -- signature), so any later call that forgot its fixture would stamp the
+    -- marker itself and make this check pass for the wrong reason. It did
+    -- exactly that once, and this comment is why there is no `nil` row below.
+    ck(type(Store.db) == "table" and Store.db[Store.ZANZA_SHAPE_MARKER] == true,
+       "Store.Init ran the pass on the live settings db (marker stamped)")
+
     -- name, input, expected array, expected changed, expected allOff
     local ROWS = {
         { "fresh empty (a real new install) is left alone",
@@ -6320,8 +6330,9 @@ local function testZanzaPriorityShape(fails)
        "a fresh empty pick list is left exactly as it was")
     ck(fresh[Store.ZANZA_SHAPE_MARKER] == true, "the marker stamps even when nothing needed fixing")
 
-    -- Malformed stores must not throw.
-    ck(select(1, Store.MigrateZanzaPriorityShape(nil)) == 0, "a nil db is a no-op")
+    -- Malformed stores must not throw. (No `nil` row: nil means "the live
+    -- Store.db" by the house signature, not "no store" — see the wiring note.)
+    ck(select(1, Store.MigrateZanzaPriorityShape(7)) == 0, "a non-table db is a no-op")
     ck(select(1, Store.MigrateZanzaPriorityShape({})) == 0, "a db with no factionSettings is a no-op")
     ck(select(1, Store.MigrateZanzaPriorityShape({ factionSettings = { Horde = 7 } })) == 0,
        "a junk faction block is skipped, not crashed on")
@@ -6330,11 +6341,6 @@ local function testZanzaPriorityShape(fails)
     -- as false and the pass runs exactly once on an existing save).
     ck(defaultSettings()[Store.ZANZA_SHAPE_MARKER] == false,
        "the marker ships as false in the settings defaults")
-
-    -- WIRING: Store.Init must actually call the pass. Without this the whole
-    -- migration can be perfect and never run on a single real login.
-    ck(type(Store.db) == "table" and Store.db[Store.ZANZA_SHAPE_MARKER] == true,
-       "Store.Init ran the pass on the live settings db (marker stamped)")
 end
 
 function Store.RunSelfTests(verbose)
