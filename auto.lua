@@ -22,12 +22,33 @@
 --   * Summon:  C_SummonInfo.ConfirmSummon / .CancelSummon /
 --              .GetSummonReason ; UnitOnTaxi ; InCombatLockdown.
 --   * Gossip:  C_GossipInfo.GetOptions / .SelectOption / .CloseGossip.
+--              GOSSIP-WINDOW QUEST LISTS (1.1.4): .GetAvailableQuests /
+--              .GetActiveQuests -> info:table, and .SelectAvailableQuest /
+--              .SelectActiveQuest(optionID:number). All eight are in
+--              functions.txt AND globals.txt for 1.15.9.68808. The catalog
+--              records existence + signatures only, so it cannot tell us
+--              whether that one number is a questID or a 1-based index; the
+--              driver therefore reads `info.questID` off the list entry and
+--              passes THAT, falling back to the entry's ordinal only when the
+--              record carries no questID. See Auto.ReadGossipQuests.
 --   * Quest:   GetNumActiveQuests / GetActiveTitle / SelectActiveQuest ;
 --              GetNumAvailableQuests / GetAvailableTitle / SelectAvailableQuest ;
 --              AcceptQuest ; IsQuestCompletable / CompleteQuest ;
---              GetNumQuestChoices / GetQuestItemInfo / GetQuestReward ;
+--              GetNumQuestChoices / GetQuestItemInfo / GetQuestItemLink /
+--              GetQuestID / GetQuestReward ;
 --              CloseQuest (all GLOBAL quest-frame functions).
+--   * Bags:    C_Container.CalculateTotalNumberOfFreeBagSlots (documented) with
+--              a C_Container.GetContainerNumFreeSlots fallback; item counts via
+--              C_Item.GetItemCount (documented) falling back to the GetItemCount
+--              global. Bank slots are read through ns.Inventory.ScanBank, which
+--              already owns the C_Container container walk.
+--   * Input:   IsShiftKeyDown ; UnitGUID (NPC identity).
 --   * Repair:  CanMerchantRepair / GetRepairAllCost / RepairAllItems (globals).
+--
+-- EVENTS (catalog events.txt, 1.15.9.68808): Event.GossipInfo.GossipShow /
+-- GossipClosed, Event.QuestOffer.QuestGreeting / QuestProgress / QuestFinished,
+-- Event.QuestLog.QuestDetail / QuestComplete, Event.Container.BagUpdateDelayed,
+-- Event.Bank.BankframeOpened / BankframeClosed.
 
 local ADDON, ns = ...
 
@@ -728,7 +749,23 @@ function Auto.HandleSayge(options, dmf)
     return false
 end
 
+-- GOSSIP_SHOW entry point.
+--
+-- ORDER MATTERS (1.1.4 defect fix). The gossip-window QUEST path runs FIRST,
+-- ahead of every keyword-matched option, and it only ever fires on an exact
+-- quest-ID match — which is unambiguous evidence, where an option keyword is a
+-- fuzzy substring test. That precedence is what stops a keyword pool (DMT's
+-- carries "spare"/"free") from eating the interaction at a quest-giving gossip
+-- NPC, and it is the shape the spec's "auto-repair only when the zanza flow is
+-- idle" rule needs: a pickable turn-in wins the one interaction we get.
+--
+-- Shift is checked before anything else: spec §14 / §19.23 — holding Shift while
+-- opening gossip skips the whole flow (and auto-repair) at Mau'ari, Vinchaxa,
+-- Rin'wosho and Drazial.
 function Auto.OnGossipShow()
+    if IsShiftKeyDown and IsShiftKeyDown() then return end
+    if Auto.HandleGossipQuests() then return end
+
     if not (C_GossipInfo and C_GossipInfo.GetOptions) then return end
     local ago = agoBlock()
     local options = C_GossipInfo.GetOptions()
@@ -748,16 +785,25 @@ function Auto.OnGossipShow()
 end
 
 ----------------------------------------------------------------------
--- Quest automation (spec §5) — global quest-frame API
+-- Quest automation (spec §5, §14) — global quest-frame API
 ----------------------------------------------------------------------
 
--- Title keyword sets per enabled category. Quest IDs vary by faction/coin type
--- so we match on the stable title text.
+-- Title keyword sets per enabled category. These drive the CLASSIC GREETING
+-- path only (QUEST_GREETING has no quest IDs to match on); the gossip-window
+-- path below is quest-ID-first and never consults them.
+--
+-- DECONTAMINATION (1.1.4): "zulian" / "razzashi" / "hakkari" used to sit in the
+-- `zanza` pool. Per spec §14 those three are the COIN set of quest 8195 — the
+-- third-priority Zul'Gurub coin turn-in at Vinchaxa — and have nothing to do
+-- with Rin'wosho's zanza flow. Their presence in the zanza pool meant a coin
+-- title matched the zanza category and dragged the zanza reward priority onto a
+-- coin turn-in. The two pools are now disjoint, and the self-test asserts it.
 local QUEST_KEYWORDS = {
     eko     = { "e'ko", "eko" },                         -- Winterspring E'ko
     zgCoins = { "coin", "bijou", "gurubashi", "vilebranch",
-                "witherbark", "sandfury", "skullsplitter", "bloodscalp" },
-    zanza   = { "zanza", "honor token", "zulian", "razzashi", "hakkari" },
+                "witherbark", "sandfury", "skullsplitter", "bloodscalp",
+                "zulian", "razzashi", "hakkari" },
+    zanza   = { "zanza", "honor token" },
     roids   = { "r.o.i.d.s", "roids" },
 }
 
@@ -785,10 +831,421 @@ function Auto.TitleMatches(title, pool)
     return false
 end
 
--- QUEST_GREETING: a multi-quest NPC (E'ko / coin / token turn-ins). Select the
--- first active quest whose title matches an enabled category; then handle
+----------------------------------------------------------------------
+-- QUEST IDENTITY (spec §14) — the ID tables the gossip path steers by.
+--
+-- Everything below is quest-ID-first. The greeting path still matches titles
+-- because QUEST_GREETING exposes no IDs, but nothing that rides the gossip
+-- window ever selects on a string.
+----------------------------------------------------------------------
+
+Auto.ZANZA_NPC          = 14921        -- Rin'wosho the Trader
+Auto.ZANZA_QUEST        = 8243         -- "Zanza's Potent Potables" turn-in
+Auto.ZANZA_TOKEN        = 19858        -- Zandalar Honor Token
+Auto.ZANZA_TOKEN_NEED   = 1
+
+-- Rin'wosho also offers 8196 and 8246. Spec §14, verbatim: they "must never be
+-- auto-progressed". 8240 is the fourth Zul'Gurub coin quest, "deliberately not
+-- handled". This set is the belt to the ID whitelist's braces: no allowed-ID
+-- table may ever contain one of these, and the self-test asserts that too.
+Auto.QUEST_NEVER = { [8196] = true, [8246] = true, [8240] = true }
+
+-- Zanza reward priority (spec §14): Swiftness -> Spirit -> Sheen. The ORDER is
+-- fixed by the spec; only MEMBERSHIP is user-toggleable (options.lua stores the
+-- ticked keys in autoQuest.zanza.priority and its own comment says "Order
+-- fixed; membership toggled"). Auto.ZanzaEnabledPicks re-imposes this order on
+-- whatever order the checkboxes happened to be clicked in.
+Auto.ZANZA_REWARDS = {
+    { key = "swiftness", itemID = 20081, name = "swiftness of zanza" },
+    { key = "spirit",    itemID = 20079, name = "spirit of zanza"    },
+    { key = "sheen",     itemID = 20080, name = "sheen of zanza"     },
+}
+
+Auto.ZANZA_REJECT_COOLDOWN  = 30       -- seconds, per reward item
+Auto.ZANZA_DELIVERY_TIMEOUT = 5        -- seconds, backstop on the bag verifier
+
+-- Zul'Gurub coin turn-ins at Vinchaxa, in spec priority order. Each needs one
+-- of each of its three coins. 8240 is absent on purpose (see QUEST_NEVER).
+Auto.ZG_COIN_SETS = {
+    { questID = 8238, items = { 19701, 19702, 19703 } },  -- Gurubashi/Vilebranch/Witherbark
+    { questID = 8239, items = { 19704, 19705, 19706 } },  -- Sandfury/Skullsplitter/Bloodscalp
+    { questID = 8195, items = { 19698, 19699, 19700 } },  -- Zulian/Razzashi/Hakkari
+}
+
+-- Enabled zanza picks in the spec's canonical order.
+--
+-- An EMPTY priority list means "all three" rather than "none": the store ships
+-- `priority = {}` and Store.ApplyDefaults recurses into tables, so seeding the
+-- three keys there would resurrect a pick the owner deliberately unticked on
+-- every login (the same trap documented on autoSummon.triggers). Treating empty
+-- as the full spec default gives a fresh install the spec's behaviour from the
+-- one parent checkbox, with no store migration and no resurrection. PURE.
+function Auto.ZanzaEnabledPicks(priority)
+    local out = {}
+    if type(priority) ~= "table" or #priority == 0 then
+        for _, r in ipairs(Auto.ZANZA_REWARDS) do out[#out + 1] = r.key end
+        return out
+    end
+    local want = {}
+    for _, k in ipairs(priority) do want[lower(k)] = true end
+    for _, r in ipairs(Auto.ZANZA_REWARDS) do
+        if want[r.key] then out[#out + 1] = r.key end
+    end
+    return out
+end
+
+function Auto.ZanzaReward(key)
+    for _, r in ipairs(Auto.ZANZA_REWARDS) do
+        if r.key == key then return r end
+    end
+    return nil
+end
+
+----------------------------------------------------------------------
+-- OWNERSHIP: bags + a SESSION-ONLY bank snapshot (spec §14, §19.22)
+--
+-- The snapshot is refreshed every time the bank frame opens and on every bag
+-- update while it is open. It is a plain Lua field on Auto — it is never
+-- written to either SavedVariables table, so a reload or relog forgets it
+-- entirely. That is a deliberate privacy choice, not an oversight.
+----------------------------------------------------------------------
+
+Auto._bankSnapshot = nil     -- itemID -> count, or nil when never taken
+Auto._bankOpen     = false
+
+function Auto.RefreshBankSnapshot()
+    local scan = ns.Inventory and ns.Inventory.ScanBank
+    if type(scan) ~= "function" then return false end
+    local ok, slots = pcall(scan)
+    if not ok or type(slots) ~= "table" then return false end
+    -- A bank frame open with zero readable slots is a cold read, not an empty
+    -- bank (inventory.lua documents the same trap): keep the last honest
+    -- snapshot rather than erasing it.
+    if #slots == 0 and Auto._bankSnapshot ~= nil then return false end
+    local snap = {}
+    for _, s in ipairs(slots) do
+        local id = tonumber(s.id)
+        if id then snap[id] = (snap[id] or 0) + (tonumber(s.count) or 1) end
+    end
+    Auto._bankSnapshot = snap
+    return true
+end
+
+-- Session teardown / test reset. Also the shape of "forgotten on reload".
+function Auto.ForgetBankSnapshot()
+    Auto._bankSnapshot = nil
+    Auto._bankOpen     = false
+end
+
+-- Carried-bag count only (the snapshot supplies the bank half).
+function Auto.BagCount(itemID)
+    if C_Item and C_Item.GetItemCount then
+        local ok, n = pcall(C_Item.GetItemCount, itemID, false)
+        if ok and tonumber(n) then return tonumber(n) end
+    end
+    if GetItemCount then
+        local ok, n = pcall(GetItemCount, itemID, false)
+        if ok and tonumber(n) then return tonumber(n) end
+    end
+    return 0
+end
+
+-- PURE: bags + snapshot. The snapshot may legitimately be nil (never banked
+-- this session), which reads as "nothing known in the bank", not as zero owned.
+function Auto.CountOwned(itemID, bagCount, snapshot)
+    local n = tonumber(bagCount) or 0
+    if type(snapshot) == "table" then n = n + (tonumber(snapshot[itemID]) or 0) end
+    return n
+end
+
+function Auto.OwnedCount(itemID)
+    return Auto.CountOwned(itemID, Auto.BagCount(itemID), Auto._bankSnapshot)
+end
+
+function Auto.FreeBagSlots()
+    local C = _G.C_Container
+    if C and C.CalculateTotalNumberOfFreeBagSlots then
+        local ok, n = pcall(C.CalculateTotalNumberOfFreeBagSlots)
+        if ok and tonumber(n) then return tonumber(n) end
+    end
+    if C and C.GetContainerNumFreeSlots then
+        local total = 0
+        for bag = 0, 4 do
+            local ok, n = pcall(C.GetContainerNumFreeSlots, bag)
+            if ok and tonumber(n) then total = total + tonumber(n) end
+        end
+        return total
+    end
+    return 0
+end
+
+-- PURE GUID parse. "Creature-0-3299-0-14-14921-0000027FA6" -> 14921.
+function Auto.ParseNpcID(guid)
+    if type(guid) ~= "string" then return nil end
+    local kind, id = guid:match("^(%a+)%-%d+%-%d+%-%d+%-%d+%-(%d+)%-")
+    if kind == "Creature" or kind == "Vehicle" or kind == "GameObject" then
+        return tonumber(id)
+    end
+    return nil
+end
+
+function Auto.NpcID()
+    if not UnitGUID then return nil end
+    local ok, g = pcall(UnitGUID, "npc")
+    if not ok then return nil end
+    return Auto.ParseNpcID(g)
+end
+
+----------------------------------------------------------------------
+-- ZANZA GATES (spec §14) — all pure, all individually asserted.
+----------------------------------------------------------------------
+
+-- Bag-space guard WITH the exact-token-count exception: a full bag is fine when
+-- the player holds exactly the required token count, because the turn-in
+-- consumes that stack and frees the slot in time for the reward. Holding MORE
+-- than the required count means the stack survives the turn-in, so a full bag
+-- really is full. PURE.
+function Auto.DecideBagSpace(freeSlots, tokenCount, needed)
+    if (tonumber(freeSlots) or 0) > 0 then return true, "free-slot" end
+    if (tonumber(tokenCount) or 0) == (tonumber(needed) or Auto.ZANZA_TOKEN_NEED) then
+        return true, "exact-token"
+    end
+    return false, "bag-full"
+end
+
+-- The full entry gate. ctx:
+--   enabled, shift, npcID (nil = unknown), tokenCount, tokenNeed, freeSlots
+-- Returns (ok:boolean, reason:string). Every refusal names its own gate.
+--
+-- An UNKNOWN npcID admits: the quest-ID whitelist is the real guard (8243 only
+-- exists at Rin'wosho), so a GUID we could not parse must not disable the flow.
+-- A KNOWN and wrong npcID refuses.
+function Auto.DecideZanzaGate(ctx)
+    if not ctx.enabled then return false, "disabled" end
+    if ctx.shift then return false, "shift-skip" end
+    if ctx.npcID ~= nil and ctx.npcID ~= (ctx.wantNpc or Auto.ZANZA_NPC) then
+        return false, "wrong-npc"
+    end
+    local need = ctx.tokenNeed or Auto.ZANZA_TOKEN_NEED
+    if (ctx.tokenCount or 0) < need then return false, "no-token" end
+    local ok, why = Auto.DecideBagSpace(ctx.freeSlots, ctx.tokenCount, need)
+    if not ok then return false, why end
+    return true, "ok"
+end
+
+-- Walk the enabled picks in canonical order and return the first that is
+-- neither already owned nor inside its rejection cooldown nor absent from the
+-- rewards actually on offer. ctx:
+--   picks (ordered keys), owned[key], cooldowns[key]=stamp, offered[key],
+--   now, cooldown (seconds)
+-- Returns (key, reason). Distinct refusal reasons matter: "all-owned" is the
+-- one that arms the bag watcher instead of closing the dialog. PURE.
+function Auto.NextZanzaPick(ctx)
+    local picks = ctx.picks or {}
+    if #picks == 0 then return nil, "none-enabled" end
+    local cd      = ctx.cooldown or Auto.ZANZA_REJECT_COOLDOWN
+    local now     = ctx.now or 0
+    local owned   = ctx.owned or {}
+    local stamps  = ctx.cooldowns or {}
+    local offered = ctx.offered
+    local sawUnowned, sawOffered = false, false
+    for _, key in ipairs(picks) do
+        local isOffered = (offered == nil) or (offered[key] == true)
+        if isOffered then
+            sawOffered = true
+            if not owned[key] then
+                sawUnowned = true
+                local stamp = stamps[key]
+                if not (stamp and (now - stamp) < cd) then
+                    return key, "pick"
+                end
+            end
+        end
+    end
+    if not sawOffered then return nil, "not-offered" end
+    if not sawUnowned then return nil, "all-owned" end
+    return nil, "all-cooling"
+end
+
+-- PURE delivery verdict. `pending` is { itemID, before, at, key }.
+function Auto.JudgeDelivery(pending, nowCount, now, timeout)
+    if not pending then return "idle" end
+    if (tonumber(nowCount) or 0) > (tonumber(pending.before) or 0) then
+        return "delivered"
+    end
+    if ((now or 0) - (pending.at or 0)) >= (timeout or Auto.ZANZA_DELIVERY_TIMEOUT) then
+        return "timeout"
+    end
+    return "pending"
+end
+
+-- PURE: highest-priority coin quest whose whole three-coin set is held.
+-- `count` is a function(itemID) -> number.
+function Auto.PickCoinQuest(count)
+    for _, set in ipairs(Auto.ZG_COIN_SETS) do
+        local holdsAll = true
+        for _, id in ipairs(set.items) do
+            if (tonumber(count(id)) or 0) < 1 then holdsAll = false break end
+        end
+        if holdsAll then return set.questID end
+    end
+    return nil
+end
+
+----------------------------------------------------------------------
+-- GOSSIP-WINDOW QUEST PATH (1.1.4 — the defect this build fixes)
+--
+-- ROOT CAUSE. Rin'wosho the Trader (14921) is a GOSSIP npc: his quests ride the
+-- gossip window, and the spec's auto-repair option lives on that same menu.
+-- Before this build auto.lua selected quests ONLY through the classic greeting
+-- API (QUEST_GREETING -> SelectActiveQuest/SelectAvailableQuest by index), and
+-- Auto.OnGossipShow handled DMT / BWL / Sayge options and nothing else — no
+-- C_GossipInfo.Get*Quests call existed anywhere in the addon. So at Rin'wosho
+-- the zanza flow was never entered at all: not gated, not refused, simply never
+-- started. That is the owner's "isn't working".
+----------------------------------------------------------------------
+
+-- Normalise one C_GossipInfo quest list into an array of
+-- { questID, title, isComplete, index, selector }.
+--
+-- SELECTOR. C_GossipInfo.SelectAvailableQuest / .SelectActiveQuest take a single
+-- number that the catalog labels `optionID` and nothing more — existence and
+-- signature only, no indication whether that number is the questID or the
+-- 1-based ordinal, and the answer differs by client generation. We therefore
+-- take it from the record itself: `info.questID` when the entry carries one
+-- (the modern gossip list is questID-keyed), the ordinal only as a fallback for
+-- a list shape that has no ID to give. Either way the value we pass came out of
+-- the very list the client just handed us.
+function Auto.ReadGossipQuests(getter)
+    local out = {}
+    if type(getter) ~= "function" then return out end
+    local ok, list = pcall(getter)
+    if not ok or type(list) ~= "table" then return out end
+    for i, info in ipairs(list) do
+        if type(info) == "table" then
+            local qid = tonumber(info.questID)
+            out[#out + 1] = {
+                questID    = qid,
+                title      = info.title,
+                isComplete = info.isComplete and true or false,
+                index      = i,
+                selector   = qid or i,
+            }
+        end
+    end
+    return out
+end
+
+-- PURE planner. `allowed` is a set of questID -> true built by the driver from
+-- the ENABLED and GATED categories, so every policy decision has already been
+-- made by the time we get here and this function's only job is ordering.
+--
+-- Active turn-ins are considered before available pickups: a turn-in always
+-- wins over a pickup at the same NPC (you cannot re-take a repeatable quest you
+-- are already on). Returns nil when nothing allowed is present — which is what
+-- leaves the gossip interaction free for the option handlers.
+function Auto.PlanGossipQuest(active, available, allowed)
+    if type(allowed) ~= "table" or next(allowed) == nil then return nil, "nothing-allowed" end
+    for _, q in ipairs(active or {}) do
+        if q.questID and allowed[q.questID] then
+            return { kind = "active", questID = q.questID, selector = q.selector }, "active"
+        end
+    end
+    for _, q in ipairs(available or {}) do
+        if q.questID and allowed[q.questID] then
+            return { kind = "available", questID = q.questID, selector = q.selector }, "available"
+        end
+    end
+    return nil, "no-match"
+end
+
+-- Build the allowed-ID set from live settings + world state. IMPURE by design:
+-- every reading it does is funnelled into the pure planner above.
+--
+-- E'ko (Mau'ari) and R.O.I.D.S. (Drazial) are deliberately NOT here. Spec §14
+-- is silent on whether those two NPCs use the gossip window, and the remit is
+-- "leave their entry as-is if the spec does not say" — they keep the greeting
+-- path they have always used. Adding IDs here for them would change their
+-- behaviour on no evidence.
+function Auto.AllowedGossipQuestIDs()
+    local _, flags = activeQuestCategories()
+    local allowed = {}
+
+    if flags.zanza then
+        local ok = Auto.ZanzaGateNow()
+        if ok then allowed[Auto.ZANZA_QUEST] = true end
+    end
+
+    if flags.zgCoins then
+        local qid = Auto.PickCoinQuest(function(id) return Auto.OwnedCount(id) end)
+        if qid then allowed[qid] = true end
+    end
+
+    -- Belt to the whitelist's braces: nothing the spec forbids may ever survive
+    -- into the set, however it got there.
+    for qid in pairs(Auto.QUEST_NEVER) do allowed[qid] = nil end
+    return allowed
+end
+
+-- Live wrapper over the pure zanza gate.
+function Auto.ZanzaGateNow()
+    local aq = aqBlock()
+    return Auto.DecideZanzaGate({
+        enabled    = aq.zanza and aq.zanza.enabled == true,
+        shift      = IsShiftKeyDown and IsShiftKeyDown() or false,
+        npcID      = Auto.NpcID(),
+        tokenCount = Auto.OwnedCount(Auto.ZANZA_TOKEN),
+        tokenNeed  = Auto.ZANZA_TOKEN_NEED,
+        freeSlots  = Auto.FreeBagSlots(),
+    })
+end
+
+-- The gossip-window driver. Returns true when it consumed the interaction.
+function Auto.HandleGossipQuests()
+    if not (C_GossipInfo and C_GossipInfo.GetAvailableQuests
+            and C_GossipInfo.GetActiveQuests) then
+        return false
+    end
+    local available = Auto.ReadGossipQuests(C_GossipInfo.GetAvailableQuests)
+    local active    = Auto.ReadGossipQuests(C_GossipInfo.GetActiveQuests)
+    if #available == 0 and #active == 0 then return false end
+
+    local plan = Auto.PlanGossipQuest(active, available, Auto.AllowedGossipQuestIDs())
+    if not plan then return false end
+
+    if plan.kind == "active" then
+        if C_GossipInfo.SelectActiveQuest then
+            C_GossipInfo.SelectActiveQuest(plan.selector)
+            return true
+        end
+    else
+        if C_GossipInfo.SelectAvailableQuest then
+            C_GossipInfo.SelectAvailableQuest(plan.selector)
+            return true
+        end
+    end
+    return false
+end
+
+-- Quest ID of the frame currently up (QUEST_DETAIL / PROGRESS / COMPLETE).
+-- Returns nil rather than 0 so callers can fall back to the title pool.
+function Auto.CurrentQuestID()
+    if not GetQuestID then return nil end
+    local ok, id = pcall(GetQuestID)
+    id = ok and tonumber(id) or nil
+    if id and id > 0 then return id end
+    return nil
+end
+
+-- QUEST_GREETING: a multi-quest greeting NPC (E'ko / coin / token turn-ins).
+-- This is the CLASSIC path, and the only one that still matches titles: the
+-- greeting API exposes no quest IDs, so a keyword pool is all there is. Select
+-- the first active quest whose title matches an enabled category; then handle
 -- available quests (accept) the same way.
+--
+-- Shift skips it, same as the gossip window (spec §19.23 names all four NPCs).
 function Auto.OnQuestGreeting()
+    if IsShiftKeyDown and IsShiftKeyDown() then return end
     local pool = activeQuestCategories()
     if #pool == 0 then return end
 
@@ -811,27 +1268,48 @@ function Auto.OnQuestGreeting()
     end
 end
 
+-- Is the quest on the open quest frame one we auto-drive?
+--
+-- QUEST-ID-FIRST. When GetQuestID answers, the ID decides — and QUEST_NEVER
+-- refuses before anything else, so 8196 / 8246 / 8240 are never accepted,
+-- completed or rewarded no matter how they got on screen (including a manual
+-- click while an enabled category is on). Only an absent ID falls back to the
+-- title keyword pool, which is what keeps the greeting-driven E'ko and
+-- R.O.I.D.S. flows working unchanged.
+-- Returns (inScope:boolean, questID:number|nil, category:string|nil).
+function Auto.QuestFrameInScope()
+    local pool, flags = activeQuestCategories()
+    if #pool == 0 then return false end
+    local qid = Auto.CurrentQuestID()
+    if qid then
+        if Auto.QUEST_NEVER[qid] then return false, qid, "never" end
+        if qid == Auto.ZANZA_QUEST then
+            return flags.zanza == true, qid, "zanza"
+        end
+        for _, set in ipairs(Auto.ZG_COIN_SETS) do
+            if set.questID == qid then return flags.zgCoins == true, qid, "zgCoins" end
+        end
+        -- An ID with no table of ours (E'ko, R.O.I.D.S.): fall through to the
+        -- title test rather than refusing, so those flows are untouched.
+    end
+    local title = GetTitleText and GetTitleText()
+    if title and Auto.TitleMatches(title, pool) then return true, qid end
+    return false, qid
+end
+
 -- QUEST_DETAIL: a quest is being offered. Accept it if it belongs to an
 -- enabled category (R.O.I.D.S. accept, coin/token re-pickups).
 function Auto.OnQuestDetail()
-    local pool = activeQuestCategories()
-    if #pool == 0 then return end
-    local title = GetTitleText and GetTitleText()
-    if title and Auto.TitleMatches(title, pool) then
-        if AcceptQuest then AcceptQuest() end
-    end
+    if not Auto.QuestFrameInScope() then return end
+    if AcceptQuest then AcceptQuest() end
 end
 
 -- QUEST_PROGRESS: turn-in requirements screen. Complete when the game says the
 -- quest is completable and it belongs to an enabled category.
 function Auto.OnQuestProgress()
-    local pool = activeQuestCategories()
-    if #pool == 0 then return end
-    local title = GetTitleText and GetTitleText()
-    if title and Auto.TitleMatches(title, pool) then
-        if IsQuestCompletable and IsQuestCompletable() and CompleteQuest then
-            CompleteQuest()
-        end
+    if not Auto.QuestFrameInScope() then return end
+    if IsQuestCompletable and IsQuestCompletable() and CompleteQuest then
+        CompleteQuest()
     end
 end
 
@@ -851,19 +1329,211 @@ function Auto.PickReward(choices, priority)
     return choices[1].index
 end
 
--- QUEST_COMPLETE: take the reward. For a single fixed reward pass 1; for a
--- choice of rewards (zanza tokens) honour the priority list. Records the
--- expected item for bag-delta verification.
-function Auto.OnQuestComplete()
-    local pool, flags = activeQuestCategories()
-    if #pool == 0 then return end
-    local title = GetTitleText and GetTitleText()
-    if not (title and Auto.TitleMatches(title, pool)) then return end
+----------------------------------------------------------------------
+-- ZANZA REWARD MACHINERY (spec §14)
+--
+-- State is all session-local. `_zanzaCooldown` is the per-item 30 s rejection
+-- stamp; `_zanzaPending` is the in-flight delivery verification; `_zanzaChoices`
+-- is the reward list captured off the open QUEST_COMPLETE frame; `_zanzaWatch`
+-- is the "every enabled flask already owned, dialog left open" bag watcher.
+----------------------------------------------------------------------
 
+Auto._zanzaCooldown = {}      -- key -> GetTime() stamp
+Auto._zanzaPending  = nil     -- { key, itemID, before, at }
+Auto._zanzaChoices  = nil     -- array of { index, itemID, name, key }
+Auto._zanzaWatch    = false
+
+-- PURE: stamp each reward choice with its zanza key. ITEM-ID-FIRST — the ID is
+-- exact and locale-proof; the display name is only consulted when the reward
+-- link did not resolve (item data not cached yet).
+function Auto.KeyRewardChoices(choices)
+    for _, c in ipairs(choices or {}) do
+        c.key = nil
+        if c.itemID then
+            for _, r in ipairs(Auto.ZANZA_REWARDS) do
+                if c.itemID == r.itemID then c.key = r.key break end
+            end
+        end
+        if not c.key then
+            local nm = lower(c.name)
+            if nm ~= "" then
+                for _, r in ipairs(Auto.ZANZA_REWARDS) do
+                    if nm:find(r.name, 1, true) then c.key = r.key break end
+                end
+            end
+        end
+    end
+    return choices
+end
+
+-- Read the choice list off the open QUEST_COMPLETE frame.
+function Auto.ReadRewardChoices()
+    local out = {}
+    local n = GetNumQuestChoices and GetNumQuestChoices() or 0
+    for i = 1, n do
+        local name
+        if GetQuestItemInfo then
+            local ok, nm = pcall(GetQuestItemInfo, "choice", i)
+            if ok and type(nm) == "string" then name = nm end
+        end
+        local itemID
+        if GetQuestItemLink then
+            local ok, link = pcall(GetQuestItemLink, "choice", i)
+            if ok and type(link) == "string" then
+                itemID = tonumber(link:match("item:(%d+)"))
+            end
+        end
+        out[#out + 1] = { index = i, itemID = itemID, name = name or "" }
+    end
+    return Auto.KeyRewardChoices(out)
+end
+
+-- Pick the next enabled zanza and request it. Used both by QUEST_COMPLETE and,
+-- later, by the bag watcher against the SAME still-open dialog.
+-- Returns (requested:boolean, keyOrReason:string).
+function Auto.ZanzaPickAndRequest()
+    local choices = Auto._zanzaChoices
+    if type(choices) ~= "table" or #choices == 0 then return false, "no-choices" end
+
+    local aq = aqBlock()
+    local picks = Auto.ZanzaEnabledPicks(aq.zanza and aq.zanza.priority)
+    local offered, owned = {}, {}
+    for _, c in ipairs(choices) do
+        if c.key then offered[c.key] = true end
+    end
+    for _, k in ipairs(picks) do
+        local r = Auto.ZanzaReward(k)
+        owned[k] = (r ~= nil) and (Auto.OwnedCount(r.itemID) > 0) or false
+    end
+
+    local now = nowSecs()
+    local key, reason = Auto.NextZanzaPick({
+        picks     = picks,
+        owned     = owned,
+        offered   = offered,
+        cooldowns = Auto._zanzaCooldown,
+        now       = now,
+        cooldown  = Auto.ZANZA_REJECT_COOLDOWN,
+    })
+
+    if not key then
+        -- SPEC: every enabled zanza already owned -> KEEP the reward dialog
+        -- open (we simply do not call GetQuestReward or CloseQuest) and arm a
+        -- bag watcher, so the moment one is drunk the next is taken without
+        -- re-opening gossip.
+        if reason == "all-owned" and not Auto._zanzaWatch then
+            Auto._zanzaWatch = true
+            ns:Print("zanza: you already hold every enabled flask. Leaving the reward "
+                  .. "window open — drink one and the next is taken automatically.")
+        end
+        return false, reason
+    end
+
+    local choice
+    for _, c in ipairs(choices) do
+        if c.key == key then choice = c break end
+    end
+    if not choice then return false, "not-offered" end
+
+    -- SPEC: stamp the rejection cooldown BEFORE the reward request goes out, so
+    -- a rapid re-open walks to the NEXT priority instead of retrying the pick
+    -- that just failed. Cleared below on confirmed delivery.
+    Auto._zanzaCooldown[key] = now
+    Auto._zanzaWatch = false
+
+    if choice.itemID then
+        Auto._zanzaPending = {
+            key = key, itemID = choice.itemID,
+            before = Auto.OwnedCount(choice.itemID), at = now,
+        }
+    else
+        -- No resolvable item ID means no honest bag delta to watch for. Rather
+        -- than let the backstop fire a false rejection, drop the stamp and take
+        -- the reward unverified.
+        Auto._zanzaCooldown[key] = nil
+        Auto._zanzaPending = nil
+    end
+
+    if GetQuestReward then GetQuestReward(choice.index) end
+
+    -- 5 s timeout backstop. The same tick also runs off BAG_UPDATE_DELAYED, so
+    -- the verification is event-driven first and timer-backed second (and stays
+    -- reachable headless, where C_Timer.After is a no-op).
+    if Auto._zanzaPending and C_Timer and C_Timer.After then
+        C_Timer.After(Auto.ZANZA_DELIVERY_TIMEOUT, function()
+            ns:SafeCall(Auto.ZanzaDeliveryTick)
+        end)
+    end
+    return true, key
+end
+
+-- Event-driven delivery verification with the 5 s backstop.
+-- Success clears the stamp and prints; failure re-stamps and prints.
+function Auto.ZanzaDeliveryTick(now)
+    local p = Auto._zanzaPending
+    if not p then return "idle" end
+    now = now or nowSecs()
+    local verdict = Auto.JudgeDelivery(p, Auto.OwnedCount(p.itemID), now,
+                                       Auto.ZANZA_DELIVERY_TIMEOUT)
+    if verdict == "delivered" then
+        Auto._zanzaCooldown[p.key] = nil
+        Auto._zanzaPending = nil
+        ns:Print(("zanza: %s delivered."):format(p.key))
+    elseif verdict == "timeout" then
+        Auto._zanzaCooldown[p.key] = now      -- re-stamp: 30 s from the failure
+        Auto._zanzaPending = nil
+        ns:Print(("zanza: %s did not arrive — trying the next priority for the "
+               .. "next %ds."):format(p.key, Auto.ZANZA_REJECT_COOLDOWN))
+    end
+    return verdict
+end
+
+-- The armed bag watcher: a flask was drunk while the reward dialog stayed open.
+function Auto.ZanzaWatchTick()
+    if not Auto._zanzaWatch then return false end
+    local ok = Auto.ZanzaPickAndRequest()
+    return ok
+end
+
+-- The reward dialog closed for real: nothing left to pick from.
+function Auto.OnQuestFinished()
+    Auto._zanzaChoices = nil
+    Auto._zanzaWatch   = false
+end
+
+-- QUEST_COMPLETE: take the reward. Zanza runs the full gated machinery above;
+-- every other category keeps the simple "one fixed reward, or honour the
+-- priority list" path it has always had.
+function Auto.OnQuestComplete()
+    local inScope, qid, category = Auto.QuestFrameInScope()
+    if not inScope then return end
+
+    if category == "zanza" or qid == Auto.ZANZA_QUEST then
+        -- Re-run the token + bag-space guard on the REWARD step, not just at
+        -- the gossip entry: this is the moment the item is actually asked for,
+        -- and the frame can be reached without passing through our entry (a
+        -- manual click, a quest already accepted before the toggle went on).
+        -- Shift is deliberately NOT re-checked — spec §14 scopes it to "while
+        -- opening gossip", so a Shift press mid-flow must not strand a
+        -- half-finished turn-in.
+        local ok = Auto.DecideZanzaGate({
+            enabled    = true,
+            shift      = false,
+            npcID      = Auto.NpcID(),
+            tokenCount = Auto.OwnedCount(Auto.ZANZA_TOKEN),
+            tokenNeed  = Auto.ZANZA_TOKEN_NEED,
+            freeSlots  = Auto.FreeBagSlots(),
+        })
+        if not ok then return end
+        Auto._zanzaChoices = Auto.ReadRewardChoices()
+        Auto.ZanzaPickAndRequest()
+        return
+    end
+
+    local _, flags = activeQuestCategories()
     local nChoices = GetNumQuestChoices and GetNumQuestChoices() or 0
     local rewardIndex = 1
     if nChoices > 1 then
-        -- Build the choice list from the quest-item info.
         local choices = {}
         for i = 1, nChoices do
             local name = GetQuestItemInfo and select(1, GetQuestItemInfo("choice", i)) or nil
@@ -871,7 +1541,6 @@ function Auto.OnQuestComplete()
         end
         local priority = flags.zanza and aqBlock().zanza and aqBlock().zanza.priority or nil
         rewardIndex = Auto.PickReward(choices, priority) or 1
-        -- Record expected reward name for bag-delta verification.
         for _, c in ipairs(choices) do
             if c.index == rewardIndex then Auto._expectedReward = lower(c.name) end
         end
@@ -881,20 +1550,46 @@ function Auto.OnQuestComplete()
     if GetQuestReward then GetQuestReward(rewardIndex) end
 end
 
--- Bag-delta verification: after a reward is taken, a follow-up bag update
--- should show the item. We keep this lightweight — log confirmation once the
--- expected reward name is seen in the reward flow. (Full inventory scanning is
--- deferred to the tracker's item pass; here we just clear the expectation.)
+-- BAG_UPDATE_DELAYED — the settled bag tick.
+--   1. refresh the session bank snapshot while the bank frame is open,
+--   2. verify an in-flight zanza delivery,
+--   3. let the armed watcher take the next flask now that one was drunk.
 function Auto.OnBagUpdate()
-    if Auto._expectedReward then
-        -- The reward was requested; assume delivery on the next bag tick and
-        -- clear. A mismatch would leave the item un-turned which the user sees.
-        Auto._expectedReward = nil
-    end
+    if Auto._bankOpen then Auto.RefreshBankSnapshot() end
+    Auto.ZanzaDeliveryTick()
+    Auto.ZanzaWatchTick()
+    Auto._expectedReward = nil
+end
+
+function Auto.OnBankOpened()
+    Auto._bankOpen = true
+    Auto.RefreshBankSnapshot()
+end
+
+function Auto.OnBankClosed()
+    -- The snapshot SURVIVES the bank closing (that is the whole point — it lets
+    -- ownership be judged away from the bank). It dies with the session.
+    Auto._bankOpen = false
 end
 
 ----------------------------------------------------------------------
 -- Auto-repair (spec §5) — MERCHANT_SHOW + RepairAllItems (globals)
+--
+-- SCOPE NOTE (1.1.4). Spec §14's "auto-repair at Rin'wosho" is a bigger flow
+-- than what is here: it selects his VENDOR gossip option (icon file ID 132060)
+-- when the zanza flow is idle, repairs on the merchant window IT opened, closes
+-- it, and guards that with a 3 s disarm and a 5 s attempt cooldown. NONE of
+-- that is shipped — what follows repairs on a merchant window the PLAYER
+-- opened, at any vendor, and never touches gossip. That flow is deliberately
+-- NOT added here (this build's remit is the zanza entry path), so there is no
+-- idle-gate to compose with yet.
+--
+-- What this build DOES guarantee for it: Auto.OnGossipShow runs the quest-ID
+-- path FIRST and returns the moment it selects, so when the Rin'wosho repair
+-- flow is eventually built, a pickable zanza turn-in already wins the single
+-- gossip interaction and the repair option cannot steal it. The "zanza flow is
+-- idle" predicate it will need is Auto.ZanzaGateNow() returning false, plus
+-- Auto.PlanGossipQuest returning nil.
 ----------------------------------------------------------------------
 
 function Auto.OnMerchantShow()
@@ -913,6 +1608,10 @@ end
 
 function Auto.OnZoneChanged()
     Auto._saygeDone = false
+    -- Walking away ends any dialog we were holding open. The rejection stamps
+    -- are NOT cleared: they are a 30 s time-based guard, not a location one.
+    Auto._zanzaChoices = nil
+    Auto._zanzaWatch   = false
 end
 
 ----------------------------------------------------------------------
@@ -951,7 +1650,13 @@ function Auto.OnLogin()
     ns:RegisterEvent("QUEST_DETAIL",   function() ns:SafeCall(Auto.OnQuestDetail) end)
     ns:RegisterEvent("QUEST_PROGRESS", function() ns:SafeCall(Auto.OnQuestProgress) end)
     ns:RegisterEvent("QUEST_COMPLETE", function() ns:SafeCall(Auto.OnQuestComplete) end)
+    ns:RegisterEvent("QUEST_FINISHED", function() ns:SafeCall(Auto.OnQuestFinished) end)
     ns:RegisterEvent("BAG_UPDATE_DELAYED", function() ns:SafeCall(Auto.OnBagUpdate) end)
+
+    -- Session-only bank snapshot for zanza ownership (spec §14, §19.22). Never
+    -- persisted: Auto._bankSnapshot is a plain field, so a reload forgets it.
+    ns:RegisterEvent("BANKFRAME_OPENED", function() ns:SafeCall(Auto.OnBankOpened) end)
+    ns:RegisterEvent("BANKFRAME_CLOSED", function() ns:SafeCall(Auto.OnBankClosed) end)
 
     ns:RegisterEvent("MERCHANT_SHOW", function() ns:SafeCall(Auto.OnMerchantShow) end)
     ns:RegisterEvent("ZONE_CHANGED_NEW_AREA", function() ns:SafeCall(Auto.OnZoneChanged) end)
@@ -1204,6 +1909,250 @@ local function testTitleAndReward()
     return true
 end
 
+----------------------------------------------------------------------
+-- ZANZA / GOSSIP-QUEST RULE TABLE (spec §14) — one assertion per rule.
+--
+-- These cover the PURE layer. harness.lua's "zanza-flow live path" section
+-- drives the real event entry points (OnGossipShow / OnQuestComplete /
+-- OnBagUpdate) against stubbed C_GossipInfo + container API for the
+-- end-to-end and adversarial scenarios.
+----------------------------------------------------------------------
+
+-- RULE: the keyword pools are disjoint. zulian/razzashi/hakkari are the coin
+-- set of 8195, never zanza.
+local function testKeywordPools()
+    local zanza, coins = {}, {}
+    for _, k in ipairs(QUEST_KEYWORDS.zanza)   do zanza[k] = true end
+    for _, k in ipairs(QUEST_KEYWORDS.zgCoins) do coins[k] = true end
+    for k in pairs(zanza) do
+        if coins[k] then return false, "zanza n zgCoins must be empty, shared: " .. k end
+    end
+    for _, k in ipairs({ "zulian", "razzashi", "hakkari" }) do
+        if not coins[k] then return false, k .. " belongs to the coin pool (quest 8195)" end
+        if zanza[k] then return false, k .. " must not be in the zanza pool" end
+    end
+    if not zanza["zanza"] then return false, "zanza pool keeps its own keyword" end
+    return true
+end
+
+-- RULE: 8243 only; 8196 / 8246 / 8240 never.
+local function testForbiddenQuests()
+    if not (Auto.QUEST_NEVER[8196] and Auto.QUEST_NEVER[8246]) then
+        return false, "8196/8246 must never be auto-progressed"
+    end
+    if not Auto.QUEST_NEVER[8240] then return false, "8240 is deliberately unhandled" end
+    if Auto.QUEST_NEVER[Auto.ZANZA_QUEST] then return false, "8243 must be allowed" end
+    for _, set in ipairs(Auto.ZG_COIN_SETS) do
+        if Auto.QUEST_NEVER[set.questID] then
+            return false, "coin quest " .. set.questID .. " must be allowed"
+        end
+    end
+    -- ADVERSARIAL: the whole forbidden trio sits in the available list next to
+    -- 8243 -> the planner takes 8243 and nothing else.
+    local available = {
+        { questID = 8196, selector = 8196 },
+        { questID = 8246, selector = 8246 },
+        { questID = 8243, selector = 8243 },
+        { questID = 8240, selector = 8240 },
+    }
+    local plan = Auto.PlanGossipQuest({}, available, { [Auto.ZANZA_QUEST] = true })
+    if not (plan and plan.questID == 8243) then return false, "must select 8243 among 8196/8246/8240" end
+    -- ... and with 8243 absent, nothing at all is selected.
+    plan = Auto.PlanGossipQuest({}, {
+        { questID = 8196, selector = 8196 }, { questID = 8246, selector = 8246 },
+    }, { [Auto.ZANZA_QUEST] = true })
+    if plan ~= nil then return false, "8196/8246 alone must select nothing" end
+    return true
+end
+
+-- RULE: active turn-ins beat available pickups; nothing allowed selects nothing.
+local function testGossipPlanOrder()
+    local plan = Auto.PlanGossipQuest(
+        { { questID = 8243, selector = 8243, isComplete = true } },
+        { { questID = 8238, selector = 8238 } },
+        { [8243] = true, [8238] = true })
+    if not (plan and plan.kind == "active" and plan.questID == 8243) then
+        return false, "an active turn-in wins over an available pickup"
+    end
+    if Auto.PlanGossipQuest({}, { { questID = 8243, selector = 8243 } }, {}) ~= nil then
+        return false, "an empty allowed-set selects nothing"
+    end
+    -- Selector provenance: questID when present, ordinal only as fallback.
+    local read = Auto.ReadGossipQuests(function()
+        return { { questID = 8243, title = "Zanza" }, { title = "No ID" } }
+    end)
+    if not (read[1].selector == 8243 and read[2].selector == 2) then
+        return false, "selector is the questID, ordinal only when there is none"
+    end
+    return true
+end
+
+-- RULE: reward priority is Swiftness -> Spirit -> Sheen, order fixed by spec,
+-- membership user-toggleable, empty list = spec default (all three).
+local function testZanzaPriority()
+    local all = Auto.ZanzaEnabledPicks({})
+    if not (all[1] == "swiftness" and all[2] == "spirit" and all[3] == "sheen" and #all == 3) then
+        return false, "empty priority means all three in spec order"
+    end
+    -- Ticked out of order in the UI -> still returned in spec order.
+    local reordered = Auto.ZanzaEnabledPicks({ "sheen", "swiftness" })
+    if not (reordered[1] == "swiftness" and reordered[2] == "sheen" and #reordered == 2) then
+        return false, "canonical order is re-imposed on the stored membership"
+    end
+    local one = Auto.ZanzaEnabledPicks({ "spirit" })
+    if not (#one == 1 and one[1] == "spirit") then return false, "single pick honoured" end
+    -- Item IDs are the spec's.
+    if Auto.ZanzaReward("swiftness").itemID ~= 20081 then return false, "swiftness 20081" end
+    if Auto.ZanzaReward("spirit").itemID    ~= 20079 then return false, "spirit 20079" end
+    if Auto.ZanzaReward("sheen").itemID     ~= 20080 then return false, "sheen 20080" end
+    if Auto.ZANZA_TOKEN ~= 19858 then return false, "token 19858" end
+    return true
+end
+
+-- RULE: bag space free, UNLESS holding exactly the required token count.
+local function testBagSpaceGuard()
+    if not Auto.DecideBagSpace(3, 1, 1) then return false, "free slots proceed" end
+    if not Auto.DecideBagSpace(0, 1, 1) then return false, "bag full + EXACT token count proceeds" end
+    if Auto.DecideBagSpace(0, 2, 1) then return false, "bag full + spare tokens must refuse" end
+    if Auto.DecideBagSpace(0, 0, 1) then return false, "bag full + no token must refuse" end
+    return true
+end
+
+-- RULE: the entry gate, every refusal named.
+local function testZanzaGate()
+    local base = { enabled = true, shift = false, npcID = Auto.ZANZA_NPC,
+                   tokenCount = 1, tokenNeed = 1, freeSlots = 5 }
+    local function with(t)
+        local c = {}
+        for k, v in pairs(base) do c[k] = v end
+        for k, v in pairs(t) do c[k] = v end
+        return Auto.DecideZanzaGate(c)
+    end
+    local ok, why = with({})
+    if not (ok and why == "ok") then return false, "the happy path admits" end
+    ok, why = with({ enabled = false })
+    if ok or why ~= "disabled" then return false, "disabled refuses" end
+    ok, why = with({ shift = true })
+    if ok or why ~= "shift-skip" then return false, "held Shift skips the flow" end
+    ok, why = with({ npcID = 15070 })
+    if ok or why ~= "wrong-npc" then return false, "a KNOWN wrong NPC refuses" end
+    ok = with({ npcID = nil })
+    if not ok then return false, "an UNKNOWN npc must not disable the flow" end
+    ok, why = with({ tokenCount = 0 })
+    if ok or why ~= "no-token" then return false, "no honor token refuses" end
+    ok, why = with({ freeSlots = 0, tokenCount = 2 })
+    if ok or why ~= "bag-full" then return false, "bag full with spare tokens refuses" end
+    ok = with({ freeSlots = 0, tokenCount = 1 })
+    if not ok then return false, "bag full with the exact token count proceeds" end
+    return true
+end
+
+-- RULE: walk the priority, skip owned, skip cooling; all-owned is its own verdict.
+local function testNextPick()
+    local picks = { "swiftness", "spirit", "sheen" }
+    local offered = { swiftness = true, spirit = true, sheen = true }
+    local key = Auto.NextZanzaPick({ picks = picks, offered = offered, now = 100 })
+    if key ~= "swiftness" then return false, "first priority first" end
+
+    -- Owned swiftness -> walk to spirit.
+    key = Auto.NextZanzaPick({ picks = picks, offered = offered, now = 100,
+                               owned = { swiftness = true } })
+    if key ~= "spirit" then return false, "an owned pick is skipped" end
+
+    -- Rapid re-open inside the 30 s stamp -> walk to the NEXT priority.
+    key = Auto.NextZanzaPick({ picks = picks, offered = offered, now = 105,
+                               cooldowns = { swiftness = 100 }, cooldown = 30 })
+    if key ~= "spirit" then return false, "a cooling pick walks to the next priority" end
+    -- ... and past the cooldown it comes back.
+    key = Auto.NextZanzaPick({ picks = picks, offered = offered, now = 131,
+                               cooldowns = { swiftness = 100 }, cooldown = 30 })
+    if key ~= "swiftness" then return false, "the stamp expires at 30 s" end
+
+    -- Every enabled pick owned -> the all-owned verdict (arms the bag watcher).
+    local k2, why = Auto.NextZanzaPick({ picks = picks, offered = offered, now = 100,
+        owned = { swiftness = true, spirit = true, sheen = true } })
+    if k2 ~= nil or why ~= "all-owned" then return false, "all owned is its own verdict" end
+
+    -- Everything cooling is NOT all-owned (must not arm the watcher).
+    k2, why = Auto.NextZanzaPick({ picks = picks, offered = offered, now = 100,
+        cooldowns = { swiftness = 90, spirit = 90, sheen = 90 }, cooldown = 30 })
+    if k2 ~= nil or why ~= "all-cooling" then return false, "all cooling is distinct from all owned" end
+
+    -- Nothing enabled.
+    k2, why = Auto.NextZanzaPick({ picks = {}, now = 100 })
+    if k2 ~= nil or why ~= "none-enabled" then return false, "no enabled picks" end
+
+    -- A pick that is enabled but not on offer is skipped, not picked.
+    key = Auto.NextZanzaPick({ picks = picks, offered = { sheen = true }, now = 100 })
+    if key ~= "sheen" then return false, "only offered rewards are pickable" end
+    return true
+end
+
+-- RULE: ownership = bags + session bank snapshot.
+local function testOwnershipMath()
+    if Auto.CountOwned(20081, 0, nil) ~= 0 then return false, "no bags, no snapshot" end
+    if Auto.CountOwned(20081, 2, nil) ~= 2 then return false, "bags only" end
+    if Auto.CountOwned(20081, 0, { [20081] = 1 }) ~= 1 then
+        return false, "owned in the BANK SNAPSHOT alone still counts as owned"
+    end
+    if Auto.CountOwned(20081, 2, { [20081] = 3 }) ~= 5 then return false, "bags + bank sum" end
+    if Auto.CountOwned(20079, 0, { [20081] = 3 }) ~= 0 then return false, "other items excluded" end
+    -- "Forgotten on reload": a nil snapshot is the fresh-session state and
+    -- reads as nothing known in the bank, NOT as a stale count.
+    if Auto.CountOwned(20081, 0, nil) ~= 0 then return false, "a forgotten snapshot contributes nothing" end
+    return true
+end
+
+-- RULE: delivery verified by bag delta, 5 s timeout backstop.
+local function testDeliveryJudge()
+    local p = { key = "spirit", itemID = 20079, before = 0, at = 100 }
+    if Auto.JudgeDelivery(p, 1, 101, 5) ~= "delivered" then return false, "bag delta = delivered" end
+    if Auto.JudgeDelivery(p, 0, 102, 5) ~= "pending" then return false, "no delta yet = pending" end
+    if Auto.JudgeDelivery(p, 0, 105, 5) ~= "timeout" then return false, "5 s backstop fires" end
+    if Auto.JudgeDelivery(nil, 0, 105, 5) ~= "idle" then return false, "nothing pending = idle" end
+    -- A delta arriving exactly at the backstop still counts as delivered.
+    if Auto.JudgeDelivery(p, 1, 105, 5) ~= "delivered" then return false, "delivery wins at the boundary" end
+    return true
+end
+
+-- RULE: coin quest priority 8238 -> 8239 -> 8195, each needing its full set.
+local function testCoinPriority()
+    local have = {}
+    local count = function(id) return have[id] or 0 end
+    if Auto.PickCoinQuest(count) ~= nil then return false, "no coins, no quest" end
+    have[19698], have[19699], have[19700] = 1, 1, 1
+    if Auto.PickCoinQuest(count) ~= 8195 then return false, "third set alone -> 8195" end
+    have[19701], have[19702] = 1, 1
+    if Auto.PickCoinQuest(count) ~= 8195 then return false, "an INCOMPLETE higher set does not win" end
+    have[19703] = 1
+    if Auto.PickCoinQuest(count) ~= 8238 then return false, "a complete set 1 takes priority" end
+    return true
+end
+
+-- RULE: reward choices are keyed by ITEM ID first, display name second.
+local function testRewardKeying()
+    local keyed = Auto.KeyRewardChoices({
+        { index = 1, itemID = 20080, name = "Something Localised" },
+        { index = 2, itemID = nil,   name = "Spirit of Zanza" },
+        { index = 3, itemID = 12345, name = "Not A Zanza" },
+    })
+    if keyed[1].key ~= "sheen" then return false, "item ID wins over the display name" end
+    if keyed[2].key ~= "spirit" then return false, "name fallback when the link did not resolve" end
+    if keyed[3].key ~= nil then return false, "a foreign reward gets no key" end
+    return true
+end
+
+-- RULE: NPC identity parse (the belt to the quest-ID braces).
+local function testNpcParse()
+    if Auto.ParseNpcID("Creature-0-3299-0-14-14921-0000027FA6") ~= 14921 then
+        return false, "Rin'wosho creature GUID"
+    end
+    if Auto.ParseNpcID("Player-4395-01C7B4D5") ~= nil then return false, "a player GUID is not an NPC" end
+    if Auto.ParseNpcID(nil) ~= nil then return false, "nil GUID" end
+    if Auto.ParseNpcID("garbage") ~= nil then return false, "unparseable GUID" end
+    return true
+end
+
 function Auto.RunSelfTests(verbose)
     local suite = {
         { name = "trust truth table",   fn = testTrustTruthTable },
@@ -1214,6 +2163,18 @@ function Auto.RunSelfTests(verbose)
         { name = "roster membership",   fn = testRosterMembership },
         { name = "gossip option match", fn = testOptionMatcher },
         { name = "quest title + reward", fn = testTitleAndReward },
+        { name = "keyword pools disjoint", fn = testKeywordPools },
+        { name = "forbidden quests",    fn = testForbiddenQuests },
+        { name = "gossip plan order",   fn = testGossipPlanOrder },
+        { name = "zanza priority",      fn = testZanzaPriority },
+        { name = "bag-space guard",     fn = testBagSpaceGuard },
+        { name = "zanza entry gate",    fn = testZanzaGate },
+        { name = "next-pick walk",      fn = testNextPick },
+        { name = "ownership math",      fn = testOwnershipMath },
+        { name = "delivery judge",      fn = testDeliveryJudge },
+        { name = "coin priority",       fn = testCoinPriority },
+        { name = "reward keying",       fn = testRewardKeying },
+        { name = "npc guid parse",      fn = testNpcParse },
     }
     local allPass = true
     for _, t in ipairs(suite) do
