@@ -295,11 +295,18 @@ end
 -- explicitly). Fails CLOSED on every uncertainty: no Battle.net connection, a
 -- missing API, an unfamiliar record shape or a non-WoW game account all
 -- contribute nothing rather than a guess.
+-- Is Battle.net actually connected right now? Split out so the ladder and the
+-- suite can ask the same question the reader asks, rather than a lookalike.
+function Social.BNetConnected()
+    if not _G.BNConnected then return false end
+    local ok, connected = pcall(_G.BNConnected)
+    return (ok and connected) and true or false
+end
+
 function Social.ReadBNetNames()
     local out = {}
     if not (_G.BNConnected and _G.BNGetNumFriends) then return out end
-    local okC, connected = pcall(_G.BNConnected)
-    if not (okC and connected) then return out end
+    if not Social.BNetConnected() then return out end
 
     local C = _G.C_BattleNet
     if not (C and C.GetFriendNumGameAccounts and C.GetFriendGameAccountInfo) then
@@ -345,6 +352,10 @@ function Social.CaptureFriends()
     local action, set = Social.JudgeFriends(ctx)
     if action ~= "write" then return "dark", false, 0 end
     local changed, n = Store.SetSocialSet("friends", set, serverNow())
+    -- NX-4: the bnet leg of the login ladder stops the moment a capture has
+    -- actually been able to READ Battle.net. Before that, "no bnet names" is a
+    -- report about the connection, not about the friends list.
+    if Social.BNetConnected() then Social._bnetCaptured = true end
     return "write", changed, n
 end
 
@@ -362,19 +373,48 @@ local GUILD_REQUEST_AT = { 2, 10, 30 }   -- seconds after login; bounded, then s
 -- and wrong if IsInGuild() has simply not been populated yet on the very first
 -- frame. Waiting for the first rung costs two seconds and removes the only path
 -- by which this module could revoke a whole roster's trust on a bad read.
+-- NX-4 (async lesson Class 7). The ladder used to carry the GUILD leg only, and
+-- the bnet half of the friends set was driven exclusively by
+-- BN_FRIEND_INFO_CHANGED / FRIENDLIST_UPDATE. Battle.net is routinely NOT yet
+-- connected on the login frame, so `ReadBNetNames` returns an empty set — and if
+-- no character friend's info happens to change afterwards, NOTHING re-fires. The
+-- bnet names simply never populate for the whole session, and every invite from
+-- a Battle.net friend's character is ignored by a gate that thinks it has never
+-- heard of them.
+--
+-- Two producers, both cheap:
+--   * BN_CONNECTED / BN_FRIEND_LIST_SIZE_CHANGED — the settle signals for "the
+--     Battle.net list is now readable" (catalog 11509: Event.FriendList.
+--     BnConnected, Event.FriendList.BnFriendListSizeChanged), routed through the
+--     SAME 2s coalescer as BN_FRIEND_INFO_CHANGED.
+--   * the login ladder now runs a bnet leg beside the guild leg, so a connection
+--     that lands between rungs is picked up even if no event reaches us at all.
+-- Each leg has its OWN stop latch: a guild answer must not silence the bnet
+-- rungs, and vice versa.
 ns:On("LOGIN", function()
     Social._guildRequested = false
     Social._guildCaptured  = false
+    Social._bnetCaptured   = false
     for _, at in ipairs(GUILD_REQUEST_AT) do
         if _G.C_Timer and C_Timer.After then
-            C_Timer.After(at, function()
-                if Social._guildCaptured then return end
-                ns:SafeCall(Social.RequestGuildRoster)
-                ns:SafeCall(Social.CaptureGuild)
-            end)
+            C_Timer.After(at, function() ns:SafeCall(Social.LoginLadderRung) end)
         end
     end
 end)
+
+-- One rung. Split out so the suite drives the exact function the timer drives.
+function Social.LoginLadderRung()
+    if not Social._guildCaptured then
+        ns:SafeCall(Social.RequestGuildRoster)
+        ns:SafeCall(Social.CaptureGuild)
+    end
+    -- The bnet leg. CaptureFriends is refusal-gated on the CHARACTER list being
+    -- confirmed, so a rung that fires while everything is still dark writes
+    -- nothing — which is why it is safe to run it unconditionally here.
+    if not Social._bnetCaptured then
+        ns:SafeCall(Social.CaptureFriends)
+    end
+end
 
 -- The answer. NEVER re-request from in here: a request fires this event.
 ns:RegisterEvent("GUILD_ROSTER_UPDATE", function()
@@ -405,8 +445,24 @@ ns:RegisterEvent("FRIENDLIST_UPDATE", function()
 end)
 
 -- Battle.net churn is noisier and cheaper to coalesce: one rebuild per 2 s.
-ns:RegisterEvent("BN_FRIEND_INFO_CHANGED", function()
-    if Social._bnPending then return end
+-- Declared as DATA so the suite can assert the set, and so a mutation test can
+-- drive the pre-fix set (BN_FRIEND_INFO_CHANGED alone) as a red control.
+Social.BNET_EVENTS = {
+    "BN_FRIEND_INFO_CHANGED",       -- a friend's own info moved
+    "BN_CONNECTED",                 -- NX-4: the list became READABLE at all
+    "BN_FRIEND_LIST_SIZE_CHANGED",  -- NX-4: the list populated / changed length
+}
+
+-- PURE. Is `event` one of the signals that rebuilds the bnet half?
+function Social.IsBNetEvent(event, list)
+    list = list or Social.BNET_EVENTS
+    if type(event) ~= "string" or event == "" then return false end
+    for i = 1, #list do if list[i] == event then return true end end
+    return false
+end
+
+function Social.OnBNetEvent()
+    if Social._bnPending then return false end
     Social._bnPending = true
     if _G.C_Timer and C_Timer.After then
         C_Timer.After(2, function()
@@ -417,7 +473,12 @@ ns:RegisterEvent("BN_FRIEND_INFO_CHANGED", function()
         Social._bnPending = false
         ns:SafeCall(Social.CaptureFriends)
     end
-end)
+    return true
+end
+
+for _, evt in ipairs(Social.BNET_EVENTS) do
+    ns:RegisterEvent(evt, function() Social.OnBNetEvent() end)
+end
 
 ----------------------------------------------------------------------
 -- Diagnostics — /dsn debug social [name]
@@ -742,6 +803,149 @@ ns:RegisterSelfTest("social", function(verbose)
         "store: only guild and friends are writable sets")
     ck(select(1, Store.SetSocialSet("guild", "not a table", 0)) == false,
         "store: a non-table is refused, not stored")
+
+    ------------------------------------------------------------------
+    -- 9. NX-4 — BATTLE.NET CONNECTS AFTER LOGIN (async lesson Class 7).
+    --
+    --    `ReadBNetNames` fails closed when Battle.net is not connected, which is
+    --    correct — but the only things that ever re-ran it were
+    --    BN_FRIEND_INFO_CHANGED and FRIENDLIST_UPDATE. Log in before the client
+    --    finishes connecting, have no character friend's info change afterwards,
+    --    and the bnet half of the set NEVER populates for the whole session.
+    --    Nothing re-fires; the capture is subscribed to churn, not to arrival.
+    --
+    --    Both halves of the fix are asserted, each against the pre-fix set as a
+    --    red control: the event set, and the login ladder's bnet leg.
+    ------------------------------------------------------------------
+    onlyGate("friends")
+    resetStore()
+
+    -- ---- the event set, both ways ----------------------------------------
+    local PRE_FIX_BNET = { "BN_FRIEND_INFO_CHANGED" }
+    for _, evt in ipairs({ "BN_CONNECTED", "BN_FRIEND_LIST_SIZE_CHANGED" }) do
+        ck(Social.IsBNetEvent(evt) == true, "bnet: " .. evt .. " is not in the event set")
+        ck(Social.IsBNetEvent(evt, PRE_FIX_BNET) == false,
+            "RED CONTROL FAILED: " .. evt .. " was already in the pre-fix set")
+    end
+    ck(Social.IsBNetEvent("BN_FRIEND_INFO_CHANGED") == true,
+        "bnet: the original signal was dropped in the promotion")
+    ck(Social.IsBNetEvent("FRIENDLIST_UPDATE") == false,
+        "bnet: the character-list signal is not a bnet signal")
+
+    -- ---- the live path ----------------------------------------------------
+    local Gb = _G
+    local savedBNC, savedBNN, savedBattle, savedWow =
+        Gb.BNConnected, Gb.BNGetNumFriends, Gb.C_BattleNet, Gb.BNET_CLIENT_WOW
+    local savedFS = ns.MeshFriends and ns.MeshFriends.FriendSet
+    local savedLC = ns.MeshFriends and ns.MeshFriends.ListConfirmed
+    local savedTimer = Gb.C_Timer
+    local savedBnCap, savedGuildCap, savedPending =
+        Social._bnetCaptured, Social._guildCaptured, Social._bnPending
+
+    -- The CHARACTER list is confirmed and empty from the first frame — so any
+    -- name that shows up in the set can only have come from Battle.net.
+    if ns.MeshFriends then
+        ns.MeshFriends.FriendSet     = function() return {} end
+        ns.MeshFriends.ListConfirmed = function() return true end
+    end
+    Gb.BNET_CLIENT_WOW  = "WoW"
+    local bnetUp = false
+    Gb.BNConnected      = function() return bnetUp end
+    Gb.BNGetNumFriends  = function() return 1 end
+    Gb.C_BattleNet = {
+        GetFriendNumGameAccounts = function() return 1 end,
+        GetFriendGameAccountInfo = function()
+            return { clientProgram = "WoW", characterName = "Bnetpal", realmName = REALM }
+        end,
+    }
+    -- Queue-and-pump timer: the 2s bnet coalescer must be a real deferral, not
+    -- an inlined call, or the debounce is not what is being tested.
+    local bnQueue = {}
+    Gb.C_Timer = { After = function(d, fn) bnQueue[#bnQueue + 1] = { at = tonumber(d) or 0, fn = fn } end }
+    local function bnPump()
+        local q = bnQueue
+        bnQueue = {}
+        for i = 1, #q do pcall(q[i].fn) end
+    end
+
+    local okBn, errBn = pcall(function()
+        Social._bnetCaptured, Social._guildCaptured, Social._bnPending = false, true, false
+
+        -- LOGIN with Battle.net still connecting. The capture runs (the character
+        -- list is confirmed) and honestly writes no bnet names.
+        Social.CaptureFriends()
+        ck(Auto.ShouldAcceptInvite(Auto.NormalizeName("Bnetpal")) == false,
+            "bnet: a disconnected Battle.net must contribute nothing")
+        ck(Social._bnetCaptured == false,
+            "bnet: a capture taken while disconnected must not close the ladder's bnet leg")
+
+        -- ...and it connects a minute later, with NO character friend's info
+        -- changing. This is the whole finding: on the pre-fix wiring, nothing
+        -- from here on ever re-reads Battle.net.
+        bnetUp = true
+        ck(Social.BNetConnected() == true, "bnet: the connection probe disagrees with the world")
+
+        -- PRODUCER 1 — the arrival event, through the real handler.
+        ck(Social.OnBNetEvent() == true, "bnet: the arrival event did not arm a rebuild")
+        ck(Social.OnBNetEvent() == false, "bnet: the 2s coalescer did not hold the second event")
+        ck(Auto.ShouldAcceptInvite(Auto.NormalizeName("Bnetpal")) == false,
+            "bnet: the rebuild ran inline instead of being deferred")
+        bnPump()
+        ck(Auto.ShouldAcceptInvite(Auto.NormalizeName("Bnetpal")) == true,
+            "bnet: BN_CONNECTED did not populate the set — a Battle.net friend's "
+            .. "character would be ignored by the invite gate all session")
+        ck(Social._bnetCaptured == true, "bnet: a connected capture did not close the leg")
+
+        -- PRODUCER 2 — the login ladder, for the case where no event reaches us
+        -- at all (the connection lands between rungs).
+        resetStore()
+        bnetUp = false
+        Social._bnetCaptured, Social._guildCaptured, Social._bnPending = false, true, false
+        Social.LoginLadderRung()                       -- rung 1: still dark
+        ck(Auto.ShouldAcceptInvite(Auto.NormalizeName("Bnetpal")) == false,
+            "ladder: a rung fired while disconnected must not fabricate names")
+        ck(Social._bnetCaptured == false, "ladder: the leg closed on a disconnected rung")
+        bnetUp = true
+        Social.LoginLadderRung()                       -- rung 2: connected now
+        ck(Auto.ShouldAcceptInvite(Auto.NormalizeName("Bnetpal")) == true,
+            "ladder: the bnet leg never ran — the pre-fix ladder carried the guild "
+            .. "leg only, so a silent connection was invisible for the session")
+        ck(Social._bnetCaptured == true, "ladder: a connected rung did not close the leg")
+
+        -- The legs are INDEPENDENT: a guild answer must not silence bnet.
+        Social._guildCaptured, Social._bnetCaptured = true, false
+        local ranBnet = false
+        local realCap = Social.CaptureFriends
+        Social.CaptureFriends = function() ranBnet = true; return realCap() end
+        Social.LoginLadderRung()
+        Social.CaptureFriends = realCap
+        ck(ranBnet == true,
+            "ladder: a captured guild silenced the bnet leg (the pre-fix ladder's "
+            .. "single latch is exactly this bug)")
+
+        -- ...and a dark CHARACTER list still refuses everything, connected or not:
+        -- the new producers must not have opened a hole in the refusal gate.
+        resetStore()
+        if ns.MeshFriends then ns.MeshFriends.ListConfirmed = function() return false end end
+        local act9 = Social.CaptureFriends()
+        ck(act9 == "dark", "bnet: an unconfirmed character list must still refuse to write")
+        ck(Auto.ShouldAcceptInvite(Auto.NormalizeName("Bnetpal")) == false,
+            "bnet: and nothing leaks past the refusal gate")
+    end)
+
+    Gb.BNConnected, Gb.BNGetNumFriends = savedBNC, savedBNN
+    Gb.C_BattleNet, Gb.BNET_CLIENT_WOW = savedBattle, savedWow
+    Gb.C_Timer = savedTimer
+    if ns.MeshFriends then
+        ns.MeshFriends.FriendSet     = savedFS
+        ns.MeshFriends.ListConfirmed = savedLC
+    end
+    Social._bnetCaptured, Social._guildCaptured = savedBnCap, savedGuildCap
+    Social._bnPending = savedPending
+    if not okBn then
+        pass = false
+        if verbose then ns:Print("  FAIL social/bnet arrival fixtures: " .. tostring(errBn)) end
+    end
 
     ------------------------------------------------------------------
     -- Restore.

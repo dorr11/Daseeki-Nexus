@@ -2085,16 +2085,195 @@ Tracker._captureLocation  = captureLocation
 Tracker._captureCooldowns = captureCooldowns
 Tracker._captureDMF       = captureDMF
 Tracker._captureBoonItems = captureBoonItems
+Tracker._captureSoulstone = captureSoulstone
 
--- Raid lockouts from the saved-instance list. Requires a prior
--- RequestRaidInfo (fired on login and refreshed on UPDATE_INSTANCE_INFO).
+----------------------------------------------------------------------
+-- RAID LOCKOUTS — THE CAPTURE AND ITS PRODUCER  (async lesson Class 7 + 6)
+--
+-- NX-1, and the worst shape Class 7 takes: not a missing subscription but a
+-- SUBSCRIPTION WITH NO PRODUCER.
+--
+-- `GetNumSavedInstances`/`GetSavedInstanceInfo` do not read the server. They
+-- read a CLIENT-SIDE table that the server refills only when something calls
+-- `RequestRaidInfo()`, and the refill announces itself with
+-- `UPDATE_INSTANCE_INFO`. This module has always listened for that event — and
+-- has always called `RequestRaidInfo()` exactly once, at login. Nothing ever
+-- re-asked, so nothing ever re-answered:
+--
+--   log in unsaved -> kill Lucifron -> you are now saved to Molten Core, and
+--   `UPDATE_INSTANCE_INFO` never fires, because nobody asked. The 30s safety
+--   rescan re-reads the SAME stale client table, so the ticker cannot heal it
+--   either. Every peer on the mesh sees "Molten Core: not saved" for the rest
+--   of the session, and the row only corrects itself after a relog.
+--
+-- The Class 7 rule is "for every mutation a capture observes, subscribe to the
+-- signal that proves settlement". Here the settle signal exists and is already
+-- subscribed — what is missing is the thing that PRODUCES it. So the fix is to
+-- ask, on every signal that means the server's answer may have changed:
+--   * an encounter completed  (BOSS_KILL / ENCOUNTER_END) — the mutation itself
+--   * the instance told us its lockout (RAID_INSTANCE_WELCOME) and the
+--     INSTANCE_LOCK_* family, which are literally about this table
+--   * an instance BOUNDARY was crossed (ZONE_CHANGED_NEW_AREA /
+--     PLAYER_ENTERING_WORLD, in->out or out->in). A boundary, not every zone
+--     change: walking the Barrens into Durotar cannot alter a lockout.
+--   * a bounded re-ask from the safety tick WHILE INSIDE A RAID, which covers
+--     any encounter whose completion event the Era client does not fire.
+-- ...and then let `UPDATE_INSTANCE_INFO` do the job it was always subscribed
+-- for. The capture rides the event the request PRODUCES; it never reads the
+-- client table hopefully.
+--
+-- CLASS 6 RIDES ALONG (dark reads of a populatable list). This capture CLEARS
+-- every raid key and rebuilds from the client table, so a table that has not
+-- been filled yet is indistinguishable from "you are saved to nothing" — and
+-- now that we ask far more often, an answer that has not landed yet is a far
+-- more frequent state than it used to be. Absence of the answer is NOT an empty
+-- answer: an empty list may only overwrite stored lockouts once the server has
+-- answered at least once this session (`_raidInfoAnswered`), or once the list
+-- itself reads non-empty (which is its own proof). Before that, the capture
+-- preserves what it holds and waits. A request that produces nothing must never
+-- be able to wipe a lockout row.
+----------------------------------------------------------------------
+
+-- Events that ALWAYS justify a re-ask: each one either is the mutation or is
+-- the client telling us about this exact table. Declared as DATA so a mutation
+-- test can ask "what happens when BOSS_KILL is not in the set?" — which is
+-- precisely the pre-fix world.
+-- Catalog-verified on interface 11509 (build 1.15.9.68808):
+--   BOSS_KILL             Event.EncounterInfo.BossKill(encounterID, encounterName)
+--   ENCOUNTER_END         Event.EncounterInfo.EncounterEnd(encounterID, name, difficultyID, groupSize, success)
+--   RAID_INSTANCE_WELCOME Event.ChatInfo.RaidInstanceWelcome(mapname, daysLeft, hoursLeft, minutesLeft, locked)
+--   INSTANCE_LOCK_START / _STOP / _WARNING   Event.EncounterInfo.InstanceLock*
+Tracker.RAID_INFO_ASK_EVENTS = {
+    "BOSS_KILL",
+    "ENCOUNTER_END",
+    "RAID_INSTANCE_WELCOME",
+    "INSTANCE_LOCK_START",
+    "INSTANCE_LOCK_STOP",
+    "INSTANCE_LOCK_WARNING",
+}
+
+-- Events that justify a re-ask ONLY at an instance boundary. Both fire
+-- constantly in the open world, where nothing about a lockout can have changed.
+--   ZONE_CHANGED_NEW_AREA Event.MapUI.ZoneChangedNewArea
+--   PLAYER_ENTERING_WORLD (the far side of every loading screen)
+Tracker.RAID_INFO_BOUNDARY_EVENTS = {
+    "ZONE_CHANGED_NEW_AREA",
+    "PLAYER_ENTERING_WORLD",
+}
+
+Tracker.RAID_INFO_MIN_GAP        = 5    -- s; floor between event-driven requests
+Tracker.RAID_INFO_INSIDE_GAP     = 60   -- s; safety-tick re-ask cadence inside a raid
+
+-- PURE membership predicates. Both lists may be overridden by the caller, which
+-- is what lets the suite drive the OLD (producer-less) chain as a red control.
+local function inList(event, list)
+    if type(event) ~= "string" or event == "" then return false end
+    for i = 1, #(list or {}) do
+        if list[i] == event then return true end
+    end
+    return false
+end
+
+function Tracker.IsRaidInfoAskEvent(event, list)
+    return inList(event, list or Tracker.RAID_INFO_ASK_EVENTS)
+end
+
+function Tracker.IsRaidInfoBoundaryEvent(event, list)
+    return inList(event, list or Tracker.RAID_INFO_BOUNDARY_EVENTS)
+end
+
+-- PURE. An instance BOUNDARY is a change in inside-ness, not a zone change.
+-- nil `wasInside` (nothing remembered yet) counts as a boundary: the first
+-- observation of the session must be allowed to ask.
+function Tracker.IsInstanceBoundary(wasInside, isInside)
+    if wasInside == nil then return true end
+    return (wasInside and true or false) ~= (isInside and true or false)
+end
+
+-- PURE. The rate floor shared by every request path. `lastAt` nil = never asked.
+function Tracker.ShouldRequestRaidInfo(now, lastAt, minGap)
+    now = tonumber(now) or 0
+    if lastAt == nil then return true end
+    return (now - (tonumber(lastAt) or 0)) >= (tonumber(minGap) or Tracker.RAID_INFO_MIN_GAP)
+end
+
+local function inRaidInstance()
+    if not IsInInstance then return false end
+    local inside, itype = IsInInstance()
+    return (inside and itype == "raid") and true or false
+end
+Tracker._inRaidInstance = inRaidInstance
+
+-- Ask the server. Rate-floored, never queued (extra RequestRaidInfo calls are
+-- dropped by the client, not stacked — the same contract GuildRoster has in
+-- social.lua). Returns true when a request actually went out.
+function Tracker.RequestRaidInfoNow(reason, minGap)
+    if not RequestRaidInfo then return false end
+    local now = ns.Store.Now()
+    if not Tracker.ShouldRequestRaidInfo(now, Tracker._raidInfoAskedAt, minGap) then
+        Tracker._raidInfoThrottled = (Tracker._raidInfoThrottled or 0) + 1
+        return false
+    end
+    Tracker._raidInfoAskedAt = now
+    Tracker._raidInfoAsks    = (Tracker._raidInfoAsks or 0) + 1
+    Tracker._raidInfoLastReason = reason
+    RequestRaidInfo()
+    return true
+end
+
+-- The ONE handler every producer signal routes through, so the self-tests drive
+-- the exact function the event frame drives.
+function Tracker.OnRaidInfoProducer(event)
+    if Tracker.IsRaidInfoAskEvent(event) then
+        return Tracker.RequestRaidInfoNow(event)
+    end
+    if Tracker.IsRaidInfoBoundaryEvent(event) then
+        local isInside = (IsInInstance and IsInInstance()) and true or false
+        local was = Tracker._raidInfoInside
+        Tracker._raidInfoInside = isInside
+        if not Tracker.IsInstanceBoundary(was, isInside) then return false end
+        return Tracker.RequestRaidInfoNow(event)
+    end
+    return false
+end
+
+-- The answer. Setting the latch BEFORE the capture is the whole Class 6 gate:
+-- from here on an empty saved-instance list is a real "you are saved to
+-- nothing" rather than "the server has not spoken yet".
+function Tracker.OnRaidInfoUpdated()
+    Tracker._raidInfoAnswered = true
+    Tracker._raidInfoAnswers  = (Tracker._raidInfoAnswers or 0) + 1
+    Tracker.RequestCapture()
+end
+
+-- Bounded re-ask from the 30s safety tick, but ONLY while standing in a raid —
+-- the one place a lockout can be earned by an encounter whose completion event
+-- the Era client may not fire at all. Outside a raid this is a no-op, so a
+-- parked character still costs zero.
+function Tracker.TickRaidInfo()
+    if not inRaidInstance() then return false end
+    return Tracker.RequestRaidInfoNow("safety-tick", Tracker.RAID_INFO_INSIDE_GAP)
+end
+
+-- Raid lockouts from the saved-instance list. Rides the UPDATE_INSTANCE_INFO
+-- that the producers above make the server send.
 local function captureRaidLockouts(rec)
     rec.raidLockouts = rec.raidLockouts or {}
+    local n = GetNumSavedInstances and GetNumSavedInstances() or 0
+    -- CLASS 6 GATE. A zero-length list is only an ANSWER once the server has
+    -- answered at least once this session. Before that it is an unfilled table,
+    -- and clearing the stored keys against it would broadcast "no lockouts" to
+    -- every peer on the strength of a read that proved nothing.
+    if n <= 0 and not Tracker._raidInfoAnswered then
+        Tracker._raidLockoutsDark = (Tracker._raidLockoutsDark or 0) + 1
+        return
+    end
+    -- A non-empty list is its own proof that the server has spoken.
+    if n > 0 then Tracker._raidInfoAnswered = true end
     -- Clear stale keys; rebuild from the current saved list.
     for _, k in ipairs(ns.Store.RAID_KEYS) do
         rec.raidLockouts[k] = nil
     end
-    local n = GetNumSavedInstances and GetNumSavedInstances() or 0
     local now = ns.Store.Now()
     for i = 1, n do
         local name, _, reset, _, locked = GetSavedInstanceInfo(i)
@@ -2112,6 +2291,10 @@ local function captureRaidLockouts(rec)
         end
     end
 end
+
+-- Exposed for the self-test harness alongside the other capture halves: the
+-- NX-1 fixture drives this directly to prove the dark-read gate and the heal.
+Tracker._captureRaidLockouts = captureRaidLockouts
 
 ----------------------------------------------------------------------
 -- RAID ATTUNEMENT (personal, Classic Era)
@@ -3131,6 +3314,11 @@ function Tracker.SafetyRescanTick()
     if not (ns.state and ns.state.loggedIn) then return end
     if Tracker.IsTeardown and Tracker.IsTeardown() then return end
     Tracker._safetyRescans = (Tracker._safetyRescans or 0) + 1
+    -- NX-1: the rescan re-reads the CLIENT's saved-instance table, which no
+    -- amount of re-reading can refresh. While inside a raid, re-ask the server
+    -- first (bounded to RAID_INFO_INSIDE_GAP) so there is something new to read;
+    -- outside a raid this is a no-op and a parked character still costs nothing.
+    ns:SafeCall(Tracker.TickRaidInfo)
     ns:SafeCall(Tracker.RequestCapture)
 end
 
@@ -3166,7 +3354,51 @@ end
 
 ----------------------------------------------------------------------
 -- Event wiring
+--
+-- THE CAPTURE SET, DECLARED AS DATA (donor: inventory.lua's dirty sets, which
+-- pair a declared list with a pure predicate so a mutation test can ask "what
+-- would happen if X were not in the set?"). Everything the capture pass READS
+-- must have its settle signal in here; a capture whose signal is missing sits
+-- stale until something unrelated happens to fire (async lesson Class 7).
 ----------------------------------------------------------------------
+
+Tracker.CAPTURE_EVENTS = {
+    "PLAYER_ENTERING_WORLD",
+    "ZONE_CHANGED_NEW_AREA",
+    -- NX-6: captureLocation prefers GetSubZoneText, so a SUBZONE-only move is a
+    -- change it can see and was never told about — ZONE_CHANGED_NEW_AREA does
+    -- not fire crossing into the Crossroads' inn. Only the 30s ticker healed it.
+    -- timers.lua:6692 already registers ZONE_CHANGED for exactly this reason;
+    -- this removes an in-repo asymmetry rather than inventing a rule.
+    -- Catalog 11509: Event.MapUI.ZoneChanged / Event.MapUI.ZoneChangedIndoors.
+    "ZONE_CHANGED",
+    "ZONE_CHANGED_INDOORS",
+    "UNIT_AURA",
+    "PLAYER_UPDATE_RESTING",
+    "PLAYER_FLAGS_CHANGED",
+    "BAG_UPDATE_DELAYED",
+    "BAG_UPDATE_COOLDOWN",
+    -- NX-3: captureSoulstone reads C_Spell.GetSpellCooldown(Create Soulstone),
+    -- and a SPELL cooldown expiring fires the spell event, never a bag one. The
+    -- capture set had the bag half of that pair and not the spell half, so a
+    -- warlock parked in a city broadcast soulstoneReady=false for up to 30s
+    -- after the cooldown actually ended.
+    -- Catalog 11509: Event.SpellBook.SpellUpdateCooldown.
+    "SPELL_UPDATE_COOLDOWN",
+    "UPDATE_INSTANCE_INFO",
+    "PLAYER_LEVEL_UP",
+    "PLAYER_CONTROL_LOST",
+    "PLAYER_CONTROL_GAINED",
+    "PLAYER_XP_UPDATE",       -- XP earned -> refresh xp/xpMax (debounced)
+    "UPDATE_EXHAUSTION",      -- rested pool changed -> refresh restedXP
+}
+
+-- PURE. Is `event` one of the signals that drives a capture? The list may be
+-- overridden by the caller, which is what lets a mutation test drive the
+-- pre-fix set and assert the stale read it produced.
+function Tracker.IsCaptureEvent(event, list)
+    return inList(event, list or Tracker.CAPTURE_EVENTS)
+end
 
 function Tracker.OnLogin()
     installTooltipHooks()
@@ -3184,8 +3416,10 @@ function Tracker.OnLogin()
         if selfRec then ns.Store.DMFCooldownResume(selfRec, ns.Store.Now()) end
     end
 
-    -- Ask the server for our saved-instance (lockout) data.
-    if RequestRaidInfo then RequestRaidInfo() end
+    -- Ask the server for our saved-instance (lockout) data. This used to be the
+    -- ONLY RequestRaidInfo call in the suite (NX-1); it is now the first rung of
+    -- a producer ladder, not the whole of the asking.
+    Tracker.RequestRaidInfoNow("login")
 
     -- Arm the periodic rescan (spec §4.2). Idempotent, so a second OnLogin — a
     -- /reload path, or the harness calling it twice — cannot stack tickers.
@@ -3237,21 +3471,20 @@ function Tracker.OnLogin()
         ns:SafeCall(Tracker.Capture, true)
     end)
 
-    local capEvents = {
-        "PLAYER_ENTERING_WORLD",
-        "ZONE_CHANGED_NEW_AREA",
-        "UNIT_AURA",
-        "PLAYER_UPDATE_RESTING",
-        "PLAYER_FLAGS_CHANGED",
-        "BAG_UPDATE_DELAYED",
-        "BAG_UPDATE_COOLDOWN",
-        "UPDATE_INSTANCE_INFO",
-        "PLAYER_LEVEL_UP",
-        "PLAYER_CONTROL_LOST",
-        "PLAYER_CONTROL_GAINED",
-        "PLAYER_XP_UPDATE",       -- XP earned -> refresh xp/xpMax (debounced)
-        "UPDATE_EXHAUSTION",      -- rested pool changed -> refresh restedXP
-    }
+    local capEvents = Tracker.CAPTURE_EVENTS
+
+    ----------------------------------------------------------------------
+    -- NX-1: THE PRODUCERS. Registered as their OWN handlers — ns:RegisterEvent
+    -- appends to a per-event list, so the two overlapping registrations
+    -- (ZONE_CHANGED_NEW_AREA and PLAYER_ENTERING_WORLD are in both sets) both
+    -- run: one asks the server, the other captures. Neither replaces the other.
+    ----------------------------------------------------------------------
+    for _, evt in ipairs(Tracker.RAID_INFO_ASK_EVENTS) do
+        ns:RegisterEvent(evt, function(event) Tracker.OnRaidInfoProducer(event or evt) end)
+    end
+    for _, evt in ipairs(Tracker.RAID_INFO_BOUNDARY_EVENTS) do
+        ns:RegisterEvent(evt, function(event) Tracker.OnRaidInfoProducer(event or evt) end)
+    end
     ----------------------------------------------------------------------
     -- A7 — chronoboon cast wiring (spec §4.4). This is what removes the hover
     -- dependency: boon your buffs and walk away, and the card still shows them.
@@ -3323,8 +3556,10 @@ function Tracker.OnLogin()
             -- UNIT_AURA fires for many units; only react to the player.
             if event == "UNIT_AURA" and unit ~= "player" then return end
             if event == "UPDATE_INSTANCE_INFO" then
-                -- lockout data just refreshed; recapture directly
-                Tracker.RequestCapture()
+                -- THE ANSWER to a RequestRaidInfo. Latches "the server has
+                -- spoken" (so an empty list stops being a dark read) and then
+                -- recaptures.
+                Tracker.OnRaidInfoUpdated()
                 return
             end
             Tracker.RequestCapture()
@@ -3472,9 +3707,46 @@ function Tracker.DebugSanity()
     ns:Print("  one-shot unboonable-slot repair: " .. (boonDone and "already run" or "PENDING"))
 end
 
+----------------------------------------------------------------------
+-- Diagnostic: /nexus debug lockouts
+--
+-- NX-1 was invisible in game precisely because a subscription with no producer
+-- looks identical to a quiet server. This prints the producer side of the ledger
+-- — how many times we asked, how many answers came back, what asked last — so
+-- the owner can kill a boss and SEE the ask and the answer rather than infer
+-- them from a row that did or did not change.
+----------------------------------------------------------------------
+function Tracker.DebugLockouts()
+    local rec = ns.Store.EnsureSelfCharacter(selfNameRealm())
+    local now = ns.Store.Now()
+    ns:Print(("lockouts — asks=%d answers=%d throttled=%d dark-refusals=%d"):format(
+        Tracker._raidInfoAsks or 0, Tracker._raidInfoAnswers or 0,
+        Tracker._raidInfoThrottled or 0, Tracker._raidLockoutsDark or 0))
+    ns:Print(("  last ask: %s%s | server answered this session: %s"):format(
+        tostring(Tracker._raidInfoLastReason or "never"),
+        Tracker._raidInfoAskedAt and (" (" .. (now - Tracker._raidInfoAskedAt) .. "s ago)") or "",
+        Tracker._raidInfoAnswered and "YES" or "NO (an empty list is being REFUSED, not written)"))
+    local inside, itype = false, "none"
+    if IsInInstance then inside, itype = IsInInstance() end
+    ns:Print(("  inside=%s type=%s | client saved-instance rows: %d"):format(
+        tostring(inside), tostring(itype),
+        (GetNumSavedInstances and GetNumSavedInstances()) or 0))
+    local any = false
+    for _, k in ipairs(ns.Store.RAID_KEYS) do
+        local at = rec and rec.raidLockouts and rec.raidLockouts[k]
+        if at then
+            any = true
+            ns:Print(("    %-5s saved, resets in %dh%02dm"):format(
+                k, math.floor((at - now) / 3600), math.floor(((at - now) % 3600) / 60)))
+        end
+    end
+    if not any then ns:Print("    (no lockouts held)") end
+end
+
 if ns.RegisterDebugCommand then
     ns:RegisterDebugCommand("auras", function() Tracker.DebugAuras() end)
     ns:RegisterDebugCommand("sanity", function() Tracker.DebugSanity() end)
+    ns:RegisterDebugCommand("lockouts", function() Tracker.DebugLockouts() end)
 end
 
 ----------------------------------------------------------------------
@@ -6578,11 +6850,460 @@ local function testCoordinateOverride(fails)
     if not ok then fails[#fails + 1] = "error in coordinate-override fixtures: " .. tostring(err) end
 end
 
+----------------------------------------------------------------------
+-- NX-1 — THE SUBSCRIPTION WITH NO PRODUCER (async lesson Class 7 + 6)
+--
+-- The whole chain, end to end, through the real functions the event frame
+-- drives: producer signal -> RequestRaidInfo -> the server refills the CLIENT
+-- table -> UPDATE_INSTANCE_INFO -> capture -> the mesh push carries the lockout.
+--
+-- Every green assertion is paired with a RED CONTROL that drives the SAME
+-- functions with the producer sets MUTATED BACK to the pre-fix world (empty —
+-- there was no producer at all), and asserts the miss. A fixture that cannot
+-- fail on the old code is not evidence, so the red half runs first and its
+-- failure to see the lockout is itself asserted.
+--
+-- The harness's own C_Timer.After is a NO-OP, which would make every deferred
+-- capture in this chain silently never happen; this fixture installs a
+-- queue-and-pump timer over a virtual clock for the duration (simulator
+-- doctrine: an unkind sim, pumped explicitly, never run-to-completion behind
+-- your back).
+----------------------------------------------------------------------
+local function testRaidInfoProducer(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+
+    local saved = {
+        auras = _G.C_UnitAuras, cont = _G.C_Container, item = _G.C_Item,
+        spell = _G.C_Spell, map = _G.C_Map, getTime = _G.GetTime,
+        resting = _G.IsResting, pvp = _G.UnitIsPVP, ffa = _G.UnitIsPVPFreeForAll,
+        inInst = _G.IsInInstance, nSaved = _G.GetNumSavedInstances,
+        sInfo = _G.GetSavedInstanceInfo, request = _G.RequestRaidInfo,
+        timer = _G.C_Timer,
+        now = ns.Store.Now, settings = ns.Store.GetSettings,
+        ensure = ns.Store.EnsureSelfCharacter, write = ns.Store.WriteSelfCharacter,
+        loggedIn = ns.state.loggedIn,
+        sub = _G.GetSubZoneText, mini = _G.GetMinimapZoneText,
+        askSet = Tracker.RAID_INFO_ASK_EVENTS,
+        bndSet = Tracker.RAID_INFO_BOUNDARY_EVENTS,
+        tick   = Tracker.TickRaidInfo,
+    }
+    local savedState = {
+        Tracker._leavingWorld, Tracker._loggingOut, Tracker._enteredWorldAt,
+        Tracker._auraCapturedAt, Tracker._cdCapturedAt,
+        Tracker._lastPushHash, Tracker._lastPushAt,
+        Tracker._raidInfoAnswered, Tracker._raidInfoAskedAt, Tracker._raidInfoAsks,
+        Tracker._raidInfoInside, Tracker._raidLockoutsDark,
+    }
+
+    local FRAME, EPOCH = 40000, 1700000000
+    local frameNow, epochNow = FRAME, EPOCH
+    _G.GetTime   = function() return frameNow end
+    ns.Store.Now = function() return epochNow end
+    ns.state.loggedIn = true
+
+    -- Queue-and-pump timer. C_Timer.After(delay, fn) is QUEUED, never inlined.
+    local queue = {}
+    _G.C_Timer = {
+        After = function(delay, fn) queue[#queue + 1] = { at = (tonumber(delay) or 0), fn = fn } end,
+        NewTicker = function() return { Cancel = function() end } end,
+    }
+    local function pump()
+        for _ = 1, 8 do
+            if #queue == 0 then break end
+            local batch, n = queue, #queue
+            queue = {}
+            for i = 1, n do
+                local ok = pcall(batch[i].fn)
+                if not ok then fails[#fails + 1] = "a queued capture errored" end
+            end
+        end
+    end
+
+    -- The world the capture pass reads. Deliberately quiet: the ONLY thing that
+    -- moves in this fixture is the lockout table.
+    _G.C_UnitAuras = { GetBuffDataByIndex = function() return nil end }
+    _G.C_Container = { GetItemCooldown = function() return 0, 0, 1 end }
+    _G.C_Item  = { GetItemCount = function() return 0 end }
+    _G.C_Spell = { GetSpellCooldown = function() return { duration = 0, startTime = 0 } end }
+    _G.C_Map   = { GetBestMapForUnit = function() return nil end,
+                   GetPlayerMapPosition = function() return nil end }
+    _G.IsResting = function() return true end
+    _G.UnitIsPVP = function() return false end
+    _G.UnitIsPVPFreeForAll = function() return false end
+    _G.GetSubZoneText     = function() return "" end
+    _G.GetMinimapZoneText = function() return "" end
+    ns.Store.GetSettings = function() return { coordinateOverrides = {} } end
+
+    -- WHERE THE CHARACTER IS. Drives both IsInInstance (the boundary gate and
+    -- the safety-tick gate) and nothing else.
+    local inside, instType = false, "none"
+    _G.IsInInstance = function() return inside, instType end
+
+    -- THE TWO TABLES. `serverList` is what the SERVER knows; `clientList` is the
+    -- table GetNumSavedInstances/GetSavedInstanceInfo actually read. Nothing but
+    -- an answered RequestRaidInfo ever copies one into the other — which is the
+    -- entire point of NX-1.
+    local serverList, clientList = {}, {}
+    _G.GetNumSavedInstances = function() return #clientList end
+    _G.GetSavedInstanceInfo = function(i)
+        local s = clientList[i]
+        if not s then return nil end
+        return s.name, nil, s.reset, nil, s.locked
+    end
+
+    -- The server side of the request. Copies its list across and fires the
+    -- UPDATE_INSTANCE_INFO the addon has always been subscribed to, through the
+    -- REAL handler (Tracker.OnRaidInfoUpdated) rather than a lookalike.
+    local serverAnswers = 0
+    _G.RequestRaidInfo = function()
+        serverAnswers = serverAnswers + 1
+        clientList = {}
+        for i = 1, #serverList do clientList[i] = serverList[i] end
+        Tracker.OnRaidInfoUpdated()
+    end
+
+    local rec, writes = {}, 0
+    ns.Store.EnsureSelfCharacter = function() return rec end
+    ns.Store.WriteSelfCharacter  = function() writes = writes + 1 end
+
+    -- The MESH PUSH. This is the payload every peer's roster is built from.
+    local pushes, lastPushed, counting = 0, nil, true
+    -- Fire signature: (nameRealm, rec, force, receipt).
+    ns:On("STATE_CHANGED", function(_, r)
+        if not counting then return end
+        pushes = pushes + 1
+        lastPushed = r
+    end)
+
+    local function mcOnPush()
+        return lastPushed and lastPushed.raidLockouts and lastPushed.raidLockouts.MC
+    end
+
+    local ok, err = pcall(function()
+        Tracker._leavingWorld, Tracker._loggingOut = false, false
+        Tracker._enteredWorldAt = frameNow - 60
+        Tracker._auraCapturedAt, Tracker._cdCapturedAt = nil, nil
+        Tracker._lastPushHash, Tracker._lastPushAt = nil, 0
+        Tracker._raidInfoAnswered = false
+        Tracker._raidInfoAskedAt  = nil
+        Tracker._raidInfoAsks     = 0
+        Tracker._raidInfoInside   = nil
+
+        ------------------------------------------------------------------
+        -- 0. LOGIN. Unsaved character; the server answers an empty list, which
+        --    is a real answer and latches "the server has spoken".
+        ------------------------------------------------------------------
+        ck(Tracker.RequestRaidInfoNow("login") == true, "login: the first request must go out")
+        ck(serverAnswers == 1, "login: the server did not answer (answers=" .. serverAnswers .. ")")
+        ck(Tracker._raidInfoAnswered == true,
+           "login: UPDATE_INSTANCE_INFO did not latch 'answered'")
+        pump()
+        ck(pushes >= 1, "login: the first capture did not push")
+        ck(mcOnPush() == nil, "login: an unsaved character must not carry an MC lockout")
+
+        ------------------------------------------------------------------
+        -- 1. THE MUTATION. The raid is entered and Lucifron dies: the SERVER
+        --    now holds a Molten Core lockout. The client table does not, and
+        --    cannot, until something asks.
+        ------------------------------------------------------------------
+        inside, instType = true, "raid"
+        serverList = { { name = "Molten Core", reset = 7 * 24 * 3600, locked = true } }
+
+        ------------------------------------------------------------------
+        -- 2. RED CONTROL — the pre-fix chain. Both producer sets mutated to
+        --    EMPTY, which is exactly what 1.1.5 shipped: UPDATE_INSTANCE_INFO
+        --    subscribed, and nothing anywhere that could make it fire.
+        ------------------------------------------------------------------
+        Tracker.RAID_INFO_ASK_EVENTS      = {}
+        Tracker.RAID_INFO_BOUNDARY_EVENTS = {}
+        -- ...and the third producer: the pre-fix SafetyRescanTick did not re-ask
+        -- either, it only re-read. Restoring that exactly is the difference
+        -- between a red control and a rigged one.
+        Tracker.TickRaidInfo = function() return false end
+        local answersBefore, pushesBefore = serverAnswers, pushes
+
+        epochNow = epochNow + 600      -- ten minutes of raiding
+        ck(Tracker.OnRaidInfoProducer("BOSS_KILL") == false,
+           "RED: BOSS_KILL asked the server on the pre-fix set")
+        ck(Tracker.OnRaidInfoProducer("ENCOUNTER_END") == false,
+           "RED: ENCOUNTER_END asked the server on the pre-fix set")
+        ck(Tracker.OnRaidInfoProducer("RAID_INSTANCE_WELCOME") == false,
+           "RED: RAID_INSTANCE_WELCOME asked the server on the pre-fix set")
+        ck(serverAnswers == answersBefore,
+           "RED: the pre-fix chain produced an UPDATE_INSTANCE_INFO from nowhere")
+
+        -- ...and the 30s safety rescan cannot heal it, because it re-reads the
+        -- SAME stale client table. Five ticks, five minutes: still nothing.
+        for _ = 1, 5 do
+            epochNow = epochNow + 30
+            Tracker.SafetyRescanTick()
+            pump()
+        end
+        ck(serverAnswers == answersBefore,
+           "RED: the safety tick asked the server despite the mutated set")
+        ck(rec.raidLockouts and rec.raidLockouts.MC == nil,
+           "RED: the record showed an MC lockout the client table never held")
+        ck(mcOnPush() == nil,
+           "RED CONTROL FAILED TO BE RED: the pre-fix chain pushed the mid-session "
+           .. "lockout, so the green half below proves nothing")
+        ck(pushes >= pushesBefore, "RED: bookkeeping (pushes never decrease)")
+
+        ------------------------------------------------------------------
+        -- 3. GREEN. Restore the real producer sets and kill the boss again.
+        ------------------------------------------------------------------
+        Tracker.RAID_INFO_ASK_EVENTS      = saved.askSet
+        Tracker.RAID_INFO_BOUNDARY_EVENTS = saved.bndSet
+        Tracker.TickRaidInfo              = saved.tick
+
+        local asksBefore = Tracker._raidInfoAsks
+        epochNow = epochNow + 60
+        ck(Tracker.OnRaidInfoProducer("BOSS_KILL") == true,
+           "GREEN: BOSS_KILL did not produce a request")
+        ck(Tracker._raidInfoAsks == asksBefore + 1, "GREEN: the request was not counted")
+        ck(serverAnswers == answersBefore + 1,
+           "GREEN: the request did not produce an UPDATE_INSTANCE_INFO")
+        ck(#clientList == 1, "GREEN: the client table was not refilled by the answer")
+        pump()
+        ck(rec.raidLockouts and rec.raidLockouts.MC ~= nil,
+           "GREEN: the capture did not record the MC lockout")
+        ck(rec.raidLockouts.MC == epochNow + 7 * 24 * 3600,
+           "GREEN: the lockout expiry is wrong (got " .. tostring(rec.raidLockouts.MC) .. ")")
+        ck(mcOnPush() ~= nil,
+           "GREEN: the mesh push did not carry the new lockout — every peer's roster "
+           .. "would still read 'not saved'")
+
+        ------------------------------------------------------------------
+        -- 4. THE RATE FLOOR. The request is cheap but not free, and BOSS_KILL
+        --    plus ENCOUNTER_END fire together on the same corpse.
+        ------------------------------------------------------------------
+        local asks2 = Tracker._raidInfoAsks
+        ck(Tracker.OnRaidInfoProducer("ENCOUNTER_END") == false,
+           "the paired ENCOUNTER_END asked again inside the rate floor")
+        ck(Tracker._raidInfoAsks == asks2, "the throttled request was counted as an ask")
+        epochNow = epochNow + Tracker.RAID_INFO_MIN_GAP
+        ck(Tracker.OnRaidInfoProducer("ENCOUNTER_END") == true,
+           "the rate floor never reopened (gap=" .. Tracker.RAID_INFO_MIN_GAP .. "s)")
+        -- and the pure predicate agrees with the behaviour
+        ck(Tracker.ShouldRequestRaidInfo(100, nil, 5) == true, "never-asked must be allowed")
+        ck(Tracker.ShouldRequestRaidInfo(104, 100, 5) == false, "inside the gap must be refused")
+        ck(Tracker.ShouldRequestRaidInfo(105, 100, 5) == true, "at the gap must be allowed")
+
+        ------------------------------------------------------------------
+        -- 5. BOUNDARY GATING. A zone change in the open world cannot change a
+        --    lockout; walking out of the raid can (and is when the lockout is
+        --    first visible to a character who was saved by someone else's kill).
+        ------------------------------------------------------------------
+        epochNow = epochNow + 60
+        Tracker._raidInfoInside = true          -- we were inside...
+        inside, instType = false, "none"        -- ...and we just stepped out
+        ck(Tracker.OnRaidInfoProducer("ZONE_CHANGED_NEW_AREA") == true,
+           "the instance EXIT boundary did not ask")
+        epochNow = epochNow + 60
+        ck(Tracker.OnRaidInfoProducer("ZONE_CHANGED_NEW_AREA") == false,
+           "an open-world zone change asked anyway (inside-ness did not move)")
+        epochNow = epochNow + 60
+        ck(Tracker.OnRaidInfoProducer("ZONE_CHANGED_NEW_AREA") == false,
+           "a second open-world zone change asked anyway")
+        inside, instType = true, "raid"          -- back through the portal
+        epochNow = epochNow + 60
+        ck(Tracker.OnRaidInfoProducer("ZONE_CHANGED_NEW_AREA") == true,
+           "the boundary back IN did not ask")
+        ck(Tracker.IsInstanceBoundary(nil, false) == true,
+           "the first observation of the session must count as a boundary")
+        ck(Tracker.IsInstanceBoundary(true, true) == false, "no boundary when nothing moved")
+        ck(Tracker.IsInstanceBoundary(false, true) == true, "out->in is a boundary")
+
+        ------------------------------------------------------------------
+        -- 6. THE SAFETY TICK'S RE-ASK. Bounded, and ONLY inside a raid — this
+        --    is the net under an encounter whose completion event Era does not
+        --    fire at all.
+        ------------------------------------------------------------------
+        inside, instType = false, "none"
+        epochNow = epochNow + 3600
+        ck(Tracker.TickRaidInfo() == false, "the tick asked while standing in the open world")
+        inside, instType = true, "party"
+        ck(Tracker.TickRaidInfo() == false, "the tick asked from a 5-man, not a raid")
+        inside, instType = true, "raid"
+        ck(Tracker.TickRaidInfo() == true, "the tick did not ask from inside a raid")
+        epochNow = epochNow + 30
+        ck(Tracker.TickRaidInfo() == false,
+           "the tick asked twice inside RAID_INFO_INSIDE_GAP (" .. Tracker.RAID_INFO_INSIDE_GAP .. "s)")
+        epochNow = epochNow + Tracker.RAID_INFO_INSIDE_GAP
+        ck(Tracker.TickRaidInfo() == true, "the inside-raid cadence never reopened")
+
+        ------------------------------------------------------------------
+        -- 7. THE DARK READ (Class 6). Asking far more often means far more
+        --    chances to read a table that has not been answered yet. An empty
+        --    list is only an ANSWER once the server has spoken.
+        ------------------------------------------------------------------
+        rec.raidLockouts = { MC = epochNow + 5000 }
+        clientList = {}
+        Tracker._raidInfoAnswered = false
+        local darkBefore = Tracker._raidLockoutsDark or 0
+        Tracker._captureRaidLockouts(rec)
+        ck(rec.raidLockouts.MC ~= nil,
+           "DARK READ: an unanswered empty list WIPED a stored lockout — the mesh "
+           .. "would broadcast 'not saved' on the strength of a read that proved nothing")
+        ck((Tracker._raidLockoutsDark or 0) == darkBefore + 1,
+           "DARK READ: the refusal was not counted")
+
+        -- Once the server HAS answered, an empty list is the real "your lockout
+        -- expired" and must be allowed to clear.
+        Tracker._raidInfoAnswered = true
+        Tracker._captureRaidLockouts(rec)
+        ck(rec.raidLockouts.MC == nil,
+           "an ANSWERED empty list must clear the lockout (a reset is real news)")
+
+        -- ...and a non-empty list is its own proof, with no latch required.
+        Tracker._raidInfoAnswered = false
+        clientList = { { name = "Blackwing Lair", reset = 3600, locked = true } }
+        Tracker._captureRaidLockouts(rec)
+        ck(rec.raidLockouts.BWL == epochNow + 3600,
+           "a populated list must be read even before the latch (it is its own proof)")
+        ck(Tracker._raidInfoAnswered == true,
+           "a populated list must set the answered latch")
+    end)
+
+    counting = false
+    _G.C_UnitAuras, _G.C_Container, _G.C_Item = saved.auras, saved.cont, saved.item
+    _G.C_Spell, _G.C_Map, _G.GetTime = saved.spell, saved.map, saved.getTime
+    _G.IsResting, _G.UnitIsPVP, _G.UnitIsPVPFreeForAll = saved.resting, saved.pvp, saved.ffa
+    _G.IsInInstance, _G.GetNumSavedInstances = saved.inInst, saved.nSaved
+    _G.GetSavedInstanceInfo, _G.RequestRaidInfo = saved.sInfo, saved.request
+    _G.GetSubZoneText, _G.GetMinimapZoneText = saved.sub, saved.mini
+    _G.C_Timer = saved.timer
+    ns.Store.Now, ns.Store.GetSettings = saved.now, saved.settings
+    ns.Store.EnsureSelfCharacter, ns.Store.WriteSelfCharacter = saved.ensure, saved.write
+    ns.state.loggedIn = saved.loggedIn
+    Tracker.RAID_INFO_ASK_EVENTS      = saved.askSet
+    Tracker.RAID_INFO_BOUNDARY_EVENTS = saved.bndSet
+    Tracker.TickRaidInfo              = saved.tick
+    Tracker._leavingWorld, Tracker._loggingOut, Tracker._enteredWorldAt = savedState[1], savedState[2], savedState[3]
+    Tracker._auraCapturedAt, Tracker._cdCapturedAt = savedState[4], savedState[5]
+    Tracker._lastPushHash, Tracker._lastPushAt = savedState[6], savedState[7]
+    Tracker._raidInfoAnswered, Tracker._raidInfoAskedAt = savedState[8], savedState[9]
+    Tracker._raidInfoAsks, Tracker._raidInfoInside = savedState[10], savedState[11]
+    Tracker._raidLockoutsDark = savedState[12]
+    if not ok then fails[#fails + 1] = "error in raid-info producer fixtures: " .. tostring(err) end
+end
+
+----------------------------------------------------------------------
+-- NX-3 / NX-6 — THE CAPTURE SET'S MISSING SETTLE SIGNALS (Class 7)
+--
+-- Both are the plain form of the class: the capture READS something whose
+-- change is announced by an event that was not in the set. Each row is asserted
+-- twice — once against the shipped set, once against the PRE-FIX set reproduced
+-- verbatim below — so the row cannot go vacuous if someone later "tidies" the
+-- declared list, and so the fixture is provably testing a real delta.
+--
+-- The behavioural halves drive the real capture halves: the soulstone answer
+-- genuinely changes when only a SPELL cooldown moves, and the location answer
+-- genuinely changes when only the SUBZONE moves.
+----------------------------------------------------------------------
+local function testCaptureEventSet(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+
+    -- The set as it shipped in 1.1.5, verbatim. This is the red control.
+    local PRE_FIX = {
+        "PLAYER_ENTERING_WORLD", "ZONE_CHANGED_NEW_AREA", "UNIT_AURA",
+        "PLAYER_UPDATE_RESTING", "PLAYER_FLAGS_CHANGED", "BAG_UPDATE_DELAYED",
+        "BAG_UPDATE_COOLDOWN", "UPDATE_INSTANCE_INFO", "PLAYER_LEVEL_UP",
+        "PLAYER_CONTROL_LOST", "PLAYER_CONTROL_GAINED", "PLAYER_XP_UPDATE",
+        "UPDATE_EXHAUSTION",
+    }
+
+    -- ---- membership, both ways ------------------------------------------
+    for _, evt in ipairs({ "SPELL_UPDATE_COOLDOWN", "ZONE_CHANGED", "ZONE_CHANGED_INDOORS" }) do
+        ck(Tracker.IsCaptureEvent(evt) == true,
+           "capture set is missing " .. evt)
+        ck(Tracker.IsCaptureEvent(evt, PRE_FIX) == false,
+           "RED CONTROL FAILED: " .. evt .. " was already in the pre-fix set, so this row "
+           .. "is asserting nothing")
+    end
+    -- Nothing was LOST in the promotion from a local literal to declared data.
+    for _, evt in ipairs(PRE_FIX) do
+        ck(Tracker.IsCaptureEvent(evt) == true,
+           "the promoted capture set dropped " .. evt)
+    end
+    ck(Tracker.IsCaptureEvent("BAG_UPDATE") == false,
+       "raw BAG_UPDATE must never be in the set (it fires before the bag API settles)")
+    ck(Tracker.IsCaptureEvent(nil) == false, "nil is not an event")
+    ck(Tracker.IsCaptureEvent("") == false, "the empty string is not an event")
+
+    -- ---- NX-3: the soulstone answer moves on a SPELL cooldown alone -------
+    local savedItem, savedSpell = _G.C_Item, _G.C_Spell
+    local savedFrame = _G.GetTime
+    local frameNow = 90000
+    _G.GetTime = function() return frameNow end
+    _G.C_Item  = { GetItemCount = function() return 0 end }   -- no stone in bags
+    local cd = { duration = 1800, startTime = frameNow - 10 } -- 30m cooldown, just cast
+    _G.C_Spell = { GetSpellCooldown = function() return cd end }
+
+    local ok, err = pcall(function()
+        local rec = { classTag = "WARLOCK" }
+        Tracker._captureSoulstone(rec)
+        ck(rec.soulstoneReady == false, "warlock on a fresh soulstone cooldown reads ready")
+
+        -- The ONLY thing that changes: the spell cooldown elapses. No bag event
+        -- can fire for this — nothing entered or left a bag — so on the pre-fix
+        -- set the peer-visible answer stayed false until the 30s ticker.
+        frameNow = frameNow + 1800
+        Tracker._captureSoulstone(rec)
+        ck(rec.soulstoneReady == true, "the expired spell cooldown did not make the stone ready")
+        ck(Tracker.IsCaptureEvent("SPELL_UPDATE_COOLDOWN", PRE_FIX) == false,
+           "RED: the pre-fix set would have been told about this")
+        ck(Tracker.IsCaptureEvent("SPELL_UPDATE_COOLDOWN") == true,
+           "GREEN: nothing in the shipped set delivers the spell-cooldown change")
+    end)
+    _G.C_Item, _G.C_Spell, _G.GetTime = savedItem, savedSpell, savedFrame
+    if not ok then fails[#fails + 1] = "error in soulstone settle fixtures: " .. tostring(err) end
+
+    -- ---- NX-6: the location answer moves on a SUBZONE alone ---------------
+    local savedSub, savedZone, savedMini = _G.GetSubZoneText, _G.GetRealZoneText, _G.GetMinimapZoneText
+    local savedMap, savedGS = _G.C_Map, ns.Store.GetSettings
+    local savedTear = Tracker._leavingWorld
+    local sub = ""
+    _G.GetSubZoneText     = function() return sub end
+    _G.GetRealZoneText    = function() return "The Barrens" end
+    _G.GetMinimapZoneText = function() return "The Barrens" end
+    _G.C_Map = { GetBestMapForUnit = function() return nil end,
+                 GetPlayerMapPosition = function() return nil end }
+    ns.Store.GetSettings = function() return { coordinateOverrides = {} } end
+    Tracker._leavingWorld, Tracker._loggingOut = false, false
+
+    local ok2, err2 = pcall(function()
+        local rec = {}
+        Tracker._captureLocation(rec)
+        ck(rec.location == "The Barrens", "zone-level location did not capture")
+
+        -- Walk into the Crossroads inn: the REAL ZONE never changes, so
+        -- ZONE_CHANGED_NEW_AREA does not fire at all. Only ZONE_CHANGED /
+        -- ZONE_CHANGED_INDOORS announce this, and neither was subscribed.
+        sub = "Crossroads"
+        Tracker._captureLocation(rec)
+        ck(rec.location == "Crossroads",
+           "the subzone move did not change the captured location (got "
+           .. tostring(rec.location) .. ")")
+        ck(Tracker.IsCaptureEvent("ZONE_CHANGED", PRE_FIX) == false
+           and Tracker.IsCaptureEvent("ZONE_CHANGED_INDOORS", PRE_FIX) == false,
+           "RED: the pre-fix set would have been told about the subzone move")
+        ck(Tracker.IsCaptureEvent("ZONE_CHANGED") == true
+           and Tracker.IsCaptureEvent("ZONE_CHANGED_INDOORS") == true,
+           "GREEN: nothing in the shipped set delivers a subzone-only move")
+    end)
+    _G.GetSubZoneText, _G.GetRealZoneText, _G.GetMinimapZoneText = savedSub, savedZone, savedMini
+    _G.C_Map, ns.Store.GetSettings = savedMap, savedGS
+    Tracker._leavingWorld = savedTear
+    if not ok2 then fails[#fails + 1] = "error in subzone settle fixtures: " .. tostring(err2) end
+end
+
 function Tracker.RunSelfTests(verbose)
     local suites = {
         { name = "state-push change filter (A10.1)", fn = testChangeFilter },
         { name = "hash-after-send rollback", fn = testHashAfterSend },
         { name = "armed safety rescan (30s)", fn = testSafetyRescan },
+        { name = "raid-info producer + dark read (NX-1, Class 7/6)", fn = testRaidInfoProducer },
+        { name = "capture set settle signals (NX-3/NX-6, Class 7)", fn = testCaptureEventSet },
         { name = "boon parsing", fn = testBoonParsing },
         { name = "boon block (owner 7-line fixture)", fn = testBoonBlock },
         { name = "boon scope (unboonable slots + duration leak)", fn = testBoonScope },

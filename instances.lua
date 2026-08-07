@@ -344,11 +344,43 @@ function Instances.AverageGroupLevel(members)
     return math.floor((sum / n) * 10 + 0.5) / 10
 end
 
+-- PURE. Is this member reading a FACT or merely a reading? (NX-2, async lesson
+-- Class 7 with a Class 6 flavour.) No character in this game is level 0 — a zero
+-- is the client saying "that unit is not loaded yet", which on the far side of a
+-- loading screen is the normal answer for `party2` for the first second or two.
+-- Treating it as data is how "Bramble:0" with no class colour gets written into
+-- a run's roster and stays there for the life of the entry.
+function Instances.MemberProven(m)
+    return (tonumber(m and m.level) or 0) > 0
+end
+
+-- PURE. Has a sample settled enough to stop asking? Every member proven, and at
+-- least as many of them as the client says are in the group (a member whose unit
+-- has not loaded is missing from the sample entirely, not merely cold).
+function Instances.GroupSampleSettled(members, expected)
+    members = members or {}
+    expected = tonumber(expected) or 1
+    if expected < 1 then expected = 1 end
+    if expected > MAX_GROUP then expected = MAX_GROUP end
+    if #members < expected then return false end
+    for i = 1, #members do
+        if not Instances.MemberProven(members[i]) then return false end
+    end
+    return true
+end
+
 -- UNION a fresh roster reading into the stored snapshot (spec §3.4: the roster is
 -- re-read on GROUP_ROSTER_UPDATE, and "fields are only overwritten when the new
 -- value is valid" — a member who has walked out of range must not blank the
 -- level we already recorded). First-seen order is preserved; new names append.
 -- Returns (encodedString, averageLevel, memberCount). Pure.
+--
+-- NX-2: a member carrying `unproven = true` is a READING, not a fact, and is
+-- refused ADMISSION — it may still upgrade a member already in the list (that
+-- path is upgrade-only and cannot damage anything), but it may not create one.
+-- The flag is set by the live sampler alone: rows decoded from storage or from
+-- another visit never carry it, so folding historical entries (`:458`,
+-- `ui_instancespanel.lua:376`) keeps admitting every name it always did.
 function Instances.UnionGroup(prevStr, members)
     local list = Instances.DecodeGroup(prevStr)
     local idx = {}
@@ -370,7 +402,7 @@ function Instances.UnionGroup(prevStr, members)
                     if type(m.classTag) == "string" and m.classTag ~= "" then
                         have.classTag = m.classTag
                     end
-                elseif #list < MAX_GROUP then
+                elseif #list < MAX_GROUP and not m.unproven then
                     local rec = { name = nm, level = math.floor(tonumber(m.level) or 0),
                                   isSelf = m.isSelf and true or false,
                                   classTag = m.classTag }
@@ -788,9 +820,72 @@ Instances._trade      = nil     -- the trade window currently open, if any
 local GROUP_SNAP_THROTTLE = 2
 Instances.GROUP_SNAP_THROTTLE = GROUP_SNAP_THROTTLE
 
+-- NX-2: the post-entry re-sample ladder, in seconds after `_recordEntry`.
+-- Bounded and then it stops — the same shape social.lua's login ladder uses for
+-- an answer that may or may not arrive. Party unit data warms within a second or
+-- two of a loading screen; UNIT_LEVEL and GROUP_ROSTER_UPDATE cover the rest.
+Instances.GROUP_LADDER_AT = { 1, 3, 8 }
+
+----------------------------------------------------------------------
+-- THE WALLET  (NX-5, async lesson Class 7 / Class 4)
+--
+-- `GetMoney()` is sampled at entry and again at exit, and BOTH of those run on
+-- the far side of a loading screen, where the wallet is one of the things that
+-- reads cold. Nothing was subscribed to `PLAYER_MONEY`, so nothing ever
+-- corrected a cold sample — and because the exit number is a DELTA, a cold zero
+-- does not merely read low, it reads as a catastrophe: entry 500g, exit cold 0,
+-- and the run is recorded as having cost the character 500 gold.
+--
+-- Two halves, per the lesson catalog's evidence-precedence shape:
+--   1. PLAYER_MONEY (catalog 11509: Event.CurrencySystem.PlayerMoney) keeps a
+--      LAST WARM figure. The event only fires in-world after the client has
+--      rewritten the value, so what it hands us is warm by construction —
+--      including a warm ZERO, which is what stops "spent everything" from being
+--      mistaken for a cold read forever after.
+--   2. A zero read while the last warm figure was positive is UNPROVEN. It
+--      still yields a usable number (the warm one) so continuity is kept, but it
+--      is flagged, and `_stampExit` refuses to write a delta built from an
+--      unproven end. `e.goldLoot` — the loot accumulator — is the honest number
+--      and the one any display should prefer (see the comment at the exit
+--      stamp); the wallet delta is a backup, and a backup that lies is worse
+--      than a backup that is absent.
+----------------------------------------------------------------------
+
+-- PURE. Returns value, proven.
+--
+-- The whole table, because a zero is the ambiguous case and every branch of it
+-- matters:
+--   live > 0                  -> proven. Only a populated wallet answers this.
+--   live == 0, no warm figure -> UNPROVEN. Nothing has ever proved this wallet;
+--                                absence of proof is not proof of an empty purse.
+--   live == 0, warm figure 0  -> proven. PLAYER_MONEY told us zero, and a warm
+--                                zero is the answer "you spent it all".
+--   live == 0, warm figure >0 -> UNPROVEN, and answer with the WARM figure. This
+--                                is the loading-screen read, and the reason the
+--                                delta used to come out as minus-everything.
+function Instances.ProvenGold(live, lastWarm)
+    live = tonumber(live)
+    if live == nil then return nil, false end        -- API absent / headless
+    if live > 0 then return live, true end
+    lastWarm = tonumber(lastWarm)
+    if lastWarm == nil then return 0, false end
+    if lastWarm > 0 then return lastWarm, false end
+    return 0, true
+end
+
+-- Record a warm reading. Called from the PLAYER_MONEY handler (warm by
+-- construction) and from every proven sample.
+function Instances._noteWallet(v)
+    v = tonumber(v)
+    if v == nil then return end
+    Instances._walletWarm = v
+end
+
 local function sampleGold()
-    if GetMoney then return GetMoney() or 0 end
-    return nil
+    if not GetMoney then return nil, false end
+    local v, proven = Instances.ProvenGold(GetMoney(), Instances._walletWarm)
+    if proven then Instances._noteWallet(v) end
+    return v, proven
 end
 
 local function sampleLevel()
@@ -829,8 +924,13 @@ local function readGroupMembers()
             local nm = UnitName(unit)
             local isMe = inRaid and UnitIsUnit and UnitIsUnit(unit, "player")
             if type(nm) == "string" and nm ~= "" and not isMe then
-                members[#members + 1] = { name = nm, level = (UnitLevel and tonumber(UnitLevel(unit))) or 0,
-                                          classTag = classOf(unit) }
+                local m = { name = nm, level = (UnitLevel and tonumber(UnitLevel(unit))) or 0,
+                            classTag = classOf(unit) }
+                -- NX-2: mark, do not drop. UnionGroup refuses ADMISSION to an
+                -- unproven member but still lets it upgrade one already stored,
+                -- so a member who goes cold mid-run never blanks their own row.
+                m.unproven = not Instances.MemberProven(m)
+                members[#members + 1] = m
             end
         end
     end
@@ -849,9 +949,32 @@ function Instances._snapshotGroup(force)
     Instances._lastGroupSnap = nowE
     local members = readGroupMembers()
     if not members then return end
+    -- NX-2: has the roster stopped being a reading and become a fact? The ladder
+    -- below stops the moment it has, so a warm group costs one extra sample.
+    local expected = (GetNumGroupMembers and tonumber(GetNumGroupMembers())) or 1
+    Instances._groupSettled = Instances.GroupSampleSettled(members, expected)
     local gstr, gavg = Instances.UnionGroup(e.group, members)
     if gstr then e.group, e.groupAvg = gstr, gavg end
     return gstr
+end
+
+-- NX-2: the bounded post-entry re-sample ladder. A STATIC group for a whole run
+-- never fires another GROUP_ROSTER_UPDATE, so without this the cold entry
+-- reading was the only reading the run ever got. Generation-stamped so a run
+-- that closes (or a boundary straight into another instance) leaves no rung of
+-- the previous ladder able to write into it.
+function Instances._armGroupLadder()
+    Instances._groupSettled  = false
+    Instances._groupLadderGen = (Instances._groupLadderGen or 0) + 1
+    local gen = Instances._groupLadderGen
+    if not (_G.C_Timer and C_Timer.After) then return end
+    for _, at in ipairs(Instances.GROUP_LADDER_AT) do
+        C_Timer.After(at, function()
+            if Instances._groupLadderGen ~= gen then return end  -- a later run owns us now
+            if Instances._groupSettled then return end           -- proven; stop asking
+            ns:SafeCall(Instances._snapshotGroup, true)
+        end)
+    end
 end
 
 -- Read the current instance identity from the live client. Returns
@@ -878,13 +1001,18 @@ function Instances._recordEntry()
     local entry = Instances.RecordInto(entries, name, instanceID, t,
         { enteredLevel = sampleLevel() })
     -- Open a run so exit can stamp duration + the wallet delta.
+    local entryGold, entryGoldProven = sampleGold()
     Instances._openKey     = { aid = aid, nameRealm = nameRealm }
-    Instances._openSample  = { gold = sampleGold(), entry = entry, entries = entries }
+    Instances._openSample  = { gold = entryGold, goldProven = entryGoldProven,
+                               entry = entry, entries = entries }
     Instances._entryAt     = t
     Instances._serialArmed = true   -- one-shot serial watcher (spec §2.1)
-    -- Group snapshot at entry; GROUP_ROSTER_UPDATE keeps it current while inside.
+    -- Group snapshot at entry; GROUP_ROSTER_UPDATE keeps it current while inside
+    -- — except that a static group never fires one, which is why the ladder
+    -- exists (NX-2). The entry sample itself is the coldest reading of the run.
     Instances._lastGroupSnap = nil
     Instances._snapshotGroup(true)
+    Instances._armGroupLadder()
     -- The entry is COUNTED immediately; the serial watcher may retroactively
     -- un-count it (spec §2.7).
     Instances._maybeWarn(aid, t)
@@ -898,12 +1026,19 @@ function Instances._stampExit(sample, nowE)
     if not e then return end
     e.exitT = nowE
     e.dur = math.max(0, nowE - (e.t or nowE))
-    local goldNow = sampleGold()
-    if sample.gold ~= nil and goldNow ~= nil then
+    local goldNow, goldProven = sampleGold()
+    if sample.gold ~= nil and goldNow ~= nil and goldProven and sample.goldProven ~= false then
         -- WALLET delta: includes repairs, vendor sales, reagents, mail. Kept as a
         -- backup; e.goldLoot (loot-only, accumulated live) is the honest number
         -- and is what any display should prefer (spec §3.4 / §8.2).
         e.gold = goldNow - sample.gold
+    else
+        -- NX-5: one end of the subtraction is an unproven (cold) wallet read, so
+        -- the difference is not a number about this run. Leave `e.gold` exactly
+        -- as it is — nil on a first stamp, or whatever a PROVEN earlier stamp
+        -- wrote — and let goldLoot carry the answer. A later stamp with two warm
+        -- ends still wins, which is how a teardown-then-real-exit sequence heals.
+        Instances._goldRefusals = (Instances._goldRefusals or 0) + 1
     end
     -- XP is the CHAT ACCUMULATOR, never an entry/exit snapshot delta — that delta
     -- goes negative across a ding. Clamped for safety.
@@ -916,6 +1051,9 @@ function Instances._closeRun()
     Instances._openKey, Instances._openSample = nil, nil
     Instances._serialArmed, Instances._entryAt = false, nil
     Instances._lastGroupSnap, Instances._trade = nil, nil
+    -- NX-2: retire any ladder rung still in flight for the run being closed.
+    Instances._groupLadderGen = (Instances._groupLadderGen or 0) + 1
+    Instances._groupSettled = false
     if not (sample and sample.entry) then return end
     Instances._stampExit(sample, now())
     if ns.Fire then ns:Fire("INSTANCES_CHANGED") end
@@ -1282,6 +1420,18 @@ Instances._Handlers = {
     CHAT_MSG_SYSTEM          = function(text) Instances._onSystemMessage(text) end,
     -- Per-entry detail (catalog: Event.PartyInfo.GroupRosterUpdate, Event.TradeInfo.*)
     GROUP_ROSTER_UPDATE      = function() Instances._snapshotGroup() end,
+    -- NX-2: a party member's unit finishing its load (or dinging) is the settle
+    -- signal for the roster read, and it is the ONLY one a static group produces.
+    -- Throttled by _snapshotGroup itself, and inert while no run is open.
+    -- Catalog 11509: Event.Unit.UnitLevel(unitTarget).
+    UNIT_LEVEL               = function() Instances._snapshotGroup() end,
+    -- NX-5: the wallet's settle signal. Warm by construction — the client has
+    -- already rewritten the value by the time this fires — so it is the one
+    -- reading allowed to teach `_walletWarm` a ZERO.
+    -- Catalog 11509: Event.CurrencySystem.PlayerMoney.
+    PLAYER_MONEY             = function()
+        if GetMoney then Instances._noteWallet(GetMoney()) end
+    end,
     TRADE_SHOW               = function() Instances._onTradeShow() end,
     TRADE_MONEY_CHANGED      = function() Instances._onTradeMoney() end,
     PLAYER_TRADE_MONEY       = function() Instances._onTradeMoney() end,
@@ -1388,6 +1538,12 @@ local function newSimClient()
         Instances._inside, Instances._curKey, Instances._openKey,
         Instances._openSample, Instances._serialArmed, Instances._entryAt,
         Instances._serverCapAt, Instances._lastGroupSnap, Instances._trade,
+        -- NX-2 / NX-5 session state. `_walletWarm` in particular is module-wide
+        -- and would otherwise leak a warm figure from one sim into the next,
+        -- which is exactly the kind of cross-test contamination that makes a
+        -- cold-read fixture pass for the wrong reason.
+        Instances._walletWarm, Instances._groupLadderGen, Instances._groupSettled,
+        Instances._goldRefusals,
     }
 
     -- Group roster the sim reports: { unitToken -> {name, level} } plus the player.
@@ -1443,6 +1599,8 @@ local function newSimClient()
     Instances._serialArmed, Instances._entryAt = false, nil
     Instances._serverCapAt = nil
     Instances._lastGroupSnap, Instances._trade = nil, nil
+    Instances._walletWarm, Instances._groupSettled = nil, false
+    Instances._goldRefusals = 0
 
     -- Fire an event exactly as core.lua's event frame would.
     function sim.fire(event, ...)
@@ -1526,6 +1684,8 @@ local function newSimClient()
         Instances._serialArmed, Instances._entryAt = savedState[5], savedState[6]
         Instances._serverCapAt = savedState[7]
         Instances._lastGroupSnap, Instances._trade = savedState[8], savedState[9]
+        Instances._walletWarm, Instances._groupLadderGen = savedState[10], savedState[11]
+        Instances._groupSettled, Instances._goldRefusals = savedState[12], savedState[13]
     end
     return sim
 end
@@ -2307,6 +2467,249 @@ local function testHashCompat(fails)
         "…but a genuine merged-flag divergence still trips a sync")
 end
 
+----------------------------------------------------------------------
+-- NX-2 — A COLD ROSTER READING IS NOT A ROSTER (async lesson Class 7 + 6)
+--
+-- The entry snapshot is forced from PLAYER_ENTERING_WORLD, i.e. on the far side
+-- of a loading screen, where `UnitLevel("party2")` routinely answers 0 and
+-- `UnitClass` answers nil because the unit has not finished loading. That
+-- reading was persisted as fact. `UnionGroup` upgrades on LATER samples, so a
+-- group that reshuffles heals itself — but a STATIC group for a whole run never
+-- fires another GROUP_ROSTER_UPDATE, so for the commonest case in the game (five
+-- people who zone in together and stay) the coldest reading of the run was the
+-- only reading the run ever got, and "Bramble:0" with no class colour was
+-- written into the entry for good.
+--
+-- Red control: the pre-fix admission rule, restated as `unproven = nil`, on the
+-- SAME sample — and the fixture asserts that the pre-fix rule really does admit
+-- the phantom, so the green half cannot be vacuous.
+----------------------------------------------------------------------
+local function testColdRoster(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+
+    -- ---- 1) the admission rule, pure ------------------------------------
+    ck(Instances.MemberProven({ name = "Bramble", level = 57 }) == true,
+       "a levelled member is proven")
+    ck(Instances.MemberProven({ name = "Bramble", level = 0 }) == false,
+       "level 0 is the client saying 'not loaded', not a level")
+    ck(Instances.MemberProven({ name = "Bramble" }) == false, "a missing level is not proven")
+    ck(Instances.MemberProven(nil) == false, "nil is not proven")
+
+    local COLD = { name = "Bramble", level = 0, classTag = nil, unproven = true }
+    local WARM = { name = "Bramble", level = 57, classTag = "DRUID" }
+
+    -- GREEN: refused admission.
+    local g1 = Instances.DecodeGroup(Instances.UnionGroup(nil, {
+        { name = "Tester", level = 60, isSelf = true, classTag = "ROGUE" }, COLD }))
+    ck(#g1 == 1, "an unproven member was admitted anyway (got " .. #g1 .. " member(s))")
+    ck(g1[1].name == "Tester", "the proven self member must still be admitted")
+
+    -- RED CONTROL: the same sample under the pre-fix rule (no `unproven` flag)
+    -- admits the phantom. If this ever stops being true, the green row above is
+    -- asserting nothing.
+    local preFix = { name = "Bramble", level = 0, classTag = nil }
+    local r1 = Instances.DecodeGroup(Instances.UnionGroup(nil, {
+        { name = "Tester", level = 60, isSelf = true }, preFix }))
+    ck(#r1 == 2 and r1[2].level == 0,
+       "RED CONTROL FAILED: the pre-fix rule no longer admits a level-0 member, "
+       .. "so the refusal above proves nothing")
+
+    -- ---- 2) refusal is ADMISSION-only, never destructive -----------------
+    -- A member already stored who goes cold mid-run (walked out of range) must
+    -- keep the level we already know — the upgrade-only path is untouched.
+    local stored = Instances.UnionGroup(nil, { { name = "Tester", level = 60, isSelf = true }, WARM })
+    local g2 = Instances.DecodeGroup(Instances.UnionGroup(stored, { COLD }))
+    ck(#g2 == 2, "the stored member was dropped by a cold sample")
+    local bramble
+    for _, m in ipairs(g2) do if m.name == "Bramble" then bramble = m end end
+    ck(bramble and bramble.level == 57, "a cold sample blanked a level we already knew")
+    ck(bramble and bramble.classTag == "DRUID", "a cold sample blanked a class we already knew")
+
+    -- ---- 3) stored/decoded rows are NOT affected -------------------------
+    -- The historical fold paths (`:458`, ui_instancespanel) union DECODED rows,
+    -- which never carry the flag. Pre-fix data containing "Bramble:0" must keep
+    -- folding exactly as it always did, or the fix would silently eat history.
+    local legacy = Instances.DecodeGroup("*Tester:60|Bramble:0")
+    local g3 = Instances.DecodeGroup(Instances.UnionGroup(nil, legacy))
+    ck(#g3 == 2, "folding a historical entry lost a member (got " .. #g3 .. ")")
+
+    -- ---- 4) the settle predicate ----------------------------------------
+    ck(Instances.GroupSampleSettled({ { level = 60 }, { level = 57 } }, 2) == true,
+       "two proven members with two expected is settled")
+    ck(Instances.GroupSampleSettled({ { level = 60 }, { level = 0 } }, 2) == false,
+       "a cold member means not settled")
+    ck(Instances.GroupSampleSettled({ { level = 60 } }, 2) == false,
+       "a member whose unit has not loaded at all is missing, not merely cold")
+    ck(Instances.GroupSampleSettled({ { level = 60 } }, 0) == true,
+       "solo (expected clamps to 1) is settled")
+
+    -- ---- 5) THE LIVE PATH, through the real handlers ---------------------
+    local sim = newSimClient()
+    -- The ladder needs a real deferral. The sim nils C_Timer on purpose (so
+    -- prints are immediate); give it a queue-and-pump one for this fixture only.
+    local queue = {}
+    _G.C_Timer = { After = function(d, fn) queue[#queue + 1] = { at = tonumber(d) or 0, fn = fn } end }
+    local function pump(untilT)
+        local keep = {}
+        for i = 1, #queue do
+            local q = queue[i]
+            if q.at <= untilT then pcall(q.fn) else keep[#keep + 1] = q end
+        end
+        queue = keep
+    end
+
+    local ok, err = pcall(function()
+        -- A STATIC five-man that zones in together. party2 is still loading.
+        sim.playerLevel = 60
+        sim.party = { { name = "Bramble", level = 0 }, { name = "Dorn", level = 58 } }
+        sim.inRaid = false
+        sim.money = 5000
+        Instances._noteWallet(5000)          -- a warm wallet, so gold is not the subject here
+        sim.enter("Molten Core", 409, "raid")
+
+        local e = sim.entries()[1]
+        ck(e ~= nil, "the entry was not recorded")
+        local atEntry = Instances.DecodeGroup(e.group)
+        ck(#atEntry == 2, "the cold member was persisted at entry (got " .. #atEntry .. ")")
+        for _, m in ipairs(atEntry) do
+            ck(m.name ~= "Bramble", "the cold member 'Bramble' was written into the entry")
+        end
+        ck(Instances._groupSettled == false, "a cold sample must not report itself settled")
+        ck(#queue == #Instances.GROUP_LADDER_AT,
+           "the post-entry ladder did not arm (" .. #queue .. " rung(s))")
+
+        -- NOTHING ELSE HAPPENS. No roster change, no event — the static-group
+        -- case. Only the ladder is left, and the unit warms up one second in.
+        sim.party[1].level = 57
+        Instances._lastGroupSnap = nil       -- the ladder rung forces past the throttle
+        pump(1)
+        local after = Instances.DecodeGroup(e.group)
+        ck(#after == 3, "the ladder did not admit the member once warm (got " .. #after .. ")")
+        local found
+        for _, m in ipairs(after) do if m.name == "Bramble" then found = m end end
+        ck(found and found.level == 57,
+           "the member landed at the wrong level (" .. tostring(found and found.level) .. ")")
+        ck(Instances._groupSettled == true, "a fully proven sample must report settled")
+        ck(e.groupAvg == 58.3,
+           "the average is over the settled roster (got " .. tostring(e.groupAvg) .. ")")
+
+        -- The remaining rungs see `_groupSettled` and stop asking.
+        local snapsBefore = e.group
+        pump(99)
+        ck(e.group == snapsBefore, "a settled ladder kept re-sampling")
+
+        -- UNIT_LEVEL is the other producer, and the only one a static group
+        -- fires at all. Drive it through the REAL handler table.
+        sim.party[#sim.party + 1] = { name = "Kess", level = 0 }
+        Instances._lastGroupSnap = nil
+        sim.fire("UNIT_LEVEL", "party3")
+        ck(#Instances.DecodeGroup(e.group) == 3, "a still-cold UNIT_LEVEL admitted a phantom")
+        sim.party[3].level = 59
+        Instances._lastGroupSnap = nil
+        sim.fire("UNIT_LEVEL", "party3")
+        ck(#Instances.DecodeGroup(e.group) == 4,
+           "UNIT_LEVEL did not admit the member once warm")
+        ck(Instances._Handlers.UNIT_LEVEL ~= nil,
+           "UNIT_LEVEL is not in the handler table (the producer is unwired)")
+
+        -- Closing the run retires any rung still in flight, so a stale timer can
+        -- never write into the next entry.
+        local genBefore = Instances._groupLadderGen
+        sim.leave()
+        ck(Instances._groupLadderGen ~= genBefore, "closing a run did not retire its ladder")
+    end)
+    _G.C_Timer = nil
+    sim.restore()
+    if not ok then fails[#fails + 1] = "cold-roster sim errored: " .. tostring(err) end
+end
+
+----------------------------------------------------------------------
+-- NX-5 — THE COLD WALLET (async lesson Class 7 / Class 4)
+--
+-- Both wallet samples run on the far side of a loading screen. A cold zero at
+-- exit does not merely read low: the stored number is a DELTA, so the run gets
+-- recorded as having cost the character everything they walked in with.
+----------------------------------------------------------------------
+local function testColdWallet(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+
+    -- ---- 1) the evidence table, pure -------------------------------------
+    local v, p
+    v, p = Instances.ProvenGold(5000, nil)
+    ck(v == 5000 and p == true, "a positive read is proven")
+    v, p = Instances.ProvenGold(0, nil)
+    ck(v == 0 and p == false, "a zero with nothing ever warm is UNPROVEN")
+    v, p = Instances.ProvenGold(0, 0)
+    ck(v == 0 and p == true, "a zero confirmed by a warm zero is proven (you spent it all)")
+    v, p = Instances.ProvenGold(0, 5000)
+    ck(v == 5000 and p == false,
+       "a zero against a warm positive must answer with the WARM figure, unproven")
+    v, p = Instances.ProvenGold(nil, 5000)
+    ck(v == nil and p == false, "an absent API is not a wallet of zero")
+
+    -- ---- 2) the live path -------------------------------------------------
+    local sim = newSimClient()
+    local ok, err = pcall(function()
+        -- Walk in with 500g. The entry read is warm.
+        sim.money = 5000000
+        sim.fire("PLAYER_MONEY")                    -- the settle signal
+        ck(Instances._walletWarm == 5000000, "PLAYER_MONEY did not record a warm figure")
+        ck(Instances._Handlers.PLAYER_MONEY ~= nil,
+           "PLAYER_MONEY is not in the handler table (the producer is unwired)")
+
+        sim.enter("Molten Core", 409, "raid")
+        ck(Instances._openSample.goldProven == true, "the warm entry sample read as unproven")
+
+        -- Loot 100g inside; the client tells us about it.
+        sim.clock = sim.clock + 3600
+        sim.money = 6000000
+        sim.fire("PLAYER_MONEY")
+
+        -- THE COLD EXIT. The loading screen has not finished; GetMoney answers 0.
+        sim.money = 0
+        local refusalsBefore = Instances._goldRefusals or 0
+        sim.leave()
+        local e = sim.entries()[1]
+        ck(e ~= nil, "no entry recorded")
+        -- The refusal leaves RecordInto's neutral `gold = 0` in place — "no
+        -- wallet delta recorded for this run", which is what an un-stamped run
+        -- already reads as, and which the display treats as nothing to show.
+        ck(e.gold == 0,
+           "the cold exit wrote a wallet delta of " .. tostring(e.gold)
+           .. " instead of refusing")
+        ck((Instances._goldRefusals or 0) == refusalsBefore + 1, "the refusal was not counted")
+
+        -- RED CONTROL. The pre-fix code ran exactly this subtraction on exactly
+        -- these two samples. Asserting the number it produced is what keeps the
+        -- row above from being a tautology about a field that starts at 0.
+        local preFixDelta = (0 - 5000000)
+        ck(preFixDelta == -5000000,
+           "RED CONTROL: the pre-fix arithmetic on these samples")
+        ck(e.gold ~= preFixDelta,
+           "the entry carries the pre-fix -500g figure — the run reads as having "
+           .. "cost the character everything they walked in with")
+
+        -- The wallet warms up a moment later, and a second stamp with two warm
+        -- ends wins — this is the teardown-then-real-exit heal.
+        sim.money = 6000000
+        sim.fire("PLAYER_MONEY")
+        Instances._stampExit({ gold = 5000000, goldProven = true, entry = e }, sim.clock)
+        ck(e.gold == 1000000,
+           "the warm re-stamp did not land (got " .. tostring(e.gold) .. ")")
+
+        -- A genuinely broke character is a real answer, not a refusal.
+        sim.money = 0
+        sim.fire("PLAYER_MONEY")
+        ck(Instances._walletWarm == 0, "a warm ZERO must be learnable, or spending everything "
+           .. "would read as a cold wallet forever")
+        local e2 = { t = sim.clock }
+        Instances._stampExit({ gold = 0, goldProven = true, entry = e2 }, sim.clock + 10)
+        ck(e2.gold == 0, "a warm zero at both ends is a real delta of zero")
+    end)
+    sim.restore()
+    if not ok then fails[#fails + 1] = "cold-wallet sim errored: " .. tostring(err) end
+end
+
 function Instances.RunSelfTests(verbose)
     local suites = {
         { name = "transition classifier",         fn = testTransition },
@@ -2322,6 +2725,8 @@ function Instances.RunSelfTests(verbose)
         { name = "ring capping",                  fn = testRingCap },
         { name = "cross-account + orphan bucket", fn = testCrossAccount },
         { name = "per-entry detail primitives",   fn = testDetailPrimitives },
+        { name = "cold roster admission + ladder (NX-2, Class 7/6)", fn = testColdRoster },
+        { name = "cold wallet refusal (NX-5, Class 7/4)",            fn = testColdWallet },
         { name = "live detail capture",           fn = testLiveDetailCapture },
         { name = "double corpse run",             fn = testDoubleCorpseRun },
         { name = "merge folds detail fields",     fn = testMergeFoldsDetail },
