@@ -2733,6 +2733,44 @@ function Store.SanitizeInboundRecord(record)
     return cleared
 end
 
+----------------------------------------------------------------------
+-- OWNER-RELAY ADMISSION (SN §9.7 rule 2, schema-v3 wave 1 / D1)
+--
+-- THE RULE: "records that came from the account that OWNS them ('owner data')
+-- bypass the epoch guard entirely and are always applied." Three field incidents
+-- are on record; the Poonyx boon wipe was contained only by a manual hover-reseed
+-- precisely because this rule was unimplemented. The failure shape is always the
+-- same: we hold a DAMAGED record for a remote character at a HIGH epoch (a wipe,
+-- a half-captured login snapshot, a truncated relay), the owning account then
+-- publishes a good record whose epoch is LOWER, and `na < ea` throws the good
+-- data away. Newest-wins is the right referee between two third-party observers
+-- and the wrong one when the owner itself is talking.
+--
+-- WHY IT CANNOT JUST TRUST THE FLAG. The mesh envelope's owner-origin claim is
+-- one boolean written by whoever sent the frame, so on its own it is a bypass
+-- anyone can ask for. It is paired with an aid match: the claim only counts when
+-- the SENDER's account id is the same account the record is being filed under.
+-- Mesh.CanAdmitPeer already binds sender -> aid (a peer's id comes from its own
+-- identified heartbeat/discovery frames and our own id can never be admitted), so
+-- "the sender is the owner" is a fact the transport established, not a claim the
+-- frame makes. A peer relaying somebody ELSE's segment addresses it to that third
+-- party's bucket, so its aid cannot match and it falls to the normal epoch rules.
+--
+-- RULE 1 STILL BEATS RULE 2. Self-immunity is untouched and sits ABOVE this
+-- check: Store.IsSelfAccount and Store.RejectInboundOwnCharacter both return
+-- before the epoch block is reached, so an owner-flagged frame about one of OUR
+-- OWN characters is still dropped. Nothing on the wire can talk about us.
+--
+-- PURE PREDICATE so the spoof matrix can be asserted without a mesh.
+Store._ownerRelay = { bypassed = 0, claimed = 0, mismatched = 0 }
+
+function Store.OwnerOriginAdmitted(aid, senderAID, claim)
+    if claim ~= true then return false end
+    if senderAID == nil or senderAID == "" then return false end
+    if aid == nil or aid == "" then return false end
+    return tostring(senderAID) == tostring(aid)
+end
+
 -- Inbound (relayed) write helper. Enforces self-immunity and the
 -- owner/epoch tiebreaker. `senderAID` (optional) is the account ID of the
 -- mesh peer that relayed this record; when two inbound writes carry an EQUAL
@@ -2743,7 +2781,12 @@ end
 --
 -- Wave N2a: added the optional 4th `senderAID` param and the lowest-account-ID
 -- tie resolution. Callers passing 3 args keep the N1 behaviour (ties rejected).
-function Store.WriteInboundCharacter(aid, nameRealm, record, senderAID)
+--
+-- Schema-v3 wave 1: added the optional 5th `ownerClaim` param — the relay
+-- envelope's owner-origin flag, VERIFIED here against senderAID (see the
+-- OWNER-RELAY ADMISSION block above). Callers passing 4 args or fewer keep
+-- today's behaviour byte for byte: a nil claim is never `true`.
+function Store.WriteInboundCharacter(aid, nameRealm, record, senderAID, ownerClaim)
     -- Guard: a nil/empty nameRealm would index bucket.characters[nil] below and
     -- error, DROPPING this record AND error-storming the rest of the receive
     -- batch — which is how a peer's characters silently stopped showing online.
@@ -2783,7 +2826,27 @@ function Store.WriteInboundCharacter(aid, nameRealm, record, senderAID)
     local bucket = Store.GetAccount(aid, true)
     if not bucket then return false end
     local existing = bucket.characters[nameRealm]
-    if existing then
+    -- §9.7 rule 2: an OWNER-SOURCED frame skips the epoch guard entirely. The
+    -- claim is only honoured when the sender IS the account this record is being
+    -- filed under; a claim that fails the match is counted (a liar, or an honest
+    -- relayer that mislabelled a third party's data) and falls through to the
+    -- normal rules below.
+    local ownerWins = false
+    if ownerClaim == true then
+        Store._ownerRelay.claimed = Store._ownerRelay.claimed + 1
+        ownerWins = Store.OwnerOriginAdmitted(aid, senderAID, ownerClaim)
+        if not ownerWins then
+            Store._ownerRelay.mismatched = Store._ownerRelay.mismatched + 1
+        end
+    end
+    if existing and ownerWins then
+        -- Only count a bypass that actually CHANGED the verdict — an owner frame
+        -- that would have won on epoch anyway is not evidence of anything.
+        if (record.ownerEpoch or 0) <= (existing.ownerEpoch or 0) then
+            Store._ownerRelay.bypassed = Store._ownerRelay.bypassed + 1
+        end
+    end
+    if existing and not ownerWins then
         -- Owner data wins; tie broken by lowest account id.
         local ea = existing.ownerEpoch or 0
         local na = record.ownerEpoch or 0
@@ -7196,6 +7259,187 @@ local function testOwnerAutomationFixture(fails)
        "a second login changes nothing in his blocks")
 end
 
+----------------------------------------------------------------------
+-- OWNER-RELAY ADMISSION — SN §9.7 rule 2 (schema-v3 wave 1 / D1)
+--
+-- THE RULE TABLE, one assertion per row, driven through the REAL
+-- Store.WriteInboundCharacter with real fixture buckets (never the predicate in
+-- isolation — a rule that is only true of a helper is not a rule):
+--
+--   owner-flagged + sender aid MATCHES the record's bucket -> epoch bypassed
+--   owner-flagged + sender aid MISMATCH (a liar)           -> normal epoch rules
+--   UNFLAGGED                                              -> today's behaviour
+--   owner-flagged about one of OUR OWN characters          -> still rejected
+--                                                             (rule 1 > rule 2)
+--
+-- Plus the acceptance fixture the rule exists for: a WIPED record stored at a
+-- HIGH epoch, and the owning account's good record arriving at a LOWER one.
+----------------------------------------------------------------------
+local function testOwnerRelayAdmission(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local T = 1700000000
+
+    local savedAccounts = Store.data.accounts
+    local savedGetAID   = ns.GetAccountID
+    local savedAuth     = Store._ownAuthority
+    local savedRelay    = Store._ownerRelay
+    local savedLog      = Store._ghostLog
+    Store._ghostLog     = function() end
+
+    local function bucket(chars, isSelf)
+        return { isSelf = isSelf or false, characters = chars or {},
+                 homeless = {}, segments = {}, segmentHashes = {} }
+    end
+    local function wire(nameRealm, epoch, boons)
+        local r = Store.NewCharacterRecord(nameRealm)
+        r.ownerEpoch, r.lastDataUpdate, r.lastSeen = epoch, epoch, epoch
+        r.level = 60
+        r.boonCount = boons or 0
+        return r
+    end
+    local function reset()
+        ns.GetAccountID = function() return "1" end
+        Store._ownAuthority = { drops = 0, names = {} }
+        Store._ownerRelay   = { bypassed = 0, claimed = 0, mismatched = 0 }
+        Store.data.accounts = {
+            -- Our own account, holding our own live character.
+            ["1"] = bucket({ ["Mine-Whitemane"] = wire("Mine-Whitemane", T, 9) }, true),
+            -- Account 2 owns Poonyx, and what we hold for it is WIPED (boonCount 0)
+            -- at a HIGH epoch: the exact shape of the field incident.
+            ["2"] = bucket({ ["Poonyx-Whitemane"] = wire("Poonyx-Whitemane", T + 5000, 0) }),
+        }
+    end
+
+    ------------------------------------------------------------------
+    -- The pure predicate's own truth table (cheap, and it pins the aid match).
+    ------------------------------------------------------------------
+    ck(Store.OwnerOriginAdmitted("2", "2", true) == true, "predicate: flag + match must admit")
+    ck(Store.OwnerOriginAdmitted("2", "7", true) == false, "predicate: a mismatched sender must NOT admit")
+    ck(Store.OwnerOriginAdmitted("2", "2", nil) == false, "predicate: no claim must NOT admit")
+    ck(Store.OwnerOriginAdmitted("2", "2", false) == false, "predicate: a false claim must NOT admit")
+    ck(Store.OwnerOriginAdmitted("2", nil, true) == false,
+        "predicate: an UNIDENTIFIED sender (no bound aid) must NOT admit")
+    ck(Store.OwnerOriginAdmitted("2", "", true) == false,
+        "predicate: an empty sender aid must NOT admit")
+    ck(Store.OwnerOriginAdmitted("", "", true) == false, "predicate: empty == empty is not a match")
+    ck(Store.OwnerOriginAdmitted("2", 2, true) == true,
+        "predicate: a numeric aid still matches its string form (the wire carries both shapes)")
+
+    ------------------------------------------------------------------
+    -- ROW 1 — THE ACCEPTANCE FIXTURE. Owner-flagged, sender aid matches, and the
+    -- good record's epoch is LOWER than the wipe we hold. It must win anyway.
+    ------------------------------------------------------------------
+    reset()
+    local good = wire("Poonyx-Whitemane", T + 1000, 7)   -- 4000s OLDER than the wipe
+    ck(Store.WriteInboundCharacter("2", "Poonyx-Whitemane", good, "2", true) == true,
+        "WIPED-POONYX: the owner's good record at a LOWER epoch must be admitted")
+    ck(Store.data.accounts["2"].characters["Poonyx-Whitemane"].boonCount == 7,
+        "...and it really landed (the wipe is gone)")
+    ck(Store._ownerRelay.bypassed == 1,
+        "...and the bypass is counted for /nexus debug (got "
+        .. tostring(Store._ownerRelay.bypassed) .. ")")
+    ck(Store._ownerRelay.mismatched == 0, "...with no spoof counted")
+
+    ------------------------------------------------------------------
+    -- ROW 2 — THE LIAR. Same frame, same flag, but the SENDER is account 7 while
+    -- the record is filed under account 2. The claim must buy nothing.
+    ------------------------------------------------------------------
+    reset()
+    local spoof = wire("Poonyx-Whitemane", T + 1000, 7)
+    ck(Store.WriteInboundCharacter("2", "Poonyx-Whitemane", spoof, "7", true) == false,
+        "SPOOF: an owner-flagged frame from a NON-owner must fall back to the epoch rules")
+    ck(Store.data.accounts["2"].characters["Poonyx-Whitemane"].boonCount == 0,
+        "...and the stored record is untouched")
+    ck(Store._ownerRelay.mismatched == 1,
+        "...and the mismatched claim is counted (got "
+        .. tostring(Store._ownerRelay.mismatched) .. ")")
+    ck(Store._ownerRelay.bypassed == 0, "...and nothing was bypassed")
+    -- ...but the liar is not BANNED: a genuinely newer record from it still
+    -- merges on epoch exactly as it did before. Rule 2 adds a lane, it does not
+    -- close one.
+    ck(Store.WriteInboundCharacter("2", "Poonyx-Whitemane", wire("Poonyx-Whitemane", T + 9000, 3), "7", true) == true,
+        "...and a NEWER record from the same non-owner still merges on epoch")
+
+    ------------------------------------------------------------------
+    -- ROW 3 — UNFLAGGED IS TODAY'S BEHAVIOUR, BYTE FOR BYTE. The same three
+    -- calls with no claim (and with the 4-arg legacy form) must produce the same
+    -- verdicts the pre-D1 build produced.
+    ------------------------------------------------------------------
+    reset()
+    ck(Store.WriteInboundCharacter("2", "Poonyx-Whitemane", wire("Poonyx-Whitemane", T + 1000, 7), "2") == false,
+        "UNFLAGGED: an older record is still rejected (4-arg legacy call)")
+    ck(Store.WriteInboundCharacter("2", "Poonyx-Whitemane", wire("Poonyx-Whitemane", T + 1000, 7), "2", nil) == false,
+        "UNFLAGGED: an explicit nil claim behaves identically")
+    ck(Store.WriteInboundCharacter("2", "Poonyx-Whitemane", wire("Poonyx-Whitemane", T + 1000, 7), "2", false) == false,
+        "UNFLAGGED: an explicit false claim behaves identically")
+    ck(Store.data.accounts["2"].characters["Poonyx-Whitemane"].boonCount == 0,
+        "...and the stored wipe survived all three")
+    ck(Store._ownerRelay.claimed == 0, "...and no claim was even counted")
+    ck(Store.WriteInboundCharacter("2", "Poonyx-Whitemane", wire("Poonyx-Whitemane", T + 9000, 3), "2") == true,
+        "UNFLAGGED: a strictly newer record still merges")
+    -- Equal-epoch lowest-account-ID tiebreak is likewise untouched when unflagged.
+    reset()
+    Store.data.accounts["2"].characters["Poonyx-Whitemane"]._srcAID = "5"
+    ck(Store.WriteInboundCharacter("2", "Poonyx-Whitemane", wire("Poonyx-Whitemane", T + 5000, 7), "9") == false,
+        "UNFLAGGED: the equal-epoch tiebreak still rejects a HIGHER relaying aid")
+    ck(Store.WriteInboundCharacter("2", "Poonyx-Whitemane", wire("Poonyx-Whitemane", T + 5000, 7), "3") == true,
+        "UNFLAGGED: ...and still accepts a strictly LOWER one")
+
+    ------------------------------------------------------------------
+    -- ROW 4 — RULE 1 BEATS RULE 2. An owner-flagged, aid-matching frame about one
+    -- of OUR OWN characters is still refused. Self-immunity is not a tiebreak
+    -- this flag can win; it is a wall in front of the whole epoch block.
+    ------------------------------------------------------------------
+    reset()
+    ck(Store.WriteInboundCharacter("1", "Mine-Whitemane", wire("Mine-Whitemane", T + 9000, 0), "1", true) == false,
+        "RULE 1 > RULE 2: an owner-flagged frame aimed at our OWN bucket is refused")
+    ck(Store.data.accounts["1"].characters["Mine-Whitemane"].boonCount == 9,
+        "...and our own capture is untouched")
+    -- ...and the misattributed shape too: a peer relaying our character, flagged,
+    -- addressed to the PEER's bucket, so bucket-level self-immunity never fires.
+    ck(Store.WriteInboundCharacter("2", "Mine-Whitemane", wire("Mine-Whitemane", T + 9000, 0), "2", true) == false,
+        "RULE 1 > RULE 2: an owner-flagged MISATTRIBUTED copy of our character is refused")
+    ck(Store.data.accounts["2"].characters["Mine-Whitemane"] == nil,
+        "...and no phantom copy was created")
+    ck(Store._ownAuthority.drops == 1,
+        "...and the own-authority counter still recorded it (got "
+        .. tostring(Store._ownAuthority.drops) .. ")")
+    ck(Store._ownerRelay.bypassed == 0,
+        "...and no epoch bypass was credited to a frame that never reached the epoch block")
+
+    ------------------------------------------------------------------
+    -- ROW 5 — A brand-new character is unaffected either way: with no existing
+    -- record there is no epoch guard to bypass, so flagged and unflagged agree.
+    ------------------------------------------------------------------
+    reset()
+    ck(Store.WriteInboundCharacter("2", "Fresh-Whitemane", wire("Fresh-Whitemane", T, 1), "2", true) == true,
+        "a first-contact character is adopted with the flag")
+    ck(Store._ownerRelay.bypassed == 0, "...and that is not counted as a bypass")
+    reset()
+    ck(Store.WriteInboundCharacter("2", "Fresh-Whitemane", wire("Fresh-Whitemane", T, 1), "2") == true,
+        "...and identically without it")
+
+    ------------------------------------------------------------------
+    -- ROW 6 — MUTATION TEST. Neuter the aid match and prove row 2 notices: a
+    -- spoof check that cannot fail is not a check.
+    ------------------------------------------------------------------
+    reset()
+    local realPredicate = Store.OwnerOriginAdmitted
+    Store.OwnerOriginAdmitted = function() return true end
+    local leaked = Store.WriteInboundCharacter("2", "Poonyx-Whitemane",
+        wire("Poonyx-Whitemane", T + 1000, 7), "7", true)
+    Store.OwnerOriginAdmitted = realPredicate
+    ck(leaked == true,
+        "MUTATION: with the aid match disabled the LIAR's older record DOES land "
+        .. "(so row 2 is really exercising the match)")
+
+    ns.GetAccountID     = savedGetAID
+    Store.data.accounts = savedAccounts
+    Store._ownAuthority = savedAuth
+    Store._ownerRelay   = savedRelay
+    Store._ghostLog     = savedLog
+end
+
 function Store.RunSelfTests(verbose)
     local suites = {
         { name = "defaults",        fn = testDefaults },
@@ -7219,6 +7463,7 @@ function Store.RunSelfTests(verbose)
         { name = "stale-twin reconciliation (B5)", fn = testStaleTwins },
         { name = "self-bucket sanity (B5.1)", fn = testSelfBucketSanity },
         { name = "own-account authority", fn = testOwnAccountAuthority },
+        { name = "owner-relay admission (§9.7 rule 2 / D1)", fn = testOwnerRelayAdmission },
         { name = "timer log dedup (F10)", fn = testTimerLogDedup },
         { name = "coordinate overrides (A17.3)", fn = testCoordinateOverrides },
         { name = "zanza pick-list shape migration", fn = testZanzaPriorityShape },

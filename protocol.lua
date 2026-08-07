@@ -39,16 +39,42 @@ Protocol.PREFIX_LIST = {
 --        pack/unpack order (Experience/Rest view).
 --
 -- DECODER TOLERANCE (release gate D-14 / NW-7). DecodeCharacter accepts any
--- schema at or below SCHEMA_VERSION and rejects only a NEWER one. Every bump so
--- far has been append-at-the-tail and newReader reads 0 / "" past the end of the
--- buffer, so an OLDER payload decodes with its absent tail fields reading as
--- "not sent" — which is exactly what they mean. A newer payload is still refused
--- outright: we cannot know what its extra fields displaced.
+-- schema from 1 up to SCHEMA_TOLERATED (see below) and rejects anything above
+-- it. Every bump so far has been append-at-the-tail and newReader reads 0 / ""
+-- past the end of the buffer, so an OLDER payload decodes with its absent tail
+-- fields reading as "not sent" — which is exactly what they mean.
 --
 -- The tolerance must ship one release BEFORE the encoder that needs it,
 -- otherwise the release that introduces v3 also breaks every v2 peer that has
 -- not updated yet. That is the whole point of it landing here, at v2.
-Protocol.SCHEMA_VERSION = 2     -- our binary state-schema version
+Protocol.SCHEMA_VERSION = 2     -- our binary state-schema version — what we ENCODE
+
+-- FORWARD TOLERANCE (schema-v3 wave 1, "release A" of NEXUS_SCHEMA_V3_DESIGN.md
+-- §J4). We now DECODE up to v3 while still ENCODING v2.
+--
+-- WHY THE TWO CONSTANTS ARE SEPARATE. The design doc's J4 (remote DMF countdown)
+-- appends a u32 remaining-seconds at the STATE tail, which is a real
+-- SCHEMA_VERSION bump. DecodeCharacter's version gate used to refuse ANY version
+-- above SCHEMA_VERSION outright, so the release that first ENCODES v3 goes one-way
+-- blind to every peer that had not updated — a mixed public mesh splits in half
+-- for a whole release cycle. Splitting "what we send" from "what we accept" lets
+-- release A (this one) teach every client to swallow v3, and release B (a
+-- release later) flip the encoder with the mesh already prepared.
+--
+-- WHY IT IS SAFE TO DECODE A SCHEMA WE DO NOT KNOW. The append-at-tail contract
+-- in the bump history above is the whole guarantee: every bump so far has ADDED
+-- fields at the END and never moved or resized an existing one, so the v2 prefix
+-- of a v3 frame is byte-identical to a v2 frame. DecodeCharacter reads the v2
+-- field order and simply stops; the appended tail is never read, exactly as
+-- newReader's read-past-end already yields 0 / "" for an ABSENT tail. Unknown
+-- appended fields therefore decode as "not sent", which is what they mean to a
+-- client that has no display for them.
+--
+-- THE TOLERANCE IS NOT OPEN-ENDED. v4 is still refused: honouring one unknown
+-- tail is a promise release B has already made, but nothing constrains a schema
+-- two bumps out, and silently decoding it would be guessing. Version 0 stays
+-- rejected too — it is what an empty or truncated buffer reads as, not a schema.
+Protocol.SCHEMA_TOLERATED = 3   -- highest version DecodeCharacter will accept
 
 -- Register every prefix so inbound messages reach CHAT_MSG_ADDON. Safe to
 -- call once logged in; the mesh dispatcher attaches in wave N2.
@@ -375,10 +401,15 @@ end
 function Protocol.DecodeCharacter(bytes)
     local r = newReader(bytes)
     local version = r.u8()
-    -- Accept our schema and every older one; reject only NEWER (see the bump
-    -- history above). Version 0 is not a schema — it is what an empty or
-    -- truncated buffer reads as — so it stays rejected.
-    if version < 1 or version > Protocol.SCHEMA_VERSION then
+    -- Accept every schema from 1 up to SCHEMA_TOLERATED — that is every OLDER
+    -- one plus the one release-B will encode. The body below reads the v2 field
+    -- order unconditionally: an older payload's absent tail reads as 0/"" and a
+    -- newer payload's appended tail is simply never read (append-at-tail
+    -- contract; see the SCHEMA_TOLERATED block above). Anything ABOVE the
+    -- tolerance is still refused — we cannot know what its extra fields
+    -- displaced. Version 0 is not a schema — it is what an empty or truncated
+    -- buffer reads as — so it stays rejected.
+    if version < 1 or version > Protocol.SCHEMA_TOLERATED then
         return nil, "unsupported schema version " .. tostring(version)
     end
 
@@ -668,10 +699,11 @@ local function testU16Clamp()
     return true
 end
 
--- Decoder tolerance (NW-7 / release gate D-14): OLDER schemas decode, NEWER
--- ones are refused cleanly. Built by restamping (and, for v1, re-truncating)
--- real encoder output, so the fixtures are exactly what a peer would put on the
--- wire rather than a hand-rolled guess.
+-- Decoder tolerance (NW-7 / release gate D-14, extended by schema-v3 wave 1
+-- "release A"): OLDER schemas decode, the ONE tolerated newer schema decodes to
+-- the identical record, and anything beyond it is refused cleanly. Built by
+-- restamping (and, for v1, re-truncating) real encoder output, so the fixtures
+-- are exactly what a peer would put on the wire rather than a hand-rolled guess.
 local V2_TAIL_BYTES = 12   -- xp + xpMax + restedXP, three u32s appended for v2
 
 local function testSchemaTolerance()
@@ -714,13 +746,32 @@ local function testSchemaTolerance()
     local same, why = recordsMatch(rec, cur)
     if not same then return false, "v2 behavior changed: " .. tostring(why) end
 
-    -- A NEWER schema is refused cleanly — nil plus a reason, never a partial
-    -- record and never an error. We cannot know what its extra fields displaced.
-    local v3bytes = "\3" .. v2bytes:sub(2)
-    local future, ferr = Protocol.DecodeCharacter(v3bytes)
-    if future ~= nil then return false, "a v3 payload must be rejected, not decoded" end
-    if type(ferr) ~= "string" or not ferr:find("unsupported schema version 3", 1, true) then
-        return false, "v3 rejection must say why, got: " .. tostring(ferr)
+    -- FORWARD TOLERANCE (release A of the v3 rollout). A v3 frame is the v2
+    -- layout plus an APPENDED tail, so it must decode to the IDENTICAL record a
+    -- v2 frame yields — the appended bytes are never read. Two fixtures prove it
+    -- is the append that is tolerated and not merely the version byte: a bare
+    -- restamp, and a restamp with arbitrary tail garbage after it.
+    local v3bare  = "\3" .. v2bytes:sub(2)
+    local v3tail  = v3bare .. "\255\0\1\254\170\7garbage\0\0"
+    for _, fixture in ipairs({ { "bare", v3bare }, { "with appended tail", v3tail } }) do
+        local newer, nerr = Protocol.DecodeCharacter(fixture[2])
+        if not newer then
+            return false, "a v3 payload (" .. fixture[1] .. ") must decode, got: " .. tostring(nerr)
+        end
+        local sameAsV2, why2 = recordsMatch(cur, newer)
+        if not sameAsV2 then
+            return false, "v3 (" .. fixture[1] .. ") must decode identically to v2: " .. tostring(why2)
+        end
+    end
+
+    -- ...but the tolerance is exactly ONE version wide. v4 is refused cleanly —
+    -- nil plus a reason, never a partial record and never an error. Nothing
+    -- constrains a schema two bumps out, so decoding it would be guessing.
+    local v4bytes = "\4" .. v2bytes:sub(2)
+    local future, ferr = Protocol.DecodeCharacter(v4bytes)
+    if future ~= nil then return false, "a v4 payload must be rejected, not decoded" end
+    if type(ferr) ~= "string" or not ferr:find("unsupported schema version 4", 1, true) then
+        return false, "v4 rejection must say why, got: " .. tostring(ferr)
     end
 
     -- Version 0 is not a schema: it is what an empty or truncated buffer reads
@@ -728,6 +779,21 @@ local function testSchemaTolerance()
     if Protocol.DecodeCharacter("") ~= nil then return false, "an empty buffer must be rejected" end
     if Protocol.DecodeCharacter("\0" .. v2bytes:sub(2)) ~= nil then
         return false, "version 0 must be rejected"
+    end
+
+    -- THE ENCODER IS UNTOUCHED. Release A raises reader tolerance only: our own
+    -- frames must still go out stamped v2, or a peer that skipped this release
+    -- goes blind to us immediately instead of a release later.
+    if Protocol.SCHEMA_VERSION ~= 2 then
+        return false, "release A must not bump the ENCODER (SCHEMA_VERSION is "
+            .. tostring(Protocol.SCHEMA_VERSION) .. ")"
+    end
+    if v2bytes:byte(1) ~= 2 then
+        return false, "our encoder must still stamp version 2, got "
+            .. tostring(v2bytes:byte(1))
+    end
+    if Protocol.SCHEMA_TOLERATED ~= Protocol.SCHEMA_VERSION + 1 then
+        return false, "the tolerance window must stay exactly one version wide"
     end
     return true
 end
@@ -742,7 +808,7 @@ function Protocol.RunSelfTests(verbose)
         { name = "chunking",         fn = testChunking },
         { name = "state round-trip", fn = testRoundTrip },
         { name = "u16 clamp",        fn = testU16Clamp },
-        { name = "schema tolerance (NW-7)", fn = testSchemaTolerance },
+        { name = "schema tolerance (NW-7 + v3 release A)", fn = testSchemaTolerance },
     }
     local allPass, results = true, {}
     for _, t in ipairs(suite) do
