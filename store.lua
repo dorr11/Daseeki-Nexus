@@ -2457,6 +2457,15 @@ function Store.NewCharacterRecord(nameRealm)
         -- offlineSince still loads, and reads as "on CD, remaining unknown" until
         -- the local tick seeds it (see Store.DMFCooldownTick).
         dmfCooldown     = { offlineSince = 0, remainingOnlineSecs = 0, lastTickEpoch = 0 },
+        -- J4 / schema v3: the WIRE MIRROR of the cooldown above — seconds
+        -- remaining AS OF this record's lastDataUpdate. Written by the tracker on
+        -- every capture (the one writer), carried in the binary STATE tail, and
+        -- read back by Dashboard.DMFCooldownRemaining, which decays it against
+        -- lastDataUpdate for a REMOTE character. Exactly the hearthstoneCD /
+        -- itemCooldown mirror pattern: the engine's truth is the sub-table above,
+        -- this is the number the wire can carry. 0 = not on cooldown, or a v1/v2
+        -- sender that never sent one (both render the flag alone).
+        dmfCooldownRemaining = 0,
         raidLockouts    = {},      -- [raidKey] = expiryEpoch
         auraStates      = {},      -- [1..10] = { duration, option, source }
         lastSeen        = 0,
@@ -3805,12 +3814,20 @@ end
 --   active, remaining > 0 -> the duration
 --   active, remaining = 0 -> "on CD"
 --
--- ⚠ FLAGGED FOLLOW-UP (no wire change in this batch): Protocol.DecodeCharacter
--- rebuilds `rec.dmfCooldown` as `{ offlineSince = <u32> }`, so a record that
--- arrives over the mesh never carries remainingOnlineSecs. Remote characters
--- therefore render the spec's tri-state (DMF in Boon / DMF on CD / DMFable) and
--- never a countdown — which is exactly what spec §5 "Display" prescribes for
--- other accounts. Syncing the real remaining would need a protocol bump.
+-- ✅ THE FLAGGED FOLLOW-UP IS CLOSED (schema-v3 wave 2 / J4, 1.1.5). It used to
+-- read: "Protocol.DecodeCharacter rebuilds rec.dmfCooldown as
+-- `{ offlineSince = <u32> }`, so a record that arrives over the mesh never
+-- carries remainingOnlineSecs... syncing the real remaining would need a protocol
+-- bump." It got one. SCHEMA_VERSION 3 appends the remaining seconds at the STATE
+-- tail, the tracker publishes it into rec.dmfCooldownRemaining on every capture,
+-- and Dashboard.DMFCooldownRemaining decays it against lastDataUpdate for the
+-- remote card.
+--
+-- THIS FUNCTION DID NOT CHANGE, deliberately. It is the ENGINE's reader: the
+-- local, ticked, online-time accounting, undecayed, which the tracker's edges and
+-- the chat lines depend on being exactly what DMFCooldownTick last wrote.
+-- Decaying here would double-count against the tick. The wire mirror is a DISPLAY
+-- concern and is read one layer up.
 function Store.DMFCooldownRemaining(rec, nowE)
     if type(rec) ~= "table" or not rec.dmfCooldownActive then return 0 end
     local cd = rec.dmfCooldown

@@ -182,7 +182,20 @@ end
 -- so this is now a thin delegation — the old local 8h-offline mirror is gone
 -- (it returned 0 for any ONLINE character, which is why a 60 that had just taken
 -- a fortune rendered READY, A8.2).
+--
+-- J4 / schema v3: routed through Dashboard.DMFCooldownRemaining rather than
+-- straight at the store, because a REMOTE character's remaining now arrives over
+-- the wire as a capture-time reading and has to be decayed against
+-- rec.lastDataUpdate (frozen while booned, while offline, or with no reference
+-- stamp) exactly like every other remote countdown on this pane. That decay is
+-- ONE choke point in ui_shell, next to Dashboard.AuraRemaining; the store keeps
+-- owning the local online-time accounting and stays the fallback there. Falls
+-- back to the store directly if the shell is somehow absent (frameless load).
 local function dmfCooldownRemaining(rec, e)
+    local D = Dash()
+    if D and D.DMFCooldownRemaining then
+        return D.DMFCooldownRemaining(rec, e) or 0
+    end
     if ns.Store and ns.Store.DMFCooldownRemaining then
         return ns.Store.DMFCooldownRemaining(rec, e) or 0
     end
@@ -1080,11 +1093,60 @@ local function testDMFCooldownState(fails)
     t = Detail.DMFCooldownState({ dmfInBoon = true, dmfCooldownActive = false }, base)
     ck(t == "In Boon", "boon outranks the ready state")
 
-    -- REMOTE record: the wire carries the boolean but not remainingOnlineSecs, so the
-    -- engine returns 0 remaining -> the third label rather than a bogus "Ready".
+    -- REMOTE record from a v1/v2 SENDER: the wire carries the boolean and no
+    -- countdown, so the row keeps the third label rather than a bogus "Ready".
+    -- This is the ZERO case J4 deliberately leaves alone — a peer that has not
+    -- updated must still read exactly as it did before the schema bump.
     local remote = { dmfCooldownActive = true, dmfCooldown = { offlineSince = base } }
     t, tok = Detail.DMFCooldownState(remote, base + 3600)
     ck(t == "On CD" and tok == "warn", "DMF remote/unknown-remaining -> On CD/warn")
+
+    -- ── J4 / schema v3: THE REMOTE COUNTDOWN, through the real row ────────────
+    -- The point of the whole wave: a v3 sender's frame turns that flat "On CD"
+    -- into a real countdown, rendered by the SAME helper, in the SAME token, at
+    -- the SAME cell width as the hearth and chrono rows beside it. Asserted
+    -- against Detail.CdDurationText directly so a future divergence between the
+    -- DMF row and its two neighbours fails here rather than looking odd in game.
+    local D = ns.Dashboard
+    local savedOnline = D and D.IsOnline
+    if D then D.IsOnline = function() return true end end
+
+    local CELL = 89                       -- the round-25 value cell width
+    local v3remote = { nameRealm = "Peer-Whitemane", lastDataUpdate = base,
+                       lastSeen = base, dmfCooldownActive = true,
+                       dmfCooldown = { offlineSince = 0 },   -- what decode rebuilds
+                       dmfCooldownRemaining = 9000 }
+    t, tok = Detail.DMFCooldownState(v3remote, base, CELL)
+    ck(tok == "warn", "J4: a remote countdown reads warn, exactly like the hearth row")
+    ck(t == Detail.CdDurationText(9000, CELL),
+       "J4: the remote countdown must render through Detail.CdDurationText like every "
+       .. "other cooldown row (got " .. tostring(t) .. ")")
+    ck(t ~= "On CD" and t ~= "Ready", "J4: a v3 sender must not still read as the flag alone")
+
+    -- ...and it DECAYS against the sender's stamp, so the row moves between pushes.
+    t = Detail.DMFCooldownState(v3remote, base + 600, CELL)
+    ck(t == Detail.CdDurationText(8400, CELL),
+       "J4: the remote countdown must decay against lastDataUpdate (got " .. tostring(t) .. ")")
+
+    -- Decayed past zero returns to the flag-only label rather than lying "Ready":
+    -- the FLAG still says the cooldown is running, we have just lost the number.
+    t, tok = Detail.DMFCooldownState(v3remote, base + 99999, CELL)
+    ck(t == "On CD" and tok == "warn", "J4: a countdown decayed to 0 falls back to On CD")
+
+    -- A BOONED remote still reads In Boon — the boon branch outranks the number,
+    -- because a stashed fortune's cooldown is frozen, not counting down.
+    local boonedRemote = { nameRealm = "Peer-Whitemane", lastDataUpdate = base, lastSeen = base,
+                           dmfInBoon = true, dmfCooldownActive = true,
+                           dmfCooldown = { offlineSince = 0 }, dmfCooldownRemaining = 9000 }
+    t, tok = Detail.DMFCooldownState(boonedRemote, base + 600, CELL)
+    ck(t == "In Boon" and tok == "ok", "J4: a booned remote still reads In Boon, never a countdown")
+
+    -- OFFLINE remote: frozen, not wall-clocked away (it is an ONLINE-time cooldown).
+    if D then D.IsOnline = function() return false end end
+    t = Detail.DMFCooldownState(v3remote, base + 600, CELL)
+    ck(t == Detail.CdDurationText(9000, CELL),
+       "J4: an OFFLINE peer's countdown must freeze, got " .. tostring(t))
+    if D then D.IsOnline = savedOnline end
 
     -- Defensive: a nil record must not error (the pane paints before a selection resolves).
     t, tok = Detail.DMFCooldownState(nil, base)
