@@ -333,6 +333,14 @@ end
 -- list omits it, but a level-up must reach peers and it is a once-per-character
 -- event, so it cannot churn. XP / rested XP are deliberately NOT in the digest:
 -- they tick constantly while questing and would defeat the whole filter.
+--
+-- SCHEMA v3 (J4): dmfCooldownRemaining is on the wire but is NOT in the digest,
+-- for exactly the XP reason — it decrements on every capture for four hours, so
+-- hashing it (even coarsened) would make a parked character with a live fortune
+-- push on a timer. It costs nothing to leave out: the receiver decays the last
+-- value it was sent against lastDataUpdate, so the remote countdown keeps
+-- running between pushes, and the transitions that actually matter (the cooldown
+-- starting, and reaching zero) flip dmfCooldownActive, which IS in the digest.
 ----------------------------------------------------------------------
 
 Mesh.AURA_COARSE = 60    -- aura durations round to the minute
@@ -434,6 +442,23 @@ end
 --   attunements / dmfCooldown       Not in the binary schema. Fails invariant (a):
 --   sub-fields                      a peer holding only STATE-pushed data would
 --                                   never match one that got a segment.
+--   dmfCooldownRemaining            IS in the binary schema (v3 tail), and is
+--     (the schema-v3 wire mirror)   still deliberately EXCLUDED — the same call
+--                                   xp/restedXP get, for the same reason. It
+--                                   counts down every capture, so hashing it
+--                                   would move the fingerprint (and the push
+--                                   filter's hash) on a value that changes by
+--                                   itself, turning a quiet parked character into
+--                                   a permanent push source. It does not need to
+--                                   be pushed to stay right: the receiver decays
+--                                   it against lastDataUpdate
+--                                   (Dashboard.DMFCooldownRemaining), so the
+--                                   countdown stays accurate between pushes and
+--                                   re-syncs whenever anything else about the
+--                                   character does move. Its meaningful
+--                                   transitions — the cooldown starting and
+--                                   ending — are the dmfCooldownActive bit above,
+--                                   which IS hashed.
 ----------------------------------------------------------------------
 function Mesh.SegmentRecordFingerprint(rec)
     if type(rec) ~= "table" then return "-" end
@@ -1737,11 +1762,42 @@ local function handleState(f, sender, isRelay)
     local ownerAID = aidForName(rec.nameRealm) or aidForName(sender) or ""
     -- Owner-wins / epoch / lowest-account-ID tiebreak lives in the store.
     local senderAID = aidForName(sender)
+    -- §9.7 RULE 2 ON THE STATE PATH (schema-v3 wave 2; completes D1, which wave 1
+    -- delivered for SEGMENT envelopes only).
+    --
+    -- THE CLAIM IS DERIVED, NOT CARRIED. The binary STATE payload has no room for
+    -- a provenance field and needs none: a DIRECT (non-relayed) STATE frame is,
+    -- BY CONSTRUCTION, the sending account talking about its own character —
+    -- Mesh.PushState only ever encodes our OWN self record, and a peer that
+    -- forwards somebody else's frame does it on OP.RELAY, which arrives here with
+    -- isRelay set. So "this sender authored this record" is a fact of the
+    -- transport, and the receiver can derive the owner claim from the frame's op
+    -- rather than trust a boolean. No new wire field, no PROTO_VERSION bump, and
+    -- nothing for an older peer to fail to send.
+    --
+    -- IT IS STILL VERIFIED. The claim only becomes a bypass inside
+    -- Store.OwnerOriginAdmitted, which requires senderAID to EQUAL the bucket the
+    -- record is being filed under. That binding comes from the peer's own
+    -- identified heartbeat/discovery frames (Mesh.CanAdmitPeer), never from this
+    -- frame — so a direct frame about a THIRD party (whose name resolves to
+    -- another peer's aid) fails the match and falls to the normal epoch rules.
+    --
+    -- RELAYED FRAMES GET NOTHING. A relayer could have modified the payload on
+    -- the way through, and nothing on the wire lets us tell a faithful forward
+    -- from an edited one. Provenance we cannot verify is provenance we do not
+    -- honour, so OP.RELAY keeps today's epoch rules verbatim. (It also could not
+    -- match anyway in the common case — the forwarder's aid is not the owner's —
+    -- but the rule is stated on the PROVENANCE, not on the coincidence.)
+    --
+    -- RULE 1 STILL BEATS RULE 2: Store.RejectInboundOwnCharacter returns before
+    -- any of this, so an owner-claimed frame about one of OUR characters is still
+    -- dropped. Nothing on the wire can talk about us.
+    local ownerClaim = (not isRelay) or nil
     -- A true return means the record really changed — an older/losing push is
     -- rejected and must NOT cost a repaint. Store.WriteInboundCharacter also
     -- runs the B5 stale-twin reconciliation internally, so a twin retired by
     -- this write is covered by the same signal.
-    if Store.WriteInboundCharacter(ownerAID, rec.nameRealm, rec, senderAID) then
+    if Store.WriteInboundCharacter(ownerAID, rec.nameRealm, rec, senderAID, ownerClaim) then
         Mesh.NoteStoreChanged()
     end
     -- One-hop forward for genuine (non-relay) pushes carrying a relayTo list.
@@ -4994,11 +5050,11 @@ local function testInboundRepaintPump()
     local fires = 0
     ns:On("STORE_REFRESHED", function() fires = fires + 1 end)
 
-    local function stateFrame(nameRealm, epoch)
+    local function stateFrame(nameRealm, epoch, op)
         local rec = Store.NewCharacterRecord(nameRealm)
         rec.level = 60
         rec.ownerEpoch, rec.lastDataUpdate, rec.lastSeen = epoch, epoch, epoch
-        return Mesh.BuildFrame(OP.STATE, Protocol.EncodeCharacter(rec), { seq = 1 })
+        return Mesh.BuildFrame(op or OP.STATE, Protocol.EncodeCharacter(rec), { seq = 1 })
     end
 
     local ok, why = true, nil
@@ -5009,10 +5065,33 @@ local function testInboundRepaintPump()
     ck(fires == 1, "an accepted inbound STATE push did not fire STORE_REFRESHED")
     ck(Store.data.accounts["9"].characters["Peer-R"] ~= nil, "inbound record was not stored")
 
-    -- 2) A LOSING push (older epoch) is rejected, so it must NOT cost a repaint.
+    -- 2) A LOSING push is rejected, so it must NOT cost a repaint.
+    --
+    -- EXPECTATION MOVED IN 1.1.5 (schema-v3 wave 2, §9.7 rule 2 on the STATE
+    -- path) — read this before "fixing" it. This row used to send an older-epoch
+    -- push DIRECTLY from Peer-R, which owns the bucket it lands in, and assert
+    -- that it lost. Owner-sourced data now bypasses the epoch guard by design
+    -- (that rejection WAS the wiped-record-wins hole), so a direct frame from the
+    -- owner is no longer a losing push and cannot be the fixture for one. The
+    -- PROPERTY under test is unchanged and still asserted: a write that the store
+    -- refuses must not pump a repaint. The fixture is simply one that is still
+    -- refused — a RELAYED older frame, which gets no bypass because a relayer
+    -- could have edited the payload.
+    fires = 0
+    pcall(Mesh.Dispatch, Protocol.PREFIX.STATE, stateFrame("Peer-R", T - 500, OP.RELAY), "Peer-R")
+    ck(fires == 0, "a rejected (stale-epoch RELAY) push still fired a repaint")
+    ck(Store.data.accounts["9"].characters["Peer-R"].ownerEpoch == T,
+        "the rejected relay overwrote the stored record anyway")
+
+    -- 2b) ...and the OWNER's own direct push at that same older epoch now WINS,
+    --     so it DOES repaint — an applied write, not a rejected one.
     fires = 0
     pcall(Mesh.Dispatch, Protocol.PREFIX.STATE, stateFrame("Peer-R", T - 500), "Peer-R")
-    ck(fires == 0, "a rejected (stale-epoch) push still fired a repaint")
+    ck(fires == 1, "§9.7 rule 2: the owner's own direct push did not fire a repaint")
+    ck(Store.data.accounts["9"].characters["Peer-R"].ownerEpoch == T - 500,
+        "§9.7 rule 2: the owner's own direct push did not land")
+    -- Put the newer record back so the segment rows below start where they did.
+    pcall(Mesh.Dispatch, Protocol.PREFIX.STATE, stateFrame("Peer-R", T), "Peer-R")
 
     -- 3) A SEGMENT adoption fires ONCE for the whole batch, not once per record.
     fires = 0
@@ -5362,6 +5441,158 @@ local function testOwnerRelayEnvelopeWire()
     Mesh.SeenBefore, Mesh.FreshSeq = savedSeen, savedFresh
     Mesh.Enqueue        = savedEnqueue
     Mesh._sendCooldowns = savedCd
+    Store._ownAuthority = savedAuth
+    Store._ownerRelay   = savedRelay
+    Store._ghostLog     = savedGhost
+    return ok, why
+end
+
+----------------------------------------------------------------------
+-- OWNER BYPASS ON THE **STATE** PATH (schema-v3 wave 2; completes §9.7 rule 2).
+--
+-- Wave 1 gave the bypass to SEGMENT envelopes, which can carry an `own` flag.
+-- The binary STATE payload cannot, and does not need to: a DIRECT (OP.STATE)
+-- frame is the sender talking about its own character by construction, so the
+-- receiver DERIVES the claim from the frame's op and then verifies it against
+-- the sender's bound account id exactly as the segment path does.
+--
+-- Driven through the REAL wire: real Protocol.EncodeCharacter payloads in real
+-- frames through the REAL Mesh.Dispatch -> handleState -> Store
+-- .WriteInboundCharacter, judged by what landed in a fixture store. The peer
+-- table IS the sender -> aid binding under test, so Poonyx is peer 2's LIVE
+-- character (that is what makes aidForName resolve the record to bucket 2 and
+-- lets a third party's forward be told apart from the owner's own push).
+--
+--   DIRECT from the owner        -> epoch bypassed  (the wiped-Poonyx fix)
+--   DIRECT from a third party    -> normal epoch rules (the claim fails the match)
+--   RELAYED (OP.RELAY)           -> normal epoch rules, no claim at all
+--   DIRECT about OUR OWN char    -> still rejected (rule 1 > rule 2)
+----------------------------------------------------------------------
+local function testOwnerStateDirectWire()
+    local savedData    = Store.data
+    local savedPeers   = Mesh.peers
+    local savedAID     = ns.GetAccountID
+    local savedSeen    = Mesh.SeenBefore
+    local savedFresh   = Mesh.FreshSeq
+    local savedEnqueue = Mesh.Enqueue
+    local savedAuth    = Store._ownAuthority
+    local savedRelay   = Store._ownerRelay
+    local savedGhost   = Store._ghostLog
+    local T = 1700000000
+
+    Mesh.SeenBefore = function() return false end
+    Mesh.FreshSeq   = function() return true end
+    Store._ghostLog = function() end
+    Mesh.Enqueue    = function() return true end
+
+    local ok, why = true, nil
+    local function ck(c, m) if ok and not c then ok, why = false, m end end
+
+    local function newBucket(isSelf)
+        return { isSelf = isSelf or false, characters = {}, homeless = {},
+                 segments = { sixties = {}, summoners = {}, norole = {} }, segmentHashes = {} }
+    end
+    local function rec(nameRealm, epoch, boon)
+        local r = Store.NewCharacterRecord(nameRealm)
+        r.level = 60
+        r.ownerEpoch, r.lastDataUpdate, r.lastSeen = epoch, epoch, epoch
+        r.boonCount = boon or 0
+        return r
+    end
+    -- A REAL state frame: the record through the real encoder, in a real frame.
+    local function stateFrame(op, r, seq)
+        return Mesh.BuildFrame(op, Protocol.EncodeCharacter(r), { seq = seq, relayTo = "" })
+    end
+
+    -- RECEIVER: account 1, holding a WIPED Poonyx at a HIGH epoch under account
+    -- 2's bucket (the incident shape), plus one of our own characters. Poonyx is
+    -- peer 2's LIVE character, so the record resolves to bucket 2 by NAME — which
+    -- is what lets a third party's forward be distinguished from the owner's push.
+    local function becomeReceiver()
+        ns.GetAccountID = function() return "1" end
+        Mesh.peers = {
+            ["2"] = { aid = "2", name = "Poonyx-Whitemane", online = true, lastSeen = T },
+            ["7"] = { aid = "7", name = "Liar-R",           online = true, lastSeen = T },
+        }
+        Store._ownAuthority = { drops = 0, names = {} }
+        Store._ownerRelay   = { bypassed = 0, claimed = 0, mismatched = 0 }
+        local mine, theirs = newBucket(true), newBucket(false)
+        mine.characters["Mine-Whitemane"]     = rec("Mine-Whitemane", T, 9)
+        theirs.characters["Poonyx-Whitemane"] = rec("Poonyx-Whitemane", T + 5000, 0)  -- the WIPE
+        Store.data = { accounts = { ["1"] = mine, ["2"] = theirs }, deletedAIDs = {} }
+    end
+    local function boons()
+        local c = Store.data.accounts["2"].characters["Poonyx-Whitemane"]
+        return c and c.boonCount
+    end
+    local function dispatch(frame, sender)
+        local okd, errd = pcall(Mesh.Dispatch, Protocol.PREFIX.STATE, frame, sender)
+        ck(okd, "state dispatch from " .. tostring(sender) .. " errored: " .. tostring(errd))
+    end
+
+    -- The owner's OWN good record, at an OLDER epoch than the stored wipe. Under
+    -- newest-wins alone this loses; that is the whole bug §9.7 rule 2 names.
+    local good = rec("Poonyx-Whitemane", T + 1000, 7)
+
+    ------------------------------------------------------------------
+    -- 1. DIRECT FROM THE OWNER -> the epoch guard is bypassed.
+    ------------------------------------------------------------------
+    becomeReceiver()
+    dispatch(stateFrame(OP.STATE, good, 11), "Poonyx-Whitemane")
+    ck(boons() == 7, "WIPED-POONYX ON THE STATE PATH: the owner's own direct push did not win "
+        .. "(boonCount " .. tostring(boons()) .. ", expected 7)")
+    ck(Store._ownerRelay.bypassed == 1, "the state path did not credit the epoch bypass")
+
+    ------------------------------------------------------------------
+    -- 2. DIRECT FROM A THIRD PARTY -> the derived claim fails the aid match.
+    --    Account 7 hand-sends a frame about account 2's character. The op says
+    --    "direct", so a claim IS derived; the SENDER BINDING says 7 while the
+    --    record files under 2, so it is refused and counted as mismatched.
+    ------------------------------------------------------------------
+    becomeReceiver()
+    dispatch(stateFrame(OP.STATE, good, 12), "Liar-R")
+    ck(boons() == 0, "SPOOF ON THE STATE PATH: a third party's direct frame bypassed the epoch guard")
+    ck(Store._ownerRelay.mismatched == 1, "the state path did not count the mismatched claim")
+    ck(Store._ownerRelay.bypassed == 0, "the state path credited a bypass to a spoof")
+
+    -- ...and an UNKNOWN sender (no peer entry -> no bound aid) is a third party too.
+    becomeReceiver()
+    dispatch(stateFrame(OP.STATE, good, 13), "Stranger-R")
+    ck(boons() == 0, "an UNIDENTIFIED sender's direct frame bypassed the epoch guard")
+
+    ------------------------------------------------------------------
+    -- 3. RELAYED -> no claim at all, today's epoch rules verbatim. A relayer
+    --    could have edited the payload and nothing on the wire proves otherwise,
+    --    so the older record loses exactly as it did before this change.
+    ------------------------------------------------------------------
+    becomeReceiver()
+    dispatch(stateFrame(OP.RELAY, good, 14), "Liar-R")
+    ck(boons() == 0, "RELAYED: an older relayed record bypassed the epoch guard")
+    ck(Store._ownerRelay.claimed == 0, "RELAYED: a claim was counted for a frame that makes none")
+
+    -- ...and the relay lane still MERGES a genuinely newer record, so nothing
+    -- about the unflagged path moved in either direction.
+    becomeReceiver()
+    dispatch(stateFrame(OP.RELAY, rec("Poonyx-Whitemane", T + 9000, 4), 15), "Liar-R")
+    ck(boons() == 4, "RELAYED: a strictly newer relayed record stopped merging")
+
+    ------------------------------------------------------------------
+    -- 4. RULE 1 BEATS RULE 2 on the state path: a DIRECT owner-claimed frame
+    --    about one of OUR OWN characters is still refused, and leaves no phantom.
+    ------------------------------------------------------------------
+    becomeReceiver()
+    dispatch(stateFrame(OP.STATE, rec("Mine-Whitemane", T + 9000, 0), 16), "Poonyx-Whitemane")
+    ck(Store.data.accounts["1"].characters["Mine-Whitemane"].boonCount == 9,
+        "RULE 1 > RULE 2 on the state path: a direct frame altered our own character")
+    ck(Store.data.accounts["2"].characters["Mine-Whitemane"] == nil,
+        "...and it left a phantom under the sender's bucket")
+    ck((Store._ownAuthority.drops or 0) >= 1, "...and the own-authority drop was not counted")
+
+    Store.data          = savedData
+    Mesh.peers          = savedPeers
+    ns.GetAccountID     = savedAID
+    Mesh.SeenBefore, Mesh.FreshSeq = savedSeen, savedFresh
+    Mesh.Enqueue        = savedEnqueue
     Store._ownAuthority = savedAuth
     Store._ownerRelay   = savedRelay
     Store._ghostLog     = savedGhost
@@ -6194,6 +6425,7 @@ function Mesh.RunSelfTests(verbose)
         { name = "inbound repaint pump", fn = testInboundRepaintPump },
         { name = "own-account authority (wire)", fn = testOwnAccountAuthorityWire },
         { name = "owner-relay envelope (wire, §9.7 rule 2)", fn = testOwnerRelayEnvelopeWire },
+        { name = "owner bypass on the STATE path (wire, §9.7 r2)", fn = testOwnerStateDirectWire },
         { name = "ns hash-input symmetrization (D2)", fn = testNSHashSymmetry },
         { name = "push delivery count",  fn = testPushDeliveryCount },
         { name = "segment content fingerprint (§9.6)", fn = testSegmentFingerprint },

@@ -37,6 +37,12 @@ Protocol.PREFIX_LIST = {
 --   v1 — original character record.
 --   v2 — appended xp (u32), xpMax (u32), restedXP (u32) at the END of the
 --        pack/unpack order (Experience/Rest view).
+--   v3 — appended dmfCooldownRemaining (u32) at the END: the Darkmoon Faire
+--        buff-cooldown REMAINING SECONDS as of the frame's lastDataUpdate, so a
+--        peer's card can show a real countdown instead of the bare flag bit
+--        (NEXUS_SCHEMA_V3_DESIGN.md §J4 / D4). 0 means "not sent / unknown",
+--        which is what an ABSENT tail reads as, so the two are the same state
+--        and the card falls back to today's flag-only rendering for both.
 --
 -- DECODER TOLERANCE (release gate D-14 / NW-7). DecodeCharacter accepts any
 -- schema from 1 up to SCHEMA_TOLERATED (see below) and rejects anything above
@@ -46,34 +52,52 @@ Protocol.PREFIX_LIST = {
 --
 -- The tolerance must ship one release BEFORE the encoder that needs it,
 -- otherwise the release that introduces v3 also breaks every v2 peer that has
--- not updated yet. That is the whole point of it landing here, at v2.
-Protocol.SCHEMA_VERSION = 2     -- our binary state-schema version — what we ENCODE
+-- not updated yet. That is the whole point of it landing at v2 — which it did,
+-- in wave 1 of this same design pass.
+Protocol.SCHEMA_VERSION = 3     -- our binary state-schema version — what we ENCODE
 
--- FORWARD TOLERANCE (schema-v3 wave 1, "release A" of NEXUS_SCHEMA_V3_DESIGN.md
--- §J4). We now DECODE up to v3 while still ENCODING v2.
+-- THE TOLERANCE WINDOW (schema-v3 wave 2, "release B" of NEXUS_SCHEMA_V3_DESIGN.md
+-- §J4). The encoder is now at v3 and the window is PINNED ONE VERSION WIDE:
 --
--- WHY THE TWO CONSTANTS ARE SEPARATE. The design doc's J4 (remote DMF countdown)
--- appends a u32 remaining-seconds at the STATE tail, which is a real
--- SCHEMA_VERSION bump. DecodeCharacter's version gate used to refuse ANY version
--- above SCHEMA_VERSION outright, so the release that first ENCODES v3 goes one-way
--- blind to every peer that had not updated — a mixed public mesh splits in half
--- for a whole release cycle. Splitting "what we send" from "what we accept" lets
--- release A (this one) teach every client to swallow v3, and release B (a
--- release later) flip the encoder with the mesh already prepared.
+--     SCHEMA_VERSION == SCHEMA_TOLERATED == 3   -- we send v3, we accept <= 3
 --
--- WHY IT IS SAFE TO DECODE A SCHEMA WE DO NOT KNOW. The append-at-tail contract
--- in the bump history above is the whole guarantee: every bump so far has ADDED
--- fields at the END and never moved or resized an existing one, so the v2 prefix
--- of a v3 frame is byte-identical to a v2 frame. DecodeCharacter reads the v2
--- field order and simply stops; the appended tail is never read, exactly as
--- newReader's read-past-end already yields 0 / "" for an ABSENT tail. Unknown
--- appended fields therefore decode as "not sent", which is what they mean to a
--- client that has no display for them.
+-- Wave 1 raised the tolerance to 3 while still ENCODING v2, so the two constants
+-- were briefly apart; this wave closes the gap by moving the ENCODER up to meet
+-- it. Nothing about the acceptance rule changed — <= 3 is still admitted, 4 is
+-- still refused — so a peer that took wave 1 (or this release) reads our frames,
+-- and the pair stays "we never emit a version we would not accept ourselves".
 --
--- THE TOLERANCE IS NOT OPEN-ENDED. v4 is still refused: honouring one unknown
--- tail is a promise release B has already made, but nothing constrains a schema
--- two bumps out, and silently decoding it would be guessing. Version 0 stays
--- rejected too — it is what an empty or truncated buffer reads as, not a schema.
+-- WHY THE TWO CONSTANTS EXIST AT ALL, restated so the next bump inherits it. A
+-- reader gate that refuses ANY version above what we ENCODE means the release
+-- that first emits vN+1 goes one-way blind to every peer that has not updated,
+-- and a mixed public mesh splits in half for a whole release cycle. Splitting
+-- "what we send" from "what we accept" lets release A teach the mesh to swallow
+-- the next schema and release B flip the encoder into a mesh already prepared.
+-- The NEXT bump repeats the pattern: raise SCHEMA_TOLERATED to 4 in one release,
+-- SCHEMA_VERSION to 4 in a later one.
+--
+-- WHAT THE OWNER KNOWINGLY GAVE UP HERE. Waves 1 and 2 ship in the SAME release
+-- (owner decision 2026-08-07, "so we don't have multiple deployments"), so the
+-- two-release rollout is collapsed: a peer still on 1.1.4 or older has a reader
+-- that stops at v2 and will REFUSE our v3 STATE frames outright until it
+-- updates. Same-machine meshes update atomically (one shared AddOns folder);
+-- only a split-machine mesh sees one-way staleness, and only until both sides
+-- are on 1.1.5. See NEXUS_SCHEMA_V3_DESIGN.md "Package as executed", and
+-- testMixedVersionMatrix below, which asserts that cost rather than hiding it.
+--
+-- WHY IT IS SAFE TO DECODE A SCHEMA WE DO NOT ENCODE (the property the window
+-- rests on, still true). The append-at-tail contract in the bump history above
+-- is the whole guarantee: every bump has ADDED fields at the END and never moved
+-- or resized an existing one, so the v2 prefix of a v3 frame is byte-identical
+-- to a v2 frame. testGoldenV2Prefix pins that structurally against real bytes.
+-- A reader that stops early simply never reads the tail, and newReader's
+-- read-past-end already yields 0 / "" for an ABSENT one — so an unknown or
+-- missing appended field decodes as "not sent", which is what it means.
+--
+-- THE TOLERANCE IS NOT OPEN-ENDED. v4 is still refused: nothing constrains a
+-- schema two bumps out, and silently decoding it would be guessing. Version 0
+-- stays rejected too — it is what an empty or truncated buffer reads as, not a
+-- schema.
 Protocol.SCHEMA_TOLERATED = 3   -- highest version DecodeCharacter will accept
 
 -- Register every prefix so inbound messages reach CHAT_MSG_ADDON. Safe to
@@ -308,6 +332,8 @@ end
 --   u32 xp                  (current XP into the level; 0 at max level)   [v2]
 --   u32 xpMax               (total XP for the level;    0 at max level)   [v2]
 --   u32 restedXP            (rested/double-XP pool;      0 when unrested)  [v2]
+--   u32 dmfCooldownRemaining (DMF buff-cooldown seconds left AS OF this     [v3]
+--                             frame's lastDataUpdate; 0 = not sent/unknown)
 ----------------------------------------------------------------------
 
 local FACTION_TO_CODE = { Alliance = 1, Horde = 2 }
@@ -395,6 +421,20 @@ function Protocol.EncodeCharacter(rec)
     w.u32(rec.xpMax or 0)
     w.u32(rec.restedXP or 0)
 
+    -- v3 tail (§J4): the DMF buff-cooldown remaining seconds. APPENDED, never
+    -- interleaved — everything above this line is byte-identical to what the v2
+    -- encoder wrote for the same record, which is the contract testGoldenV2Prefix
+    -- pins against real bytes and the whole reason an older reader can stop early.
+    --
+    -- THE VALUE IS A MIRROR, NOT A DERIVATION. tracker.lua's captureDMF writes
+    -- rec.dmfCooldownRemaining from Store.DMFCooldownRemaining on every capture,
+    -- in the same pass that stamps lastDataUpdate — so the number that goes out is
+    -- true AS OF that stamp and the receiver can decay it against it. Re-deriving
+    -- here would be re-deriving from the same field the tracker already ticked,
+    -- one capture later, for nothing. 0 = "no countdown to report", which is also
+    -- exactly what an ABSENT tail reads as on a v1/v2 frame.
+    w.u32(rec.dmfCooldownRemaining or 0)
+
     return w.result()
 end
 
@@ -470,6 +510,18 @@ function Protocol.DecodeCharacter(bytes)
     rec.xpMax    = r.u32()
     rec.restedXP = r.u32()
 
+    -- v3 tail: the DMF buff-cooldown remaining seconds. Only a v3 frame CARRIES
+    -- it, and it is read the same way every tail before it is read — flatly, in
+    -- appended order, with no version branch. On a v1/v2 frame the reader is
+    -- already past the end of the buffer here and newReader's read-past-end
+    -- yields 0, which IS the field's "not sent / unknown" value: the card falls
+    -- back to the flag-only rendering it has always had. The version gate above
+    -- has already refused anything newer than SCHEMA_TOLERATED, so the only
+    -- frames that reach this line are v1/v2 (tail absent -> 0) and v3 (tail
+    -- present). Branching on the version here would buy nothing and would make
+    -- the ONE contract every bump depends on stop being exercised.
+    rec.dmfCooldownRemaining = r.u32()
+
     return rec
 end
 
@@ -489,6 +541,7 @@ local function recordsMatch(a, b)
         "lastSeen", "lastDataUpdate", "ownerEpoch", "nameRealm",
         "className", "location",
         "xp", "xpMax", "restedXP",           -- v2 experience/rest tail
+        "dmfCooldownRemaining",              -- v3 DMF countdown tail
     }
     for _, k in ipairs(scalars) do
         if a[k] ~= b[k] then
@@ -562,6 +615,9 @@ local function testRoundTrip()
     rec.dmfCooldownActive = true
     rec.soulstoneReady = true
     rec.dmfCooldown = { offlineSince = 1784990000 }
+    -- v3 tail — a live countdown (3h 12m of the 4h owed), so the appended u32 is
+    -- proven to round-trip byte-exactly rather than only proven to be present.
+    rec.dmfCooldownRemaining = 11520
     rec.raidLockouts = { MC = 1785200000, BWL = 1785300000, Ony = 1785100000 }
     rec.auraStates = {
         [1] = { duration = 3600, option = 1, source = 0 },
@@ -700,13 +756,18 @@ local function testU16Clamp()
 end
 
 -- Decoder tolerance (NW-7 / release gate D-14, extended by schema-v3 wave 1
--- "release A"): OLDER schemas decode, the ONE tolerated newer schema decodes to
--- the identical record, and anything beyond it is refused cleanly. Built by
--- restamping (and, for v1, re-truncating) real encoder output, so the fixtures
--- are exactly what a peer would put on the wire rather than a hand-rolled guess.
+-- "release A" and now driven by the v3 ENCODER of wave 2 "release B"): OLDER
+-- schemas decode with their absent tails reading as "not sent", the current one
+-- decodes whole, and anything beyond the window is refused cleanly. Every
+-- fixture is built by TRUNCATING and RESTAMPING real encoder output, so it is
+-- exactly what a peer would put on the wire rather than a hand-rolled guess.
 local V2_TAIL_BYTES = 12   -- xp + xpMax + restedXP, three u32s appended for v2
+local V3_TAIL_BYTES = 4    -- dmfCooldownRemaining, one u32 appended for v3
 
-local function testSchemaTolerance()
+-- The record every version fixture below is cut from. Carries a live value in
+-- BOTH appended tails, so "the tail is absent" and "the tail is zero" can never
+-- be confused with "the record had nothing to say".
+local function toleranceFixture()
     local rec = ns.Store.NewCharacterRecord("Older-Whitemane")
     rec.classTag, rec.className, rec.faction = "MAGE", "Mage", "Alliance"
     rec.level, rec.boonCount, rec.shardCount = 60, 3, 0
@@ -715,13 +776,52 @@ local function testSchemaTolerance()
     rec.raidLockouts = { MC = 1785200000 }
     rec.auraStates = { [1] = { duration = 3600, option = 1, source = 0 } }
     rec.xp, rec.xpMax, rec.restedXP = 734512, 1526400, 381600
+    rec.dmfCooldownActive = true
+    rec.dmfCooldownRemaining = 9000        -- 2h 30m of the 4h still owed
+    return rec
+end
 
-    local v2bytes = Protocol.EncodeCharacter(rec)
-    if not v2bytes then return false, "encoder produced nothing" end
+-- Cut a genuine older-schema payload out of a v3 frame: drop the tails the older
+-- encoder never wrote, and restamp the version byte. This is only legitimate
+-- BECAUSE of the append-at-tail contract (testGoldenV2Prefix pins it against real
+-- bytes) — if a bump ever inserted a field mid-record, these fixtures would stop
+-- being what an old peer emits and the whole tolerance suite would lie.
+local function truncateTo(v3bytes, version)
+    if version == 2 then
+        return "\2" .. v3bytes:sub(2, #v3bytes - V3_TAIL_BYTES)
+    end
+    return "\1" .. v3bytes:sub(2, #v3bytes - V3_TAIL_BYTES - V2_TAIL_BYTES)
+end
 
-    -- A genuine v1 payload: version byte 1, and NONE of the v2 tail present.
-    local v1bytes = "\1" .. v2bytes:sub(2, #v2bytes - V2_TAIL_BYTES)
-    if #v1bytes ~= #v2bytes - V2_TAIL_BYTES then
+local function testSchemaTolerance()
+    local rec = toleranceFixture()
+
+    local v3bytes = Protocol.EncodeCharacter(rec)
+    if not v3bytes then return false, "encoder produced nothing" end
+
+    -- THE ENCODER IS AT v3 NOW (release B). Our own frames go out stamped 3, and
+    -- the window is pinned one wide: VERSION == TOLERATED, so we never emit a
+    -- version we would not accept from a peer.
+    if Protocol.SCHEMA_VERSION ~= 3 then
+        return false, "release B must ENCODE v3 (SCHEMA_VERSION is "
+            .. tostring(Protocol.SCHEMA_VERSION) .. ")"
+    end
+    if v3bytes:byte(1) ~= 3 then
+        return false, "our encoder must stamp version 3, got " .. tostring(v3bytes:byte(1))
+    end
+    if Protocol.SCHEMA_TOLERATED ~= Protocol.SCHEMA_VERSION then
+        return false, "the window must stay pinned one version wide: TOLERATED "
+            .. tostring(Protocol.SCHEMA_TOLERATED) .. " vs VERSION "
+            .. tostring(Protocol.SCHEMA_VERSION)
+    end
+    if Protocol.SCHEMA_TOLERATED ~= 3 then
+        return false, "the tolerance must accept v3 and stop there, got "
+            .. tostring(Protocol.SCHEMA_TOLERATED)
+    end
+
+    -- A genuine v1 payload: version byte 1, and NEITHER appended tail present.
+    local v1bytes = truncateTo(v3bytes, 1)
+    if #v1bytes ~= #v3bytes - V3_TAIL_BYTES - V2_TAIL_BYTES then
         return false, "v1 fixture is the wrong length"
     end
     local old, oerr = Protocol.DecodeCharacter(v1bytes)
@@ -739,35 +839,55 @@ local function testSchemaTolerance()
     if old.xp ~= 0 or old.xpMax ~= 0 or old.restedXP ~= 0 then
         return false, "absent v2 tail should read as 0, got " .. tostring(old.xp)
     end
-
-    -- v2 is unchanged by the tolerance: same bytes, same record.
-    local cur = Protocol.DecodeCharacter(v2bytes)
-    if not cur then return false, "v2 payload must still decode" end
-    local same, why = recordsMatch(rec, cur)
-    if not same then return false, "v2 behavior changed: " .. tostring(why) end
-
-    -- FORWARD TOLERANCE (release A of the v3 rollout). A v3 frame is the v2
-    -- layout plus an APPENDED tail, so it must decode to the IDENTICAL record a
-    -- v2 frame yields — the appended bytes are never read. Two fixtures prove it
-    -- is the append that is tolerated and not merely the version byte: a bare
-    -- restamp, and a restamp with arbitrary tail garbage after it.
-    local v3bare  = "\3" .. v2bytes:sub(2)
-    local v3tail  = v3bare .. "\255\0\1\254\170\7garbage\0\0"
-    for _, fixture in ipairs({ { "bare", v3bare }, { "with appended tail", v3tail } }) do
-        local newer, nerr = Protocol.DecodeCharacter(fixture[2])
-        if not newer then
-            return false, "a v3 payload (" .. fixture[1] .. ") must decode, got: " .. tostring(nerr)
-        end
-        local sameAsV2, why2 = recordsMatch(cur, newer)
-        if not sameAsV2 then
-            return false, "v3 (" .. fixture[1] .. ") must decode identically to v2: " .. tostring(why2)
-        end
+    -- ...and so does the absent v3 tail, by the SAME read-past-end contract.
+    if old.dmfCooldownRemaining ~= 0 then
+        return false, "absent v3 tail should read as 0 on a v1 frame, got "
+            .. tostring(old.dmfCooldownRemaining)
+    end
+    -- The FLAG still crosses on a v1/v2 frame — only the countdown is missing.
+    if old.dmfCooldownActive ~= true then
+        return false, "the v1 frame lost the dmf cooldown FLAG (it is a v1-era bit)"
     end
 
-    -- ...but the tolerance is exactly ONE version wide. v4 is refused cleanly —
+    -- v2: the whole record MINUS the v3 tail. Every v2-era field survives and the
+    -- appended countdown reads absent-as-0, i.e. "this sender never told us".
+    local v2bytes = truncateTo(v3bytes, 2)
+    local cur = Protocol.DecodeCharacter(v2bytes)
+    if not cur then return false, "a v2 payload must still decode" end
+    if cur.xp ~= rec.xp or cur.xpMax ~= rec.xpMax or cur.restedXP ~= rec.restedXP then
+        return false, "v2 payload lost a v2-era field"
+    end
+    if cur.dmfCooldownRemaining ~= 0 then
+        return false, "absent v3 tail should read as 0 on a v2 frame, got "
+            .. tostring(cur.dmfCooldownRemaining)
+    end
+    if cur.dmfCooldownActive ~= true then
+        return false, "the v2 frame lost the dmf cooldown FLAG"
+    end
+
+    -- v3: the record we encoded, whole, countdown included.
+    local now3, nerr = Protocol.DecodeCharacter(v3bytes)
+    if not now3 then return false, "our own v3 payload must decode: " .. tostring(nerr) end
+    local same, why = recordsMatch(rec, now3)
+    if not same then return false, "v3 round-trip differs: " .. tostring(why) end
+    if now3.dmfCooldownRemaining ~= 9000 then
+        return false, "the v3 countdown did not survive the wire, got "
+            .. tostring(now3.dmfCooldownRemaining)
+    end
+
+    -- A TRUNCATED v3 frame (the tail lost in transit) is the read-past-end
+    -- contract's own case: it must read 0 rather than error or half-decode.
+    local chopped = v3bytes:sub(1, #v3bytes - V3_TAIL_BYTES)
+    local cut, cerr = Protocol.DecodeCharacter(chopped)
+    if not cut then return false, "a v3 frame missing its tail must decode: " .. tostring(cerr) end
+    if cut.dmfCooldownRemaining ~= 0 then
+        return false, "a truncated v3 tail must read as 0, got " .. tostring(cut.dmfCooldownRemaining)
+    end
+
+    -- ...but the window is exactly ONE version wide. v4 is refused cleanly —
     -- nil plus a reason, never a partial record and never an error. Nothing
     -- constrains a schema two bumps out, so decoding it would be guessing.
-    local v4bytes = "\4" .. v2bytes:sub(2)
+    local v4bytes = "\4" .. v3bytes:sub(2)
     local future, ferr = Protocol.DecodeCharacter(v4bytes)
     if future ~= nil then return false, "a v4 payload must be rejected, not decoded" end
     if type(ferr) ~= "string" or not ferr:find("unsupported schema version 4", 1, true) then
@@ -777,23 +897,186 @@ local function testSchemaTolerance()
     -- Version 0 is not a schema: it is what an empty or truncated buffer reads
     -- as, and it must stay rejected rather than decode a record of zeroes.
     if Protocol.DecodeCharacter("") ~= nil then return false, "an empty buffer must be rejected" end
-    if Protocol.DecodeCharacter("\0" .. v2bytes:sub(2)) ~= nil then
+    if Protocol.DecodeCharacter("\0" .. v3bytes:sub(2)) ~= nil then
         return false, "version 0 must be rejected"
     end
+    return true
+end
 
-    -- THE ENCODER IS UNTOUCHED. Release A raises reader tolerance only: our own
-    -- frames must still go out stamped v2, or a peer that skipped this release
-    -- goes blind to us immediately instead of a release later.
-    if Protocol.SCHEMA_VERSION ~= 2 then
-        return false, "release A must not bump the ENCODER (SCHEMA_VERSION is "
-            .. tostring(Protocol.SCHEMA_VERSION) .. ")"
+-- ────────────────────────────────────────────────────────────────────────────
+-- GOLDEN BYTES: the v2 prefix of a v3 frame is FROZEN.
+--
+-- The append-at-tail contract is what lets an older reader decode a newer frame
+-- and stop early, and it is the sole justification for the truncate-and-restamp
+-- fixtures above. Asserting it against the encoder's own current output would be
+-- circular, so it is pinned against REAL BYTES captured from the v2 encoder
+-- before the bump: encode the fixture today, and every byte up to the appended
+-- u32 must still be what the v2 build wrote, with only the version byte moved
+-- from 2 to 3.
+--
+-- WHAT THIS CATCHES that nothing else does: a future edit that reorders a field,
+-- widens a u16 to a u32, inserts a value mid-record, or changes a string's
+-- length prefix. All of those still round-trip perfectly through our own
+-- encoder/decoder pair — and all of them silently corrupt every peer on an
+-- older build. This test is the only thing standing between that edit and the
+-- wire, so a failure here is a WIRE BREAK, never "the golden needs updating":
+-- regenerating the constant to make it pass would be deleting the guarantee.
+-- The ONLY legitimate reason to touch GOLDEN_V2 is a deliberate, documented
+-- schema break, and that is a bump-history entry plus a rollout plan, not a
+-- test edit.
+-- ────────────────────────────────────────────────────────────────────────────
+
+-- Captured 2026-08-07 from the SHIPPED v2 encoder (1.1.4, SCHEMA_VERSION = 2)
+-- for goldenFixture() below. 118 bytes, version byte included.
+local GOLDEN_V2 =
+        "\2\126\8\2\60\7\24\7\8\1\164\106\100\241\108\106" ..
+        "\100\240\187\106\100\201\48\106\100\242\52\106\100\242\52\106" ..
+        "\100\242\52\76\106\105\132\32\106\103\253\128\106\102\118\224" ..
+        "\3\1\14\16\1\0\3\28\32\2\1\10\0\120\0\2" ..
+        "\16\71\111\108\100\101\110\45\87\104\105\116\101\109\97\110" ..
+        "\101\7\87\97\114\108\111\99\107\16\82\101\110\100\32\83" ..
+        "\116\97\103\105\110\103\32\40\83\41\0\11\53\48\0\23" ..
+        "\74\128\0\5\210\160"
+
+-- The record GOLDEN_V2 was captured from. Every field is pinned literally: it
+-- must NOT drift with defaults, so nothing here is left to NewCharacterRecord
+-- except the shape itself.
+local function goldenFixture()
+    local rec = ns.Store.NewCharacterRecord("Golden-Whitemane")
+    rec.classTag, rec.className, rec.faction = "WARLOCK", "Warlock", "Horde"
+    rec.level, rec.boonCount, rec.shardCount = 60, 7, 24
+    rec.location = "Rend Staging (S)"
+    rec.inInstance, rec.isResting, rec.pvpFlagged = false, true, true
+    rec.pvpExpiry = 1785000300
+    rec.chronoboonActive, rec.chronoboonLastSeen = true, 1785000123
+    rec.itemCooldown, rec.hearthstoneCD = 1800, 420
+    rec.dmfInBoon, rec.dmfCooldownActive, rec.soulstoneReady = true, true, true
+    rec.dmfCooldown = { offlineSince = 1784990000 }
+    rec.raidLockouts = { MC = 1785200000, BWL = 1785300000, Ony = 1785100000 }
+    rec.auraStates = {
+        [1]  = { duration = 3600, option = 1, source = 0 },
+        [3]  = { duration = 7200, option = 2, source = 1 },
+        [10] = { duration = 120,  option = 0, source = 2 },
+    }
+    rec.lastSeen, rec.lastDataUpdate, rec.ownerEpoch = 1785000500, 1785000500, 1785000500
+    rec.xp, rec.xpMax, rec.restedXP = 734512, 1526400, 381600
+    return rec
+end
+
+local function testGoldenV2Prefix()
+    local rec = goldenFixture()
+    rec.dmfCooldownRemaining = 12345          -- the v3 tail, deliberately non-zero
+    local bytes = Protocol.EncodeCharacter(rec)
+    if not bytes then return false, "encoder produced nothing" end
+
+    -- 1. LENGTH. A v3 frame is the v2 frame plus exactly one appended u32.
+    if #bytes ~= #GOLDEN_V2 + V3_TAIL_BYTES then
+        return false, ("v3 frame must be exactly %d bytes longer than the v2 golden: got %d, expected %d")
+            :format(V3_TAIL_BYTES, #bytes, #GOLDEN_V2 + V3_TAIL_BYTES)
     end
-    if v2bytes:byte(1) ~= 2 then
-        return false, "our encoder must still stamp version 2, got "
-            .. tostring(v2bytes:byte(1))
+
+    -- 2. THE PREFIX, BYTE FOR BYTE. Only the version byte may differ, and only
+    --    from 2 to 3 — every other byte of the v2 layout is frozen.
+    if bytes:byte(1) ~= 3 then
+        return false, "the version byte must be 3, got " .. tostring(bytes:byte(1))
     end
-    if Protocol.SCHEMA_TOLERATED ~= Protocol.SCHEMA_VERSION + 1 then
-        return false, "the tolerance window must stay exactly one version wide"
+    local prefix = bytes:sub(2, #GOLDEN_V2)
+    local golden = GOLDEN_V2:sub(2)
+    if prefix ~= golden then
+        -- Name the first offending offset: "it differs" is useless at 118 bytes.
+        local at = 0
+        for i = 1, math.min(#prefix, #golden) do
+            if prefix:byte(i) ~= golden:byte(i) then at = i + 1 break end
+        end
+        return false, ("THE v2 PREFIX MOVED — this is a wire break, not a stale golden. "
+            .. "First difference at byte %d: got %s, golden %s")
+            :format(at, tostring(prefix:byte(at - 1)), tostring(golden:byte(at - 1)))
+    end
+
+    -- 3. THE TAIL is the appended u32, big-endian, and nothing else.
+    local tail = bytes:sub(#GOLDEN_V2 + 1)
+    local v = tail:byte(1) * 16777216 + tail:byte(2) * 65536 + tail:byte(3) * 256 + tail:byte(4)
+    if v ~= 12345 then
+        return false, "the appended v3 tail is not the countdown, decoded " .. tostring(v)
+    end
+
+    -- 4. And an OLD reader's view of our new frame is the golden record: cut the
+    --    tail, restamp to 2, and it is the v2 frame byte for byte.
+    if ("\2" .. bytes:sub(2, #GOLDEN_V2)) ~= GOLDEN_V2 then
+        return false, "a v2 peer's view of our v3 frame is not the frozen v2 frame"
+    end
+    return true
+end
+
+-- ────────────────────────────────────────────────────────────────────────────
+-- THE MIXED-VERSION MATRIX, asserted end to end.
+--
+-- Three cells, and the third one is a COST the owner accepted rather than a
+-- behaviour we want:
+--
+--   v3 reader x v2 frame  -> decodes; countdown absent-as-0 -> flag-only card.
+--   v3 reader x v3 frame  -> decodes; countdown present     -> countdown card.
+--   v2 reader x v3 frame  -> REFUSED. A build whose SCHEMA_TOLERATED is 2 (i.e.
+--                            Nexus 1.1.3 and earlier — 1.1.4 already tolerates
+--                            v3 via wave 1) drops our STATE frames entirely and
+--                            goes one-way blind to us until it updates.
+--
+-- That third row is the price of collapsing the two-release rollout into one
+-- deployment (owner decision 2026-08-07, "so we don't have multiple
+-- deployments"; NEXUS_SCHEMA_V3_DESIGN.md "Package as executed"). It is asserted
+-- HERE, through a fixture decoder running the real DecodeCharacter with the
+-- tolerance dialled back to 2, so the cost is documented in code that fails if
+-- anyone quietly changes what it means — not left as a paragraph in a design doc.
+-- ────────────────────────────────────────────────────────────────────────────
+local function testMixedVersionMatrix()
+    local rec = toleranceFixture()
+    local v3bytes = Protocol.EncodeCharacter(rec)
+    local v2bytes = truncateTo(v3bytes, 2)
+
+    -- ROW 1 — v3 reader, v2 frame. The record lands; the countdown does not, and
+    -- 0 is precisely the "render the flag alone" state the card already has.
+    local fromOld = Protocol.DecodeCharacter(v2bytes)
+    if not fromOld then return false, "row 1: a v2 peer's frame must still decode" end
+    if fromOld.dmfCooldownActive ~= true then
+        return false, "row 1: the v2 frame's dmf FLAG must still cross"
+    end
+    if fromOld.dmfCooldownRemaining ~= 0 then
+        return false, "row 1: a v2 frame must yield no countdown, got "
+            .. tostring(fromOld.dmfCooldownRemaining)
+    end
+
+    -- ROW 2 — v3 reader, v3 frame. Flag AND countdown.
+    local fromNew = Protocol.DecodeCharacter(v3bytes)
+    if not fromNew then return false, "row 2: our own v3 frame must decode" end
+    if fromNew.dmfCooldownActive ~= true or fromNew.dmfCooldownRemaining ~= 9000 then
+        return false, "row 2: a v3 frame must carry flag AND countdown, got "
+            .. tostring(fromNew.dmfCooldownRemaining)
+    end
+
+    -- ROW 3 — THE ACCEPTED COST. A pre-wave-1 reader (SCHEMA_TOLERATED = 2) run
+    -- against our v3 frame. Same real decoder, one constant dialled back, and
+    -- restored in every exit path below so a failure cannot leak the fixture
+    -- setting into the rest of the suite.
+    local realTolerance = Protocol.SCHEMA_TOLERATED
+    Protocol.SCHEMA_TOLERATED = 2
+    local refused, rerr = Protocol.DecodeCharacter(v3bytes)
+    local stillOK      = Protocol.DecodeCharacter(v2bytes)
+    Protocol.SCHEMA_TOLERATED = realTolerance
+
+    if refused ~= nil then
+        return false, "row 3: a v2-era reader must REFUSE a v3 frame outright "
+            .. "(if this now passes, the accepted cost changed and the CHANGELOG is wrong)"
+    end
+    if type(rerr) ~= "string" or not rerr:find("unsupported schema version 3", 1, true) then
+        return false, "row 3: the refusal must say why, got: " .. tostring(rerr)
+    end
+    -- ...and the blindness is ONE-WAY: that same old reader still reads an old
+    -- frame perfectly, so the mesh degrades on one edge rather than partitioning.
+    if not stillOK then
+        return false, "row 3: a v2-era reader must still read v2 frames"
+    end
+    if Protocol.SCHEMA_TOLERATED ~= realTolerance then
+        return false, "row 3: the fixture leaked its tolerance override"
     end
     return true
 end
@@ -808,7 +1091,9 @@ function Protocol.RunSelfTests(verbose)
         { name = "chunking",         fn = testChunking },
         { name = "state round-trip", fn = testRoundTrip },
         { name = "u16 clamp",        fn = testU16Clamp },
-        { name = "schema tolerance (NW-7 + v3 release A)", fn = testSchemaTolerance },
+        { name = "schema tolerance (NW-7 + v3 release B)", fn = testSchemaTolerance },
+        { name = "golden v2 prefix (append-at-tail)",      fn = testGoldenV2Prefix },
+        { name = "mixed-version matrix (J4)",              fn = testMixedVersionMatrix },
     }
     local allPass, results = true, {}
     for _, t in ipairs(suite) do

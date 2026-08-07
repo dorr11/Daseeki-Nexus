@@ -19,9 +19,28 @@
   for nothing. Each side now advertises everything it actually holds, so a converged mesh goes
   quiet. First-contact syncing is untouched: a peer that has never seen a namespace still pulls
   the whole thing.
-- **Changed:** Nexus now **understands the next character-data format a release early.** Nothing
-  it sends has changed — this is purely so that when the format does move, every client that
-  took this release keeps reading its peers instead of going one-way blind for a release cycle.
+- **Added:** **you can now see how long another account's Darkmoon fortune cooldown has left.**
+  Nexus knew whether a character of yours on another account was waiting on Sayge — it just
+  could not tell you *how long*, so every one of them read a flat "On CD" until it wasn't. The
+  remaining time now travels with the rest of the character's data and the cooldown row shows a
+  real countdown, in the same place and the same style as the hearthstone and chronoboon rows
+  right beside it. It keeps ticking between updates instead of sitting frozen, and it holds
+  still while the character is offline or has the fortune stashed in a chronoboon — because in
+  both of those cases the game isn't running the cooldown either. A character on an older
+  version of Nexus still shows the plain "On CD" it always did.
+- **Changed:** **the character-data format moves to version 3** to carry that countdown.
+  Everything else on the wire is byte-for-byte where it was, so nothing else about your data
+  changes and nothing needs converting. **Update every machine you run Nexus on.** A copy still
+  on 1.1.4 or older will not read character updates from a copy on 1.1.5 until you update it —
+  it keeps its last-known data and its own updates still reach you, so it goes quiet in one
+  direction rather than breaking. If all your accounts share one AddOns folder they all update
+  together and you will never see this.
+- **Fixed:** **an account's own live updates can no longer lose to a stale copy of themselves.**
+  The same repair as the bulk-data fix above, now applied to the moment-to-moment updates too:
+  when the account that owns a character sends its own update directly, it is trusted over
+  whatever we are holding, whatever the timestamps say. An update *forwarded* by a third
+  account still has to win on timestamp — anyone in the middle could have changed it — and a
+  character of your own account is still never overwritten from the network.
 - **Changed:** `/nexus debug mesh` gains an **owner-relay** line (claims received, stale records
   repaired, claims that failed the sender check).
 

@@ -2010,7 +2010,7 @@ end
 Tracker._dmfSeeded  = false   -- first capture only seeds the fresh-gain edge
 Tracker._dmfWasLive = false
 
-local function captureDMF(rec)
+local function captureDMFEdges(rec)
     local Store = ns.Store
     if not (Store and Store.DMFCooldownTick) then return end
     local now = Store.Now()
@@ -2046,6 +2046,36 @@ local function captureDMF(rec)
     end
 
     Store.DMFCooldownTick(rec, now, rec.nameRealm)
+end
+
+-- J4 / schema v3: publish the cooldown to the WIRE MIRROR.
+--
+-- The edges above own rec.dmfCooldown.remainingOnlineSecs, which is the engine's
+-- truth and is NOT something the binary STATE payload can carry (decode rebuilds
+-- rec.dmfCooldown as `{ offlineSince = u32 }` and nothing else). rec
+-- .dmfCooldownRemaining is the flat u32 the v3 tail DOES carry, and this is its
+-- ONE writer — the same relationship Store.RefreshItemCdMirrors has with the
+-- hearth/chrono epochs.
+--
+-- WHY IT IS WRITTEN HERE AND NOT AT SEND TIME. The value is only meaningful
+-- paired with the stamp a reader will decay it against, and that stamp is
+-- rec.lastDataUpdate, which this same capture pass re-writes. Deriving it again
+-- in Mesh.WireRecord would re-read the identical field one capture later and
+-- change nothing: unlike the item cooldowns (wall-clock, so they keep running
+-- between captures) the DMF cooldown only advances when DMFCooldownTick is
+-- called — i.e. exactly here.
+--
+-- WHY IT WRAPS RATHER THAN APPENDING TO THE BODY. captureDMFEdges returns early
+-- on three paths (teardown, the debuff-bar push clear, a store too old to have
+-- the A8 model). Every one of those CHANGES the cooldown, so every one must be
+-- published — and a wrapper cannot forget a fourth one added later.
+-- Store.DMFCooldownRemaining returns 0 when the cooldown is not active, so a
+-- clear publishes 0, which is the "nothing to report" the tail already means.
+local function captureDMF(rec)
+    captureDMFEdges(rec)
+    local Store = ns.Store
+    rec.dmfCooldownRemaining =
+        (Store and Store.DMFCooldownRemaining and Store.DMFCooldownRemaining(rec)) or 0
 end
 
 -- Exposed for the self-test harness (pure-Lua fixtures drive these directly;
@@ -5588,18 +5618,30 @@ local function testDMFCapture(fails)
     Tracker._captureDMF(rec)
     ck(rec.dmfCooldownActive == true, "fresh gain: cooldown started")
     ck(ns.Store.DMFCooldownRemaining(rec) == 14400, "fresh gain: a full 4h is owed")
+    -- J4 / schema v3: the capture publishes the WIRE MIRROR the encoder reads.
+    -- Without this the v3 tail ships 0 on every frame and the remote card silently
+    -- keeps its flag-only rendering forever — a failure with no symptom locally.
+    ck(rec.dmfCooldownRemaining == 14400,
+       "J4: a fresh gain must publish the wire mirror, got " .. tostring(rec.dmfCooldownRemaining))
 
     -- ...and holding it does not re-stamp on every capture.
     epochNow = EPOCH + 900
     Tracker._captureDMF(rec)
     ck(ns.Store.DMFCooldownRemaining(rec) == 13500,
        "holding the fortune: the tick decrements, it does not re-stamp")
+    ck(rec.dmfCooldownRemaining == 13500,
+       "J4: the mirror follows the tick (it is republished on every capture)")
 
     -- ---- teardown stamps the offline epoch ---------------------------------
     Tracker._loggingOut = true
     epochNow = EPOCH + 1000
     Tracker._captureDMF(rec)
     ck(rec.dmfCooldown.offlineSince == EPOCH + 1000, "teardown: offlineSince stamped")
+    -- J4: the teardown path RETURNS EARLY out of the edge logic, so the mirror is
+    -- published by the wrapper rather than by the body — which is the point of the
+    -- wrapper. The logout frame must carry the same number the record holds.
+    ck(rec.dmfCooldownRemaining == ns.Store.DMFCooldownRemaining(rec),
+       "J4: the teardown path skipped the wire mirror")
     Tracker._loggingOut = false
 
     -- ---- A8.4 debuff-bar push: the gate matrix (PURE) ----------------------
@@ -5625,6 +5667,11 @@ local function testDMFCapture(fails)
     Tracker._captureDMF(rec)
     ck(rec.dmfCooldownActive == false, "push: the capture path clears the cooldown")
     ck((Tracker._dmfPushes or 0) == before + 1, "push: the event is counted")
+    -- J4: the push-clear path also returns early. A cleared cooldown must publish
+    -- 0 — a mirror left holding the old countdown would keep peers showing a
+    -- timer for a cooldown that is over.
+    ck(rec.dmfCooldownRemaining == 0,
+       "J4: the debuff-push clear must publish 0, got " .. tostring(rec.dmfCooldownRemaining))
     nDebuffs = 0
 
     -- ---- A8.4 announcement routing (PURE) ----------------------------------

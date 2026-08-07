@@ -332,6 +332,12 @@ function Import._MapCharacterRecord(sn)
         dmfInBoon          = sn.dmfInBoon or false,
         dmfCooldownActive  = sn.dmfCooldownActive or false,
         dmfCooldown        = { offlineSince = dmfOffline },
+        -- Schema v3's wire mirror. ShadowNetwork carries the FLAG and no
+        -- remaining, so an imported record honestly reports "no countdown
+        -- known" (0) and the card keeps the flag-only rendering — the same
+        -- state a pre-1.1.5 peer's frame produces. Stated rather than left
+        -- absent so the imported shape matches Store.NewCharacterRecord.
+        dmfCooldownRemaining = 0,
         raidLockouts       = deepCopy(sn.raidLockouts) or {},
         auraStates         = mapAuraStates(sn.auraStates),
         lastSeen           = sn.lastSeenEpoch or 0,

@@ -582,15 +582,69 @@ end
 -- Contract kept exactly as the UI expects:
 --   not on cooldown       -> 0   (callers render "READY")
 --   on cooldown, rem > 0  -> the remaining seconds
---   on cooldown, rem == 0 -> 0   (callers render "on CD"; this is the remote /
---                                 legacy case, where the real remaining is not
---                                 something we can know — see the tri-state note
---                                 on Store.DMFCooldownRemaining)
-local function dmfCooldownRemaining(rec, nowE)
-    if ns.Store and ns.Store.DMFCooldownRemaining then
-        return ns.Store.DMFCooldownRemaining(rec, nowE) or 0
+--   on cooldown, rem == 0 -> 0   (callers render "on CD"; the sender told us the
+--                                 cooldown is running but not how much is left)
+--
+-- J4 / schema v3 — THE REMOTE COUNTDOWN, and the single choke point for it.
+--
+-- Until v3 the binary STATE payload carried the dmfCooldownActive FLAG and
+-- nothing else, so every remote character rendered the bare "On CD" third label
+-- however long they actually had left. v3 appends the remaining seconds, the
+-- tracker publishes it into rec.dmfCooldownRemaining on every capture, and this
+-- is where it becomes a countdown.
+--
+-- THE VALUE IS A CAPTURE-TIME READING, exactly like an aura duration, so it is
+-- decayed on the SAME rules as Dashboard.AuraRemaining (A6.8/A7.6) rather than
+-- rendered raw:
+--   * BOONED (rec.dmfInBoon)  -> FROZEN. The game does not run the cooldown
+--                                against a fortune stashed in a chronoboon, so a
+--                                countdown there would imply time is passing when
+--                                it is not. (Callers render "In Boon" and never
+--                                reach the number — this is belt and braces.)
+--   * OFFLINE character       -> FROZEN. This is a 14,400 s ONLINE-TIME cooldown;
+--                                a logged-out peer is not burning it, and
+--                                wall-clock decay would invent progress they have
+--                                not made. Same rule the aura path applies, and
+--                                for the same reason.
+--   * no lastDataUpdate       -> FROZEN. With no reference stamp there is nothing
+--                                honest to decay against (Store.ItemCdRemaining's
+--                                legacy branch makes the identical call).
+--   * ONLINE character        -> stored - (now - lastDataUpdate), floored at 0,
+--                                via Dashboard.DecayRemaining — the same helper
+--                                every other capture-time remaining goes through.
+--
+-- PRECEDENCE. The wire mirror is preferred over rec.dmfCooldown.remainingOnlineSecs
+-- because it is the field that is guaranteed fresh: a STATE push REPLACES the
+-- record and Store.CarryNonWireFields carries the old sub-table accounting
+-- forward, so remainingOnlineSecs on a remote record can be an older reading
+-- than the frame that just arrived. The sub-table is still the fallback, and it
+-- is what our OWN characters and SEGMENT-borne records from a v2 peer carry.
+--
+-- `online` may be passed by a caller that already computed it (the card gather
+-- stamps entry.online); otherwise it is resolved through Dashboard.IsOnline.
+-- Returns 0 for "no countdown to show", which is the flag-only rendering.
+function Dashboard.DMFCooldownRemaining(rec, nowE, online)
+    if type(rec) ~= "table" then return 0 end
+    if not rec.dmfCooldownActive then return 0 end
+
+    local stored = tonumber(rec.dmfCooldownRemaining) or 0
+    if stored <= 0 then
+        -- No wire mirror: our own record's live accounting, or a v2 peer's
+        -- SEGMENT record, or nothing at all (-> 0 -> "On CD", today's rendering).
+        stored = (ns.Store and ns.Store.DMFCooldownRemaining
+                  and ns.Store.DMFCooldownRemaining(rec, nowE)) or 0
     end
-    return 0
+    if stored <= 0 then return 0 end
+
+    if rec.dmfInBoon then return math.floor(stored) end          -- frozen in the boon
+
+    local ref = tonumber(rec.lastDataUpdate) or 0
+    if ref <= 0 then return math.floor(stored) end                -- no honest reference
+
+    if online == nil then online = Dashboard.IsOnline(rec, rec.nameRealm) end
+    if not online then return math.floor(stored) end              -- offline: not ticking
+
+    return Dashboard.DecayRemaining(stored, ref, nowE)
 end
 
 ----------------------------------------------------------------------
@@ -2174,6 +2228,75 @@ local function testAuraDisplayDecay(fails)
     ck(cell and cell.source == BOON, "returns the raw cell alongside the remaining")
 end
 
+-- J4 / schema v3 — THE REMOTE DMF COUNTDOWN.
+--
+-- The wire mirror is a capture-time reading, so it obeys the SAME decay rules the
+-- aura path above proves, for the same reasons. The rows that matter most are the
+-- two FALLBACKS: zero (or absent) must read as 0 so the card keeps the flag-only
+-- rendering it has always had for a v1/v2 sender, and an OFFLINE peer must freeze
+-- rather than wall-clock away an ONLINE-TIME cooldown they are not burning.
+local function testDMFRemoteCountdown(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local T = 1700000000
+
+    local function remote(mirror, upd, extra)
+        local r = { nameRealm = "Peer-Whitemane", lastDataUpdate = upd or T,
+                    lastSeen = upd or T, dmfCooldownActive = true,
+                    dmfCooldown = { offlineSince = 0 },      -- what decode rebuilds
+                    dmfCooldownRemaining = mirror }
+        for k, v in pairs(extra or {}) do r[k] = v end
+        return r
+    end
+
+    -- ONLINE: the received number ages against the stamp it was true at.
+    local r = remote(9000)
+    ck(Dashboard.DMFCooldownRemaining(r, T, true) == 9000, "online, no elapsed -> unchanged")
+    ck(Dashboard.DMFCooldownRemaining(r, T + 600, true) == 8400,
+       "online: 600s since the owner's last update -> 600s off the countdown")
+    ck(Dashboard.DMFCooldownRemaining(r, T + 99999, true) == 0,
+       "online: floors at 0 (which renders as the flag-only 'On CD'), never negative")
+
+    -- OFFLINE: FROZEN. This is a 14,400s ONLINE-TIME cooldown — a logged-out peer
+    -- is not burning it, so decaying would invent progress they have not made.
+    ck(Dashboard.DMFCooldownRemaining(r, T + 600, false) == 9000,
+       "offline: FROZEN — an online-time cooldown does not run against wall clock")
+    ck(Dashboard.DMFCooldownRemaining(r, T + 99999, false) == 9000, "offline: still frozen much later")
+
+    -- BOONED: frozen for everyone (the game does not run the CD against a stashed
+    -- fortune). Callers render "In Boon" and never reach the number; belt-and-braces.
+    ck(Dashboard.DMFCooldownRemaining(remote(9000, T, { dmfInBoon = true }), T + 600, true) == 9000,
+       "booned: frozen even while online")
+
+    -- NO REFERENCE STAMP: nothing honest to decay against, so freeze.
+    ck(Dashboard.DMFCooldownRemaining(remote(9000, 0), T + 600, true) == 9000,
+       "no lastDataUpdate: frozen rather than decayed off epoch 0")
+    -- Clock skew the other way must not inflate the countdown either.
+    ck(Dashboard.DMFCooldownRemaining(remote(9000, T + 500), T, true) == 9000,
+       "clock skew: elapsed clamps at 0")
+
+    -- THE v2-SENDER FALLBACK. No mirror on the wire -> 0 -> the card keeps the
+    -- flag-only "On CD" it rendered before this feature existed.
+    ck(Dashboard.DMFCooldownRemaining(remote(0), T, true) == 0,
+       "a v2 sender's frame (mirror 0) must yield no countdown")
+    local noField = remote(nil)
+    noField.dmfCooldownRemaining = nil
+    ck(Dashboard.DMFCooldownRemaining(noField, T, true) == 0,
+       "an absent mirror must yield no countdown")
+
+    -- ...but the SUB-TABLE accounting is still the fallback, so our own records
+    -- and a v2 peer's SEGMENT record (whole table, remainingOnlineSecs included)
+    -- still produce a countdown.
+    local seg = remote(0)
+    seg.dmfCooldown = { offlineSince = 0, remainingOnlineSecs = 7200, lastTickEpoch = T }
+    ck(Dashboard.DMFCooldownRemaining(seg, T + 600, true) == 6600,
+       "the segment/local sub-table is still the fallback source")
+
+    -- NOT ON COOLDOWN outranks any leftover number: callers render "Ready".
+    local ready = remote(9000); ready.dmfCooldownActive = false
+    ck(Dashboard.DMFCooldownRemaining(ready, T, true) == 0, "no active cooldown -> 0 (Ready)")
+    ck(Dashboard.DMFCooldownRemaining(nil, T, true) == 0, "nil record -> 0, no error")
+end
+
 -- CROSS-BUCKET ROSTER DEDUP (owner bug: one character, two cards, both green,
 -- after a third account joined the mesh under a new AID). Exercises the pure
 -- tiebreak chain, the GatherRoster fold, and the Detail.Resolve agreement that
@@ -2399,6 +2522,7 @@ end
             { name = "fixed buff-time rule (settings rework item 4)", fn = testBuffTimeRule },
             { name = "cooldown decay", fn = testDecayRemaining },
             { name = "aura display decay (A6.8/A7.6)", fn = testAuraDisplayDecay },
+            { name = "remote dmf countdown (J4)", fn = testDMFRemoteCountdown },
             { name = "dmf schedule", fn = testDMFSchedule },
             { name = "online exclusivity", fn = testOnlineExclusivity },
             { name = "mesh presence + 15s window (A1.1/A1.2)", fn = testMeshPresence },
