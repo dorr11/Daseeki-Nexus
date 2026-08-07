@@ -1280,25 +1280,57 @@ end
 
 -- Reverse index of every character the store already knows -> its account id
 -- (the characters bucket wins over homeless). Used to attribute NIT runs.
+--
+-- CLASS 8 / NX-9 — AN EXPLICIT WINNER RULE, not iteration luck.
+--
+-- What this used to do: one interleaved `pairs(accounts)` walk in which
+-- `characters` wrote LAST-wins and `homeless` wrote first-wins. Two things
+-- followed. (1) A Name-Realm held by more than one account — the ordinary
+-- residue of an account re-set-up under a new AID, and the exact state
+-- Store's phantom cleanup exists for — was attributed to whichever bucket the
+-- walk happened to reach last, so a NIT run's owner FLIPPED between sessions and
+-- the instance meter it counted against flipped with it. (2) The header's own
+-- claim, "the characters bucket wins over homeless", was not actually true
+-- across accounts: a later account's `characters` pass could overwrite an
+-- earlier account's `homeless` win, but never the reverse.
+--
+-- The rule now, stated rather than emergent, and matching Brief C's `aidForName`
+-- (NXM-5) precedent — attribution settles on the LOWEST account id, because an
+-- owner that drifts is worse than one that is arbitrary but fixed:
+--   1. a real `characters` bucket beats any `homeless` bucket, everywhere;
+--   2. within each of those, the lowest account id wins.
+-- Two ordered passes give exactly that, and the account walk is aid-sorted so
+-- "first" and "lowest" are the same thing.
 local function buildOwnerIndex()
     local idx = {}
     local Store = ns.Store
     local data = Store and Store.GetData and Store.GetData()
     local accounts = data and data.accounts
-    if type(accounts) == "table" then
-        for aid, bucket in pairs(accounts) do
-            if type(bucket) == "table" then
-                if type(bucket.characters) == "table" then
-                    for nameRealm in pairs(bucket.characters) do idx[nameRealm] = aid end
-                end
-                if type(bucket.homeless) == "table" then
-                    for nameRealm in pairs(bucket.homeless) do if idx[nameRealm] == nil then idx[nameRealm] = aid end end
-                end
+    if type(accounts) ~= "table" then return idx end
+
+    local aids = ns.SortedAIDs(accounts)
+    -- Pass 1: real characters, lowest aid wins.
+    for i = 1, #aids do
+        local bucket = accounts[aids[i]]
+        if type(bucket) == "table" and type(bucket.characters) == "table" then
+            for nameRealm in pairs(bucket.characters) do
+                if idx[nameRealm] == nil then idx[nameRealm] = aids[i] end
+            end
+        end
+    end
+    -- Pass 2: homeless records fill only what no characters bucket claimed.
+    for i = 1, #aids do
+        local bucket = accounts[aids[i]]
+        if type(bucket) == "table" and type(bucket.homeless) == "table" then
+            for nameRealm in pairs(bucket.homeless) do
+                if idx[nameRealm] == nil then idx[nameRealm] = aids[i] end
             end
         end
     end
     return idx
 end
+-- Exposed so the suite can drive the SHIPPING index builder rather than a copy.
+Import._BuildOwnerIndex = buildOwnerIndex
 
 -- Merge the mapped NIT partial into the live Store.data.instances, idempotently
 -- (Instances.MergeEntryList dedups by t and caps to the 60-ring). Returns added.
@@ -2489,6 +2521,105 @@ local function selfTest(verbose)
         Store.data       = savedStoreData
         G["NITdatabase"] = savedNIT
         ns.Print         = savedPrint
+    end
+
+    ------------------------------------------------------------------
+    -- NX-9 (CLASS 8): the owner index has an explicit winner rule.
+    --
+    -- This index answers "whose run was that?" for every imported NIT record,
+    -- and the answer decides which account's instance meter the run counts
+    -- against. It used to be one interleaved `pairs(accounts)` walk with
+    -- `characters` writing LAST-wins, so a Name-Realm held by two accounts —
+    -- the ordinary residue of an account re-set-up under a new AID — was
+    -- attributed to whichever bucket the walk happened to reach last, and the
+    -- attribution FLIPPED between sessions.
+    --
+    -- The rule now: a real `characters` bucket beats any `homeless` bucket
+    -- everywhere, and within each, the LOWEST account id wins (Brief C's
+    -- `aidForName` precedent — attribution must not drift).
+    ------------------------------------------------------------------
+    do
+        local OF = ns.OrderFixture
+        local Store = ns.Store
+        local savedData = Store.data
+        local DUP = "Twinned-Whitemane"
+
+        -- Thirty account buckets, all holding a copy of DUP: aids 2 and 9 hold
+        -- theirs as HOMELESS records, everyone else in `characters`. Thirty is
+        -- the size at which the three insertion histories genuinely diverge.
+        local aids = {}
+        for i = 1, 30 do aids[i] = tostring(i) end
+        local function mkBucket(aid)
+            local rec = { nameRealm = DUP, level = 60 }
+            if aid == "2" or aid == "9" then
+                return { characters = { [("Solo%s-Whitemane"):format(aid)] = {} },
+                         homeless   = { [DUP] = rec } }
+            end
+            return { characters = { [DUP] = rec }, homeless = {} }
+        end
+        local A1, A2, A3 = OF.Histories(aids, mkBucket)
+
+        check("NX-9 fixture is not divergent — the three accounts-graph insertion "
+            .. "histories walked in the same pairs() order, so this row proves nothing",
+            OF.Divergent(A1, A2, A3))
+
+        local function ownerOf(accounts)
+            Store.data = { accounts = accounts }
+            return Import._BuildOwnerIndex()[DUP]
+        end
+        local o1, o2, o3 = ownerOf(A1), ownerOf(A2), ownerOf(A3)
+        check("NX-9: the attributed owner differed across insertion histories — an "
+            .. "imported run changes accounts between sessions",
+            o1 == o2 and o2 == o3)
+        check("NX-9: the winner is the LOWEST account id holding a real record (got "
+            .. tostring(o1) .. ", expected 1)", o1 == "1")
+
+        -- RED CONTROL: the pre-fix builder, verbatim, on the same three
+        -- histories. It must disagree with itself, or the row above is proving
+        -- nothing about the defect it was written for.
+        local function preFix(accounts)
+            local idx = {}
+            for aid, bucket in pairs(accounts) do
+                if type(bucket.characters) == "table" then
+                    for nameRealm in pairs(bucket.characters) do idx[nameRealm] = aid end
+                end
+                if type(bucket.homeless) == "table" then
+                    for nameRealm in pairs(bucket.homeless) do
+                        if idx[nameRealm] == nil then idx[nameRealm] = aid end
+                    end
+                end
+            end
+            return idx[DUP]
+        end
+        local r1, r2, r3 = preFix(A1), preFix(A2), preFix(A3)
+        check("NX-9 RED CONTROL: the pre-fix last-wins builder agreed with itself "
+            .. "across all three histories — this fixture would not have caught it",
+            not (r1 == r2 and r2 == r3))
+
+        -- The documented rule "the characters bucket wins over homeless" was
+        -- never actually true across accounts before: a later account's
+        -- `characters` pass could overwrite an earlier account's `homeless` win,
+        -- but never the reverse. Now it holds in both directions.
+        local homelessLow = {
+            ["1"] = { characters = {}, homeless = { [DUP] = { nameRealm = DUP } } },
+            ["8"] = { characters = { [DUP] = { nameRealm = DUP } }, homeless = {} },
+        }
+        Store.data = { accounts = homelessLow }
+        check("NX-9: a real characters record beats a LOWER-aid homeless one",
+            Import._BuildOwnerIndex()[DUP] == "8")
+
+        Store.data = { accounts = {
+            ["4"] = { characters = {}, homeless = { [DUP] = { nameRealm = DUP } } },
+            ["7"] = { characters = {}, homeless = { [DUP] = { nameRealm = DUP } } },
+        } }
+        check("NX-9: with only homeless copies, the lowest aid still wins",
+            Import._BuildOwnerIndex()[DUP] == "4")
+
+        Store.data = nil
+        check("NX-9: no store at all yields an empty index rather than an error",
+            next(Import._BuildOwnerIndex()) == nil)
+
+        Store.data = savedData
     end
 
     if verbose and ns.Print then

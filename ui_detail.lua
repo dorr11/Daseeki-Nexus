@@ -481,8 +481,12 @@ end
 -- deduped) card could then open a two-week-old copy of the character while the
 -- card beside it showed the live one. One winner, both surfaces.
 --
--- The scan below survives as the fallback for a host where ns.Dashboard has not
--- loaded (this file is reachable from the headless suites before the shell is).
+-- BRIEF E (NX-14). The fallback below — reached on a host where ns.Dashboard has
+-- not loaded, since this file is reachable from the headless suites before the
+-- shell is — was ITSELF the first-`pairs()`-hit lottery this function exists to
+-- have retired. It now asks the same store-level rule the shell asks
+-- (Store.ResolveOwner), so the two branches of this function can no longer
+-- disagree with each other, let alone with the roster.
 function Detail.Resolve(nameRealm)
     local D = ns.Dashboard
     if D and D.ResolveRosterOwner then
@@ -490,14 +494,9 @@ function Detail.Resolve(nameRealm)
         if rec then return rec, aid end
         return nil
     end
-    local data = ns.Store and ns.Store.GetData and ns.Store.GetData()
-    if not data or not data.accounts then return nil end
-    for aid, bucket in pairs(data.accounts) do
-        local rec = (bucket.characters and bucket.characters[nameRealm])
-                 or (bucket.homeless and bucket.homeless[nameRealm])
-        if rec then return rec, aid end
-    end
-    return nil
+    local Store = ns.Store
+    if not (Store and Store.ResolveOwner and Store.GetData) then return nil end
+    return Store.ResolveOwner(Store.GetData(), nameRealm)
 end
 
 -- Resolve an item's inventory-icon texture through the shared ns.Dashboard.ItemIcon
@@ -1653,9 +1652,79 @@ local function testNoteCommit(fails)
     S.SetNote(NR, "")
 end
 
+----------------------------------------------------------------------
+-- NX-14 (CLASS 8): Detail.Resolve agrees with the roster — on BOTH branches.
+--
+-- The shell-present branch was fixed earlier (it delegates to the roster's own
+-- winner). The FALLBACK — reached whenever ns.Dashboard has not loaded, which is
+-- exactly the frameless host `_test_detail.lua` exists to model — was still the
+-- first-`pairs()`-hit lottery, so the one host with no shell to disagree with
+-- could disagree with the store instead. Both branches now ask
+-- Store.ResolveOwner, so the two cannot diverge from each other or from the card.
+----------------------------------------------------------------------
+local function testResolveAgreement(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local OF = ns.OrderFixture
+    local S = ns.Store
+    local NAME = "Twinned-Whitemane"
+
+    local savedData = S.data
+    local aids = {}
+    for i = 1, 30 do aids[i] = tostring(i) end
+    local function mkBucket(aid)
+        local rec = { nameRealm = NAME, ownerEpoch = 1000, lastDataUpdate = 1000, aidTag = aid }
+        if aid == "17" then
+            rec = { nameRealm = NAME, ownerEpoch = 8888, lastDataUpdate = 8888, aidTag = aid }
+        end
+        return { characters = { [NAME] = rec }, homeless = {} }
+    end
+    local A1, A2, A3 = OF.Histories(aids, mkBucket)
+    ck(OF.Divergent(A1, A2, A3),
+        "NX-14 fixture is not divergent — the three accounts-graph insertion histories "
+        .. "walked in the same pairs() order, so this row proves nothing")
+
+    -- The FALLBACK branch, driven the way the frameless host reaches it.
+    local savedDash = ns.Dashboard
+    ns.Dashboard = nil
+    local function fallback(accounts)
+        S.data = { accounts = accounts }
+        local rec = Detail.Resolve(NAME)
+        return rec and rec.aidTag or "nil"
+    end
+    local f1, f2v, f3 = fallback(A1), fallback(A2), fallback(A3)
+    ns.Dashboard = savedDash
+
+    ck(f1 == f2v and f2v == f3,
+        "NX-14: the no-shell fallback picked a different copy per insertion history")
+    ck(f1 == "17",
+        "NX-14: the fallback picks the freshest copy, same as the roster (got " .. f1 .. ")")
+
+    -- And the two branches must agree with each other on the same store.
+    S.data = { accounts = A1 }
+    local shellRec = Detail.Resolve(NAME)
+    ck(shellRec and shellRec.aidTag == "17",
+        "NX-14: the shell branch picks the same copy the fallback does")
+    ck(Detail.Resolve("Nobody-Whitemane") == nil, "NX-14: an unheld name resolves to nothing")
+
+    -- RED CONTROL: the code this replaced, on the same three histories.
+    local function preFix(accounts)
+        for _, b in pairs(accounts) do
+            local rec = (b.characters and b.characters[NAME]) or (b.homeless and b.homeless[NAME])
+            if rec then return rec.aidTag end
+        end
+    end
+    local p1, p2, p3 = preFix(A1), preFix(A2), preFix(A3)
+    ck(not (p1 == p2 and p2 == p3),
+        "NX-14 RED CONTROL: the pre-fix first-pairs()-hit fallback agreed with itself "
+        .. "across all three histories — this fixture would not have caught the bug")
+
+    S.data = savedData
+end
+
 if ns.RegisterSelfTest then
     ns:RegisterSelfTest("detail", function(verbose)
         local cases = {
+            { name = "resolve agreement (NX-14)", fn = testResolveAgreement },
             { name = "note commit/escape", fn = testNoteCommit },
             { name = "dmf cooldown state", fn = testDMFCooldownState },
             { name = "buff display matrix", fn = testBuffMatrix },

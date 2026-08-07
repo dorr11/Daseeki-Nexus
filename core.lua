@@ -37,6 +37,128 @@ function ns:SafeCall(fn, ...)
 end
 
 ----------------------------------------------------------------------
+-- DETERMINISTIC ITERATION (CLASS 8) — the suite-wide primitives.
+--
+-- `pairs()` order is a property of a table's LIFETIME (insertion history,
+-- resizes, deletions), not of its content. Two clients holding IDENTICAL data
+-- walk it differently, and so does the SAME client across two sessions. That is
+-- harmless for a walk that visits everything and judges each entry
+-- independently; it is a defect the moment the walk is TRUNCATED (a ceiling
+-- decides who survives), RETRIED (a bounded queue decides who is served), or
+-- FIRST-MATCH-WINS (iteration order decides identity).
+--
+-- THE HOUSE RULE, from friends.lua:423 (`Plan`) and Brief C's mesh helpers:
+-- SORT BEFORE THE CEILING. Truncating an unsorted walk re-rolls the surviving
+-- subset per call; truncating a sorted one keeps the same subset every call.
+--
+-- These live in core.lua rather than in a feature file because the sites that
+-- need them span the whole tree (mesh, friends, store, import, timers, the two
+-- UI panels) and core.lua is the one file every headless runner loads first.
+-- Brief C's `Mesh.SortedKeys` is this same function under its mesh-local name.
+----------------------------------------------------------------------
+
+-- Sorted key list for a map, optionally truncated — with the sort applied BEFORE
+-- the ceiling, so `limit` keeps a stable subset rather than an arbitrary one.
+-- String keys only (every keyed map that reaches a ceiling in this addon is
+-- string-keyed: ownerKeys, namespace keys, account ids, Name-Realms, addon ids).
+-- `pred(key, value)` optionally filters BEFORE the sort, so a caller's own
+-- eligibility rule cannot reintroduce iteration luck by filtering afterwards.
+function ns.SortedKeys(tbl, limit, pred)
+    local out = {}
+    if type(tbl) ~= "table" then return out end
+    for k, v in pairs(tbl) do
+        if type(k) == "string" and (not pred or pred(k, v)) then
+            out[#out + 1] = k
+        end
+    end
+    table.sort(out)
+    if limit and #out > limit then
+        for i = #out, limit + 1, -1 do out[i] = nil end
+    end
+    return out
+end
+
+-- Account-id order. Account ids are 1-2 digit NUMERIC strings, so a plain string
+-- sort puts "10" before "2" and the owner reads their own accounts out of order.
+-- Numeric ids sort numerically and beat non-numeric ones; the "" orphan bucket
+-- sorts last of all. This is the single ordering used for every account walk
+-- (roster winner tiebreak, the instances panel, the debug print).
+function ns.AIDLess(a, b)
+    a, b = a or "", b or ""
+    if a == b then return false end
+    local na, nb = tonumber(a), tonumber(b)
+    if na and nb then return na < nb end
+    if na then return true end          -- numeric beats non-numeric
+    if nb then return false end
+    return a < b
+end
+
+-- Account ids of a map, in ns.AIDLess order, sorted before any ceiling.
+function ns.SortedAIDs(tbl, limit, pred)
+    local out = {}
+    if type(tbl) ~= "table" then return out end
+    for k, v in pairs(tbl) do
+        if type(k) == "string" and (not pred or pred(k, v)) then
+            out[#out + 1] = k
+        end
+    end
+    table.sort(out, ns.AIDLess)
+    if limit and #out > limit then
+        for i = #out, limit + 1, -1 do out[i] = nil end
+    end
+    return out
+end
+
+----------------------------------------------------------------------
+-- THE FIXTURE KIT FOR CLASS-8 ROWS (test-only; ships inert).
+--
+-- A determinism test that builds its table ONCE proves nothing: it observes one
+-- `pairs()` order and calls it stable. So every Class-8 fixture in this addon is
+-- built THREE TIMES from three different insertion histories (forward, reverse,
+-- and decoys-inserted-then-deleted-then-interleaved) holding IDENTICAL content,
+-- and is required to PROVE ITSELF divergent — a fixture whose three histories
+-- happen to walk the same way makes its row VACUOUS, which is a failure, not a
+-- pass. Transcribed from Brief C's mesh-local kit (mesh.lua §CLASS 8) so every
+-- brief's rows clear the same bar.
+----------------------------------------------------------------------
+ns.OrderFixture = {}
+
+-- Raw pairs() walk of a map, as a comparable string.
+function ns.OrderFixture.RawWalk(t)
+    local out = {}
+    for k in pairs(t) do out[#out + 1] = tostring(k) end
+    return table.concat(out, ",")
+end
+
+-- An ordered list, as a comparable string.
+function ns.OrderFixture.Seq(list)
+    local out = {}
+    for i = 1, #(list or {}) do out[i] = tostring(list[i]) end
+    return table.concat(out, ",")
+end
+
+-- Build one map three ways from the same keys. `mk(key)` produces the value.
+function ns.OrderFixture.Histories(keys, mk)
+    mk = mk or function() return true end
+    local A, B, C = {}, {}, {}
+    for i = 1, #keys do A[keys[i]] = mk(keys[i]) end                 -- forward
+    for i = #keys, 1, -1 do B[keys[i]] = mk(keys[i]) end             -- reverse
+    for i = 1, #keys do C["\1decoy" .. i] = true end                 -- churn the
+    for i = 1, #keys do C["\1decoy" .. i] = nil end                  -- table's shape
+    for i = 2, #keys, 2 do C[keys[i]] = mk(keys[i]) end              -- evens, then
+    for i = 1, #keys, 2 do C[keys[i]] = mk(keys[i]) end              -- odds
+    return A, B, C
+end
+
+-- True when the three histories really do walk differently — i.e. the fixture is
+-- unkind enough for the row built on it to mean something.
+function ns.OrderFixture.Divergent(A, B, C)
+    local RawWalk = ns.OrderFixture.RawWalk
+    local a, b, c = RawWalk(A), RawWalk(B), RawWalk(C)
+    return not (a == b and b == c)
+end
+
+----------------------------------------------------------------------
 -- Cross-addon API guard  (ROLLOUT_CONTINUITY_AUDIT NW-6 / release gate D-13)
 --
 -- Nexus declares "## Dependencies: Daseeki-Core", which guarantees SOME Core is
@@ -434,7 +556,68 @@ ns:RegisterSelfTest("core", function(verbose)
     ns.Print = realPrint
     G.DaseekiSuite = savedSuite
 
-    if verbose and pass then ns:Print("  PASS core/parse-whisper + coreapi guard") end
+    ------------------------------------------------------------------
+    -- CLASS 8 (BRIEF E): the shared ordering primitives, and the fixture kit
+    -- every Class-8 row in this addon is built on.
+    --
+    -- These are asserted HERE, once, because six sites across five files now
+    -- lean on them: if `ns.SortedKeys` ever stopped sorting before its ceiling,
+    -- every one of those rows would go quietly wrong at scale, and each would
+    -- have to rediscover it.
+    ------------------------------------------------------------------
+    local OF = ns.OrderFixture
+    local keys = {}
+    for i = 1, 40 do keys[i] = string.format("Key%02d", i) end
+    local A, B, C = OF.Histories(keys)
+
+    -- THE FIXTURE MUST PROVE ITSELF. If the three insertion histories walked
+    -- identically, every assertion built on them would be vacuous — a pass that
+    -- means nothing is worse than a failure, so this is a FAILURE.
+    ck(OF.Divergent(A, B, C),
+        "fixture kit: the three insertion histories did NOT diverge under pairs() — "
+        .. "every Class-8 row built on this kit would be vacuous")
+
+    ck(OF.Seq(ns.SortedKeys(A)) == OF.Seq(ns.SortedKeys(B))
+        and OF.Seq(ns.SortedKeys(B)) == OF.Seq(ns.SortedKeys(C)),
+        "SortedKeys: same content, three lifetimes, one order")
+
+    -- SORT BEFORE THE CEILING is the whole rule: a truncated walk must keep the
+    -- SAME subset every call, not merely a same-sized one.
+    local cap = 7
+    local tA, tB, tC = ns.SortedKeys(A, cap), ns.SortedKeys(B, cap), ns.SortedKeys(C, cap)
+    ck(#tA == cap, "SortedKeys: the ceiling is honoured")
+    ck(OF.Seq(tA) == OF.Seq(tB) and OF.Seq(tB) == OF.Seq(tC),
+        "SortedKeys: the SURVIVING SUBSET is stable across insertion histories")
+    ck(OF.Seq(tA) == "Key01,Key02,Key03,Key04,Key05,Key06,Key07",
+        "SortedKeys: the survivors are the sorted head, not an arbitrary slice")
+
+    -- The predicate filters BEFORE the sort, so a caller's eligibility rule
+    -- cannot smuggle iteration order back in ahead of the ceiling.
+    local pA = ns.SortedKeys(A, 3, function(k) return k:sub(-1) == "0" end)
+    local pC = ns.SortedKeys(C, 3, function(k) return k:sub(-1) == "0" end)
+    ck(OF.Seq(pA) == "Key10,Key20,Key30" and OF.Seq(pA) == OF.Seq(pC),
+        "SortedKeys: a predicate filters before the sort, and stays stable")
+
+    ck(#ns.SortedKeys(nil) == 0 and #ns.SortedKeys("nope") == 0,
+        "SortedKeys: a non-table sorts to nothing rather than erroring")
+    ck(#ns.SortedKeys({ [1] = true, ["a"] = true }) == 1,
+        "SortedKeys: non-string keys are not ordered against strings")
+
+    -- Account ids are NUMERIC strings. A plain string sort puts "10" before "2",
+    -- which is the owner reading their own accounts out of order.
+    local aidKeys = { "1", "2", "3", "9", "10", "11", "", "abc" }
+    local aA, aB, aC = OF.Histories(aidKeys)
+    ck(OF.Divergent(aA, aB, aC), "aid fixture: the three histories did NOT diverge — row is vacuous")
+    ck(OF.Seq(ns.SortedAIDs(aA)) == "1,2,3,9,10,11,,abc",
+        "SortedAIDs: numeric ids sort numerically, non-numeric last, orphan bucket after them")
+    ck(OF.Seq(ns.SortedAIDs(aA)) == OF.Seq(ns.SortedAIDs(aB))
+        and OF.Seq(ns.SortedAIDs(aB)) == OF.Seq(ns.SortedAIDs(aC)),
+        "SortedAIDs: one order across three insertion histories")
+    ck(ns.AIDLess("2", "10") and not ns.AIDLess("10", "2"), "AIDLess: 2 before 10, numerically")
+    ck(not ns.AIDLess("3", "3"), "AIDLess: an aid does not beat itself")
+    ck(ns.AIDLess("3", "abc") and not ns.AIDLess("abc", "3"), "AIDLess: numeric beats non-numeric")
+
+    if verbose and pass then ns:Print("  PASS core/parse-whisper + coreapi guard + class-8 primitives") end
     return pass
 end)
 

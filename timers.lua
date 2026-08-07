@@ -844,16 +844,55 @@ local ZG_EXCLUDE = "temple of atal"
 -- Rend announcers, and which Barrens bar variant each implies.
 local REND_NPC_VARIANT = { ["thrall"] = "thrall", ["herald of thrall"] = "herald" }
 
--- Resolve a monster name to its canonical table key. Exact match first, then a
--- loose contains-match so a localized/realm prefix still resolves.
-local function npcKeyOf(monsterName)
+-- CLASS 8 / NX-13 — THE LOOSE FALLBACK'S CANDIDATE ORDER, DECIDED ONCE.
+--
+-- The fallback fires on any yelled name that CONTAINS a known announcer key, so
+-- it takes only one key that is a substring of another for two keys to match the
+-- same yell — and this table SHIPS such a pair: "thrall" and "herald of thrall".
+-- A decorated or localized rendering of the Herald ("Herald of Thrall" with any
+-- suffix, anything that misses the exact-match branch) matches BOTH, and
+-- whichever key `pairs()` reached first won. The two are not interchangeable:
+-- REND_NPC_VARIANT below reads the resolved key to choose the Barrens bar
+-- variant, and the announcer decides which world buff is timed, stored, and
+-- re-broadcast to the whole mesh. A coin-flip there is a wrong timer on every
+-- peer's screen.
+--
+-- The rule: LONGEST MATCH WINS (ties broken by the key itself, ascending). Both
+-- deterministic and semantically right — the more specific name is the better
+-- identification. Pure and parameterised so the suite can drive the rule against
+-- a table built three different ways, which the shipping table (one lifetime)
+-- could never prove on its own.
+function Timers.NpcCandidateOrder(rows)
+    local out = {}
+    for npc in pairs(rows or {}) do
+        if type(npc) == "string" then out[#out + 1] = npc end
+    end
+    table.sort(out, function(a, b)
+        if #a ~= #b then return #a > #b end
+        return a < b
+    end)
+    return out
+end
+
+-- Resolve a monster name to its canonical key in `rows`, given that table's
+-- candidate order. Exact match first, then longest containing match. Pure.
+function Timers.ResolveNpcKey(rows, order, monsterName)
     local key = (monsterName or ""):lower()
-    if key == "" then return nil end
-    if YELL_NPC_ROWS[key] then return key end
-    for npc in pairs(YELL_NPC_ROWS) do
+    if key == "" or type(rows) ~= "table" then return nil end
+    if rows[key] then return key end
+    for i = 1, #(order or {}) do
+        local npc = order[i]
         if key:find(npc, 1, true) then return npc end
     end
     return nil
+end
+
+local YELL_NPC_KEYS = Timers.NpcCandidateOrder(YELL_NPC_ROWS)
+Timers._yellNpcKeys = YELL_NPC_KEYS
+
+-- Resolve a monster name to its canonical table key.
+local function npcKeyOf(monsterName)
+    return Timers.ResolveNpcKey(YELL_NPC_ROWS, YELL_NPC_KEYS, monsterName)
 end
 Timers._npcKeyOf = npcKeyOf
 
@@ -3847,6 +3886,99 @@ local function tcheck(cond, msg, fails)
     return cond
 end
 
+----------------------------------------------------------------------
+-- NX-13 (CLASS 8): the announcer fallback resolves by longest match, not by
+-- iteration order.
+--
+-- The audit filed this LATENT, "needs an overlapping-substring NPC pair". The
+-- shipping table HAS one: "thrall" is a substring of "herald of thrall". Any
+-- rendering of the Herald that misses the exact-match branch matches both keys,
+-- and REND_NPC_VARIANT reads the resolved key to choose which Barrens bar to
+-- raise — so the coin flip does not merely pick a name, it picks a timer that
+-- goes out to the whole mesh.
+----------------------------------------------------------------------
+local function testNpcKeyOrder(fails)
+    local OF = ns.OrderFixture
+
+    -- The shipping table's own overlapping pair, through the SHIPPING resolver.
+    tcheck(Timers._npcKeyOf("Herald of Thrall") == "herald of thrall",
+        "NX-13: the exact name still resolves exactly", fails)
+    tcheck(Timers._npcKeyOf("Thrall") == "thrall",
+        "NX-13: the shorter announcer still resolves to itself", fails)
+    tcheck(Timers._npcKeyOf("Herald of Thrall <Warchief's Envoy>") == "herald of thrall",
+        "NX-13: a DECORATED Herald resolves to the Herald, not to Thrall — the "
+        .. "longer, more specific key wins the loose match", fails)
+    tcheck(Timers._npcKeyOf("Overlord Runthak the Elder") == "overlord runthak",
+        "NX-13: an undecorated loose match is unchanged", fails)
+    tcheck(Timers._npcKeyOf("Innkeeper Norman") == nil,
+        "NX-13: an unknown announcer still resolves to nothing", fails)
+    tcheck(Timers._npcKeyOf("") == nil and Timers._npcKeyOf(nil) == nil,
+        "NX-13: an empty or missing name resolves to nothing", fails)
+
+    -- The candidate order itself: longest first, ties by key ascending, and the
+    -- SAME order from three insertion histories of the same content. The
+    -- shipping table has exactly one lifetime and so can never prove this on its
+    -- own — which is why the rule is a pure function taking the table.
+    local names = {
+        "thrall", "herald of thrall", "overlord runthak", "major mattingly",
+        "high overlord saurfang", "field marshal afrasiabi",
+        "field marshal stonebridge", "molthor", "zandalarian emissary",
+        "fallen hero of the horde", "the herald of thrall himself",
+        "lord molthor", "an emissary", "emissary", "hero of the horde",
+        "runthak", "saurfang", "mattingly", "afrasiabi", "stonebridge",
+        "hero", "herald", "lord", "envoy", "warchief", "the warchief",
+        "grand herald", "grand herald of thrall", "elder molthor", "molthor the elder",
+    }
+    local R1, R2, R3 = OF.Histories(names, function() return { {} } end)
+    tcheck(OF.Divergent(R1, R2, R3),
+        "NX-13 fixture is not divergent — the three announcer-table insertion "
+        .. "histories walked in the same pairs() order, so this row proves nothing",
+        fails)
+
+    local o1 = Timers.NpcCandidateOrder(R1)
+    local o2 = Timers.NpcCandidateOrder(R2)
+    local o3 = Timers.NpcCandidateOrder(R3)
+    tcheck(OF.Seq(o1) == OF.Seq(o2) and OF.Seq(o2) == OF.Seq(o3),
+        "NX-13: the candidate order differed across insertion histories", fails)
+    tcheck(#o1 >= 2 and #o1[1] >= #o1[2],
+        "NX-13: the candidate list is longest-first", fails)
+    do
+        local sortedByLen = true
+        for i = 2, #o1 do
+            if #o1[i - 1] < #o1[i] then sortedByLen = false end
+            if #o1[i - 1] == #o1[i] and o1[i - 1] > o1[i] then sortedByLen = false end
+        end
+        tcheck(sortedByLen,
+            "NX-13: descending length, then key ascending, all the way down", fails)
+    end
+
+    -- The resolution itself, from all three histories, on a name that carries
+    -- FOUR of these keys at once ("thrall", "herald", "herald of thrall",
+    -- "grand herald of thrall").
+    local DECORATED = "the grand herald of thrall, envoy"
+    local r1 = Timers.ResolveNpcKey(R1, o1, DECORATED)
+    local r2 = Timers.ResolveNpcKey(R2, o2, DECORATED)
+    local r3 = Timers.ResolveNpcKey(R3, o3, DECORATED)
+    tcheck(r1 == r2 and r2 == r3,
+        "NX-13: an overlapping name resolved differently across insertion histories", fails)
+    tcheck(r1 == "grand herald of thrall",
+        "NX-13: the LONGEST matching key wins (got " .. tostring(r1) .. ")", fails)
+
+    -- RED CONTROL: the pre-fix walk, verbatim, on the same three tables. It must
+    -- disagree with itself — otherwise this fixture proves nothing about the bug.
+    local function preFix(rows, name)
+        local key = (name or ""):lower()
+        if rows[key] then return key end
+        for npc in pairs(rows) do
+            if key:find(npc, 1, true) then return npc end
+        end
+    end
+    local p1, p2, p3 = preFix(R1, DECORATED), preFix(R2, DECORATED), preFix(R3, DECORATED)
+    tcheck(not (p1 == p2 and p2 == p3),
+        "NX-13 RED CONTROL: the pre-fix first-pairs()-match agreed with itself across "
+        .. "all three histories — this fixture would not have caught the bug", fails)
+end
+
 -- CD derivation: anchor + CD boundary, ready flip, kill reset.
 local function testCDDerivation(fails)
     local a = 1000000000
@@ -6557,6 +6689,7 @@ function Timers.RunSelfTests(verbose)
         { name = "cd derivation",     fn = testCDDerivation },
         { name = "false-positive gate", fn = testFalsePositive },
         { name = "yell table (A2)",   fn = testYellTable },
+        { name = "announcer resolution: longest match wins (NX-13)", fn = testNpcKeyOrder },
         { name = "announcer kill respawn (A3)", fn = testAnnouncerKill },
         { name = "quest hand-in (A4)", fn = testQuestHandin },
         { name = "songflower pick gate (A5)", fn = testSongflowerPick },

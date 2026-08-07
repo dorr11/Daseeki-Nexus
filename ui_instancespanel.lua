@@ -920,15 +920,26 @@ function InstancesUI.FilterEntries(list, scope, selfNameRealm)
 end
 
 -- Account ids sorted numerically (falls back to string order). Pure.
+-- Brief E: this WAS the account order; ns.SortedAIDs is now that rule's one home
+-- (core.lua), shared with the roster winner's tiebreak and the debug print.
 function InstancesUI.SortedAccountIDs(accountsMap)
-    local ids = {}
-    for aid in pairs(accountsMap or {}) do ids[#ids + 1] = aid end
-    table.sort(ids, function(a, b)
-        local na, nb = tonumber(a), tonumber(b)
-        if na and nb then return na < nb end
-        return tostring(a) < tostring(b)
-    end)
-    return ids
+    return ns.SortedAIDs(accountsMap)
+end
+
+-- Resolve a character record (for the rest/xp rows) across all account buckets.
+--
+-- BRIEF E (NX-15). This was a private `pairs()` first-hit scan nested inside the
+-- panel builder, so a character duplicated across account buckets fed these
+-- xp/rested rows an arbitrary copy — and a DIFFERENT arbitrary copy than the
+-- detail pane and the roster card beside it, on the same screen, at the same
+-- moment. One rule now, in the layer that owns the accounts graph
+-- (Store.ResolveOwner): newest ownerEpoch, then newest lastDataUpdate, then a
+-- real bucket over homeless, then lowest account id. Hoisted out of the builder
+-- so the suite can drive the function the rows actually call. Pure.
+function InstancesUI.ResolveRec(data, nameRealm)
+    local Store = ns.Store
+    if not (Store and Store.ResolveOwner) then return nil end
+    return (Store.ResolveOwner(data, nameRealm))
 end
 
 -- nameRealm -> classTag lookup across every account's characters + homeless. Pure.
@@ -1727,15 +1738,7 @@ function InstancesPanel.Attach(host)
         local r = P._expRows[i]; if not r then r = makeExpRow(); P._expRows[i] = r end; return r
     end
 
-    -- Resolve a character record (for xp/rested fields) across all account buckets.
-    local function resolveRec(data, nameRealm)
-        local accounts = data and data.accounts
-        if type(accounts) ~= "table" then return nil end
-        for _, b in pairs(accounts) do
-            local rec = (b.characters and b.characters[nameRealm]) or (b.homeless and b.homeless[nameRealm])
-            if rec then return rec end
-        end
-    end
+    local resolveRec = InstancesUI.ResolveRec
 
     local function nowEpoch()
         return (Dashboard and Dashboard.Now and Dashboard.Now()) or (GetServerTime and GetServerTime()) or 0
@@ -2810,6 +2813,77 @@ local function testInstancesUI(fails)
     ck(rZeroRest.xpText == "33%", "zero-rest: XP still formats from a valid xpMax")
     ck(rZeroRest.restedText == "0%" and rZeroRest.restedToken == "muted",
         "zero-rest: 0 rested with a valid xpMax is '0%', NOT the absent-data em-dash")
+
+    ------------------------------------------------------------------
+    -- NX-15 (CLASS 8): the rest/xp rows resolve a duplicated character the SAME
+    -- way the detail pane and the roster card do.
+    --
+    -- These rows feed a meter the owner reads next to a card for the same
+    -- character. When the two picked different copies of it — which is what a
+    -- private `pairs()` first-hit scan guarantees the moment one Name-Realm sits
+    -- under two account buckets — the panel contradicted itself on screen, and
+    -- differently each session.
+    ------------------------------------------------------------------
+    local OF = ns.OrderFixture
+    local NAME = "Twinned-Whitemane"
+    local aids = {}
+    for i = 1, 30 do aids[i] = tostring(i) end
+    local function mkBucket(aid)
+        local rec = { nameRealm = NAME, ownerEpoch = 1000, lastDataUpdate = 1000,
+                      level = 40, xp = 1, xpMax = 100, aidTag = aid }
+        if aid == "23" then
+            rec = { nameRealm = NAME, ownerEpoch = 7777, lastDataUpdate = 7777,
+                    level = 60, xp = 50, xpMax = 100, aidTag = aid }
+        end
+        return { characters = { [NAME] = rec }, homeless = {} }
+    end
+    local A1, A2, A3 = OF.Histories(aids, mkBucket)
+    ck(OF.Divergent(A1, A2, A3),
+        "NX-15 fixture is not divergent — the three accounts-graph insertion histories "
+        .. "walked in the same pairs() order, so this row proves nothing")
+
+    local function tag(accounts)
+        local rec = IU.ResolveRec({ accounts = accounts }, NAME)
+        return rec and rec.aidTag or "nil"
+    end
+    ck(tag(A1) == tag(A2) and tag(A2) == tag(A3),
+        "NX-15: the rest/xp rows picked a different copy per insertion history")
+    ck(tag(A1) == "23",
+        "NX-15: the rows resolve the freshest copy (got " .. tag(A1) .. ")")
+
+    -- THE AGREEMENT ITSELF: same store, same name, same answer as the detail
+    -- pane's resolver. This is the row's whole point — one rule, three surfaces.
+    if ns.Store and ns.Store.ResolveOwner then
+        local shared = ns.Store.ResolveOwner({ accounts = A1 }, NAME)
+        ck(shared and shared.aidTag == tag(A1),
+            "NX-15: the panel's resolver and the store's shared rule are the same answer")
+    end
+    ck(IU.ResolveRec({ accounts = A1 }, "Nobody-Whitemane") == nil,
+        "NX-15: an unheld name resolves to nothing")
+    ck(IU.ResolveRec(nil, NAME) == nil, "NX-15: a missing store resolves to nothing")
+
+    -- The panel's account ORDER is the same shared rule, and stable.
+    local view = {}
+    for i = 1, #aids do view[aids[i]] = { hour = 0, day = 0 } end
+    local V1, V2, V3 = OF.Histories(aids, function() return { hour = 0, day = 0 } end)
+    ck(OF.Divergent(V1, V2, V3), "NX-15 account-order fixture is not divergent")
+    ck(OF.Seq(IU.SortedAccountIDs(V1)) == OF.Seq(IU.SortedAccountIDs(V2))
+        and OF.Seq(IU.SortedAccountIDs(V2)) == OF.Seq(IU.SortedAccountIDs(V3)),
+        "NX-15: the meter account order differed across insertion histories")
+    ck(OF.Seq(IU.SortedAccountIDs(V1)):sub(1, 10) == "1,2,3,4,5,",
+        "NX-15: and the account order is numeric, not string ('10' does not lead)")
+
+    -- RED CONTROL: the code this replaced, on the same three histories.
+    local function preFix(accounts)
+        for _, b in pairs(accounts) do
+            local rec = (b.characters and b.characters[NAME]) or (b.homeless and b.homeless[NAME])
+            if rec then return rec.aidTag end
+        end
+    end
+    local p1, p2, p3 = preFix(A1), preFix(A2), preFix(A3)
+    ck(not (p1 == p2 and p2 == p3),
+        "NX-15 RED CONTROL: the pre-fix first-pairs()-hit resolver agreed with itself "
+        .. "across all three histories — this fixture would not have caught the bug")
 end
 
 if ns.RegisterSelfTest then

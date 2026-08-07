@@ -273,12 +273,21 @@ function Friends.Reconcile(ledger, ctx)
     local friends = ctx.friends or {}
     local now     = ctx.now or 0
     local changed, confirmed, blocked = false, 0, 0
-    local seen = 0
 
-    for key, e in pairs(ledger) do
-        seen = seen + 1
-        if seen > Friends.MAX_LEDGER then break end
-        if type(key) == "string" and type(e) == "table" then
+    -- CLASS 8 / NX-7 — SORT BEFORE THE CEILING, exactly as `Plan` below already
+    -- does (friends.lua:423, the pattern the audit cites as this file's own
+    -- correct precedent). This walk is not a display: adjudication here is a
+    -- PERMANENT state transition — an entry that reaches MAX_ATTEMPTS is written
+    -- "blocked" and is never retried. Truncating an unsorted walk at MAX_LEDGER
+    -- meant that, above the ceiling, WHICH entries got sentenced was iteration
+    -- luck, re-rolled every session: the same ledger could block a different
+    -- eighth-hundred of itself each login, and an entry that never came up was
+    -- never judged at all.
+    local keys = ns.SortedKeys(ledger, Friends.MAX_LEDGER)
+    for i = 1, #keys do
+        local key = keys[i]
+        local e = ledger[key]
+        if type(e) == "table" then
             local isFriend = friends[keyBase(key)] and true or false
             if e.s == "pending" then
                 if isFriend then
@@ -1120,6 +1129,73 @@ ns:RegisterSelfTest("meshfriends", function(verbose)
     ck(Friends.CollectRoster(nil) ~= nil and next(Friends.CollectRoster(nil)) == nil,
         "ceiling: a missing accounts table collects nothing")
 
-    if verbose and pass then ns:Print("  PASS meshfriends/rules + ledger + cap + growth") end
+    ------------------------------------------------------------------
+    -- NX-7 (CLASS 8): Reconcile sorts before MAX_LEDGER.
+    --
+    -- The stake: adjudication in Reconcile is PERMANENT. An entry that has spent
+    -- its MAX_ATTEMPTS is written "blocked" and is never retried. So above the
+    -- ceiling, an unsorted walk did not merely reorder work — it chose, by
+    -- iteration luck and afresh every session, WHICH names got sentenced and
+    -- which were never looked at at all.
+    --
+    -- The fixture is MAX_LEDGER + 200 exhausted-pending entries built from three
+    -- different insertion histories holding IDENTICAL content, and it asserts its
+    -- own divergence first: if the three histories walked the same way, the row
+    -- below would prove nothing and that is a failure, not a pass.
+    ------------------------------------------------------------------
+    do
+        local OF = ns.OrderFixture
+        local lkeys = {}
+        for i = 1, Friends.MAX_LEDGER + 200 do
+            lkeys[i] = string.format("bulk%04d-testrealm", i)
+        end
+        -- Every entry: pending, out of attempts, and not on the friends list —
+        -- so every one of them is eligible to be blocked this pass. Which 800
+        -- actually are is the whole question.
+        local mk = function() return { s = "pending", n = Friends.MAX_ATTEMPTS, ts = 0 } end
+        local L1, L2, L3 = OF.Histories(lkeys, mk)
+
+        ck(OF.Divergent(L1, L2, L3),
+            "NX-7 fixture is not divergent — the three ledger insertion histories "
+            .. "walked in the same pairs() order, so this row proves nothing")
+
+        local rctx = { listConfirmed = true, friends = {}, now = 7000 }
+        local function blockedSet(ledger)
+            local _, _, nBlocked = Friends.Reconcile(ledger, rctx)
+            local out = {}
+            for k, e in pairs(ledger) do
+                if e.s == "blocked" then out[#out + 1] = k end
+            end
+            table.sort(out)
+            return table.concat(out, ","), nBlocked
+        end
+        local s1, n1 = blockedSet(L1)
+        local s2, n2 = blockedSet(L2)
+        local s3, n3 = blockedSet(L3)
+
+        ck(n1 == Friends.MAX_LEDGER, "NX-7: the ceiling still holds (" .. tostring(n1)
+            .. " adjudicated, expected " .. Friends.MAX_LEDGER .. ")")
+        ck(s1 == s2 and s2 == s3 and n1 == n2 and n2 == n3,
+            "NX-7: the SENTENCED SET differed across insertion histories — a ledger "
+            .. "over MAX_LEDGER blocks a different subset of itself each session")
+        ck(s1:sub(1, 20) == "bulk0001-testrealm,b",
+            "NX-7: the adjudicated subset is the sorted head, not an arbitrary slice")
+
+        -- And the ordering must not have changed the VERDICT for anything the
+        -- pre-fix walk would also have reached: a ledger under the ceiling is
+        -- judged entry by entry, identically, and order is irrelevant there.
+        local small = { ["a-testrealm"] = { s = "pending", n = Friends.MAX_ATTEMPTS },
+                        ["b-testrealm"] = { s = "added",   n = 0 },
+                        ["c-testrealm"] = { s = "pending", n = 0 } }
+        local ch, conf, blk = Friends.Reconcile(small,
+            { listConfirmed = true, friends = { ["c"] = true }, now = 10 })
+        ck(ch == true and conf == 1 and blk == 2,
+            "NX-7: under the ceiling the verdicts are unchanged (1 confirmed, 2 blocked)")
+        ck(small["c-testrealm"].s == "added" and small["a-testrealm"].s == "blocked"
+            and small["b-testrealm"].s == "blocked",
+            "NX-7: and each verdict landed on the right entry")
+    end
+
+    if verbose and pass then ns:Print("  PASS meshfriends/rules + ledger + cap + growth + NX-7 order") end
     return pass
 end)
