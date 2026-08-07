@@ -1127,15 +1127,13 @@ end
 -- then anything non-numeric (including the "" orphan bucket) lexicographically.
 -- Numbers first so "lowest numeric AID" means what it says even when a
 -- differently-FORMATTED id (the very thing that caused this bug) is in the mix.
-function Dashboard.AIDLess(a, b)
-    a, b = a or "", b or ""
-    if a == b then return false end
-    local na, nb = tonumber(a), tonumber(b)
-    if na and nb then return na < nb end
-    if na then return true end          -- numeric beats non-numeric
-    if nb then return false end
-    return a < b
-end
+--
+-- BRIEF E (NX-14 / NX-15): the rule below moved to store.lua, because the detail
+-- pane's no-shell fallback and the instances panel's own resolver each kept a
+-- private `pairs()` first-hit scan and could not reach it here. These four names
+-- survive as the dashboard's vocabulary; there is now exactly ONE rule, in the
+-- layer that owns the accounts graph, and three surfaces asking it.
+Dashboard.AIDLess = ns.AIDLess
 
 -- PURE. Is candidate `a` a better copy of a character than candidate `b`?
 -- A candidate is { aid = , rec = , homeless = bool }.
@@ -1143,60 +1141,22 @@ end
 --   2. newest lastDataUpdate      (when the epochs are unstamped/equal)
 --   3. a real account bucket beats homeless / the "" orphan bucket
 --   4. lowest numeric aid         (pure determinism — no data left to judge on)
-function Dashboard.RosterCandidateBetter(a, b)
-    if not b then return true end
-    if not a then return false end
-    local ra, rb = a.rec or {}, b.rec or {}
-
-    local ea, eb = tonumber(ra.ownerEpoch) or 0, tonumber(rb.ownerEpoch) or 0
-    if ea ~= eb then return ea > eb end
-
-    local ua, ub = tonumber(ra.lastDataUpdate) or 0, tonumber(rb.lastDataUpdate) or 0
-    if ua ~= ub then return ua > ub end
-
-    -- "Homeless" for ranking means "has no real home": the per-bucket homeless
-    -- table OR the "" orphan bucket, which is exactly the same claim (a record
-    -- we hold without a confirmed place to put it).
-    local ha = (a.homeless or (a.aid or "") == "") and 1 or 0
-    local hb = (b.homeless or (b.aid or "") == "") and 1 or 0
-    if ha ~= hb then return ha < hb end
-
-    return Dashboard.AIDLess(a.aid, b.aid)
-end
+Dashboard.RosterCandidateBetter = ns.Store.OwnerCandidateBetter
 
 -- PURE. Fold an array of candidates for ONE Name-Realm down to the winner.
-function Dashboard.RosterWinner(candidates)
-    local best
-    for _, c in ipairs(candidates or {}) do
-        if Dashboard.RosterCandidateBetter(c, best) then best = c end
-    end
-    return best
-end
+Dashboard.RosterWinner = ns.Store.OwnerWinner
 
 -- Every copy of `nameRealm` the store holds, as candidates. Unfiltered — this is
 -- the identity question ("which bucket owns this character"), not a view.
 function Dashboard.RosterCandidates(nameRealm)
-    local out = {}
-    if type(nameRealm) ~= "string" or nameRealm == "" then return out end
     local data = ns.Store and ns.Store.GetData and ns.Store.GetData()
-    if not data or not data.accounts then return out end
-    for aid, bucket in pairs(data.accounts) do
-        local rec = bucket.characters and bucket.characters[nameRealm]
-        if rec then
-            out[#out + 1] = { nameRealm = nameRealm, aid = aid, rec = rec, homeless = false }
-        else
-            rec = bucket.homeless and bucket.homeless[nameRealm]
-            if rec then
-                out[#out + 1] = { nameRealm = nameRealm, aid = aid, rec = rec, homeless = true }
-            end
-        end
-    end
-    return out
+    return ns.Store.OwnerCandidates(data, nameRealm)
 end
 
 -- THE shared answer to "which stored copy IS this character". Returns rec, aid
--- (nil when we hold no copy). Detail.Resolve delegates here so the detail pane
--- can never disagree with the card the owner just clicked.
+-- (nil when we hold no copy). Detail.Resolve and the instances panel's row
+-- resolver ask the same store-level function, so no two surfaces can disagree
+-- about which copy the owner just clicked.
 function Dashboard.ResolveRosterOwner(nameRealm)
     local best = Dashboard.RosterWinner(Dashboard.RosterCandidates(nameRealm))
     if not best then return nil end

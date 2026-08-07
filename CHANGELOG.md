@@ -79,6 +79,41 @@
   about the messages themselves changed and no update is required: an account still on 1.1.5 or
   older talks to an updated one exactly as before, because this only affects the order a sender
   chooses, never what a receiver reads.
+- **Fixed:** **a character that exists under two of your account IDs now shows the same copy
+  everywhere.** If an account was ever re-set up under a new ID, Nexus can end up holding two
+  stored copies of one character. Three places on the dashboard each picked one of those copies
+  independently and each picked arbitrarily — so the roster card could show today's data, the
+  detail pane you opened by clicking that very card could show a copy from two weeks ago, and
+  the rest/XP meter beside it a third — and which one you got changed between sessions. All
+  three now ask the same question and get the same answer: the copy the owning account stamped
+  most recently. Nothing is deleted; only which copy is *displayed* was ever at stake.
+- **Fixed:** **an imported instance run no longer changes which account it belongs to.** Runs
+  imported from NovaInstanceTracker are matched to whichever of your accounts owns that
+  character — and when a character existed under two account IDs, the match was decided
+  arbitrarily and could land differently on a later import, moving the run (and the hourly
+  instance count it contributes to) from one account to the other. The owner is now decided by
+  a fixed rule, so a re-import attributes every run exactly where the first one did.
+- **Fixed:** **the Herald of Thrall can no longer be mistaken for Thrall himself.** When a
+  world-buff announcer's name arrives with anything extra attached to it, Nexus matches it
+  against the names it knows — and "Thrall" is contained inside "Herald of Thrall", so both
+  matched and the winner was arbitrary. The two are not interchangeable: they raise different
+  Barrens timers, and the wrong one goes out to everyone on the mesh. The most specific name
+  now wins, always.
+- **Fixed:** **a very large guild or friends list no longer rewrites your saved data on every
+  update.** Nexus keeps up to 800 names in the trust list used for invites and summons. Past
+  that number it kept an arbitrary 800, freshly re-drawn each time — so the check that asks
+  "has anything actually changed?" always answered yes, and every friend logging on or off
+  rewrote the file for nothing. The same 800 are kept every time now, so an unchanged list is
+  correctly recognised as unchanged. (Below 800 nothing was ever wrong.)
+- **Fixed:** **a very large auto-friend history no longer judges a different slice of itself
+  each session.** The auto-friend ledger stops looking after 800 entries, and *which* 800 was
+  arbitrary — which matters because the decision made there is permanent: an entry that has
+  used up its attempts is marked as never-to-retry. Above that size the same ledger could
+  sentence a different portion of itself on each login, and an entry could go permanently
+  unexamined. It now always works through the same 800.
+- **Changed:** **`/nexus debug instances` prints in a stable order.** Accounts come out in
+  account-ID order and characters alphabetically, so two runs of it — or the same command on
+  two accounts — can actually be compared line for line. Output content is unchanged.
 
 ## 1.1.5 — 2026-08-07
 

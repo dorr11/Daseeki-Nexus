@@ -251,18 +251,12 @@ Mesh.Fnv1a = fnv1a
 -- the ceiling so `limit` keeps a stable subset rather than an arbitrary one.
 -- String keys only (every keyed map on this transport is string-keyed: ownerKeys,
 -- namespace keys, account ids, addon ids).
-function Mesh.SortedKeys(tbl, limit)
-    local out = {}
-    if type(tbl) ~= "table" then return out end
-    for k in pairs(tbl) do
-        if type(k) == "string" then out[#out + 1] = k end
-    end
-    table.sort(out)
-    if limit and #out > limit then
-        for i = #out, limit + 1, -1 do out[i] = nil end
-    end
-    return out
-end
+--
+-- Brief E promoted this body verbatim to `ns.SortedKeys` (core.lua) when the
+-- same rule was needed by friends/store/import/timers and the two UI panels,
+-- which cannot see mesh.lua in every headless runner. This name stays as the
+-- transport's vocabulary; there is exactly ONE implementation behind it.
+Mesh.SortedKeys = ns.SortedKeys
 
 -- Account ids of every known peer, ascending. The identity sites (aidForName,
 -- TouchPeerByName) walk this so a duplicate-name collision resolves the same way

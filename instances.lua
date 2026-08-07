@@ -1470,8 +1470,18 @@ local function debugInstances()
     if capAt and (nowE - capAt) >= 0 and (nowE - capAt) < HOUR then
         ns:Print(string.format("  SERVER said 'too many instances' %ds ago — meter reconciled to cap.", nowE - capAt))
     end
+    -- CLASS 8 / NX-16 — a diagnostic is for the OWNER'S EYES, and its whole value
+    -- is comparison: two accounts' prints side by side, or the same account's
+    -- print before and after a change. An unordered block order makes every such
+    -- diff full of moves that mean nothing, which is exactly how a diff stops
+    -- being read. Accounts in aid order (ns.SortedAIDs — the same account order
+    -- the instances panel paints), characters by Name-Realm; the per-character
+    -- entry walk below was already newest-first by index and is left alone.
     local anyAcct = false
-    for aid, charMap in pairs(all) do
+    local aids = ns.SortedAIDs(all)
+    for ai = 1, #aids do
+        local aid = aids[ai]
+        local charMap = all[aid]
         anyAcct = true
         local isOrphan = (aid == Instances.ORPHAN_AID)
         local c = view.accounts[aid] or { hour = 0, day = 0 }
@@ -1488,7 +1498,10 @@ local function debugInstances()
                 c.hour, Instances.HOURLY_CAP, c.day, Instances.DAILY_CAP, slotStr,
                 c.serverCapped and " [server-reconciled]" or ""))
         end
-        for nameRealm, crec in pairs(charMap) do
+        local names = ns.SortedKeys(charMap)
+        for ni = 1, #names do
+            local nameRealm = names[ni]
+            local crec = charMap[nameRealm]
             local entries = (crec and crec.entries) or {}
             local shown = 0
             for i = #entries, 1, -1 do
@@ -2710,6 +2723,105 @@ local function testColdWallet(fails)
     if not ok then fails[#fails + 1] = "cold-wallet sim errored: " .. tostring(err) end
 end
 
+----------------------------------------------------------------------
+-- NX-16 (CLASS 8): /nexus debug instances prints in a stable order.
+--
+-- Cosmetic in the audit's severity column, and it stays cosmetic — but a
+-- diagnostic's value IS comparison. Two accounts' prints side by side, or the
+-- same account's print before and after a change: an unordered block order fills
+-- every such diff with moves that mean nothing, which is how a diff stops being
+-- read. Determinism is what makes the owner's eyes worth something here.
+----------------------------------------------------------------------
+local function testDebugPrintOrder(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local OF = ns.OrderFixture
+
+    local savedData, savedPrint = Store.data, ns.Print
+    local said = {}
+    ns.Print = function(_, ...) said[#said + 1] = table.concat({ ... }, " ") end
+
+    -- Thirty accounts, each holding several characters, all with one entry.
+    local aids, chars = {}, {}
+    for i = 1, 30 do aids[i] = tostring(i) end
+    for i = 1, 12 do chars[i] = string.format("Char%02d-Whitemane", i) end
+    local function mkAccount()
+        local m = {}
+        for i = 1, #chars do
+            m[chars[i]] = { entries = { { t = 100, name = "Deadmines", dur = 60 } } }
+        end
+        return m
+    end
+    local A1, A2, A3 = OF.Histories(aids, mkAccount)
+    ck(OF.Divergent(A1, A2, A3),
+        "NX-16 fixture is not divergent — the three instance-ledger insertion "
+        .. "histories walked in the same pairs() order, so this row proves nothing")
+
+    local function printed(all)
+        said = {}
+        Store.data = { instances = all }
+        debugInstances()
+        -- Just the identifying spine of the print: which account, then which
+        -- character, in the order the owner reads them.
+        local spine = {}
+        for i = 1, #said do
+            local aid = said[i]:match("^  acct (%S+):")
+            if aid then spine[#spine + 1] = "A" .. aid end
+            local nr = said[i]:match("^     (%S+) |")
+            if nr then spine[#spine + 1] = nr end
+        end
+        return table.concat(spine, ",")
+    end
+    local s1, s2, s3 = printed(A1), printed(A2), printed(A3)
+
+    ck(#s1 > 0, "NX-16: the diagnostic printed nothing to order")
+    ck(s1 == s2 and s2 == s3,
+        "NX-16: the print order differed across insertion histories — two prints of "
+        .. "the SAME ledger cannot be diffed")
+    ck(s1:sub(1, 30) == "A1,Char01-Whitemane,Char02-Whi",
+        "NX-16: accounts in aid order, characters by Name-Realm (got " .. s1:sub(1, 30) .. ")")
+    ck(s1:find("A2,Char01-Whitemane", 1, true) ~= nil,
+        "NX-16: the second account block follows the first, not '10'")
+
+    -- The per-character entry cap is untouched: still the six most recent.
+    said = {}
+    local many = { entries = {} }
+    for i = 1, 20 do many.entries[i] = { t = 100 + i, name = "Run" .. i } end
+    Store.data = { instances = { ["1"] = { ["Solo-Whitemane"] = many } } }
+    debugInstances()
+    local rows = 0
+    for i = 1, #said do if said[i]:match("^     Solo%-Whitemane |") then rows = rows + 1 end end
+    ck(rows == 6, "NX-16: the 6-entry cap per character is unchanged (got " .. rows .. ")")
+    do
+        local blob = table.concat(said, "|")
+        ck(blob:find("Run20", 1, true) ~= nil and blob:find("Run15", 1, true) ~= nil
+            and blob:find("Run14", 1, true) == nil,
+            "NX-16: and it is still the SIX MOST RECENT entries (20..15), newest first")
+    end
+
+    -- An empty ledger still says so rather than printing an empty block.
+    said = {}
+    Store.data = { instances = {} }
+    debugInstances()
+    ck(table.concat(said, "|"):find("no instance entries recorded yet", 1, true) ~= nil,
+        "NX-16: an empty ledger still reports itself")
+
+    -- RED CONTROL: the pre-fix walk, verbatim, on the same three ledgers.
+    local function preFix(all)
+        local spine = {}
+        for aid, charMap in pairs(all) do
+            spine[#spine + 1] = "A" .. aid
+            for nameRealm in pairs(charMap) do spine[#spine + 1] = nameRealm end
+        end
+        return table.concat(spine, ",")
+    end
+    local p1, p2, p3 = preFix(A1), preFix(A2), preFix(A3)
+    ck(not (p1 == p2 and p2 == p3),
+        "NX-16 RED CONTROL: the pre-fix pairs() walk agreed with itself across all "
+        .. "three histories — this fixture would not have caught the bug")
+
+    Store.data, ns.Print = savedData, savedPrint
+end
+
 function Instances.RunSelfTests(verbose)
     local suites = {
         { name = "transition classifier",         fn = testTransition },
@@ -2733,6 +2845,7 @@ function Instances.RunSelfTests(verbose)
         { name = "inbound merge dedup",           fn = testMergeInbound },
         { name = "segment round-trip (codec)",    fn = testSegmentRoundTrip },
         { name = "mesh hash compatibility",       fn = testHashCompat },
+        { name = "debug print order (NX-16, Class 8)", fn = testDebugPrintOrder },
     }
     local allPass = true
     for _, suite in ipairs(suites) do

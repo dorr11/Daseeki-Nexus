@@ -4328,6 +4328,110 @@ end
 function Store.GetSocial()        return Store.data and Store.data.social end
 
 ----------------------------------------------------------------------
+-- WHICH STORED COPY *IS* THIS CHARACTER  (CLASS 8 / NX-14, NX-15)
+--
+-- One Name-Realm can sit under more than one account bucket — the state an
+-- account re-set-up under a new AID leaves behind, and the state the phantom
+-- cleanup above (B4) exists to clear. Every surface that renders a character
+-- must therefore answer "which copy" the SAME way, or the dashboard disagrees
+-- with itself: the roster card shows the live copy, the detail pane opens a
+-- two-week-old one, and the rest/xp meter beside it quotes a third.
+--
+-- The winner rule used to live in ui_shell.lua (Dashboard.RosterWinner) where
+-- only ui_shell could reach it, so the detail pane's no-shell fallback and the
+-- instances panel's `resolveRec` each kept a private `pairs()` first-hit scan —
+-- an identity decided by iteration luck, re-rolled every session. The rule now
+-- lives HERE, in the layer that owns the accounts graph and that every headless
+-- runner loads, and ui_shell / ui_detail / ui_instancespanel are three names for
+-- this one answer.
+--
+-- The rule itself is unchanged from ui_shell's, rung for rung.
+----------------------------------------------------------------------
+
+-- Account-id order (see ns.AIDLess): numeric ids numerically, numeric beats
+-- non-numeric, the "" orphan bucket last.
+Store.AIDLess = ns.AIDLess
+
+-- PURE. Is candidate `a` a better copy of a character than candidate `b`?
+-- A candidate is { aid = , rec = , homeless = bool }.
+--   1. newest ownerEpoch          (the owner's own stamp — the real evidence)
+--   2. newest lastDataUpdate      (when the epochs are unstamped/equal)
+--   3. a real account bucket beats homeless / the "" orphan bucket
+--   4. lowest numeric aid         (pure determinism — no data left to judge on)
+--
+-- Rung 4 is Brief C's `aidForName` precedent (NXM-5): identity settles on the
+-- LOWEST account id, never on "whoever we saw last", because an attribution that
+-- drifts is worse than one that is arbitrary but fixed.
+function Store.OwnerCandidateBetter(a, b)
+    if not b then return true end
+    if not a then return false end
+    local ra, rb = a.rec or {}, b.rec or {}
+
+    local ea, eb = tonumber(ra.ownerEpoch) or 0, tonumber(rb.ownerEpoch) or 0
+    if ea ~= eb then return ea > eb end
+
+    local ua, ub = tonumber(ra.lastDataUpdate) or 0, tonumber(rb.lastDataUpdate) or 0
+    if ua ~= ub then return ua > ub end
+
+    -- "Homeless" for ranking means "has no real home": the per-bucket homeless
+    -- table OR the "" orphan bucket, which is exactly the same claim (a record
+    -- we hold without a confirmed place to put it).
+    local ha = (a.homeless or (a.aid or "") == "") and 1 or 0
+    local hb = (b.homeless or (b.aid or "") == "") and 1 or 0
+    if ha ~= hb then return ha < hb end
+
+    return ns.AIDLess(a.aid, b.aid)
+end
+
+-- PURE. Fold an array of candidates for ONE Name-Realm down to the winner.
+-- Order-independent by construction: every rung is a strict comparison and the
+-- last rung is a total order on distinct account ids, so the fold cannot depend
+-- on the order the candidates were collected in.
+function Store.OwnerWinner(candidates)
+    local best
+    for _, c in ipairs(candidates or {}) do
+        if Store.OwnerCandidateBetter(c, best) then best = c end
+    end
+    return best
+end
+
+-- Every copy of `nameRealm` that `data` holds, as candidates. Unfiltered — this
+-- is the identity question ("which bucket owns this character"), not a view.
+-- The bucket walk is aid-ordered so a caller that inspects the raw list (the
+-- debug print, a future ceiling) sees the same list every session.
+function Store.OwnerCandidates(data, nameRealm)
+    local out = {}
+    if type(nameRealm) ~= "string" or nameRealm == "" then return out end
+    local accounts = data and data.accounts
+    if type(accounts) ~= "table" then return out end
+    local aids = ns.SortedAIDs(accounts)
+    for i = 1, #aids do
+        local aid = aids[i]
+        local bucket = accounts[aid]
+        if type(bucket) == "table" then
+            local rec = bucket.characters and bucket.characters[nameRealm]
+            if rec then
+                out[#out + 1] = { nameRealm = nameRealm, aid = aid, rec = rec, homeless = false }
+            else
+                rec = bucket.homeless and bucket.homeless[nameRealm]
+                if rec then
+                    out[#out + 1] = { nameRealm = nameRealm, aid = aid, rec = rec, homeless = true }
+                end
+            end
+        end
+    end
+    return out
+end
+
+-- THE shared answer to "which stored copy IS this character". Returns rec, aid
+-- (nil when `data` holds no copy).
+function Store.ResolveOwner(data, nameRealm)
+    local best = Store.OwnerWinner(Store.OwnerCandidates(data, nameRealm))
+    if not best then return nil end
+    return best.rec, best.aid
+end
+
+----------------------------------------------------------------------
 -- SOCIAL TRUST SETS — the one writer (see defaultData's `social` block).
 --
 -- Replaces one set WHOLESALE from a confirmed read. Callers hand over a
@@ -4345,6 +4449,15 @@ function Store.GetSocial()        return Store.data and Store.data.social end
 
 -- Headless discipline: a corrupt or absurd roster can never grow the saved
 -- variables without bound. Far above any real Classic guild.
+--
+-- CLASS 8 / NX-8 — SORT BEFORE THE CEILING. This ceiling is not a display cap:
+-- it decides WHICH 800 of a larger roster are the trusted set, and the answer is
+-- then compared against the stored set to decide whether to write SavedVariables
+-- at all. Taking the first 800 of a `pairs()` walk re-rolls that subset on every
+-- call, so `changed` came back true every single time and the comparison — whose
+-- entire job is to keep a FRIENDLIST_UPDATE storm (every friend logging on or
+-- off fires one) from rewriting the SV — was defeated exactly when it mattered.
+-- A sorted truncation keeps the SAME 800, so an unchanged roster reads unchanged.
 Store.SOCIAL_MAX = 800
 
 local SOCIAL_SETS = { guild = true, friends = true }
@@ -4363,14 +4476,14 @@ function Store.SetSocialSet(which, set, at, label)
     local social = Store.data and Store.data.social
     if type(social) ~= "table" then return false, 0 end
 
-    local clean, n = {}, 0
-    for k, v in pairs(set) do
-        if type(k) == "string" and k ~= "" and v then
-            if n >= Store.SOCIAL_MAX then break end
-            clean[k] = true
-            n = n + 1
-        end
-    end
+    -- The eligibility rule is handed to ns.SortedKeys as a predicate rather than
+    -- applied after the walk, so the filter cannot smuggle iteration order back
+    -- in ahead of the sort.
+    local keys = ns.SortedKeys(set, Store.SOCIAL_MAX, function(k, v)
+        return k ~= "" and v and true or false
+    end)
+    local clean, n = {}, #keys
+    for i = 1, n do clean[keys[i]] = true end
 
     local changed = not socialSetsEqual(social[which], clean)
     if changed then social[which] = clean end
@@ -7457,6 +7570,186 @@ local function testOwnerRelayAdmission(fails)
     Store._ghostLog     = savedLog
 end
 
+----------------------------------------------------------------------
+-- NX-8 (CLASS 8) — SetSocialSet sorts before SOCIAL_MAX.
+--
+-- This ceiling is not cosmetic. The retained subset IS the trust set (who may
+-- summon you, who may invite you), and it is then compared against the stored
+-- set to decide whether to write SavedVariables at all. An unsorted truncation
+-- re-rolled the survivors on every call, so `changed` came back true every time
+-- — defeating the comparison exactly when a big guild made it matter, and
+-- rewriting the SV on every FRIENDLIST_UPDATE in a login storm.
+----------------------------------------------------------------------
+local function testSocialSetOrder(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local OF = ns.OrderFixture
+
+    local savedData = Store.data
+    Store.data = { social = { guild = {}, friends = {}, guildAt = 0, friendsAt = 0, guildName = "" } }
+
+    local names = {}
+    for i = 1, Store.SOCIAL_MAX + 150 do names[i] = string.format("member%04d-whitemane", i) end
+    local S1, S2, S3 = OF.Histories(names)
+
+    -- THE FIXTURE MUST PROVE ITSELF UNKIND.
+    ck(OF.Divergent(S1, S2, S3),
+        "NX-8 fixture is not divergent — the three roster insertion histories walked "
+        .. "in the same pairs() order, so this row proves nothing")
+
+    local function retained(set)
+        Store.data.social.guild = {}
+        local _, n = Store.SetSocialSet("guild", set, 100, "Guild")
+        local out = {}
+        for k in pairs(Store.data.social.guild) do out[#out + 1] = k end
+        table.sort(out)
+        return table.concat(out, ","), n
+    end
+    local r1, n1 = retained(S1)
+    local r2, n2 = retained(S2)
+    local r3, n3 = retained(S3)
+
+    ck(n1 == Store.SOCIAL_MAX and n2 == n1 and n3 == n1,
+        "NX-8: the ceiling holds at SOCIAL_MAX (" .. tostring(n1) .. ")")
+    ck(r1 == r2 and r2 == r3,
+        "NX-8: the RETAINED SUBSET differed across insertion histories — an "
+        .. "over-cap roster keeps a different 800 every call")
+    ck(r1:sub(1, 21) == "member0001-whitemane,",
+        "NX-8: the survivors are the sorted head, not an arbitrary slice")
+
+    -- THE POINT OF THE ROW: `changed` must go false for an unchanged roster.
+    -- Same content, a DIFFERENT lifetime — which is precisely what the client
+    -- hands us on the next FRIENDLIST_UPDATE — must not rewrite SavedVariables.
+    Store.data.social.guild = {}
+    local ch1 = Store.SetSocialSet("guild", S1, 100, "Guild")
+    ck(ch1 == true, "NX-8: the first write of a roster is a change")
+    local ch2 = Store.SetSocialSet("guild", S2, 101, "Guild")
+    local ch3 = Store.SetSocialSet("guild", S3, 102, "Guild")
+    ck(ch2 == false and ch3 == false,
+        "NX-8: re-writing the SAME over-cap roster from a different insertion "
+        .. "history reports NO change — the storm gate actually holds")
+
+    -- Under the cap the behaviour is unchanged, including the real change case.
+    Store.data.social.guild = {}
+    local a1 = Store.SetSocialSet("guild", { ["x-w"] = true, ["y-w"] = true }, 5, "G")
+    local a2 = Store.SetSocialSet("guild", { ["y-w"] = true, ["x-w"] = true }, 6, "G")
+    local a3 = Store.SetSocialSet("guild", { ["x-w"] = true }, 7, "G")
+    ck(a1 == true and a2 == false and a3 == true,
+        "NX-8: under the cap, an identical set is no change and a real edit is")
+    ck(select(2, Store.SetSocialSet("guild",
+        { ["ok-w"] = true, [""] = true, ["skipme-w"] = false, [7] = true }, 8, "G")) == 1,
+        "NX-8: the eligibility rule (non-empty string key, truthy value) is unchanged")
+
+    Store.data = savedData
+end
+
+----------------------------------------------------------------------
+-- NX-14 / NX-15 (CLASS 8) — ONE answer to "which stored copy IS this
+-- character", now that the roster card, the detail pane and the instances
+-- panel's rest/xp rows all ask Store.ResolveOwner.
+----------------------------------------------------------------------
+local function testResolveOwner(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local OF = ns.OrderFixture
+    local NAME = "Puucons-Whitemane"
+
+    -- Thirty account buckets, every one holding a copy of ONE character — the
+    -- residue an account re-set-up under a new AID leaves behind, at a scale
+    -- where the three insertion histories really do walk differently (a
+    -- twelve-bucket fixture does NOT diverge in Lua 5.1, which is exactly the
+    -- trap the self-proving fixture discipline exists to catch). Only aid "6"
+    -- carries the live stamp; "2" and "9" hold theirs as homeless records.
+    local aids = {}
+    for i = 1, 30 do aids[i] = tostring(i) end
+    local function mkBucket(aid)
+        local rec = { ownerEpoch = 1000, lastDataUpdate = 1000, level = 40, aidTag = aid }
+        if aid == "6" then rec = { ownerEpoch = 9999, lastDataUpdate = 9999, level = 60, aidTag = aid } end
+        if aid == "2" or aid == "9" then
+            return { characters = {}, homeless = { [NAME] = rec } }
+        end
+        return { characters = { [NAME] = rec }, homeless = {} }
+    end
+    local A1, A2, A3 = OF.Histories(aids, mkBucket)
+
+    ck(OF.Divergent(A1, A2, A3),
+        "NX-14/15 fixture is not divergent — the three accounts-graph insertion "
+        .. "histories walked in the same pairs() order, so this row proves nothing")
+
+    local function res(accounts)
+        local rec, aid = Store.ResolveOwner({ accounts = accounts }, NAME)
+        return (rec and rec.aidTag or "nil") .. "/" .. tostring(aid)
+    end
+    ck(res(A1) == "6/6", "NX-14/15: the freshest ownerEpoch wins (got " .. res(A1) .. ")")
+    ck(res(A1) == res(A2) and res(A2) == res(A3),
+        "NX-14/15: the winner differed across insertion histories — the identity of "
+        .. "a duplicated character is decided by iteration luck")
+
+    -- Rung by rung, and each from all three histories via an unsorted candidate
+    -- list, because the FOLD must be order-independent too.
+    local T = 5000
+    local function cand(aid, epoch, upd, homeless)
+        return { aid = aid, homeless = homeless,
+                 rec = { ownerEpoch = epoch, lastDataUpdate = upd } }
+    end
+    ck(Store.OwnerWinner({ cand("3", T - 1, T), cand("7", T, T) }).aid == "7",
+        "rung 1: newest ownerEpoch wins")
+    ck(Store.OwnerWinner({ cand("7", T, T), cand("3", T - 1, T) }).aid == "7",
+        "rung 1: ...regardless of collection order")
+    ck(Store.OwnerWinner({ cand("3", T, T - 500), cand("7", T, T) }).aid == "7",
+        "rung 2: equal epochs fall through to newest lastDataUpdate")
+    ck(Store.OwnerWinner({ cand("3", T, T, true), cand("7", T, T, false) }).aid == "7",
+        "rung 3: a real bucket beats a homeless one")
+    ck(Store.OwnerWinner({ cand("", T, T), cand("7", T, T) }).aid == "7",
+        "rung 3: the orphan bucket ranks as homeless")
+    ck(Store.OwnerWinner({ cand("7", T, T), cand("3", T, T) }).aid == "3",
+        "rung 4: with nothing left to judge on, the LOWEST aid wins")
+    ck(Store.OwnerWinner({ cand("10", T, T), cand("9", T, T) }).aid == "9",
+        "rung 4: and 'lowest' is numeric — 9 beats 10, not the string order")
+    ck(Store.OwnerWinner({}) == nil, "no candidates -> no winner")
+
+    -- A character in exactly one bucket resolves to it; an unheld name to nil.
+    ck(select(2, Store.ResolveOwner({ accounts = { ["4"] = mkBucket("4") } }, NAME)) == "4",
+        "a single copy resolves to its own bucket")
+    ck(Store.ResolveOwner({ accounts = A1 }, "Nobody-Whitemane") == nil,
+        "an unheld Name-Realm resolves to nothing")
+    ck(Store.ResolveOwner(nil, NAME) == nil and Store.ResolveOwner({}, NAME) == nil,
+        "a missing accounts graph resolves to nothing rather than erroring")
+    ck(Store.ResolveOwner({ accounts = A1 }, "") == nil, "an empty name resolves to nothing")
+
+    -- THE RED CONTROL. The row above is only worth having if the code it
+    -- replaced would actually have failed on this fixture. This is that code,
+    -- verbatim — ui_detail's and ui_instancespanel's old first-`pairs()`-hit
+    -- scan — run against the same three histories. It must DISAGREE with itself.
+    local function preFixResolve(accounts)
+        for aid, b in pairs(accounts) do
+            local rec = (b.characters and b.characters[NAME]) or (b.homeless and b.homeless[NAME])
+            if rec then return rec, aid end
+        end
+    end
+    local p1 = select(2, preFixResolve(A1))
+    local p2 = select(2, preFixResolve(A2))
+    local p3 = select(2, preFixResolve(A3))
+    ck(not (p1 == p2 and p2 == p3),
+        "NX-14/15 RED CONTROL: the pre-fix first-pairs()-hit scan agreed with itself "
+        .. "across all three histories, so this fixture would not have caught the bug")
+    ck(not (p1 == "6" and p2 == "6" and p3 == "6"),
+        "NX-14/15 RED CONTROL: the pre-fix scan happened to find the live copy every "
+        .. "time — the fixture is not exercising the defect")
+
+    -- And with every judgeable rung tied, the winner is the LAST rung's answer:
+    -- the lowest aid, not "whoever was collected first".
+    local flat = {}
+    for i = 1, #aids do
+        local b = mkBucket(aids[i])
+        local r = b.characters[NAME] or b.homeless[NAME]
+        if r then r.ownerEpoch, r.lastDataUpdate = 1000, 1000 end
+        flat[aids[i]] = b
+    end
+    local _, flatAid = Store.ResolveOwner({ accounts = flat }, NAME)
+    ck(flatAid == "1",
+        "NX-14/15: with every rung tied, the winner is the LOWEST aid (got "
+        .. tostring(flatAid) .. ")")
+end
+
 function Store.RunSelfTests(verbose)
     local suites = {
         { name = "defaults",        fn = testDefaults },
@@ -7487,6 +7780,9 @@ function Store.RunSelfTests(verbose)
         { name = "automation defaults flip: heal (1.1.4)", fn = testAutomationDefaultFlips },
         { name = "zanza default pick list: seed + stickiness", fn = testZanzaSeeds },
         { name = "OWNER fixture: automation defaults end to end", fn = testOwnerAutomationFixture },
+        -- Brief E (Class 8): sort before the ceiling, one identity rule.
+        { name = "social set: sort before the ceiling (NX-8)", fn = testSocialSetOrder },
+        { name = "owner resolution: one rule, three surfaces (NX-14/NX-15)", fn = testResolveOwner },
     }
     local allPass = true
     for _, suite in ipairs(suites) do
