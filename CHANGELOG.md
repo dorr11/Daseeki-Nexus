@@ -1,5 +1,39 @@
 # Changelog
 
+## Unreleased
+
+- **Fixed:** **the one character that would not sync now goes to the front of the queue.**
+  When your accounts were fully caught up except for a single character, Nexus already knew
+  how to ask for just that one — but it had no idea which order to send the answers in, so the
+  reply it built was shuffled fresh every time. Nexus only sends about one message a second,
+  so position in that queue is the whole wait: the character you were actually missing could
+  sit near the back, and if the exchange was interrupted — a relog, a dropped message, or
+  simply the next round starting before the last one finished — the reshuffle put it somewhere
+  else entirely. A character could stay stale for hours that way while everything around it
+  updated fine. Answers are now ordered by who needs what most: characters the other account
+  holds **nothing** for go first, then the ones it is furthest behind on. In the common case —
+  one character out of date — that character is now the very first thing sent.
+- **Fixed:** **duplicate world-buff announcements to your guild.** When two of your accounts
+  both decided they were the one who should relay a buff timer, each was supposed to notice the
+  other's copy and stand down. The check compared the two messages by their compressed contents,
+  which — for reasons invisible from the outside — could differ between two machines holding
+  *identical* timers. So the check never matched and the stand-down never happened: your guild
+  got the same announcement twice. The comparison now looks at what the message actually says
+  rather than how it happened to be packed, so the second copy is dropped as intended.
+- **Fixed:** **an account that appeared online and offline at the same time.** If Nexus had
+  ended up with two entries for one character, going offline correctly marked both — but coming
+  back only ever revived one of them, and which one changed from session to session. The result
+  was a status light that flickered between online and offline for no visible reason. Returning
+  from offline now revives every entry, matching what going offline already did.
+- **Changed:** **the order Nexus sends things in is now fixed instead of arbitrary.** Settings
+  pushes, blacklist syncs, timer requests, the "Sync now" button and the login publish all used
+  to visit your accounts in whatever order happened to come up, which meant that when something
+  had to be skipped — a rate limit, a busy queue — *which* account got skipped was a coin flip
+  that landed differently every session. All of them now follow one consistent order. Nothing
+  about the messages themselves changed and no update is required: an account still on 1.1.5 or
+  older talks to an updated one exactly as before, because this only affects the order a sender
+  chooses, never what a receiver reads.
+
 ## 1.1.5 — 2026-08-07
 
 - **Fixed:** **an account's own data can no longer lose to a stale copy of itself.** If Nexus

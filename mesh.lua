@@ -225,6 +225,113 @@ end
 Mesh.Fnv1a = fnv1a
 
 ----------------------------------------------------------------------
+-- DETERMINISTIC WIRE ORDER (async lesson Class 8)
+--
+-- `pairs()` order differs per table LIFETIME, not per table CONTENT: two clients
+-- (or the same client after a relog) holding byte-identical state will walk it in
+-- different orders. Anywhere that walk feeds a BOUNDED, TRUNCATED or RETRIED send,
+-- the subset that actually reaches the wire is a lottery — and under this mesh's
+-- ~1 msg/sec token bucket a lottery means a converged-but-for-one-owner peer can
+-- wait hours for the one payload it is missing to win the draw.
+--
+-- THE WIRE INVARIANT FOR EVERYTHING BELOW: ordering here is SENDER-LOCAL. No
+-- frame layout, op letter, field name or field value changes; only the sequence in
+-- which frames are handed to Mesh.Enqueue. Every receiver in the wild is already
+-- order-agnostic (each NSPAYLOAD is rev-gated on arrival, each peer send is
+-- independent), so a sorted sender and an unsorted one are indistinguishable to a
+-- 1.1.5-or-older peer. Nothing here needs a PROTO/SCHEMA bump.
+--
+-- The house rule these helpers encode, from friends.lua:423 (`Plan`): SORT BEFORE
+-- THE CEILING. Truncating an unsorted walk re-rolls the surviving subset per call;
+-- truncating a sorted one keeps the same subset every call, so a bounded send
+-- makes the same progress each round instead of re-shuffling.
+----------------------------------------------------------------------
+
+-- Sorted key list for a map, optionally truncated — with the sort applied BEFORE
+-- the ceiling so `limit` keeps a stable subset rather than an arbitrary one.
+-- String keys only (every keyed map on this transport is string-keyed: ownerKeys,
+-- namespace keys, account ids, addon ids).
+function Mesh.SortedKeys(tbl, limit)
+    local out = {}
+    if type(tbl) ~= "table" then return out end
+    for k in pairs(tbl) do
+        if type(k) == "string" then out[#out + 1] = k end
+    end
+    table.sort(out)
+    if limit and #out > limit then
+        for i = #out, limit + 1, -1 do out[i] = nil end
+    end
+    return out
+end
+
+-- Account ids of every known peer, ascending. The identity sites (aidForName,
+-- TouchPeerByName) walk this so a duplicate-name collision resolves the same way
+-- in every session instead of flipping with iteration order.
+function Mesh.SortedPeerAIDs()
+    return Mesh.SortedKeys(Mesh.peers)
+end
+
+-- Every ONLINE, NAMED peer in account-id order — the one walk shared by every
+-- whisper fan-out (PushNamespace, SyncSettings, RequestTimers, SendTimerSnapshot,
+-- WhisperKnownPeers, and the options blacklist push). Enqueue order IS wire order
+-- under the token bucket, and the per-op SendGate/dedup can drop later entrants,
+-- so a shared stable order means the same peer is served first (and the same peer
+-- is gated out) every session rather than a fresh draw each time.
+function Mesh.SortedOnlinePeers()
+    local aids, out = Mesh.SortedPeerAIDs(), {}
+    for i = 1, #aids do
+        local p = Mesh.peers[aids[i]]
+        if p and p.online and p.name then out[#out + 1] = p end
+    end
+    return out
+end
+
+-- Canonical, order-independent digest of an arbitrary decoded value.
+--
+-- Why this exists (see Mesh.BroadcastPayloadHash): LibSerialize walks tables with
+-- `pairs()`, so two clients packing the SAME snapshot can emit DIFFERENT bytes.
+-- Any comparison that means "is this the same content?" must therefore be made
+-- against a canonical form, never against the packed bytes. Keys are sorted and
+-- both keys and values are type-tagged, so 1 and "1" cannot collide.
+local CANON_MAX_DEPTH = 12
+
+local function canonKeyLess(a, b)
+    local ta, tb = type(a), type(b)
+    if ta ~= tb then return ta < tb end
+    if ta == "number" or ta == "string" then return a < b end
+    return tostring(a) < tostring(b)
+end
+
+local function canonWrite(v, depth, out)
+    local tv = type(v)
+    if tv ~= "table" then
+        out[#out + 1] = tv .. ":" .. tostring(v)
+        return
+    end
+    if depth >= CANON_MAX_DEPTH then
+        out[#out + 1] = "table:!depth"   -- bounded: a cyclic/absurd blob cannot hang us
+        return
+    end
+    local keys = {}
+    for k in pairs(v) do keys[#keys + 1] = k end
+    table.sort(keys, canonKeyLess)
+    out[#out + 1] = "{"
+    for i = 1, #keys do
+        local k = keys[i]
+        out[#out + 1] = type(k) .. ":" .. tostring(k) .. "="
+        canonWrite(v[k], depth + 1, out)
+        out[#out + 1] = ";"
+    end
+    out[#out + 1] = "}"
+end
+
+function Mesh.CanonicalDigest(v)
+    local out = {}
+    canonWrite(v, 0, out)
+    return fnv1a(joinList(out, ""))
+end
+
+----------------------------------------------------------------------
 -- Segment / homeless / timer hashing (heartbeat inputs)
 ----------------------------------------------------------------------
 
@@ -976,25 +1083,39 @@ function Mesh.StaleLatchHolds(p, t)
     return (t - at) < (Mesh.PRESENCE_STALE_HOLD or 0)
 end
 
+-- CLASS 8 / NXM-6. This used to return on the FIRST `pairs()` match, which made
+-- it asymmetric with its own counterpart: Mesh.MarkPresenceStale deliberately
+-- loops EVERY match and latches them all. With duplicate peer entries for one
+-- name, "go offline" hit all of them and "come back" hit one — so one entry stayed
+-- green while its twin decayed, and which one that was flipped per session,
+-- producing presence flicker.
+--
+-- Fixed by making it symmetric rather than by sorting: liveness is a property of
+-- the NAME, so every entry matching the name is refreshed. That removes the
+-- ordering question entirely instead of merely making it repeatable. The RETURN
+-- is still a single peer for the existing callers, and it is now the lowest
+-- account id among the matches — the same explicit tiebreak aidForName uses, so
+-- the two identity paths cannot disagree about which duplicate is canonical.
 function Mesh.TouchPeerByName(name, t)
     if not name or name == "" then return nil end
     t = t or (Store and Store.Now and Store.Now()) or 0
-    for _, p in pairs(Mesh.peers) do
+    local aids, first = Mesh.SortedPeerAIDs(), nil
+    for i = 1, #aids do
+        local p = Mesh.peers[aids[i]]
         if Mesh.PeerNameMatches(p, name) then
             p.lastSeen = t
-            if Mesh.StaleLatchHolds(p, t) then
-                -- In-flight residue from a peer that just announced it is going
-                -- away. Keep the liveness stamp, keep the latch.
-                return p
+            if not Mesh.StaleLatchHolds(p, t) then
+                -- Otherwise: in-flight residue from a peer that just announced it
+                -- is going away. Keep the liveness stamp, keep the latch.
+                p.online = true      -- evidence of life outranks a stale latch
+                p.timedOut = nil
+                p.presenceStale = nil
+                p.presenceStaleAt = nil
             end
-            p.online = true          -- evidence of life outranks a stale latch
-            p.timedOut = nil
-            p.presenceStale = nil
-            p.presenceStaleAt = nil
-            return p
+            if not first then first = p end
         end
     end
-    return nil
+    return first
 end
 
 -- Cadence gate for the drain ticker: sweep at most once per PEER_SWEEP_INTERVAL.
@@ -1387,11 +1508,47 @@ function Mesh.Enqueue(prefix, frame, meta)
     return true, #chunks
 end
 
+-- Every scheduler prefix in a fixed order: the protocol's own declared order
+-- (TIMER, STATE, HEARTBEAT, SYNC) first, then any unexpected key sorted, so a
+-- stray prefix can never silently reintroduce iteration luck.
+--
+-- CLASS 8 / NXM-4. The prefix walk is not cosmetic: within one tick it sets the
+-- real order sends hit the wire, AND Mesh.NoteFailure mutates per-target skip
+-- state that prefixes visited LATER in the same tick read back through
+-- Mesh.TargetSkipped. So `pairs()` decided both who transmitted first and which
+-- prefix ate the failure-skip for a flaky target. PREFIX_LIST is the right order
+-- rather than merely a sorted one: it is the protocol's own declared priority,
+-- with the bulk SYNC prefix deliberately last.
+function Mesh.SchedulerPrefixes()
+    local out, seen = {}, {}
+    local list = Protocol and Protocol.PREFIX_LIST
+    if type(list) == "table" then
+        for i = 1, #list do
+            local prefix = list[i]
+            if Mesh._sched[prefix] and not seen[prefix] then
+                seen[prefix] = true
+                out[#out + 1] = prefix
+            end
+        end
+    end
+    local extra = Mesh.SortedKeys(Mesh._sched)
+    for i = 1, #extra do
+        if not seen[extra[i]] then
+            seen[extra[i]] = true
+            out[#out + 1] = extra[i]
+        end
+    end
+    return out
+end
+
 -- Drain one message per prefix per tick, honouring buckets, target skips and
 -- per-op burst caps. Called by the 50ms ticker.
 function Mesh.DrainTick(t)
     t = t or now()
-    for prefix, s in pairs(Mesh._sched) do
+    local prefixes = Mesh.SchedulerPrefixes()
+    for pi = 1, #prefixes do
+        local prefix = prefixes[pi]
+        local s = Mesh._sched[prefix]
         s.bucket:Refill(t)
         local burst = {}
         -- One send per prefix per tick keeps us well under the hardware cap;
@@ -1706,12 +1863,30 @@ end
 ----------------------------------------------------------------------
 
 -- Map a Name-Realm sender to its account ID via the peer table (best effort).
+--
+-- CLASS 8 / NXM-5. This is not a cosmetic lookup: the result becomes the
+-- `senderAID` handed to Store.WriteInboundCharacter, which gates owner-origin
+-- arbitration — i.e. which ACCOUNT gets credited as the origin of a character's
+-- data. Two peer entries matching one name is a state this file explicitly
+-- anticipates (Mesh.CheckAccountConflict exists for it), and under `pairs()` the
+-- winner flipped between sessions, so the same inbound frame could be attributed
+-- to a different account after a relog.
+--
+-- The tiebreak is an explicit rule, not just a sort: LOWEST ACCOUNT ID WINS.
+-- Deliberately chosen over "newest lastSeen", which is also deterministic but is
+-- TIME-VARYING — attribution would still drift as liveness stamps moved, just
+-- less visibly. Data attribution should be stable for the same peer table, so the
+-- rule keys on the one field that never changes. Duplicates are the conflict
+-- CheckAccountConflict is there to surface; this only stops them being random.
 local function aidForName(name)
-    for aid, p in pairs(Mesh.peers) do
-        if Mesh.PeerNameMatches(p, name) then return aid end
+    local aids = Mesh.SortedPeerAIDs()
+    for i = 1, #aids do
+        local p = Mesh.peers[aids[i]]
+        if Mesh.PeerNameMatches(p, name) then return aids[i] end
     end
     return nil
 end
+Mesh._AidForNameForTest = aidForName   -- exposed for the NXM-5 determinism row
 
 ----------------------------------------------------------------------
 -- THE REPAINT PUMP
@@ -2590,10 +2765,10 @@ function Mesh.PushNamespace(nsKey, ownerKey)
     local function flush()
         Mesh._nsPushPending[pendKey] = nil
         if not Mesh.IsEnabled() then return end
-        for _, p in pairs(Mesh.peers) do
-            if p.online and p.name then
-                sendNSPayloadTo(p.name, nsKey, ownerKey, "nspush")
-            end
+        -- CLASS 8 / NXM-7: shared sorted fan-out (see Mesh.SortedOnlinePeers).
+        local peers = Mesh.SortedOnlinePeers()
+        for i = 1, #peers do
+            sendNSPayloadTo(peers[i].name, nsKey, ownerKey, "nspush")
         end
     end
     if C_Timer and C_Timer.After then
@@ -2626,21 +2801,90 @@ function Mesh.NSOwnerIsBehind(manifest, ownerKey, entry)
     return mine > theirs
 end
 
+-- PURE: the ORDER in which an answer's owner payloads go on the wire.
+--
+-- CLASS 8 / NXM-1. Determinism alone would be satisfied by sorting owner keys
+-- alphabetically, but alphabetical is worth nothing to a peer waiting on one
+-- specific owner — under a ~1 msg/sec bucket the position in the queue IS the
+-- wait. The NSREQ manifest already tells us exactly what the requester is missing
+-- or behind on, so we spend that knowledge on the ORDER too, not just the filter:
+-- STALEST-REQUESTER-SIDE FIRST.
+--
+-- The rule, in precedence order:
+--   1. Owners the requester holds NOTHING for (absent from the manifest) go
+--      first. "No data at all" is a worse state than "old data" — it is a blank
+--      row in their UI — and it is also the state a fresh/partial peer is in, so
+--      first contact fills in before top-ups.
+--   2. Then by REV GAP (ours - theirs), largest first. The further behind they
+--      are, the more that one payload buys them.
+--   3. Ties break on ownerKey ascending — the deterministic floor, and the whole
+--      order when there is no manifest (a legacy requester gives us no staleness
+--      signal, so every owner sits in bucket 1 and alphabetical is all we have).
+--
+-- `cap` is applied to the SORTED key list before filtering (sort before the
+-- ceiling, per friends.lua:423), so an over-ceiling namespace scans the same
+-- owners every round instead of re-rolling which ones are even considered.
+--
+-- Returns (orderedOwnerKeys, skippedCount).
+function Mesh.NSAnswerOrder(manifest, all, cap)
+    local order = {}
+    if type(all) ~= "table" then return order, 0 end
+    if manifest ~= nil and type(manifest) ~= "table" then manifest = nil end
+
+    local owners  = Mesh.SortedKeys(all, cap)
+    local rank    = {}   -- ownerKey -> 0 (holds nothing) | 1 (holds an older rev)
+    local gap     = {}   -- ownerKey -> how far behind they are, for rank 1
+    local skipped = 0
+
+    for i = 1, #owners do
+        local ownerKey = owners[i]
+        local entry = all[ownerKey]
+        if Mesh.NSOwnerIsBehind(manifest, ownerKey, entry) then
+            local theirsRaw = manifest and manifest[ownerKey]
+            if theirsRaw == nil then
+                rank[ownerKey], gap[ownerKey] = 0, 0
+            else
+                rank[ownerKey] = 1
+                gap[ownerKey]  = (tonumber(entry and entry.rev) or 0) - (tonumber(theirsRaw) or 0)
+            end
+            order[#order + 1] = ownerKey
+        else
+            skipped = skipped + 1
+        end
+    end
+
+    table.sort(order, function(a, b)
+        if rank[a] ~= rank[b] then return rank[a] < rank[b] end   -- holds-nothing first
+        if gap[a]  ~= gap[b]  then return gap[a]  > gap[b]  end   -- furthest behind first
+        return a < b                                              -- deterministic floor
+    end)
+    return order, skipped
+end
+
 -- PURE-ish (reads the store, no side effects): our owner->rev manifest for one
 -- namespace, as carried in an outgoing NSREQ. Numbers only — the whole point is
 -- that this stays a few dozen small integers next to the KBs of inventory the
 -- unfiltered answer would otherwise cost.
+--
+-- CLASS 8 / NXM-2 — SORT BEFORE THE CEILING. `NS_MANIFEST_MAX` truncates this
+-- map, and the manifest is what tells the answerer which owners we are behind on.
+-- Walked with `pairs()`, an over-ceiling roster re-rolled the surviving subset on
+-- every call, so the answerer's idea of our gaps changed each round and repair
+-- never settled. Sorted, the truncated set is the SAME owners every call: the
+-- omitted tail is consistently declared "we hold nothing", which the answerer
+-- safely over-answers (it can only cost extra sends, never a missed one).
+-- Wire-neutral: `m` is an unordered map on the wire; only WHICH owners survive
+-- the ceiling is decided here, and the field's shape is untouched.
 function Mesh.BuildNSManifest(nsKey)
     local out = {}
     local S = Store
     if not (S and S.SyncNSAll) then return out end
-    local n = 0
-    for ownerKey, entry in pairs(S.SyncNSAll(nsKey)) do
-        if type(ownerKey) == "string" then
-            out[ownerKey] = tonumber(entry and entry.rev) or 0
-            n = n + 1
-            if n >= Mesh.NS_MANIFEST_MAX then break end   -- iteration ceiling
-        end
+    local all = S.SyncNSAll(nsKey)
+    local owners = Mesh.SortedKeys(all, Mesh.NS_MANIFEST_MAX)
+    for i = 1, #owners do
+        local ownerKey = owners[i]
+        local entry = all[ownerKey]
+        out[ownerKey] = tonumber(entry and entry.rev) or 0
     end
     return out
 end
@@ -2656,20 +2900,31 @@ end
 -- one still draining. `pairs()` re-randomised the order each time, so which owner
 -- actually landed was a lottery and a stale entry could persist for many hours.
 -- Returns the number of owner payloads enqueued (harness-observable).
+--
+-- CLASS 8 / NXM-1 — THE HALF THE MANIFEST FIX LEFT UNDONE. That pass fixed WHICH
+-- owners (the manifest filter) and HOW OFTEN (dedup 15s->120s). The ORDER within
+-- the filtered set was still `pairs()`, and that is the half that hurts: the
+-- filter only shrinks the lottery, it does not end it. Any answer interrupted
+-- part-way — a relog, a SendGate drop, a bucket that never drains before the next
+-- round supersedes it — repaired a RANDOM subset, so the one owner a peer was
+-- actually missing could keep losing the draw for hours. The order is now decided
+-- by convergence value; see Mesh.NSAnswerOrder for the rule.
+--
+-- WIRE INVARIANT: this ordering is SENDER-LOCAL. Every NSPAYLOAD is an
+-- independent, rev-gated frame and receivers have always applied them in whatever
+-- order they land, so a 1.1.5-or-older peer cannot distinguish an ordered
+-- answerer from an unordered one. No frame, op or field changed.
 function Mesh.SendNamespace(target, nsKey, manifest)
     if not Mesh.IsEnabled() or not target then return 0 end
     local S = Store
     if not (S and S.SyncNSAll) then return 0 end
     if manifest ~= nil and type(manifest) ~= "table" then manifest = nil end
-    local sent, scanned = 0, 0
-    for ownerKey, entry in pairs(S.SyncNSAll(nsKey)) do
-        scanned = scanned + 1
-        if scanned > Mesh.NS_ANSWER_SCAN_CAP then break end   -- iteration ceiling
-        if Mesh.NSOwnerIsBehind(manifest, ownerKey, entry) then
-            if sendNSPayloadTo(target, nsKey, ownerKey) then sent = sent + 1 end
-        else
-            Mesh._nsOwnersSkipped = (Mesh._nsOwnersSkipped or 0) + 1
-        end
+    local all = S.SyncNSAll(nsKey)
+    local order, skipped = Mesh.NSAnswerOrder(manifest, all, Mesh.NS_ANSWER_SCAN_CAP)
+    local sent = 0
+    Mesh._nsOwnersSkipped = (Mesh._nsOwnersSkipped or 0) + skipped
+    for i = 1, #order do
+        if sendNSPayloadTo(target, nsKey, order[i]) then sent = sent + 1 end
     end
     if manifest then
         Mesh._nsAnswersTargeted = (Mesh._nsAnswersTargeted or 0) + 1
@@ -2724,11 +2979,23 @@ end
 
 -- PURE: given our namespace hashes and a peer's advertised hashes, return the
 -- namespace keys whose hashes differ (so we should pull them from that peer).
+--
+-- CLASS 8 / NXM-3. This list is consumed as one RequestNamespace per entry, and
+-- each of those burns a 120s NSAskAllowed slot plus a SYNC frame — so the order
+-- decided not merely which namespace was repaired FIRST but, under the cooldown,
+-- which was repaired AT ALL this round. Sorted, a peer with several diverged
+-- namespaces works through them in the same sequence every round instead of
+-- re-drawing, so the tail namespace is reached on a predictable schedule rather
+-- than whenever the iterator happens to favour it. Alphabetical is the honest
+-- rule here: unlike the owner answer, a hash mismatch carries no magnitude, so
+-- there is no staleness to rank by — only "differs" or "does not".
 function Mesh.DiffNamespaceHashes(localH, remoteH)
     local diffs = {}
     if type(remoteH) ~= "table" then return diffs end
-    for nsKey, rhash in pairs(remoteH) do
-        if (localH and localH[nsKey] or "0") ~= rhash then
+    local keys = Mesh.SortedKeys(remoteH)
+    for i = 1, #keys do
+        local nsKey = keys[i]
+        if (localH and localH[nsKey] or "0") ~= remoteH[nsKey] then
             diffs[#diffs + 1] = nsKey
         end
     end
@@ -2789,14 +3056,18 @@ function Mesh.SyncSettings()
     if not payload then return end
     local t = now()
     local wait, sent = {}, 0
-    for aid, p in pairs(Mesh.peers) do
+    -- CLASS 8 / NXM-7: shared sorted fan-out. Order matters more here than in a
+    -- plain broadcast because SendGate below can REFUSE a target — so iteration
+    -- order chose who got the settings and who was silently gated out.
+    local peers = Mesh.SortedOnlinePeers()
+    for i = 1, #peers do
+        local p = peers[i]
         -- Anti-mash gate (local policy, not spec): this is a BUTTON that fans a
         -- multi-chunk payload out to every peer at once, so an impatient double-
         -- press used to be an N-peer duplicate broadcast. A gated target is
         -- skipped entirely — it is NOT added to the ACK wait set, because we
         -- never sent it anything to acknowledge.
-        if p.online and p.name
-           and Mesh.SendGate("settings", p.name, nil, Mesh.SETTINGS_COOLDOWN, t) then
+        if Mesh.SendGate("settings", p.name, nil, Mesh.SETTINGS_COOLDOWN, t) then
             wait[p.name] = true
             sent = sent + 1
             local seq = Mesh._outSeq + 1
@@ -2924,11 +3195,11 @@ Mesh._handleTimerSnap = handleTimerSnap
 function Mesh.RequestTimers()
     if not Mesh.IsEnabled() then return 0 end
     local sent = 0
-    for _, p in pairs(Mesh.peers) do
-        if p.online and p.name then
-            Mesh.RequestSync(p.name, "timers", "timers")
-            sent = sent + 1
-        end
+    -- CLASS 8 / NXM-7: shared sorted fan-out (see Mesh.SortedOnlinePeers).
+    local peers = Mesh.SortedOnlinePeers()
+    for i = 1, #peers do
+        Mesh.RequestSync(peers[i].name, "timers", "timers")
+        sent = sent + 1
     end
     -- Guild fallback so members not yet in our peer table also answer.
     if IsInGuild and IsInGuild() then
@@ -2962,12 +3233,33 @@ end
 -- snapshot is not latency-sensitive at second granularity.
 ----------------------------------------------------------------------
 
--- Content hash of a packed snapshot. Same rolling hash the segment/state hashes
--- use, so "identical payload" means identical BYTES, not merely equal-looking
--- tables — two independently packed copies of the same snapshot serialize
--- identically, which is what makes the comparison sound.
+-- Content hash of a packed snapshot.
+--
+-- CLASS 8 / NXM-8 — THE ASSERTION THAT WAS FALSE. This used to hash the packed
+-- BYTES, on the stated reasoning that "two independently packed copies of the same
+-- snapshot serialize identically". They do not. LibSerialize walks tables with
+-- `pairs()` (LibSerialize.lua:1661/1731/1744) and Timers.GetSnapshot() returns a
+-- STRING-KEYED `snap.buffs` map, so two clients holding identical world-buff state
+-- emit different bytes and therefore different hashes. The consequence was silent
+-- and exactly backwards from the intent: CancelPendingBroadcast could never match
+-- an inbound copy, so the B5 split-brain suppression this hash exists to serve
+-- NEVER FIRED, and duplicate world-buff broadcasts went out every time two clients
+-- elected themselves.
+--
+-- Fixed by hashing a CANONICAL form (sorted, type-tagged keys — the same principle
+-- Mesh.HashSet already applies to flat sets) instead of the serializer's output.
+-- Garbage or unpackable input degrades to the old byte hash, which keeps the
+-- comparison total: two identical unpackable strings still match each other.
+--
+-- WIRE INVARIANT: this hash is never transmitted. Both the arming side and the
+-- receiving side compute it locally from a payload they already hold, so changing
+-- how it is derived is invisible to every peer — it only makes two clients'
+-- independently-derived answers agree, which is the entire point.
 function Mesh.BroadcastPayloadHash(payload)
-    return fnv1a(payload or "")
+    if type(payload) ~= "string" or payload == "" then return fnv1a(payload or "") end
+    local blob = Mesh.Unpack(payload)
+    if blob == nil then return fnv1a(payload) end
+    return Mesh.CanonicalDigest(blob)
 end
 
 -- Drop an armed broadcast whose payload hash matches. Returns true if it fired.
@@ -2990,11 +3282,11 @@ function Mesh.SendTimerSnapshot(payload)
         Mesh.Enqueue(Protocol.PREFIX.SYNC, frame,
             { op = "sync", chatType = "GUILD", seq = seq })
     end
-    for _, p in pairs(Mesh.peers) do
-        if p.online and p.name then
-            Mesh.Enqueue(Protocol.PREFIX.SYNC, frame,
-                { op = "sync", chatType = "WHISPER", target = p.name, seq = seq })
-        end
+    -- CLASS 8 / NXM-7: shared sorted fan-out (see Mesh.SortedOnlinePeers).
+    local peers = Mesh.SortedOnlinePeers()
+    for i = 1, #peers do
+        Mesh.Enqueue(Protocol.PREFIX.SYNC, frame,
+            { op = "sync", chatType = "WHISPER", target = peers[i].name, seq = seq })
     end
 end
 
@@ -3117,12 +3409,14 @@ end
 -- whisper; all recipients share the frame's seq — each sees one send from us).
 function Mesh.WhisperKnownPeers(prefix, frame, meta)
     meta = meta or {}
-    for _, p in pairs(Mesh.peers) do
-        if p.online and p.name then
-            Mesh.Enqueue(prefix, frame, {
-                op = meta.op, chatType = "WHISPER", target = p.name, seq = meta.seq,
-            })
-        end
+    -- CLASS 8 / NXM-7: shared sorted fan-out (see Mesh.SortedOnlinePeers). This is
+    -- the widest of the fan-outs — heartbeats, discovery and Config.Push all ride
+    -- it — so pinning its order pins most of the mesh's outbound sequencing.
+    local peers = Mesh.SortedOnlinePeers()
+    for i = 1, #peers do
+        Mesh.Enqueue(prefix, frame, {
+            op = meta.op, chatType = "WHISPER", target = peers[i].name, seq = meta.seq,
+        })
     end
 end
 
@@ -4664,6 +4958,441 @@ local function testNSTargetedBackfill()
     Mesh._nsReqSeen, Mesh._nsReqAsked, Mesh._nsQueued = savedSeen, savedAsked, savedQueued
     if restoreSync then _G.Daseeki.Sync = nil end
     _G.Daseeki = savedDaseeki
+    return ok, why
+end
+
+----------------------------------------------------------------------
+-- CLASS 8: DETERMINISTIC WIRE ORDER (NXM-1..NXM-8)
+--
+-- THE FIXTURE DISCIPLINE THAT MAKES THESE ROWS REAL. A determinism test that
+-- builds its table ONCE proves nothing: it observes one `pairs()` order and calls
+-- it stable. `pairs()` order is a property of the table's LIFETIME — how its keys
+-- were inserted, how it resized, what was deleted — so every fixture below is
+-- built THREE TIMES from three different insertion histories (forward, reverse,
+-- and decoys-inserted-then-deleted-then-interleaved) holding IDENTICAL content.
+--
+-- And the fixture is required to PROVE ITSELF: `ckDivergent` asserts the three
+-- raw `pairs()` walks actually disagree. If a future Lua ever made them agree,
+-- these rows would silently become vacuous — so the fixture failing to diverge is
+-- itself a test failure, not a pass.
+--
+-- The bar each site must clear is then: same content, three lifetimes, one order.
+----------------------------------------------------------------------
+
+-- Raw pairs() walk of a map, as a comparable string.
+local function rawWalk(t)
+    local out = {}
+    for k in pairs(t) do out[#out + 1] = tostring(k) end
+    return table.concat(out, ",")
+end
+local function seqOf(list)
+    local out = {}
+    for i = 1, #list do out[i] = tostring(list[i]) end
+    return table.concat(out, ",")
+end
+
+-- Build one map three ways from the same (key, value) pairs. `mk(key)` produces
+-- the value. Returns the three tables.
+local function threeHistories(keys, mk)
+    local A, B, C = {}, {}, {}
+    for i = 1, #keys do A[keys[i]] = mk(keys[i]) end                 -- forward
+    for i = #keys, 1, -1 do B[keys[i]] = mk(keys[i]) end             -- reverse
+    for i = 1, #keys do C["\1decoy" .. i] = true end                 -- churn the
+    for i = 1, #keys do C["\1decoy" .. i] = nil end                  -- table's shape
+    for i = 2, #keys, 2 do C[keys[i]] = mk(keys[i]) end              -- evens, then
+    for i = 1, #keys, 2 do C[keys[i]] = mk(keys[i]) end              -- odds
+    return A, B, C
+end
+
+local function testWireOrderDeterminism()
+    local ok, why = true, nil
+    local function ck(c, m) if ok and not c then ok, why = false, m end end
+    -- The fixture must be UNKIND or the rows below are vacuous.
+    local function ckDivergent(A, B, C, label)
+        local a, b, c = rawWalk(A), rawWalk(B), rawWalk(C)
+        ck(not (a == b and b == c),
+            label .. ": fixture is not divergent — all three insertion histories "
+            .. "walked in the same pairs() order, so this row proves nothing")
+    end
+    -- All three orderings must be equal AND non-empty.
+    local function ckStable(x, y, z, label)
+        ck(#x > 0, label .. ": produced an empty order")
+        ck(seqOf(x) == seqOf(y) and seqOf(y) == seqOf(z),
+            label .. ": order differed across insertion histories ("
+            .. seqOf(x) .. " | " .. seqOf(y) .. " | " .. seqOf(z) .. ")")
+    end
+
+    local owners = {}
+    for i = 1, 44 do owners[i] = string.format("Owner%02d-Whitemane", i) end
+
+    ------------------------------------------------------------------
+    -- NXM-1a. THE CONVERGENCE-VALUE RULE (pure, Mesh.NSAnswerOrder).
+    -- The whole point of Brief C: not merely stable, but stalest-first.
+    ------------------------------------------------------------------
+    do
+        local all = {
+            ["Behind-Two"]  = { rev = 30 },   -- gap 20 vs theirs 10
+            ["Behind-Ten"]  = { rev = 50 },   -- gap 40 vs theirs 10  <- bigger gap
+            ["Missing-One"] = { rev = 3  },   -- they hold NOTHING    <- outranks both
+            ["Level-One"]   = { rev = 7  },   -- equal: filtered out
+            ["We-Are-Old"]  = { rev = 1  },   -- we are behind: filtered out
+        }
+        local manifest = {
+            ["Behind-Two"] = 10, ["Behind-Ten"] = 10,
+            ["Level-One"]  = 7,  ["We-Are-Old"] = 9,
+        }
+        local order, skipped = Mesh.NSAnswerOrder(manifest, all, 500)
+        ck(seqOf(order) == "Missing-One,Behind-Ten,Behind-Two",
+            "convergence order wrong: expected holds-nothing, then widest gap, got "
+            .. seqOf(order))
+        ck(skipped == 2, "expected 2 filtered owners, got " .. tostring(skipped))
+
+        -- Ties fall back to ownerKey ascending, not to iteration luck.
+        local tied = Mesh.NSAnswerOrder(
+            { ["B-Owner"] = 1, ["A-Owner"] = 1, ["C-Owner"] = 1 },
+            { ["B-Owner"] = { rev = 5 }, ["A-Owner"] = { rev = 5 }, ["C-Owner"] = { rev = 5 } },
+            500)
+        ck(seqOf(tied) == "A-Owner,B-Owner,C-Owner",
+            "equal-gap tiebreak was not ownerKey-ascending: " .. seqOf(tied))
+    end
+
+    ------------------------------------------------------------------
+    -- NXM-1b. THE HEADLINE SCENARIO AS A FIXTURE: 44 owners, the requester is
+    -- behind on exactly ONE. That owner must be the FIRST payload out — under a
+    -- ~1 msg/sec bucket, first is the difference between seconds and hours —
+    -- and it must be first from all three insertion histories.
+    ------------------------------------------------------------------
+    do
+        local manifest = {}
+        for i = 1, #owners do manifest[owners[i]] = 100 end
+        local stale = owners[37]                       -- arbitrary, mid-table
+        manifest[stale] = 99                           -- behind by one rev
+        local A, B, C = threeHistories(owners, function() return { rev = 100 } end)
+        A[stale], B[stale], C[stale] = { rev = 100 }, { rev = 100 }, { rev = 100 }
+        ckDivergent(A, B, C, "NXM-1 44-owner store")
+
+        local oA = Mesh.NSAnswerOrder(manifest, A, Mesh.NS_ANSWER_SCAN_CAP)
+        local oB = Mesh.NSAnswerOrder(manifest, B, Mesh.NS_ANSWER_SCAN_CAP)
+        local oC = Mesh.NSAnswerOrder(manifest, C, Mesh.NS_ANSWER_SCAN_CAP)
+        ckStable(oA, oB, oC, "NXM-1 answer order")
+        ck(#oA == 1, "the one-rev gap produced " .. #oA .. " payloads (expected 1)")
+        ck(oA[1] == stale, "the owner the requester is behind on was not first")
+
+        -- And with a WIDER spread: three behind, one holding nothing. The
+        -- holds-nothing owner leads, then the widest gap, every history.
+        local m2 = {}
+        for i = 1, #owners do m2[owners[i]] = 100 end
+        m2[owners[5]]  = 60     -- gap 40
+        m2[owners[20]] = 90     -- gap 10
+        m2[owners[33]] = nil    -- holds nothing
+        local expect = owners[33] .. "," .. owners[5] .. "," .. owners[20]
+        local p1 = Mesh.NSAnswerOrder(m2, A, Mesh.NS_ANSWER_SCAN_CAP)
+        local p2 = Mesh.NSAnswerOrder(m2, B, Mesh.NS_ANSWER_SCAN_CAP)
+        local p3 = Mesh.NSAnswerOrder(m2, C, Mesh.NS_ANSWER_SCAN_CAP)
+        ckStable(p1, p2, p3, "NXM-1 multi-gap answer order")
+        ck(seqOf(p1) == expect,
+            "multi-gap order wrong: expected " .. expect .. ", got " .. seqOf(p1))
+
+        -- No manifest (legacy requester): no staleness signal exists, so the whole
+        -- set ships in the deterministic alphabetical floor — still not a lottery.
+        local l1 = Mesh.NSAnswerOrder(nil, A, Mesh.NS_ANSWER_SCAN_CAP)
+        local l2 = Mesh.NSAnswerOrder(nil, B, Mesh.NS_ANSWER_SCAN_CAP)
+        local l3 = Mesh.NSAnswerOrder(nil, C, Mesh.NS_ANSWER_SCAN_CAP)
+        ckStable(l1, l2, l3, "NXM-1 legacy full-blast order")
+        ck(#l1 == #owners, "legacy blast dropped owners: " .. #l1)
+        ck(l1[1] == owners[1] and l1[#l1] == owners[#owners],
+            "legacy blast was not in the alphabetical floor order")
+
+        ------------------------------------------------------------------
+        -- NXM-1c. SORT BEFORE THE CEILING. Over the scan cap, the owners even
+        -- CONSIDERED must be the same set every round — that is what stops a
+        -- truncated answer re-rolling its subset and never finishing.
+        ------------------------------------------------------------------
+        local big = {}
+        for i = 1, 40 do big[i] = string.format("Big%03d-Realm", i) end
+        local D, E, F = threeHistories(big, function() return { rev = 9 } end)
+        ckDivergent(D, E, F, "NXM-1 over-ceiling store")
+        local c1 = Mesh.NSAnswerOrder(nil, D, 10)
+        local c2 = Mesh.NSAnswerOrder(nil, E, 10)
+        local c3 = Mesh.NSAnswerOrder(nil, F, 10)
+        ckStable(c1, c2, c3, "NXM-1 truncated answer order")
+        ck(#c1 == 10, "the scan cap did not bind: " .. #c1)
+        ck(c1[1] == "Big001-Realm" and c1[10] == "Big010-Realm",
+            "the truncated set was not the sorted head: " .. seqOf(c1))
+    end
+
+    ------------------------------------------------------------------
+    -- NXM-2. The NSREQ manifest: sorted before NS_MANIFEST_MAX, so which owners
+    -- we declare (and therefore which gaps the answerer sees) is stable.
+    ------------------------------------------------------------------
+    do
+        local savedData, savedMax = Store.data, Mesh.NS_MANIFEST_MAX
+        local A, B, C = threeHistories(owners, function() return { rev = 7 } end)
+        ckDivergent(A, B, C, "NXM-2 manifest store")
+        Mesh.NS_MANIFEST_MAX = 12
+        local function manifestKeys(tbl)
+            Store.data = { syncNamespaces = { bags = tbl } }
+            local m = Mesh.BuildNSManifest("bags")
+            local ks = {}
+            for k in pairs(m) do ks[#ks + 1] = k end
+            table.sort(ks)          -- the map itself is unordered ON THE WIRE;
+            return ks               -- what must be stable is WHICH keys survive.
+        end
+        local k1, k2, k3 = manifestKeys(A), manifestKeys(B), manifestKeys(C)
+        ckStable(k1, k2, k3, "NXM-2 manifest membership")
+        ck(#k1 == 12, "the manifest ceiling did not bind: " .. #k1)
+        ck(k1[1] == owners[1] and k1[12] == owners[12],
+            "the manifest kept an arbitrary subset instead of the sorted head")
+        Mesh.NS_MANIFEST_MAX, Store.data = savedMax, savedData
+    end
+
+    ------------------------------------------------------------------
+    -- NXM-3. Hash-diff list: each entry burns an NSAskAllowed slot, so order
+    -- decides which namespace is repaired at all this round.
+    ------------------------------------------------------------------
+    do
+        local keys = { "attune", "bags", "cfg", "inv", "prof", "rep", "timers" }
+        local A, B, C = threeHistories(keys, function(k) return "remote-" .. k end)
+        ckDivergent(A, B, C, "NXM-3 remote hash bundle")
+        local localH = { bags = "remote-bags" }        -- only bags agrees
+        local d1 = Mesh.DiffNamespaceHashes(localH, A)
+        local d2 = Mesh.DiffNamespaceHashes(localH, B)
+        local d3 = Mesh.DiffNamespaceHashes(localH, C)
+        ckStable(d1, d2, d3, "NXM-3 diff order")
+        ck(seqOf(d1) == "attune,cfg,inv,prof,rep,timers",
+            "diff list was not sorted or dropped/kept the wrong keys: " .. seqOf(d1))
+    end
+
+    ------------------------------------------------------------------
+    -- NXM-4. Scheduler prefix walk. Must follow the protocol's DECLARED order
+    -- (SYNC last), not merely a stable one, and must survive a stray key.
+    ------------------------------------------------------------------
+    do
+        local savedSched = Mesh._sched
+        local P = Protocol.PREFIX
+        local function schedFrom(order)
+            local s = {}
+            for i = 1, #order do s[order[i]] = { stub = true } end
+            return s
+        end
+        Mesh._sched = schedFrom({ P.SYNC, P.TIMER, P.HEARTBEAT, P.STATE })
+        local w1 = Mesh.SchedulerPrefixes()
+        Mesh._sched = schedFrom({ P.STATE, P.HEARTBEAT, P.TIMER, P.SYNC })
+        local w2 = Mesh.SchedulerPrefixes()
+        Mesh._sched = schedFrom({ P.HEARTBEAT, P.SYNC, P.STATE, P.TIMER })
+        local w3 = Mesh.SchedulerPrefixes()
+        ckStable(w1, w2, w3, "NXM-4 prefix walk")
+        ck(seqOf(w1) == seqOf({ P.TIMER, P.STATE, P.HEARTBEAT, P.SYNC }),
+            "prefix walk did not follow Protocol.PREFIX_LIST: " .. seqOf(w1))
+        -- A prefix outside PREFIX_LIST still lands deterministically (sorted tail).
+        Mesh._sched = schedFrom({ P.SYNC, "ZZZZ", P.TIMER, "AAAA" })
+        local w4 = Mesh.SchedulerPrefixes()
+        ck(seqOf(w4) == seqOf({ P.TIMER, P.SYNC, "AAAA", "ZZZZ" }),
+            "an unlisted prefix was not appended in sorted order: " .. seqOf(w4))
+        Mesh._sched = savedSched
+    end
+
+    ------------------------------------------------------------------
+    -- NXM-7. The shared peer fan-out. Enqueue order IS wire order under the
+    -- bucket, and a SendGate can drop later entrants, so this must not re-draw.
+    ------------------------------------------------------------------
+    do
+        local savedPeers = Mesh.peers
+        local aids = {}
+        for i = 1, 20 do aids[i] = string.format("acct-%02d", i) end
+        local A, B, C = threeHistories(aids, function(a)
+            return { online = true, name = a .. "-Char" }
+        end)
+        ckDivergent(A, B, C, "NXM-7 peer table")
+        local function fanout(tbl)
+            Mesh.peers = tbl
+            local out = {}
+            local peers = Mesh.SortedOnlinePeers()
+            for i = 1, #peers do out[i] = peers[i].name end
+            return out
+        end
+        local f1, f2, f3 = fanout(A), fanout(B), fanout(C)
+        ckStable(f1, f2, f3, "NXM-7 fan-out order")
+        ck(#f1 == 20, "fan-out dropped peers: " .. #f1)
+        ck(f1[1] == "acct-01-Char" and f1[20] == "acct-20-Char",
+            "fan-out was not account-id ascending: " .. f1[1] .. ".." .. f1[20])
+
+        -- Offline / unnamed peers are excluded, and excluding them does not
+        -- disturb the order of the rest.
+        Mesh.peers = A
+        A["acct-05"].online = false
+        A["acct-11"].name   = nil
+        local peers = Mesh.SortedOnlinePeers()
+        ck(#peers == 18, "offline/unnamed peers were not excluded: " .. #peers)
+        ck(peers[5].name == "acct-06-Char",
+            "excluding a peer disturbed the surviving order: " .. peers[5].name)
+        A["acct-05"].online = true
+        A["acct-11"].name   = "acct-11-Char"
+
+        ------------------------------------------------------------------
+        -- NXM-5. Duplicate-name resolution: lowest account id, every history.
+        -- This decides which ACCOUNT is credited as a character's data origin.
+        ------------------------------------------------------------------
+        local dupKeys = { "acct-02", "acct-07", "acct-15" }
+        local function dupPeers(base)
+            local t = {}
+            for k, v in pairs(base) do t[k] = { online = v.online, name = v.name } end
+            for i = 1, #dupKeys do t[dupKeys[i]].name = "Twin-Whitemane" end
+            return t
+        end
+        local r1, r2, r3
+        Mesh.peers = dupPeers(A); r1 = Mesh._AidForNameForTest("Twin-Whitemane")
+        Mesh.peers = dupPeers(B); r2 = Mesh._AidForNameForTest("Twin-Whitemane")
+        Mesh.peers = dupPeers(C); r3 = Mesh._AidForNameForTest("Twin-Whitemane")
+        ck(r1 == "acct-02" and r2 == "acct-02" and r3 == "acct-02",
+            "duplicate-name attribution was not the lowest account id: "
+            .. tostring(r1) .. "/" .. tostring(r2) .. "/" .. tostring(r3))
+
+        ------------------------------------------------------------------
+        -- NXM-6. TouchPeerByName must be symmetric with MarkPresenceStale:
+        -- MarkPresenceStale latches EVERY match, so Touch must green EVERY
+        -- match, or one duplicate stays online while its twin decays.
+        ------------------------------------------------------------------
+        local dup = dupPeers(A)
+        Mesh.peers = dup
+        local latched = Mesh.MarkPresenceStale("Twin-Whitemane", 1000)
+        ck(latched == 3, "MarkPresenceStale did not latch all duplicates: " .. tostring(latched))
+        -- Past the stale hold, so the latch may legitimately clear.
+        local t2 = 1000 + (Mesh.PRESENCE_STALE_HOLD or 0) + 10
+        local got = Mesh.TouchPeerByName("Twin-Whitemane", t2)
+        local greened, stamped = 0, 0
+        for i = 1, #dupKeys do
+            local p = dup[dupKeys[i]]
+            if p.online then greened = greened + 1 end
+            if p.lastSeen == t2 then stamped = stamped + 1 end
+        end
+        ck(greened == 3, "TouchPeerByName greened only " .. greened
+            .. " of 3 duplicates — asymmetric with MarkPresenceStale (NXM-6)")
+        ck(stamped == 3, "TouchPeerByName stamped only " .. stamped .. " of 3 duplicates")
+        ck(got == dup["acct-02"],
+            "TouchPeerByName returned a peer other than the lowest account id")
+        Mesh.peers = savedPeers
+    end
+
+    ------------------------------------------------------------------
+    -- NXM-8. Split-brain suppression. Two clients holding IDENTICAL snapshot
+    -- content must derive the SAME hash even though LibSerialize packs their
+    -- string-keyed tables in different orders. This is the row that proves the
+    -- B5 duplicate-broadcast suppression can actually fire.
+    ------------------------------------------------------------------
+    do
+        local keys = {}
+        for i = 1, 24 do keys[i] = string.format("buff-%02d", i) end
+        local A, B, C = threeHistories(keys, function(k) return { at = #k, id = k } end)
+        ckDivergent(A, B, C, "NXM-8 snapshot buffs")
+        local pA = Mesh.Pack({ buffs = A, v = 3 })
+        local pB = Mesh.Pack({ buffs = B, v = 3 })
+        local pC = Mesh.Pack({ buffs = C, v = 3 })
+        if pA and pB and pC then
+            local hA = Mesh.BroadcastPayloadHash(pA)
+            local hB = Mesh.BroadcastPayloadHash(pB)
+            local hC = Mesh.BroadcastPayloadHash(pC)
+            ck(hA == hB and hB == hC,
+                "identical snapshot content hashed differently across pack orders "
+                .. "— split-brain suppression cannot match (NXM-8)")
+            -- ...and the hash must still DISCRIMINATE, or it would suppress
+            -- genuinely different broadcasts.
+            local diff = {}
+            for k, v in pairs(A) do diff[k] = v end
+            diff["buff-07"] = { at = 999, id = "buff-07" }
+            local pD = Mesh.Pack({ buffs = diff, v = 3 })
+            ck(pD and Mesh.BroadcastPayloadHash(pD) ~= hA,
+                "a genuinely different snapshot produced the same hash")
+        else
+            ck(false, "NXM-8: the pack path was unavailable, row could not run")
+        end
+        -- Unpackable input degrades to the byte hash and stays total.
+        ck(Mesh.BroadcastPayloadHash("not-a-payload")
+            == Mesh.BroadcastPayloadHash("not-a-payload"),
+            "unpackable payloads did not hash consistently")
+        ck(Mesh.BroadcastPayloadHash("not-a-payload")
+            ~= Mesh.BroadcastPayloadHash("other-garbage"),
+            "unpackable payloads collided")
+    end
+
+    return ok, why
+end
+
+----------------------------------------------------------------------
+-- NXM-1, END TO END. The pure ordering rule above is the contract; this row
+-- proves the REAL answer path honours it, through Pack/BuildFrame/ParseFrame/
+-- Unpack, by reading the order frames were actually handed to Mesh.Enqueue.
+----------------------------------------------------------------------
+local function testNSAnswerOrderOnTheWire()
+    local ok, why = true, nil
+    local function ck(c, m) if ok and not c then ok, why = false, m end end
+
+    local savedData    = Store.data
+    local savedEnabled = Mesh.IsEnabled
+    local savedEnqueue = Mesh.Enqueue
+    local savedSeen    = Mesh._nsReqSeen
+    local savedAsked   = Mesh._nsReqAsked
+    local savedQueued  = Mesh._nsQueued
+    Mesh.IsEnabled = function() return true end
+
+    local caught
+    Mesh.Enqueue = function(prefix, frame, meta)
+        caught[#caught + 1] = { frame = frame, meta = meta }
+        return true, 1
+    end
+
+    local owners = {}
+    for i = 1, 44 do owners[i] = string.format("Owner%02d-Whitemane", i) end
+    local stale = owners[37]
+
+    -- The answerer's store, three insertion histories, identical content.
+    local A, B, C = threeHistories(owners, function(k)
+        return { rev = 100, data = { g = k } }
+    end)
+    -- The requester is level on 43 owners and ONE rev behind on `stale`.
+    local manifest = {}
+    for i = 1, #owners do manifest[owners[i]] = 100 end
+    manifest[stale] = 99
+
+    -- Owner keys in the order their payloads were handed to Enqueue.
+    local function answerOrder(store)
+        caught = {}
+        Mesh._nsReqSeen, Mesh._nsReqAsked, Mesh._nsQueued = {}, {}, {}
+        Store.data = { syncNamespaces = { bags = store } }
+        Mesh.SendNamespace("Peer-R", "bags", manifest)
+        local out = {}
+        for i = 1, #caught do
+            local c = caught[i]
+            if c.meta and c.meta.op == "nspayload" then
+                local pf = Mesh.ParseFrame(c.frame)
+                local blob = pf and Mesh.Unpack(pf.payload)
+                if blob and blob.o then out[#out + 1] = blob.o end
+            end
+        end
+        return out
+    end
+
+    local o1, o2, o3 = answerOrder(A), answerOrder(B), answerOrder(C)
+    ck(#o1 == 1, "the wire carried " .. #o1 .. " owner payloads (expected exactly 1)")
+    ck(o1[1] == stale, "the wire's FIRST payload was not the owner the requester "
+        .. "is behind on (got " .. tostring(o1[1]) .. ")")
+    ck(seqOf(o1) == seqOf(o2) and seqOf(o2) == seqOf(o3),
+        "the real send order differed across insertion histories")
+
+    -- And the legacy full blast: 44 payloads, same sequence every history, with
+    -- the stalest-first rule degrading to the alphabetical floor.
+    local savedManifest = manifest
+    manifest = nil
+    local l1, l2, l3 = answerOrder(A), answerOrder(B), answerOrder(C)
+    manifest = savedManifest
+    ck(#l1 == 44, "the legacy blast put " .. #l1 .. " payloads on the wire (expected 44)")
+    ck(seqOf(l1) == seqOf(l2) and seqOf(l2) == seqOf(l3),
+        "the legacy blast order differed across insertion histories")
+    ck(l1[1] == owners[1], "the legacy blast did not start at the sorted head")
+
+    Store.data  = savedData
+    Mesh.IsEnabled, Mesh.Enqueue = savedEnabled, savedEnqueue
+    Mesh._nsReqSeen, Mesh._nsReqAsked, Mesh._nsQueued = savedSeen, savedAsked, savedQueued
     return ok, why
 end
 
@@ -6441,6 +7170,8 @@ function Mesh.RunSelfTests(verbose)
         { name = "hash diff",        fn = testHashDiff },
         { name = "namespace hash diff", fn = testNamespaceDiff },
         { name = "ns targeted backfill (rev manifest)", fn = testNSTargetedBackfill },
+        { name = "wire-order determinism (Class 8, NXM-1..8)", fn = testWireOrderDeterminism },
+        { name = "ns answer order on the wire (NXM-1)", fn = testNSAnswerOrderOnTheWire },
         { name = "ns queue duplicate suppression", fn = testNSQueueDedup },
         { name = "fresh ns push outranks bulk backfill", fn = testNSPushPriority },
         { name = "instances hash",   fn = testInstancesHash },

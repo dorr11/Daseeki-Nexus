@@ -318,11 +318,20 @@ function Sync.AllNamespaceHashes()
 end
 
 -- Provider namespace keys (mesh iterates these when answering a pull).
+--
+-- CLASS 8 / NX-10: sorted, matching the sibling NamespaceHashKeys above, which
+-- already did. PublishAll consumes this as one MarkDirty per key at login, and
+-- every one of those becomes traffic under the SYNC prefix's token bucket — so
+-- the walk order decided which namespace a peer saw published first on every
+-- login. The asymmetry with the sibling was the tell.
 function Sync.ProviderKeys()
     local out = {}
     for key, spec in pairs(Sync._namespaces) do
-        if spec.provide then out[#out + 1] = key end
+        -- String-only, as NamespaceHashKeys does: a non-string key would both be
+        -- unsendable and make the sort below throw on mixed types.
+        if spec.provide and type(key) == "string" then out[#out + 1] = key end
     end
+    table.sort(out)
     return out
 end
 
@@ -501,10 +510,19 @@ function Config.Push(addonId)
 end
 
 -- Broadcast every registered addon's config (the "Sync now" action).
+--
+-- CLASS 8 / NX-11: sorted addon ids. Each Push fans a payload out to every peer
+-- through WhisperKnownPeers, so with several registered addons the button's own
+-- per-addon order set the wire order of the whole burst under the token bucket.
 function Config.SyncNow()
     local any = false
+    local ids = {}
     for addonId in pairs(Config._registry) do
-        if Config.Push(addonId) then any = true end
+        if type(addonId) == "string" then ids[#ids + 1] = addonId end
+    end
+    table.sort(ids)
+    for i = 1, #ids do
+        if Config.Push(ids[i]) then any = true end
     end
     return any
 end
@@ -675,6 +693,70 @@ local function selfTest(verbose)
     Config._ApplyFromFile("config", { bags = { revision = 5, payload = "f" } })
     check("file-mirror applied rev5", Config._revisions.bags == 5 and state2applied[1] == 5)
     Config._registry, Config._revisions = saveReg, saveRev
+
+    ------------------------------------------------------------------
+    -- CLASS 8 (NX-10, NX-11): deterministic publish order.
+    --
+    -- Both of these feed the mesh's token bucket — ProviderKeys becomes one
+    -- MarkDirty per key at login, Config.SyncNow becomes one peer fan-out per
+    -- addon — so an unordered walk made the wire sequence a per-session draw.
+    -- As in mesh.lua's Class 8 rows, the fixtures are built from THREE different
+    -- insertion histories holding identical content, and the fixture must prove
+    -- it actually diverges under pairs() or the assertion would be vacuous.
+    ------------------------------------------------------------------
+    local function walk(t)
+        local o = {}
+        for k in pairs(t) do o[#o + 1] = tostring(k) end
+        return table.concat(o, ",")
+    end
+    local function threeWays(keys, mk)
+        local A, B, C = {}, {}, {}
+        for i = 1, #keys do A[keys[i]] = mk(keys[i]) end
+        for i = #keys, 1, -1 do B[keys[i]] = mk(keys[i]) end
+        for i = 1, #keys do C["\1d" .. i] = true end
+        for i = 1, #keys do C["\1d" .. i] = nil end
+        for i = 2, #keys, 2 do C[keys[i]] = mk(keys[i]) end
+        for i = 1, #keys, 2 do C[keys[i]] = mk(keys[i]) end
+        return A, B, C
+    end
+
+    local nsKeys = { "attune", "bags", "cfg", "instances", "inv", "prof", "rep", "timers" }
+    local savedNS = Sync._namespaces
+    local nA, nB, nC = threeWays(nsKeys, function() return { provide = true } end)
+    check("NX-10 fixture is divergent under pairs()",
+          not (walk(nA) == walk(nB) and walk(nB) == walk(nC)))
+    Sync._namespaces = nA; local pk1 = table.concat(Sync.ProviderKeys(), ",")
+    Sync._namespaces = nB; local pk2 = table.concat(Sync.ProviderKeys(), ",")
+    Sync._namespaces = nC; local pk3 = table.concat(Sync.ProviderKeys(), ",")
+    check("NX-10 ProviderKeys is stable across insertion histories",
+          pk1 == pk2 and pk2 == pk3)
+    check("NX-10 ProviderKeys is sorted",
+          pk1 == "attune,bags,cfg,instances,inv,prof,rep,timers")
+    -- Non-provider namespaces stay out, and excluding them keeps the order.
+    nA.bags.provide, nA.rep.provide = false, false
+    Sync._namespaces = nA
+    check("NX-10 non-providers excluded without disturbing order",
+          table.concat(Sync.ProviderKeys(), ",") == "attune,cfg,instances,inv,prof,timers")
+    Sync._namespaces = savedNS
+
+    local addonIds = { "armory", "bags", "conduit", "nexus", "raidprep" }
+    local savedReg2, savedPush = Config._registry, Config.Push
+    local pushed
+    Config.Push = function(id) pushed[#pushed + 1] = id; return true end
+    local rA, rB, rC = threeWays(addonIds, function() return {} end)
+    check("NX-11 fixture is divergent under pairs()",
+          not (walk(rA) == walk(rB) and walk(rB) == walk(rC)))
+    local function syncOrder(reg)
+        Config._registry, pushed = reg, {}
+        Config.SyncNow()
+        return table.concat(pushed, ",")
+    end
+    local s1, s2, s3 = syncOrder(rA), syncOrder(rB), syncOrder(rC)
+    check("NX-11 Config.SyncNow order is stable across insertion histories",
+          s1 == s2 and s2 == s3)
+    check("NX-11 Config.SyncNow order is sorted",
+          s1 == "armory,bags,conduit,nexus,raidprep")
+    Config._registry, Config.Push = savedReg2, savedPush
 
     if verbose and ns.Print then
         ns:Print(pass and "  syncns selftest: PASS" or "  syncns selftest: FAIL")

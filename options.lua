@@ -2605,8 +2605,13 @@ local function buildBlacklist(flow)
             ns:Print("mesh is not enabled — nothing to sync."); return
         end
         local sent = 0
-        for _, p in pairs(ns.Mesh.peers or {}) do
-            if p.online and p.name and ns.Mesh.SendBlacklist then ns.Mesh.SendBlacklist(p.name); sent = sent + 1 end
+        -- CLASS 8 / NX-12: the shared sorted fan-out (Mesh.SortedOnlinePeers).
+        -- Each SendBlacklist consumes a SendGate("blacklist", …) slot, so the walk
+        -- order decided who received the list first and who was gated out of this
+        -- press entirely. Guarded so an older Mesh without the helper still works.
+        local peers = (ns.Mesh.SortedOnlinePeers and ns.Mesh.SortedOnlinePeers()) or {}
+        for i = 1, #peers do
+            if ns.Mesh.SendBlacklist then ns.Mesh.SendBlacklist(peers[i].name); sent = sent + 1 end
         end
         ns:Print("blacklist sync sent to " .. sent .. " account(s).")
     end })
