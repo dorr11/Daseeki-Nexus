@@ -2,6 +2,52 @@
 
 ## Unreleased
 
+- **Fixed:** **a raid lockout you earn during a session now shows up without relogging.**
+  This was the big one. Nexus asked the server for your saved-raid list exactly once, at
+  login, and then waited to be told when it changed — but nothing ever asked again, so the
+  server never had a reason to say anything. Kill Lucifron after logging in and your Molten
+  Core row stayed on "not saved" for the rest of the session, on your own roster and on every
+  other account's, and the thirty-second background refresh could not help because it was
+  re-reading the same unchanged list. Nexus now asks again at the moments that can actually
+  change a lockout: when a boss dies, when the instance tells you its reset timer, and when
+  you cross in or out of an instance — plus a quiet re-check every minute while you are
+  standing in a raid, in case a kill goes unannounced. Your lockouts now appear on other
+  accounts' rosters within seconds of earning them. If you want to watch it work,
+  `/nexus debug lockouts` shows what was asked, what answered, and what is currently held.
+- **Fixed:** **an unanswered server can no longer wipe the lockouts Nexus already knows about.**
+  The list of saved raids reads as *empty* both when you are genuinely saved to nothing and
+  when the server simply has not answered yet — and now that Nexus asks far more often, the
+  second case comes up far more often too. An empty list is only treated as an answer once the
+  server has actually spoken; before that, whatever Nexus already holds stands. A real reset
+  still clears the row exactly as before.
+- **Fixed:** **a party member who was still loading no longer gets recorded at level 0.**
+  The group for a dungeon or raid run was photographed the instant you finished zoning in,
+  which is the one moment the game has not finished loading everybody yet — so a member could
+  be written into that run's roster with no level and no class colour, and if nobody joined or
+  left for the rest of the run there was never a second photograph to correct it. A reading
+  that has not loaded yet is no longer treated as a fact: Nexus waits, re-checks a few times
+  over the following seconds, and also re-checks whenever a group member's level arrives.
+  Members already recorded are untouched, and old run history is unaffected.
+- **Fixed:** **a run no longer reports costing you every copper you owned.** The gold figure
+  for a run is the difference between your purse on the way in and on the way out, and the
+  reading on the way out is taken during a loading screen, where your purse can briefly read
+  as zero. Walk out of Molten Core with 500 gold and the run could be recorded as having cost
+  you 500 gold. Nexus now follows your purse as it changes and refuses to record a difference
+  built on a reading it cannot trust — the loot total, which was always the honest number,
+  carries the run instead.
+- **Fixed:** **Battle.net friends now register even if Battle.net connects after you log in.**
+  Nexus read your Battle.net friends' characters once at login and then only when one of them
+  changed something. If Battle.net had not finished connecting yet — common — the list came
+  back empty and nothing ever went back for it, so for that whole session an invite from a
+  Battle.net friend's character was treated as coming from a stranger. Nexus now notices the
+  connection arriving and re-reads then, and the login retry sequence covers Battle.net as
+  well as your guild.
+- **Fixed:** **a warlock's soulstone status and your current sub-zone update promptly again.**
+  Two small ones with the same cause. When a Create Soulstone cooldown finished, nothing told
+  Nexus, so other accounts could show the stone as unavailable for up to half a minute after
+  it was ready. And moving between sub-zones without changing zone — walking into the
+  Crossroads inn — did not refresh your location for the same reason. Both now update as soon
+  as they happen instead of waiting for the background refresh.
 - **Fixed:** **the one character that would not sync now goes to the front of the queue.**
   When your accounts were fully caught up except for a single character, Nexus already knew
   how to ask for just that one — but it had no idea which order to send the answers in, so the
