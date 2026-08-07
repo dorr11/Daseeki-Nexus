@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.1.5 — 2026-08-07
 
 - **Fixed:** **an account's own data can no longer lose to a stale copy of itself.** If Nexus
   had somehow stored a damaged record for one of your other accounts' characters — a wiped

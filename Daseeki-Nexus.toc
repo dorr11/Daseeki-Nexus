@@ -4,7 +4,7 @@
 ## Author: Daseeki
 ## X-License: All Rights Reserved
 ## X-Curse-Project-ID: 1638357
-## Version: 1.1.4
+## Version: 1.1.5
 ## SavedVariables: DaseekiNexusDB, DaseekiNexusData
 ## Dependencies: Daseeki-Core
 ## IconTexture: Interface\Icons\INV_Misc_Net_01
