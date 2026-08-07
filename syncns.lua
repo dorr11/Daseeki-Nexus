@@ -257,11 +257,62 @@ function Sync.NamespaceRevHash(key)
     return tostring(h)
 end
 
--- All provider namespaces' rev hashes, for the heartbeat bundle.
+-- The namespace keys we ADVERTISE a rev hash for: the UNION of the provider
+-- namespaces registered in this client and every namespace key present in the
+-- store. Sorted, so the key set is deterministic for the tests.
+--
+-- HASH-INPUT SYMMETRIZATION (schema-v3 wave 1, D2 / NEXUS_SCHEMA_V3_DESIGN.md
+-- §J2). THE PATHOLOGY: this used to iterate the REGISTRATION list only —
+-- `Sync._namespaces` filtered to spec.provide — while NamespaceRevHash has
+-- always hashed the STORED owner->rev map (Store.SyncNSAll). Those two sets are
+-- not the same set. A client stores owners for every namespace a PEER provides
+-- (Mesh.HandleNSPayload -> Sync.ApplyInbound -> Store.SyncNSPut does not care
+-- whether we registered it), so a Nexus without Bags installed holds a full
+-- "bags" owner->rev map and advertised NOTHING for it.
+--
+-- Mesh.DiffNamespaceHashes iterates the REMOTE hash map and treats a locally
+-- absent key as "0", so the Bags-provider peer's advertised "bags" hash could
+-- never match — two FULLY CONVERGED stores disagreed structurally, forever. The
+-- consumer re-asked every NS_REQ_ASK_COOLDOWN (120s) for the rest of time and
+-- got a near-empty answer each round. 1.1.3's NSREQ manifest made each round
+-- cheap (a targeted answer instead of a namespace re-blast) but did not stop the
+-- asking. Hashing what we STORE on both sides is what makes the asking stop.
+--
+-- Registered-but-never-stored providers stay in the set (they hash their empty
+-- map), so a provider we have registered still advertises from the first
+-- heartbeat rather than only after its first MarkDirty.
+function Sync.NamespaceHashKeys()
+    local seen, out = {}, {}
+    for key, spec in pairs(Sync._namespaces) do
+        if spec.provide and type(key) == "string" and key ~= "" and not seen[key] then
+            seen[key] = true
+            out[#out + 1] = key
+        end
+    end
+    local S = store()
+    if S and S.SyncNS then
+        for key in pairs(S.SyncNS()) do
+            if type(key) == "string" and key ~= "" and not seen[key] then
+                seen[key] = true
+                out[#out + 1] = key
+            end
+        end
+    end
+    table.sort(out)
+    return out
+end
+
+-- Rev hashes for every advertised namespace, for the heartbeat bundle.
+--
+-- BOOTSTRAP IS DELIBERATELY UNTOUCHED: a namespace we have NEVER stored and do
+-- not provide is still absent from this map, so Mesh.DiffNamespaceHashes still
+-- scores the peer's advertisement as a divergence and pulls it. First contact
+-- has to pull everything, and it still does.
 function Sync.AllNamespaceHashes()
     local out = {}
-    for key, spec in pairs(Sync._namespaces) do
-        if spec.provide then out[key] = Sync.NamespaceRevHash(key) end
+    local keys = Sync.NamespaceHashKeys()
+    for i = 1, #keys do
+        out[keys[i]] = Sync.NamespaceRevHash(keys[i])
     end
     return out
 end
@@ -931,8 +982,18 @@ local function attuneSelfTest(verbose)
     check("unknown namespace applies without error", okUnk == true and resUnk == "applied")
     check("unknown namespace payload was cached",
           (S.SyncNSGetData(UNK, "someone") or {}).a == 1)
-    check("unknown namespace not advertised in our hashes", Sync.AllNamespaceHashes()[UNK] == nil)
+    -- ...and, since D2 (hash-input symmetrization), it IS advertised. This
+    -- assertion was inverted: "cached but never advertised" is exactly the
+    -- structural disagreement that kept an un-updated consumer re-asking the
+    -- provider every 120s forever. We hash what we STORE, so a namespace we
+    -- merely cache now advertises a hash the provider's own hash can equal.
+    check("a cached unknown namespace IS advertised (D2)",
+          Sync.AllNamespaceHashes()[UNK] ~= nil)
+    check("...and its advertised hash is the hash of the stored owner->rev map",
+          Sync.AllNamespaceHashes()[UNK] == Sync.NamespaceRevHash(UNK))
     S.SyncNS()[UNK] = nil
+    check("dropping the stored namespace stops advertising it",
+          Sync.AllNamespaceHashes()[UNK] == nil)
 
     S.SyncNSDrop(KEY, OWNER)
     T._attuneIndex, T._attuneIndexDirty = savedIdx, savedDirty

@@ -1911,10 +1911,18 @@ end
 local function handleSegment(f, sender)
     local seg = Mesh.Unpack(f.payload)
     if not seg or not seg.aid or not seg.records then return end
+    -- CanAdmitPeer binds sender -> aid: this id comes from the peer's own
+    -- identified frames (heartbeat / discovery -> NotePeer), never from the
+    -- segment envelope, so it is the fact the owner-origin CLAIM is checked
+    -- against. An unknown sender resolves to nil and can never satisfy the match.
     local senderAID = aidForName(sender)
+    -- §9.7 rule 2 (D1): pass the envelope's owner-origin claim through to the
+    -- arbitration boundary. Only ever `true` — a missing key (older sender) or
+    -- any non-boolean garbage stays nil, which is the unflagged path.
+    local ownerClaim = (seg.own == true) or nil
     local adopted = 0
     for nameRealm, rec in pairs(seg.records) do
-        if Store.WriteInboundCharacter(seg.aid, nameRealm, rec, senderAID) then
+        if Store.WriteInboundCharacter(seg.aid, nameRealm, rec, senderAID, ownerClaim) then
             adopted = adopted + 1
         end
     end
@@ -2328,8 +2336,36 @@ function Mesh.SendManifest(target, aid, area)
     })
 end
 
+-- PURE: is the segment we are about to send for OUR OWN account? That is the
+-- whole owner-origin test at send time — the envelope's `own` flag says "the
+-- records in this frame come from the account that owns them", and the only
+-- account whose records we can honestly make that claim about is our own.
+-- Relaying a third party's segment (aid ~= ours) never sets it.
+function Mesh.SegmentIsOwnerSourced(aid)
+    if aid == nil or aid == "" then return false end
+    local selfID = ns.GetAccountID and ns:GetAccountID() or ""
+    if selfID == "" then return false end
+    return tostring(aid) == tostring(selfID)
+end
+
 -- Spec §9.5: bulk segment / homeless data is capped per ACCOUNT + TARGET at 60 s
 -- (it is the expensive one — a full segment is the whole character set).
+--
+-- ADDITIVE ENVELOPE FIELD `own` (SN §9.7 rule 2, schema-v3 wave 1 / D1). The
+-- segment envelope is a Pack table, so this is a k/v addition of exactly the kind
+-- nsRev / instancesHash / NSREQ's `m` already proved safe in both directions:
+--
+--   * NEW sender -> OLD receiver : `own` is an unknown key in the unpacked table
+--     and handleSegment never reads it, so the receiver keeps today's epoch rules
+--     verbatim. No PROTO_VERSION bump, no SCHEMA_VERSION involvement (the flag is
+--     on the ENVELOPE, not inside the binary character payload — it describes the
+--     frame's PROVENANCE, which is not a property of any character).
+--   * OLD sender -> NEW receiver : no `own` key -> the claim is nil -> the
+--     unflagged path, i.e. today's behaviour.
+--
+-- The flag is only a CLAIM. Store.WriteInboundCharacter verifies it against the
+-- sender's bound account id before it means anything; see the OWNER-RELAY
+-- ADMISSION block in store.lua.
 function Mesh.SendSegment(target, aid, area)
     if not Mesh.SendGate("segment", target, tostring(aid) .. "\2" .. tostring(area),
                          Mesh.SEGMENT_COOLDOWN) then return end
@@ -2343,7 +2379,12 @@ function Mesh.SendSegment(target, aid, area)
             records[nameRealm] = bucket.characters[nameRealm]
         end
     end
-    local payload = Mesh.Pack({ aid = aid, area = area, records = records })
+    local payload = Mesh.Pack({
+        aid = aid, area = area, records = records,
+        -- nil (not false) when we are relaying somebody else's segment, so an
+        -- unflagged envelope is byte-for-byte what a pre-D1 client emits.
+        own = Mesh.SegmentIsOwnerSourced(aid) or nil,
+    })
     if not payload then return end
     local seq = Mesh._outSeq + 1
     local frame = Mesh.BuildFrame(OP.SEGMENT, payload, { seq = seq })
@@ -3616,6 +3657,18 @@ local function debugMesh()
         Mesh._pushSuppressed or 0,
         (ns.Tracker and ns.Tracker._capturesFiltered) or 0,
         Mesh._relayAgeDrops or 0, tostring(Mesh._lastPeerSweep or 0)))
+    -- D1 / §9.7 rule 2 telemetry. `claimed` counts owner-flagged segment records
+    -- received; `bypassed` counts the ones that beat a stored HIGHER epoch (the
+    -- wiped-record repair actually happening); `mismatched` counts claims whose
+    -- sender was not the account the record files under. A non-zero `mismatched`
+    -- is worth reading: it is either a peer relaying a segment it mislabelled, or
+    -- somebody asking for a bypass they are not entitled to.
+    local orl = Store._ownerRelay
+    if type(orl) == "table" then
+        ns:Print(string.format(
+            "  owner-relay (§9.7 r2): claimed=%d epochBypassed=%d aidMismatched=%d",
+            orl.claimed or 0, orl.bypassed or 0, orl.mismatched or 0))
+    end
     for prefix, s in pairs(Mesh._sched) do
         ns:Print(string.format("  prefix %s: queue=%d bucket=%.1f/%d",
             prefix, s.queue:Size(), s.bucket.tokens, s.bucket.cap))
@@ -5113,6 +5166,394 @@ local function testOwnAccountAuthorityWire()
 end
 
 ----------------------------------------------------------------------
+-- OWNER-RELAY ENVELOPE, at the wire (SN §9.7 rule 2 / D1).
+--
+-- The whole spoof matrix driven through the REAL admission path: envelopes built
+-- by the REAL Mesh.SendSegment (so the `own` flag is set by the ship code, not by
+-- the test), carried as REAL frames through Pack -> BuildFrame -> Mesh.Dispatch
+-- -> ParseFrame -> Unpack -> handleSegment -> Store.WriteInboundCharacter, and
+-- judged by what actually landed in the fixture store. Nothing here is stubbed
+-- but the transport edges (Enqueue capture, dedup/freshness bypass for hand-fed
+-- frames) and the peer table, which IS the sender -> aid binding under test.
+--
+--   owner-flagged + sender aid matches  -> epoch bypassed  (the wiped-Poonyx fix)
+--   owner-flagged + sender aid mismatch -> normal epoch rules (the liar)
+--   unflagged                           -> today's behaviour
+--   owner-flagged about OUR OWN char    -> still rejected (rule 1 > rule 2)
+--   old client RECEIVING the new field  -> re-pack without `own`: same verdict
+--   old client SENDING (no field)       -> unflagged path
+----------------------------------------------------------------------
+local function testOwnerRelayEnvelopeWire()
+    local savedData     = Store.data
+    local savedPeers    = Mesh.peers
+    local savedAID      = ns.GetAccountID
+    local savedSeen     = Mesh.SeenBefore
+    local savedFresh    = Mesh.FreshSeq
+    local savedEnqueue  = Mesh.Enqueue
+    local savedCd       = Mesh._sendCooldowns
+    local savedAuth     = Store._ownAuthority
+    local savedRelay    = Store._ownerRelay
+    local savedGhost    = Store._ghostLog
+    local T = 1700000000
+
+    Mesh.SeenBefore = function() return false end
+    Mesh.FreshSeq   = function() return true end
+    Store._ghostLog = function() end
+
+    local ok, why = true, nil
+    local function ck(c, m) if ok and not c then ok, why = false, m end end
+
+    local function newBucket(isSelf)
+        return { isSelf = isSelf or false, characters = {}, homeless = {},
+                 segments = { sixties = {}, summoners = {}, norole = {} }, segmentHashes = {} }
+    end
+    local function rec(nameRealm, epoch, boon)
+        local r = Store.NewCharacterRecord(nameRealm)
+        r.level = 60
+        r.ownerEpoch, r.lastDataUpdate, r.lastSeen = epoch, epoch, epoch
+        r.boonCount = boon or 0
+        return r
+    end
+
+    -- BUILD the two envelopes with the real sender code, from two different
+    -- identities. `senderAid` is who we ARE; `segAid` is whose segment we ship.
+    local function buildSegment(senderAid, segAid, name, epoch, boon)
+        local b = newBucket(senderAid == segAid)
+        b.characters[name] = rec(name, epoch, boon)
+        b.segments.sixties = { name }
+        Store.data = { accounts = { [segAid] = b }, deletedAIDs = {} }
+        ns.GetAccountID = function() return senderAid end
+        Mesh._sendCooldowns = {}
+        local captured
+        Mesh.Enqueue = function(_, fr) captured = fr; return true end
+        Mesh.SendSegment("Recv-R", segAid, "sixties")
+        return captured
+    end
+
+    -- Account 2 shipping its OWN segment -> owner-flagged.
+    local ownerFrame = buildSegment("2", "2", "Poonyx-Whitemane", T + 1000, 7)
+    -- Account 7 relaying account 2's segment -> NOT flagged (it is not the owner).
+    local relayFrame = buildSegment("7", "2", "Poonyx-Whitemane", T + 1000, 7)
+    ck(ownerFrame ~= nil and relayFrame ~= nil, "SendSegment enqueued nothing to inspect")
+    if not (ownerFrame and relayFrame) then
+        Store.data = savedData; Mesh.peers = savedPeers; ns.GetAccountID = savedAID
+        Mesh.SeenBefore, Mesh.FreshSeq = savedSeen, savedFresh
+        Mesh.Enqueue = savedEnqueue; Mesh._sendCooldowns = savedCd
+        Store._ownAuthority, Store._ownerRelay, Store._ghostLog = savedAuth, savedRelay, savedGhost
+        return ok, why
+    end
+
+    ------------------------------------------------------------------
+    -- 0. THE ENVELOPE ITSELF. The flag is present on the owner's frame, ABSENT
+    --    (not false) on the relay, and nothing else about the envelope moved.
+    ------------------------------------------------------------------
+    local ownEnv   = Mesh.Unpack(Mesh.ParseFrame(ownerFrame).payload)
+    local relayEnv = Mesh.Unpack(Mesh.ParseFrame(relayFrame).payload)
+    ck(ownEnv and ownEnv.own == true, "the owner's own segment did not carry own=true")
+    ck(relayEnv and relayEnv.own == nil,
+        "a RELAYED segment carried an owner claim (got " .. tostring(relayEnv and relayEnv.own) .. ")")
+    ck(ownEnv.aid == "2" and ownEnv.area == "sixties"
+        and ownEnv.records and ownEnv.records["Poonyx-Whitemane"] ~= nil,
+        "the additive field disturbed the rest of the envelope")
+    ck(Mesh.SegmentIsOwnerSourced(nil) == false and Mesh.SegmentIsOwnerSourced("") == false,
+        "an empty aid must never be claimed as owner-sourced")
+
+    -- Old client SENDING: byte-for-byte what a pre-D1 build emits is the relay
+    -- envelope shape — no `own` key at all — and that is the unflagged path.
+    local legacyFrame = Mesh.BuildFrame(OP.SEGMENT, Mesh.Pack({
+        aid = ownEnv.aid, area = ownEnv.area, records = ownEnv.records }), { seq = 9 })
+    -- Old client RECEIVING: an old handleSegment never reads `own`, which is
+    -- behaviourally identical to the key being absent. Re-pack without it and
+    -- assert the verdict is the pre-D1 one.
+    local repackFrame = legacyFrame
+
+    ------------------------------------------------------------------
+    -- The RECEIVER: account 1, holding a WIPED Poonyx at a HIGH epoch under
+    -- account 2's bucket, plus one of our own characters.
+    ------------------------------------------------------------------
+    local function becomeReceiver()
+        ns.GetAccountID = function() return "1" end
+        Mesh.peers = {
+            ["2"] = { aid = "2", name = "Owner-R", online = true, lastSeen = T },
+            ["7"] = { aid = "7", name = "Liar-R",  online = true, lastSeen = T },
+        }
+        Store._ownAuthority = { drops = 0, names = {} }
+        Store._ownerRelay   = { bypassed = 0, claimed = 0, mismatched = 0 }
+        local mine, theirs = newBucket(true), newBucket(false)
+        mine.characters["Mine-Whitemane"]     = rec("Mine-Whitemane", T, 9)
+        theirs.characters["Poonyx-Whitemane"] = rec("Poonyx-Whitemane", T + 5000, 0)  -- the WIPE
+        Store.data = { accounts = { ["1"] = mine, ["2"] = theirs }, deletedAIDs = {} }
+        Mesh.Enqueue = function() return true end
+    end
+    local function boons()
+        local c = Store.data.accounts["2"].characters["Poonyx-Whitemane"]
+        return c and c.boonCount
+    end
+    -- A dispatch that ERRORS would make every "nothing changed" row below pass
+    -- for the wrong reason, so failures are surfaced rather than swallowed.
+    local function dispatch(frame, sender)
+        local okd, errd = pcall(Mesh.Dispatch, Protocol.PREFIX.SYNC, frame, sender)
+        ck(okd, "segment dispatch from " .. tostring(sender) .. " errored: " .. tostring(errd))
+    end
+
+    ------------------------------------------------------------------
+    -- 1. ACCEPTANCE FIXTURE — the owner's frame from the OWNER wins over the
+    --    stored higher-epoch wipe.
+    ------------------------------------------------------------------
+    becomeReceiver()
+    dispatch(ownerFrame, "Owner-R")
+    ck(boons() == 7, "WIPED-POONYX AT THE WIRE: the owner's good record did not win "
+        .. "(boonCount " .. tostring(boons()) .. ", expected 7)")
+    ck(Store._ownerRelay.bypassed == 1, "the wire path did not credit the epoch bypass")
+
+    ------------------------------------------------------------------
+    -- 2. THE LIAR — the SAME owner-flagged frame, forwarded by account 7. The
+    --    envelope still says own=true; the sender binding says otherwise.
+    ------------------------------------------------------------------
+    becomeReceiver()
+    dispatch(ownerFrame, "Liar-R")
+    ck(boons() == 0, "SPOOF AT THE WIRE: a non-owner's owner-flagged frame overwrote the store")
+    ck(Store._ownerRelay.mismatched == 1, "the wire path did not count the mismatched claim")
+    ck(Store._ownerRelay.bypassed == 0, "the wire path credited a bypass to a spoof")
+
+    -- ...and an UNKNOWN sender (no peer entry -> no bound aid) is a liar too.
+    becomeReceiver()
+    dispatch(ownerFrame, "Stranger-R")
+    ck(boons() == 0, "an UNIDENTIFIED sender's owner claim was honoured")
+
+    ------------------------------------------------------------------
+    -- 3. UNFLAGGED IS TODAY'S BEHAVIOUR. Same records, same epochs, no flag.
+    ------------------------------------------------------------------
+    becomeReceiver()
+    dispatch(relayFrame, "Owner-R")
+    ck(boons() == 0, "UNFLAGGED: an older relayed record bypassed the epoch guard")
+    ck(Store._ownerRelay.claimed == 0, "UNFLAGGED: a claim was counted for a frame that made none")
+
+    -- 3b. OLD CLIENT ON EITHER END: the owner's own envelope re-packed WITHOUT
+    --     `own` must produce the pre-D1 verdict exactly.
+    becomeReceiver()
+    dispatch(repackFrame, "Owner-R")
+    ck(boons() == 0, "the re-packed (field-less) envelope did not reproduce pre-D1 behaviour")
+
+    -- 3c. ...and unflagged still merges a genuinely NEWER record, so the
+    --      unflagged lane is unchanged in both directions.
+    becomeReceiver()
+    local newerFrame = buildSegment("7", "2", "Poonyx-Whitemane", T + 9000, 4)
+    becomeReceiver()
+    dispatch(newerFrame, "Liar-R")
+    ck(boons() == 4, "UNFLAGGED: a strictly newer relayed record stopped merging")
+
+    ------------------------------------------------------------------
+    -- 4. RULE 1 BEATS RULE 2 at the wire: an owner-flagged segment describing one
+    --    of OUR OWN characters is still refused, and leaves no phantom.
+    ------------------------------------------------------------------
+    local ownClaimOnUs = buildSegment("2", "2", "Mine-Whitemane", T + 9000, 0)
+    becomeReceiver()
+    dispatch(ownClaimOnUs, "Owner-R")
+    ck(Store.data.accounts["1"].characters["Mine-Whitemane"].boonCount == 9,
+        "RULE 1 > RULE 2 at the wire: an owner-flagged frame altered our own character")
+    ck(Store.data.accounts["2"].characters["Mine-Whitemane"] == nil,
+        "...and it left a phantom under the sender's bucket")
+    ck((Store._ownAuthority.drops or 0) >= 1, "...and the own-authority drop was not counted")
+
+    Store.data          = savedData
+    Mesh.peers          = savedPeers
+    ns.GetAccountID     = savedAID
+    Mesh.SeenBefore, Mesh.FreshSeq = savedSeen, savedFresh
+    Mesh.Enqueue        = savedEnqueue
+    Mesh._sendCooldowns = savedCd
+    Store._ownAuthority = savedAuth
+    Store._ownerRelay   = savedRelay
+    Store._ghostLog     = savedGhost
+    return ok, why
+end
+
+----------------------------------------------------------------------
+-- NAMESPACE HASH-INPUT SYMMETRIZATION (D2 / NEXUS_SCHEMA_V3_DESIGN.md §J2).
+--
+-- THE CHATTER THIS KILLS. Sync.AllNamespaceHashes used to advertise the
+-- REGISTRATION list (provider namespaces declared by addons installed HERE) while
+-- Sync.NamespaceRevHash has always hashed the STORED owner->rev map. A client
+-- that merely CACHES a namespace a peer provides — a Nexus without Bags holding a
+-- full "bags" owner->rev map — advertised nothing for it, so
+-- Mesh.DiffNamespaceHashes scored the provider's advertisement against a missing
+-- local key ("0") and pulled, every NS_REQ_ASK_COOLDOWN, forever, on two stores
+-- that were already identical.
+--
+-- Driven through the REAL consumer: a real heartbeat frame built by the REAL
+-- Mesh.SendHeartbeat under peer A's identity, dispatched into peer B's store
+-- through the REAL Mesh.Dispatch -> handleHeartbeat, counting the REAL
+-- Mesh.RequestNamespace calls it makes. The two peers differ ONLY in which
+-- namespaces they registered.
+----------------------------------------------------------------------
+local function testNSHashSymmetry()
+    local Sync = _G and _G.Daseeki and _G.Daseeki.Sync
+    if not (Sync and Sync.AllNamespaceHashes and Sync._namespaces) then
+        return false, "Daseeki.Sync.AllNamespaceHashes is missing (syncns.lua did not load)"
+    end
+
+    local savedData    = Store.data
+    local savedSpecs   = Sync._namespaces
+    local savedPeers   = Mesh.peers
+    local savedAID     = ns.GetAccountID
+    local savedEnabled = Mesh.IsEnabled
+    local savedEnqueue = Mesh.Enqueue
+    local savedRequest = Mesh.RequestNamespace
+    local savedSeen    = Mesh.SeenBefore
+    local savedFresh   = Mesh.FreshSeq
+    local savedAsked   = Mesh._nsReqAsked
+    local savedSelfName = _G.UnitName
+
+    Mesh.IsEnabled  = function() return true end
+    Mesh.SeenBefore = function() return false end
+    Mesh.FreshSeq   = function() return true end
+
+    local ok, why = true, nil
+    local function ck(c, m) if ok and not c then ok, why = false, m end end
+
+    -- The two peers hold the SAME stored owner->rev map for "bags".
+    local function bagsStore(puuconsRev)
+        return {
+            accounts = {},
+            deletedAIDs = {},   -- Store.IsTombstoned indexes this on every CanAdmitPeer
+            syncNamespaces = {
+                bags = {
+                    ["Puucons-Whitemane"] = { rev = puuconsRev, updatedAt = 1, data = { g = 1 } },
+                    ["Alt-One"]           = { rev = 12, updatedAt = 1, data = { g = 2 } },
+                },
+            },
+        }
+    end
+    local PROVIDER = { provide = function() return {} end, ownerKey = function() return "me" end }
+
+    -- Become one of the two peers: its store AND its registration set.
+    local function become(aid, data, specs)
+        ns.GetAccountID = function() return aid end
+        Store.data = data
+        Sync._namespaces = specs
+    end
+
+    -- Build a REAL heartbeat frame as this peer would emit it.
+    local function heartbeatFrame()
+        local captured
+        Mesh.peers = { ["z"] = { aid = "z", name = "Listener-R", online = true, lastSeen = 1 } }
+        Mesh.Enqueue = function(_, fr) captured = captured or fr; return true end
+        Mesh.SendHeartbeat()
+        return captured
+    end
+
+    -- Consume a peer's heartbeat and report how many namespace pulls it provoked.
+    -- A dispatch that ERRORS would silently report zero pulls and make row A pass
+    -- for the wrong reason, so the error is surfaced as a failure, never swallowed.
+    local function pullsFor(frame, sender)
+        local asked = {}
+        Mesh._nsReqAsked = {}
+        Mesh.RequestNamespace = function(_, nsKey) asked[#asked + 1] = nsKey; return true end
+        Mesh.Enqueue = function() return true end
+        local okd, errd = pcall(Mesh.Dispatch, Protocol.PREFIX.HEARTBEAT, frame, sender or "Provider-R")
+        Mesh.RequestNamespace = savedRequest
+        ck(okd, "heartbeat dispatch errored (so the pull count means nothing): " .. tostring(errd))
+        return asked
+    end
+
+    ------------------------------------------------------------------
+    -- A. CONVERGED, DIFFERENT REGISTRATION SETS. Peer A provides "bags"; peer B
+    --    has never registered it and only caches it. Same stored map.
+    ------------------------------------------------------------------
+    become("2", bagsStore(76), { bags = PROVIDER })
+    local hashA = Sync.AllNamespaceHashes()
+    local frameA = heartbeatFrame()
+    ck(frameA ~= nil, "SendHeartbeat enqueued nothing")
+
+    become("1", bagsStore(76), {})               -- B registers NOTHING
+    local hashB = Sync.AllNamespaceHashes()
+    ck(hashB.bags ~= nil,
+        "the consumer does not advertise a namespace it stores (the whole D2 defect)")
+    ck(hashA.bags == hashB.bags,
+        "two converged stores hash 'bags' differently: A=" .. tostring(hashA.bags)
+        .. " B=" .. tostring(hashB.bags))
+    ck(#Mesh.DiffNamespaceHashes(hashB, hashA) == 0, "converged stores still produced a diff")
+    ck(#Mesh.DiffNamespaceHashes(hashA, hashB) == 0, "...and the reverse direction diffed")
+
+    if frameA then
+        local asked = pullsFor(frameA, "Provider-R")
+        ck(#asked == 0, "a converged consumer still sent " .. #asked
+            .. " NSREQ(s) (this is the 120s-forever chatter)")
+    end
+
+    ------------------------------------------------------------------
+    -- B. DIVERGENT STORES STILL PULL. One owner one rev behind: the existing
+    --    behaviour must be completely intact.
+    ------------------------------------------------------------------
+    become("2", bagsStore(76), { bags = PROVIDER })
+    local frameDiv = heartbeatFrame()
+    become("1", bagsStore(75), {})
+    if frameDiv then
+        local asked = pullsFor(frameDiv, "Provider-R")
+        ck(#asked == 1 and asked[1] == "bags",
+            "a genuinely divergent consumer did not pull (asked " .. #asked .. ")")
+    end
+
+    ------------------------------------------------------------------
+    -- C. BOOTSTRAP PRESERVED. A brand-new peer with an EMPTY store must pull
+    --    everything the provider advertises — that is first contact, and it is
+    --    the one case where an absent local key is supposed to mean "pull".
+    ------------------------------------------------------------------
+    become("2", bagsStore(76), { bags = PROVIDER })
+    local frameBoot = heartbeatFrame()
+    become("1", { accounts = {}, deletedAIDs = {}, syncNamespaces = {} }, {})
+    ck(next(Sync.AllNamespaceHashes()) == nil,
+        "an empty store with no registrations advertised a namespace out of nowhere")
+    if frameBoot then
+        local asked = pullsFor(frameBoot, "Provider-R")
+        ck(#asked == 1 and asked[1] == "bags",
+            "BOOTSTRAP BROKEN: a first-contact peer did not pull (asked " .. #asked .. ")")
+    end
+
+    ------------------------------------------------------------------
+    -- D. A REGISTERED-BUT-NEVER-STORED provider still advertises, so a provider
+    --    is visible from its first heartbeat rather than only after MarkDirty.
+    ------------------------------------------------------------------
+    become("1", { accounts = {}, deletedAIDs = {}, syncNamespaces = {} }, { bags = PROVIDER })
+    ck(Sync.AllNamespaceHashes().bags ~= nil,
+        "a registered provider with an empty store stopped advertising")
+
+    ------------------------------------------------------------------
+    -- E. MUTATION. Put the REGISTRATION-ONLY key set back and prove row A
+    --    notices: the converged consumer must start chattering again. A fix that
+    --    cannot be un-fixed is not being measured.
+    ------------------------------------------------------------------
+    if frameA then
+        local realKeys = Sync.NamespaceHashKeys
+        Sync.NamespaceHashKeys = function()
+            local out = {}
+            for key, spec in pairs(Sync._namespaces) do
+                if spec.provide then out[#out + 1] = key end
+            end
+            return out
+        end
+        become("1", bagsStore(76), {})
+        local chatter = pullsFor(frameA, "Provider-R")
+        Sync.NamespaceHashKeys = realKeys
+        ck(#chatter == 1 and chatter[1] == "bags",
+            "MUTATION: with the old registration-only key set the converged consumer "
+            .. "did NOT chatter (so row A proves nothing); asked " .. #chatter)
+    end
+
+    Store.data       = savedData
+    Sync._namespaces = savedSpecs
+    Mesh.peers       = savedPeers
+    ns.GetAccountID  = savedAID
+    Mesh.IsEnabled   = savedEnabled
+    Mesh.Enqueue     = savedEnqueue
+    Mesh.RequestNamespace = savedRequest
+    Mesh.SeenBefore, Mesh.FreshSeq = savedSeen, savedFresh
+    Mesh._nsReqAsked = savedAsked
+    _G.UnitName      = savedSelfName
+    return ok, why
+end
+
+----------------------------------------------------------------------
 -- HASH-AFTER-SEND: Mesh.PushState must report how many targets it reached.
 ----------------------------------------------------------------------
 local function testPushDeliveryCount()
@@ -5752,6 +6193,8 @@ function Mesh.RunSelfTests(verbose)
         { name = "push suppressor",    fn = testPushSuppressor },
         { name = "inbound repaint pump", fn = testInboundRepaintPump },
         { name = "own-account authority (wire)", fn = testOwnAccountAuthorityWire },
+        { name = "owner-relay envelope (wire, §9.7 rule 2)", fn = testOwnerRelayEnvelopeWire },
+        { name = "ns hash-input symmetrization (D2)", fn = testNSHashSymmetry },
         { name = "push delivery count",  fn = testPushDeliveryCount },
         { name = "segment content fingerprint (§9.6)", fn = testSegmentFingerprint },
         { name = "canonical peer names", fn = testCanonicalPeerNames },

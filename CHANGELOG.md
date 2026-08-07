@@ -1,5 +1,30 @@
 # Changelog
 
+## Unreleased
+
+- **Fixed:** **an account's own data can no longer lose to a stale copy of itself.** If Nexus
+  had somehow stored a damaged record for one of your other accounts' characters — a wiped
+  boon list, a half-captured login snapshot — and that record happened to carry a *newer*
+  timestamp, the real account's own data was thrown away every time it arrived, forever. The
+  only way out was to hover the character and force a re-read. Bulk data that comes **from the
+  account that owns it** now overrides what we hold, whatever the timestamps say. Everything
+  else is unchanged: a character of *your* account is still never overwritten from the network
+  no matter who sends it, and data relayed by a third account still has to win on timestamp
+  the way it always did — an account can only claim ownership of characters it actually owns,
+  and the claim is checked against who really sent the message.
+- **Fixed:** **two fully-synced accounts stopped quietly re-asking each other for data they
+  already had.** A Nexus that merely *caches* another suite addon's shared data (say, an
+  account without Bags installed holding everyone's Bags data) never advertised it, so its peer
+  read "we disagree" on every heartbeat and both sides re-negotiated every two minutes, forever,
+  for nothing. Each side now advertises everything it actually holds, so a converged mesh goes
+  quiet. First-contact syncing is untouched: a peer that has never seen a namespace still pulls
+  the whole thing.
+- **Changed:** Nexus now **understands the next character-data format a release early.** Nothing
+  it sends has changed — this is purely so that when the format does move, every client that
+  took this release keeps reading its peers instead of going one-way blind for a release cycle.
+- **Changed:** `/nexus debug mesh` gains an **owner-relay** line (claims received, stale records
+  repaired, claims that failed the sender check).
+
 ## 1.1.4 — 2026-08-05
 
 - **Changed:** **the buff automations now ship switched ON.** Dire Maul tribute, the BWL Orb of
