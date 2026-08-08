@@ -232,10 +232,18 @@ local SOUND_CHANNELS = { "Master", "SFX", "Music", "Ambience", "Dialog" }
 -- Exported so the options self-test can assert the text: an assertion on a
 -- string buried in a UI builder closure is not reachable, and this label going
 -- stale again is precisely the kind of drift the conformance audit found.
+-- THE SECOND HALF (1.1.6). The Rin'wosho flow spec §14 actually describes now
+-- exists too — at Rin'wosho, with no turn-in waiting and damaged gear, Nexus
+-- selects his vendor gossip option ITSELF, repairs, and closes the window it
+-- opened. That is a bigger promise than "repairs when you open a shop": ticking
+-- this box now also means "click a gossip line on my behalf", and the hint has
+-- to say so, for exactly the reason the label was fixed in the first place.
 Options.REPAIR_LABEL = "Auto-repair at vendors"
 Options.REPAIR_HINT  =
-    "Auto-repair runs at |cffffd100any|r vendor whose window you open, not just Rin'wosho. "
-    .. "It spends your own gold and prints the cost."
+    "Auto-repair runs at |cffffd100any|r vendor whose window you open. "
+    .. "At |cffffd100Rin'wosho|r it also opens the shop itself when you have nothing to hand "
+    .. "in and something is damaged, then closes it again. "
+    .. "It spends your own gold and prints the cost. Hold |cffffd100Shift|r to skip."
 
 -- DMF Sayge fortune buff-types (spec §7 Gossip).
 local DMF_BUFF_TYPES = {
@@ -3075,6 +3083,13 @@ ns:RegisterSelfTest("options", function(verbose)
     ck(type(Options.REPAIR_HINT) == "string"
        and Options.REPAIR_HINT:lower():find("any", 1, true) ~= nil,
        "repair hint spells out the any-vendor scope")
+    -- 1.1.6: and the OTHER half. The box now also licenses Nexus to select a
+    -- gossip option at Rin'wosho on the owner's behalf; a hint that only
+    -- described the passive half would understate what a tick buys.
+    ck(Options.REPAIR_HINT:lower():find("rin'wosho", 1, true) ~= nil,
+       "repair hint names the Rin'wosho flow the addon drives itself")
+    ck(Options.REPAIR_HINT:lower():find("shift", 1, true) ~= nil,
+       "repair hint names the Shift escape hatch (spec §19.23)")
 
     ----------------------------------------------------------------------
     -- SAYGE DROPDOWN <-> ENGINE PAGE-MAP PARITY.
