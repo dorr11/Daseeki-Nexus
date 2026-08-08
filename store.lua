@@ -263,8 +263,6 @@ local function defaultFactionBlock()
         --   * autoGossip.dmf.skipCookie — spec-default ON (audit row 78). The
         --     owner's list named the fortune, not the cookie dialog.
         --   * autoQuest.zgCoins — spec-default ON. Not in the owner's list.
-        --   * autoQuest.autoRepair — spec-default ON. Explicitly out of scope for
-        --     this flip; it spends gold, which is its own conversation.
         --   * autoGroup.sendToGuild / .sendToFriends — the outbound keyword-send
         --     gates above. Not in the owner's list; they whisper strangers.
         --   * autoSummon.dropOnTaxiPvp — just set to the spec's OFF by the taxi
@@ -306,7 +304,12 @@ local function defaultFactionBlock()
                 defaultsApplied = false,
             },
             roids     = true,
-            autoRepair = false,              -- waiver above
+            -- OWNER DECISION (2026-08-07): "lets default the vendor repair to
+            -- ticked". This was the last standing waiver of the 1.1.4 flip —
+            -- held back because it spends gold — and the owner has now called
+            -- it. Spec-default ON, shipped ON. Store.MigrateRepairDefault
+            -- carries the existing installs across, once.
+            autoRepair = true,
         },
         -- Per-key record of "the user touched this automation toggle", the
         -- match-by-value + userChose half of the house heal pattern (cf.
@@ -1292,6 +1295,12 @@ local function defaultSettings()
         -- if a `chosen` stamp ever failed to be written, a bare value match would
         -- re-enable the same toggle on every login. It gets exactly one attempt.
         automationDefaultsHealed = false,
+        -- autoQuest.autoRepair healed from the old shipped OFF to the owner's
+        -- new ON, once (see Store.MigrateRepairDefault). A SEPARATE marker from
+        -- automationDefaultsHealed on purpose: that one is already stamped true
+        -- on every install that has logged in since 1.1.4, so folding this flip
+        -- into it would heal precisely nobody.
+        repairDefaultHealed = false,
         factionSettings     = buildFactionSettings(),
         timerSettings       = defaultTimerSettings(),
         ui = {
@@ -1681,6 +1690,71 @@ function Store.MigrateAutomationDefaults(db)
     end
 
     db[Store.AUTOMATION_HEAL_MARKER] = true
+    return healed
+end
+
+----------------------------------------------------------------------
+-- autoQuest.autoRepair — the seventh flip (OWNER DECISION 2026-08-07).
+--
+-- "lets default the vendor repair to ticked". Auto-repair was the one automation
+-- the 1.1.4 wave deliberately left OFF (the waiver in the defaults block read
+-- "it spends gold, which is its own conversation"); the owner has now had that
+-- conversation. Spec-default ON, and as of this build shipped ON.
+--
+-- SAME heal as Store.MigrateAutomationDefaults, in a separate pass with its own
+-- marker. It cannot be a seventh row in AUTOMATION_DEFAULT_FLIPS: that pass is
+-- guarded by `automationDefaultsHealed`, which is already stamped true on every
+-- install that has logged in since 1.1.4, so a row added there would heal nobody
+-- and quietly look like it had.
+--
+-- A stored value is rewritten ONLY when BOTH hold:
+--   * it is still exactly the old shipped default (false) — an already-true block
+--     is left alone, and so is a nil (applyDefaults installs the new default a
+--     moment later), and
+--   * `automationChosen.autoRepair` is not stamped. options.lua stamps that the
+--     moment the checkbox is clicked, in EITHER direction, so a deliberate OFF
+--     survives every future login.
+--
+-- The chosen table is the SAME automationChosen table the six use — the stamp
+-- machinery is general, only the marker is per-wave.
+--
+-- ONE-SHOT, marker-guarded, for the same reason the six are: this heal moves
+-- toward doing MORE, and a heal that can turn an automation back on more than
+-- once is a heal that can fight the user. Exactly one attempt, ever.
+--
+-- KNOWN AND ACCEPTED LIMIT, identical to the six: an install that ticked this ON
+-- and then OFF again BEFORE the stamp existed has no `chosen` flag to prove it —
+-- the flag cannot be applied retroactively — so it is healed to ON once and has
+-- to be re-cleared. The failure mode is a repair bill at a vendor window you
+-- opened yourself, printed with its cost, with Shift as the escape hatch.
+----------------------------------------------------------------------
+
+Store.REPAIR_HEAL_MARKER = "repairDefaultHealed"
+-- The automationChosen key AND the options checkbox's identity, exactly like the
+-- `chosen` field of an AUTOMATION_DEFAULT_FLIPS row.
+Store.REPAIR_CHOSEN_KEY  = "autoRepair"
+
+function Store.MigrateRepairDefault(db)
+    if type(db) ~= "table" then return 0 end
+    if db[Store.REPAIR_HEAL_MARKER] then return 0 end
+    local fsAll = db.factionSettings
+    -- No faction blocks at all = a brand-new install. Do NOT stamp: applyDefaults
+    -- has not built the tree yet on this call order and a fresh tree needs no
+    -- heal. Same honesty rule as MigrateAutomationDefaults.
+    if type(fsAll) ~= "table" then return 0 end
+
+    local healed = 0
+    for _, faction in ipairs({ "Alliance", "Horde" }) do
+        local fs = fsAll[faction]
+        local aq = type(fs) == "table" and fs.autoQuest or nil
+        if type(aq) == "table" and aq.autoRepair == false
+           and not Store.AutomationChosen(fs, Store.REPAIR_CHOSEN_KEY) then
+            aq.autoRepair = true
+            healed = healed + 1
+        end
+    end
+
+    db[Store.REPAIR_HEAL_MARKER] = true
     return healed
 end
 
@@ -2141,6 +2215,11 @@ function Store.Init()
     -- heal would be reading a value it had just installed rather than the one the
     -- user actually stored.
     Store.MigrateAutomationDefaults(DaseekiNexusDB)
+    -- The seventh flip (owner decision 2026-08-07): auto-repair now ships ON, so
+    -- heal the installs still carrying the old false with no choice behind it.
+    -- Its own marker, its own pass — see the header — and BEFORE applyDefaults
+    -- for the same reason as every heal above it.
+    Store.MigrateRepairDefault(DaseekiNexusDB)
 
     applyDefaults(DaseekiNexusDB, defaultSettings())
     DaseekiNexusDB.settingsVersion = Store.SETTINGS_VERSION
@@ -4550,14 +4629,18 @@ local function testDefaults(fails)
         ck(fs.autoQuest.eko == true,         faction .. " E'ko defaults ON")
         ck(fs.autoQuest.roids == true,       faction .. " R.O.I.D.S. defaults ON")
         ck(fs.autoQuest.zanza.enabled == true, faction .. " zanza defaults ON")
-        -- ...and the five that deliberately did NOT flip. Each is a waiver, so
+        -- OWNER DECISION (2026-08-07): "lets default the vendor repair to
+        -- ticked". Auto-repair was the 1.1.4 wave's out-of-scope waiver and this
+        -- assertion used to pin it OFF; it pins ON now, and a silent flip BACK
+        -- is a test failure exactly as the flip forward would have been.
+        ck(fs.autoQuest.autoRepair == true,
+            faction .. " auto-repair defaults ON (owner decision 2026-08-07)")
+        -- ...and the four that deliberately did NOT flip. Each is a waiver, so
         -- each is pinned: a silent flip later is a test failure, not a surprise.
         ck(fs.autoGossip.dmf.skipCookie == false,
             faction .. " skipCookie stays OFF (waiver: not in the owner's list)")
         ck(fs.autoQuest.zgCoins == false,
             faction .. " ZG coins stay OFF (waiver: not in the owner's list)")
-        ck(fs.autoQuest.autoRepair == false,
-            faction .. " auto-repair stays OFF (waiver: out of scope, spends gold)")
         ck(fs.autoGroup.sendToGuild == false and fs.autoGroup.sendToFriends == false,
             faction .. " guild/friends keyword SEND gates stay OFF (standing waiver)")
         -- The pick list itself is STILL empty in the tree — an array here would
@@ -4572,6 +4655,10 @@ local function testDefaults(fails)
     end
     ck(s[Store.AUTOMATION_HEAL_MARKER] == false,
        "the automation-defaults heal marker ships as false")
+    ck(s[Store.REPAIR_HEAL_MARKER] == false,
+       "the auto-repair heal marker ships as false")
+    ck(Store.REPAIR_HEAL_MARKER ~= Store.AUTOMATION_HEAL_MARKER,
+       "the repair heal has its OWN marker (the 1.1.4 one is already stamped live)")
     -- RULE (spec §14): Sayge's buff type defaults to Damage for EVERY class.
     -- The store used to ship {} while the options dropdown painted "damage" as
     -- its own fallback, so the UI showed a value the engine could not read and
@@ -7166,6 +7253,108 @@ local function testAutomationDefaultFlips(fails)
 end
 
 ----------------------------------------------------------------------
+-- The 2026-08-07 auto-repair flip: same rows, one key, its own marker.
+--
+-- Every claim Store.MigrateRepairDefault makes gets a line: match-by-value,
+-- userChose respected, already-on untouched, one-shot, malformed-safe, and — the
+-- row that matters most here — INDEPENDENT of the 1.1.4 marker, because a live
+-- install already carries that one stamped true.
+----------------------------------------------------------------------
+local function testRepairDefaultFlip(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+
+    local function oldInstall()
+        local function block()
+            return { autoQuest = { eko = true, roids = true, autoRepair = false } }
+        end
+        return { factionSettings = { Alliance = block(), Horde = block() } }
+    end
+
+    ------------------------------------------------------------------
+    -- 1. Untouched old default heals to ON, both factions, once.
+    ------------------------------------------------------------------
+    local db = oldInstall()
+    local healed = Store.MigrateRepairDefault(db)
+    ck(healed == 2, ("1 key x 2 factions heal (got %d)"):format(healed))
+    ck(db.factionSettings.Alliance.autoQuest.autoRepair == true, "Alliance auto-repair healed ON")
+    ck(db.factionSettings.Horde.autoQuest.autoRepair == true,    "Horde auto-repair healed ON")
+    ck(db[Store.REPAIR_HEAL_MARKER] == true, "the heal stamps its marker")
+
+    ------------------------------------------------------------------
+    -- 2. ONE-SHOT / IDEMPOTENT: rot a value back and re-run. Nothing moves.
+    ------------------------------------------------------------------
+    db.factionSettings.Horde.autoQuest.autoRepair = false
+    ck(Store.MigrateRepairDefault(db) == 0, "the stamped marker makes a second run a no-op")
+    ck(db.factionSettings.Horde.autoQuest.autoRepair == false,
+       "...and it does not touch the store (stamp, do not wipe)")
+
+    ------------------------------------------------------------------
+    -- 3. A USER-CHOSEN false is never healed, per faction block.
+    ------------------------------------------------------------------
+    local chosen = oldInstall()
+    Store.MarkAutomationChosen(chosen.factionSettings.Horde, Store.REPAIR_CHOSEN_KEY)
+    local healed3 = Store.MigrateRepairDefault(chosen)
+    ck(healed3 == 1, ("the chosen block is skipped (got %d, want 1)"):format(healed3))
+    ck(chosen.factionSettings.Horde.autoQuest.autoRepair == false, "a user-chosen OFF stays off")
+    ck(chosen.factionSettings.Alliance.autoQuest.autoRepair == true,
+       "the stamp is per FACTION BLOCK, not global")
+    -- The stamp is written into the SAME automationChosen table as the six, so a
+    -- repair stamp must not read as a stamp on anything else.
+    ck(Store.AutomationChosen(chosen.factionSettings.Horde, "eko") == false,
+       "stamping autoRepair stamps nothing else in automationChosen")
+
+    ------------------------------------------------------------------
+    -- 4. Already-ON is untouched and never counted.
+    ------------------------------------------------------------------
+    local on = oldInstall()
+    on.factionSettings.Alliance.autoQuest.autoRepair = true
+    local healed4 = Store.MigrateRepairDefault(on)
+    ck(healed4 == 1, ("an already-true key is not a heal (got %d, want 1)"):format(healed4))
+    ck(on.factionSettings.Alliance.autoQuest.autoRepair == true, "already-ON stays ON")
+
+    ------------------------------------------------------------------
+    -- 5. MALFORMED stores are skipped, never crashed on, never created.
+    ------------------------------------------------------------------
+    ck(Store.MigrateRepairDefault(7) == 0, "a non-table db is a no-op")
+    ck(Store.MigrateRepairDefault({}) == 0, "a db with no factionSettings is a no-op")
+    local junk = { factionSettings = { Horde = 7, Alliance = { autoQuest = 9 } } }
+    ck(Store.MigrateRepairDefault(junk) == 0, "junk faction blocks heal nothing")
+    ck(junk.factionSettings.Alliance.autoQuest == 9, "...and a junk block is left as found")
+    local absent = { factionSettings = { Horde = { autoQuest = {} } } }
+    ck(Store.MigrateRepairDefault(absent) == 0, "an ABSENT key is not a false to heal")
+    ck(absent.factionSettings.Horde.autoQuest.autoRepair == nil,
+       "...and the key is NOT created (applyDefaults installs the new default)")
+    local noQuest = { factionSettings = { Horde = {} } }
+    ck(Store.MigrateRepairDefault(noQuest) == 0, "a block with no autoQuest heals nothing")
+    ck(noQuest.factionSettings.Horde.autoQuest == nil, "...and the container is NOT created")
+
+    ------------------------------------------------------------------
+    -- 6. A brand-new install (no factionSettings yet) is not stamped.
+    ------------------------------------------------------------------
+    local fresh = {}
+    Store.MigrateRepairDefault(fresh)
+    ck(fresh[Store.REPAIR_HEAL_MARKER] == nil, "a db with no faction blocks yet is not stamped")
+
+    ------------------------------------------------------------------
+    -- 7. THE ROW THAT MADE THIS A SEPARATE PASS. An install that has already
+    --    logged in since 1.1.4 carries automationDefaultsHealed == true. That
+    --    must not suppress this heal.
+    ------------------------------------------------------------------
+    local post114 = oldInstall()
+    post114[Store.AUTOMATION_HEAL_MARKER] = true
+    ck(Store.MigrateRepairDefault(post114) == 2,
+       "the 1.1.4 marker does NOT gate the repair heal (that is why it has its own)")
+    ck(#Store.AUTOMATION_DEFAULT_FLIPS == 6,
+       "auto-repair was NOT bolted onto the 1.1.4 flip table (it would heal nobody)")
+
+    ------------------------------------------------------------------
+    -- 8. The flip resolves on a real fresh block, and reads ON there.
+    ------------------------------------------------------------------
+    local live = defaultSettings().factionSettings.Alliance
+    ck(live.autoQuest.autoRepair == true, "a fresh Alliance block reads auto-repair ON")
+end
+
+----------------------------------------------------------------------
 -- The zanza DEFAULT PICK LIST seeder (1.1.4) — and the empty-array semantics
 -- that only became honest once the seeder existed.
 ----------------------------------------------------------------------
@@ -7335,6 +7524,7 @@ local function testOwnerAutomationFixture(fails)
 
     -- Store.Init's order, exactly: heal -> (applyDefaults) -> shape -> seed.
     Store.MigrateAutomationDefaults(db)
+    Store.MigrateRepairDefault(db)
     applyDefaults(db, defaultSettings())
     Store.MigrateZanzaPriorityShape(db)
     Store.SeedZanzaDefaults(db)
@@ -7353,9 +7543,13 @@ local function testOwnerAutomationFixture(fails)
     ck(H.autoQuest.eko == true and A.autoQuest.eko == true, "untouched E'ko is ON in both blocks")
     ck(H.autoQuest.roids == true and A.autoQuest.roids == true, "untouched R.O.I.D.S. is ON in both blocks")
     ck(A.autoGossip.dmt == true and A.autoGossip.bwl == true, "his Alliance gossip pair heals to ON")
-    -- The waivers stayed where they were.
-    ck(H.autoQuest.zgCoins == false and H.autoQuest.autoRepair == false,
-       "his ZG-coin and auto-repair OFFs are not touched by this flip")
+    -- The remaining waiver stayed where it was.
+    ck(H.autoQuest.zgCoins == false and A.autoQuest.zgCoins == false,
+       "his ZG-coin OFFs are not touched by either flip")
+    -- ...and the one that is no longer a waiver. He never touched auto-repair, so
+    -- the 2026-08-07 pass carries both his blocks to the owner's new ON.
+    ck(H.autoQuest.autoRepair == true and A.autoQuest.autoRepair == true,
+       "his untouched auto-repair OFFs heal to ON in both blocks")
     ck(H.autoGossip.dmf.skipCookie == false and A.autoGossip.dmf.skipCookie == false,
        "skipCookie stays off (backfilled at the shipped default, not flipped)")
 
@@ -7380,13 +7574,17 @@ local function testOwnerAutomationFixture(fails)
     end
 
     -- A SECOND LOGIN is a total no-op: every marker is stamped, nothing moves.
-    local before = arr(H.autoQuest.zanza.priority) .. "|" .. tostring(H.autoGossip.dmt)
+    local function snap()
+        return arr(H.autoQuest.zanza.priority) .. "|" .. tostring(H.autoGossip.dmt)
+            .. "|" .. tostring(H.autoQuest.autoRepair)
+    end
+    local before = snap()
     Store.MigrateAutomationDefaults(db)
+    Store.MigrateRepairDefault(db)
     applyDefaults(db, defaultSettings())
     Store.MigrateZanzaPriorityShape(db)
     Store.SeedZanzaDefaults(db)
-    ck(arr(H.autoQuest.zanza.priority) .. "|" .. tostring(H.autoGossip.dmt) == before,
-       "a second login changes nothing in his blocks")
+    ck(snap() == before, "a second login changes nothing in his blocks")
 end
 
 ----------------------------------------------------------------------
@@ -7778,6 +7976,7 @@ function Store.RunSelfTests(verbose)
         { name = "coordinate overrides (A17.3)", fn = testCoordinateOverrides },
         { name = "zanza pick-list shape migration", fn = testZanzaPriorityShape },
         { name = "automation defaults flip: heal (1.1.4)", fn = testAutomationDefaultFlips },
+        { name = "auto-repair default flip: heal (2026-08-07)", fn = testRepairDefaultFlip },
         { name = "zanza default pick list: seed + stickiness", fn = testZanzaSeeds },
         { name = "OWNER fixture: automation defaults end to end", fn = testOwnerAutomationFixture },
         -- Brief E (Class 8): sort before the ceiling, one identity rule.
