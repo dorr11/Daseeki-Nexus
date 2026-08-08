@@ -54,7 +54,16 @@
 --              already owns the C_Container container walk.
 --   * Input:   IsShiftKeyDown ; UnitGUID (NPC identity).
 --   * Repair:  CanMerchantRepair / GetRepairAllCost / RepairAllItems / GetMoney
---              / GetCoinTextureString (globals; all in globals.txt 1.15.9).
+--              / GetCoinTextureString / CloseMerchant (globals; all in
+--              globals.txt 1.15.9). CloseMerchant is used by ONE caller — the
+--              Rin'wosho gossip flow, closing the merchant window it opened
+--              itself (spec §19.21). A player-opened window is never closed.
+--   * Durability: GetInventoryItemDurability(slot) -> current, maximum
+--              (GLOBAL; globals.txt 1.15.9.68808). Read-only. Walked over
+--              equipment slots 1-18, which is the range spec §14 names for the
+--              auto-repair trigger. The catalog records existence only, so the
+--              reader treats a nil/!number answer as "this slot has no
+--              durability" rather than as damage.
 --
 -- EVENTS (catalog events.txt, 1.15.9.68808): Event.GossipInfo.GossipShow /
 -- GossipClosed, Event.QuestOffer.QuestGreeting / QuestProgress / QuestFinished,
@@ -1551,6 +1560,43 @@ function Auto.HandleSayge(options, dmf)
     return true
 end
 
+-- AUTO-REPAIR AT RIN'WOSHO — the gossip half (spec §14, §19.21).
+--
+-- Lives here, above Auto.OnGossipShow, because it needs the file-local
+-- selectGossipOption: there is exactly ONE place in this addon that selects a
+-- gossip option, and this flow is not going to be the second. Every rule it
+-- reads is a pure function in the auto-repair block (Auto.DecideRinwoshoRepair,
+-- Auto.ZanzaIdleNow, Auto.AnyEquipmentDamaged, Auto.PickVendorOption).
+--
+-- Returns true when it consumed the interaction. NOTHING IS ARMED UNLESS THE
+-- SELECT ACTUALLY GOES OUT — an unaffordable gate, a window with no vendor
+-- option, or a matched option carrying no gossipOptionID all leave the flag
+-- cold and the 5 s attempt cooldown unspent.
+function Auto.TryRinwoshoRepair(options)
+    local ok, why = Auto.DecideRinwoshoRepair({
+        enabled   = aqBlock().autoRepair == true,
+        shift     = IsShiftKeyDown and IsShiftKeyDown() or false,
+        npcID     = Auto.NpcID(),
+        zanzaIdle = (Auto.ZanzaIdleNow()),
+        damaged   = (Auto.AnyEquipmentDamaged()),
+        now       = nowSecs(),
+    })
+    if not ok then
+        gdbg("rin'wosho repair: refused -- %s", tostring(why))
+        return false
+    end
+    local selector, where = Auto.PickVendorOption(options)
+    if selector == nil then
+        gdbg("rin'wosho repair: %s (%d option(s))", tostring(where), #(options or {}))
+        return false
+    end
+    if not selectGossipOption(selector) then return false end
+    Auto.ArmRepair()
+    gdbg("rin'wosho repair: vendor option %s selected via %s icon",
+         tostring(selector), tostring(where))
+    return true
+end
+
 -- GOSSIP_SHOW entry point.
 --
 -- ORDER MATTERS (1.1.4 defect fix). The gossip-window QUEST path runs FIRST,
@@ -1578,6 +1624,14 @@ function Auto.OnGossipShow()
     -- Spec §14: "Interacting with Sayge is timestamped regardless of the
     -- setting." Stamped before the dmf.enabled test for exactly that reason.
     if npcID == Auto.SAYGE_NPC then Auto._saygeInteractAt = nowSecs() end
+
+    -- Spec §14 auto-repair, the gossip half. It sits AFTER HandleGossipQuests
+    -- (above) by construction, which is the spec's priority rule as code: a
+    -- pickable turn-in has already consumed the interaction and returned, so
+    -- repair can only ever take a visit on which the zanza flow is idle. The
+    -- NPC test is repeated inside Auto.DecideRinwoshoRepair — this one is a
+    -- cheap short-circuit, that one is the guard.
+    if npcID == Auto.ZANZA_NPC and Auto.TryRinwoshoRepair(options) then return end
 
     local idx, why = Auto.DecideDmtOption({
         enabled = ago.dmt, npcID = npcID, optionCount = n,
@@ -3007,7 +3061,184 @@ end
 -- repairing everywhere, the repair printed a bare line with no cost, and an
 -- unaffordable repair fell through in total silence — indistinguishable from a
 -- broken feature. All three are fixed (label lives in options.lua).
+--
+-- THE OTHER HALF (1.1.6). The waiver kept the ANY-VENDOR repair on a window the
+-- PLAYER opens. What it never covered — and what was never built — is the flow
+-- spec §14 / §19.21 actually describes: at Rin'wosho, when the zanza flow is
+-- idle and equipment is damaged, the ADDON selects his vendor gossip option,
+-- opens the merchant window itself, repairs, and closes it again. That flow is
+-- below, and the two halves are deliberately COMPOSED rather than duplicated:
+--
+--   * There is exactly ONE MERCHANT_SHOW handler and exactly ONE repair call
+--     path (Auto.RepairNow). A merchant window that the gossip flow opened
+--     fires the same handler as one the player opened, so a second repair call
+--     of our own would be a DOUBLE repair. There is none.
+--   * The only thing the gossip flow adds at MERCHANT_SHOW is the CLOSE, and
+--     the close is gated on the arm flag — §19.21's absolute, stated as code:
+--     the addon only ever closes a merchant window it opened itself.
 ----------------------------------------------------------------------
+
+-- Spec §14: the vendor gossip option is identified by its ICON FILE ID, never
+-- by its text (a localised client has no "browse your goods" string for us).
+Auto.VENDOR_ICON = 132060
+
+-- Spec §14: equipment slots 1-18 are the auto-repair trigger's search range.
+Auto.DURABILITY_SLOTS = 18
+
+-- Spec §14's two guards on the gossip-driven flow.
+Auto.REPAIR_ARM_WINDOW  = 3      -- s; disarm backstop on the armed flag
+Auto.REPAIR_COOLDOWN    = 5      -- s; attempt cooldown on the option select
+
+Auto._repairArmedAt   = nil      -- GetTime() stamp; nil = we opened nothing
+Auto._repairCooldown  = {}       -- shared-shape stamp table, one key: "repair"
+
+-- PURE. The icon of one gossip option, OVERRIDE FIRST.
+--
+-- Spec §14, verbatim: "identified by the vendor icon file ID 132060, checking
+-- the override icon first". JUDGEMENT CALL, recorded: that sentence has two
+-- readings — per-option (prefer this option's override field over its base
+-- field) and list-wide (sweep every option's override field before any base
+-- field). This takes the per-option reading, which is the plain one and the
+-- only one that matters at Rin'wosho, where exactly one option is a vendor.
+-- The two readings can only disagree on a contrived list where option A carries
+-- the vendor icon in its BASE field and a later option B carries it in its
+-- OVERRIDE field; no such window exists here.
+--
+-- The catalog (1.15.9.68808) records structure NAMES only — GossipOptionUIInfo
+-- is in doc-tables.txt with no field list — so it cannot tell us what the two
+-- fields are called. Both spellings are read defensively through tonumber, and
+-- a record carrying neither simply does not match.
+function Auto.OptionIcon(opt)
+    if type(opt) ~= "table" then return nil, "not-a-record" end
+    local override = tonumber(opt.overrideIconID)
+    if override then return override, "override" end
+    local icon = tonumber(opt.icon)
+    if icon then return icon, "icon" end
+    return nil, "no-icon"
+end
+
+-- PURE. The API selector of the first VENDOR option in the list, or nil.
+--
+-- A matched option with no gossipOptionID REFUSES — it never falls back to the
+-- ordinal. That is the same rule optionSelector already enforces for the DMT /
+-- orb / Sayge handlers, restated here because this caller spends gold.
+function Auto.PickVendorOption(options)
+    if type(options) ~= "table" then return nil, "no-options" end
+    for i = 1, #options do
+        local opt  = options[i]
+        local icon, where = Auto.OptionIcon(opt)
+        if icon == Auto.VENDOR_ICON then
+            if opt.gossipOptionID == nil then return nil, "no-option-id" end
+            return opt.gossipOptionID, where
+        end
+    end
+    return nil, "no-vendor-option"
+end
+
+-- Is anything equipped below max durability? `read` is injectable:
+-- function(slot) -> current, maximum. Defaults to the live global.
+--
+-- A slot that answers with anything other than two numbers, or with a maximum
+-- of zero, is an item with no durability (or an empty slot) — NOT damage. Only
+-- current < maximum is damage. Returns (bool, firstDamagedSlot|nil).
+function Auto.AnyEquipmentDamaged(read)
+    read = read or function(slot)
+        if not GetInventoryItemDurability then return nil end
+        local ok, cur, max = pcall(GetInventoryItemDurability, slot)
+        if not ok then return nil end
+        return cur, max
+    end
+    for slot = 1, Auto.DURABILITY_SLOTS do
+        local cur, max = read(slot)
+        cur, max = tonumber(cur), tonumber(max)
+        if cur and max and max > 0 and cur < max then return true, slot end
+    end
+    return false, nil
+end
+
+-- Is the zanza flow IDLE on this gossip window?
+--
+-- THE SEAM the zanza remediation left behind, used exactly as documented there:
+-- ZanzaGateNow() == false (no token, bag rule, wrong NPC, or zanza disabled)
+-- OR PlanGossipQuest() == nil (the gate passed but 8243 is not actually on
+-- offer) is "the zanza flow will not fire on this interaction".
+--
+-- A MISSING QUEST API IS NOT IDLE. If the gossip quest lists cannot be read we
+-- cannot answer the spec's question, and the safe answer to "may I spend this
+-- interaction on the vendor?" when the guard cannot be evaluated is no — the
+-- same rule the Orb of Command guard follows. Returns (idle:boolean, reason).
+function Auto.ZanzaIdleNow()
+    if not Auto.ZanzaGateNow() then return true, "gate-refused" end
+    if not (C_GossipInfo and C_GossipInfo.GetAvailableQuests
+            and C_GossipInfo.GetActiveQuests) then
+        return false, "cannot-judge"
+    end
+    local available = Auto.ReadGossipQuests(C_GossipInfo.GetAvailableQuests)
+    local active    = Auto.ReadGossipQuests(C_GossipInfo.GetActiveQuests)
+    if Auto.PlanGossipQuest(active, available, { [Auto.ZANZA_QUEST] = true }) then
+        return false, "turn-in-pending"
+    end
+    return true, "nothing-pickable"
+end
+
+-- PURE. The whole §14 auto-repair-at-Rin'wosho entry rule, one gate per row.
+-- ctx: enabled, shift, npcID, zanzaIdle, damaged, now, cooldowns, cooldown.
+-- Returns (ok:boolean, reason:string). Every refusal names its own gate.
+--
+-- AN UNKNOWN npcID REFUSES — and that is a deliberate divergence from the zanza
+-- gate sitting next to it, which ADMITS an unparseable GUID. Zanza can afford
+-- that because the quest-ID whitelist is its real guard: 8243 only exists at
+-- Rin'wosho. This flow has no second guard — an icon ID is not an identity —
+-- and it opens a vendor and spends the player's gold, so the NPC test IS the
+-- guard and it must be answered, not assumed.
+function Auto.DecideRinwoshoRepair(ctx)
+    ctx = ctx or {}
+    if not ctx.enabled then return false, "disabled" end
+    if ctx.shift then return false, "shift-skip" end
+    if ctx.npcID ~= Auto.ZANZA_NPC then return false, "wrong-npc" end
+    if not ctx.zanzaIdle then return false, "zanza-busy" end
+    if not ctx.damaged then return false, "nothing-damaged" end
+    if Auto.IsCooling(ctx.cooldowns or Auto._repairCooldown, "repair",
+                      ctx.now or 0, ctx.cooldown or Auto.REPAIR_COOLDOWN) then
+        return false, "cooling"
+    end
+    return true, "ok"
+end
+
+-- Arm the "this merchant window is MINE" flag. Called at exactly one point —
+-- the instant the vendor option select goes out — and it stamps the 5 s attempt
+-- cooldown in the same breath, so a gossip that yields no merchant still burns
+-- the attempt (the zanza rejection stamp's "stamp before the request" shape).
+function Auto.ArmRepair(now)
+    now = now or nowSecs()
+    Auto._repairArmedAt = now
+    Auto._repairCooldown.repair = now
+    -- Spec's 3 s disarm backstop. The READ-TIME expiry in Auto.ConsumeRepairArm
+    -- is what actually enforces the window (it is correct with no timer at all,
+    -- which is what the headless harness has); this is the housekeeping half,
+    -- so a gossip that never yields a merchant does not leave a live-looking
+    -- stamp lying around. Guarded on C_Timer exactly like the zanza verifier:
+    -- Auto.After would otherwise run the disarm INLINE on a client with no
+    -- timer API and un-arm the flow before the merchant ever opened.
+    if C_Timer and C_Timer.After then
+        C_Timer.After(Auto.REPAIR_ARM_WINDOW, function()
+            if Auto._repairArmedAt == now then Auto._repairArmedAt = nil end
+        end)
+    end
+end
+
+-- Did WE open the merchant window that is opening right now? Consumes the flag
+-- either way: an armed-but-expired stamp is spent, not left to catch the next
+-- vendor the player walks up to.
+function Auto.ConsumeRepairArm(now)
+    local at = Auto._repairArmedAt
+    Auto._repairArmedAt = nil
+    if not at then return false, "not-armed" end
+    if ((now or nowSecs()) - at) > Auto.REPAIR_ARM_WINDOW then
+        return false, "arm-expired"
+    end
+    return true, "ours"
+end
 
 -- Money for humans. Prefers the client's coin-icon string; the plain-text
 -- fallback is what the headless harness and any stripped client see.
@@ -3023,21 +3254,45 @@ function Auto.FormatMoney(copper)
         copper % 100)
 end
 
-function Auto.OnMerchantShow()
-    if not aqBlock().autoRepair then return end
-    if not (CanMerchantRepair and CanMerchantRepair()) then return end
+-- THE ONE REPAIR CALL PATH. This is the owner-waived any-vendor body, moved
+-- out of the event handler unchanged so that the Rin'wosho flow can share it
+-- instead of repairing a second time. Returns (repaired:boolean, reason).
+function Auto.RepairNow()
+    if not aqBlock().autoRepair then return false, "disabled" end
+    if not (CanMerchantRepair and CanMerchantRepair()) then return false, "cannot-repair" end
     local cost = math.floor(tonumber(GetRepairAllCost and GetRepairAllCost() or 0) or 0)
-    if cost <= 0 then return end                       -- nothing damaged: silent
+    if cost <= 0 then return false, "nothing-damaged" end   -- silent
     local money = math.floor(tonumber(GetMoney and GetMoney() or 0) or 0)
     if money < cost then
         -- Spec §14's "not enough gold" line. Silence here used to look exactly
         -- like the feature being broken.
         ns:Print("auto-repair: not enough gold — repairing costs "
             .. Auto.FormatMoney(cost) .. ", you have " .. Auto.FormatMoney(money) .. ".")
-        return
+        return false, "poor"
     end
     if RepairAllItems then RepairAllItems() end
     ns:Print("auto-repaired for " .. Auto.FormatMoney(cost) .. ".")
+    return true, "repaired"
+end
+
+-- THE COMPOSITION (spec §14 + §19.21), and the whole of it.
+--
+-- One handler, one repair call, one close. The arm flag is the ONLY thing that
+-- distinguishes the two flows, and all it decides is the close:
+--
+--   player-opened window (flag cold) -> repair (owner waiver), DO NOT close.
+--   addon-opened window  (flag hot)  -> repair (same call),    close it.
+--
+-- The window is closed whatever the repair verdict was — including "not enough
+-- gold" and "this vendor cannot repair". JUDGEMENT CALL, recorded: §19.21 makes
+-- the ownership of the window the whole rule, and this window is one the player
+-- never asked for. Leaving a merchant pane the addon opened sitting on their
+-- screen because the repair was unaffordable would be the addon walking away
+-- from its own mess; the printed line already says why nothing was repaired.
+function Auto.OnMerchantShow()
+    local ours = Auto.ConsumeRepairArm()
+    Auto.RepairNow()
+    if ours and CloseMerchant then CloseMerchant() end
 end
 
 ----------------------------------------------------------------------
@@ -4229,15 +4484,19 @@ end
 local function testRepairHonesty()
     local SAVE = {}
     local NAMES = { "CanMerchantRepair", "GetRepairAllCost", "RepairAllItems",
-                    "GetMoney", "GetCoinTextureString", "print" }
+                    "GetMoney", "GetCoinTextureString", "CloseMerchant", "print" }
     for _, k in ipairs(NAMES) do SAVE[k] = _G[k] end
+    -- The waived path is the FLAG-COLD path by definition. Start from cold so
+    -- this suite measures the player-opened window, whatever ran before it.
+    local savedArm = Auto._repairArmedAt
+    Auto._repairArmedAt = nil
 
     local aq = Auto.AQBlock and Auto.AQBlock() or nil
     if type(aq) ~= "table" then return false, "the live autoQuest block is reachable" end
     local savedRepair = aq.autoRepair
 
     local W = { canRepair = true, cost = 12345, money = 999999 }
-    local said, repaired
+    local said, repaired, closed
     _G.print = function(...)
         local p = {}
         for i = 1, select("#", ...) do p[i] = tostring((select(i, ...))) end
@@ -4247,10 +4506,12 @@ local function testRepairHonesty()
     _G.GetRepairAllCost     = function() return W.cost end
     _G.GetMoney             = function() return W.money end
     _G.RepairAllItems       = function() repaired = repaired + 1 end
+    _G.CloseMerchant        = function() closed = closed + 1 end
     _G.GetCoinTextureString = nil          -- exercise the plain-text fallback
     local function run(t)
         for k, v in pairs(t or {}) do W[k] = v end
-        said, repaired = {}, 0
+        said, repaired, closed = {}, 0, 0
+        Auto._repairArmedAt = nil          -- the PLAYER opened this window
         Auto.OnMerchantShow()
     end
     local function saidMatching(frag)
@@ -4269,6 +4530,9 @@ local function testRepairHonesty()
     run({})
     ck(repaired == 1, "auto-repair fires at an arbitrary vendor (owner-waived, INTENDED)")
     ck(saidMatching("1g 23s 45c"), "the repair cost is printed, got: " .. tostring(said[1]))
+    -- SPEC §19.21, THE NEGATIVE DIRECTION. This window is the PLAYER's. The
+    -- waiver bought the repair; it did not buy the right to shut their vendor.
+    ck(closed == 0, "a PLAYER-opened merchant window is never closed by us")
 
     -- Not enough gold: a plain line, not silence.
     run({ money = 100 })
@@ -4299,6 +4563,478 @@ local function testRepairHonesty()
     ck(Auto.FormatMoney(10000) == "1g 0s 0c", "one gold formats")
 
     aq.autoRepair = savedRepair
+    Auto._repairArmedAt = savedArm
+    for _, k in ipairs(NAMES) do _G[k] = SAVE[k] end
+    if fail then return false, fail end
+    return true
+end
+
+----------------------------------------------------------------------
+-- AUTO-REPAIR AT RIN'WOSHO — the gossip-driven half (spec §14, §19.21).
+--
+-- The half the owner waiver did NOT cover, and the half that was never built:
+-- the ADDON opens the vendor pane. Four suites, one rule per assertion.
+----------------------------------------------------------------------
+
+-- RULE (§14): the vendor option is identified by icon file ID 132060, checking
+-- the OVERRIDE icon first. Never by text, never by ordinal.
+local function testVendorIconPick()
+    if Auto.VENDOR_ICON ~= 132060 then return false, "the spec's icon file ID is 132060" end
+
+    local function opt(t) return t end
+    -- Plain base icon, and the vendor option is NOT first — an index/ID mixup
+    -- would surface as the wrong number rather than an accidental pass.
+    local list = {
+        opt({ name = "Tell me about Zandalar", gossipOptionID = 770, icon = 132048 }),
+        opt({ name = "I want to browse your goods", gossipOptionID = 771, icon = 132060 }),
+    }
+    local sel, where = Auto.PickVendorOption(list)
+    if sel ~= 771 then return false, "the base icon 132060 selects id 771, got " .. tostring(sel) end
+    if where ~= "icon" then return false, "a base-icon match reports 'icon'" end
+
+    -- OVERRIDE FIRST: the base icon says something else, the override says
+    -- vendor. The override is the one that counts.
+    list = { opt({ name = "x", gossipOptionID = 772, icon = 132048, overrideIconID = 132060 }) }
+    sel, where = Auto.PickVendorOption(list)
+    if sel ~= 772 then return false, "an override icon of 132060 matches" end
+    if where ~= "override" then return false, "an override match reports 'override'" end
+
+    -- …and the override losing is just as load-bearing: an option whose BASE
+    -- icon is the vendor one but whose OVERRIDE is not is NOT a vendor option.
+    list = { opt({ name = "x", gossipOptionID = 773, icon = 132060, overrideIconID = 132048 }) }
+    if Auto.PickVendorOption(list) ~= nil then
+        return false, "override 132048 beats base 132060 -- not a vendor option"
+    end
+
+    -- No vendor option on the window at all.
+    list = { opt({ name = "Tell me about Zandalar", gossipOptionID = 770, icon = 132048 }),
+             opt({ name = "Goodbye", gossipOptionID = 774, icon = 132049 }) }
+    local none, why = Auto.PickVendorOption(list)
+    if none ~= nil or why ~= "no-vendor-option" then
+        return false, "a window with no vendor option picks nothing"
+    end
+    if Auto.PickVendorOption({}) ~= nil then return false, "an empty list picks nothing" end
+    if Auto.PickVendorOption(nil) ~= nil then return false, "a nil list picks nothing" end
+
+    -- A matched option with no gossipOptionID REFUSES. It never falls back to
+    -- the ordinal -- the same rule optionSelector enforces for DMT/orb/Sayge.
+    none, why = Auto.PickVendorOption({ opt({ name = "browse", icon = 132060 }) })
+    if none ~= nil or why ~= "no-option-id" then
+        return false, "a vendor option with no gossipOptionID refuses, got " .. tostring(why)
+    end
+
+    -- Icons that arrive as STRINGS (a client or a profile that stringified
+    -- them) still compare as numbers; anything unparseable simply is not one.
+    if Auto.PickVendorOption({ opt({ gossipOptionID = 775, icon = "132060" }) }) ~= 775 then
+        return false, "a stringified icon id still matches"
+    end
+    if Auto.PickVendorOption({ opt({ gossipOptionID = 776, icon = "vendor.blp" }) }) ~= nil then
+        return false, "a texture PATH is not the file ID"
+    end
+    return true
+end
+
+-- RULE (§14): "any equipped item (slots 1-18) is below max durability".
+local function testDurabilityScan()
+    if Auto.DURABILITY_SLOTS ~= 18 then return false, "the spec's range is slots 1-18" end
+    local D = {}
+    local function read(slot) local d = D[slot]; if not d then return nil end return d[1], d[2] end
+
+    D = {}
+    if Auto.AnyEquipmentDamaged(read) then return false, "nothing equipped is not damage" end
+
+    D = { [1] = { 100, 100 }, [5] = { 60, 60 } }
+    if Auto.AnyEquipmentDamaged(read) then return false, "full durability is not damage" end
+
+    D[5] = { 59, 60 }
+    local dmg, slot = Auto.AnyEquipmentDamaged(read)
+    if not dmg or slot ~= 5 then return false, "one point of damage on slot 5 counts" end
+
+    -- The BOUNDARIES of the spec's range, both ways.
+    D = { [18] = { 1, 100 } }
+    if not Auto.AnyEquipmentDamaged(read) then return false, "slot 18 is inside the range" end
+    D = { [19] = { 1, 100 }, [20] = { 1, 100 } }
+    if Auto.AnyEquipmentDamaged(read) then return false, "slot 19+ is outside the range" end
+    D = { [0] = { 1, 100 } }
+    if Auto.AnyEquipmentDamaged(read) then return false, "slot 0 is outside the range" end
+
+    -- A slot with no durability is not damage, however it says so.
+    D = { [1] = { 0, 0 } }
+    if Auto.AnyEquipmentDamaged(read) then return false, "a max of 0 is 'no durability', not damage" end
+    D = { [1] = { nil, 100 } }
+    if Auto.AnyEquipmentDamaged(read) then return false, "a nil current reading is not damage" end
+    D = { [1] = { "broken", "100" } }
+    if Auto.AnyEquipmentDamaged(read) then return false, "a non-numeric reading is not damage" end
+    -- …and a reading that stringifies two real numbers still counts.
+    D = { [1] = { "50", "100" } }
+    if not Auto.AnyEquipmentDamaged(read) then return false, "stringified numbers still count" end
+    return true
+end
+
+-- RULE TABLE (§14 / §19.21): the entry gate, one row per gate, each naming
+-- itself. Order matters -- the first refusal wins and it must be the truthful
+-- one, so every row here turns exactly ONE thing off.
+local function testRinwoshoRepairGate()
+    local function ctx(t)
+        local base = { enabled = true, shift = false, npcID = Auto.ZANZA_NPC,
+                       zanzaIdle = true, damaged = true, now = 1000,
+                       cooldowns = {}, cooldown = Auto.REPAIR_COOLDOWN }
+        for k, v in pairs(t or {}) do base[k] = v end
+        return base
+    end
+    local ROWS = {
+        { "everything on",       {},                                  true,  "ok" },
+        { "toggle off",          { enabled = false },                 false, "disabled" },
+        { "Shift held",          { shift = true },                    false, "shift-skip" },
+        { "some other NPC",      { npcID = 14822 },                   false, "wrong-npc" },
+        { "zanza turn-in due",   { zanzaIdle = false },               false, "zanza-busy" },
+        { "nothing damaged",     { damaged = false },                 false, "nothing-damaged" },
+        { "inside the cooldown", { cooldowns = { repair = 996 } },    false, "cooling" },
+    }
+    for _, row in ipairs(ROWS) do
+        local ok, why = Auto.DecideRinwoshoRepair(ctx(row[2]))
+        if ok ~= row[3] or why ~= row[4] then
+            return false, ("%s -> ok=%s (%s), want ok=%s (%s)")
+                :format(row[1], tostring(ok), tostring(why), tostring(row[3]), row[4])
+        end
+    end
+    -- AN UNKNOWN npcID REFUSES -- written out longhand because `npcID = nil` in
+    -- a table constructor is not an override, it is an absent key, and a row
+    -- that silently reused the good value would assert nothing at all. This is
+    -- the one place this flow diverges from the zanza gate beside it, which
+    -- ADMITS an unparseable GUID on the strength of the quest-ID whitelist.
+    local blind = ctx({})
+    blind.npcID = nil
+    local ok, why = Auto.DecideRinwoshoRepair(blind)
+    if ok or why ~= "wrong-npc" then
+        return false, "an unparseable GUID refuses, got ok=" .. tostring(ok) .. " (" .. tostring(why) .. ")"
+    end
+
+    -- The 5 s attempt cooldown, at its exact edge.
+    if Auto.REPAIR_COOLDOWN ~= 5 then return false, "the spec's attempt cooldown is 5 s" end
+    local stamps = { repair = 1000 }
+    local ok = Auto.DecideRinwoshoRepair(ctx({ now = 1004.9, cooldowns = stamps }))
+    if ok then return false, "4.9 s after an attempt is still cooling" end
+    ok = Auto.DecideRinwoshoRepair(ctx({ now = 1005, cooldowns = stamps }))
+    if not ok then return false, "the cooldown expires AT 5 s" end
+
+    -- The arm window, at its exact edge. 3 s is the spec's backstop.
+    if Auto.REPAIR_ARM_WINDOW ~= 3 then return false, "the spec's disarm backstop is 3 s" end
+    local savedArm = Auto._repairArmedAt
+    Auto._repairArmedAt = 500
+    if not (Auto.ConsumeRepairArm(503)) then return false, "3.0 s after arming is still ours" end
+    Auto._repairArmedAt = 500
+    if Auto.ConsumeRepairArm(503.1) then return false, "3.1 s after arming is NOT ours" end
+    -- Consuming always spends the flag, expired or not.
+    Auto._repairArmedAt = 500
+    Auto.ConsumeRepairArm(600)
+    if Auto._repairArmedAt ~= nil then return false, "an expired arm is spent, not left armed" end
+    if (Auto.ConsumeRepairArm(600)) then return false, "a cold flag is never ours" end
+    Auto._repairArmedAt = savedArm
+    return true
+end
+
+-- THE LIVE PATH. Real Auto.OnGossipShow and real Auto.OnMerchantShow, driven
+-- through stubbed client APIs -- the owner's two-visit flow at Rin'wosho, plus
+-- the guards, plus the composition with the shipped any-vendor handler.
+local function testRinwoshoRepairLive()
+    local SAVE = {}
+    local NAMES = { "C_GossipInfo", "C_Item", "C_Container", "GetItemCount",
+                    "IsShiftKeyDown", "UnitGUID", "GetTime", "C_Timer",
+                    "GetInventoryItemDurability", "CanMerchantRepair",
+                    "GetRepairAllCost", "GetMoney", "RepairAllItems",
+                    "CloseMerchant", "GetCoinTextureString", "print" }
+    for _, k in ipairs(NAMES) do SAVE[k] = _G[k] end
+
+    local fs = Auto.FactionSettings and Auto.FactionSettings() or nil
+    if type(fs) ~= "table" or type(fs.autoQuest) ~= "table" then
+        return false, "the live autoQuest block is reachable"
+    end
+    local savedAQ   = fs.autoQuest
+    local savedArm  = Auto._repairArmedAt
+    local savedCD   = Auto._repairCooldown
+    local savedBank = Auto._bankSnapshot
+
+    local RIN     = "Creature-0-3299-0-14-14921-0000027FA6"
+    -- An NPC no handler in this file claims, so scene 10 measures the repair
+    -- flow's NPC gate and nothing else. (Sayge would answer his own gossip.)
+    local INNKEEP = "Creature-0-3299-0-14-6740-0000027FA8"
+
+    local W, CALLS, said
+    local function reset()
+        CALLS = { option = {}, quest = {}, repaired = 0, closedMerchant = 0, closedGossip = 0 }
+        said  = {}
+    end
+
+    _G.GetTime        = function() return W.clock end
+    _G.IsShiftKeyDown = function() return W.shift end
+    _G.UnitGUID       = function(u) if u == "npc" then return W.guid end return "Player-4395-01C7B4D5" end
+    _G.C_Timer        = { After = function() end }   -- the backstop cannot fire inline
+    _G.GetCoinTextureString = nil
+    _G.print = function(...)
+        local p = {}
+        for i = 1, select("#", ...) do p[i] = tostring((select(i, ...))) end
+        said[#said + 1] = table.concat(p, "\t")
+    end
+    _G.C_GossipInfo = {
+        GetAvailableQuests = function()
+            local out = {}
+            for i, q in ipairs(W.available) do out[i] = { questID = q, title = "q" .. q } end
+            return out
+        end,
+        GetActiveQuests = function() return {} end,
+        SelectAvailableQuest = function(id) CALLS.quest[#CALLS.quest + 1] = id end,
+        SelectActiveQuest    = function(id) CALLS.quest[#CALLS.quest + 1] = id end,
+        GetOptions   = function() return W.options end,
+        SelectOption = function(id) CALLS.option[#CALLS.option + 1] = id end,
+        CloseGossip  = function() CALLS.closedGossip = CALLS.closedGossip + 1 end,
+    }
+    _G.C_Item       = { GetItemCount = function(id) return W.bags[id] or 0 end }
+    _G.GetItemCount = function(id) return W.bags[id] or 0 end
+    _G.C_Container  = { CalculateTotalNumberOfFreeBagSlots = function() return W.free end }
+    _G.GetInventoryItemDurability = function(slot)
+        local d = W.dur[slot]
+        if not d then return nil end
+        return d[1], d[2]
+    end
+    _G.CanMerchantRepair = function() return W.canRepair end
+    _G.GetRepairAllCost  = function() return W.cost end
+    _G.GetMoney          = function() return W.money end
+    _G.RepairAllItems    = function() CALLS.repaired = CALLS.repaired + 1 end
+    _G.CloseMerchant     = function() CALLS.closedMerchant = CALLS.closedMerchant + 1 end
+
+    -- Rin'wosho's real window shape: a vendor option that is NOT first, so an
+    -- ordinal/ID mixup shows up as a wrong number instead of a lucky pass.
+    local function rinOptions()
+        return {
+            { name = "Tell me about the Zandalar tribe", gossipOptionID = 770, icon = 132048 },
+            { name = "I want to browse your goods",      gossipOptionID = 771, icon = 132060 },
+        }
+    end
+
+    local fail = nil
+    local function ck(cond, why) if not fail and not cond then fail = why end end
+    local function scene(t)
+        reset()
+        Auto._repairArmedAt  = nil
+        Auto._repairCooldown = {}
+        Auto._bankSnapshot   = nil
+        W = { clock = 1000, shift = false, guid = RIN, options = rinOptions(),
+              available = {}, bags = {}, free = 5,
+              dur = { [5] = { 40, 100 } },                 -- damaged by default
+              canRepair = true, cost = 12345, money = 999999 }
+        for k, v in pairs(t or {}) do W[k] = v end
+    end
+    local function saidMatching(frag)
+        for _, l in ipairs(said) do if l:lower():find(frag, 1, true) then return true end end
+        return false
+    end
+
+    -- Zanza on, everything else off, auto-repair ON.
+    fs.autoQuest = { eko = false, zgCoins = false, roids = false, autoRepair = true,
+                     zanza = { enabled = true, priority = { "swiftness" },
+                               defaultsApplied = true } }
+
+    ------------------------------------------------------------------
+    -- 1. THE PRIORITY RULE. Visit one: a token in the bags and 8243 on offer.
+    --    The turn-in wins the one interaction; repair does not even try, and
+    --    nothing is armed, so no merchant window can ever be ours.
+    ------------------------------------------------------------------
+    scene({ bags = { [Auto.ZANZA_TOKEN] = 1 }, available = { Auto.ZANZA_QUEST } })
+    Auto.OnGossipShow()
+    ck(CALLS.quest[1] == Auto.ZANZA_QUEST,
+       "visit 1: the turn-in is selected, got " .. tostring(CALLS.quest[1]))
+    ck(#CALLS.option == 0,
+       "visit 1: the vendor option must NOT be selected, got " .. tostring(CALLS.option[1]))
+    ck(Auto._repairArmedAt == nil, "visit 1: nothing is armed while a turn-in is pending")
+    ck(Auto._repairCooldown.repair == nil, "visit 1: the attempt cooldown is not spent either")
+
+    ------------------------------------------------------------------
+    -- 2. THE OWNER'S SECOND VISIT. No token, damaged gear: the vendor option
+    --    is selected, the flag is armed, the attempt is stamped.
+    ------------------------------------------------------------------
+    scene({})
+    Auto.OnGossipShow()
+    ck(CALLS.option[1] == 771,
+       "visit 2: the VENDOR option (id 771) is selected, got " .. tostring(CALLS.option[1]))
+    ck(#CALLS.option == 1, "visit 2: exactly one selection")
+    ck(#CALLS.quest == 0, "visit 2: no quest is touched")
+    ck(Auto._repairArmedAt == 1000, "visit 2: the window is armed as ours")
+    ck(Auto._repairCooldown.repair == 1000, "visit 2: the 5 s attempt is stamped at select time")
+
+    --    …and the merchant window that follows: ONE repair, the cost printed,
+    --    and the window closed because it is ours.
+    Auto.OnMerchantShow()
+    ck(CALLS.repaired == 1, "visit 2: repaired exactly once (no double-repair)")
+    ck(saidMatching("1g 23s 45c"), "visit 2: the cost is printed, got: " .. tostring(said[1]))
+    ck(CALLS.closedMerchant == 1, "visit 2: OUR merchant window is closed")
+    ck(Auto._repairArmedAt == nil, "visit 2: the flag is spent by the window it opened")
+
+    ------------------------------------------------------------------
+    -- 3. NOTHING DAMAGED -> nothing happens. Full durability, no token.
+    ------------------------------------------------------------------
+    scene({ dur = { [5] = { 100, 100 }, [1] = { 60, 60 } } })
+    Auto.OnGossipShow()
+    ck(#CALLS.option == 0, "undamaged gear selects nothing, got " .. tostring(CALLS.option[1]))
+    ck(Auto._repairArmedAt == nil, "undamaged gear arms nothing")
+
+    ------------------------------------------------------------------
+    -- 4. THE TOGGLE OFF -> nothing happens, damage or no damage.
+    ------------------------------------------------------------------
+    fs.autoQuest.autoRepair = false
+    scene({})
+    Auto.OnGossipShow()
+    ck(#CALLS.option == 0, "auto-repair off selects nothing")
+    ck(Auto._repairArmedAt == nil, "auto-repair off arms nothing")
+    fs.autoQuest.autoRepair = true
+
+    ------------------------------------------------------------------
+    -- 5. SHIFT (§19.23). The existing gossip Shift-skip is the FIRST statement
+    --    of Auto.OnGossipShow, so it covers this flow too -- asserted here
+    --    rather than assumed, because "it composes" is a claim.
+    ------------------------------------------------------------------
+    scene({ shift = true })
+    Auto.OnGossipShow()
+    ck(#CALLS.option == 0, "Shift skips the repair flow, got " .. tostring(CALLS.option[1]))
+    ck(Auto._repairArmedAt == nil, "Shift arms nothing")
+
+    ------------------------------------------------------------------
+    -- 6. THE OWN-WINDOW GUARD, POSITIVE AND NEGATIVE, at the SAME NPC.
+    --    A player-opened window at Rin'wosho with the flow idle: the waived
+    --    any-vendor path repairs it, and we do not close it.
+    ------------------------------------------------------------------
+    scene({})
+    Auto.OnMerchantShow()                     -- no gossip ran: the flag is cold
+    ck(CALLS.repaired == 1, "a PLAYER-opened window at Rin'wosho still repairs (owner waiver)")
+    ck(CALLS.closedMerchant == 0, "a PLAYER-opened window is NOT closed by us")
+
+    ------------------------------------------------------------------
+    -- 7. THE 3 s DISARM BACKSTOP. A gossip that never yielded a merchant
+    --    cannot strand the flag: four seconds later, the next vendor the
+    --    player walks up to is theirs.
+    ------------------------------------------------------------------
+    scene({})
+    Auto.OnGossipShow()
+    ck(Auto._repairArmedAt == 1000, "armed at t=1000")
+    W.clock = 1004                            -- 4 s later, an unrelated vendor
+    Auto.OnMerchantShow()
+    ck(CALLS.repaired == 1, "the stale window still repairs (waived path)")
+    ck(CALLS.closedMerchant == 0, "a stale arm does NOT close someone else's window")
+    --    …and exactly 3 s is still inside the window.
+    scene({})
+    Auto.OnGossipShow()
+    W.clock = 1003
+    Auto.OnMerchantShow()
+    ck(CALLS.closedMerchant == 1, "3.0 s after arming the window is still ours")
+
+    ------------------------------------------------------------------
+    -- 8. THE 5 s ATTEMPT COOLDOWN. A second gossip inside the window refuses;
+    --    at 5 s it fires again.
+    ------------------------------------------------------------------
+    scene({})
+    Auto.OnGossipShow()
+    ck(#CALLS.option == 1, "the first attempt goes out")
+    W.clock = 1004
+    Auto.OnGossipShow()
+    ck(#CALLS.option == 1, "a second gossip 4 s later must not re-select")
+    W.clock = 1005
+    Auto.OnGossipShow()
+    ck(#CALLS.option == 2, "at 5 s the attempt is allowed again")
+    ck(CALLS.option[2] == 771, "…and it is still the vendor option")
+
+    ------------------------------------------------------------------
+    -- 9. ICON IDENTIFICATION on the live path: override-first, and a window
+    --    with no vendor option at all.
+    ------------------------------------------------------------------
+    scene({ options = {
+        { name = "Tell me about the Zandalar tribe", gossipOptionID = 770, icon = 132048 },
+        { name = "browse", gossipOptionID = 779, icon = 132048, overrideIconID = 132060 },
+    } })
+    Auto.OnGossipShow()
+    ck(CALLS.option[1] == 779, "the override icon identifies the vendor option live")
+
+    scene({ options = {
+        { name = "Tell me about the Zandalar tribe", gossipOptionID = 770, icon = 132048 },
+        { name = "Goodbye",                          gossipOptionID = 774, icon = 132049 },
+    } })
+    Auto.OnGossipShow()
+    ck(#CALLS.option == 0, "a gossip with NO vendor option selects nothing")
+    ck(Auto._repairArmedAt == nil, "…and arms nothing, so the next vendor is not ours")
+    ck(Auto._repairCooldown.repair == nil, "…and does not burn the 5 s attempt")
+
+    ------------------------------------------------------------------
+    -- 10. THE NPC GATE. Damaged gear and a vendor option at somebody else's
+    --     gossip window is still nothing -- including a GUID we cannot parse.
+    ------------------------------------------------------------------
+    scene({ guid = INNKEEP })
+    Auto.OnGossipShow()
+    ck(#CALLS.option == 0, "a vendor icon at an unrelated NPC selects nothing")
+    ck(Auto._repairArmedAt == nil, "…and arms nothing")
+    scene({ guid = "not-a-guid" })
+    Auto.OnGossipShow()
+    ck(#CALLS.option == 0, "an unparseable GUID selects nothing (this flow spends gold)")
+    scene({})
+    W.guid = nil                              -- an absent key is not an override
+    Auto.OnGossipShow()
+    ck(#CALLS.option == 0, "no NPC GUID at all selects nothing")
+
+    ------------------------------------------------------------------
+    -- 11. ZANZA BUSY WITHOUT THE TURN-IN CONSUMING THE WINDOW. Token held and
+    --     8243 on offer, but the client's SelectAvailableQuest is missing, so
+    --     HandleGossipQuests cannot consume the interaction. Repair STILL must
+    --     not take it: the idle predicate is a rule, not a side effect of
+    --     whichever handler happened to return first.
+    ------------------------------------------------------------------
+    scene({ bags = { [Auto.ZANZA_TOKEN] = 1 }, available = { Auto.ZANZA_QUEST } })
+    _G.C_GossipInfo.SelectAvailableQuest = nil
+    Auto.OnGossipShow()
+    ck(#CALLS.option == 0, "a pending turn-in blocks repair even when the turn-in cannot fire")
+    _G.C_GossipInfo.SelectAvailableQuest = function(id) CALLS.quest[#CALLS.quest + 1] = id end
+
+    --     …and a missing quest API is NOT read as "idle" either. The token is
+    --     held here, so the zanza GATE passes and the only thing left that can
+    --     answer "is a turn-in pending?" is the quest list — which is gone.
+    scene({ bags = { [Auto.ZANZA_TOKEN] = 1 } })
+    _G.C_GossipInfo.GetAvailableQuests = nil
+    Auto.OnGossipShow()
+    ck(#CALLS.option == 0, "an unreadable quest list refuses rather than assuming idle")
+    ck((select(2, Auto.ZanzaIdleNow())) == "cannot-judge", "…and says so by name")
+    _G.C_GossipInfo.GetAvailableQuests = function()
+        local out = {}
+        for i, q in ipairs(W.available) do out[i] = { questID = q, title = "q" .. q } end
+        return out
+    end
+
+    ------------------------------------------------------------------
+    -- 12. THE THREE ARMS OF "IDLE" the spec names, each on its own: no token,
+    --     nothing pickable, zanza disabled. All three must let repair through.
+    ------------------------------------------------------------------
+    scene({})                                             -- arm 1: no token
+    ck((select(2, Auto.ZanzaIdleNow())) == "gate-refused", "no token = idle (gate-refused)")
+    Auto.OnGossipShow()
+    ck(CALLS.option[1] == 771, "no token: repair takes the visit")
+
+    --     arm 2: the token IS held and the gate passes, but 8243 is not on
+    --     offer (Rin'wosho's other two quests are, and are never touched).
+    scene({ bags = { [Auto.ZANZA_TOKEN] = 1 }, available = { 8196, 8246 } })
+    ck((select(2, Auto.ZanzaIdleNow())) == "nothing-pickable",
+       "a held token with 8243 absent is still idle")
+    Auto.OnGossipShow()
+    ck(#CALLS.quest == 0, "8196/8246 are never auto-progressed")
+    ck(CALLS.option[1] == 771, "nothing pickable: repair takes the visit")
+
+    --     arm 3: zanza switched off entirely, token in the bags, 8243 on offer.
+    fs.autoQuest.zanza = { enabled = false, priority = { "swiftness" }, defaultsApplied = true }
+    scene({ bags = { [Auto.ZANZA_TOKEN] = 1 }, available = { Auto.ZANZA_QUEST } })
+    Auto.OnGossipShow()
+    ck(#CALLS.quest == 0, "zanza off: the turn-in is not taken")
+    ck(CALLS.option[1] == 771, "zanza off: repair takes the visit")
+    fs.autoQuest.zanza = { enabled = true, priority = { "swiftness" }, defaultsApplied = true }
+
+    fs.autoQuest          = savedAQ
+    Auto._repairArmedAt   = savedArm
+    Auto._repairCooldown  = savedCD
+    Auto._bankSnapshot    = savedBank
     for _, k in ipairs(NAMES) do _G[k] = SAVE[k] end
     if fail then return false, fail end
     return true
@@ -5274,6 +6010,13 @@ function Auto.RunSelfTests(verbose)
         { name = "gossip: sayge page maps + shape guard", fn = testSaygePageMaps },
         { name = "gossip: npc-gated live path (adversarial)", fn = testGossipLivePath },
         { name = "auto-repair honesty",  fn = testRepairHonesty },
+        { name = "rin'wosho: vendor icon 132060 (override first)",
+                                        fn = testVendorIconPick },
+        { name = "rin'wosho: durability scan (slots 1-18)", fn = testDurabilityScan },
+        { name = "rin'wosho: repair entry gate (rule per row)",
+                                        fn = testRinwoshoRepairGate },
+        { name = "rin'wosho: gossip->vendor->repair->close, live path",
+                                        fn = testRinwoshoRepairLive },
         { name = "quest title + reward", fn = testTitleAndReward },
         { name = "keyword pools disjoint", fn = testKeywordPools },
         { name = "forbidden quests",    fn = testForbiddenQuests },

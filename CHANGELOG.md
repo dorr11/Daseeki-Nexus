@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- **Added:** **Rin'wosho repairs your gear again.** Nexus has always been able to auto-repair,
+  but only on a vendor window *you* opened — walk up to Rin'wosho the Trader in Zul'Gurub,
+  hand in your Honor Token, and the repair half simply never happened, because nothing ever
+  opened his shop. It does now. On a visit where there is no turn-in waiting — no token in
+  your bags, nothing he is offering that Nexus handles, or the Zanza automation switched off —
+  and something you are wearing is damaged, Nexus picks his "browse your goods" line itself,
+  repairs everything from your own gold, tells you what it cost, and closes the shop again.
+  A turn-in always wins the visit: if you are holding a token, the token goes in and the
+  repair waits for the next time you talk to him. Holding **Shift** skips the whole thing, as
+  it always has. Nexus only ever closes a shop window it opened itself — a vendor pane *you*
+  opened is still yours to close, at Rin'wosho or anywhere else. Needs "Auto-repair" ticked
+  in Automations; it stays off until you turn it on, because it spends your gold.
+
 - **Fixed:** **visiting your mailbox no longer wipes the mail out of your inventory.**
   Nexus keeps a note of what is sitting in each character's mailbox, because the mailbox is
   only readable when you are standing at one — that note is how an item in the mail still
