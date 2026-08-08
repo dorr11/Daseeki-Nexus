@@ -1045,6 +1045,14 @@ function Options.ApplyFactionCopy(src, dst)
             ns.Store.MarkAutomationChosen(dst, flip.chosen)
         end
     end
+    -- And the seventh (owner decision 2026-08-07). Auto-repair lives in the
+    -- autoQuest clone above, so the copy has just handed the destination the
+    -- source's value — an expressed choice — and Store.MigrateRepairDefault must
+    -- never heal a copied OFF back to ON. Stamped separately because the flip
+    -- table above is the 1.1.4 wave's record and auto-repair is not in it.
+    if ns.Store and ns.Store.MarkAutomationChosen then
+        ns.Store.MarkAutomationChosen(dst, ns.Store.REPAIR_CHOSEN_KEY or "autoRepair")
+    end
     return true
 end
 
@@ -2240,7 +2248,15 @@ local function buildAutomation(flow)
     register("automation", qb:Checkbox({
         label = Options.REPAIR_LABEL,
         get = function() local fs = FS(); return fs and fs.autoQuest.autoRepair end,
-        set = function(v) local fs = FS(); if fs then fs.autoQuest.autoRepair = v and true or false end end,
+        -- THE SEVENTH `chose` STAMP (owner decision 2026-08-07). Auto-repair's
+        -- shipped default flipped OFF -> ON and Store.MigrateRepairDefault heals
+        -- an existing save that still carries the old false. It must not heal a
+        -- false the USER chose, so the click is recorded here in EITHER
+        -- direction, exactly like the six above. Same automationChosen table;
+        -- the key is Store.REPAIR_CHOSEN_KEY.
+        set = function(v) local fs = FS(); if fs then
+            fs.autoQuest.autoRepair = v and true or false
+            chose(fs, (ns.Store and ns.Store.REPAIR_CHOSEN_KEY) or "autoRepair") end end,
     }).Refresh)
     q:Hint(Options.REPAIR_HINT)
 
@@ -3058,6 +3074,23 @@ ns:RegisterSelfTest("options", function(verbose)
             if not ns.Store.AutomationChosen(dst, flip.chosen) then allChosen = false end
         end
         ck(allChosen, "copy stamps all six flipped toggles as chosen on the destination")
+    end
+    -- The SEVENTH flip (owner decision 2026-08-07): auto-repair now ships ON and
+    -- Store.MigrateRepairDefault heals an unchosen OFF. A copy is a choice about
+    -- it too, so the destination must come out stamped — otherwise a copied OFF
+    -- gets healed back ON at the next login.
+    if ns.Store and ns.Store.AutomationChosen then
+        ck(ns.Store.AutomationChosen(dst, ns.Store.REPAIR_CHOSEN_KEY or "autoRepair") == true,
+           "copy stamps auto-repair as chosen on the destination")
+        -- ...and a copied OFF really does survive the heal, end to end.
+        local offSrc = { autoQuest = { autoRepair = false, zanza = { priority = {} } } }
+        local offDst = { autoQuest = { autoRepair = true,  zanza = { priority = {} } } }
+        Options.ApplyFactionCopy(offSrc, offDst)
+        ck(offDst.autoQuest.autoRepair == false, "copying an OFF auto-repair copies the OFF")
+        local healDB = { factionSettings = { Alliance = offDst, Horde = offDst } }
+        ns.Store.MigrateRepairDefault(healDB)
+        ck(offDst.autoQuest.autoRepair == false,
+           "a COPIED auto-repair OFF is not healed back on")
     end
 
     -- Deep copy, not aliasing: editing the source afterwards must not move the

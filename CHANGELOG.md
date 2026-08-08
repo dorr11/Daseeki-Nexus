@@ -13,7 +13,16 @@
   repair waits for the next time you talk to him. Holding **Shift** skips the whole thing, as
   it always has. Nexus only ever closes a shop window it opened itself — a vendor pane *you*
   opened is still yours to close, at Rin'wosho or anywhere else. Needs "Auto-repair" ticked
-  in Automations; it stays off until you turn it on, because it spends your gold.
+  in Automations — see the next entry, it now starts ticked.
+
+- **Changed:** **auto-repair now ships on — untick it if you'd rather pay attention to your
+  own durability.** "Auto-repair at vendors" used to start switched off, because it spends
+  your gold and that felt like something to opt into. It now starts on, so opening any
+  vendor's window repairs your gear from your own purse and prints what it cost. If you had
+  never touched that checkbox, it switches itself on once when you next log in; if you had
+  ever ticked or unticked it yourself, your setting is left exactly as you left it and
+  nothing changes. Holding **Shift** still skips it, and unticking it in Automations is
+  final — Nexus will not turn it back on a second time.
 
 - **Fixed:** **visiting your mailbox no longer wipes the mail out of your inventory.**
   Nexus keeps a note of what is sitting in each character's mailbox, because the mailbox is
