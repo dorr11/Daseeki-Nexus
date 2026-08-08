@@ -1238,16 +1238,61 @@ end
 ----------------------------------------------------------------------
 
 -- Identity + level + faction. Class token is the non-localized filename.
+--
+-- ── THE IDENTITY WIPE (honesty audit NX-1, Class 4) ──────────────────────────
+--
+-- This function used to write all four fields UNCONDITIONALLY, and it is the
+-- FIRST thing Tracker.Capture runs — including the capture that
+-- PLAYER_LEAVING_WORLD and PLAYER_LOGOUT fire SYNCHRONOUSLY and FORCED as the
+-- session's last act. That is the identical window captureXP (immediately below)
+-- carries a forty-line comment about, and the wipe here is the same wipe with
+-- different fields:
+--
+--   * cold UnitLevel answers 0. `or 0` cannot help — 0 is truthy, and 0 is what
+--     got written. A level of 0 does not exist in the game.
+--   * cold UnitClass answers nil, so className/classTag were nil'd — the peer
+--     row loses its class colour AND every class-gated capture below
+--     (captureShards, captureSoulstone) then reads rec.classTag as nil.
+--   * cold UnitFactionGroup takes the else branch, which NIL'D A STORED FACTION.
+--     Absence of an answer is not an answer that the character has no faction.
+--
+-- WriteSelfCharacter persists that record, ShouldPush sees a changed hash and
+-- force-pushes it, and every peer's WriteInboundCharacter is a documented
+-- REPLACE — so the whole mesh's row for you becomes a class-colourless
+-- "Level 0" with no faction, and that is what SavedVariables holds at next login.
+--
+-- TWO RULES, matching captureXP:
+--   1. TEARDOWN — do not write at all. The record keeps the last known-good
+--      identity, which is exactly what the logout flush exists to preserve.
+--   2. PROVE, THEN WRITE — every field individually. A level of 0, a nil/empty
+--      class token and a faction that is neither Alliance nor Horde are all
+--      "the API did not answer", never "the answer is nothing". Each one freezes
+--      its own field and leaves the other three alone.
+--
+-- Rule 2 is what covers the windows the teardown latch does not: the first
+-- frames of a fresh login, and any capture racing a loading screen.
 local function captureIdentity(rec)
-    rec.level = UnitLevel("player") or 0
-    local className, classTag = UnitClass("player")
-    rec.className = className
-    rec.classTag  = classTag
-    local eng = UnitFactionGroup("player")
+    -- Rule 1: teardown freeze (A17.2 latch, the same gate captureXP uses).
+    if Tracker.IsTeardown() then return end
+
+    -- Rule 2, level: 0 is a cold read, never a character.
+    local level = UnitLevel and tonumber(UnitLevel("player"))
+    if level and level > 0 then rec.level = level end
+
+    -- Rule 2, class: the token is the identity. Never store nil over a known one.
+    if UnitClass then
+        local className, classTag = UnitClass("player")
+        if classTag and classTag ~= "" then
+            rec.classTag = classTag
+            if className and className ~= "" then rec.className = className end
+        end
+    end
+
+    -- Rule 2, faction: only a positive Alliance/Horde answer writes. Anything
+    -- else (nil, "", "Neutral", a cold read) leaves the stored faction standing.
+    local eng = UnitFactionGroup and UnitFactionGroup("player")
     if eng == "Alliance" or eng == "Horde" then
         rec.faction = eng
-    else
-        rec.faction = nil
     end
 end
 
@@ -1313,17 +1358,59 @@ local function captureXP(rec)
 end
 
 -- Resting / PvP / instance flags.
+--
+-- ── THE PVP COUNTDOWN WIPE (honesty audit NX-4, Class 4) ─────────────────────
+--
+-- IsResting / UnitIsPVP / IsInInstance all answer FALSY during teardown and
+-- inside the post-loading-screen window, and this function had no gate at all.
+-- Two of the three writes are transient and self-correct on the next warm
+-- capture. `pvpExpiry` does not: it is filled from PLAYER_FLAGS_CHANGED timing
+-- (and from an SN import, import.lua:325) and CANNOT be recomputed from any
+-- later read. `if not rec.pvpFlagged then rec.pvpExpiry = 0 end` therefore
+-- destroyed it permanently — a flagged player zones, the cold UnitIsPVP reads
+-- false, the countdown is zeroed, and the next warm capture restores
+-- pvpFlagged = true with nothing left to count down to.
+--
+-- THREE RULES:
+--   1. TEARDOWN — write nothing. The flags the record holds are the last honest
+--      ones and there is no warm source to improve on them.
+--   2. A FALSY PVP READ IS ONLY EVIDENCE IN A WARM FRAME. Inside
+--      ENTERING_WORLD_GRACE, `false` is what the API says about a flagged player
+--      too, so BOTH pvpFlagged and pvpExpiry freeze. Freezing pvpFlagged as well
+--      as the expiry is load-bearing: rule 3 reads the stored flag to detect the
+--      transition, so letting a cold `false` land there would erase the very
+--      evidence the countdown's retirement depends on.
+--   3. THE COUNTDOWN RETIRES ON A TRANSITION, not on a state. Only a warm frame
+--      that watches pvpFlagged go true -> false zeroes pvpExpiry.
+--
+-- isResting / inInstance keep writing outside teardown: they are recomputed from
+-- scratch every capture, so a transient wrong answer costs one frame and nothing
+-- is destroyed. (`UnitIsPVP("player") or UnitIsPVPFreeForAll("player")` is sound
+-- as written — UnitIsPVP returns `false`, which is falsy, so the FFA fallback is
+-- genuinely reached. This is not a Class 5 truthy-zero site.)
 local function captureFlags(rec)
-    rec.isResting = IsResting() and true or false
+    -- Rule 1: teardown freeze.
+    if Tracker.IsTeardown() then return end
 
-    local pvp = UnitIsPVP("player") or UnitIsPVPFreeForAll("player")
-    rec.pvpFlagged = pvp and true or false
-    -- WoW does not expose the flag's drop time directly; the mesh layer
-    -- fills pvpExpiry from PLAYER_FLAGS_CHANGED timing in a later wave.
-    if not rec.pvpFlagged then rec.pvpExpiry = 0 end
+    rec.isResting  = IsResting() and true or false
+    rec.inInstance = IsInInstance() and true or false
 
-    local inInstance = IsInInstance()
-    rec.inInstance = inInstance and true or false
+    local pvp = (UnitIsPVP("player") or UnitIsPVPFreeForAll("player")) and true or false
+    if pvp then
+        -- Positive evidence, always believed. WoW does not expose the flag's
+        -- drop time directly; the mesh layer fills pvpExpiry from
+        -- PLAYER_FLAGS_CHANGED timing.
+        rec.pvpFlagged = true
+        return
+    end
+
+    -- Rule 2: a falsy read inside the entering-world grace proves nothing.
+    if Tracker.InEnteringWorldGrace() then return end
+
+    -- Rule 3: warm frame. The stored flag is the "before" side of the transition.
+    local was = rec.pvpFlagged and true or false
+    rec.pvpFlagged = false
+    if was then rec.pvpExpiry = 0 end
 end
 
 -- Zone / location: coordinate overrides first, then the game's zone text.
@@ -1434,42 +1521,114 @@ function Tracker.ResolveCoordinateOverride()
 end
 
 -- Warlock soul-shard count (bag item count).
+--
+-- ── THE SHARD ZERO (honesty audit NX-3, Class 4) ─────────────────────────────
+--
+-- `rec.shardCount = C_Item.GetItemCount(...) or 0` with no gate. The `or 0` was
+-- never the defect — GetItemCount returns 0, not nil, when the bag API is cold —
+-- the defect is that the observed zero was STORED and SENT. A warlock holding 24
+-- shards logs out, the teardown read answers 0, protocol.lua encodes it and
+-- ui_cards.lua renders "0" in red on every peer's card. And unlike
+-- soulstoneReady, ZERO SHARDS IS A LEGITIMATE STATE, so nothing downstream can
+-- tell the lie from the truth. The only place it can be caught is here.
+--
+-- The gate is the one captureBoonItems already carries for the identical
+-- question (a chronoboon count out of the same bag API): teardown OR
+-- COOLDOWN_GRACE => keep the last honest count, exactly as captureXP's Rule 2
+-- freezes a cold xpMax. Note this is a COUNT, not item metadata, so the
+-- IsItemDataCachedByID warmth proof that ClassifyBoonRead consults for tooltips
+-- does not apply — the boon COUNT sibling does not consult it either, and the
+-- declared-cold windows are the proof we have.
+--
+-- The class check is now also prove-then-write: a nil classTag means identity
+-- has not been captured yet (a fresh record mid-loading-screen), not that this
+-- character is a non-warlock with zero shards.
 local function captureShards(rec)
-    if rec.classTag == "WARLOCK" and C_Item and C_Item.GetItemCount then
-        rec.shardCount = C_Item.GetItemCount(ITEM_SOUL_SHARD) or 0
-    else
-        rec.shardCount = 0
+    if Tracker.IsTeardown() or Tracker.InEnteringWorldGrace(COOLDOWN_GRACE) then
+        return   -- cold API: keep the last honest count
     end
+
+    local tag = rec.classTag
+    if not tag or tag == "" then return end     -- class unknown: judge nothing
+    if tag ~= "WARLOCK" then
+        rec.shardCount = 0                      -- a real fact about a non-warlock
+        return
+    end
+
+    if not (C_Item and C_Item.GetItemCount) then return end
+    local n = tonumber(C_Item.GetItemCount(ITEM_SOUL_SHARD))
+    if not n then return end                    -- no answer is not an answer of 0
+    rec.shardCount = n
 end
 
 -- Warlock soulstone availability (item 6): a created soulstone item is in bags,
 -- OR the Create Soulstone spell is off cooldown (so one can be made now).
+--
+-- ── "NO SOULSTONE" FROM A COLD CLIENT (honesty audit NX-2, Class 4) ──────────
+--
+-- The function opened `rec.soulstoneReady = false` and then looked for reasons
+-- to say true — CLEAR-THEN-PROVE, with no gate, sitting between captureCooldowns
+-- and captureBoonItems which BOTH gate on IsTeardown() or
+-- InEnteringWorldGrace(COOLDOWN_GRACE). Both of its sources go dark in exactly
+-- those windows: C_Item.GetItemCount answers 0 for items that are really there,
+-- and C_Spell.GetSpellCooldown answers nil rather than a table. So a warlock
+-- with a soulstone in bags logs out, `false` latches, is persisted, and is
+-- broadcast (protocol.lua:370) — the raid leader's dashboard shows "no
+-- soulstone" for a lock who has one. The forced 1.0s post-PLAYER_ENTERING_WORLD
+-- capture reproduces it on the way IN as well.
+--
+-- Now PROVE-THEN-WRITE. `false` is only stored when a source actually ANSWERED
+-- and its answer was negative; a read where nothing answered freezes whatever
+-- the record holds. "Answered" for the spell source means it handed back a table
+-- — a nil return is the cold shape, not an off-cooldown shape.
 local function captureSoulstone(rec)
-    rec.soulstoneReady = false
-    if rec.classTag ~= "WARLOCK" then return end
+    if Tracker.IsTeardown() or Tracker.InEnteringWorldGrace(COOLDOWN_GRACE) then
+        return   -- cold item + spell APIs: keep the last honest answer
+    end
+
+    local tag = rec.classTag
+    if not tag or tag == "" then return end     -- class unknown: judge nothing
+    if tag ~= "WARLOCK" then
+        rec.soulstoneReady = false              -- a real fact about a non-warlock
+        return
+    end
+
+    local answered = false
+
     -- 1) A soulstone reagent already sitting in bags.
     if C_Item and C_Item.GetItemCount then
         for i = 1, #SOULSTONE_ITEMS do
-            if (C_Item.GetItemCount(SOULSTONE_ITEMS[i]) or 0) > 0 then
-                rec.soulstoneReady = true
-                return
+            local n = tonumber(C_Item.GetItemCount(SOULSTONE_ITEMS[i]))
+            if n then
+                answered = true
+                if n > 0 then
+                    rec.soulstoneReady = true
+                    return
+                end
             end
         end
     end
+
     -- 2) Create Soulstone spell off cooldown (C_Spell in 11509).
     if C_Spell and C_Spell.GetSpellCooldown then
         local cd = C_Spell.GetSpellCooldown(SPELL_CREATE_SOULSTONE)
         if type(cd) == "table" then
+            answered = true
             -- Ready when there is no active cooldown (duration 0 or elapsed).
             local dur = cd.duration or 0
             local start = cd.startTime or 0
             if dur <= 1.6 then                      -- <=GCD => effectively ready
                 rec.soulstoneReady = true
+                return
             elseif start > 0 and (start + dur) - GetTime() <= 0 then
                 rec.soulstoneReady = true
+                return
             end
         end
     end
+
+    -- Negative, but only if something actually answered. Otherwise freeze.
+    if answered then rec.soulstoneReady = false end
 end
 
 -- A9.1 — the bag API reduced to a START EPOCH, with the spec §6 sanity gates.
@@ -2086,6 +2245,9 @@ Tracker._captureCooldowns = captureCooldowns
 Tracker._captureDMF       = captureDMF
 Tracker._captureBoonItems = captureBoonItems
 Tracker._captureSoulstone = captureSoulstone
+Tracker._captureIdentity  = captureIdentity
+Tracker._captureFlags     = captureFlags
+Tracker._captureShards    = captureShards
 
 ----------------------------------------------------------------------
 -- RAID LOCKOUTS — THE CAPTURE AND ITS PRODUCER  (async lesson Class 7 + 6)
@@ -5233,6 +5395,470 @@ local function testXPCapture(fails)
     if not ok then fails[#fails + 1] = "error in xp-capture fixtures: " .. tostring(err) end
 end
 
+----------------------------------------------------------------------
+-- CAPTURE HONESTY GATES — the four ungated halves (NX-1..NX-4, Class 4)
+--
+-- Tracker.Capture runs twelve capture pieces back to back. Eight of them opened
+-- with a proof gate and four did not: captureIdentity (NX-1), captureFlags
+-- (NX-4), captureShards (NX-3) and captureSoulstone (NX-2). They sit BETWEEN
+-- hardened siblings in this very file, and captureXP — the function immediately
+-- after the worst of them — carries a forty-line comment describing this exact
+-- hazard, applied to its own three fields only.
+--
+-- It is one mechanism, so it takes one fixture: a FORCED TEARDOWN CAPTURE OVER A
+-- COLD CLIENT MUST PRESERVE EVERY PREVIOUSLY-STORED VALUE AND BROADCAST NOTHING
+-- COLDER THAN WHAT WAS HELD. That is the whole contract, and it is asserted
+-- through the real Tracker.Capture — not the helpers in isolation — because the
+-- defect was never in any helper's arithmetic. It was that the session's LAST
+-- write, fired synchronously and FORCED from PLAYER_LEAVING_WORLD and
+-- PLAYER_LOGOUT, is the write SavedVariables keeps and the mesh publishes.
+--
+-- Four RED CONTROLS carry the pre-fix bodies verbatim and are asserted to
+-- reproduce their own wipe against the identical cold world. Without them a
+-- green row here would be asserting nothing: the audit's own instruction was to
+-- land the fixture first and confirm the suite passed WHILE THE DATA WAS WRONG.
+--
+-- Dark-read discipline, both directions:
+--   * a cold read never overwrites warm stored state (the freeze), and
+--   * a PROVEN read still updates — including deleting. A warlock who genuinely
+--     spends every shard writes 0; a flag that genuinely drops retires its
+--     countdown. A gate that could not do this would be a different lie.
+----------------------------------------------------------------------
+local function testCaptureHonestyGates(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+
+    local saved = {
+        auras = _G.C_UnitAuras, cont = _G.C_Container, item = _G.C_Item,
+        spell = _G.C_Spell, map = _G.C_Map, getTime = _G.GetTime,
+        level = _G.UnitLevel, class = _G.UnitClass, faction = _G.UnitFactionGroup,
+        resting = _G.IsResting, pvp = _G.UnitIsPVP, ffa = _G.UnitIsPVPFreeForAll,
+        inInst = _G.IsInInstance, savedInst = _G.GetNumSavedInstances,
+        xp = _G.UnitXP, xpMax = _G.UnitXPMax, exhaust = _G.GetXPExhaustion,
+        sub = _G.GetSubZoneText, mini = _G.GetMinimapZoneText,
+        now = ns.Store.Now, settings = ns.Store.GetSettings,
+        ensure = ns.Store.EnsureSelfCharacter, write = ns.Store.WriteSelfCharacter,
+        loggedIn = ns.state.loggedIn,
+    }
+    local savedLatch = {
+        Tracker._leavingWorld, Tracker._loggingOut, Tracker._enteredWorldAt,
+        Tracker._auraCapturedAt, Tracker._cdCapturedAt,
+        Tracker._lastPushHash, Tracker._lastPushAt,
+        Tracker._boonCountSeeded, Tracker._lastBoonCount,
+    }
+
+    local frameNow, epochNow = 40000, 1700000000
+    _G.GetTime   = function() return frameNow end
+    ns.Store.Now = function() return epochNow end
+    ns.state.loggedIn = true
+
+    -- ── the world, one dial per client answer ─────────────────────────────────
+    local W = {
+        level = 41, className = "Warlock", classTag = "WARLOCK", faction = "Horde",
+        resting = true, pvp = true, inInstance = false,
+        shards = 24,        -- soul shards in bags
+        stones = 1,         -- soulstone reagents in bags
+        spellCD = nil,      -- nil = the spell API did not answer at all
+        itemAPI = true,     -- false = this client has no C_Item.GetItemCount
+    }
+    -- Every one of these answers is exactly what the live client hands back in
+    -- the teardown / loading-screen window: 0 for a level, nil for a class, nil
+    -- for a faction, false for every flag, 0 for every bag count.
+    local function goCold()
+        W.level, W.className, W.classTag, W.faction = 0, nil, nil, nil
+        W.resting, W.pvp, W.inInstance = false, false, false
+        W.shards, W.stones, W.spellCD = 0, 0, nil
+    end
+    local function goWarm()
+        W.level, W.className, W.classTag, W.faction = 41, "Warlock", "WARLOCK", "Horde"
+        W.resting, W.pvp, W.inInstance = true, true, false
+        W.shards, W.stones, W.spellCD = 24, 1, nil
+    end
+
+    local SOULSTONE_SET = {}
+    for i = 1, #SOULSTONE_ITEMS do SOULSTONE_SET[SOULSTONE_ITEMS[i]] = true end
+
+    _G.UnitLevel         = function() return W.level end
+    _G.UnitClass         = function() return W.className, W.classTag end
+    _G.UnitFactionGroup  = function() return W.faction end
+    _G.IsResting         = function() return W.resting end
+    _G.UnitIsPVP         = function() return W.pvp end
+    _G.UnitIsPVPFreeForAll = function() return false end
+    _G.IsInInstance      = function() return W.inInstance, "none" end
+    _G.GetNumSavedInstances = function() return 0 end
+    _G.UnitXP        = function() return 50000 end
+    _G.UnitXPMax     = function() return 155000 end
+    _G.GetXPExhaustion = function() return 0 end
+    _G.C_UnitAuras = { GetBuffDataByIndex = function() return nil end }
+    _G.C_Container = { GetItemCooldown = function() return 0, 0, 1 end }
+    _G.C_Map  = { GetBestMapForUnit = function() return nil end,
+                  GetPlayerMapPosition = function() return nil end }
+    _G.GetSubZoneText     = function() return "" end
+    _G.GetMinimapZoneText = function() return "" end
+    ns.Store.GetSettings = function() return { coordinateOverrides = {} } end
+
+    -- W.itemAPI: true = a normal client; false = no C_Item at all;
+    -- "silent" = the API exists but answers nil, which is a DIFFERENT refusal
+    -- from answering 0 and must be treated as "no answer", never as "none".
+    local function installItemAPI()
+        if W.itemAPI == false then _G.C_Item = nil return end
+        if W.itemAPI == "silent" then
+            _G.C_Item = { GetItemCount = function() return nil end }
+            return
+        end
+        _G.C_Item = { GetItemCount = function(id)
+            if id == ITEM_SOUL_SHARD then return W.shards end
+            if SOULSTONE_SET[id] then return W.stones end
+            return 0
+        end }
+    end
+    _G.C_Spell = { GetSpellCooldown = function() return W.spellCD end }
+    installItemAPI()
+
+    -- The real record shape, one durable table across captures, exactly as the
+    -- game holds it between the session's captures.
+    local rec = ns.Store.NewCharacterRecord("Tester-TestRealm")
+    ns.Store.EnsureSelfCharacter = function() return rec end
+    ns.Store.WriteSelfCharacter  = function() end
+
+    -- What actually crossed the wire. ns has no unsubscribe, so the closure is
+    -- gated by `watching` and goes inert the moment this suite finishes.
+    local sent, watching = nil, true
+    ns:On("STATE_CHANGED", function(_, pushed)
+        if not watching then return end
+        sent = {
+            level = pushed.level, className = pushed.className,
+            classTag = pushed.classTag, faction = pushed.faction,
+            pvpFlagged = pushed.pvpFlagged, pvpExpiry = pushed.pvpExpiry,
+            shardCount = pushed.shardCount, soulstoneReady = pushed.soulstoneReady,
+        }
+    end)
+
+    -- The identity a cold capture must never be able to reach.
+    local EXPIRY = 1785000300
+    local function identityHeld(where)
+        ck(rec.level == 41, where .. ": level must stay 41 (got " .. tostring(rec.level) .. ")")
+        ck(rec.classTag == "WARLOCK", where .. ": classTag must stay WARLOCK (got " .. tostring(rec.classTag) .. ")")
+        ck(rec.className == "Warlock", where .. ": className must stay Warlock (got " .. tostring(rec.className) .. ")")
+        ck(rec.faction == "Horde", where .. ": faction must stay Horde (got " .. tostring(rec.faction) .. ")")
+        ck(rec.pvpFlagged == true, where .. ": pvpFlagged must stay true")
+        ck(rec.pvpExpiry == EXPIRY, where .. ": the pvp countdown must survive (got " .. tostring(rec.pvpExpiry) .. ")")
+        ck(rec.shardCount == 24, where .. ": shardCount must stay 24 (got " .. tostring(rec.shardCount) .. ")")
+        ck(rec.soulstoneReady == true, where .. ": soulstoneReady must stay true")
+    end
+
+    -- ── the pre-fix bodies, verbatim as they shipped in 1.1.5 ────────────────
+    local PRE = {}
+    function PRE.identity(r)
+        r.level = UnitLevel("player") or 0
+        local className, classTag = UnitClass("player")
+        r.className = className
+        r.classTag  = classTag
+        local eng = UnitFactionGroup("player")
+        if eng == "Alliance" or eng == "Horde" then r.faction = eng else r.faction = nil end
+    end
+    function PRE.flags(r)
+        r.isResting = IsResting() and true or false
+        local pvp = UnitIsPVP("player") or UnitIsPVPFreeForAll("player")
+        r.pvpFlagged = pvp and true or false
+        if not r.pvpFlagged then r.pvpExpiry = 0 end
+        r.inInstance = IsInInstance() and true or false
+    end
+    function PRE.shards(r)
+        if r.classTag == "WARLOCK" and C_Item and C_Item.GetItemCount then
+            r.shardCount = C_Item.GetItemCount(ITEM_SOUL_SHARD) or 0
+        else
+            r.shardCount = 0
+        end
+    end
+    function PRE.soulstone(r)
+        r.soulstoneReady = false
+        if r.classTag ~= "WARLOCK" then return end
+        if C_Item and C_Item.GetItemCount then
+            for i = 1, #SOULSTONE_ITEMS do
+                if (C_Item.GetItemCount(SOULSTONE_ITEMS[i]) or 0) > 0 then
+                    r.soulstoneReady = true
+                    return
+                end
+            end
+        end
+        if C_Spell and C_Spell.GetSpellCooldown then
+            local cd = C_Spell.GetSpellCooldown(SPELL_CREATE_SOULSTONE)
+            if type(cd) == "table" then
+                local dur, start = cd.duration or 0, cd.startTime or 0
+                if dur <= 1.6 then r.soulstoneReady = true
+                elseif start > 0 and (start + dur) - GetTime() <= 0 then r.soulstoneReady = true end
+            end
+        end
+    end
+    -- A warm record to hand each red control, so what it destroys is visible.
+    local function warmRec()
+        return { level = 41, className = "Warlock", classTag = "WARLOCK", faction = "Horde",
+                 isResting = true, inInstance = false,
+                 pvpFlagged = true, pvpExpiry = EXPIRY,
+                 shardCount = 24, soulstoneReady = true }
+    end
+
+    local ok, err = pcall(function()
+        Tracker._leavingWorld, Tracker._loggingOut = false, false
+        Tracker._enteredWorldAt = frameNow - 60          -- long settled, fully warm
+        Tracker._auraCapturedAt, Tracker._cdCapturedAt = nil, nil
+        Tracker._lastPushHash, Tracker._lastPushAt = nil, 0
+        Tracker._boonCountSeeded, Tracker._lastBoonCount = true, 0
+
+        ------------------------------------------------------------------
+        -- A) A warm capture WRITES all four halves. Without this row the
+        --    freeze below could be satisfied by a function that never writes.
+        ------------------------------------------------------------------
+        Tracker.Capture()
+        ck(rec.level == 41, "warm capture writes level (got " .. tostring(rec.level) .. ")")
+        ck(rec.classTag == "WARLOCK" and rec.className == "Warlock", "warm capture writes the class")
+        ck(rec.faction == "Horde", "warm capture writes the faction")
+        ck(rec.isResting == true, "warm capture writes isResting")
+        ck(rec.pvpFlagged == true, "warm capture writes pvpFlagged")
+        ck(rec.shardCount == 24, "warm capture writes shardCount (got " .. tostring(rec.shardCount) .. ")")
+        ck(rec.soulstoneReady == true, "warm capture writes soulstoneReady")
+
+        -- The mesh layer fills the countdown from PLAYER_FLAGS_CHANGED timing.
+        rec.pvpExpiry = EXPIRY
+
+        ------------------------------------------------------------------
+        -- B) THE FIXTURE. PLAYER_LEAVING_WORLD fires Tracker.Capture(true)
+        --    synchronously against a client that has already gone cold.
+        ------------------------------------------------------------------
+        goCold()
+        sent = nil
+        Tracker._leavingWorld = true
+        Tracker.Capture(true)
+        identityHeld("leaving-world teardown")
+        -- ...and nothing colder than what was held reached the wire.
+        ck(sent ~= nil, "the forced teardown capture must still push")
+        if sent then
+            ck(sent.level == 41 and sent.classTag == "WARLOCK" and sent.className == "Warlock"
+               and sent.faction == "Horde",
+               "the teardown broadcast carried a cold identity (level " .. tostring(sent.level)
+               .. " / " .. tostring(sent.classTag) .. " / " .. tostring(sent.faction) .. ")")
+            ck(sent.shardCount == 24 and sent.soulstoneReady == true and sent.pvpExpiry == EXPIRY,
+               "the teardown broadcast carried cold warlock/pvp state (shards "
+               .. tostring(sent.shardCount) .. ", stone " .. tostring(sent.soulstoneReady)
+               .. ", expiry " .. tostring(sent.pvpExpiry) .. ")")
+        end
+
+        ------------------------------------------------------------------
+        -- C) PLAYER_LOGOUT, the terminal latch — the session's final write and
+        --    the one SavedVariables keeps until next login.
+        ------------------------------------------------------------------
+        Tracker._leavingWorld = false
+        Tracker._loggingOut = true
+        Tracker.Capture(true)
+        identityHeld("logout teardown")
+
+        ------------------------------------------------------------------
+        -- C2) TEARDOWN GARBAGE, still under the logout latch. The A17.2
+        --     header's word for a teardown read is "nothing OR garbage", and
+        --     prove-then-write can only refuse the "nothing" half — a plausible
+        --     WRONG answer walks straight past every proof rule. These values
+        --     are therefore what isolates the TEARDOWN gate from the proof
+        --     rules, one mutant per rule, exactly as testXPCapture's goGarbage
+        --     isolates the same two rules for XP. A level 1 Alliance mage
+        --     holding 3 shards is the shape of a teardown read that "answers".
+        ------------------------------------------------------------------
+        W.level, W.className, W.classTag, W.faction = 1, "Mage", "MAGE", "Alliance"
+        W.shards, W.stones = 3, 0
+        W.spellCD = { duration = 1800, startTime = frameNow - 10 }  -- answers "not ready"
+        W.pvp, W.resting = false, false
+        Tracker.Capture(true)
+        identityHeld("logout teardown, garbage reads")
+
+        ------------------------------------------------------------------
+        -- D) The window the teardown latch does NOT cover: the forced 1.0s
+        --    capture after PLAYER_ENTERING_WORLD. Same cold answers, no latch.
+        ------------------------------------------------------------------
+        goCold()
+        Tracker._loggingOut = false
+        Tracker._enteredWorldAt = frameNow           -- grace wide open
+        Tracker.Capture(true)
+        identityHeld("entering-world grace")
+
+        ------------------------------------------------------------------
+        -- E) Grace CLOSED, but the unit APIs are still cold. This isolates
+        --    captureIdentity's prove-then-write rule from any window gate:
+        --    identity has no grace gate and must survive on proof alone.
+        --    The bag APIs and the pvp flag go warm here, so those halves update
+        --    for real — which is also the proof the four are independently
+        --    gated rather than sharing one blanket window.
+        ------------------------------------------------------------------
+        frameNow = frameNow + 10
+        W.shards, W.stones, W.pvp = 24, 1, true
+        Tracker.Capture()
+        ck(rec.level == 41, "a cold level 0 outside every window must not land (got " .. tostring(rec.level) .. ")")
+        ck(rec.classTag == "WARLOCK", "a cold nil classTag must not land")
+        ck(rec.className == "Warlock", "a cold nil className must not land")
+        ck(rec.faction == "Horde", "a cold nil faction must not land")
+        ck(rec.pvpExpiry == EXPIRY,
+           "the flag is still up, so nothing may retire the countdown (got "
+           .. tostring(rec.pvpExpiry) .. ")")
+        ck(rec.shardCount == 24, "the warm bag read updates shards normally")
+        ck(rec.soulstoneReady == true, "the warm bag read updates the soulstone normally")
+
+        ------------------------------------------------------------------
+        -- F) A client that CANNOT ANSWER must not be able to delete data
+        --    (the house rule ClassifyBoonRead row 5 states). No C_Item at all
+        --    and a spell API that returns nil: everything is warm, nothing
+        --    answered, so soulstoneReady and shardCount both freeze.
+        ------------------------------------------------------------------
+        W.itemAPI, W.spellCD = false, nil
+        installItemAPI()
+        Tracker.Capture()
+        ck(rec.shardCount == 24, "no C_Item at all must freeze shardCount, not zero it")
+        ck(rec.soulstoneReady == true, "no source answered: soulstoneReady must freeze, not latch false")
+
+        --    ...and the sharper version: the API EXISTS and answers nil. That is
+        --    a refusal, not a count of none — `or 0` would launder it into a
+        --    stored, broadcast zero that nothing downstream can tell from a
+        --    warlock who really has no shards.
+        W.itemAPI = "silent"
+        installItemAPI()
+        Tracker.Capture()
+        ck(rec.shardCount == 24,
+           "a GetItemCount that answers nil must freeze the count, not store 0 (got "
+           .. tostring(rec.shardCount) .. ")")
+        ck(rec.soulstoneReady == true, "a nil GetItemCount is not a negative soulstone answer")
+
+        W.itemAPI = true
+        installItemAPI()
+
+        ------------------------------------------------------------------
+        -- F2) THE CLASS IS PART OF THE PROOF. Both warlock halves branch on
+        --     rec.classTag, and both used to treat a nil token as "not a
+        --     warlock" — which is how a stripped build with no UnitClass, or a
+        --     record adopted before identity was ever captured, ends up
+        --     asserting that a warlock has no shards and no soulstone. An
+        --     unknown class is not a negative answer about the class; judge
+        --     nothing and keep what is stored. (Driven through the seams so the
+        --     unknown-class record is the only variable.)
+        ------------------------------------------------------------------
+        local unknown = warmRec()
+        unknown.classTag, unknown.className = nil, nil
+        Tracker._captureShards(unknown)
+        ck(unknown.shardCount == 24,
+           "an unknown class was read as 'not a warlock, therefore 0 shards' (got "
+           .. tostring(unknown.shardCount) .. ")")
+        Tracker._captureSoulstone(unknown)
+        ck(unknown.soulstoneReady == true,
+           "an unknown class was read as 'not a warlock, therefore no soulstone'")
+
+        ------------------------------------------------------------------
+        -- G) THE FREEZE IS NOT A ONE-WAY STICK. A proven warm read still
+        --    updates, and still DELETES: the warlock spends every shard and
+        --    lets the stone lapse, and the pvp flag genuinely drops.
+        ------------------------------------------------------------------
+        goWarm()
+        W.level  = 42                                   -- a real ding
+        W.shards, W.stones = 0, 0                       -- genuinely spent
+        W.spellCD = { duration = 1800, startTime = frameNow - 10 }  -- answered: on cooldown
+        W.pvp, W.resting = false, false                 -- the flag genuinely drops
+        Tracker.Capture()
+        ck(rec.level == 42, "a proven level-up still writes (got " .. tostring(rec.level) .. ")")
+        ck(rec.shardCount == 0, "a proven warm zero still writes (got " .. tostring(rec.shardCount) .. ")")
+        ck(rec.soulstoneReady == false, "an answered negative still writes")
+        ck(rec.isResting == false, "a proven resting change still writes")
+        ck(rec.pvpFlagged == false, "a proven unflag still writes")
+        ck(rec.pvpExpiry == 0,
+           "a true->false transition in a warm frame must retire the countdown (got "
+           .. tostring(rec.pvpExpiry) .. ")")
+
+        ------------------------------------------------------------------
+        -- G2) ...but it retires on the TRANSITION, not on the state. An SN
+        --     import (import.lua:325) writes pvpExpiry from the foreign
+        --     snapshot's pvpExpireAtEpoch while writing pvpFlagged from a
+        --     separate field, so an imported countdown can legitimately sit on
+        --     an unflagged record. Every steady-state capture after that is a
+        --     warm frame reading false — none of them WATCHED a flag drop, so
+        --     none of them may retire the countdown they never saw start.
+        ------------------------------------------------------------------
+        rec.pvpExpiry = EXPIRY                       -- as the SN import wrote it
+        Tracker.Capture()
+        ck(rec.pvpFlagged == false, "the character is still unflagged")
+        ck(rec.pvpExpiry == EXPIRY,
+           "an ordinary unflagged capture retired an imported countdown it never saw start (got "
+           .. tostring(rec.pvpExpiry) .. ")")
+
+        ------------------------------------------------------------------
+        -- H) RED CONTROLS. Each pre-fix body, verbatim, against the same cold
+        --    teardown world, must reproduce its own wipe. If a control ever
+        --    stops failing, the row above it has stopped asserting anything.
+        ------------------------------------------------------------------
+        goCold()
+        Tracker._leavingWorld = true
+
+        local r1 = warmRec(); PRE.identity(r1)
+        ck(r1.level == 0 and r1.classTag == nil and r1.className == nil and r1.faction == nil,
+           "RED CONTROL FAILED (NX-1): the pre-fix captureIdentity did not wipe level/class/faction, "
+           .. "so the teardown rows are asserting nothing")
+        local g1 = warmRec(); Tracker._captureIdentity(g1)
+        ck(g1.level == 41 and g1.classTag == "WARLOCK" and g1.className == "Warlock"
+           and g1.faction == "Horde", "GREEN (NX-1): captureIdentity wrote through a cold teardown")
+
+        local r2 = warmRec(); PRE.flags(r2)
+        ck(r2.pvpExpiry == 0,
+           "RED CONTROL FAILED (NX-4): the pre-fix captureFlags did not destroy pvpExpiry")
+        local g2 = warmRec(); Tracker._captureFlags(g2)
+        ck(g2.pvpExpiry == EXPIRY and g2.pvpFlagged == true,
+           "GREEN (NX-4): captureFlags wrote through a cold teardown")
+
+        local r3 = warmRec(); PRE.shards(r3)
+        ck(r3.shardCount == 0,
+           "RED CONTROL FAILED (NX-3): the pre-fix captureShards did not store the cold zero")
+        local g3 = warmRec(); Tracker._captureShards(g3)
+        ck(g3.shardCount == 24, "GREEN (NX-3): captureShards wrote a cold zero over 24 shards")
+
+        local r4 = warmRec(); PRE.soulstone(r4)
+        ck(r4.soulstoneReady == false,
+           "RED CONTROL FAILED (NX-2): the pre-fix captureSoulstone did not latch false")
+        local g4 = warmRec(); Tracker._captureSoulstone(g4)
+        ck(g4.soulstoneReady == true, "GREEN (NX-2): captureSoulstone latched a cold false")
+
+        -- The same four controls inside the ENTERING_WORLD grace, with no
+        -- teardown latch — the second live trigger the audit names (the forced
+        -- 1.0s post-loading-screen capture).
+        Tracker._leavingWorld = false
+        Tracker._enteredWorldAt = frameNow
+        local r5 = warmRec(); PRE.soulstone(r5)
+        ck(r5.soulstoneReady == false,
+           "RED CONTROL FAILED (NX-2, grace): the pre-fix body did not latch false after a loading screen")
+        local g5 = warmRec(); Tracker._captureSoulstone(g5)
+        ck(g5.soulstoneReady == true, "GREEN (NX-2, grace): the post-loading-screen capture latched false")
+        local r6 = warmRec(); PRE.shards(r6)
+        ck(r6.shardCount == 0, "RED CONTROL FAILED (NX-3, grace): the pre-fix body did not store 0")
+        local g6 = warmRec(); Tracker._captureShards(g6)
+        ck(g6.shardCount == 24, "GREEN (NX-3, grace): the post-loading-screen capture stored 0 shards")
+        local g7 = warmRec(); Tracker._captureFlags(g7)
+        ck(g7.pvpExpiry == EXPIRY,
+           "GREEN (NX-4, grace): a cold falsy UnitIsPVP inside the grace retired the countdown")
+        ck(g7.pvpFlagged == true,
+           "GREEN (NX-4, grace): a cold falsy UnitIsPVP inside the grace erased the flag the "
+           .. "transition rule reads")
+    end)
+
+    watching = false
+    _G.C_UnitAuras, _G.C_Container, _G.C_Item, _G.C_Spell = saved.auras, saved.cont, saved.item, saved.spell
+    _G.C_Map, _G.GetTime = saved.map, saved.getTime
+    _G.UnitLevel, _G.UnitClass, _G.UnitFactionGroup = saved.level, saved.class, saved.faction
+    _G.IsResting, _G.UnitIsPVP, _G.UnitIsPVPFreeForAll = saved.resting, saved.pvp, saved.ffa
+    _G.IsInInstance, _G.GetNumSavedInstances = saved.inInst, saved.savedInst
+    _G.UnitXP, _G.UnitXPMax, _G.GetXPExhaustion = saved.xp, saved.xpMax, saved.exhaust
+    _G.GetSubZoneText, _G.GetMinimapZoneText = saved.sub, saved.mini
+    ns.Store.Now, ns.Store.GetSettings = saved.now, saved.settings
+    ns.Store.EnsureSelfCharacter, ns.Store.WriteSelfCharacter = saved.ensure, saved.write
+    ns.state.loggedIn = saved.loggedIn
+    Tracker._leavingWorld, Tracker._loggingOut, Tracker._enteredWorldAt = savedLatch[1], savedLatch[2], savedLatch[3]
+    Tracker._auraCapturedAt, Tracker._cdCapturedAt = savedLatch[4], savedLatch[5]
+    Tracker._lastPushHash, Tracker._lastPushAt = savedLatch[6], savedLatch[7]
+    Tracker._boonCountSeeded, Tracker._lastBoonCount = savedLatch[8], savedLatch[9]
+
+    if not ok then fails[#fails + 1] = "error in capture-gate fixtures: " .. tostring(err) end
+end
+
 -- A10.1 — the change filter, end to end through the real Tracker.Capture.
 -- Counts actual STATE_CHANGED fires, so it proves the MESH signal is gated and
 -- (just as important) that the local store write is NOT.
@@ -7314,6 +7940,7 @@ function Tracker.RunSelfTests(verbose)
         { name = "spell-ID matching (A6.4/A6.6)", fn = testSpellIDMatching },
         { name = "teardown latch + grace windows", fn = testTeardownLatch },
         { name = "xp/rested capture + logout freeze", fn = testXPCapture },
+        { name = "capture honesty gates (NX-1..NX-4, Class 4)", fn = testCaptureHonestyGates },
         { name = "capture guards (A6.1/A6.2/A6.3/A17.2/A9.2)", fn = testCaptureGuards },
         { name = "boon cast lifecycle (A7.1/A7.2/A7.3/A7.4)", fn = testBoonCastLifecycle },
         { name = "boon tooltip reconciliation (A7.5)", fn = testBoonReconcile },
