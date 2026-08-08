@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+- **Fixed:** **logging out no longer turns your character into a classless "Level 0" on
+  every roster.** Nexus takes one last photograph of your character as you log out or zone,
+  and that photograph is both what gets saved to disk and what gets sent to your other
+  accounts. The problem is that the game has already started packing up by then: asked for
+  your level it answers 0, asked for your class it answers nothing, and asked for your
+  faction it answers nothing — and Nexus wrote all three down as if they were facts. So the
+  last thing every session recorded, and broadcast, was a level-0 character with no class
+  colour and no faction, and that is what you and everyone else saw on the next login until
+  the character logged in again and fixed itself. The same shutdown reading was also
+  emptying a warlock's soul shards ("0" in red on every card, even holding a full bag),
+  reporting a warlock with a soulstone in their bags as having none, and quietly deleting
+  the countdown on a PvP flag. Nexus now refuses to write any of it: a reading taken while
+  the game is shutting down or still loading is treated as *no answer*, and no answer never
+  overwrites what is already known. A genuine change — a level-up, spending your last shard,
+  a flag that really drops — still records instantly, exactly as before. This one had already
+  been fixed for XP and rested; it is now fixed for everything beside it.
 - **Fixed:** **a raid lockout you earn during a session now shows up without relogging.**
   This was the big one. Nexus asked the server for your saved-raid list exactly once, at
   login, and then waited to be told when it changed — but nothing ever asked again, so the
