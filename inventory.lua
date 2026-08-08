@@ -189,7 +189,10 @@ Inventory.PLAIN_DIRTY_EVENTS = {
 Inventory.REFRESH_DIRTY_EVENTS = {
     "BAG_UPDATE_DELAYED",
     "BANKFRAME_OPENED", "PLAYERBANKSLOTS_CHANGED", "BANKFRAME_CLOSED",
-    "MAIL_INBOX_UPDATE", "MAIL_CLOSED",
+    -- MAIL_SHOW is the mail twin of BANKFRAME_OPENED and was missing entirely
+    -- (honesty audit NX-5): without it there was no window flag, so nothing
+    -- could tell a readable inbox from an unreadable one.
+    "MAIL_SHOW", "MAIL_INBOX_UPDATE", "MAIL_CLOSED",
 }
 
 -- PURE. Is `event` one of the signals that marks the publisher dirty? Both
@@ -215,6 +218,13 @@ Inventory._healed      = false   -- this session unlatched a gen-1 consume-only 
 Inventory._dirtyTimer  = nil
 Inventory._ticker      = nil
 Inventory._bankOpen    = false
+-- NX-5: the mail twin of _bankOpen, plus its populate proof. _mailOpen is the
+-- frame window (MAIL_SHOW .. MAIL_CLOSED); _mailAnswered records that a read
+-- INSIDE that window actually came back with something, which is the only
+-- positive evidence this API offers that the server has delivered the inbox.
+-- Together they are Inventory.MailReadable, and only a readable inbox may erase.
+Inventory._mailOpen     = false
+Inventory._mailAnswered = false
 Inventory._lastSig     = nil     -- signature of the payload we last PUBLISHED
 Inventory._pending     = nil     -- payload handed straight to provide() (see Publish)
 
@@ -523,12 +533,101 @@ function Inventory.RefreshBank()
     return true
 end
 
-function Inventory.RefreshMail()
+-- PURE over two facts. Is the inbox PROVABLY readable right now?
+--
+-- Both halves are required and they prove different things:
+--   * `open`     — MAIL_SHOW has fired and MAIL_CLOSED has not yet finished. The
+--                  inbox surface only exists while the mailbox frame is up;
+--                  outside that window GetInboxNumItems answers 0 for a mailbox
+--                  stuffed with mail. This is the READABILITY half (Class 4).
+--   * `answered` — inside THIS window, a read actually came back with something:
+--                  rows, a row count, or attached gold. That is the only positive
+--                  evidence this API offers that the server has delivered the
+--                  inbox, and it is what closes the Class 6 half — the first
+--                  MAIL_INBOX_UPDATE of a visit can land before the list does,
+--                  and a zero read taken then is dark, not empty.
+--
+-- This is the mesh-friends doctrine transplanted: MAIL_SHOW is the REQUEST, and
+-- only an answer that arrives after it counts as confirmation, so an inbox event
+-- fired for some other reason can never green-light a dark list.
+--
+-- Both are passable so the truth table can be asserted without touching session
+-- state, exactly as Inventory.IsDirtyEvent takes its own tables.
+function Inventory.MailReadable(open, answered)
+    if open     == nil then open     = Inventory._mailOpen end
+    if answered == nil then answered = Inventory._mailAnswered end
+    return (open and answered) and true or false
+end
+
+-- ── EVERY MAILBOX VISIT USED TO ERASE YOUR MAIL (honesty audit NX-5, Class 4+6)
+--
+-- This function wrote parts.mail / mailN / mailMoney UNCONDITIONALLY while its
+-- sibling RefreshBank, fourteen lines above, already carried the guard it
+-- needed. It is driven from MAIL_INBOX_UPDATE and MAIL_CLOSED, and BOTH of those
+-- can deliver while the inbox is unreadable:
+--
+--   * MAIL_CLOSED is the mailbox going away. GetInboxNumItems then answers 0,
+--     ScanMail returns `{}, {n=0, money=0}`, and the last honest mail snapshot
+--     was overwritten with empty — then MarkDirty PUBLISHED the diminished item
+--     counts to every peer. The mail half of your inventory was erased on every
+--     single mailbox visit, and the erasure crossed the wire.
+--   * the first MAIL_INBOX_UPDATE of a visit can land before the server has
+--     delivered the inbox list — the Class 6 dark read of the same surface, with
+--     the same result.
+--
+-- THE GUARD CANNOT BE A NON-EMPTINESS TEST. Taking everything out of your
+-- mailbox is a real state and has to be recorded, so "zero rows" is not by
+-- itself evidence of anything — which is why RefreshBank's shape is not enough
+-- here and the rule has to be a READABILITY PROOF instead:
+--
+--   an empty read may only DELETE a stored mail snapshot when the emptiness is
+--   provable — i.e. when Inventory.MailReadable() says the frame is open AND the
+--   server has answered. Any other empty read keeps the last honest snapshot.
+--
+-- A read that FINDS rows is never refused: rows can only be read when the inbox
+-- is readable, so their presence is its own proof and they land immediately,
+-- open flag or not. The freeze is one-directional — it withholds deletions,
+-- never updates.
+--
+-- `mayDelete` is the second half of the same rule and answers a different
+-- question: WHO IS ENTITLED TO SAY THE INBOX IS EMPTY. Only MAIL_INBOX_UPDATE
+-- is, because only it is a statement about inbox CONTENTS. MAIL_SHOW is a
+-- statement about a frame, and MAIL_CLOSED is a statement about a frame going
+-- away — neither one observed a mail leave, so neither may retire one. This is
+-- where the mail twin deliberately parts company with BANKFRAME_CLOSED: the bank
+-- close frame is refreshed because PLAYERBANKSLOTS_CHANGED does not fire for
+-- every bank mutation, while MAIL_INBOX_UPDATE does fire for every inbox
+-- mutation, so the close frame here carries no information and all of the risk.
+-- It still refreshes (an update suppressed by the debounce can still land, and
+-- MarkDirty still needs the signal) — it simply cannot subtract.
+--
+-- Residual, stated rather than hidden: mail that disappears without the owner
+-- ever seeing it — expired back to sender while they were offline — leaves the
+-- stored snapshot standing until a later visit reads rows again. That is the
+-- same direction of error RefreshBank has always accepted (`#slots == 0` never
+-- erases a stored bank), and it over-reports rather than deleting.
+function Inventory.RefreshMail(mayDelete)
     if not Inventory.IsEnabled() or Inventory._mode == "consume" then return false end
     if not Inventory.CaptureAllowed() then return false end
     local parts = Inventory.Parts(true)
     if not parts then return false end
     local slots, summary = Inventory.ScanMail()
+
+    -- The whole snapshot, not just the item map: a mail carrying only gold has
+    -- no rows, so mailMoney/mailN are destroyed by the identical dark read.
+    local readEmpty = (#slots == 0) and (summary.n == 0) and (summary.money == 0)
+
+    -- Positive evidence that the inbox is answering in THIS window. Recorded
+    -- before the write, because it is what licenses the NEXT read to subtract.
+    if not readEmpty and Inventory._mailOpen then Inventory._mailAnswered = true end
+
+    local heldAny = (next(parts.mail or EMPTY) ~= nil)
+                    or ((tonumber(parts.mailN) or 0) > 0)
+                    or ((tonumber(parts.mailMoney) or 0) > 0)
+    if readEmpty and heldAny and not (mayDelete and Inventory.MailReadable()) then
+        return false   -- unproven emptiness: keep the last honest snapshot
+    end
+
     parts.mail      = Inventory.AggregateCounts({ slots = { slots } })
     parts.mailN     = summary.n
     parts.mailMoney = summary.money
@@ -1315,16 +1414,46 @@ ns:RegisterEvent("BANKFRAME_CLOSED", function()
     Inventory._bankOpen = false
 end)
 
-ns:RegisterEvent("MAIL_INBOX_UPDATE", function()
+-- NX-5: the mailbox window, wired exactly like the bank's. The three handlers
+-- are NAMED rather than inlined so a suite can drive a whole mailbox visit —
+-- open, update, close — through the real lifecycle instead of asserting on the
+-- flags it set itself. The flags are set and cleared OUTSIDE the IsEnabled()
+-- guard for the same reason BANKFRAME_OPENED sets _bankOpen outside it: a module
+-- toggled on mid-visit must not inherit a window flag nothing will ever clear.
+
+-- The mailbox frame is up. This is the REQUEST; nothing has been answered yet,
+-- so the window opens with its proof cleared.
+function Inventory.OnMailShow()
+    Inventory._mailOpen     = true
+    Inventory._mailAnswered = false
     if not Inventory.IsEnabled() then return end
-    Inventory.RefreshMail()
+    Inventory.RefreshMail(false)
     Inventory.MarkDirty()
-end)
-ns:RegisterEvent("MAIL_CLOSED", function()
+end
+
+-- The one event that is a statement about inbox CONTENTS, and therefore the only
+-- one entitled to record that a mail is gone.
+function Inventory.OnMailInboxUpdate()
     if not Inventory.IsEnabled() then return end
-    Inventory.RefreshMail()
+    Inventory.RefreshMail(true)
     Inventory.MarkDirty()
-end)
+end
+
+-- The frame is going away. Take the final reading while the window is still
+-- open (BANKFRAME_CLOSED's shape), THEN close it. It can add and it can correct;
+-- it cannot subtract, because it observed nothing leaving.
+function Inventory.OnMailClosed()
+    if Inventory.IsEnabled() then
+        Inventory.RefreshMail(false)
+        Inventory.MarkDirty()
+    end
+    Inventory._mailOpen     = false
+    Inventory._mailAnswered = false
+end
+
+ns:RegisterEvent("MAIL_SHOW",         function() Inventory.OnMailShow() end)
+ns:RegisterEvent("MAIL_INBOX_UPDATE", function() Inventory.OnMailInboxUpdate() end)
+ns:RegisterEvent("MAIL_CLOSED",       function() Inventory.OnMailClosed() end)
 
 -- Mode is decided once, a short beat after login: Bags' modules load on
 -- PLAYER_LOGIN (WildAddon defers OnLoad to that event), so probing inside our
@@ -2206,6 +2335,172 @@ local function selfTest(verbose)
     ck("teardown blocks the mail refresh", Inventory.RefreshMail() == false)
     Inventory._leavingWorld = false
     ck("latch re-arms after entering the world", Inventory.CaptureAllowed() == true)
+
+    ------------------------------------------------------------------
+    -- 7) THE MAILBOX READABILITY WINDOW  (honesty audit NX-5, Class 4 + 6)
+    --
+    -- §5 of the audit names this suite's own blindness: inventory.lua NEVER
+    -- stubbed GetInboxNumItems, so ScanMail short-circuited on its capability
+    -- guard in every single test and the whole mail path was unexercised — the
+    -- only mail assertion in the file was the teardown refusal above. Nothing
+    -- here could have seen NX-5, and a green run said so anyway.
+    --
+    -- So the client is installed first. `INBOX.readable` is the mailbox being
+    -- REALLY open, which is a different fact from whether Nexus BELIEVES it is
+    -- open, and the whole fixture lives in the gap between the two: a dark
+    -- profile that answers 0/nil to everything, and a populated profile that
+    -- answers rows. The visit is then driven through the REAL handlers.
+    --
+    -- RED CONTROLS carry the 1.1.5 body verbatim and must reproduce the wipe
+    -- against the identical world, or the green rows are asserting nothing.
+    ------------------------------------------------------------------
+    local savedInboxAPI = {
+        num = _G.GetInboxNumItems, link = _G.GetInboxItemLink,
+        item = _G.GetInboxItem, header = _G.GetInboxHeaderInfo,
+    }
+    local savedMailWin = { Inventory._mailOpen, Inventory._mailAnswered }
+    local savedParts   = area.parts and area.parts[Inventory.SelfKey()]
+
+    do
+        local INBOX = { readable = false, mail = {} }
+        _G.GetInboxNumItems = function() return (INBOX.readable and #INBOX.mail) or 0 end
+        _G.GetInboxHeaderInfo = function(i)
+            local m = INBOX.readable and INBOX.mail[i]
+            return nil, nil, nil, nil, (m and m.money) or 0
+        end
+        _G.GetInboxItemLink = function(i, j)
+            local m = INBOX.readable and INBOX.mail[i]
+            if not m or j ~= 1 or not m.id then return nil end
+            return "|cffffffff|Hitem:" .. m.id .. "::::::::60:::::|h[Mail]|h|r"
+        end
+        _G.GetInboxItem = function(i, j)
+            local m = INBOX.readable and INBOX.mail[i]
+            if not m or j ~= 1 or not m.id then return nil end
+            return "Mail", m.id, nil, m.count or 1
+        end
+
+        -- The 1.1.5 body, verbatim: scan, write, no questions asked.
+        local function PRE_RefreshMail(parts)
+            local slots, summary = Inventory.ScanMail()
+            parts.mail      = Inventory.AggregateCounts({ slots = { slots } })
+            parts.mailN     = summary.n
+            parts.mailMoney = summary.money
+            return true
+        end
+
+        local parts = Inventory.Parts(true)
+        local function resetMail()
+            parts.mail, parts.mailN, parts.mailMoney = {}, 0, 0
+            Inventory._mailOpen, Inventory._mailAnswered = false, false
+        end
+        local function held(where)
+            ck(where .. ": the mail items survived", parts.mail[4306] == 20)
+            ck(where .. ": the row count survived",  parts.mailN == 1)
+            ck(where .. ": the attached gold survived", parts.mailMoney == 5000)
+        end
+
+        -- ---- 7a) the scanner itself, now that it is finally reachable ------
+        resetMail()
+        INBOX.readable, INBOX.mail = true, { { id = 4306, count = 20, money = 5000 } }
+        local sl, sm = Inventory.ScanMail()
+        ck("mail scan: the row was read", #sl == 1 and sl[1].id == 4306 and sl[1].count == 20)
+        ck("mail scan: the row count", sm.n == 1)
+        ck("mail scan: the attached gold", sm.money == 5000)
+        INBOX.readable = false
+        local dl, dm = Inventory.ScanMail()
+        ck("mail scan: a closed mailbox answers nothing", #dl == 0 and dm.n == 0 and dm.money == 0)
+
+        -- ---- 7b) A WARM VISIT records the inbox ---------------------------
+        resetMail()
+        INBOX.readable = true
+        Inventory.OnMailShow()
+        Inventory.OnMailInboxUpdate()
+        held("a warm visit")
+        ck("a warm visit proves the inbox answered", Inventory.MailReadable() == true)
+
+        -- ---- 7c) THE BUG. The client goes cold, THEN MAIL_CLOSED lands ----
+        --      This is the whole finding: every mailbox visit ended by erasing
+        --      the mail half of the inventory and publishing the loss.
+        INBOX.readable = false
+        Inventory.OnMailClosed()
+        held("the close frame")
+        ck("the window closed", Inventory._mailOpen == false)
+
+        -- RED CONTROL: the shipped body against the identical cold client.
+        local r = { mail = { [4306] = 20 }, mailN = 1, mailMoney = 5000 }
+        PRE_RefreshMail(r)
+        ck("RED CONTROL FAILED (NX-5 close frame): the pre-fix body no longer wipes "
+           .. "the mail snapshot, so the row above proves nothing",
+           next(r.mail) == nil and r.mailN == 0 and r.mailMoney == 0)
+
+        -- ---- 7d) a stray inbox event OUTSIDE any visit ---------------------
+        --      MAIL_INBOX_UPDATE can be delivered by anything that calls
+        --      CheckInbox. With no window open it is entitled to add, never to
+        --      subtract.
+        Inventory.OnMailInboxUpdate()
+        held("a stray update outside a visit")
+        ck("a stray update did not open a window", Inventory._mailOpen == false)
+
+        -- ---- 7e) THE CLASS 6 HALF. The first update of a visit lands before
+        --      the server has delivered the list: open, but nothing answered.
+        Inventory.OnMailShow()                      -- frame up, inbox still dark
+        ck("an unanswered window is not readable", Inventory.MailReadable() == false)
+        Inventory.OnMailInboxUpdate()
+        held("the first update of a visit, inbox still dark")
+
+        --      ...and the moment the list actually arrives, it lands.
+        INBOX.readable = true
+        INBOX.mail = { { id = 4306, count = 20, money = 5000 },
+                       { id = 12811, count = 3, money = 0 } }
+        Inventory.OnMailInboxUpdate()
+        ck("the delivered list landed", parts.mail[12811] == 3 and parts.mailN == 2)
+        ck("the delivered list proved the inbox", Inventory._mailAnswered == true)
+
+        -- ---- 7f) THE FREEZE IS NOT A ONE-WAY STICK. Emptying your mailbox is
+        --      a real state and MUST be recorded: the owner takes everything
+        --      while the frame is open and the proven zero writes through.
+        INBOX.mail = {}
+        Inventory.OnMailInboxUpdate()
+        ck("a proven empty inbox still clears the items", next(parts.mail) == nil)
+        ck("a proven empty inbox still clears the count", parts.mailN == 0)
+        ck("a proven empty inbox still clears the gold",  parts.mailMoney == 0)
+        Inventory.OnMailClosed()
+
+        -- ---- 7g) a mail carrying ONLY gold is still an answer -------------
+        --      #slots is 0 for it, so the old shape of this guard would have
+        --      called the read empty and destroyed mailMoney on the next visit.
+        resetMail()
+        INBOX.readable, INBOX.mail = true, { { money = 12345 } }
+        Inventory.OnMailShow()
+        Inventory.OnMailInboxUpdate()
+        ck("a gold-only mail records its gold", parts.mailMoney == 12345)
+        ck("a gold-only mail proves the inbox answered", Inventory._mailAnswered == true)
+        INBOX.readable = false
+        Inventory.OnMailClosed()
+        ck("a gold-only snapshot survives the close frame", parts.mailMoney == 12345)
+
+        -- ---- 7h) the predicate's truth table, pure ------------------------
+        ck("readable: open + answered", Inventory.MailReadable(true, true) == true)
+        ck("readable: open, nothing answered", Inventory.MailReadable(true, false) == false)
+        ck("readable: answered but the window closed", Inventory.MailReadable(false, true) == false)
+        ck("readable: neither", Inventory.MailReadable(false, false) == false)
+
+        -- ---- 7i) MAIL_SHOW is wired as a dirty signal ---------------------
+        ck("MAIL_SHOW is a dirty signal", Inventory.IsDirtyEvent("MAIL_SHOW") == true)
+
+        -- ---- 7j) the teardown gate still outranks a proven window ---------
+        Inventory._mailOpen, Inventory._mailAnswered = true, true
+        Inventory._leavingWorld = true
+        ck("teardown refuses the mail refresh even inside a proven window",
+            Inventory.RefreshMail(true) == false)
+        Inventory._leavingWorld = false
+        resetMail()
+    end
+
+    _G.GetInboxNumItems, _G.GetInboxItemLink = savedInboxAPI.num, savedInboxAPI.link
+    _G.GetInboxItem, _G.GetInboxHeaderInfo   = savedInboxAPI.item, savedInboxAPI.header
+    Inventory._mailOpen, Inventory._mailAnswered = savedMailWin[1], savedMailWin[2]
+    if area.parts then area.parts[Inventory.SelfKey()] = savedParts end
 
     ------------------------------------------------------------------
     -- Restore

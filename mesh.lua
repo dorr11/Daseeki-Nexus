@@ -782,7 +782,10 @@ Mesh._lastPush       = {}   -- [nameRealm] = { hash, peers } of the last push.
 Mesh._pushSuppressed = 0    -- telemetry: change-filter suppressions (debug)
 Mesh._relayAgeDrops  = 0    -- telemetry: relays dropped by the 10s age gate
 Mesh._pingCooldowns  = {}   -- [name] = ts we last whisper-pinged that name
-Mesh._lastRosterSweep = 0   -- ts of the last full roster sweep (debug telemetry)
+Mesh._lastRosterSweep = 0   -- ts of the last sweep that actually SWEPT (NXM-1:
+                            -- a refused sweep must not spend the interval)
+Mesh._rosterConfirmed = false -- a sweep has seen a populated roster this session
+Mesh._rosterDark      = 0   -- telemetry: sweeps refused as "not yet populated"
 Mesh._sendCooldowns  = {}   -- [kind\1target(\1scope)] = ts of the last such send (A10.7)
 Mesh._sendGated      = 0    -- telemetry: sends suppressed by a per-target cooldown
 
@@ -2496,6 +2499,28 @@ Mesh.PruneCooldowns = pruneCooldowns   -- exposed for the self-tests
 
 -- Live roster sweep: resolve our channel, enumerate the roster, whisper a
 -- discovery ping to every eligible member, and record the sweep time.
+--
+-- ── A REFUSED SWEEP USED TO BURN THE WHOLE INTERVAL (audit NXM-1, Class 6) ───
+--
+-- `Mesh._lastRosterSweep = t` was executed ABOVE the "not joined yet" return, so
+-- a sweep that did nothing at all still spent the 60s MaybeRosterSweep budget.
+-- Login on a laggy realm, the join-retry machine resolves at T+6s, a
+-- heartbeat-driven sweep lands at T+7s while the channel is not yet resolved:
+-- the timestamp is stamped, the refusal fires, zero discovery pings go out, and
+-- peer discovery is silent for a full minute. On a short session or a /reload
+-- cycle that is the entire window.
+--
+-- TWO RULES, and they are the same rule twice:
+--   1. ONLY A SWEEP THAT HAPPENED IS STAMPED. The timestamp is the record of
+--      work done, so it moves below every refusal.
+--   2. AN EMPTY ROSTER ON A JOINED CHANNEL IS NOT AN EMPTY CHANNEL. We are on
+--      that channel, so it contains at least us; a roster of nothing is
+--      C_ChatInfo.GetChannelRosterInfo answering nil for every index because the
+--      server has not delivered the member list yet. `:2384` already hardens
+--      against a cold GetNumChannelMembers but cannot harden against the roster
+--      call itself being cold — it scans ROSTER_SCAN_CAP nils and returns {}.
+--      That read is DARK, not empty: do not stamp, and let the next heartbeat
+--      (17-23s, not 60s) or the CHANNEL_ROSTER_UPDATE confirmation try again.
 function Mesh.PingRoster()
     if not Mesh.IsEnabled() then return end
     local chanName = Mesh.GetChannelName()
@@ -2505,9 +2530,18 @@ function Mesh.PingRoster()
     -- further down the file, so we can't close over it from here.
     local idx = (chanName and GetChannelName) and (GetChannelName(chanName) or 0) or 0
     local t = now()
-    Mesh._lastRosterSweep = t
-    if not idx or idx <= 0 then return end   -- not joined yet; nothing to sweep
+    if not idx or idx <= 0 then return end   -- not joined yet; nothing swept, nothing stamped
     local roster = Mesh.ChannelRoster(idx)
+    if #roster == 0 then
+        -- Rule 2: dark, not empty. Nothing stamped, so the gate stays open.
+        Mesh._rosterDark = (Mesh._rosterDark or 0) + 1
+        return
+    end
+    -- Rule 1: a sweep that reached a populated roster is the only sweep that
+    -- spends the interval. This is also the populate confirmation the
+    -- CHANNEL_ROSTER_UPDATE retry below waits on.
+    Mesh._lastRosterSweep = t
+    Mesh._rosterConfirmed = true
     -- Drop self-echoes robustly (roster may report bare Name or Name-Realm).
     local filtered = {}
     for i = 1, #roster do
@@ -2527,6 +2561,24 @@ end
 function Mesh.MaybeRosterSweep()
     if not Mesh.IsEnabled() then return end
     if (now() - (Mesh._lastRosterSweep or 0)) < Mesh.ROSTER_SWEEP_INTERVAL then return end
+    Mesh.PingRoster()
+end
+
+-- NXM-1, the producer half: CHANNEL_ROSTER_UPDATE is the event that says the
+-- server has delivered a channel's member list (catalog
+-- Event.ChatInfo.ChannelRosterUpdate -> displayIndex, count). Without it the
+-- only thing that could rescue a dark first sweep was the next heartbeat, and
+-- the heartbeat's jitter puts that up to 23s away — on a short session that is
+-- the whole discovery window.
+--
+-- Deliberately NOT a general-purpose trigger: it fires for every channel and
+-- every membership change, so it drives a sweep only until we have seen a
+-- populated roster once. After that the interval gate owns the cadence again and
+-- this handler costs a boolean. `_rosterConfirmed` clears on a rejoin (a new
+-- channel index means a new member list to wait for), so the rescue re-arms.
+function Mesh.OnChannelRosterUpdate()
+    if not Mesh.IsEnabled() then return end
+    if Mesh._rosterConfirmed then return end
     Mesh.PingRoster()
 end
 
@@ -3713,6 +3765,14 @@ function Mesh.StartJoinSequence()
     Mesh._joinGen = Mesh._joinGen + 1
     Mesh._lastSeqStart = now()
     Mesh._joinState = Mesh.NewJoinState(chanName)
+    -- NXM-1: a fresh join means a fresh member list, and a list we have not read
+    -- is unconfirmed no matter what the previous membership told us. Re-arm the
+    -- CHANNEL_ROSTER_UPDATE rescue — but do NOT refund `_lastRosterSweep`: the
+    -- interval is an anti-storm budget, and PLAYER_ENTERING_WORLD runs this on
+    -- every loading screen. The rescue is self-limiting instead (it stops the
+    -- moment a populated roster is read), so a heavy zoning session costs at most
+    -- one extra sweep per zone, every ping in it still per-name cooldown-gated.
+    Mesh._rosterConfirmed = false
     Mesh._runJoinTick(Mesh._joinGen)
 end
 
@@ -3867,6 +3927,14 @@ function Mesh.OnLogin()
         ns:SafeCall(Mesh.OnChannelJoinNotice, playerName, channelBaseName)
     end)
 
+    -- NXM-1: the populate confirmation for the channel roster. Until a sweep has
+    -- read a non-empty roster, GetChannelRosterInfo answering nil for every index
+    -- is the server not having delivered the list — this is the event that says
+    -- it has. (catalog Event.ChatInfo.ChannelRosterUpdate)
+    ns:RegisterEvent("CHANNEL_ROSTER_UPDATE", function()
+        ns:SafeCall(Mesh.OnChannelRosterUpdate)
+    end)
+
     -- Presence-driven offline detection: mark peers stale when they leave.
     ns:RegisterEvent("CHAT_MSG_CHANNEL_LEAVE", function(_, ...)
         local playerName      = select(2, ...)
@@ -3975,8 +4043,9 @@ local function debugMesh()
     if liveIdx and liveIdx > 0 then roster = Mesh.ChannelRoster(liveIdx) end
     local shown = {}
     for i = 1, math.min(5, #roster) do shown[i] = roster[i] end
-    ns:Print(string.format("  roster: members=%d [%s] lastSweep=%s",
-        #roster, table.concat(shown, ", "), tostring(Mesh._lastRosterSweep or 0)))
+    ns:Print(string.format("  roster: members=%d [%s] lastSweep=%s confirmed=%s dark=%s",
+        #roster, table.concat(shown, ", "), tostring(Mesh._lastRosterSweep or 0),
+        tostring(Mesh._rosterConfirmed and true or false), tostring(Mesh._rosterDark or 0)))
 
     local n = 0
     for aid, p in pairs(Mesh.peers) do
@@ -4397,6 +4466,203 @@ local function testHealthCheck()
     Mesh._joinState = { gaveUp = true }
     if Mesh.SeqInFlight() then return false, "inFlight: gaveUp should be false" end
     Mesh._joinState = saved
+    return true
+end
+
+----------------------------------------------------------------------
+-- THE SWEEP THAT NEVER SWEPT  (honesty audit NXM-1, Class 6)
+--
+-- `Mesh._lastRosterSweep = t` sat ABOVE the "not joined yet" refusal, and
+-- MaybeRosterSweep blocks any retry for ROSTER_SWEEP_INTERVAL = 60s. So a sweep
+-- that landed in the join window — routine on a laggy realm, where the join
+-- machine resolves several seconds into the session and the heartbeat is right
+-- behind it — stamped the clock, refused, sent nothing, and made peer discovery
+-- silent for a full minute. The second half is the same mistake one layer down:
+-- ChannelRoster walks GetChannelRosterInfo, which answers nil for every index
+-- until the server delivers the member list, so an unpopulated roster came back
+-- as `{}` and was read as an empty channel — on a channel we are ourselves a
+-- member of, which cannot be empty.
+--
+-- The fixture drives the REAL Mesh.PingRoster against a scripted client, because
+-- the defect was never in the selection arithmetic (testRosterPingSelection
+-- already pins that, and it always passed). It was in which reads are allowed to
+-- spend the budget.
+--
+-- TWO RED CONTROLS, and the second is the one that matters: a partial fix that
+-- only moves the stamp below the idx return still burns the interval on a dark
+-- roster, so a green row against the top-stamp control alone would be asserting
+-- half the finding.
+----------------------------------------------------------------------
+local function testRosterSweepStamp()
+    local G = _G
+    local saved = {
+        getChan = G.GetChannelName, chatInfo = G.C_ChatInfo,
+        numMembers = G.GetNumChannelMembers,
+        now = Store.Now,
+        isEnabled = Mesh.IsEnabled, chanName = Mesh.GetChannelName,
+        send = Mesh.SendDiscovery, tick = Mesh._runJoinTick,
+        peers = Mesh.peers, pingCd = Mesh._pingCooldowns, sendCd = Mesh._sendCooldowns,
+        lastSweep = Mesh._lastRosterSweep, confirmed = Mesh._rosterConfirmed,
+        dark = Mesh._rosterDark, joinState = Mesh._joinState, joinGen = Mesh._joinGen,
+    }
+
+    -- The scripted client: an index the join machine has (or has not) resolved,
+    -- and a roster the server has (or has not) delivered.
+    local W = { idx = 0, roster = {}, clock = 1000 }
+    local pinged = {}
+
+    G.GetChannelName        = function() return W.idx end
+    G.GetNumChannelMembers  = function() return #W.roster end
+    G.C_ChatInfo = { GetChannelRosterInfo = function(_, r) return W.roster[r] end }
+    Store.Now      = function() return W.clock end
+    Mesh.IsEnabled = function() return true end
+    Mesh.GetChannelName = function() return "dsnTest" end
+    Mesh.SendDiscovery  = function(_, target) pinged[#pinged + 1] = target end
+    Mesh.peers, Mesh._pingCooldowns, Mesh._sendCooldowns = {}, {}, {}
+
+    -- ── the pre-fix bodies, reduced to the one decision each makes ───────────
+    -- PRE_TOP: 1.1.5 verbatim — stamp, THEN refuse.
+    local function PRE_TOP()
+        local idx = W.idx
+        Mesh._lastRosterSweep = W.clock
+        if not idx or idx <= 0 then return end
+        -- (the sweep body never runs in the window this control models)
+    end
+    -- PRE_PARTIAL: the obvious half-fix — stamp moved below the idx return, but
+    -- an empty roster still counts as a completed sweep.
+    local function PRE_PARTIAL()
+        local idx = W.idx
+        if not idx or idx <= 0 then return end
+        Mesh._lastRosterSweep = W.clock
+        local _ = Mesh.ChannelRoster(idx)
+    end
+
+    local fails = {}
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+
+    local ok, err = pcall(function()
+        ------------------------------------------------------------------
+        -- A) THE JOIN WINDOW. The channel is not resolved yet. Nothing is
+        --    swept, so nothing may be stamped, and the next heartbeat must
+        --    still be allowed to try.
+        ------------------------------------------------------------------
+        W.idx, W.roster = 0, {}
+        Mesh._lastRosterSweep, Mesh._rosterConfirmed, Mesh._rosterDark = 0, false, 0
+        Mesh.PingRoster()
+        ck(Mesh._lastRosterSweep == 0,
+           "a refused sweep stamped the clock (got " .. tostring(Mesh._lastRosterSweep) .. ")")
+        ck(#pinged == 0, "an unjoined channel produced pings")
+
+        -- RED CONTROL 1: the shipped body, same world, stamps anyway.
+        Mesh._lastRosterSweep = 0
+        PRE_TOP()
+        ck(Mesh._lastRosterSweep == W.clock,
+           "RED CONTROL FAILED (NXM-1 top-stamp): the pre-fix body no longer burns "
+           .. "the interval in the join window, so the row above proves nothing")
+        Mesh._lastRosterSweep = 0
+
+        ------------------------------------------------------------------
+        -- B) JOINED, ROSTER DARK. GetChannelRosterInfo answers nil for every
+        --    index; ChannelRoster scans its cap and returns {}. We are a member
+        --    of this channel, so it is not empty — the read is.
+        ------------------------------------------------------------------
+        W.idx, W.roster = 4, {}
+        Mesh.PingRoster()
+        ck(Mesh._lastRosterSweep == 0,
+           "a dark roster on a JOINED channel spent the interval (got "
+           .. tostring(Mesh._lastRosterSweep) .. ")")
+        ck(Mesh._rosterConfirmed == false, "a dark roster confirmed itself")
+        ck(Mesh._rosterDark == 1, "the dark read was not counted (got "
+           .. tostring(Mesh._rosterDark) .. ")")
+        ck(#pinged == 0, "a dark roster produced pings")
+
+        -- RED CONTROL 2: the half-fix. Stamp below the idx return is not enough.
+        PRE_PARTIAL()
+        ck(Mesh._lastRosterSweep == W.clock,
+           "RED CONTROL FAILED (NXM-1 empty-roster): moving the stamp alone no longer "
+           .. "burns the interval on a dark roster, so the row above proves nothing")
+        Mesh._lastRosterSweep = 0
+
+        -- ...and the gate is still OPEN, which is the whole point of not
+        -- stamping: the next heartbeat retries instead of waiting out 60s.
+        W.clock = W.clock + 1
+        local swept = false
+        local realPing = Mesh.PingRoster
+        Mesh.PingRoster = function() swept = true; return realPing() end
+        Mesh.MaybeRosterSweep()
+        Mesh.PingRoster = realPing
+        ck(swept, "the interval gate stayed shut after a refused sweep")
+
+        ------------------------------------------------------------------
+        -- C) POPULATED. This is the only shape that counts as a sweep: it
+        --    stamps, it confirms, and it pings the strangers.
+        ------------------------------------------------------------------
+        W.roster = { "Ally-R", "Ally2-R" }
+        Mesh._rosterDark, pinged = 0, {}
+        Mesh.PingRoster()
+        ck(Mesh._lastRosterSweep == W.clock,
+           "a real sweep did not stamp (got " .. tostring(Mesh._lastRosterSweep) .. ")")
+        ck(Mesh._rosterConfirmed == true, "a populated roster did not confirm")
+        ck(#pinged == 2, "the populated sweep pinged " .. #pinged .. " name(s), expected 2")
+
+        -- And NOW the interval means something: a second sweep inside the
+        -- window is suppressed, exactly as the anti-storm rule intends.
+        pinged = {}
+        Mesh._pingCooldowns = {}
+        W.clock = W.clock + 1
+        Mesh.MaybeRosterSweep()
+        ck(#pinged == 0, "a confirmed sweep did not hold the interval")
+
+        ------------------------------------------------------------------
+        -- D) THE POPULATE CONFIRMATION. CHANNEL_ROSTER_UPDATE rescues a dark
+        --    first sweep without waiting on the heartbeat's 17-23s jitter —
+        --    and goes inert once a roster has actually been read, so a chatty
+        --    event on a busy channel cannot turn into a sweep storm.
+        ------------------------------------------------------------------
+        Mesh._lastRosterSweep, Mesh._rosterConfirmed, Mesh._rosterDark = 0, false, 0
+        W.roster, pinged = {}, {}
+        Mesh.PingRoster()                       -- dark: nothing stamped
+        ck(Mesh._rosterConfirmed == false, "setup: the dark sweep must not confirm")
+
+        W.roster = { "Ally-R" }                 -- the server delivers the list
+        W.clock = W.clock + 1
+        Mesh._pingCooldowns = {}
+        Mesh.OnChannelRosterUpdate()
+        ck(Mesh._rosterConfirmed == true, "CHANNEL_ROSTER_UPDATE did not rescue the dark sweep")
+        ck(#pinged == 1, "the rescued sweep pinged " .. #pinged .. " name(s), expected 1")
+
+        pinged = {}
+        Mesh._pingCooldowns = {}
+        W.clock = W.clock + 1
+        Mesh.OnChannelRosterUpdate()
+        ck(#pinged == 0, "a confirmed roster kept re-sweeping on every roster update")
+
+        ------------------------------------------------------------------
+        -- E) A REJOIN IS A NEW MEMBER LIST. StartJoinSequence re-arms the
+        --    rescue, so the reload race (which already has its own suite) cannot
+        --    leave us confirmed against a channel index we no longer hold. It
+        --    must NOT refund the interval: PLAYER_ENTERING_WORLD runs this on
+        --    every loading screen, and a budget handed back on every zone is not
+        --    a budget.
+        ------------------------------------------------------------------
+        Mesh._runJoinTick = function() end      -- no timers in the suite
+        Mesh._lastRosterSweep = 7777
+        Mesh.StartJoinSequence()
+        ck(Mesh._rosterConfirmed == false, "a rejoin did not re-arm the roster confirmation")
+        ck(Mesh._lastRosterSweep == 7777, "a rejoin refunded the anti-storm interval")
+    end)
+
+    G.GetChannelName, G.C_ChatInfo, G.GetNumChannelMembers =
+        saved.getChan, saved.chatInfo, saved.numMembers
+    Store.Now = saved.now
+    Mesh.IsEnabled, Mesh.GetChannelName = saved.isEnabled, saved.chanName
+    Mesh.SendDiscovery, Mesh._runJoinTick = saved.send, saved.tick
+    Mesh.peers, Mesh._pingCooldowns, Mesh._sendCooldowns = saved.peers, saved.pingCd, saved.sendCd
+    Mesh._lastRosterSweep, Mesh._rosterConfirmed = saved.lastSweep, saved.confirmed
+    Mesh._rosterDark, Mesh._joinState, Mesh._joinGen = saved.dark, saved.joinState, saved.joinGen
+
+    if not ok then return false, "roster-sweep fixture errored: " .. tostring(err) end
+    if #fails > 0 then return false, table.concat(fails, "; ") end
     return true
 end
 
@@ -7178,6 +7444,8 @@ function Mesh.RunSelfTests(verbose)
         { name = "reload race rejoin", fn = testReloadRace },
         { name = "channel health check", fn = testHealthCheck },
         { name = "roster ping selection", fn = testRosterPingSelection },
+        { name = "roster sweep stamp + populate confirmation (NXM-1, Class 6)",
+          fn = testRosterSweepStamp },
         { name = "join notice throttle", fn = testJoinNoticeThrottle },
         { name = "channel gating",   fn = testChannelGating },
         { name = "account conflict", fn = testAccountConflict },

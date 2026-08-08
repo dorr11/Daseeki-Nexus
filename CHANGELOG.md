@@ -2,6 +2,34 @@
 
 ## Unreleased
 
+- **Fixed:** **visiting your mailbox no longer wipes the mail out of your inventory.**
+  Nexus keeps a note of what is sitting in each character's mailbox, because the mailbox is
+  only readable when you are standing at one — that note is how an item in the mail still
+  shows up when you search your alts. The trouble was that Nexus also took a reading at the
+  moment the mailbox *closed*, when the game has already stopped answering questions about
+  it. The answer it got back was "nothing in there", and Nexus wrote that down as fact and
+  sent it to your other accounts. So every single mailbox visit ended by deleting the mail
+  half of that character's inventory. Nexus now knows the difference between an inbox that
+  says "empty" and one that is not talking to it: it only records an emptying while the
+  mailbox is genuinely open and has actually answered. Taking everything out of your mail
+  is still recorded the instant you do it — that is a real change, and it always lands.
+- **Fixed:** **zoning into a dungeon no longer records you as "Level 0" in your own run.**
+  Nexus already refused to write down a groupmate whose character had not finished loading,
+  because a level of 0 is the game saying "not loaded yet" rather than a real level. It was
+  applying that rule to everyone except you. Walk through a portal and Nexus could take the
+  group photograph before your own character had finished arriving, and your name went into
+  that run's roster at level 0 with no class colour. It usually corrected itself within a
+  few seconds, but a short run could close with it still there. You are now held to the same
+  standard as everyone else in the group: your row is written when it is real, not before.
+- **Fixed:** **other characters on your account are found sooner after login.** Nexus
+  discovers your other accounts by looking at who else is on its private channel, and it
+  does that sweep at most once a minute so it can never spam anyone. The bug was that a
+  sweep which did nothing at all — because the channel had not finished connecting, or
+  because the server had not yet sent the member list — still counted as that minute's
+  sweep. On a slow login that meant a full minute of silence before Nexus looked again, and
+  on a short session or a quick reload that was the whole window. Only a sweep that actually
+  read the channel now counts, and the moment the server delivers the member list Nexus
+  looks straight away instead of waiting.
 - **Fixed:** **logging out no longer turns your character into a classless "Level 0" on
   every roster.** Nexus takes one last photograph of your character as you log out or zone,
   and that photograph is both what gets saved to disk and what gets sent to your other

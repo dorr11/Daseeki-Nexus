@@ -911,8 +911,18 @@ local function readGroupMembers()
         local _, tag = UnitClass(unit)
         return (type(tag) == "string" and tag ~= "") and tag or nil
     end
-    local members = { { name = selfName, level = sampleLevel() or 0, isSelf = true,
-                        classTag = classOf("player") } }
+    -- ── THE SELF ROW WAS EXEMPT FROM ITS OWN RULE (honesty audit NX-6) ───────
+    -- sampleLevel() already refuses a zero read by returning nil; the `or 0`
+    -- below throws that refusal away, and the row used to skip the `unproven`
+    -- stamp that every OTHER member gets sixteen lines down. `not m.unproven`
+    -- was therefore true, UnionGroup admitted it, and zoning in during the first
+    -- frames after a loading screen wrote `*Self:0` into the entry — the exact
+    -- failure MemberProven exists to stop, applied to everyone but you.
+    -- Build it through the same path: one row, one rule.
+    local me = { name = selfName, level = sampleLevel() or 0, isSelf = true,
+                 classTag = classOf("player") }
+    me.unproven = not Instances.MemberProven(me)
+    local members = { me }
     local n = (GetNumGroupMembers and tonumber(GetNumGroupMembers())) or 0
     if n > 1 then
         local inRaid = (IsInRaid and IsInRaid()) and true or false
@@ -2637,6 +2647,140 @@ local function testColdRoster(fails)
 end
 
 ----------------------------------------------------------------------
+-- THE SELF ROW WAS EXEMPT FROM ITS OWN RULE  (honesty audit NX-6, Class 6)
+--
+-- readGroupMembers stamps `unproven` on every member it reads — except the one
+-- it builds first. `sampleLevel()` already refuses a zero read by returning nil;
+-- `or 0` threw that refusal away, and with no stamp `not m.unproven` was true,
+-- so UnionGroup ADMITTED the player at level 0. Zone into an instance in the
+-- first frames after a loading screen and `*Self:0` went into the entry — the
+-- exact failure MemberProven was written to stop, applied to everyone but you.
+--
+-- The audit rates this LATENT, not LIVE, because GROUP_LADDER_AT = {1, 3, 8}
+-- upgrades the row within 8s in practice. It sticks when C_Timer is unavailable
+-- or the run closes inside 8s, and the fixture drives both: the ladder healing
+-- it, and a run that ends before the ladder can.
+----------------------------------------------------------------------
+local function testColdSelfRow(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+
+    -- ---- 1) the admission rule applied to a SELF row, pure ---------------
+    -- RED CONTROL: the pre-fix self row — level 0, isSelf, no stamp — is
+    -- admitted and encodes as "*Tester:0". If this stops being true the live
+    -- rows below are asserting nothing.
+    local preFix = { name = "Tester", level = 0, isSelf = true }
+    local r1 = Instances.UnionGroup(nil, { preFix, { name = "Dorn", level = 58 } })
+    ck(r1:find("*Tester:0", 1, true) ~= nil,
+       "RED CONTROL FAILED (NX-6): an unstamped level-0 self row is no longer admitted, "
+       .. "so the refusal below proves nothing (got " .. tostring(r1) .. ")")
+
+    -- GREEN: the same row, stamped the way every other member is.
+    local stamped = { name = "Tester", level = 0, isSelf = true }
+    stamped.unproven = not Instances.MemberProven(stamped)
+    local g1 = Instances.DecodeGroup(Instances.UnionGroup(nil,
+        { stamped, { name = "Dorn", level = 58 } }))
+    ck(#g1 == 1 and g1[1].name == "Dorn",
+       "an unproven SELF row was admitted anyway (got " .. #g1 .. " member(s))")
+
+    -- ...and admission-refusal is still not destructive: a self row already
+    -- stored keeps its level when a later sample goes cold (walked through a
+    -- portal, unit unloaded), exactly as for every other member.
+    local stored = Instances.UnionGroup(nil, { { name = "Tester", level = 60, isSelf = true } })
+    local g2 = Instances.DecodeGroup(Instances.UnionGroup(stored, { stamped }))
+    ck(#g2 == 1 and g2[1].level == 60 and g2[1].isSelf == true,
+       "a cold self sample blanked the level (and the self mark) we already knew")
+
+    -- ---- 2) THE LIVE PATH, through the real handlers ---------------------
+    local sim = newSimClient()
+    local queue = {}
+    _G.C_Timer = { After = function(d, fn) queue[#queue + 1] = { at = tonumber(d) or 0, fn = fn } end }
+    local function pump(untilT)
+        local keep = {}
+        for i = 1, #queue do
+            local q = queue[i]
+            if q.at <= untilT then pcall(q.fn) else keep[#keep + 1] = q end
+        end
+        queue = keep
+    end
+
+    local ok, err = pcall(function()
+        -- Zone in during the first frames after the loading screen: the PLAYER's
+        -- own unit has not loaded, so UnitLevel("player") answers 0. Everyone
+        -- else is warm — this is the self row and nothing else.
+        sim.playerLevel = 0
+        sim.party = { { name = "Dorn", level = 58 } }
+        sim.money = 5000
+        Instances._noteWallet(5000)
+        sim.enter("Scholomance", 289, "party")
+
+        local e = sim.entries()[1]
+        ck(e ~= nil, "the entry was not recorded")
+        local atEntry = Instances.DecodeGroup(e.group)
+        for _, m in ipairs(atEntry) do
+            ck(not (m.isSelf and (m.level or 0) == 0),
+               "a level-0 SELF row was written into the entry (" .. tostring(e.group) .. ")")
+        end
+        ck(#atEntry == 1 and atEntry[1].name == "Dorn",
+           "the cold self row was persisted at entry (" .. tostring(e.group) .. ")")
+        ck(Instances._groupSettled == false,
+           "a sample whose own player is cold must not report itself settled")
+        ck(e.groupAvg == 58,
+           "the average must be over the proven members only (got " .. tostring(e.groupAvg) .. ")")
+
+        -- The ladder is the heal the audit credits, and it must actually run.
+        ck(#queue == #Instances.GROUP_LADDER_AT,
+           "the post-entry ladder did not arm (" .. #queue .. " rung(s))")
+        sim.playerLevel = 60
+        Instances._lastGroupSnap = nil
+        pump(1)
+        local after = Instances.DecodeGroup(e.group)
+        ck(#after == 2, "the ladder did not admit the player once warm (got " .. #after .. ")")
+        local me
+        for _, m in ipairs(after) do if m.isSelf then me = m end end
+        ck(me and me.name == "Tester" and me.level == 60,
+           "the player landed wrong (" .. tostring(me and me.level) .. ")")
+        ck(Instances._groupSettled == true, "a fully proven sample must report settled")
+
+        -- ---- 3) THE CASE THE LADDER CANNOT SAVE --------------------------
+        -- A run that closes inside the ladder's 8s window. Pre-fix this is where
+        -- "*Self:0" stuck forever; now the entry simply carries no self row
+        -- until one is proven, which is what MemberProven means.
+        sim.leave()
+        queue = {}
+        sim.playerLevel = 0
+        Instances._lastGroupSnap = nil
+        sim.enter("Stratholme", 329, "party")
+        local e2 = sim.entries()[1]
+        for _, m in ipairs(Instances.DecodeGroup(e2.group)) do
+            ck(not (m.isSelf and (m.level or 0) == 0),
+               "a short run kept a level-0 self row (" .. tostring(e2.group) .. ")")
+        end
+        sim.leave()
+        for _, m in ipairs(Instances.DecodeGroup(e2.group)) do
+            ck(not (m.isSelf and (m.level or 0) == 0),
+               "closing the run wrote a level-0 self row (" .. tostring(e2.group) .. ")")
+        end
+
+        -- ---- 4) A WARM SELF ROW IS UNCHANGED -----------------------------
+        -- The refusal is evidence-driven, not a blanket ban on the self row.
+        queue = {}
+        sim.playerLevel = 60
+        Instances._lastGroupSnap = nil
+        sim.enter("Molten Core", 409, "raid")
+        local e3 = sim.entries()[1]
+        local warm = Instances.DecodeGroup(e3.group)
+        local self3
+        for _, m in ipairs(warm) do if m.isSelf then self3 = m end end
+        ck(self3 and self3.level == 60,
+           "a warm self row must still lead the roster (" .. tostring(e3.group) .. ")")
+        sim.leave()
+    end)
+    _G.C_Timer = nil
+    sim.restore()
+    if not ok then fails[#fails + 1] = "cold-self-row sim errored: " .. tostring(err) end
+end
+
+----------------------------------------------------------------------
 -- NX-5 — THE COLD WALLET (async lesson Class 7 / Class 4)
 --
 -- Both wallet samples run on the far side of a loading screen. A cold zero at
@@ -2838,6 +2982,7 @@ function Instances.RunSelfTests(verbose)
         { name = "cross-account + orphan bucket", fn = testCrossAccount },
         { name = "per-entry detail primitives",   fn = testDetailPrimitives },
         { name = "cold roster admission + ladder (NX-2, Class 7/6)", fn = testColdRoster },
+        { name = "cold SELF row admission (NX-6, Class 6)",          fn = testColdSelfRow },
         { name = "cold wallet refusal (NX-5, Class 7/4)",            fn = testColdWallet },
         { name = "live detail capture",           fn = testLiveDetailCapture },
         { name = "double corpse run",             fn = testDoubleCorpseRun },
