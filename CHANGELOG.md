@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.1.6 — 2026-08-08
 
 - **Added:** **Rin'wosho repairs your gear again.** Nexus has always been able to auto-repair,
   but only on a vendor window *you* opened — walk up to Rin'wosho the Trader in Zul'Gurub,
