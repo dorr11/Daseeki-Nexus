@@ -143,11 +143,16 @@ local L = {
                         -- row and change; the self-test pins both facts.
 
     -- The owner's rework splits: the grid pane takes GRID_FRACTION of the
-    -- body's width (his boxes said "~55-60%"; 60 is the clean edge of that),
-    -- and the right column gives DETAIL_FRACTION of its height to the detail
-    -- pane, the rest to the cooldown kinds. ProfUI.SplitWidths() and
-    -- ProfUI.RightSplitHeights() are the only readers.
-    GRID_FRACTION   = 0.60,
+    -- body's width (his first boxes said "~55-60%" and 60 shipped; the
+    -- iteration round he booked then moved it — owner, 2026-08-10: an even
+    -- 50/50, the detail column earning the width), and the right column gives
+    -- DETAIL_FRACTION of its height to the detail pane, the rest to the
+    -- cooldown kinds. ProfUI.SplitWidths() and ProfUI.RightSplitHeights()
+    -- are the only readers. The grid absorbs the narrower pane the way it
+    -- absorbs ANY pane: GridColumns shrinks every column pitch off the real
+    -- width and every cell text stays capped at its own column — at the 700px
+    -- shell the band now rides ~0.45 of natural (was ~0.54), tight but honest.
+    GRID_FRACTION   = 0.50,
     DETAIL_FRACTION = 0.70,
 
     ROW_H       = 32,   -- one character row in the grid
