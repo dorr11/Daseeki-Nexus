@@ -2,6 +2,45 @@
 
 ## Unreleased
 
+- **Fixed:** **opening a profession window now actually records what is in it.** Every
+  profession was reading "not checked" no matter how many times you opened its window. The
+  window announces itself before the server has sent the recipe list, so Nexus's first look
+  found an empty list — and a one-second "don't re-scan the same thing twice" guard was being
+  armed by that failed look, which meant the update that finally *carried* the recipes was
+  waved away as a repeat. Nothing ever asked again. The guard now only counts a scan that
+  actually read something, and a window that refuses gets asked again on a short, finite
+  ladder that stops the moment it succeeds or you close the window. The reagent list Nexus
+  builds from the same window comes back with it.
+
+- **Fixed:** **the search box and the category picker on the profession window.** Typing did
+  nothing and picking a category did not narrow the list. Two causes, both now handled
+  honestly. Setting one of the game's own list filters changes what the game *counts* but does
+  not repaint the window, so Nexus now asks the game to redraw. And the category and slot
+  filters take arguments whose meaning is not written down anywhere for this client version —
+  the previous build guessed, and guessed wrong. Nexus no longer guesses: it tries the
+  possibilities, watches what each one does to the game's own recipe count, and keeps the one
+  that actually works. If nothing works on your client, the control says so and stands down
+  instead of sitting there pretending.
+
+- **Fixed:** clearing the filters when a profession window opens can no longer narrow it by
+  accident. The clear is now measured the same way — a call that leaves *fewer* recipes
+  visible is rejected on the spot — so an unverifiable "show everything" argument can never
+  again quietly empty the window that the recipe scan is about to read.
+
+- **Fixed:** the game's own **"only show recipes that give a skill-up"** box is now noticed.
+  It hides most of a maxed character's list, and Nexus was reading the short list as the
+  whole truth. It is cleared when a profession window opens, like every other leftover
+  filter, and while it is on Nexus records nothing rather than recording less.
+
+- **Added:** `/nexus debug professions` now explains itself. Under each profession it prints
+  how many times the window scan has been tried, when, and why the last one was refused —
+  the list was empty, a filter was engaged, a row would not resolve, the throttle held it —
+  plus a short rolling trace of the last thirty attempts that survives a reload and is stamped
+  with the build that wrote it. `/nexus debug proffilters` reports which filter argument forms
+  this client turned out to honour, whether the two interfere, and whether the game's own
+  redraw function was found. If a scan ever goes missing again, the answer is on screen
+  instead of one build away.
+
 - **Added:** **the Professions tab — the half you can actually look at.** Nexus has a second
   page now, next to Characters in the title bar, and it opens on a grid: one row per
   character in the same order your cards are in, with each profession's icon, skill, its

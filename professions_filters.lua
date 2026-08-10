@@ -110,6 +110,10 @@ Filters.SURFACES = { TRADESKILL, CRAFT }
 local TEXT_DEBOUNCE = 0.2
 Filters.TEXT_DEBOUNCE = TEXT_DEBOUNCE
 
+-- How many times per window session the filter conventions may be measured
+-- against an enumeration that answered zero. See Filters.Settle.
+Filters.MAX_DARK_PROBES = 4
+
 -- Session state. All nil/false until Activate().
 Filters._activated = false
 Filters._frame     = nil
@@ -118,6 +122,10 @@ Filters._panels    = nil     -- surface -> panel frame
 Filters._hooked    = nil     -- surface -> true once the game frame's scripts are hooked
 Filters._prof      = nil     -- surface -> the profession name the window last showed
 Filters._textTimer = nil     -- surface -> debounce generation
+Filters._conv      = nil     -- surface -> the MEASURED argument forms for the pickers
+Filters._probing   = nil     -- surface -> true while we are moving the client's filters
+Filters._unhonored = nil     -- surface -> { dimension -> true } this client ignores
+Filters._redrawFn  = nil     -- surface -> the client's own list-update function name
 
 ----------------------------------------------------------------------
 -- Stand-down
@@ -301,6 +309,8 @@ function Filters.Api(surface, G)
         setText     = G.SetTradeSkillItemNameFilter,
         getText     = G.GetTradeSkillItemNameFilter,
         setMakeable = G.TradeSkillOnlyShowMakeable,
+        -- Not a control we offer; a leftover we clear. See ClearNative.
+        setSkillUps = G.TradeSkillOnlyShowSkillUps,
         setSub      = G.SetTradeSkillSubClassFilter,
         getSub      = G.GetTradeSkillSubClassFilter,
         subs        = G.GetTradeSkillSubClasses,
@@ -342,54 +352,387 @@ function Filters.DimensionKeys(api)
 end
 
 ----------------------------------------------------------------------
--- LIVE: pushing the state at the client
+-- ═══════ PUSHING THE STATE AT THE CLIENT: MEASURE, NEVER ASSUME ═════════════
+--
+-- Wave P3 shipped this file with a written-down judgement call: the argument
+-- convention of the two PICKER setters is "index 0 with the list-all flag means
+-- every subclass". The 11509 catalog carries the NAMES of those functions and
+-- nothing else — no arity, no parameter list, no documented sentinel — so that
+-- convention was a guess, it was flagged as a guess, and live it was wrong in
+-- both directions: the category picker did not narrow, and the search box
+-- appeared to do nothing at all.
+--
+-- The lesson is not "find the right constant". It is that a constant we cannot
+-- verify must not be passed BLIND, because the same call that fails to narrow
+-- when we want it to can narrow to NOTHING when we do not — and this file's
+-- clear-on-open runs before every capture, so a clear that quietly narrowed
+-- would take the capture layer down with it. That is precisely what "the window
+-- always opens unfiltered" turned into.
+--
+-- So nothing here interprets a value. Every filter call is a HYPOTHESIS and the
+-- client's own row count is the experiment:
+--
+--   * to show everything, try each candidate argument form and keep the one that
+--     leaves the MOST rows enumerated. A form that shrinks the list is rejected
+--     by measurement, so an unverified sentinel can no longer wedge the window
+--     shut. Worst case we change nothing.
+--   * to narrow, keep the first form that produces a strictly smaller, non-empty
+--     list. If no form does, the dimension is NOT HONORED on this client and the
+--     control says so instead of pretending.
+--   * the forms that win are remembered per surface, and forgotten the moment
+--     one stops producing the effect it was learned for (class 5: a calibration
+--     learned once and never revisited turns one bad read into a permanent
+--     state).
+--
+-- And because moving the client's filters is exactly the thing the capture must
+-- never read across, the probe registers itself in the view guard while it runs.
 ----------------------------------------------------------------------
+
+-- Candidate argument forms. `n` is how many arguments to pass; entries 1 and 2
+-- are the second and third arguments when there are three. The orderings are
+-- deliberate: the shortest call first, because a client that only ever wanted an
+-- index will accept it and the extra flags are then noise we never send.
+local ALL_FORMS = {
+    { n = 1 },
+    { n = 3, 1, 1 },
+    { n = 3, 1, 0 },
+    { n = 3, 0, 1 },
+}
+local PICK_FORMS = {
+    { n = 1 },
+    { n = 3, 0, 1 },
+    { n = 3, 1, 0 },
+    { n = 3, 0, 0 },
+}
+Filters.ALL_FORMS  = ALL_FORMS
+Filters.PICK_FORMS = PICK_FORMS
+
+function Filters.FormName(form)
+    if type(form) ~= "table" then return "none" end
+    if form.n == 1 then return "(i)" end
+    return "(i," .. tostring(form[1]) .. "," .. tostring(form[2]) .. ")"
+end
+
+local function callForm(fn, index, form)
+    if not fn then return false end
+    if form.n == 1 then return pcall(fn, index) end
+    return pcall(fn, index, form[1], form[2])
+end
+
+-- The client's own enumeration size — the single witness every decision in this
+-- section rests on. nil when it cannot be read, which is a refusal to decide,
+-- never a zero.
+function Filters.RowCount(surface, G)
+    local api = Filters.Api(surface, G)
+    if not api.numRows then return nil end
+    local ok, n = pcall(api.numRows)
+    if not ok or type(n) ~= "number" then return nil end
+    return n
+end
+
+-- THE REDRAW. Setting a server-side filter changes what the client ENUMERATES;
+-- it does not repaint the window. Blizzard's own filter menu calls the frame's
+-- update function itself afterwards, and a panel that sets a filter without one
+-- produces exactly the symptom this fix was reported as: typing changes nothing
+-- on screen. Probed rather than assumed — the update function lives in a
+-- load-on-demand addon, so it is absent until the window has been opened once.
+function Filters.Redraw(surface, G)
+    G = G or _G
+    local names = (surface == CRAFT)
+        and { "CraftFrame_Update" }
+        or  { "TradeSkillFrame_Update" }
+    for i = 1, #names do
+        local fn = G[names[i]]
+        if type(fn) == "function" then
+            Filters._redrawFn = Filters._redrawFn or {}
+            Filters._redrawFn[surface] = names[i]
+            pcall(fn)
+            return names[i]
+        end
+    end
+    Filters._redrawFn = Filters._redrawFn or {}
+    Filters._redrawFn[surface] = false
+    return nil
+end
+
+-- Note one measured fact into the professions module's forensics ring, so the
+-- owner's next window open answers "what does this client actually honor?"
+-- without another round trip.
+local function noteProbe(surface, what, detail)
+    local P = ns.Professions
+    if not (P and P.RecordAttempt) then return false end
+    return P.RecordAttempt({
+        e = "filter-probe", s = surface, r = what, g = detail,
+    })
+end
+
+function Filters.Conv(surface)
+    Filters._conv = Filters._conv or {}
+    Filters._conv[surface] = Filters._conv[surface] or {}
+    return Filters._conv[surface]
+end
+
+-- SHOW EVERYTHING, by measurement. Returns the row count we ended on.
+--
+-- Each candidate is applied and measured; the winner is the one that leaves the
+-- most rows, and it is re-applied last so the client ends in the state we chose
+-- rather than the state of the final probe. Because "more rows" is the only
+-- thing this function will accept, it is incapable of narrowing the window —
+-- which is the property the capture layer depends on.
+function Filters.ShowAll(surface, api, G)
+    local best, bestCount = nil, Filters.RowCount(surface, G) or 0
+    local conv = Filters.Conv(surface)
+    local applied = false
+
+    -- An empty enumeration is measured too, because it is exactly where a
+    -- LEFTOVER filter hides — the client's picker state survives window
+    -- sessions, so a window can open showing nothing at all and every candidate
+    -- that lifts it is an improvement. What such a probe may NOT do is believe
+    -- itself: no form is cached from an all-zero measurement, `settled` stays
+    -- false, and Settle() re-asks the question once there is something to count.
+    local function search(setter, key)
+        if not setter then return end
+        local start = Filters.RowCount(surface, G) or 0
+        local winner, winnerCount = nil, -1
+        for i = 1, #ALL_FORMS do
+            local form = ALL_FORMS[i]
+            if callForm(setter, 0, form) then
+                local n = Filters.RowCount(surface, G)
+                if n and n > winnerCount then winner, winnerCount = form, n end
+                -- Starting from nothing, the first form that produces ANY rows
+                -- has already lifted whatever was hiding them. Sweeping the rest
+                -- would only spend more setter calls, and every setter call
+                -- comes back at the capture layer as an update to refuse.
+                if start <= 0 and n and n > 0 then break end
+            end
+        end
+        if winner then
+            callForm(setter, 0, winner)
+            applied = true
+            if winnerCount > 0 then conv[key] = winner end     -- never cache off an empty window
+            if winnerCount > bestCount then bestCount = winnerCount end
+            if winnerCount < start then
+                -- No form we know reaches the state we found the client in. We
+                -- are left with the least-bad one and the fact is recorded
+                -- rather than swallowed.
+                conv.degraded = true
+                noteProbe(surface, "clear-degraded",
+                    key .. " " .. tostring(winnerCount) .. "<" .. tostring(start))
+            end
+        end
+    end
+
+    -- Subclass first, then slot, then subclass AGAIN. The third call is the
+    -- whole point: these two setters share one filter record on the client, so
+    -- the slot call can carry flags that undo what the subclass call just
+    -- established. Re-asserting and re-measuring is how that is caught rather
+    -- than reasoned about.
+    search(api.setSub, "subAll")
+    search(api.setSlot, "slotAll")
+    if api.setSub and conv.subAll then
+        callForm(api.setSub, 0, conv.subAll)
+        local n = Filters.RowCount(surface, G)
+        if n and n < bestCount and conv.slotAll then
+            -- Re-asserting the subclass lost rows: the two orderings disagree,
+            -- so keep whichever leaves more and record that they interfere.
+            callForm(api.setSlot, 0, conv.slotAll)
+            local m = Filters.RowCount(surface, G)
+            if not m or m < n then callForm(api.setSub, 0, conv.subAll) end
+            conv.interfere = true
+        end
+    end
+    best = applied
+    local final = Filters.RowCount(surface, G) or bestCount
+    -- SETTLED means "this measurement was taken against a window that had rows".
+    -- A window opens before the server's row list arrives, so the first probe of
+    -- a session can easily run against an empty enumeration, where every
+    -- candidate scores zero and the winner is arbitrary. That answer is not
+    -- wrong so much as unearned, and OnWindowUpdate re-asks once the rows are
+    -- actually there rather than living with it (class 5: a calibration taken
+    -- once, in the dark, is worse than no calibration).
+    conv.settled = final > 0
+    if not conv.settled then conv.darkProbes = (conv.darkProbes or 0) + 1 end
+    return final, best
+end
+
+-- NARROW one picker to `index`, by measurement. Returns true when the client
+-- honored it. `baseline` is the unfiltered count to beat.
+function Filters.Narrow(surface, api, setter, key, index, baseline, G)
+    if not setter or (tonumber(index) or 0) <= 0 then return false end
+    local conv = Filters.Conv(surface)
+
+    local function try(form)
+        if not callForm(setter, index, form) then return nil end
+        return Filters.RowCount(surface, G)
+    end
+
+    -- The remembered form first — and it is only kept while it keeps working.
+    local cached = conv[key]
+    if cached then
+        local n = try(cached)
+        if n and n > 0 and n < baseline then return true end
+        conv[key] = nil                              -- it stopped working: forget it
+        noteProbe(surface, "recalibrate", key)
+    end
+    for i = 1, #PICK_FORMS do
+        local form = PICK_FORMS[i]
+        local n = try(form)
+        if n and n > 0 and n < baseline then
+            conv[key] = form
+            noteProbe(surface, "form-learned", key .. "=" .. Filters.FormName(form)
+                .. " rows " .. tostring(n) .. "/" .. tostring(baseline))
+            return true
+        end
+    end
+    return false
+end
+
+-- The dimensions we are told to engage, engaged in an order that cannot lose
+-- them: everything that should show ALL goes first, and the narrowing calls go
+-- last, so a shared flag written by a later call can only ever be the one we
+-- wanted. Then the result is VERIFIED against the unfiltered count.
+function Filters.ApplyPickers(surface, api, state, G)
+    local sub  = tonumber(state.subclass) or 0
+    local slot = tonumber(state.slot) or 0
+    local baseline = Filters.ShowAll(surface, api, G)
+    if sub <= 0 and slot <= 0 then return true, baseline end
+    -- Narrowing an empty enumeration proves nothing and cannot be verified, so
+    -- the pick waits for the window to have something in it.
+    if baseline <= 0 then return false, 0 end
+
+    Filters._unhonored = Filters._unhonored or {}
+    Filters._unhonored[surface] = Filters._unhonored[surface] or {}
+    local bad = Filters._unhonored[surface]
+
+    local okSub, okSlot = true, true
+    if sub > 0 then
+        okSub = Filters.Narrow(surface, api, api.setSub, "subPick", sub, baseline, G)
+        bad.subclass = (not okSub) or nil
+    end
+    if slot > 0 then
+        okSlot = Filters.Narrow(surface, api, api.setSlot, "slotPick", slot, baseline, G)
+        bad.slot = (not okSlot) or nil
+        -- Engaging the slot may have carried flags that released the subclass.
+        -- Re-assert it and keep the narrower of the two orderings.
+        if okSlot and sub > 0 and okSub then
+            local after = Filters.RowCount(surface, G) or baseline
+            if after >= baseline then
+                Filters.Narrow(surface, api, api.setSub, "subPick", sub, baseline, G)
+                Filters.Conv(surface).interfere = true
+            end
+        end
+    end
+
+    local final = Filters.RowCount(surface, G) or baseline
+    if final >= baseline then
+        -- Nothing we could say narrowed this client. Leave the window showing
+        -- everything rather than in some half-set state, and let the control
+        -- report the absence honestly.
+        Filters.ShowAll(surface, api, G)
+        if sub > 0 then bad.subclass = true end
+        if slot > 0 then bad.slot = true end
+        noteProbe(surface, "not-honored",
+            (sub > 0 and "subclass " or "") .. (slot > 0 and "slot" or ""))
+        return false, baseline
+    end
+    return true, final
+end
 
 -- Every call is guarded and pcall'd. A client that has moved on and dropped one
 -- of these functions loses that dimension, not the window.
+--
+-- The whole push runs behind the probing latch, because the measurement moves
+-- the client's filters on purpose and a capture that read the list mid-probe
+-- would read a deliberately narrowed one.
 function Filters.ApplyNative(surface, state, G)
     local api = Filters.Api(surface, G)
     state = state or Filters.NewState()
-    if api.setText then pcall(api.setText, Filters.Trim(state.text)) end
-    if api.setMakeable then pcall(api.setMakeable, state.makeable and true or false) end
-    if api.setSub then
-        local i = tonumber(state.subclass) or 0
-        -- The client's own convention for these two: index 0 with the "list all"
-        -- flag means every subclass; a real index selects one and hides the rest.
-        if i > 0 then pcall(api.setSub, i, 0, 1) else pcall(api.setSub, 0, 1, 1) end
-    end
-    if api.setSlot then
-        local i = tonumber(state.slot) or 0
-        if surface == CRAFT then
-            -- The craft surface's slot filter takes the index alone.
-            pcall(api.setSlot, i)
-        elseif i > 0 then pcall(api.setSlot, i, 0, 1)
-        else pcall(api.setSlot, 0, 1, 1) end
-    end
-    return true
+    Filters._probing = Filters._probing or {}
+    local was = Filters._probing[surface]
+    Filters._probing[surface] = true
+    local ok, err = pcall(function()
+        -- The two dimensions whose meaning is NOT in doubt: one string, one
+        -- boolean, both with getters that read back what was set.
+        if api.setText then pcall(api.setText, Filters.Trim(state.text)) end
+        if api.setMakeable then pcall(api.setMakeable, state.makeable and true or false) end
+        -- ...and the two whose argument convention the catalog does not carry.
+        Filters.ApplyPickers(surface, api, state, G)
+    end)
+    Filters._probing[surface] = was
+    -- The client filtered; now make it repaint. Without this the list on screen
+    -- is the list from before the filter, which is indistinguishable to a player
+    -- from a filter that does not work.
+    Filters.Redraw(surface, G)
+    if not ok then noteProbe(surface, "apply-error", tostring(err)) end
+    return ok
 end
 
 -- Everything back to "show me all of it". This is what runs on window show and
 -- on window hide, and it is the reason the next capture sees a full list.
+--
+-- It cannot narrow: ShowAll only ever accepts a candidate that leaves MORE rows
+-- enumerated, and the unambiguous dimensions are set to their empty values.
 function Filters.ClearNative(surface, G)
+    -- The client's own "only show skill-ups" box is not a dimension this panel
+    -- offers, but it IS one the capture layer refuses on, and it survives across
+    -- window sessions. Left engaged it would mean every open lands in a
+    -- permanent refusal that nothing this file does can lift. One boolean, no
+    -- ambiguity, cleared where every other leftover is cleared — on the way in
+    -- and on the way out, never on a keystroke.
+    local api = Filters.Api(surface, G)
+    if api.setSkillUps then pcall(api.setSkillUps, false) end
     return Filters.ApplyNative(surface, Filters.NewState(), G)
 end
 
 -- The witness professions.lua's capture consults. A window that is closed
 -- narrows nothing, so a nil state is an honest false.
+--
+-- The probing latch comes FIRST and outranks everything: while this file is
+-- moving the client's filters to find out what they do, the list is narrowed by
+-- construction and no capture may read it.
 function Filters.ViewGuard(surface)
+    if Filters._probing and Filters._probing[surface] then return true, "probing" end
     local st = Filters._state and Filters._state[surface]
     if not st then return false end
-    return Filters.Narrowed(st)
+    if Filters.Narrowed(st) then return true, "panel" end
+    return false
 end
 
 -- The one place a filter change lands: push it at the client, refresh the
 -- controls, and — when nothing narrows any more — re-capture the full list.
+-- A dimension this client would not honor is reported ONCE and then rolled back
+-- out of our own state, so the control cannot sit there looking engaged while
+-- the list behind it is unfiltered. Honest absence beats a lying control.
+function Filters.NoteUnhonored(surface, st)
+    local bad = Filters._unhonored and Filters._unhonored[surface]
+    if not bad then return false end
+    local rolled = false
+    Filters._toldUnhonored = Filters._toldUnhonored or {}
+    for _, key in ipairs({ "subclass", "slot" }) do
+        if bad[key] then
+            if st and (tonumber(st[key]) or 0) > 0 then st[key] = 0 rolled = true end
+            local tag = surface .. ":" .. key
+            if not Filters._toldUnhonored[tag] and ns.Print then
+                Filters._toldUnhonored[tag] = true
+                ns:Print("this client does not honor the " ..
+                    (key == "slot" and "slot" or "category") ..
+                    " filter on the " .. surface .. " window — the control is standing down.")
+            end
+        end
+    end
+    return rolled
+end
+
 function Filters.SetState(surface, mutate)
     local st = Filters._state and Filters._state[surface]
     if not st then return false end
     if type(mutate) == "function" then mutate(st) end
     Filters.ApplyNative(surface, st)
+    if Filters.NoteUnhonored(surface, st) then
+        -- The roll-back is a state change of its own, so it goes back at the
+        -- client rather than only at the panel.
+        Filters.ApplyNative(surface, st)
+    end
     Filters.RefreshPanel(surface)
     if not Filters.Narrowed(st) then
         -- Deferred one frame: the client rebuilds its list in response to the
@@ -651,6 +994,10 @@ function Filters.OnWindowShow(surface, retried)
     -- frame later overwrites anything a racing filtered capture wrote.
     Filters._state = Filters._state or {}
     Filters._state[surface] = Filters.NewState()
+    -- The dark-probe budget is per WINDOW SESSION, not per client: a second open
+    -- is a fresh chance for the rows to be there this time. The measured forms
+    -- themselves are a client property and survive.
+    Filters.Conv(surface).darkProbes = nil
     Filters.ClearNative(surface)
     Filters._prof = Filters._prof or {}
     Filters._prof[surface] = Filters.ProfessionName(surface)
@@ -683,6 +1030,9 @@ end
 -- A filter that means something for tailoring means nothing for cooking.
 function Filters.OnWindowUpdate(surface)
     if not (Filters._state and Filters._state[surface]) then return false end
+    -- Our own probe echoes back as updates. Re-entering here mid-measurement
+    -- would measure the measurement.
+    if Filters._probing and Filters._probing[surface] then return false end
     local now = Filters.ProfessionName(surface)
     local was = Filters._prof and Filters._prof[surface]
     if now and was and now ~= was then
@@ -691,7 +1041,39 @@ function Filters.OnWindowUpdate(surface)
         return true
     end
     if now and not was and Filters._prof then Filters._prof[surface] = now end
-    return false
+
+    return Filters.Settle(surface)
+end
+
+-- THE SETTLE. The clear that ran on SHOW may have measured a window whose rows
+-- had not arrived, where every candidate scores zero and the winner is
+-- arbitrary. That answer is unearned, so it is marked unsettled and asked again
+-- — on the next window update, and on each rung of the capture layer's retry
+-- ladder, because a window whose rows arrive without an event has no update to
+-- ride on.
+--
+-- It latches: once a measurement has been taken against a window that had rows,
+-- `settled` is true and this cannot become a loop.
+function Filters.Settle(surface)
+    if not (Filters._state and Filters._state[surface]) then return false end
+    if Filters._probing and Filters._probing[surface] then return false end
+    local conv = Filters.Conv(surface)
+    if conv.settled then return false end
+    if Filters.Narrowed(Filters._state[surface]) then return false end
+    -- A probe taken against an empty enumeration is a probe in the dark, and
+    -- there are only so many of those per window session. Four is enough to
+    -- cover the first four rungs of the capture layer's ladder — about two
+    -- seconds, which is longer than a trade-skill list packet takes to arrive on
+    -- any connection worth waiting for — and it is a hard stop, so a window that
+    -- genuinely has nothing in it stops being asked.
+    if (conv.darkProbes or 0) >= Filters.MAX_DARK_PROBES
+       and (Filters.RowCount(surface) or 0) <= 0 then
+        return false
+    end
+    Filters.ClearNative(surface)
+    if not conv.settled then return false end       -- still nothing to count
+    Filters.CaptureSoon(surface)
+    return true
 end
 
 -- Watch the OBJECT, not only the event (CLIENT_ASYNC_LESSONS class 2): a UI that
@@ -791,6 +1173,13 @@ function Filters.Teardown()
     Filters._state     = nil
     Filters._prof      = nil
     Filters._textTimer = nil
+    Filters._probing   = nil
+    -- The measured conventions go too. They describe a client we are no longer
+    -- talking to, and a form remembered across a teardown is the sticky
+    -- calibration class 5 warns about wearing a different hat.
+    Filters._conv      = nil
+    Filters._unhonored = nil
+    Filters._redrawFn  = nil
     return true
 end
 
@@ -814,6 +1203,23 @@ ns:RegisterDebugCommand("proffilters", function()
     ns:Print(string.format("  activated=%s | cpf=%s | panels=%s",
         tostring(Filters._activated), tostring(Filters.ProbeCPF().cpfLoaded),
         tostring(Filters._panels ~= nil)))
+    -- WHAT THIS CLIENT ACTUALLY HONORS, as measured rather than as assumed.
+    -- This is the readout that answers the question P3 could only flag.
+    for _, surface in ipairs(Filters.SURFACES) do
+        local conv = Filters._conv and Filters._conv[surface]
+        local bad  = Filters._unhonored and Filters._unhonored[surface]
+        local badList = {}
+        for key in pairs(bad or EMPTY) do badList[#badList + 1] = key end
+        table.sort(badList)
+        ns:Print(string.format("  %s conventions: subAll=%s subPick=%s slotAll=%s slotPick=%s"
+            .. " | interfere=%s | redraw=%s | rows=%s%s", surface,
+            Filters.FormName(conv and conv.subAll), Filters.FormName(conv and conv.subPick),
+            Filters.FormName(conv and conv.slotAll), Filters.FormName(conv and conv.slotPick),
+            tostring((conv and conv.interfere) and true or false),
+            tostring((Filters._redrawFn and Filters._redrawFn[surface]) or "NOT FOUND"),
+            tostring(Filters.RowCount(surface) or "?"),
+            (#badList > 0) and (" | NOT HONORED: " .. table.concat(badList, ",")) or ""))
+    end
 end)
 
 ----------------------------------------------------------------------
@@ -1153,6 +1559,23 @@ local function testCaptureInterlock(fails)
         _G.TradeSkillOnlyShowMakeable(false)
         ck(P.ViewNarrowed(TRADESKILL) == false,
            "the guard latched on after have-materials was cleared")
+
+        -- (6) ...and the client's own SKILL-UPS box, which hides most of a maxed
+        --     character's list, has a getter and was invisible until the live
+        --     miss made the cost of a missing witness plain.
+        local savedUps, savedGetUps = _G.TradeSkillOnlyShowSkillUps, _G.GetOnlyShowSkillUps
+        local ups = false
+        _G.TradeSkillOnlyShowSkillUps = function(v) ups = v and true or false end
+        _G.GetOnlyShowSkillUps = function() return ups end
+        _G.TradeSkillOnlyShowSkillUps(true)
+        ck(P.ViewNarrowed(TRADESKILL) == true,
+           "Blizzard's own skill-ups-only tick was invisible to the capture; the "
+           .. "known set would have been truncated to the recipes that still level")
+        Filters.ClearNative(TRADESKILL)
+        ck(ups == false, "the window clear left the skill-ups box engaged, which is a "
+           .. "refusal nothing in this file could ever lift")
+        ck(P.ViewNarrowed(TRADESKILL) == false, "the skill-ups guard latched on")
+        _G.TradeSkillOnlyShowSkillUps, _G.GetOnlyShowSkillUps = savedUps, savedGetUps
     end)
 
     sim:restore()
@@ -1163,6 +1586,420 @@ local function testCaptureInterlock(fails)
     Filters._state = savedState
     P.ClearViewGuards()
     if not ok then fails[#fails + 1] = "error in interlock fixtures: " .. tostring(err) end
+end
+
+----------------------------------------------------------------------
+-- THE CONVENTION SUITE — what the client HONORS, not what we hoped
+--
+-- Wave P3's filter controls were reported broken in both directions on a live
+-- 11509 client: the search box appeared to do nothing and the category picker
+-- did not narrow. Both symptoms trace to things this file could not know and
+-- assumed anyway — the argument convention of the two picker setters, and
+-- whether setting a server-side filter repaints the window.
+--
+-- So the fixture below is a client whose picker setters share ONE filter record,
+-- which is the shape that produces the reported defect, and it is instantiated
+-- under three different argument conventions. The point is not that one of them
+-- is the real 11509 (we cannot know that from here). The point is that the
+-- shipped code must come out right under ALL of them, because that is what
+-- "measured rather than assumed" has to mean to be worth anything.
+--
+-- Each leg carries a RED CONTROL: the pre-fix call sequence, replayed against
+-- the same client, reproducing the owner's symptom.
+----------------------------------------------------------------------
+
+-- The list every convention leg filters. Two categories, two slots, one row with
+-- no materials, so every dimension has something to bite on.
+local function convFixture()
+    return {
+        { kind = "header", name = "Weapons" },
+        { kind = "recipe", name = "Arcanite Reaper", avail = 1, sub = 1, slot = 1 },
+        { kind = "recipe", name = "Iron Sword",      avail = 0, sub = 1, slot = 1 },
+        { kind = "header", name = "Armor" },
+        { kind = "recipe", name = "Iron Shield",     avail = 2, sub = 2, slot = 2 },
+        { kind = "recipe", name = "Arcanite Plate",  avail = 1, sub = 2, slot = 2 },
+        { kind = "recipe", name = "Copper Chain",    avail = 3, sub = 2, slot = 2 },
+    }
+end
+
+-- A client whose two picker setters write the SAME three-field filter record.
+--
+--   "triple"    set(index, listAllSub, listAllSlot); a missing flag reads as 0,
+--               i.e. "do not list all" — the unforgiving reading, and the one
+--               under which a bare set(0) narrows the window to nothing.
+--   "inverted"  the same three fields with the flag polarity the other way, so
+--               the exact call P3 shipped as its blind CLEAR empties the list.
+--   "indexonly" one argument, 0 means all, extra arguments ignored, and neither
+--               setter touches the other's field.
+local function newConventionSim(convention, rows)
+    local G = _G
+    local sim = { rows = rows or convFixture(), saved = {}, redraws = 0, convention = convention }
+    sim.f = { text = "", makeable = false, sub = 0, slot = 0,
+              allSub = true, allSlot = true }
+
+    function sim.visible()
+        local out, pending = {}, nil
+        local f = sim.f
+        for i = 1, #sim.rows do
+            local row = sim.rows[i]
+            if row.kind == "header" then
+                pending = row
+            else
+                local keep = true
+                if Filters.Trim(f.text) ~= "" and not Filters.TextMatches(row.name, f.text) then
+                    keep = false
+                end
+                if f.makeable and (tonumber(row.avail) or 0) <= 0 then keep = false end
+                if not f.allSub and (tonumber(row.sub) or 0) ~= f.sub then keep = false end
+                if not f.allSlot and (tonumber(row.slot) or 0) ~= f.slot then keep = false end
+                if keep then
+                    if pending then out[#out + 1] = pending pending = nil end
+                    out[#out + 1] = row
+                end
+            end
+        end
+        return out
+    end
+
+    local function setPicker(field, index, a, b)
+        local f = sim.f
+        f[field] = tonumber(index) or 0
+        if convention == "indexonly" then
+            if field == "sub" then f.allSub = (f.sub == 0) else f.allSlot = (f.slot == 0) end
+        elseif convention == "inverted" then
+            f.allSub  = (a ~= 1)
+            f.allSlot = (b ~= 1)
+        else                                       -- "triple"
+            f.allSub  = (a == 1)
+            f.allSlot = (b == 1)
+        end
+    end
+
+    function sim:install()
+        local s = sim.saved
+        s.num, s.info, s.link = G.GetNumTradeSkills, G.GetTradeSkillInfo, G.GetTradeSkillRecipeLink
+        s.line, s.setText, s.getText = G.GetTradeSkillLine,
+            G.SetTradeSkillItemNameFilter, G.GetTradeSkillItemNameFilter
+        s.makeable, s.getMakeable = G.TradeSkillOnlyShowMakeable, G.GetOnlyShowMakeable
+        s.setSub, s.subs = G.SetTradeSkillSubClassFilter, G.GetTradeSkillSubClasses
+        s.setSlot, s.slots = G.SetTradeSkillInvSlotFilter, G.GetTradeSkillInvSlots
+        s.frame, s.update = G.TradeSkillFrame, G.TradeSkillFrame_Update
+
+        G.GetNumTradeSkills = function() return #sim.visible() end
+        G.GetTradeSkillInfo = function(i)
+            local row = sim.visible()[i]
+            if not row then return nil end
+            return row.name, (row.kind == "header") and "header" or "optimal", row.avail or 0, false
+        end
+        G.GetTradeSkillRecipeLink = function() return nil end
+        G.GetTradeSkillLine = function() return "Blacksmithing", 275, 300 end
+        G.SetTradeSkillItemNameFilter = function(t) sim.f.text = t or "" end
+        G.GetTradeSkillItemNameFilter = function() return sim.f.text end
+        G.TradeSkillOnlyShowMakeable = function(v) sim.f.makeable = v and true or false end
+        G.GetOnlyShowMakeable = function() return sim.f.makeable end
+        G.SetTradeSkillSubClassFilter  = function(i, a, b) setPicker("sub", i, a, b) end
+        G.SetTradeSkillInvSlotFilter   = function(i, a, b) setPicker("slot", i, a, b) end
+        G.GetTradeSkillSubClasses = function() return { "Weapon", "Armor" } end
+        G.GetTradeSkillInvSlots   = function() return { "Head", "Chest" } end
+        G.TradeSkillFrame = {}
+        -- THE DISPLAY. The client only repaints when its own update runs, which
+        -- is why a filter that works can still look like a filter that does not.
+        sim.displayed = sim.visible()
+        G.TradeSkillFrame_Update = function()
+            sim.redraws = sim.redraws + 1
+            sim.displayed = sim.visible()
+        end
+    end
+
+    function sim:restore()
+        local s = sim.saved
+        G.GetNumTradeSkills, G.GetTradeSkillInfo = s.num, s.info
+        G.GetTradeSkillRecipeLink, G.GetTradeSkillLine = s.link, s.line
+        G.SetTradeSkillItemNameFilter, G.GetTradeSkillItemNameFilter = s.setText, s.getText
+        G.TradeSkillOnlyShowMakeable, G.GetOnlyShowMakeable = s.makeable, s.getMakeable
+        G.SetTradeSkillSubClassFilter, G.GetTradeSkillSubClasses = s.setSub, s.subs
+        G.SetTradeSkillInvSlotFilter, G.GetTradeSkillInvSlots = s.setSlot, s.slots
+        G.TradeSkillFrame, G.TradeSkillFrame_Update = s.frame, s.update
+    end
+
+    return sim
+end
+
+-- THE RED CONTROL: wave P3's ApplyNative, exactly as it shipped. The judgement
+-- call is in the last four lines — an unverified "show all" convention passed
+-- blind, and a slot call that lands AFTER the subclass call and overwrites the
+-- flag the subclass call had just set.
+local function prefixApplyNative(state)
+    local G = _G
+    if G.SetTradeSkillItemNameFilter then
+        pcall(G.SetTradeSkillItemNameFilter, Filters.Trim(state.text))
+    end
+    if G.TradeSkillOnlyShowMakeable then
+        pcall(G.TradeSkillOnlyShowMakeable, state.makeable and true or false)
+    end
+    local i = tonumber(state.subclass) or 0
+    if i > 0 then pcall(G.SetTradeSkillSubClassFilter, i, 0, 1)
+    else pcall(G.SetTradeSkillSubClassFilter, 0, 1, 1) end
+    local j = tonumber(state.slot) or 0
+    if j > 0 then pcall(G.SetTradeSkillInvSlotFilter, j, 0, 1)
+    else pcall(G.SetTradeSkillInvSlotFilter, 0, 1, 1) end
+    -- ...and no repaint at all, which is the other half of the report.
+end
+
+local function testNativeConventions(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+
+    local function freshState(mut)
+        local st = Filters.NewState()
+        if mut then mut(st) end
+        return st
+    end
+
+    local function reset()
+        Filters._conv, Filters._unhonored, Filters._probing = nil, nil, nil
+        Filters._redrawFn, Filters._toldUnhonored = nil, nil
+    end
+
+    local savedConv = { Filters._conv, Filters._unhonored, Filters._probing,
+                        Filters._redrawFn, Filters._toldUnhonored }
+
+    local ok, err = pcall(function()
+        -- ══ (1) THE SHARED-RECORD CLIENT: the category picker report ═════════
+        do
+            local sim = newConventionSim("triple")
+            sim:install()
+            reset()
+            local full = _G.GetNumTradeSkills()
+            ck(full == 7, "the fixture did not start unfiltered (" .. full .. " rows)")
+
+            -- RED: P3's sequence. The subclass call narrows and the slot call,
+            -- one line later, hands the flag back — the list is full again. This
+            -- is "selecting a category doesnt filter the recipes correctly",
+            -- reproduced.
+            prefixApplyNative(freshState(function(st) st.subclass = 1 end))
+            ck(_G.GetNumTradeSkills() == full,
+               "RED CONTROL DID NOT REPRODUCE: the pre-fix sequence narrowed the "
+               .. "category after all — the fixture no longer models the defect")
+
+            -- GREEN: measured. The winning form is found by trying and counting.
+            reset()
+            Filters.ApplyNative(TRADESKILL, freshState(function(st) st.subclass = 1 end))
+            ck(_G.GetNumTradeSkills() == 3,
+               "the measured category filter left " .. _G.GetNumTradeSkills()
+               .. " rows, expected 3 (one header + two weapons)")
+            ck(Filters._conv[TRADESKILL].subPick ~= nil,
+               "the category form was applied without being recorded")
+
+            -- The SLOT picker's winning form is a DIFFERENT one — the two flags
+            -- are not interchangeable, which is exactly the assumption that
+            -- shipped. A single hard-coded convention cannot satisfy both.
+            reset()
+            Filters.ApplyNative(TRADESKILL, freshState(function(st) st.slot = 2 end))
+            ck(_G.GetNumTradeSkills() == 4,
+               "the measured slot filter left " .. _G.GetNumTradeSkills()
+               .. " rows, expected 4 (one header + three armor)")
+
+            -- Both at once still composes.
+            reset()
+            Filters.ApplyNative(TRADESKILL, freshState(function(st)
+                st.subclass = 2 st.slot = 2 end))
+            ck(_G.GetNumTradeSkills() == 4,
+               "category AND slot together left " .. _G.GetNumTradeSkills() .. " rows, expected 4")
+
+            -- Clearing goes all the way back.
+            Filters.ClearNative(TRADESKILL)
+            ck(_G.GetNumTradeSkills() == full,
+               "the measured clear did not restore the full list (" ..
+               _G.GetNumTradeSkills() .. "/" .. full .. ")")
+            sim:restore()
+        end
+
+        -- ══ (2) THE INVERTED CLIENT: the blind clear that empties the window ══
+        -- This is the hazard that made the whole judgement call dangerous rather
+        -- than merely wrong: the SAME call P3 used to guarantee an unfiltered
+        -- window narrows this client to nothing, and every capture behind it
+        -- then reads an empty list.
+        do
+            local sim = newConventionSim("inverted")
+            sim:install()
+            reset()
+            local full = _G.GetNumTradeSkills()
+
+            prefixApplyNative(freshState())          -- the pre-fix CLEAR
+            ck(_G.GetNumTradeSkills() == 0,
+               "RED CONTROL DID NOT REPRODUCE: the blind clear left "
+               .. _G.GetNumTradeSkills() .. " rows on the inverted client")
+
+            reset()
+            Filters.ClearNative(TRADESKILL)
+            ck(_G.GetNumTradeSkills() == full,
+               "the measured clear narrowed the window it was supposed to open ("
+               .. _G.GetNumTradeSkills() .. "/" .. full .. ") — a clear that can "
+               .. "narrow is the defect that took the capture layer down with it")
+            sim:restore()
+        end
+
+        -- ══ (3) THE INDEX-ONLY CLIENT: the same code, no flags sent ══════════
+        do
+            local sim = newConventionSim("indexonly")
+            sim:install()
+            reset()
+            local full = _G.GetNumTradeSkills()
+            Filters.ApplyNative(TRADESKILL, freshState(function(st) st.subclass = 1 end))
+            ck(_G.GetNumTradeSkills() == 3,
+               "the index-only client was not narrowed (" .. _G.GetNumTradeSkills() .. ")")
+            ck(Filters.FormName(Filters._conv[TRADESKILL].subPick) == "(i)",
+               "the index-only client was handed flags it never asked for ("
+               .. Filters.FormName(Filters._conv[TRADESKILL].subPick) .. ")")
+            Filters.ClearNative(TRADESKILL)
+            ck(_G.GetNumTradeSkills() == full, "the index-only clear did not restore the list")
+            sim:restore()
+        end
+
+        -- ══ (4) THE REPAINT: a filter nobody drew is a filter nobody has ═════
+        do
+            local sim = newConventionSim("triple")
+            sim:install()
+            reset()
+            local function displayedNames()
+                local out = {}
+                for i = 1, #sim.displayed do out[i] = sim.displayed[i].name end
+                return table.concat(out, ",")
+            end
+            local before = displayedNames()
+
+            -- RED: the pre-fix path filters the client and never repaints, so
+            -- the rows on screen are the rows from before. To the player that is
+            -- "typing into the search recipes doesnt return anything".
+            prefixApplyNative(freshState(function(st) st.text = "arcanite" end))
+            ck(displayedNames() == before,
+               "RED CONTROL DID NOT REPRODUCE: the display changed without a repaint")
+            ck(_G.GetNumTradeSkills() < 7,
+               "the client's own enumeration did not narrow, so the red control is "
+               .. "proving the wrong thing")
+
+            -- GREEN: the shipped path drives the client's own update.
+            reset()
+            Filters.ApplyNative(TRADESKILL, freshState(function(st) st.text = "arcanite" end))
+            ck(sim.redraws > 0, "the client's list-update was never called")
+            ck(displayedNames() == "Weapons,Arcanite Reaper,Armor,Arcanite Plate",
+               "the repainted list was '" .. displayedNames() .. "'")
+            ck(Filters._redrawFn[TRADESKILL] == "TradeSkillFrame_Update",
+               "the repaint function was not recorded for the diagnostics")
+
+            -- And a client with NO update function is recorded as such rather
+            -- than silently doing nothing.
+            _G.TradeSkillFrame_Update = nil
+            reset()
+            Filters.ApplyNative(TRADESKILL, freshState())
+            ck(Filters._redrawFn[TRADESKILL] == false,
+               "a client with no list-update was not recorded as such")
+            sim:restore()
+        end
+
+        -- ══ (5) A DIMENSION THE CLIENT WILL NOT HONOR IS NOT PRETENDED ═══════
+        do
+            local sim = newConventionSim("triple")
+            sim:install()
+            reset()
+            -- A client whose subclass setter is a no-op: nothing we can say
+            -- narrows it, so the control must stand down rather than sit there
+            -- looking engaged over an unfiltered list.
+            _G.SetTradeSkillSubClassFilter = function() end
+            local full = _G.GetNumTradeSkills()
+            Filters._state = { [TRADESKILL] = Filters.NewState() }
+            Filters.SetState(TRADESKILL, function(st) st.subclass = 1 end)
+            ck(_G.GetNumTradeSkills() == full,
+               "a no-op setter still produced a narrowed list")
+            ck(Filters._unhonored[TRADESKILL].subclass == true,
+               "an ignored dimension was not recorded as unhonored")
+            ck((Filters._state[TRADESKILL].subclass or 0) == 0,
+               "the picker kept a value the client never applied")
+            ck(Filters.ViewGuard(TRADESKILL) == false,
+               "a filter the client ignored still blocked the capture forever")
+            Filters._state = nil
+            sim:restore()
+        end
+
+        -- ══ (6) THE PROBE ITSELF IS INTERLOCKED ══════════════════════════════
+        -- Measuring means deliberately narrowing the client, so a capture that
+        -- read the list mid-probe would read a list we narrowed on purpose.
+        do
+            local sim = newConventionSim("triple")
+            sim:install()
+            reset()
+            local P = ns.Professions
+            local seen = {}
+            local savedSetSub = _G.SetTradeSkillSubClassFilter
+            _G.SetTradeSkillSubClassFilter = function(i, a, b)
+                seen[#seen + 1] = Filters.ViewGuard(TRADESKILL) and true or false
+                return savedSetSub(i, a, b)
+            end
+            Filters.ApplyNative(TRADESKILL, freshState(function(st) st.subclass = 1 end))
+            local allGuarded = #seen > 0
+            for i = 1, #seen do if not seen[i] then allGuarded = false end end
+            ck(allGuarded, "the client's filters were moved with the capture unguarded ("
+               .. #seen .. " calls) — a scan landing mid-probe would have written a "
+               .. "deliberately narrowed known set")
+            ck(Filters.ViewGuard(TRADESKILL) ~= true or Filters.Narrowed(
+                   Filters._state and Filters._state[TRADESKILL] or nil),
+               "the probing latch did not come back down")
+            if P and P.ViewNarrowedWhy then
+                local savedGuards = P._viewGuards
+                P.ClearViewGuards()
+                P.RegisterViewGuard(Filters.ViewGuard)
+                Filters._probing = { [TRADESKILL] = true }
+                local narrowed, why = P.ViewNarrowedWhy(TRADESKILL)
+                ck(narrowed == true and tostring(why):find("probing", 1, true) ~= nil,
+                   "the capture layer could not see the probe (" .. tostring(why) .. ")")
+                Filters._probing = nil
+                P._viewGuards = savedGuards
+            end
+            sim:restore()
+        end
+
+        -- ══ (7) THE WINDOW THAT OPENS EMPTY ══════════════════════════════════
+        -- The measurement is only worth what the window had to measure. A clear
+        -- that ran before the server's rows arrived scored every candidate at
+        -- zero and picked one arbitrarily; on a client where the arbitrary pick
+        -- narrows, living with that answer would hide the whole list the moment
+        -- it arrived. So the answer is marked unsettled and re-asked.
+        do
+            local sim = newConventionSim("triple")
+            local landed = false
+            sim:install()
+            reset()
+            local realNum = _G.GetNumTradeSkills
+            _G.GetNumTradeSkills = function() return landed and realNum() or 0 end
+
+            Filters._state = { [TRADESKILL] = Filters.NewState() }
+            Filters.ClearNative(TRADESKILL)                       -- measured in the dark
+            ck(Filters.Conv(TRADESKILL).settled ~= true,
+               "a measurement taken against an empty window claimed to be settled")
+
+            landed = true
+            Filters.OnWindowUpdate(TRADESKILL)                    -- the rows arrive
+            ck(Filters.Conv(TRADESKILL).settled == true,
+               "the settle never ran once the rows were there")
+            ck(_G.GetNumTradeSkills() == 7,
+               "the window that opened empty stayed narrowed after its rows landed ("
+               .. _G.GetNumTradeSkills() .. "/7) — the clear taken in the dark was kept")
+
+            -- ...and it does not keep re-asking.
+            local before = sim.redraws
+            Filters.OnWindowUpdate(TRADESKILL)
+            ck(sim.redraws == before, "the settle re-ran after it had already settled")
+
+            _G.GetNumTradeSkills = realNum
+            Filters._state = nil
+            sim:restore()
+        end
+    end)
+
+    reset()
+    Filters._conv, Filters._unhonored, Filters._probing = savedConv[1], savedConv[2], savedConv[3]
+    Filters._redrawFn, Filters._toldUnhonored = savedConv[4], savedConv[5]
+    if not ok then fails[#fails + 1] = "error in convention fixtures: " .. tostring(err) end
 end
 
 local function testInertness(fails)
@@ -1206,6 +2043,8 @@ function Filters.RunSelfTests(verbose)
     local suites = {
         { name = "pure model (state, narrowing, plain matching, stand-down)", fn = testPureModel },
         { name = "filter dimensions through the list model", fn = testDimensions },
+        { name = "native filter conventions, measured on three different clients",
+          fn = testNativeConventions },
         { name = "capture interlock (a filtered VIEW never becomes a filtered CAPTURE)",
           fn = testCaptureInterlock },
         { name = "inertness (off = no frame, no panel, no guard)", fn = testInertness },

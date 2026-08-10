@@ -4462,6 +4462,29 @@ function Store.ProfessionsReagents(create)
     return a and a.reagents or nil
 end
 
+-- The window-scan forensics ring (professions.lua's Trace). Additive, bounded
+-- and BUILD-STAMPED: rows written by a different addon build describe gates that
+-- may no longer exist, so the ring is dropped rather than mixed — a trace that
+-- silently blends two builds is worse than no trace, because the reader cannot
+-- tell which code produced which row. Lazily created like everything else in
+-- this area, so a disabled module still writes no saved-variable key.
+function Store.ProfessionsTrace(create, build)
+    local a = Store.ProfessionsArea(create)
+    if not a then return nil end
+    local t = a.scanTrace
+    if type(t) ~= "table" then
+        if not create then return nil end
+        t = { build = build, rows = {} }
+        a.scanTrace = t
+    end
+    if type(t.rows) ~= "table" then t.rows = {} end
+    if build ~= nil and t.build ~= build then
+        t.build = build
+        t.rows = {}
+    end
+    return t
+end
+
 -- Owner-wins-by-rev with a timestamp tiebreak — the same merge the inventory
 -- owners graph uses, and for the same reason: two inputs (our own capture and
 -- the mesh) count revisions independently and meet here.
