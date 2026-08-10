@@ -264,6 +264,11 @@ Professions.RETRY_LADDER = RETRY_LADDER
 local RETRYABLE = {
     ["cold"] = true, ["empty"] = true, ["incomplete"] = true, ["unresolved"] = true,
     ["row-error"] = true, ["unidentified"] = true, ["throttled"] = true,
+    -- A window whose collapsed headers could not be expanded (calls absent, or
+    -- the expand-all convention measured a no-op on this client). The rows are
+    -- still THERE server-side and the player can expand by hand, so re-asking
+    -- on the ladder is honest; writing the visible subset never is.
+    ["collapsed"] = true,
 }
 Professions.RETRYABLE = RETRYABLE
 
@@ -322,6 +327,8 @@ Professions._settled       = nil    -- profKey -> settled-signature record (sess
 Professions._stale         = nil    -- profKey -> true: a learning signal fired; next look is a FULL capture
 Professions._harvestJob    = nil    -- the in-flight chunked reagent harvest, if any
 Professions._harvestGen    = 0      -- supersession counter for harvest jobs
+Professions._collapseLatch = nil    -- surface -> true while OUR expand/collapse calls are echoing
+Professions._collapseWorld = nil    -- surface -> the last-witnessed collapse world (debug readout)
 
 ----------------------------------------------------------------------
 -- Enablement
@@ -1437,6 +1444,12 @@ function Professions.RecordAttempt(rec)
             -- its own tally so "247 settled, 1 ok" reads as the design working
             -- rather than as 247 of something going wrong.
             st.settled = (st.settled or 0) + 1
+        elseif rec.r == "settled-collapsed" then
+            -- The loop killer's verdict: a collapsed VIEW of the settled truth
+            -- was witnessed and declined to verify — deliberately, not as a
+            -- failure. Its own tally, so a player who lives with collapsed
+            -- headers reads as the design working, not as endless refusals.
+            st.settledc = (st.settledc or 0) + 1
         else
             st.reasons[rec.r or "?"] = (st.reasons[rec.r or "?"] or 0) + 1
         end
@@ -1447,10 +1460,12 @@ function Professions.RecordAttempt(rec)
     -- refusals off the end of the ring. Consecutive settled rows for the same
     -- profession collapse onto one row with a running count. The session and
     -- stored rings share row TABLES, so bumping the shared row updates both.
-    if rec.r == "settled" then
+    -- "settled-collapsed" coalesces for the same reason: a crafting spree in a
+    -- collapsed window answers it once per craft.
+    if rec.r == "settled" or rec.r == "settled-collapsed" then
         local ring = Professions._trace
         local last = ring and ring[#ring]
-        if last and last.r == "settled" and last.p == rec.p and last.s == rec.s then
+        if last and last.r == rec.r and last.p == rec.p and last.s == rec.s then
             last.c = (last.c or 1) + 1
             last.t = rec.t
             return true
@@ -1500,6 +1515,7 @@ function Professions.FormatTraceRow(rec)
     if rec.i ~= nil then parts[#parts + 1] = "ids=" .. tostring(rec.i) end
     if rec.u ~= nil and rec.u > 0 then parts[#parts + 1] = "unresolved=" .. tostring(rec.u) end
     if rec.res then parts[#parts + 1] = "res=" .. tostring(rec.res) end
+    if rec.w then parts[#parts + 1] = "collapse=" .. tostring(rec.w) end
     if rec.g then parts[#parts + 1] = "guard=" .. tostring(rec.g) end
     if rec.d then parts[#parts + 1] = "ladder=" .. tostring(rec.d) end
     if type(rec.x) == "table" then
@@ -1609,6 +1625,129 @@ function Professions.ViewNarrowed(surface)
     return narrowed
 end
 
+----------------------------------------------------------------------
+-- THE COLLAPSE WITNESS  (fix/professions-collapse)
+--
+-- The exposure this section closes: a window opened with COLLAPSED category
+-- headers enumerates fewer rows, every visible row resolves, nothing reads as
+-- missing — and a full scan of it would write the shortened set as the
+-- character's complete known-recipe list. The view guard cannot see it (no
+-- filter is engaged) and the completeness gate cannot see it (nothing visible
+-- failed). It is the view-filter lie arriving through a door nobody watched.
+--
+-- The witness: on this API family a header row reports its expanded state
+-- through the same info getter the row walk already calls — one return past
+-- numAvailable on the trade-skill surface, one further on the craft surface.
+-- The catalog (11509) carries NAMES ONLY, no signatures, so the position is
+-- never trusted raw: the value is accepted only when it is a BOOLEAN and only
+-- when it is COHERENT — a header that claims "collapsed" while its member rows
+-- are visibly enumerated right under it is not a witness, it is a client whose
+-- return layout we misread, and guessing there would wedge the capture. Any
+-- non-boolean or incoherent read files the whole window as "unreadable" and the
+-- capture falls back to expand-all-before-every-full-scan (blind, no restore —
+-- restoring needs a witness to know what to restore).
+--
+-- With a READABLE witness, a full scan of a collapsed window becomes:
+-- expand all (the index-0 convention, verified by MEASUREMENT — the call must
+-- actually clear the witnessed collapse, the way professions_filters.lua
+-- verifies its setter conventions) -> take the complete scan -> RESTORE the
+-- player's exact prior collapse set, per header, by name. A collapse that
+-- cannot be expanded is the refusal "collapsed" — retryable, never a shortened
+-- write. Our own expand/collapse calls echo back as window updates; the latch
+-- below keeps those echoes from re-entering the capture mid-flight.
+----------------------------------------------------------------------
+
+-- Fold the row walk's header observations into the scan evidence. Writes
+-- ev.clp (array of { i, name } for witnessed-collapsed headers, top to bottom)
+-- when every header's state is readable, or ev.cwit = "unreadable" when any is
+-- not. No headers => neither field: nothing can be collapsed.
+function Professions.FoldCollapseEvidence(ev, hdrs, hdrAt, n)
+    if type(ev) ~= "table" or type(hdrs) ~= "table" or #hdrs == 0 then return ev end
+    local clp = nil
+    for k = 1, #hdrs do
+        local h = hdrs[k]
+        if type(h.x) ~= "boolean" or type(h.name) ~= "string" then
+            -- Non-boolean: the return position did not answer the question on
+            -- this client. Nameless: even a true collapse could not be restored.
+            ev.cwit = "unreadable"
+            ev.clp = nil
+            return ev
+        end
+        if h.x == false then
+            if h.i < n and not hdrAt[h.i + 1] then
+                -- "Collapsed", yet the very next enumerated row is a member.
+                -- Incoherent — a real collapse hides its members — so the whole
+                -- witness is disqualified rather than half-trusted.
+                ev.cwit = "unreadable"
+                ev.clp = nil
+                return ev
+            end
+            clp = clp or {}
+            clp[#clp + 1] = { i = h.i, name = h.name }
+        end
+    end
+    ev.clp = clp
+    return ev
+end
+
+-- Every expand/collapse call WE issue makes the client rebuild its list and
+-- announce it (TRADE_SKILL_UPDATE / CRAFT_UPDATE). Handling our own echo as a
+-- capture opportunity mid-roundtrip would recurse into the capture that issued
+-- it. The latch is held only across the client call itself.
+local function withCollapseLatch(surface, fn)
+    Professions._collapseLatch = Professions._collapseLatch or {}
+    Professions._collapseLatch[surface] = true
+    local ok = pcall(fn)
+    Professions._collapseLatch[surface] = nil
+    return ok
+end
+
+-- Find the CURRENT row index of the header named `name`. Indexes shift every
+-- time a header collapses or expands, so a restore must never reuse the index
+-- the collapse was witnessed at — it re-finds by name, fresh, per call.
+local function findHeaderRow(surface, name)
+    local numFn, infoFn
+    if surface == "craft" then numFn, infoFn = GetNumCrafts, GetCraftInfo
+    else numFn, infoFn = GetNumTradeSkills, GetTradeSkillInfo end
+    if not (numFn and infoFn) then return nil end
+    local okN, n = pcall(numFn)
+    if not okN or type(n) ~= "number" then return nil end
+    for i = 1, n do
+        local nm, kind
+        if surface == "craft" then
+            local ok, a, _, c = pcall(infoFn, i)
+            if ok then nm, kind = a, c end
+        else
+            local ok, a, b = pcall(infoFn, i)
+            if ok then nm, kind = a, b end
+        end
+        if kind == "header" and nm == name then return i end
+    end
+    return nil
+end
+
+-- Re-collapse the player's prior collapse set, bottom-up (collapsing a header
+-- shifts only the indexes BELOW it, and the per-call re-find covers even that).
+-- Best effort by design: a header that vanished mid-restore is skipped, a
+-- window that closed stops the walk cold. Returns how many were restored.
+local function restoreCollapse(surface, names)
+    local collapseFn
+    if surface == "craft" then collapseFn = CollapseCraftSkillLine
+    else collapseFn = CollapseTradeSkillSubClass end
+    if not collapseFn or type(names) ~= "table" then return 0 end
+    local restored = 0
+    for k = #names, 1, -1 do
+        if not Professions.WindowIsOpen(surface) then break end
+        local i = findHeaderRow(surface, names[k])
+        if i then
+            withCollapseLatch(surface, function() collapseFn(i) end)
+            restored = restored + 1
+        end
+    end
+    return restored
+end
+Professions._restoreCollapse = restoreCollapse   -- the self-tests drive it directly
+
 function Professions.ScanTradeSkillWindow()
     -- Every exit carries the same shaped evidence table, so a refusal is as
     -- readable as a success: how many rows the client offered, how many resolved
@@ -1632,8 +1771,15 @@ function Professions.ScanTradeSkillWindow()
     local itemLinkFn = GetTradeSkillItemLink        -- catalog-verified at 11509
 
     local rows, ids, missed, via, names = {}, {}, 0, {}, {}
+    local hdrs, hdrAt = {}, {}
     for i = 1, n do
-        local ok, name, kind = pcall(GetTradeSkillInfo, i)
+        -- The 4th return rides the info read this loop already pays for: on this
+        -- API family a header row carries its expanded state there. The value is
+        -- WITNESSED, never assumed — anything non-boolean lands in the
+        -- "unreadable" world below, because the catalog carries names only and a
+        -- guessed collapse state wedges the capture in whichever direction the
+        -- guess was wrong.
+        local ok, name, kind, _, xpd = pcall(GetTradeSkillInfo, i)
         if not ok then return nil, "row-error", ev end
         names[i] = name                               -- the settled signature's per-row witness
         if kind ~= "header" then
@@ -1653,8 +1799,12 @@ function Professions.ScanTradeSkillWindow()
                 missed = missed + 1
                 if not ev.sample then ev.sample = Professions.MissSample(name, rl, il) end
             end
+        else
+            hdrAt[i] = true
+            hdrs[#hdrs + 1] = { i = i, name = name, x = xpd }
         end
     end
+    Professions.FoldCollapseEvidence(ev, hdrs, hdrAt, n)
     ev.ids, ev.missed = #ids, missed
     ev.res = Professions.SummarizeVia(via)
     if #ids == 0 then return nil, "unresolved", ev end
@@ -1701,10 +1851,18 @@ function Professions.ScanCraftWindow()
     local itemLinkFn = GetCraftItemLink
 
     local rows, ids, missed, via, names = {}, {}, 0, {}, {}
+    local hdrs, hdrAt = {}, {}
     for i = 1, n do
-        local ok, name, _, kind = pcall(GetCraftInfo, i)
+        -- Same collapse witness as the trade-skill surface, one return further
+        -- along: this getter answers (name, subSpell, type, numAvailable,
+        -- isExpanded). Non-boolean => unreadable, never a guess.
+        local ok, name, _, kind, _, xpd = pcall(GetCraftInfo, i)
         if not ok then return nil, "row-error", ev end
         names[i] = name                               -- the settled signature's per-row witness
+        if kind == "header" then
+            hdrAt[i] = true
+            hdrs[#hdrs + 1] = { i = i, name = name, x = xpd }
+        end
         if kind ~= "header" then
             local okL, rl = pcall(GetCraftRecipeLink, i)
             rl = okL and rl or nil
@@ -1724,6 +1882,7 @@ function Professions.ScanCraftWindow()
             end
         end
     end
+    Professions.FoldCollapseEvidence(ev, hdrs, hdrAt, n)
     ev.ids, ev.missed = #ids, missed
     ev.res = Professions.SummarizeVia(via)
     if #ids == 0 then return nil, "unresolved", ev end
@@ -1809,8 +1968,13 @@ end
 --     Learning a recipe INSERTS a row: the count changes, and every row at or
 --     after the insertion point changes name. There is no edit of the recipe
 --     list that leaves both the count and the full ordered name sequence
---     intact. A collapsed header, a narrowed view that slipped past the guard,
---     a client that reordered its list — all of them move names or counts.
+--     intact. A narrowed view that slipped past the guard, a client that
+--     reordered its list — they move names or counts. A COLLAPSED header moves
+--     them too, but in a shape the verify can PROVE is only a collapse
+--     (fix/professions-collapse): that one shape earns the distinct
+--     "settled-collapsed" verdict instead of a drift-forced rescan, because
+--     rescanning a restored-collapsed window would loop forever. See
+--     VerifySettled's second verdict.
 --   * the window's own skill line (name, rank, maxRank). A rank-up changes
 --     `rank`; a different profession in the same window changes `name`.
 --   * the LIVE record must already hold the bitmap the skip preserves (same
@@ -1956,6 +2120,29 @@ end
 -- THE VERIFY. Returns the settled record when — and only when — every
 -- component of the live window matches it, or nil. Cost: one GetNum*, one
 -- line read, and one info read per row. Nothing else. Every doubt is nil.
+--
+-- SECOND VERDICT (fix/professions-collapse, the loop killer): a window whose
+-- enumeration is SHORTER than the record can be a collapsed VIEW of the very
+-- truth the record holds — the player collapsed some headers, hiding exactly
+-- those headers' member rows and nothing else. That is not drift and must not
+-- be answered as drift: the full path would expand the window to rescan and
+-- then restore the collapse, the restore's echo would look shorter again, and
+-- expand->shrink->"drift"->rescan->expand would flicker forever. So when every
+-- visible row is proven to be the record's row sequence with witnessed-
+-- collapsed headers' members removed — header names matching, member runs
+-- skipped only under a header whose own state reads boolean-false — the verify
+-- DECLINES rather than fails: it returns the record with the verdict
+-- "collapsed" and the caller stays settled, leaving staleness to the learning
+-- events and the manual rescan. The proof needs the witness, so any
+-- non-boolean header state in the shortened window is nil (drift semantics —
+-- honest, and the full path's blind expand answers it).
+--
+-- Returns: rec                              -- exact match
+--          rec, "collapsed", visRows, n     -- collapsed view; visRows is the
+--                                              visible rows' proven index->spell
+--                                              mapping (cooldown license), n the
+--                                              visible row count
+--          nil                              -- everything else
 function Professions.VerifySettled(surface)
     if not Professions.CaptureAllowed() then return nil end
     local numFn, infoFn, lineFn
@@ -1975,27 +2162,66 @@ function Professions.VerifySettled(surface)
     if rank ~= rec.l or maxRank ~= rec.m then return nil end    -- rank drift => full
 
     local okN, n = pcall(numFn)
-    if not okN or type(n) ~= "number" or n ~= rec.n then return nil end
+    if not okN or type(n) ~= "number" or n <= 0 then return nil end
+    if n > rec.n then return nil end          -- collapse only ever SHRINKS: this is drift
 
     -- The live record must already carry what the skip preserves.
     local cur = Professions._live and Professions._live.p and Professions._live.p[rec.prof]
     if not (cur and cur.k ~= nil and cur.n == rec.known) then return nil end
 
-    for i = 1, n do
-        local name, isHeader
-        if surface == "craft" then
-            local ok, nm, _, kind = pcall(infoFn, i)
-            if not ok then return nil end
-            name, isHeader = nm, (kind == "header")
-        else
-            local ok, nm, kind = pcall(infoFn, i)
-            if not ok then return nil end
-            name, isHeader = nm, (kind == "header")
+    if n == rec.n then
+        for i = 1, n do
+            local name, isHeader
+            if surface == "craft" then
+                local ok, nm, _, kind = pcall(infoFn, i)
+                if not ok then return nil end
+                name, isHeader = nm, (kind == "header")
+            else
+                local ok, nm, kind = pcall(infoFn, i)
+                if not ok then return nil end
+                name, isHeader = nm, (kind == "header")
+            end
+            if type(name) ~= "string" or name ~= rec.names[i] then return nil end
+            if isHeader == (rec.rows[i] ~= nil) then return nil end -- shape drifted
         end
-        if type(name) ~= "string" or name ~= rec.names[i] then return nil end
-        if isHeader == (rec.rows[i] ~= nil) then return nil end -- shape drifted
+        return rec
     end
-    return rec
+
+    -- n < rec.n: the collapsed-view walk. Two pointers — `i` over the visible
+    -- rows, `j` over the record — and the ONLY licensed skip is a member run
+    -- directly under a header whose expanded state reads boolean false.
+    local j = 1
+    local visRows, sawCollapsed = nil, false
+    for i = 1, n do
+        local name, isHeader, xpd
+        if surface == "craft" then
+            local ok, nm, _, kind, _, x = pcall(infoFn, i)
+            if not ok then return nil end
+            name, isHeader, xpd = nm, (kind == "header"), x
+        else
+            local ok, nm, kind, _, x = pcall(infoFn, i)
+            if not ok then return nil end
+            name, isHeader, xpd = nm, (kind == "header"), x
+        end
+        if type(name) ~= "string" or j > rec.n then return nil end
+        if isHeader then
+            if rec.rows[j] ~= nil or rec.names[j] ~= name then return nil end
+            j = j + 1
+            if type(xpd) ~= "boolean" then return nil end   -- no witness, no license
+            if xpd == false then
+                sawCollapsed = true
+                while j <= rec.n and rec.rows[j] ~= nil do j = j + 1 end
+            end
+        else
+            if rec.rows[j] == nil or rec.names[j] ~= name then return nil end
+            visRows = visRows or {}
+            visRows[#visRows + 1] = { i = i, spell = rec.rows[j] }
+            j = j + 1
+        end
+    end
+    if j ~= rec.n + 1 then return nil end     -- the record was not fully accounted for
+    if not sawCollapsed then return nil end   -- shorter with nothing collapsed: real drift
+    return rec, "collapsed", visRows, n
 end
 
 -- Build the record off a proven-complete scan. Conservative: a scan that could
@@ -2043,9 +2269,17 @@ end
 -- row's cooldown, through the same proof-gated fold a full scan uses. The
 -- pseudo-scan is licensed by the row-for-row name verification that just
 -- passed. Returns changed(bool), consumed(bool).
-function Professions.SettledCooldownPass(rec, stamp)
+--
+-- `rowsArr` (optional) narrows the pass to a VERIFIED SUBSET of the record's
+-- rows — the collapsed-view verdict hands its visible rows here, because the
+-- hidden rows' indexes name nothing in the current enumeration. The partial
+-- fold stays honest: FoldCooldowns only PROVES the keys its rows witness, so a
+-- hidden recipe's cooldown is left alone rather than "proven ready" — and a
+-- shared-group cooldown (the transmutes) is witnessed by ANY visible member,
+-- because sharing is the group's whole meaning.
+function Professions.SettledCooldownPass(rec, stamp, rowsArr)
     local pseudo = { complete = true, surface = rec.surface,
-                     rows = Professions.SettledRowsArray(rec) }
+                     rows = rowsArr or Professions.SettledRowsArray(rec) }
     local running, proven = Professions.FoldCooldowns(pseudo, stamp)
     if not (running and proven) then return false, false end
     local L = Professions._live
@@ -2746,7 +2980,17 @@ end
 -- has nothing to coalesce.
 function Professions.CaptureWindow(surface, force, event)
     if not Professions.IsEnabled() then return false, "disabled" end
+    -- Our own expand/restore calls echo back as window updates — synchronously
+    -- on some clients, a frame later on others. Re-entering the capture from
+    -- inside its own roundtrip would scan a half-mutated window and (worse)
+    -- recurse. Self-inflicted, so it gets neither ring space nor a ladder rung:
+    -- the roundtrip that caused it records its own verdict.
+    if Professions._collapseLatch and Professions._collapseLatch[surface] then
+        return false, "collapse-echo"
+    end
     event = event or (force and "forced" or "update")
+
+    local wWorld = nil     -- which collapse world this attempt moved through (trace)
 
     local function refuse(reason, ev, guard)
         Professions.RecordAttempt({
@@ -2757,7 +3001,7 @@ function Professions.CaptureWindow(surface, force, event)
             -- that DID resolve: an "incomplete" that resolved 164 by name and
             -- missed one is a different diagnosis from one that resolved none.
             res = ev and ev.res, x = ev and ev.sample,
-            g = guard, d = Professions.RetryState(surface),
+            w = wWorld, g = guard, d = Professions.RetryState(surface),
         })
         Professions.ScheduleRetry(surface, reason)
         return false, reason
@@ -2776,7 +3020,30 @@ function Professions.CaptureWindow(surface, force, event)
     -- AND the profession is not stale; every doubt falls through to the full
     -- path below. A manual rescan (event "rescan") never consults it.
     if event ~= "rescan" then
-        local rec = Professions.VerifySettled(surface)
+        local rec, view, visRows, nVis = Professions.VerifySettled(surface)
+        if rec and view == "collapsed" then
+            -- THE LOOP KILLER (fix/professions-collapse). The shorter
+            -- enumeration is a collapsed VIEW of the settled truth, proven row
+            -- for row — EXPECTED, not drift. Verification is declined but the
+            -- profession STAYS SETTLED: no rescan, no expand, no flicker.
+            -- Staleness still belongs to the learning/rank-up events and the
+            -- manual rescan, both of which bypass this verdict entirely.
+            Professions.CancelRetry(surface)
+            Professions.RecordAttempt({
+                e = event, s = surface, f = force and true or nil, p = rec.prof,
+                r = "settled-collapsed", n = nVis, g = guardWhy, d = "cleared",
+            })
+            -- Cooldowns still publish off the VISIBLE rows — their mapping was
+            -- just proven, and a hidden row's key is simply not proven either
+            -- way. No harvest here: its indexes would name hidden rows.
+            local changed, consumed = false, false
+            if visRows and #visRows > 0 then
+                changed, consumed = Professions.SettledCooldownPass(
+                    rec, nowEpoch(), visRows)
+            end
+            if changed then Professions.MarkDirty(consumed) end
+            return true, rec.prof, consumed
+        end
         if rec then
             Professions.CancelRetry(surface)
             Professions.RecordAttempt({
@@ -2804,23 +3071,117 @@ function Professions.CaptureWindow(surface, force, event)
         return refuse("throttled", nil, guardWhy)
     end
 
-    local scan, why, ev
-    if surface == "craft" then scan, why, ev = Professions.ScanCraftWindow()
-    else scan, why, ev = Professions.ScanTradeSkillWindow() end
+    local function doScan()
+        if surface == "craft" then return Professions.ScanCraftWindow() end
+        return Professions.ScanTradeSkillWindow()
+    end
+    local scan, why, ev = doScan()
+
+    -- ══ THE COLLAPSE GATE (fix/professions-collapse) ═══════════════════════
+    -- Runs on the scan's collapse EVIDENCE, whatever its verdict was: a
+    -- collapsed window can produce a scan that looks complete (the lie this
+    -- branch exists to stop) or a refusal that expanding may heal.
+    local expandFn, numFn
+    if surface == "craft" then expandFn, numFn = ExpandCraftSkillLine, GetNumCrafts
+    else expandFn, numFn = ExpandTradeSkillSubClass, GetNumTradeSkills end
+    -- "Closed" here means the client SAID so (the tri-state latch's false) —
+    -- a surface never latched this session still captures, as it always has.
+    local function windowVanished()
+        return (Professions._windowOpen and Professions._windowOpen[surface]) == false
+    end
+    local restoreNames = nil       -- the player's collapse set, top to bottom
+
+    if ev and ev.cwit == "unreadable" then
+        -- THE WITNESS-UNREADABLE WORLD: this client's info getter does not
+        -- answer the expanded-state question where we can read it. Honesty
+        -- fallback: expand all before every full scan and LEAVE it expanded —
+        -- with no witness there is no knowing what to restore. Mild UI
+        -- rudeness, recorded (collapse=blind* in the trace), never a lie.
+        if expandFn then
+            wWorld = "blind"
+            withCollapseLatch(surface, function() expandFn(0) end)
+            if windowVanished() then return refuse("window-closed", ev, guardWhy) end
+            -- Measured, not assumed: only a call that MOVED the enumeration
+            -- earns the second walk.
+            local okN2, n2 = pcall(numFn)
+            if okN2 and type(n2) == "number" and n2 ~= (ev.n or 0) then
+                wWorld = "blind-grew"
+                scan, why, ev = doScan()
+            end
+        else
+            -- No witness AND no expand call: nothing this client lets us do.
+            -- The pre-fix world, named out loud in the trace.
+            wWorld = "blind-dark"
+        end
+        Professions._collapseWorld = Professions._collapseWorld or {}
+        Professions._collapseWorld[surface] = wWorld
+    elseif ev and ev.clp and #ev.clp > 0 then
+        -- WITNESSED COLLAPSE at full-scan time: expand all, take the complete
+        -- scan, restore the player's exact prior collapse set afterwards.
+        Professions._collapseWorld = Professions._collapseWorld or {}
+        Professions._collapseWorld[surface] = "witnessed"
+        if not expandFn then
+            wWorld = "collapsed-dark"
+            return refuse("collapsed", ev, guardWhy)
+        end
+        restoreNames = {}
+        for k = 1, #ev.clp do restoreNames[k] = ev.clp[k].name end
+        withCollapseLatch(surface, function() expandFn(0) end)
+        if windowVanished() then
+            -- Mid-expand close: clean abort. Nothing was written, and there is
+            -- no restore against a window that is not there.
+            return refuse("window-closed", ev, guardWhy)
+        end
+        local scan2, why2, ev2 = doScan()
+        if ev2 and ev2.clp and #ev2.clp > 0 then
+            -- The expand-all convention MEASURED a no-op (or a partial) on this
+            -- client. Put back whatever did move, then refuse — "collapsed" is
+            -- retryable on the ladder, a shortened write never is.
+            local still = {}
+            for k = 1, #ev2.clp do still[ev2.clp[k].name] = true end
+            local moved = {}
+            for k = 1, #restoreNames do
+                if not still[restoreNames[k]] then moved[#moved + 1] = restoreNames[k] end
+            end
+            if #moved > 0 then restoreCollapse(surface, moved) end
+            wWorld = "expand-noop"
+            return refuse("collapsed", ev2, guardWhy)
+        end
+        if ev2 and ev2.cwit == "unreadable" then
+            -- The witness degraded between the two walks. Without it a restore
+            -- cannot be verified against anything: blind semantics from here —
+            -- leave expanded, say so.
+            restoreNames = nil
+            wWorld = "blind"
+        else
+            wWorld = "roundtrip"
+        end
+        if not scan2 then
+            -- Expanded and still refused (cold rows, unresolved, …). Give the
+            -- player their window back before the ladder takes over.
+            if restoreNames then restoreCollapse(surface, restoreNames) end
+            return refuse(why2, ev2, guardWhy)
+        end
+        scan, why, ev = scan2, why2, ev2
+    end
+
     if not scan then return refuse(why, ev, guardWhy) end
 
     Professions._scanAt = now
     Professions.CancelRetry(surface)
-    Professions.RecordAttempt({
+    local traceRec = {
         e = event, s = surface, f = force and true or nil, p = scan.profKey,
         r = "ok", n = ev and ev.n, i = ev and ev.ids, u = ev and ev.missed,
         res = ev and ev.res,           -- WHICH rung carried the scan (res=…)
-        g = guardWhy, d = "cleared",
-    })
+        w = wWorld, g = guardWhy, d = "cleared",
+    }
+    Professions.RecordAttempt(traceRec)
 
     local stamp = nowEpoch()
     Professions.ApplyScan(scan, stamp)
 
+    -- Cooldowns fold BEFORE any restore: the fold reads by the EXPANDED scan's
+    -- row indexes, and restoring first would shift them under it.
     local running, proven = Professions.FoldCooldowns(scan, stamp)
     local consumed = false
     if running and proven then
@@ -2830,6 +3191,9 @@ function Professions.CaptureWindow(surface, force, event)
 
     -- The full capture is the moment the settled signature is (re)taken and
     -- the staleness mark comes off: this scan just proved the current truth.
+    -- After a roundtrip the record is the scan CAPTURED AT FULL EXPANSION —
+    -- that is the whole point — and the collapsed view the restore re-creates
+    -- is answered by the verify's "collapsed" verdict, not by drift.
     if Professions._stale then Professions._stale[scan.profKey] = nil end
     local settledRec = Professions.BuildSettledRecord(scan)
     if settledRec then
@@ -2844,10 +3208,23 @@ function Professions.CaptureWindow(surface, force, event)
     -- or between two logins, or until the DATASET itself changes. The harvest
     -- runs once per profession per dataset stamp (store-persisted), is
     -- time-sliced across frames, and a manual rescan clears the stamp first.
-    if event == "rescan"
-       or (not Professions.HarvestStamped(scan.profKey)
-           and not (Professions._harvested and Professions._harvested[scan.profKey])) then
+    -- NOT after a roundtrip: the restore below shrinks the enumeration before
+    -- the first sliced chunk runs, its row indexes would name hidden rows, and
+    -- the job's own count guard would abort it anyway. The stamp stays absent
+    -- and the first expanded-window session completes it instead.
+    if not restoreNames
+       and (event == "rescan"
+            or (not Professions.HarvestStamped(scan.profKey)
+                and not (Professions._harvested and Professions._harvested[scan.profKey]))) then
         Professions.ScheduleHarvest(surface, scan.profKey, scan.rows, ev and ev.n)
+    end
+
+    -- THE RESTORE: the player's window goes back exactly as they left it, per
+    -- header, by name, bottom-up. Every collapse call echoes; the latch inside
+    -- keeps the echoes out of the capture.
+    if restoreNames then
+        local restored = restoreCollapse(surface, restoreNames)
+        traceRec.w = "roundtrip(" .. restored .. "/" .. #restoreNames .. ")"
     end
 
     Professions.MarkDirty(consumed)
@@ -3229,6 +3606,7 @@ function Professions.SetEnabled(on)
         -- honored again.
         Professions._settled, Professions._stale = nil, nil
         Professions._harvestJob = nil
+        Professions._collapseLatch, Professions._collapseWorld = nil, nil
         -- The forensics go too. They are session state describing a module that
         -- is no longer running, and a stats table that outlived its module would
         -- report attempts against a build path that is not there any more. The
@@ -3373,11 +3751,16 @@ ns:RegisterDebugCommand("professions", function()
     end
 
     -- Windows and ladders: the two pieces of state that decide whether another
-    -- attempt is coming at all.
+    -- attempt is coming at all. The collapse world names which client we are
+    -- on: "witnessed" (headers report their state, expand/restore roundtrips
+    -- work), "blind*" (state unreadable — every full scan expands and leaves
+    -- it that way), or unprobed (no full scan has met a header yet).
     for _, surface in ipairs({ "tradeskill", "craft" }) do
         local st = P.Stats("surface:" .. surface)
-        ns:Print(string.format("  %s window: open=%s | ladder %s%s", surface,
+        local world = P._collapseWorld and P._collapseWorld[surface]
+        ns:Print(string.format("  %s window: open=%s | ladder %s | collapse world %s%s", surface,
             tostring(P.WindowIsOpen(surface)), P.RetryState(surface),
+            tostring(world or "unprobed"),
             st and string.format(" | unattributed %d attempt(s), last %s",
                 st.attempts, tostring(st.lastReason or "?")) or ""))
     end
@@ -5552,6 +5935,566 @@ local function testSettledBudget(fails)
     if not ok then fails[#fails + 1] = "error in settled-budget fixtures: " .. tostring(err) end
 end
 
+----------------------------------------------------------------------
+-- THE COLLAPSE HONESTY SUITE  (fix/professions-collapse)
+--
+-- The exposure: a window opened with collapsed category headers enumerates
+-- fewer rows, every visible row resolves cleanly, and a full scan of it would
+-- write the shortened set as the character's complete known-recipe list. The
+-- RED CONTROL below reproduces exactly that with the pre-fix write path (scan
+-- then apply, no collapse gate) against a 165-recipe window showing 30 rows.
+--
+-- The sim models collapse the way the client does: a collapsed category
+-- enumerates only its header row, expand-all is the index-0 convention, and
+-- every expand/collapse call ECHOES a window update synchronously — the
+-- unkindest ordering, since it re-enters the module inside its own roundtrip.
+-- Profiles: "witnessed" (boolean header state), "unreadable" (the pre-boolean
+-- 1/nil convention), "noop-expand" (expand-all measured doing nothing), and
+-- "close-on-expand" (the player closes the window inside the expand).
+----------------------------------------------------------------------
+
+local function newCollapseSim(cats, profile)
+    local W = { cats = cats, profile = profile or "witnessed", cds = {},
+                count = { num = 0, info = 0, link = 0, expandAll = 0,
+                          expandOne = 0, collapse = 0 } }
+    local G = _G
+    local saved = {}
+
+    function W.visible()
+        local rows = {}
+        for c = 1, #W.cats do
+            local cat = W.cats[c]
+            rows[#rows + 1] = { kind = "header", name = cat.name, cat = cat }
+            if not cat.collapsed then
+                for r = 1, #cat.spells do
+                    rows[#rows + 1] = { kind = "recipe",
+                                        name = "Recipe " .. tostring(cat.spells[r]),
+                                        s = cat.spells[r] }
+                end
+            end
+        end
+        return rows
+    end
+
+    local function emit(event)
+        if Professions._onEvent then Professions._onEvent(nil, event) end
+    end
+    W.emit = emit
+
+    function W.zero()
+        for k in pairs(W.count) do W.count[k] = 0 end
+    end
+
+    function W.collapsedSet()
+        local out = {}
+        for c = 1, #W.cats do
+            if W.cats[c].collapsed then out[W.cats[c].name] = true end
+        end
+        return out
+    end
+
+    function W:install()
+        saved = {
+            num = G.GetNumTradeSkills, info = G.GetTradeSkillInfo,
+            link = G.GetTradeSkillRecipeLink, item = G.GetTradeSkillItemLink,
+            line = G.GetTradeSkillLine, cd = G.GetTradeSkillCooldown,
+            exp = G.ExpandTradeSkillSubClass, col = G.CollapseTradeSkillSubClass,
+            nameF = G.GetTradeSkillItemNameFilter, makeF = G.GetOnlyShowMakeable,
+            upsF = G.GetOnlyShowSkillUps,
+            rgN = G.GetTradeSkillNumReagents, rgI = G.GetTradeSkillReagentInfo,
+            rgL = G.GetTradeSkillReagentItemLink, rgM = G.GetTradeSkillNumMade,
+            unit = G.UnitName, realm = G.GetRealmName, full = G.UnitFullName,
+            daseeki = G.Daseeki,
+        }
+        G.GetNumTradeSkills = function()
+            W.count.num = W.count.num + 1
+            return #W.visible()
+        end
+        G.GetTradeSkillInfo = function(i)
+            W.count.info = W.count.info + 1
+            local row = W.visible()[i]
+            if not row then return nil end
+            if row.kind == "header" then
+                local x
+                if W.profile == "unreadable" then
+                    x = row.cat.collapsed and nil or 1        -- the 1/nil convention
+                else
+                    x = not row.cat.collapsed                 -- the boolean convention
+                end
+                return row.name, "header", 0, x
+            end
+            return row.name, "optimal", 1, true
+        end
+        G.GetTradeSkillRecipeLink = function(i)
+            W.count.link = W.count.link + 1
+            local row = W.visible()[i]
+            if not row or row.kind == "header" then return nil end
+            return "|cffffd000|Henchant:" .. tostring(row.s) .. "|h[x]|h|r"
+        end
+        G.GetTradeSkillItemLink = function() return nil end
+        G.GetTradeSkillLine = function() return "Blacksmithing", 275, 300 end
+        G.GetTradeSkillCooldown = function(i)
+            local row = W.visible()[i]
+            return (row and row.s) and W.cds[row.s] or nil
+        end
+        G.ExpandTradeSkillSubClass = function(idx)
+            if idx == 0 then
+                W.count.expandAll = W.count.expandAll + 1
+                if W.profile ~= "noop-expand" then
+                    for c = 1, #W.cats do W.cats[c].collapsed = nil end
+                end
+                -- The echo, synchronously, INSIDE the call — the unkindest
+                -- ordering. close-on-expand models the player slamming the
+                -- window shut at exactly that moment.
+                if W.profile == "close-on-expand" then emit("TRADE_SKILL_CLOSE")
+                else emit("TRADE_SKILL_UPDATE") end
+            else
+                W.count.expandOne = W.count.expandOne + 1
+                local row = W.visible()[idx]
+                if row and row.kind == "header" then row.cat.collapsed = nil end
+                emit("TRADE_SKILL_UPDATE")
+            end
+        end
+        G.CollapseTradeSkillSubClass = function(idx)
+            W.count.collapse = W.count.collapse + 1
+            local row = W.visible()[idx]
+            if row and row.kind == "header" then row.cat.collapsed = true end
+            emit("TRADE_SKILL_UPDATE")
+        end
+        G.GetTradeSkillItemNameFilter = function() return "" end
+        G.GetOnlyShowMakeable = function() return false end
+        G.GetOnlyShowSkillUps = function() return false end
+        G.GetTradeSkillNumReagents = function() return 1 end
+        G.GetTradeSkillReagentInfo = function() return "reagent", nil, 2 end
+        G.GetTradeSkillReagentItemLink = function()
+            return "|cffffffff|Hitem:2840:0|h[r]|h|r"
+        end
+        G.GetTradeSkillNumMade = function() return 1, 1 end
+        G.UnitName = function() return "CollapseTester" end
+        G.GetRealmName = function() return "TestRealm" end
+        G.UnitFullName = nil
+        G.Daseeki = nil                       -- no mesh: Publish stays inert
+    end
+
+    function W:restore()
+        G.GetNumTradeSkills, G.GetTradeSkillInfo = saved.num, saved.info
+        G.GetTradeSkillRecipeLink, G.GetTradeSkillItemLink = saved.link, saved.item
+        G.GetTradeSkillLine, G.GetTradeSkillCooldown = saved.line, saved.cd
+        G.ExpandTradeSkillSubClass, G.CollapseTradeSkillSubClass = saved.exp, saved.col
+        G.GetTradeSkillItemNameFilter, G.GetOnlyShowMakeable = saved.nameF, saved.makeF
+        G.GetOnlyShowSkillUps = saved.upsF
+        G.GetTradeSkillNumReagents, G.GetTradeSkillReagentInfo = saved.rgN, saved.rgI
+        G.GetTradeSkillReagentItemLink, G.GetTradeSkillNumMade = saved.rgL, saved.rgM
+        G.UnitName, G.GetRealmName, G.UnitFullName = saved.unit, saved.realm, saved.full
+        G.Daseeki = saved.daseeki
+    end
+
+    return W
+end
+
+local function testCollapseHonesty(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    if not Dataset.LoadCore() then
+        fails[#fails + 1] = "the dataset would not load"
+        return
+    end
+
+    local G = _G
+    local savedState = {
+        Professions._leavingWorld, Professions._loggingOut, Professions._enteredWorldAt,
+        Professions._live, Professions._scanAt, Professions._harvested,
+        Professions._windowOpen, Professions._retry, Professions._stats,
+        Professions._trace, Professions._lastSig, Professions._nameMap,
+        Professions._recipeNames, Professions._viewGuards,
+        Professions._settled, Professions._stale, Professions._harvestJob,
+        Professions._collapseLatch, Professions._collapseWorld,
+    }
+    local savedArea = ns.Store and ns.Store.data and ns.Store.data.professions
+    -- The filter sub-surface is composedChain's territory; here it would only
+    -- add its own re-captures to the call counts this suite asserts on.
+    local savedFilters = ns.ProfessionFilters
+    ns.ProfessionFilters = nil
+
+    local clock = newClock(200000)
+    local sim = nil
+
+    local function resetModule()
+        Professions._leavingWorld, Professions._loggingOut = false, false
+        Professions._enteredWorldAt = 0
+        Professions._live, Professions._scanAt, Professions._harvested = nil, nil, nil
+        Professions._windowOpen, Professions._retry = nil, nil
+        Professions._stats, Professions._trace = nil, nil
+        Professions._nameMap, Professions._recipeNames = nil, nil
+        Professions._settled, Professions._stale, Professions._harvestJob = nil, nil, nil
+        Professions._viewGuards, Professions._lastSig = nil, nil
+        Professions._collapseLatch, Professions._collapseWorld = nil, nil
+        if ns.Store and ns.Store.data then ns.Store.data.professions = nil end
+    end
+
+    -- 165 blacksmithing recipes across six categories; category 1 (24 recipes)
+    -- expanded, categories 2-6 (141 recipes) collapsed. Visible: 6 headers +
+    -- 24 recipes = 30 rows standing in for a 171-row truth.
+    local bs = Dataset.profRecipes[Dataset.profIdx.blacksmithing]
+    local function buildCats()
+        local sizes = { 24, 29, 28, 28, 28, 28 }
+        local cats, at = {}, 0
+        for c = 1, #sizes do
+            local spells = {}
+            for r = 1, sizes[c] do
+                at = at + 1
+                spells[r] = bs[at]
+            end
+            cats[c] = { name = "Category " .. c, spells = spells,
+                        collapsed = (c > 1) or nil }
+        end
+        return cats, at
+    end
+
+    local ok, err = pcall(function()
+        clock:install()
+        resetModule()
+        local cats, total = buildCats()
+        ck(total == 165, "the fixture built " .. total .. " recipes, wanted 165")
+        sim = newCollapseSim(cats, "witnessed")
+        sim:install()
+
+        -- ══ (1) RED CONTROL: the pre-fix write path against the collapsed
+        --        window. Scan-then-apply, no collapse gate — the shortened set
+        --        goes down as the character's complete list. THE LIE. ═════════
+        local scan = Professions.ScanTradeSkillWindow()
+        ck(scan ~= nil and scan.complete == true and scan.profKey == "blacksmithing",
+           "RED: the collapsed window's scan no longer presents itself as complete"
+           .. " — the exposure vanished from the fixture")
+        ck(scan and #scan.ids == 24,
+           "RED: the collapsed window resolved " .. tostring(scan and #scan.ids)
+           .. " rows, expected the 24 visible ones")
+        Professions.ApplyScan(scan, 12345)
+        ck(Professions._live.p.blacksmithing.n == 24,
+           "RED CONTROL DID NOT REPRODUCE: the pre-fix path wrote "
+           .. tostring(Professions._live.p.blacksmithing.n)
+           .. " known recipes as the complete set; the character knows 165")
+        -- ...and the witness that makes the green path possible was THERE, in
+        -- the same read the scan already paid for.
+        ck(scan and scan.ev.clp and #scan.ev.clp == 5,
+           "the scan did not witness the 5 collapsed headers ("
+           .. tostring(scan and scan.ev.clp and #scan.ev.clp) .. ")")
+
+        -- ══ (2) GREEN: the same window through CaptureWindow — expand all,
+        --        scan complete, restore the player's exact collapse set ═══════
+        resetModule()
+        sim.zero()
+        Professions.OpenWindow("tradeskill", true)
+        ck(Professions.CaptureWindow("tradeskill", true, "TRADE_SKILL_SHOW") == true,
+           "the collapsed window's capture did not land")
+        ck(Professions._live.p.blacksmithing.n == 165,
+           "the roundtrip wrote " .. tostring(Professions._live.p.blacksmithing.n)
+           .. " known recipes, expected the full 165")
+        ck(sim.count.expandAll == 1,
+           "the roundtrip issued " .. sim.count.expandAll .. " expand-all call(s), expected 1")
+        ck(sim.count.collapse == 5,
+           "the restore issued " .. sim.count.collapse .. " collapse call(s), expected 5")
+        local set = sim.collapsedSet()
+        local restoredExactly = not set["Category 1"]
+        for c = 2, 6 do
+            if not set["Category " .. c] then restoredExactly = false end
+        end
+        ck(restoredExactly, "the player's exact collapse set did not survive the roundtrip")
+        local ring = Professions.TraceRows()
+        local last = ring[#ring]
+        ck(last and last.r == "ok"
+           and tostring(last.w):find("roundtrip(5/5)", 1, true) ~= nil,
+           "the trace does not record the roundtrip (r=" .. tostring(last and last.r)
+           .. " collapse=" .. tostring(last and last.w) .. ")")
+        local rec = Professions.SettledGet("blacksmithing")
+        ck(rec ~= nil and rec.n == 171,
+           "the settled record was not taken at full expansion (n="
+           .. tostring(rec and rec.n) .. ", expected 171)")
+        -- No harvest behind a restore: its row indexes would name hidden rows.
+        clock:pump(clock.now + 1)
+        ck(not Professions.HarvestStamped("blacksmithing"),
+           "a roundtrip capture stamped a harvest whose indexes the restore invalidated")
+
+        -- ══ (3) THE LOOP KILLER: a stream of update echoes on the restored
+        --        (collapsed again) window — zero rescans, zero expand calls,
+        --        the distinct settled-collapsed verdict, STAYS SETTLED ════════
+        sim.zero()
+        for i = 1, 10 do
+            clock:pump(clock.now + 1.5)
+            ck(Professions.CaptureWindow("tradeskill", false, "TRADE_SKILL_UPDATE") == true,
+               "a collapsed-window update was refused (event " .. i .. ")")
+        end
+        ck(sim.count.link == 0,
+           "the collapsed settled window paid a full resolve (" .. sim.count.link .. " links)")
+        ck(sim.count.expandAll == 0 and sim.count.collapse == 0,
+           "the loop killer failed: expand=" .. sim.count.expandAll
+           .. " collapse=" .. sim.count.collapse .. " — the flicker cycle is alive")
+        local ring3 = Professions.TraceRows()
+        local last3 = ring3[#ring3]
+        ck(last3 and last3.r == "settled-collapsed",
+           "the declined verify is not trace-recorded distinctly (r="
+           .. tostring(last3 and last3.r) .. ")")
+        ck(last3 and last3.c == 10,
+           "ten settled-collapsed verdicts did not coalesce onto one ring row (c="
+           .. tostring(last3 and last3.c) .. ")")
+        local st = Professions.Stats("blacksmithing")
+        ck(st and (st.settledc or 0) == 10,
+           "the settled-collapsed tally reads " .. tostring(st and st.settledc)
+           .. ", expected 10")
+        ck(st and st.ok == 1,
+           "the echo stream re-ran the full capture " .. tostring(st and st.ok)
+           .. " time(s); only the roundtrip may")
+
+        -- ══ (4) COOLDOWNS still publish off the VISIBLE rows of a collapsed
+        --        settled window — proof-gated, hidden rows left alone ═════════
+        local cdSpell = cats[1].spells[1]              -- visible: category 1 is expanded
+        local cdRec = Dataset.recipe[cdSpell]
+        local cdKey = (cdRec.cd and cdRec.cd > 0) and ("g" .. cdRec.cd) or tostring(cdSpell)
+        sim.cds[cdSpell] = 3600
+        sim.zero()
+        clock:pump(clock.now + 1.5)
+        ck(Professions.CaptureWindow("tradeskill", false, "TRADE_SKILL_UPDATE") == true,
+           "the cooldown-carrying collapsed update was refused")
+        ck(Professions.Live().c[cdKey] ~= nil,
+           "a consumed cooldown on a visible row did not publish off the settled-collapsed pass")
+        ck(sim.count.link == 0, "noticing the cooldown cost a full resolve")
+        sim.cds[cdSpell] = nil
+        clock:pump(clock.now + 1.5)
+        Professions.CaptureWindow("tradeskill", false, "TRADE_SKILL_UPDATE")
+        ck(Professions.Live().c[cdKey] == nil,
+           "the proven-ready cooldown was not cleared by the settled-collapsed pass")
+
+        -- ══ (5) STALENESS BYPASSES the loop killer: a learning signal on the
+        --        collapsed window still forces the honest expand-scan-restore ═
+        Professions._onEvent(nil, "CHAT_MSG_SKILL")
+        sim.zero()
+        clock:pump(clock.now + 1.5)
+        ck(Professions.CaptureWindow("tradeskill", false, "TRADE_SKILL_UPDATE") == true,
+           "the stale collapsed window was refused")
+        ck(sim.count.expandAll == 1 and sim.count.link >= 165,
+           "a stale collapsed window did not run the full expand-scan cycle (expand="
+           .. sim.count.expandAll .. " links=" .. sim.count.link .. ")")
+        ck(sim.count.collapse == 5, "the stale-forced roundtrip did not restore")
+        ck(not Professions.IsStale("blacksmithing"),
+           "the roundtrip did not clear the staleness mark")
+
+        -- ══ (6) MID-EXPAND WINDOW CLOSE: clean abort — nothing written, no
+        --        dangling restore, no ladder against a closed window ══════════
+        sim:restore()
+        resetModule()
+        local cats6 = buildCats()
+        sim = newCollapseSim(cats6, "close-on-expand")
+        sim:install()
+        Professions.OpenWindow("tradeskill", true)
+        local ok6, why6 = Professions.CaptureWindow("tradeskill", true, "TRADE_SKILL_SHOW")
+        ck(ok6 == false and why6 == "window-closed",
+           "the mid-expand close was answered '" .. tostring(why6)
+           .. "', expected the clean window-closed abort")
+        ck(sim.count.collapse == 0, "a dangling restore ran against a closed window")
+        ck(not (Professions._live and Professions._live.p
+                and Professions._live.p.blacksmithing),
+           "the aborted capture still wrote a known set")
+        ck(not (Professions._retry and Professions._retry.tradeskill),
+           "a retry ladder was armed against a closed window")
+
+        -- ══ (7) THE WITNESS-UNREADABLE CLIENT: expand-all before every full
+        --        scan, leave expanded, recorded — honest scan, no restore ═════
+        sim:restore()
+        resetModule()
+        local cats7 = buildCats()
+        sim = newCollapseSim(cats7, "unreadable")
+        sim:install()
+        sim.zero()
+        Professions.OpenWindow("tradeskill", true)
+        ck(Professions.CaptureWindow("tradeskill", true, "TRADE_SKILL_SHOW") == true,
+           "the blind-world capture did not land")
+        ck(Professions._live.p.blacksmithing.n == 165,
+           "the blind world wrote " .. tostring(Professions._live.p.blacksmithing.n)
+           .. " known recipes, expected 165")
+        ck(sim.count.expandAll == 1,
+           "the blind world issued " .. sim.count.expandAll .. " expand-all call(s)")
+        ck(sim.count.collapse == 0, "the blind world restored without a witness")
+        local anyCollapsed = false
+        for c = 1, #cats7 do if cats7[c].collapsed then anyCollapsed = true end end
+        ck(not anyCollapsed, "the blind world did not leave the window expanded")
+        local ring7 = Professions.TraceRows()
+        local last7 = ring7[#ring7]
+        ck(last7 and last7.r == "ok"
+           and tostring(last7.w):find("blind", 1, true) ~= nil,
+           "the blind world is not named in the trace (collapse="
+           .. tostring(last7 and last7.w) .. ")")
+        ck(Professions._collapseWorld and Professions._collapseWorld.tradeskill
+           and tostring(Professions._collapseWorld.tradeskill):find("blind", 1, true) ~= nil,
+           "the debug readout does not know which world the client is")
+        -- The settled path in this world runs as today: an unchanged expanded
+        -- window settles on the strict walk, no witness required...
+        sim.zero()
+        clock:pump(clock.now + 1.5)
+        ck(Professions.CaptureWindow("tradeskill", false, "TRADE_SKILL_UPDATE") == true,
+           "the blind-world settled reopen was refused")
+        ck(sim.count.link == 0, "the blind-world settled pass paid a full resolve")
+        -- ...and a player re-collapsing LOOKS like drift, which forces a full
+        -- scan, which expands again. Accepted: full scans are rare and manual.
+        for c = 2, #cats7 do cats7[c].collapsed = true end
+        sim.zero()
+        clock:pump(clock.now + 1.5)
+        ck(Professions.CaptureWindow("tradeskill", false, "TRADE_SKILL_UPDATE") == true,
+           "the blind-world shrink was refused instead of full-scanned")
+        ck(sim.count.expandAll == 1 and sim.count.link >= 165,
+           "the blind-world shrink was not answered by an expanding full scan (expand="
+           .. sim.count.expandAll .. " links=" .. sim.count.link .. ")")
+
+        -- ══ (8) THE EXPAND CONVENTION MEASURED WRONG (index-0 no-op): the
+        --        refusal "collapsed", no shortened write, a ladder that ends ══
+        sim:restore()
+        resetModule()
+        local cats8 = buildCats()
+        sim = newCollapseSim(cats8, "noop-expand")
+        sim:install()
+        sim.zero()
+        Professions.OpenWindow("tradeskill", true)
+        local ok8, why8 = Professions.CaptureWindow("tradeskill", true, "TRADE_SKILL_SHOW")
+        ck(ok8 == false and why8 == "collapsed",
+           "the measured no-op was answered '" .. tostring(why8)
+           .. "', expected the refusal 'collapsed'")
+        ck(not (Professions._live and Professions._live.p
+                and Professions._live.p.blacksmithing),
+           "the unexpandable collapsed window still wrote a shortened set")
+        ck(sim.count.collapse == 0,
+           "the no-op refusal re-collapsed headers that never moved")
+        local ring8 = Professions.TraceRows()
+        local last8 = ring8[#ring8]
+        ck(last8 and last8.r == "collapsed" and last8.w == "expand-noop",
+           "the refusal is not recorded with its measured reason (r="
+           .. tostring(last8 and last8.r) .. " collapse=" .. tostring(last8 and last8.w) .. ")")
+        -- The ladder retries the retryable refusal and TERMINATES.
+        local before = sim.count.expandAll
+        clock:pump(clock.now + 30)
+        local rungs = sim.count.expandAll - before
+        ck(rungs >= 1, "the ladder never retried the collapsed refusal")
+        ck(rungs <= #Professions.RETRY_LADDER,
+           "the ladder ran " .. rungs .. " retries against " .. #Professions.RETRY_LADDER
+           .. " rungs — it is polling")
+        local at = sim.count.expandAll
+        clock:pump(clock.now + 30)
+        ck(sim.count.expandAll == at, "the spent ladder kept polling")
+        ck(not (Professions._live and Professions._live.p
+                and Professions._live.p.blacksmithing),
+           "the retry ladder eventually wrote the shortened set")
+
+        -- ══ (9) THE CRAFT SURFACE: same witness one return further along,
+        --        same roundtrip, through the Craft expand/collapse pair ═══════
+        sim:restore()
+        sim = nil
+        resetModule()
+        local en = Dataset.profRecipes[Dataset.profIdx.enchanting]
+        local ccats = {
+            { name = "Enchants A", spells = { en[1], en[2], en[3] }, collapsed = true },
+            { name = "Enchants B", spells = { en[4], en[5], en[6] } },
+        }
+        local ccount = { expandAll = 0, collapse = 0, link = 0 }
+        local function cvisible()
+            local rows = {}
+            for c = 1, #ccats do
+                local cat = ccats[c]
+                rows[#rows + 1] = { kind = "header", name = cat.name, cat = cat }
+                if not cat.collapsed then
+                    for r = 1, #cat.spells do
+                        rows[#rows + 1] = { kind = "recipe",
+                                            name = "Ench " .. tostring(cat.spells[r]),
+                                            s = cat.spells[r] }
+                    end
+                end
+            end
+            return rows
+        end
+        local csaved = {
+            ench = G.CraftIsEnchanting, num = G.GetNumCrafts, info = G.GetCraftInfo,
+            link = G.GetCraftRecipeLink, item = G.GetCraftItemLink,
+            line = G.GetCraftDisplaySkillLine, cd = G.GetCraftCooldown,
+            exp = G.ExpandCraftSkillLine, col = G.CollapseCraftSkillLine,
+            unit = G.UnitName, realm = G.GetRealmName, full = G.UnitFullName,
+            daseeki = G.Daseeki,
+            makeF = G.GetOnlyShowMakeable, upsF = G.GetOnlyShowSkillUps,
+        }
+        G.GetOnlyShowMakeable = function() return false end
+        G.GetOnlyShowSkillUps = function() return false end
+        G.CraftIsEnchanting = function() return true end
+        G.GetNumCrafts = function() return #cvisible() end
+        G.GetCraftInfo = function(i)
+            local row = cvisible()[i]
+            if not row then return nil end
+            if row.kind == "header" then
+                -- (name, subSpell, type, numAvailable, isExpanded)
+                return row.name, nil, "header", 0, (not row.cat.collapsed)
+            end
+            return row.name, nil, "optimal", 1, true
+        end
+        G.GetCraftRecipeLink = function(i)
+            ccount.link = ccount.link + 1
+            local row = cvisible()[i]
+            if not row or row.kind == "header" then return nil end
+            return "|cffffd000|Henchant:" .. tostring(row.s) .. "|h[x]|h|r"
+        end
+        G.GetCraftItemLink = function() return nil end
+        G.GetCraftDisplaySkillLine = function() return "Enchanting", 290, 300 end
+        G.GetCraftCooldown = function() return nil end
+        G.ExpandCraftSkillLine = function(idx)
+            if idx == 0 then
+                ccount.expandAll = ccount.expandAll + 1
+                for c = 1, #ccats do ccats[c].collapsed = nil end
+                if Professions._onEvent then Professions._onEvent(nil, "CRAFT_UPDATE") end
+            end
+        end
+        G.CollapseCraftSkillLine = function(idx)
+            ccount.collapse = ccount.collapse + 1
+            local row = cvisible()[idx]
+            if row and row.kind == "header" then row.cat.collapsed = true end
+            if Professions._onEvent then Professions._onEvent(nil, "CRAFT_UPDATE") end
+        end
+        G.UnitName = function() return "CollapseTester" end
+        G.GetRealmName = function() return "TestRealm" end
+        G.UnitFullName = nil
+        G.Daseeki = nil
+        Professions.OpenWindow("craft", true)
+        ck(Professions.CaptureWindow("craft", true, "CRAFT_SHOW") == true,
+           "the collapsed craft window's capture did not land")
+        ck(Professions._live and Professions._live.p.enchanting
+           and Professions._live.p.enchanting.n == 6,
+           "the craft roundtrip wrote "
+           .. tostring(Professions._live and Professions._live.p.enchanting
+                       and Professions._live.p.enchanting.n)
+           .. " known enchants, expected 6")
+        ck(ccount.expandAll == 1 and ccount.collapse == 1,
+           "the craft roundtrip's calls read expand=" .. ccount.expandAll
+           .. " collapse=" .. ccount.collapse .. ", expected 1/1")
+        ck(ccats[1].collapsed == true and not ccats[2].collapsed,
+           "the craft window's collapse set did not restore exactly")
+        G.CraftIsEnchanting, G.GetNumCrafts, G.GetCraftInfo = csaved.ench, csaved.num, csaved.info
+        G.GetCraftRecipeLink, G.GetCraftItemLink = csaved.link, csaved.item
+        G.GetCraftDisplaySkillLine, G.GetCraftCooldown = csaved.line, csaved.cd
+        G.ExpandCraftSkillLine, G.CollapseCraftSkillLine = csaved.exp, csaved.col
+        G.UnitName, G.GetRealmName, G.UnitFullName = csaved.unit, csaved.realm, csaved.full
+        G.Daseeki = csaved.daseeki
+        G.GetOnlyShowMakeable, G.GetOnlyShowSkillUps = csaved.makeF, csaved.upsF
+    end)
+
+    if sim then sim:restore() end
+    clock:restore()
+    ns.ProfessionFilters = savedFilters
+    Professions._leavingWorld, Professions._loggingOut = savedState[1], savedState[2]
+    Professions._enteredWorldAt, Professions._live = savedState[3], savedState[4]
+    Professions._scanAt, Professions._harvested = savedState[5], savedState[6]
+    Professions._windowOpen, Professions._retry = savedState[7], savedState[8]
+    Professions._stats, Professions._trace = savedState[9], savedState[10]
+    Professions._lastSig, Professions._nameMap = savedState[11], savedState[12]
+    Professions._recipeNames, Professions._viewGuards = savedState[13], savedState[14]
+    Professions._settled, Professions._stale = savedState[15], savedState[16]
+    Professions._harvestJob = savedState[17]
+    Professions._collapseLatch, Professions._collapseWorld = savedState[18], savedState[19]
+    if ns.Store and ns.Store.data then ns.Store.data.professions = savedArea end
+    if not ok then fails[#fails + 1] = "error in collapse-honesty fixtures: " .. tostring(err) end
+end
+
 local function testInertness(fails)
     local function ck(c, m) if not c then fails[#fails + 1] = m end end
 
@@ -5623,6 +6566,8 @@ function Professions.RunSelfTests(verbose)
           fn = testResolutionChain },
         { name = "settled-signature budget (warm reopens and sprees by API call count, with the red control)",
           fn = testSettledBudget },
+        { name = "collapse honesty (witness, expand-scan-restore, loop killer, blind + no-op worlds, with the red control)",
+          fn = testCollapseHonesty },
         { name = "publish delta detector", fn = testPublishDelta },
         { name = "module inertness (off = no frame, no events, no dataset, no SV)",
           fn = testInertness },
