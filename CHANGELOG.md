@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- **Professions pane polish.** The specialization marker and the recipe list's "known"
+  marker are now glyphs the suite font actually carries (the old diamond and check mark
+  rendered as colored boxes), with a self-test that fails if either tofu glyph ever returns.
+  Vendor and quest acquisition lines now name the zone — "Sold by Dan Golthas — Badlands",
+  "Quest: Goretusk Liver Pie — Westfall" — with multi-vendor recipes naming two then
+  "+N more". The MATERIALS block left the recipe info pane (the reagent data and harvest
+  stay), and the recipe list gained four more visible rows from the freed space. Fishing,
+  Herbalism and Skinning — professions with no craft window and no recipes — no longer get
+  a detail tab, never say "not checked" or ask you to open them, and a remembered tab that
+  no longer qualifies falls back to the character's first real profession (Mining keeps its
+  tab: Smelting is a window). Secondary cells for professions a character never learned now
+  show a quiet "--" instead of sitting empty.
+
 - **Professions: fixed gathering professions being invisible to the presence probe.**
   Detection relied solely on IsSpellKnown over the rank-tier spells, which Herbalism (and by
   construction Mining) never answers — Orn's Herbalism 300 showed neither presence nor
