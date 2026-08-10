@@ -211,9 +211,50 @@ Professions.PUSH_OP = PUSH_OP
 
 local PUBLISH_DEBOUNCE     = 5     -- seconds; a burst of window updates coalesces
 local ENTERING_WORLD_GRACE = 5     -- seconds after entering the world before we trust a read
+local SCAN_THROTTLE        = 1     -- seconds between two coalesced window scans
 
 Professions.PUBLISH_DEBOUNCE = PUBLISH_DEBOUNCE
 Professions.ENTERING_WORLD_GRACE = ENTERING_WORLD_GRACE
+Professions.SCAN_THROTTLE = SCAN_THROTTLE
+
+----------------------------------------------------------------------
+-- THE RETRY LADDER  (CLIENT_ASYNC_LESSONS class 7)
+--
+-- The window's data is not on the window's SHOW. TRADE_SKILL_SHOW is the client
+-- saying "a profession window is opening"; the rows arrive with the server's own
+-- list packet, which surfaces as one or more TRADE_SKILL_UPDATEs some unknown
+-- number of frames later. A scan taken at SHOW can therefore legitimately find
+-- an EMPTY enumeration, and the settle signal we need is not the event we were
+-- woken by.
+--
+-- Class 7's fix shape is exactly this: "a capture that observed a locked slot
+-- schedules its own follow-up". So a refusal that could plausibly heal on its
+-- own re-asks on a bounded ladder while the window is still open, instead of
+-- trusting that some later event will wake us. The ladder is short, finite, and
+-- dies with the window: it can never become a poll.
+--
+-- The rungs are cumulative delays from the refusal, spread over ~6 seconds —
+-- long enough to outlast a bad-latency list packet, short enough that the player
+-- has not closed the window and moved on.
+----------------------------------------------------------------------
+
+local RETRY_LADDER = { 0.10, 0.25, 0.50, 1.00, 2.00, 4.00 }
+Professions.RETRY_LADDER = RETRY_LADDER
+
+-- Refusals that mean "not yet" rather than "not ever". A reason absent from this
+-- set is a settled state and re-asking it would only burn frames: `disabled` is
+-- a setting, `view-filtered` clears through the filter panel's own re-capture,
+-- `no-api` is a client that will not grow the function back.
+local RETRYABLE = {
+    ["cold"] = true, ["empty"] = true, ["incomplete"] = true, ["unresolved"] = true,
+    ["row-error"] = true, ["unidentified"] = true, ["throttled"] = true,
+}
+Professions.RETRYABLE = RETRYABLE
+
+-- How many trace rows survive in the saved variables. Bounded because a ring
+-- that grows without limit is a saved-variable leak wearing a diagnostic's hat.
+local TRACE_CAP = 30
+Professions.TRACE_CAP = TRACE_CAP
 
 -- Blizzard events the module subscribes to, on ITS OWN frame, only while
 -- enabled. Listed here so the inertness self-test can assert the set rather
@@ -235,9 +276,14 @@ Professions._leavingWorld  = false
 Professions._loggingOut    = false
 Professions._enteredWorldAt = nil
 Professions._live          = nil    -- the capture we are accumulating this session
-Professions._scanAt        = nil    -- GetTime of the last window scan (throttle)
+Professions._scanAt        = nil    -- GetTime of the last SUCCESSFUL window scan (throttle)
 Professions._staticAt      = nil    -- GetTime of the last presence/level probe (throttle)
 Professions._harvested     = nil    -- profKey -> reagents already harvested this session
+Professions._windowOpen    = nil    -- surface -> true while the client says the window is up
+Professions._retry         = nil    -- surface -> { step, timer } the bounded ladder
+Professions._stats         = nil    -- key -> per-profession/surface scan forensics
+Professions._trace         = nil    -- the session's own copy of the bounded trace ring
+Professions._nameMap       = nil    -- memoised localized-skill-name -> profKey
 
 ----------------------------------------------------------------------
 -- Enablement
@@ -350,6 +396,7 @@ function Dataset.Unload()
     Dataset.faction, Dataset.standing, Dataset.trainerSet = nil, nil, nil
     Dataset.item, Dataset.acq, Dataset.itemAcq = nil, nil, nil
     Dataset.itemOfRecipe = nil
+    Professions._nameMap = nil
 end
 
 -- PURE. Walk the payload once, handing each row to `fn(section, line)`. Rows
@@ -791,6 +838,7 @@ end
 ----------------------------------------------------------------------
 
 function Professions.SkillNameMap()
+    if Professions._nameMap then return Professions._nameMap end
     if not Dataset.LoadCore() then return {} end
     local map = {}
     for idx, prof in pairs(Dataset.profs) do
@@ -808,7 +856,27 @@ function Professions.SkillNameMap()
             end
         end
     end
+    -- Memoised: the map is a pure function of the dataset and the client's own
+    -- spell names, neither of which changes inside a session, and the forensics
+    -- path now asks for it on every refused scan. Dataset.Unload() drops it.
+    Professions._nameMap = map
     return map
+end
+
+-- WHICH PROFESSION IS THIS WINDOW SHOWING — asked of a window whose scan FAILED.
+--
+-- A refusal we cannot attribute is a refusal the owner cannot act on: "some
+-- window refused" is not a diagnosis. The window names its own skill line even
+-- when its rows have not arrived, so the reason can be filed against the
+-- profession it belongs to. Localized, so it goes through the same client-built
+-- name map the skill panel uses, and it returns nil rather than guessing.
+function Professions.WindowProfKey(surface)
+    local fn
+    if surface == "craft" then fn = GetCraftDisplaySkillLine else fn = GetTradeSkillLine end
+    if not fn then return nil end
+    local ok, name = pcall(fn)
+    if not ok or type(name) ~= "string" or name == "" then return nil end
+    return Professions.SkillNameMap()[name:lower()]
 end
 
 -- Returns { [profKey] = { l = rank, m = maxRank } } or nil when the panel could
@@ -876,6 +944,159 @@ function Professions.ResolveProfession(ids)
 end
 
 ----------------------------------------------------------------------
+-- SCAN FORENSICS  (this ships whether or not it ever catches anything)
+--
+-- The defect this section was written for was invisible for a whole wave: the
+-- window opened, the module was enabled, the frame was up, the levels captured,
+-- and every profession still read NEVER SCANNED. The debug print could say that
+-- the scan had not happened and nothing at all about WHY, so there was no way to
+-- tell a throttle from a filter from a client that had not sent its rows yet.
+--
+-- So every window-capture attempt now leaves a record, and the record names the
+-- gate. Three layers, cheapest first:
+--
+--   STATS   per profession (and per surface when the profession is unknown):
+--           attempts, the last attempt's epoch, the last refusal reason, the
+--           last success, and a tally per reason. Two numbers and a string.
+--
+--   TRACE   a bounded ring of the last TRACE_CAP attempts, each carrying the
+--           event that woke us, the row count the client enumerated, how many
+--           rows did not resolve, the view-guard verdict AND which getter
+--           produced it, and where the retry ladder stood. Saved-variable
+--           backed and BUILD-STAMPED, so the answer survives the /reload the
+--           owner does before reporting and cannot silently blend two builds.
+--
+--   LADDER  the deferral state itself is a trace field, because "the deferred
+--           re-capture never fired" and "it fired and was refused" look
+--           identical from the outside and are opposite bugs.
+--
+-- Cost when nothing is wrong: one small table per window open, plus one per
+-- coalesced update. The ring is capped and the stats table has at most a dozen
+-- keys — one per profession this character can hold.
+----------------------------------------------------------------------
+
+local function nowEpoch()
+    return (ns.Store and ns.Store.Now and ns.Store.Now()) or (time and time()) or 0
+end
+
+local function nowMono()
+    return (GetTime and GetTime()) or 0
+end
+
+Professions.NowEpoch = nowEpoch
+
+function Professions.BuildStamp()
+    return tostring(ns.VERSION or "?")
+end
+
+-- The session stats table. Keyed by profession key when we could name the
+-- window's profession, and by "surface:<name>" when we could not — an
+-- unattributable refusal is still a refusal and must not vanish.
+function Professions.Stats(key, create)
+    if not create then
+        local s = Professions._stats
+        return s and s[key] or nil
+    end
+    Professions._stats = Professions._stats or {}
+    local s = Professions._stats[key]
+    if not s then
+        s = { attempts = 0, ok = 0, reasons = {} }
+        Professions._stats[key] = s
+    end
+    return s
+end
+
+function Professions.AllStats()
+    return Professions._stats or {}
+end
+
+-- The ring, session copy first so the diagnostics work even when the store is
+-- not up (the harness, an early error, a disabled store).
+function Professions.TraceRows()
+    return Professions._trace or {}
+end
+
+function Professions.ClearTrace()
+    Professions._trace = nil
+    local S = ns.Store
+    local t = S and S.ProfessionsTrace and S.ProfessionsTrace(false)
+    if t then t.rows = {} end
+end
+
+-- PURE-ish. Append one attempt record, cap the ring, mirror it into the saved
+-- variables when the store is up. Never creates the saved-variable area unless
+-- the module is enabled — the inertness rule outranks the diagnostic.
+function Professions.RecordAttempt(rec)
+    if type(rec) ~= "table" then return false end
+    if not Professions.IsEnabled() then return false end
+    rec.t = rec.t or nowEpoch()
+
+    -- A note from the filter layer's convention probe is EVIDENCE, not a capture
+    -- attempt. Counting it as one would inflate the attempt tally with our own
+    -- measurements and file "form-learned" among the refusal reasons, which is
+    -- the diagnostic reading its own handwriting back as a symptom.
+    if rec.e ~= "filter-probe" then
+        local key = rec.p or ("surface:" .. tostring(rec.s or "?"))
+        local st = Professions.Stats(key, true)
+        st.attempts = st.attempts + 1
+        st.lastAt = rec.t
+        st.lastReason = rec.r
+        st.lastEvent = rec.e
+        if rec.r == "ok" then
+            st.ok = st.ok + 1
+            st.lastOkAt = rec.t
+        else
+            st.reasons[rec.r or "?"] = (st.reasons[rec.r or "?"] or 0) + 1
+        end
+    end
+
+    -- SELF-INFLICTED REFUSALS DO NOT GET RING SPACE. Measuring what the client's
+    -- filter setters do means moving them on purpose, and every one of those
+    -- calls echoes back as an update that this layer correctly refuses. Ten of
+    -- those per probe would push the rows that actually explain something off
+    -- the end of a thirty-row ring. They are still tallied in the stats, so the
+    -- work is not invisible — it just does not get to drown out the evidence.
+    local selfInflicted = rec.r == "view-filtered"
+        and tostring(rec.g or ""):find("probing", 1, true) ~= nil
+    if not selfInflicted then
+        local ring = Professions._trace
+        if not ring then ring = {} Professions._trace = ring end
+        ring[#ring + 1] = rec
+        while #ring > TRACE_CAP do table.remove(ring, 1) end
+    end
+
+    local S = ns.Store
+    if not selfInflicted and S and S.ProfessionsTrace then
+        local t = S.ProfessionsTrace(true, Professions.BuildStamp())
+        if t then
+            t.rows[#t.rows + 1] = rec
+            while #t.rows > TRACE_CAP do table.remove(t.rows, 1) end
+        end
+    end
+    return true
+end
+
+-- One trace row rendered for a human. The field order is the order the question
+-- is asked in: when, what woke us, which window, which profession, what the
+-- gate said, and then the evidence that produced that verdict.
+function Professions.FormatTraceRow(rec)
+    if type(rec) ~= "table" then return "" end
+    local parts = {
+        tostring(rec.t or "?"),
+        (rec.e or "?") .. (rec.f and "!" or ""),
+        tostring(rec.s or "?"),
+        rec.p or "(unattributed)",
+        "=> " .. tostring(rec.r or "?"),
+    }
+    if rec.n ~= nil then parts[#parts + 1] = "rows=" .. tostring(rec.n) end
+    if rec.i ~= nil then parts[#parts + 1] = "ids=" .. tostring(rec.i) end
+    if rec.u ~= nil and rec.u > 0 then parts[#parts + 1] = "unresolved=" .. tostring(rec.u) end
+    if rec.g then parts[#parts + 1] = "guard=" .. tostring(rec.g) end
+    if rec.d then parts[#parts + 1] = "ladder=" .. tostring(rec.d) end
+    return table.concat(parts, " | ")
+end
+
+----------------------------------------------------------------------
 -- THE VIEW GUARD — filtering the VIEW must never filter the CAPTURE
 --
 -- Era's own client filters the trade-skill list SERVER-SIDE: with a name
@@ -912,15 +1133,22 @@ function Professions.ClearViewGuards()
     Professions._viewGuards = nil
 end
 
--- true when something is currently narrowing the client's own enumeration of
--- `surface`. Anything we cannot READ we do not assert: a false "narrowed" would
--- stop the capture forever, which is its own kind of lie.
-function Professions.ViewNarrowed(surface)
+-- narrowed(bool), why(string). `why` is the WITNESS, not a label: it names the
+-- guard or the getter that produced the verdict, so a capture refused as
+-- "view-filtered" can be told apart from a capture refused because a panel of
+-- ours forgot to deregister. "clear" is the honest answer for "nothing that can
+-- be read is narrowing anything".
+--
+-- Anything we cannot READ we do not assert: a false "narrowed" would stop the
+-- capture forever, which is its own kind of lie.
+function Professions.ViewNarrowedWhy(surface)
     local list = Professions._viewGuards
     if list then
         for i = 1, #list do
-            local ok, narrowed = pcall(list[i], surface)
-            if ok and narrowed then return true end
+            local ok, narrowed, why = pcall(list[i], surface)
+            if ok and narrowed then
+                return true, "guard#" .. i .. (why and (":" .. tostring(why)) or "")
+            end
         end
     end
     -- Two of the client's own filter states have getters, and both survive
@@ -929,35 +1157,63 @@ function Professions.ViewNarrowed(surface)
     -- has always been able to hand us a short list.
     if surface ~= "craft" and GetTradeSkillItemNameFilter then
         local ok, txt = pcall(GetTradeSkillItemNameFilter)
-        if ok and type(txt) == "string" and txt:gsub("%s+", "") ~= "" then return true end
+        if ok and type(txt) == "string" and txt:gsub("%s+", "") ~= "" then
+            return true, "client-name-filter"
+        end
     end
     if GetOnlyShowMakeable then
         local ok, only = pcall(GetOnlyShowMakeable)
-        if ok and only then return true end
+        if ok and only then return true, "client-have-materials" end
+    end
+    -- The third readable one, added after the live miss made it obvious how much
+    -- a missing witness costs: the client's own "only show skill-ups" box hides
+    -- most of a maxed character's list and has a getter, so there is no reason
+    -- for it to have been invisible except that nobody looked. A refusal here
+    -- can now be diagnosed from the trace, which is what makes it safe to add:
+    -- the alternative was writing a truncated known set and calling it the
+    -- truth.
+    if GetOnlyShowSkillUps then
+        local ok, only = pcall(GetOnlyShowSkillUps)
+        if ok and only then return true, "client-skill-ups-only" end
     end
     -- The subclass and inventory-slot filters have getters too
-    -- (GetTradeSkillSubClassFilter / GetTradeSkillInvSlotFilter) and they are
-    -- DELIBERATELY not asked here. Their "show everything" sentinel is a numeric
-    -- convention we cannot verify from the catalog, and reading it wrong in the
-    -- narrowing direction would wedge the capture shut forever — a refusal that
-    -- can never clear is its own kind of lie. professions_filters.lua covers
-    -- them by clearing every filter when the window opens, which is a fact we
+    -- (GetTradeSkillSubClassFilter / GetTradeSkillInvSlotFilter) and their
+    -- VALUES are still not interpreted here. Their "show everything" sentinel is
+    -- a numeric convention the catalog does not carry, and reading it wrong in
+    -- the narrowing direction would wedge the capture shut forever — a refusal
+    -- that can never clear is its own kind of lie. professions_filters.lua
+    -- covers them by MEASURING what a call actually does to the client's own row
+    -- count and registering a guard while it is measuring, which is a fact we
     -- establish rather than a value we interpret.
-    return false
+    return false, "clear"
+end
+
+-- true when something is currently narrowing the client's own enumeration of
+-- `surface`. The boolean form, kept because every reader outside the capture
+-- path only wants the verdict.
+function Professions.ViewNarrowed(surface)
+    local narrowed = Professions.ViewNarrowedWhy(surface)
+    return narrowed
 end
 
 function Professions.ScanTradeSkillWindow()
-    if not Professions.CaptureAllowed() then return nil, "cold" end
+    -- Every exit carries the same shaped evidence table, so a refusal is as
+    -- readable as a success: how many rows the client offered, how many resolved
+    -- to a teaching spell, and how many did not.
+    local ev = { n = 0, ids = 0, missed = 0 }
+    if not Professions.CaptureAllowed() then return nil, "cold", ev end
     if not (GetNumTradeSkills and GetTradeSkillInfo and GetTradeSkillRecipeLink) then
-        return nil, "no-api"
+        return nil, "no-api", ev
     end
     local okN, n = pcall(GetNumTradeSkills)
-    if not okN or type(n) ~= "number" or n <= 0 then return nil, "empty" end
+    if not okN or type(n) ~= "number" then return nil, "empty", ev end
+    ev.n = n
+    if n <= 0 then return nil, "empty", ev end
 
     local rows, ids, missed = {}, {}, 0
     for i = 1, n do
         local ok, name, kind = pcall(GetTradeSkillInfo, i)
-        if not ok then return nil, "row-error" end
+        if not ok then return nil, "row-error", ev end
         if kind ~= "header" and name ~= nil then
             local okL, link = pcall(GetTradeSkillRecipeLink, i)
             local spell = okL and spellFromRecipeLink(link) or nil
@@ -969,14 +1225,15 @@ function Professions.ScanTradeSkillWindow()
             end
         end
     end
-    if #ids == 0 then return nil, "unresolved" end
-    if missed > 0 then return nil, "incomplete" end
+    ev.ids, ev.missed = #ids, missed
+    if #ids == 0 then return nil, "unresolved", ev end
+    if missed > 0 then return nil, "incomplete", ev end
 
     local profKey, unknown = Professions.ResolveProfession(ids)
-    if not profKey then return nil, "unidentified" end
+    if not profKey then return nil, "unidentified", ev end
 
     local scan = { profKey = profKey, rows = rows, ids = ids, unknown = unknown,
-                   complete = true, surface = "tradeskill" }
+                   complete = true, surface = "tradeskill", ev = ev }
     if GetTradeSkillLine then
         local ok, _, rank, maxRank = pcall(GetTradeSkillLine)
         if ok and type(rank) == "number" and type(maxRank) == "number" and maxRank > 0 then
@@ -987,21 +1244,24 @@ function Professions.ScanTradeSkillWindow()
 end
 
 function Professions.ScanCraftWindow()
-    if not Professions.CaptureAllowed() then return nil, "cold" end
+    local ev = { n = 0, ids = 0, missed = 0 }
+    if not Professions.CaptureAllowed() then return nil, "cold", ev end
     -- The craft surface is shared with hunter beast training, which is not a
     -- profession. This is the discriminator, and it is a refusal, not a filter.
-    if not CraftIsEnchanting then return nil, "no-api" end
+    if not CraftIsEnchanting then return nil, "no-api", ev end
     local okE, isEnch = pcall(CraftIsEnchanting)
-    if not okE or not isEnch then return nil, "not-a-profession" end
-    if not (GetNumCrafts and GetCraftInfo and GetCraftRecipeLink) then return nil, "no-api" end
+    if not okE or not isEnch then return nil, "not-a-profession", ev end
+    if not (GetNumCrafts and GetCraftInfo and GetCraftRecipeLink) then return nil, "no-api", ev end
 
     local okN, n = pcall(GetNumCrafts)
-    if not okN or type(n) ~= "number" or n <= 0 then return nil, "empty" end
+    if not okN or type(n) ~= "number" then return nil, "empty", ev end
+    ev.n = n
+    if n <= 0 then return nil, "empty", ev end
 
     local rows, ids, missed = {}, {}, 0
     for i = 1, n do
         local ok, name, _, kind = pcall(GetCraftInfo, i)
-        if not ok then return nil, "row-error" end
+        if not ok then return nil, "row-error", ev end
         if kind ~= "header" and name ~= nil then
             local okL, link = pcall(GetCraftRecipeLink, i)
             local spell = okL and spellFromRecipeLink(link) or nil
@@ -1013,14 +1273,15 @@ function Professions.ScanCraftWindow()
             end
         end
     end
-    if #ids == 0 then return nil, "unresolved" end
-    if missed > 0 then return nil, "incomplete" end
+    ev.ids, ev.missed = #ids, missed
+    if #ids == 0 then return nil, "unresolved", ev end
+    if missed > 0 then return nil, "incomplete", ev end
 
     local profKey, unknown = Professions.ResolveProfession(ids)
-    if not profKey then return nil, "unidentified" end
+    if not profKey then return nil, "unidentified", ev end
 
     local scan = { profKey = profKey, rows = rows, ids = ids, unknown = unknown,
-                   complete = true, surface = "craft" }
+                   complete = true, surface = "craft", ev = ev }
     if GetCraftDisplaySkillLine then
         local ok, _, rank, maxRank = pcall(GetCraftDisplaySkillLine)
         if ok and type(rank) == "number" and type(maxRank) == "number" and maxRank > 0 then
@@ -1516,7 +1777,80 @@ function Professions.CaptureStatic(force)
     return true
 end
 
--- The authoritative half: an open window. `surface` is "tradeskill" or "craft".
+-- THE BOUNDED RETRY LADDER
+--
+-- Armed by a refusal that could heal, disarmed by a success or by the window
+-- closing. One timer per surface, at most #RETRY_LADDER rungs per window
+-- session, and every rung is recorded in the trace so "the deferral never fired"
+-- can never again be confused with "it fired and was refused".
+
+function Professions.CancelRetry(surface)
+    local r = Professions._retry and Professions._retry[surface]
+    if not r then return false end
+    if r.timer then pcall(function() r.timer:Cancel() end) end
+    Professions._retry[surface] = nil
+    return true
+end
+
+function Professions.RetryState(surface)
+    local r = Professions._retry and Professions._retry[surface]
+    if not r then return "idle" end
+    return string.format("rung %d/%d %s", r.step, #RETRY_LADDER,
+        r.pending and "pending" or "fired")
+end
+
+-- Returns true when a rung was armed. Refuses to arm when the window is not
+-- open, when the ladder is spent, or when the client has no timer service —
+-- three honest "no"s rather than a poll.
+function Professions.ScheduleRetry(surface, reason)
+    if not RETRYABLE[reason or ""] then return false end
+    if not (Professions._windowOpen and Professions._windowOpen[surface]) then return false end
+    if not Professions.IsEnabled() or Professions.IsTeardown() then return false end
+    Professions._retry = Professions._retry or {}
+    local r = Professions._retry[surface]
+    -- A rung already in flight is the answer. The filter clears alone fire four
+    -- update echoes in one frame, and letting each refusal advance the ladder
+    -- would spend all six rungs before the first one had a chance to run — a
+    -- ladder that climbs itself is not a ladder.
+    if r and r.pending then return false end
+    local step = (r and r.step or 0) + 1
+    local delay = RETRY_LADDER[step]
+    if not delay then return false end                    -- the ladder is finite on purpose
+    local rec = { step = step, timer = nil, pending = true }
+    Professions._retry[surface] = rec
+    local run = function()
+        local cur = Professions._retry and Professions._retry[surface]
+        if cur ~= rec then return end                     -- superseded
+        rec.timer, rec.pending = nil, false
+        if not Professions.IsEnabled() then return end
+        if not (Professions._windowOpen and Professions._windowOpen[surface]) then
+            Professions.CancelRetry(surface)
+            return
+        end
+        -- Give the filter sub-surface a chance to finish measuring first. Its
+        -- clear-on-open can only be measured against a window that has rows, and
+        -- when the rows arrive without an event this rung is the only thing that
+        -- will ever ask again.
+        local F = ns.ProfessionFilters
+        if F and F.Settle then pcall(F.Settle, surface) end
+        Professions.CaptureWindow(surface, true, "retry")
+    end
+    if C_Timer and C_Timer.NewTimer then
+        rec.timer = C_Timer.NewTimer(delay, run)
+    elseif C_Timer and C_Timer.After then
+        C_Timer.After(delay, run)
+    else
+        -- No timer service: no ladder, and no phantom rung left behind either.
+        -- A step counter that advanced without a timer would spend the ladder
+        -- on deferrals that never existed.
+        Professions._retry[surface] = r
+        return false
+    end
+    return true
+end
+
+-- The authoritative half: an open window. `surface` is "tradeskill" or "craft";
+-- `event` names what woke us and exists only for the trace.
 --
 -- THROTTLE. The window's update event fires on every craft, and a full scan of
 -- a 300-row profession is ~300 link reads plus ~300 cooldown reads. Crafting a
@@ -1524,23 +1858,56 @@ end
 -- second. `force` (the window's SHOW) always scans; an update inside the window
 -- coalesces. One second is short enough that a cooldown that just started is
 -- still published within the same breath.
-function Professions.CaptureWindow(surface, force)
+--
+-- THE THROTTLE IS ARMED BY SUCCESS, NEVER BY A REFUSAL. That distinction is the
+-- whole live defect. TRADE_SKILL_SHOW arrives before the server's row list does,
+-- so the forced scan at SHOW legitimately finds an empty enumeration; arming the
+-- throttle on that failure then made the module deaf for a second — and the
+-- TRADE_SKILL_UPDATE that finally CARRIED the rows lands inside that second.
+-- Every subsequent update was answered "throttled", nothing re-fired afterwards,
+-- and the profession read NEVER SCANNED for the rest of the session. A throttle
+-- exists to coalesce work that was already done; a refusal did no work, so it
+-- has nothing to coalesce.
+function Professions.CaptureWindow(surface, force, event)
     if not Professions.IsEnabled() then return false, "disabled" end
-    if not Professions.CaptureAllowed() then return false, "cold" end
+    event = event or (force and "forced" or "update")
+
+    local function refuse(reason, ev, guard)
+        Professions.RecordAttempt({
+            e = event, s = surface, f = force and true or nil,
+            p = Professions.WindowProfKey(surface),
+            r = reason, n = ev and ev.n, i = ev and ev.ids, u = ev and ev.missed,
+            g = guard, d = Professions.RetryState(surface),
+        })
+        Professions.ScheduleRetry(surface, reason)
+        return false, reason
+    end
+
+    if not Professions.CaptureAllowed() then return refuse("cold") end
     -- A narrowed list is a SHORT list, and a short list written as the known set
     -- is a confident lie about this character. See the view guard above.
-    if Professions.ViewNarrowed(surface) then return false, "view-filtered" end
-    local now = (GetTime and GetTime()) or 0
-    if not force and Professions._scanAt and (now - Professions._scanAt) < 1 then
-        return false, "throttled"
-    end
-    Professions._scanAt = now
-    local scan, why
-    if surface == "craft" then scan, why = Professions.ScanCraftWindow()
-    else scan, why = Professions.ScanTradeSkillWindow() end
-    if not scan then return false, why end
+    local narrowed, guardWhy = Professions.ViewNarrowedWhy(surface)
+    if narrowed then return refuse("view-filtered", nil, guardWhy) end
 
-    local stamp = (ns.Store and ns.Store.Now and ns.Store.Now()) or (time and time()) or 0
+    local now = nowMono()
+    if not force and Professions._scanAt and (now - Professions._scanAt) < SCAN_THROTTLE then
+        return refuse("throttled", nil, guardWhy)
+    end
+
+    local scan, why, ev
+    if surface == "craft" then scan, why, ev = Professions.ScanCraftWindow()
+    else scan, why, ev = Professions.ScanTradeSkillWindow() end
+    if not scan then return refuse(why, ev, guardWhy) end
+
+    Professions._scanAt = now
+    Professions.CancelRetry(surface)
+    Professions.RecordAttempt({
+        e = event, s = surface, f = force and true or nil, p = scan.profKey,
+        r = "ok", n = ev and ev.n, i = ev and ev.ids, u = ev and ev.missed,
+        g = guardWhy, d = "cleared",
+    })
+
+    local stamp = nowEpoch()
     Professions.ApplyScan(scan, stamp)
 
     local running, proven = Professions.FoldCooldowns(scan, stamp)
@@ -1588,6 +1955,44 @@ function Professions.StoreReagents(harvest)
 end
 
 ----------------------------------------------------------------------
+-- WINDOW SESSIONS
+--
+-- "Is the window open" is a fact the retry ladder needs and no client API
+-- answers cheaply for both surfaces, so it is latched from the events that
+-- bracket it. Opening also resets the ladder: a second open of the same window
+-- is a fresh chance, not a continuation of the last one's spent rungs.
+----------------------------------------------------------------------
+
+-- Tri-state on purpose: nil = never seen this session, true = open, false = the
+-- client TOLD us it closed. Only the SHOW event may lift a `false`.
+--
+-- That distinction is not pedantry. Closing the window makes the filter panel
+-- clear the client's filters on the way out, and every one of those setter calls
+-- comes back as a TRADE_SKILL_UPDATE — arriving AFTER the close we are handling.
+-- If an update could re-latch the window open, every close would re-arm a retry
+-- ladder against a window that is not there.
+function Professions.OpenWindow(surface, authoritative)
+    Professions._windowOpen = Professions._windowOpen or {}
+    local was = Professions._windowOpen[surface]
+    if was == false and not authoritative then return false end
+    if was == true then return false end
+    Professions._windowOpen[surface] = true
+    Professions.CancelRetry(surface)
+    return true
+end
+
+function Professions.CloseWindow(surface)
+    Professions._windowOpen = Professions._windowOpen or {}
+    Professions._windowOpen[surface] = false
+    Professions.CancelRetry(surface)
+    return true
+end
+
+function Professions.WindowIsOpen(surface)
+    return (Professions._windowOpen and Professions._windowOpen[surface]) == true
+end
+
+----------------------------------------------------------------------
 -- LIFECYCLE
 --
 -- Nothing here runs at file scope. Activate() is the first moment this module
@@ -1617,16 +2022,26 @@ local function onEvent(_, event, ...)
         Professions._loggingOut = true
         cancelDirty()
     elseif event == "TRADE_SKILL_SHOW" then
-        Professions.CaptureWindow("tradeskill", true)
+        Professions.OpenWindow("tradeskill", true)
+        Professions.CaptureWindow("tradeskill", true, "TRADE_SKILL_SHOW")
     elseif event == "TRADE_SKILL_UPDATE" then
-        Professions.CaptureWindow("tradeskill")
+        -- The rows usually arrive HERE, not on SHOW. An update on a surface we
+        -- were never told opened is still an open window as far as the client is
+        -- concerned, so the ladder is allowed to arm from it.
+        Professions.OpenWindow("tradeskill")
+        Professions.CaptureWindow("tradeskill", false, "TRADE_SKILL_UPDATE")
     elseif event == "CRAFT_SHOW" then
-        Professions.CaptureWindow("craft", true)
+        Professions.OpenWindow("craft", true)
+        Professions.CaptureWindow("craft", true, "CRAFT_SHOW")
     elseif event == "CRAFT_UPDATE" then
-        Professions.CaptureWindow("craft")
+        Professions.OpenWindow("craft")
+        Professions.CaptureWindow("craft", false, "CRAFT_UPDATE")
     elseif event == "TRADE_SKILL_CLOSE" or event == "CRAFT_CLOSE" then
         -- Nothing to tear down: the scan already wrote what it proved. The
-        -- close is only interesting as a publish opportunity.
+        -- close is only interesting as a publish opportunity — and as the
+        -- moment the retry ladder must stop, because a ladder that outlives its
+        -- window is a poll against a window that is not there.
+        Professions.CloseWindow(event == "CRAFT_CLOSE" and "craft" or "tradeskill")
         Professions.MarkDirty()
     elseif event == "SKILL_LINES_CHANGED" or event == "SPELLS_CHANGED" then
         if Professions.CaptureStatic() then Professions.MarkDirty() end
@@ -1692,6 +2107,9 @@ function Professions.SetEnabled(on)
         if F and F.Teardown then F.Teardown() end
         Professions.ClearViewGuards()
         cancelDirty()
+        for _, surface in ipairs({ "tradeskill", "craft" }) do
+            Professions.CloseWindow(surface)
+        end
         if Professions._frame then
             pcall(function() Professions._frame:UnregisterAllEvents() end)
             pcall(function() Professions._frame:SetScript("OnEvent", nil) end)
@@ -1703,6 +2121,13 @@ function Professions.SetEnabled(on)
         Professions._lastSig = nil
         Professions._scanAt, Professions._staticAt = nil, nil
         Professions._harvested = nil
+        Professions._windowOpen, Professions._retry = nil, nil
+        -- The forensics go too. They are session state describing a module that
+        -- is no longer running, and a stats table that outlived its module would
+        -- report attempts against a build path that is not there any more. The
+        -- saved-variable ring is left alone: it is the record of what happened
+        -- while the module WAS on, and that is exactly what a bug report needs.
+        Professions._stats, Professions._trace = nil, nil
         Dataset.Unload()
     end
     -- Readers that cache anything derived from the dataset (the recipe tooltip's
@@ -1759,6 +2184,23 @@ ns:RegisterDebugCommand("professions", function()
                 r.k and tostring(r.n) or "NEVER SCANNED",
                 tostring(r.u or 0),
                 r.a and tostring(r.a) or "never"))
+            -- The forensics line, right under the profession it explains. This
+            -- is the line the last wave did not have: "NEVER SCANNED" with no
+            -- attempts is a dead event chain, "NEVER SCANNED" with 7 attempts
+            -- all refused `empty` is a client that never sent its rows, and
+            -- "NEVER SCANNED" with `view-filtered` is a filter nobody cleared.
+            local st = P.Stats(keys[i])
+            if st then
+                local tally = {}
+                for reason, n in pairs(st.reasons) do tally[#tally + 1] = reason .. "x" .. n end
+                table.sort(tally)
+                ns:Print(string.format("      scans: %d attempt(s), %d ok | last %s at %s (%s)%s",
+                    st.attempts, st.ok, tostring(st.lastReason or "?"),
+                    tostring(st.lastAt or "never"), tostring(st.lastEvent or "?"),
+                    (#tally > 0) and (" | refusals " .. table.concat(tally, ",")) or ""))
+            else
+                ns:Print("      scans: NO ATTEMPT RECORDED — no window event ever reached the capture")
+            end
         end
         local ck = {}
         for k in pairs(L.c) do ck[#ck + 1] = k end
@@ -1798,6 +2240,40 @@ ns:RegisterDebugCommand("professions", function()
         for _ in pairs(area.reagents or {}) do n = n + 1 end
         ns:Print("  reagent harvest: " .. n .. " recipe(s), taken " ..
             tostring(area.reagentsAt or "never") .. " against ds " .. tostring(area.reagentsDS or "?"))
+    end
+
+    -- Windows and ladders: the two pieces of state that decide whether another
+    -- attempt is coming at all.
+    for _, surface in ipairs({ "tradeskill", "craft" }) do
+        local st = P.Stats("surface:" .. surface)
+        ns:Print(string.format("  %s window: open=%s | ladder %s%s", surface,
+            tostring(P.WindowIsOpen(surface)), P.RetryState(surface),
+            st and string.format(" | unattributed %d attempt(s), last %s",
+                st.attempts, tostring(st.lastReason or "?")) or ""))
+    end
+
+    -- The ring. Newest last, because that is the order the events happened in
+    -- and a trace read backwards is a trace read wrong. The session's own copy
+    -- is preferred; the stored ring answers after a /reload.
+    local rows = P.TraceRows()
+    if #rows == 0 then
+        local stored = S and S.ProfessionsTrace and S.ProfessionsTrace(false)
+        rows = (stored and stored.rows) or {}
+        if #rows > 0 then
+            ns:Print("  scan trace (from saved variables, build "
+                .. tostring(stored.build) .. "):")
+        end
+    else
+        ns:Print("  scan trace (this session, build " .. P.BuildStamp() .. "):")
+    end
+    if #rows == 0 then
+        ns:Print("  scan trace: EMPTY — not one window-capture attempt has been recorded")
+    else
+        local from = math.max(1, #rows - 12)
+        if from > 1 then ns:Print("    ... " .. (from - 1) .. " older row(s)") end
+        for i = from, #rows do
+            ns:Print("    " .. P.FormatTraceRow(rows[i]))
+        end
     end
 end)
 
@@ -2395,6 +2871,542 @@ local function testPublishDelta(fails)
     if not ok then fails[#fails + 1] = "error in publish-delta fixtures: " .. tostring(err) end
 end
 
+----------------------------------------------------------------------
+-- THE COMPOSED CHAIN — the suite that would have caught the live miss
+--
+-- Every earlier suite drives ONE layer with the others held still: the scanner
+-- against a fixed row list, the interlock against a fixed filter state, the
+-- codec against fixed ids. The defect that shipped lived in none of them. It
+-- lived in the COMPOSITION — module init, then the client's real event order,
+-- then wave P3's filter clears (each of which the client echoes back as an
+-- update), then the deferred re-capture — and every layer, tested alone, was
+-- correct.
+--
+-- So this fixture drives the whole chain, and its client is UNKIND by default
+-- (simulator doctrine, CLIENT_ASYNC_LESSONS):
+--
+--   * TRADE_SKILL_SHOW arrives BEFORE the rows. GetNumTradeSkills answers 0
+--     until the server's list packet lands some frames later — the thing that
+--     makes the SHOW-time scan legitimately fail.
+--   * every filter setter echoes TRADE_SKILL_UPDATE, so one clear is four more
+--     re-entrant capture attempts in the same frame.
+--   * deferred work does not run itself. C_Timer is a queue this fixture pumps
+--     frame by frame against a virtual clock, so "the timer never fired" is a
+--     state the test can actually be in.
+--   * the SILENT profile is harsher still: the rows land with NO event at all,
+--     which is the only profile the retry ladder can survive.
+--
+-- The RED CONTROL is the pre-fix gate, written out here as eight lines and
+-- replayed against the SAME recorded opportunity list the real module was given.
+-- Without it the green rows below assert only that the current code does what
+-- the current code does.
+----------------------------------------------------------------------
+
+-- A pumpable C_Timer over a virtual clock. Returns the fixture; call :install()
+-- and :restore(). `pump(to)` runs every callback due at or before `to` in due
+-- order, advancing the clock as it goes, so callbacks scheduled by callbacks
+-- run at their own honest time.
+local function newClock(t0)
+    local C = { now = t0 or 1000, q = {}, seq = 0 }
+    local savedTime, savedTimer
+
+    local function push(delay, fn)
+        C.seq = C.seq + 1
+        local item = { due = C.now + (tonumber(delay) or 0), fn = fn,
+                       seq = C.seq, cancelled = false }
+        C.q[#C.q + 1] = item
+        return item
+    end
+
+    function C:install()
+        savedTime, savedTimer = _G.GetTime, _G.C_Timer
+        _G.GetTime = function() return C.now end
+        _G.C_Timer = {
+            After = function(delay, fn) push(delay, fn) end,
+            NewTimer = function(delay, fn)
+                local item = push(delay, fn)
+                return { Cancel = function() item.cancelled = true end }
+            end,
+            NewTicker = function() return { Cancel = function() end } end,
+        }
+    end
+
+    function C:restore()
+        _G.GetTime, _G.C_Timer = savedTime, savedTimer
+    end
+
+    -- Run everything due up to `to`, in (due, seq) order. Bounded so a callback
+    -- that re-arms itself at zero delay cannot hang the suite.
+    function C:pump(to)
+        local guard = 0
+        while true do
+            guard = guard + 1
+            if guard > 500 then error("timer pump did not settle") end
+            local best
+            for i = 1, #C.q do
+                local it = C.q[i]
+                if not it.cancelled and not it.done and it.due <= to then
+                    if not best or it.due < best.due
+                       or (it.due == best.due and it.seq < best.seq) then best = it end
+                end
+            end
+            if not best then break end
+            best.done = true
+            C.now = math.max(C.now, best.due)
+            best.fn()
+        end
+        C.now = math.max(C.now, to)
+    end
+
+    return C
+end
+
+-- A widget mock that answers METHODS and nothing else. The harness's frame mock
+-- hands back a callable for every key, which makes `if box.editBox then` take
+-- the wrong branch; here anything that is not an upper-case method name reads as
+-- absent, which is what the panel code is actually asking about.
+local mockMeta = {}
+mockMeta.__index = function(t, k)
+    if type(k) ~= "string" then return nil end
+    local first = k:sub(1, 1)
+    if first == "_" or first:upper() ~= first then return nil end
+    return function(_, ...) return t end
+end
+local function newMock(fields)
+    local m = setmetatable(fields or {}, mockMeta)
+    return m
+end
+
+-- The unkind trade-skill client. `profile` is "echo" (the landing announces
+-- itself with an update) or "silent" (it does not).
+local function newWindowSim(rows, landedAt, profile)
+    local W = {
+        rows = rows, landedAt = landedAt, profile = profile or "echo",
+        events = {}, echoes = 0, filters = { text = "", makeable = false },
+    }
+    local saved = {}
+    local G = _G
+
+    local function landed() return (G.GetTime() + 1e-9) >= W.landedAt end
+
+    -- Emit an event to BOTH modules in registration order — professions.lua
+    -- creates its frame first, then hands off to professions_filters.lua, so
+    -- that is the order the client would use.
+    function W.emit(event)
+        W.events[#W.events + 1] = { t = G.GetTime(), e = event }
+        if Professions._onEvent then Professions._onEvent(nil, event) end
+        local F = ns.ProfessionFilters
+        if F and F._onEvent then F._onEvent(nil, event) end
+    end
+
+    -- The client's own echo: any filter setter rebuilds the list and tells the
+    -- UI about it. This is what turns one clear into four capture attempts.
+    local function echo()
+        W.echoes = W.echoes + 1
+        W.events[#W.events + 1] = { t = G.GetTime(), e = "TRADE_SKILL_UPDATE" }
+        if Professions._onEvent then Professions._onEvent(nil, "TRADE_SKILL_UPDATE") end
+        local F = ns.ProfessionFilters
+        if F and F._onEvent then F._onEvent(nil, "TRADE_SKILL_UPDATE") end
+    end
+
+    function W:install()
+        saved = {
+            num = G.GetNumTradeSkills, info = G.GetTradeSkillInfo,
+            link = G.GetTradeSkillRecipeLink, line = G.GetTradeSkillLine,
+            cd = G.GetTradeSkillCooldown,
+            setText = G.SetTradeSkillItemNameFilter, getText = G.GetTradeSkillItemNameFilter,
+            makeable = G.TradeSkillOnlyShowMakeable, getMakeable = G.GetOnlyShowMakeable,
+            setSub = G.SetTradeSkillSubClassFilter, getSub = G.GetTradeSkillSubClassFilter,
+            subs = G.GetTradeSkillSubClasses,
+            setSlot = G.SetTradeSkillInvSlotFilter, getSlot = G.GetTradeSkillInvSlotFilter,
+            slots = G.GetTradeSkillInvSlots,
+            numReagents = G.GetTradeSkillNumReagents, reagentInfo = G.GetTradeSkillReagentInfo,
+            reagentLink = G.GetTradeSkillReagentItemLink, itemLink = G.GetTradeSkillItemLink,
+            numMade = G.GetTradeSkillNumMade,
+            frame = G.TradeSkillFrame, update = G.TradeSkillFrame_Update,
+        }
+        G.GetNumTradeSkills = function() return landed() and #W.rows or 0 end
+        G.GetTradeSkillInfo = function(i)
+            if not landed() then return nil end
+            local row = W.rows[i]
+            if not row then return nil end
+            return row.name, (row.kind == "header") and "header" or "optimal", 1, false
+        end
+        G.GetTradeSkillRecipeLink = function(i)
+            if not landed() then return nil end
+            local row = W.rows[i]
+            if not row or row.kind == "header" then return nil end
+            return "|cffffd000|Henchant:" .. tostring(row.s) .. "|h[x]|h|r"
+        end
+        G.GetTradeSkillLine = function() return "Blacksmithing", 275, 300 end
+        G.GetTradeSkillCooldown = function() return nil end
+        G.SetTradeSkillItemNameFilter = function(t) W.filters.text = t or ""; echo() end
+        G.GetTradeSkillItemNameFilter = function() return W.filters.text end
+        G.TradeSkillOnlyShowMakeable = function(v)
+            W.filters.makeable = v and true or false; echo()
+        end
+        G.GetOnlyShowMakeable = function() return W.filters.makeable end
+        G.SetTradeSkillSubClassFilter = function(...) W.lastSub = { ... }; echo() end
+        G.GetTradeSkillSubClassFilter = function() return 0 end
+        G.GetTradeSkillSubClasses = function() return { "Weapon", "Armor" } end
+        G.SetTradeSkillInvSlotFilter = function(...) W.lastSlot = { ... }; echo() end
+        G.GetTradeSkillInvSlotFilter = function() return 0 end
+        G.GetTradeSkillInvSlots = function() return { "Head", "Chest" } end
+        G.GetTradeSkillNumReagents = function() return 1 end
+        G.GetTradeSkillReagentInfo = function() return "reagent", nil, 2 end
+        G.GetTradeSkillReagentItemLink = function() return "|Hitem:2840:0|h[Copper]|h|r" end
+        G.GetTradeSkillItemLink = function() return "|Hitem:2841:0|h[out]|h|r" end
+        G.GetTradeSkillNumMade = function() return 1, 1 end
+        -- The Blizzard frame IS present, because a chain that never builds the
+        -- filter panel never fires the clears, and the clears are half of what
+        -- this fixture exists to compose.
+        W.frame = newMock({ GetFrameLevel = function() return 3 end })
+        G.TradeSkillFrame = W.frame
+        W.redraws = 0
+        G.TradeSkillFrame_Update = function() W.redraws = W.redraws + 1 end
+        -- The widget kit the panel builds with. The harness's DaseekiUI stub
+        -- carries FlatFrame and MakeButton but not the three control factories,
+        -- so they are supplied here and taken away again on restore.
+        local UI = G.DaseekiUI
+        if UI then
+            saved.mkEdit, saved.mkCheck, saved.mkDrop =
+                UI.MakeEditBox, UI.MakeCheckbox, UI.MakeDropdown
+            UI.MakeEditBox  = function() return newMock() end
+            UI.MakeCheckbox = function() return newMock() end
+            UI.MakeDropdown = function() return newMock() end
+        end
+    end
+
+    function W:restore()
+        G.GetNumTradeSkills, G.GetTradeSkillInfo = saved.num, saved.info
+        G.GetTradeSkillRecipeLink, G.GetTradeSkillLine = saved.link, saved.line
+        G.GetTradeSkillCooldown = saved.cd
+        G.SetTradeSkillItemNameFilter, G.GetTradeSkillItemNameFilter = saved.setText, saved.getText
+        G.TradeSkillOnlyShowMakeable, G.GetOnlyShowMakeable = saved.makeable, saved.getMakeable
+        G.SetTradeSkillSubClassFilter, G.GetTradeSkillSubClassFilter = saved.setSub, saved.getSub
+        G.GetTradeSkillSubClasses = saved.subs
+        G.SetTradeSkillInvSlotFilter, G.GetTradeSkillInvSlotFilter = saved.setSlot, saved.getSlot
+        G.GetTradeSkillInvSlots = saved.slots
+        G.GetTradeSkillNumReagents, G.GetTradeSkillReagentInfo = saved.numReagents, saved.reagentInfo
+        G.GetTradeSkillReagentItemLink, G.GetTradeSkillItemLink = saved.reagentLink, saved.itemLink
+        G.GetTradeSkillNumMade = saved.numMade
+        G.TradeSkillFrame, G.TradeSkillFrame_Update = saved.frame, saved.update
+        local UI = G.DaseekiUI
+        if UI then
+            UI.MakeEditBox, UI.MakeCheckbox, UI.MakeDropdown =
+                saved.mkEdit, saved.mkCheck, saved.mkDrop
+        end
+    end
+
+    -- The landing. In the ECHO profile the client announces it; in the SILENT
+    -- profile the rows simply become readable and nothing says so.
+    function W:land()
+        if W.profile == "echo" then W.emit("TRADE_SKILL_UPDATE") end
+    end
+
+    return W
+end
+
+-- THE PRE-FIX CHAIN, written down. This is the sequence of capture
+-- opportunities the shipped code had on a live window open, and it is stated
+-- here rather than recorded from the current code because the current code has
+-- MORE opportunities — that is what the fix consists of, and a red control fed
+-- the green code's opportunity list would quietly stop reproducing anything.
+--
+-- Times are seconds from TRADE_SKILL_SHOW. The rows land at 0.30.
+local PREFIX_CHAIN = {
+    { t = 0.00, force = true,  what = "TRADE_SKILL_SHOW" },
+    { t = 0.00, force = false, what = "echo: name filter cleared" },
+    { t = 0.00, force = false, what = "echo: have-materials cleared" },
+    { t = 0.00, force = false, what = "echo: subclass cleared" },
+    { t = 0.00, force = false, what = "echo: inv-slot cleared" },
+    { t = 0.00, force = true,  what = "P3's one-frame deferred re-capture" },
+    { t = 0.30, force = false, what = "TRADE_SKILL_UPDATE carrying the rows" },
+}
+
+-- THE RED CONTROL: the pre-fix gate, in eight lines. `_scanAt` is armed by the
+-- ATTEMPT rather than by the SCAN, so one legitimately-empty read at SHOW
+-- deafens the module for a second — and the update that finally carries the
+-- rows lands inside it.
+local function legacyGate(opportunities, landedAt)
+    local scanAt, captured = nil, false
+    for i = 1, #opportunities do
+        local o = opportunities[i]
+        local throttled = (not o.force) and scanAt and (o.t - scanAt) < 1
+        if not throttled then
+            scanAt = o.t                                 -- armed by the attempt
+            if o.t + 1e-9 >= landedAt then captured = true end
+        end
+    end
+    return captured
+end
+
+local function testComposedChain(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    if not Dataset.LoadCore() then
+        fails[#fails + 1] = "the dataset would not load"
+        return
+    end
+
+    local bs = Dataset.profRecipes[Dataset.profIdx.blacksmithing]
+    local function fixtureRows()
+        return {
+            { kind = "header", name = "Weapons" },
+            { kind = "recipe", name = "Arcanite Reaper", s = bs[1] },
+            { kind = "recipe", name = "Iron Sword",      s = bs[2] },
+            { kind = "header", name = "Armor" },
+            { kind = "recipe", name = "Iron Shield",     s = bs[3] },
+            { kind = "recipe", name = "Copper Chain",    s = bs[4] },
+        }
+    end
+
+    local F = ns.ProfessionFilters
+    local savedLatch = {
+        Professions._leavingWorld, Professions._loggingOut, Professions._enteredWorldAt,
+        Professions._live, Professions._scanAt, Professions._harvested,
+        Professions._windowOpen, Professions._retry, Professions._stats,
+        Professions._trace, Professions._lastSig,
+    }
+    local savedFilters = F and { F._state, F._prof, F._panels, F._hooked, F._activated }
+    local savedGuards = Professions._viewGuards
+    local savedStore = ns.Store and ns.Store.data and ns.Store.data.professions
+
+    -- One run of the whole chain. Returns a report the rows below assert on.
+    local function runChain(profile)
+        local clock = newClock(1000)
+        local sim = newWindowSim(fixtureRows(), 1000.30, profile)
+        local opportunities = {}
+        local realCapture = Professions.CaptureWindow
+
+        clock:install()
+        sim:install()
+        -- Wrap the capture so the RED CONTROL is replayed against exactly the
+        -- opportunities the client and wave P3 handed the real module — the
+        -- ladder's own rungs are excluded, because the pre-fix code had none.
+        Professions.CaptureWindow = function(surface, force, event)
+            if event ~= "retry" then
+                opportunities[#opportunities + 1] =
+                    { t = _G.GetTime() - 1000, force = force and true or false, e = event }
+            end
+            return realCapture(surface, force, event)
+        end
+
+        Professions._leavingWorld, Professions._loggingOut = false, false
+        Professions._enteredWorldAt = 0
+        Professions._live, Professions._scanAt = nil, nil
+        Professions._harvested, Professions._windowOpen, Professions._retry = nil, nil, nil
+        Professions._stats, Professions._trace = nil, nil
+        Professions._viewGuards = nil
+        if F then
+            F._state, F._prof, F._panels, F._hooked = nil, nil, nil, nil
+            F._activated = false
+            F.Activate()                                  -- registers the view guard
+        end
+
+        local ok, err = pcall(function()
+            sim.emit("TRADE_SKILL_SHOW")                  -- t = 0, before the rows
+            clock:pump(1000.30)                           -- P3's deferral + every early rung
+            sim:land()                                    -- t = 0.30: the rows are readable
+            clock:pump(1000 + 8)                          -- let the ladder run itself out
+        end)
+
+        local rec = Professions._live and Professions._live.p
+                    and Professions._live.p.blacksmithing
+        -- WHICH mechanism landed the scan. Two different fixes are in play and a
+        -- green row that cannot say which one did the work would go on passing
+        -- after one of them regressed.
+        local landedBy
+        for _, row in ipairs(Professions.TraceRows()) do
+            if row.r == "ok" and not landedBy then landedBy = row.e end
+        end
+        local report = {
+            captured = (rec and rec.k) and true or false,
+            landedBy = landedBy,
+            known = rec and rec.n or 0,
+            opportunities = opportunities,
+            attempts = (Professions.Stats("blacksmithing") or {}).attempts or 0,
+            trace = Professions.TraceRows(),
+            echoes = sim.echoes,
+            err = (not ok) and err or nil,
+        }
+
+        Professions.CaptureWindow = realCapture
+        sim:restore()
+        clock:restore()
+        return report
+    end
+
+    local ok, err = pcall(function()
+        -- ══ (1) THE ECHO PROFILE — the live shape, exactly ═══════════════════
+        local echoRun = runChain("echo")
+        ck(echoRun.err == nil, "the echo chain errored: " .. tostring(echoRun.err))
+        ck(echoRun.echoes > 0,
+           "the sim never echoed a single filter clear back as an update; the fixture "
+           .. "is kinder than the client and proves nothing")
+
+        -- RED: the pre-fix gate over the pre-fix chain never captures. Every
+        -- opportunity after the SHOW is either an echo inside the throttled
+        -- second or a forced read taken before the rows existed, and the one
+        -- read that would have worked is refused as "throttled".
+        ck(legacyGate(PREFIX_CHAIN, 0.30) == false,
+           "RED CONTROL DID NOT REPRODUCE: the pre-fix throttle captured the window. "
+           .. "Either the chain model is wrong or the miss is elsewhere.")
+        -- ...and the model is not fiction: the live fixture really does hand the
+        -- module a forced read at SHOW, a burst of clear echoes in the same
+        -- frame, and a deferred forced read, all before the rows land.
+        do
+            local preLanding, echoesAtOpen, forced = 0, 0, 0
+            for _, o in ipairs(echoRun.opportunities) do
+                if o.t < 0.30 then
+                    preLanding = preLanding + 1
+                    if o.force then forced = forced + 1 else echoesAtOpen = echoesAtOpen + 1 end
+                end
+            end
+            ck(forced >= 2, "the fixture produced " .. forced .. " forced pre-landing reads; "
+               .. "the live chain has at least two (SHOW and the deferral)")
+            ck(echoesAtOpen >= 3, "the fixture produced " .. echoesAtOpen
+               .. " clear echoes; the live clear fires one per filter setter")
+        end
+
+        -- GREEN: the shipped gate does.
+        ck(echoRun.captured == true,
+           "the composed chain did not capture (attempts " .. echoRun.attempts
+           .. ", opportunities " .. #echoRun.opportunities .. ")")
+        ck(echoRun.known == 4,
+           "the chain captured " .. tostring(echoRun.known) .. " recipes, expected 4")
+        -- ...and it was the LANDING UPDATE that landed it, not a ladder rung.
+        -- That is the throttle fix and nothing else: the update carrying the
+        -- rows arrives 0.28s after the last refused attempt, deep inside the
+        -- one-second window a refusal used to arm.
+        ck(echoRun.landedBy == "TRADE_SKILL_UPDATE",
+           "the echo chain was rescued by '" .. tostring(echoRun.landedBy)
+           .. "' rather than by the update that carried the rows — the throttle "
+           .. "is swallowing the settle signal again")
+
+        -- The forensics are not decoration: the refusals BEFORE the capture are
+        -- on the record with reasons, and the capture itself is on the record.
+        local sawEmpty, sawOk = false, false
+        for i = 1, #echoRun.trace do
+            local r = echoRun.trace[i]
+            if r.r == "empty" then sawEmpty = true end
+            if r.r == "ok" then sawOk = true end
+        end
+        ck(sawEmpty, "no refusal reason was recorded for the pre-landing reads")
+        ck(sawOk, "the successful scan left no trace row")
+
+        -- ══ (2) THE SILENT PROFILE — the rows land and nothing says so ═══════
+        -- The only thing that can save this is the ladder. If it ever becomes a
+        -- one-shot again this row goes red.
+        local silentRun = runChain("silent")
+        ck(silentRun.err == nil, "the silent chain errored: " .. tostring(silentRun.err))
+        -- The pre-fix chain minus its last row: in the silent profile nothing at
+        -- all fires after the rows arrive, so there is not even a throttled
+        -- opportunity to lose.
+        local silentChain = {}
+        for i = 1, #PREFIX_CHAIN - 1 do silentChain[i] = PREFIX_CHAIN[i] end
+        ck(legacyGate(silentChain, 0.30) == false,
+           "RED CONTROL DID NOT REPRODUCE on the silent profile")
+        ck(silentRun.captured == true,
+           "the retry ladder did not heal a window whose rows arrived without an event "
+           .. "(attempts " .. silentRun.attempts .. ")")
+        ck(silentRun.landedBy == "retry",
+           "the silent chain was landed by '" .. tostring(silentRun.landedBy)
+           .. "' — this profile has no event after the landing, so only a ladder "
+           .. "rung can honestly have done it")
+
+        -- ══ (3) THE LADDER IS BOUNDED AND DIES WITH THE WINDOW ═══════════════
+        do
+            local clock = newClock(2000)
+            local sim = newWindowSim(fixtureRows(), 1e9, "silent")   -- rows never arrive
+            clock:install()
+            sim:install()
+            Professions._live, Professions._scanAt = nil, nil
+            Professions._windowOpen, Professions._retry = nil, nil
+            Professions._stats, Professions._trace = nil, nil
+            local function totalAttempts()
+                return ((Professions.Stats("blacksmithing") or {}).attempts or 0)
+                     + ((Professions.Stats("surface:tradeskill") or {}).attempts or 0)
+            end
+            local settledBy
+            local okRun = pcall(function()
+                sim.emit("TRADE_SKILL_SHOW")
+                clock:pump(2000 + 10)          -- the whole ladder, and then some
+                settledBy = totalAttempts()
+                clock:pump(2000 + 60)          -- fifty more seconds of nothing
+            end)
+            ck(okRun, "the never-landing window errored")
+            -- The bound that matters is not the count, it is that the work STOPS.
+            -- A poll would keep going for the whole minute.
+            ck(totalAttempts() == settledBy,
+               "the ladder was still working " .. (totalAttempts() - (settledBy or 0))
+               .. " attempts later, fifty seconds after the window opened — that is a poll")
+            ck(settledBy and settledBy <= 60,
+               "a window that never sent its rows cost " .. tostring(settledBy)
+               .. " capture attempts before it gave up")
+            ck(Professions.RetryState("tradeskill"):find("idle") == nil,
+               "the spent ladder reported itself idle instead of naming its last rung")
+
+            -- ...and the close disarms it.
+            sim.emit("TRADE_SKILL_CLOSE")
+            ck(Professions.WindowIsOpen("tradeskill") == false,
+               "the window stayed open after TRADE_SKILL_CLOSE")
+            ck(Professions.RetryState("tradeskill") == "idle",
+               "the ladder outlived the window it belonged to")
+            sim:restore()
+            clock:restore()
+        end
+
+        -- ══ (4) THE INTERLOCK STILL STANDS INSIDE THE CHAIN ══════════════════
+        -- A capture that fires while a filter is engaged must refuse, and the
+        -- refusal must name the witness rather than a generic "no".
+        do
+            local clock = newClock(3000)
+            local sim = newWindowSim(fixtureRows(), 3000, "echo")    -- rows already there
+            clock:install()
+            sim:install()
+            Professions._live, Professions._scanAt = nil, nil
+            Professions._windowOpen, Professions._retry = nil, nil
+            Professions._stats, Professions._trace = nil, nil
+            local okRun = pcall(function()
+                sim.emit("TRADE_SKILL_SHOW")
+                clock:pump(3000 + 1)
+                _G.SetTradeSkillItemNameFilter("iron")
+                Professions._scanAt = nil
+                Professions.CaptureWindow("tradeskill", true, "test")
+            end)
+            ck(okRun, "the interlock leg errored")
+            local narrowed, why = Professions.ViewNarrowedWhy("tradeskill")
+            ck(narrowed == true, "a client-side name filter was invisible to the guard")
+            ck(why == "client-name-filter",
+               "the guard did not name its witness (" .. tostring(why) .. ")")
+            local last = Professions.TraceRows()[#Professions.TraceRows()]
+            ck(last and last.r == "view-filtered" and last.g == "client-name-filter",
+               "the filtered refusal did not record which witness produced it")
+            local rec = Professions._live and Professions._live.p
+                        and Professions._live.p.blacksmithing
+            ck(rec and rec.n == 4,
+               "the filtered capture replaced the known set instead of leaving it standing")
+            sim:restore()
+            clock:restore()
+        end
+    end)
+
+    Professions.CaptureWindow = Professions.CaptureWindow      -- (restored inside runChain)
+    Professions._leavingWorld, Professions._loggingOut = savedLatch[1], savedLatch[2]
+    Professions._enteredWorldAt, Professions._live = savedLatch[3], savedLatch[4]
+    Professions._scanAt, Professions._harvested = savedLatch[5], savedLatch[6]
+    Professions._windowOpen, Professions._retry = savedLatch[7], savedLatch[8]
+    Professions._stats, Professions._trace = savedLatch[9], savedLatch[10]
+    Professions._lastSig = savedLatch[11]
+    Professions._viewGuards = savedGuards
+    if F then
+        F._state, F._prof, F._panels = savedFilters[1], savedFilters[2], savedFilters[3]
+        F._hooked, F._activated = savedFilters[4], savedFilters[5]
+    end
+    if ns.Store and ns.Store.data then ns.Store.data.professions = savedStore end
+    if not ok then fails[#fails + 1] = "error in composed-chain fixtures: " .. tostring(err) end
+end
+
 local function testInertness(fails)
     local function ck(c, m) if not c then fails[#fails + 1] = m end end
 
@@ -2458,6 +3470,8 @@ function Professions.RunSelfTests(verbose)
         { name = "capture honesty gates (class 4/6/7: cold, partial, polarity, cooldown proof)",
           fn = testCaptureHonesty },
         { name = "reagent harvest (class 4: partial lists are not lists)", fn = testReagentHarvest },
+        { name = "composed chain (open -> clears -> deferral -> landing, with the red control)",
+          fn = testComposedChain },
         { name = "publish delta detector", fn = testPublishDelta },
         { name = "module inertness (off = no frame, no events, no dataset, no SV)",
           fn = testInertness },
