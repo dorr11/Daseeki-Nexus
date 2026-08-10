@@ -34,6 +34,7 @@ inventory.lua
 # string until the professions module is enabled and asks — see professions.lua.
 professions_data.lua
 professions.lua
+professions_filters.lua
 tooltips.lua
 import.lua
 ui_shell.lua

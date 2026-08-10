@@ -856,6 +856,433 @@ function Tooltips.AppendCounts(tt)
 end
 
 ----------------------------------------------------------------------
+-- ═══════════ RECIPE LINES — NOT TRANSCRIBED, NEXUS ORIGINAL ═════════
+--
+-- Everything from here to the end of this section is the PROFESSIONS module's
+-- tooltip surface (wave P3). It has nothing to do with Daseeki-Bags, is NOT
+-- part of the transcription, and is NOT covered by the cross-addon parity gate
+-- — the gate drives AppendCounts and the pure count model only, and those are
+-- untouched above. Do not transcribe anything from Bags into this section and
+-- do not let anything here leak upward.
+--
+-- WHAT IT DRAWS. On a RECIPE ITEM (a plan / pattern / formula / recipe /
+-- schematic — anything the dataset maps to a teaching spell), two lines:
+--
+--     Known: Poonyx, Zug
+--     Learnable: Puucons (285/275)
+--     (2 alts unscanned)
+--
+-- Known = alts we have PROVEN know it. Learnable = alts we have proven do NOT
+-- know it, who have the profession, whose current skill meets the requirement,
+-- and who hold the specialisation when the recipe is gated on one. The owner's
+-- ruling was "just learned and can learn is fine" — so an alt whose skill is
+-- short, or who lacks the gating specialisation, appears in NEITHER line. There
+-- is no craftable-by line.
+--
+-- WHY THE THIRD LINE EXISTS — the defect we refuse to reproduce.
+-- PROFESSIONS_DATASET_ADDENDUM §5.3: the shipped third-party equivalent stores
+-- each alt's MISSING set and treats "absent from missing" as KNOWN. An alt
+-- whose record predates the recipe — dataset updated, alt not logged in since —
+-- is therefore reported as ALREADY KNOWING IT. That hides exactly the alt the
+-- player opened the tooltip to find.
+--
+-- Our chain cannot say that. professions.lua stores the LEARNED set, and
+-- Professions.KnownState returns "known" / "missing" / "unknown" with no
+-- boolean form. An "unknown" alt is in neither list — and because silence is
+-- itself a claim, the count of them is stated out loud, quietly, in grey. An
+-- absent third line means we have a proven answer for every alt that has the
+-- profession. That is the whole difference between this and the thing it
+-- replaces.
+--
+-- WHICH ALTS. Every character in the professions owners graph — this account's
+-- and every peer account's, since the mesh is the point — that HAS the
+-- profession recorded. A character with no record of that profession is not a
+-- data gap, it is a proven negative, and it is counted nowhere. The VIEWER's
+-- own character is excluded: Blizzard's own tooltip already says "Already
+-- known" in red, and already colours the skill requirement, so repeating
+-- ourselves would only create a surface that can disagree with the client.
+--
+-- PROFESSION RESOLUTION is an item-id lookup into our dataset
+-- (Dataset.RecipeItemSpell), never the item's recipe SUBCLASS ORDINAL. The
+-- addendum's §5.2 ceiling — a fixed positional list of eight professions, so
+-- poisons and fishing get no lines at all and a client renumber silently
+-- re-attributes everything — is not inherited.
+--
+-- STAND-DOWN. MissingTradeSkillsList draws its own version of these lines. It
+-- is going away, but it is still installed today, and two blocks on one hover
+-- is worse than either. So while that addon is loaded we draw NOTHING and say
+-- so once. This is the same rule, and the same probe shape, as the Bags
+-- stand-down above — the difference is that Daseeki-Bags does not draw recipe
+-- lines, so the wealth stand-down does NOT gate this block, and this one does
+-- not gate the wealth block.
+--
+-- INERTNESS. No new hook is installed for this: the OnTooltipSetItem hook that
+-- already exists for the count block calls this appender too, and it returns on
+-- its first line when the Professions module is off — before the dataset is
+-- asked for anything, which is what keeps "disabled means no dataset resident"
+-- true.
+----------------------------------------------------------------------
+
+-- The addon FOLDER, exactly as the Bags probe reads its own. A SavedVariables
+-- file is not the signal: it survives an uninstall and would mute us forever.
+Tooltips.MTSL_ADDON = "MissingTradeSkillsList"
+
+-- PURE. probe = { mtslLoaded = bool }.
+function Tooltips.MTSLOwnsRecipeLines(probe)
+    if type(probe) ~= "table" then return false end
+    return probe.mtslLoaded and true or false
+end
+
+function Tooltips.ProbeMTSL(G)
+    G = G or _G
+    local name = Tooltips.MTSL_ADDON
+    local loaded = false
+    local CA = G.C_AddOns
+    if CA and CA.IsAddOnLoaded then
+        local ok, res = pcall(CA.IsAddOnLoaded, name)
+        loaded = (ok and res) and true or false
+    elseif G.IsAddOnLoaded then
+        local ok, res = pcall(G.IsAddOnLoaded, name)
+        loaded = (ok and res) and true or false
+    end
+    return { mtslLoaded = loaded }
+end
+
+-- The gate for the recipe block. Deliberately independent of Tooltips.Status():
+-- the wealth block stands down for Daseeki-Bags, this one does not (Bags draws
+-- no recipe lines), and this one stands down for MTSL, which the wealth block
+-- has no opinion about.
+function Tooltips.RecipeStatus()
+    local P = ns.Professions
+    if not (P and P.IsEnabled) then
+        return false, "the Professions module is not loaded"
+    end
+    if not P.IsEnabled() then
+        return false, "the Professions module is switched off"
+    end
+    if Tooltips.MTSLOwnsRecipeLines(Tooltips.ProbeMTSL()) then
+        return false, "MissingTradeSkillsList is installed and draws its own recipe lines"
+    end
+    return true, "active"
+end
+
+function Tooltips.RecipeActive()
+    local active = Tooltips.RecipeStatus()
+    return active
+end
+
+-- Said ONCE per session, on the first recipe we decline to annotate, so the
+-- feature's silence during the transition is explained rather than mysterious.
+function Tooltips.NoteRecipeStandDown(why)
+    if Tooltips._recipeNoted then return false end
+    Tooltips._recipeNoted = true
+    if ns.Print then
+        ns:Print("recipe tooltip lines are standing down — " .. tostring(why)
+            .. ". Uninstall it to use the Nexus lines.")
+    end
+    return true
+end
+
+----------------------------------------------------------------------
+-- PURE MODEL — the recipe block
+--
+-- `entries` is one record per candidate character:
+--   { key=, name=, class=, state="known"|"missing"|"unknown", skill=<n|nil>,
+--     specs={ <spec spell ids> } }
+-- `req` is the recipe's required skill; `specID` the gating specialisation spell
+-- id or nil. Neither the dataset nor any client API is touched here.
+----------------------------------------------------------------------
+
+-- PURE. Does this character hold the specialisation the recipe is gated on?
+function Tooltips.RecipeSpecOK(entry, specID)
+    if specID == nil then return true end
+    local list = entry and entry.specs
+    if type(list) ~= "table" then return false end
+    for i = 1, #list do
+        if list[i] == specID then return true end
+    end
+    return false
+end
+
+-- PURE. entries -> { known = {entry,...}, learnable = {entry,...}, unscanned = n }.
+--
+-- The three-way sort is deterministic by construction (class 8): known by name,
+-- learnable by skill DESCENDING then name, so the alt best placed to learn it
+-- reads first. `unscanned` counts every character that has the profession and
+-- about whom we cannot give a proven answer — the never-scanned window, the
+-- payload written against a different dataset version, and the scanned record
+-- whose skill level never resolved (we cannot judge learnability without it).
+function Tooltips.BuildRecipeBlock(entries, req, specID)
+    local block = { known = {}, learnable = {}, unscanned = 0 }
+    if type(entries) ~= "table" then return block end
+    req = tonumber(req)
+
+    for i = 1, #entries do
+        local e = entries[i]
+        if type(e) == "table" and e.name then
+            if e.state == "known" then
+                block.known[#block.known + 1] = e
+            elseif e.state == "missing" then
+                local skill = tonumber(e.skill)
+                if skill == nil then
+                    -- proven not-known, but we cannot say whether they COULD
+                    -- learn it. That is a gap, and gaps are counted, not hidden.
+                    block.unscanned = block.unscanned + 1
+                elseif req ~= nil and skill >= req and Tooltips.RecipeSpecOK(e, specID) then
+                    block.learnable[#block.learnable + 1] = e
+                end
+                -- skill short, or specialisation missing: the owner asked for
+                -- "learned and can learn" only. Neither line, and NOT a gap —
+                -- we know the answer, it is just not one of the two he wants.
+            else
+                block.unscanned = block.unscanned + 1
+            end
+        end
+    end
+
+    table.sort(block.known, function(a, b) return tostring(a.name) < tostring(b.name) end)
+    table.sort(block.learnable, function(a, b)
+        local sa, sb = tonumber(a.skill) or 0, tonumber(b.skill) or 0
+        if sa ~= sb then return sa > sb end
+        return tostring(a.name) < tostring(b.name)
+    end)
+    return block
+end
+
+-- PURE. block -> the rows to draw, in order.
+-- Each row is { kind = "known"|"learnable"|"unscanned", text = <coloured>,
+-- plain = <uncoloured> }. `colorize` is injectable so the self-tests can read
+-- the text without escape sequences; live callers pass nothing.
+function Tooltips.RecipeRows(block, req, colorize)
+    local rows = {}
+    if type(block) ~= "table" then return rows end
+    local plainMode = (colorize == false)
+    local wrapName = plainMode and function(_, n) return n end
+        or (type(colorize) == "function" and colorize)
+        or function(class, n) return hex(classColor(class)) .. n .. "|r" end
+    local wrapQuiet = plainMode and function(s) return s end or gray
+    req = tonumber(req)
+
+    if #block.known > 0 then
+        local parts = {}
+        for i, e in ipairs(block.known) do parts[i] = wrapName(e.class, e.name) end
+        rows[#rows + 1] = {
+            kind  = "known",
+            text  = wrapQuiet("Known:") .. " " .. table.concat(parts, ", "),
+            plain = "Known: " .. (function()
+                local p = {} for i, e in ipairs(block.known) do p[i] = e.name end
+                return table.concat(p, ", ") end)(),
+        }
+    end
+
+    if #block.learnable > 0 then
+        local parts, plains = {}, {}
+        for i, e in ipairs(block.learnable) do
+            local skill = tonumber(e.skill)
+            -- current/required, so the line answers "by how much" as well as
+            -- "who" — the same two numbers the recipe's own requirement line
+            -- shows, from the other character's side.
+            local suffix = (skill and req) and string.format(" (%d/%d)", skill, req)
+                or (skill and string.format(" (%d)", skill) or "")
+            parts[i]  = wrapName(e.class, e.name) .. wrapQuiet(suffix)
+            plains[i] = e.name .. suffix
+        end
+        rows[#rows + 1] = {
+            kind  = "learnable",
+            text  = wrapQuiet("Learnable:") .. " " .. table.concat(parts, ", "),
+            plain = "Learnable: " .. table.concat(plains, ", "),
+        }
+    end
+
+    if (block.unscanned or 0) > 0 then
+        local n = block.unscanned
+        local label = string.format("(%d %s unscanned)", n, (n == 1) and "alt" or "alts")
+        rows[#rows + 1] = { kind = "unscanned", text = wrapQuiet(label), plain = label }
+    end
+
+    return rows
+end
+
+----------------------------------------------------------------------
+-- LIVE: collecting the candidate characters
+----------------------------------------------------------------------
+
+-- Class tag and side for every character the account graph knows, keyed by
+-- "Name-Realm". Account buckets are walked in sorted id order and the first
+-- writer wins, so a character parked under two buckets always resolves to the
+-- same record rather than to whichever one pairs() happened to reach first.
+function Tooltips.CharMeta()
+    local out = {}
+    local S = ns.Store
+    local data = S and S.GetData and S.GetData()
+    local accounts = data and data.accounts
+    if type(accounts) ~= "table" then return out end
+    local aids = {}
+    for aid in pairs(accounts) do aids[#aids + 1] = tostring(aid) end
+    table.sort(aids)
+    local selfID = (ns.GetAccountID and ns:GetAccountID()) or nil
+    if selfID and accounts[selfID] then table.insert(aids, 1, tostring(selfID)) end
+    for _, aid in ipairs(aids) do
+        local bucket = accounts[aid]
+        if type(bucket) == "table" then
+            for _, field in ipairs({ "characters", "homeless" }) do
+                local t = bucket[field]
+                if type(t) == "table" then
+                    for key, rec in pairs(t) do
+                        if type(key) == "string" and type(rec) == "table" and out[key] == nil then
+                            out[key] = { class = rec.classTag, faction = rec.faction }
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return out
+end
+
+-- PURE. ownerKeys -> display name per key. A bare first name normally; the full
+-- "Name-Realm" for any name two characters share, so the block never shows the
+-- same label twice meaning two different alts.
+function Tooltips.RecipeDisplayNames(keys)
+    local seen, out = {}, {}
+    for i = 1, #keys do
+        local name = keys[i]:match("^([^%-]+)") or keys[i]
+        seen[name] = (seen[name] or 0) + 1
+    end
+    for i = 1, #keys do
+        local name = keys[i]:match("^([^%-]+)") or keys[i]
+        out[keys[i]] = (seen[name] > 1) and keys[i] or name
+    end
+    return out
+end
+
+-- The candidate list for one recipe, read from the professions owners graph.
+-- Every character that HAS the profession contributes exactly one entry; a
+-- character with no record of it contributes nothing at all.
+function Tooltips.RecipeEntries(facts, viewerKey)
+    local out = {}
+    local P, S = ns.Professions, ns.Store
+    if not (P and P.KnownState and S and S.ProfessionsOwners) then return out end
+    if type(facts) ~= "table" or not facts.profKey then return out end
+
+    local owners = S.ProfessionsOwners()
+    if type(owners) ~= "table" then return out end
+
+    local keys = {}
+    for key in pairs(owners) do
+        if type(key) == "string" and key ~= "" and key ~= viewerKey then keys[#keys + 1] = key end
+    end
+    table.sort(keys)                          -- class 8: one order, every hover
+    local names = Tooltips.RecipeDisplayNames(keys)
+    local meta  = Tooltips.CharMeta()
+
+    for i = 1, #keys do
+        local key = keys[i]
+        local entry = owners[key]
+        local payload = type(entry) == "table" and entry.data or nil
+        local prec = (type(payload) == "table" and type(payload.p) == "table")
+                     and payload.p[facts.profKey] or nil
+        if prec then
+            local state, skill = P.KnownState(payload, facts.profKey, facts.spell)
+            local m = meta[key] or EMPTY
+            out[#out + 1] = {
+                key   = key,
+                name  = names[key] or key,
+                class = m.class,
+                state = state,
+                skill = skill,
+                specs = (type(prec.s) == "table") and prec.s or nil,
+            }
+        end
+    end
+    return out
+end
+
+-- Session cache: itemID -> facts|false. A bag full of recipes hovers the same
+-- ids over and over, and the dataset is frozen, so this is answered once.
+-- Dropped when the module is toggled (Invalidate is called from the same
+-- store-refresh signal the owners cache listens to).
+Tooltips._recipeFacts = nil
+
+function Tooltips.InvalidateRecipes()
+    Tooltips._recipeFacts = nil
+end
+
+-- itemID -> { profKey, spell, req, specID, prof } or nil.
+function Tooltips.ResolveRecipeItem(itemID)
+    itemID = tonumber(itemID)
+    if not itemID then return nil end
+    Tooltips._recipeFacts = Tooltips._recipeFacts or {}
+    local hit = Tooltips._recipeFacts[itemID]
+    if hit ~= nil then return hit or nil end
+
+    local P = ns.Professions
+    local D = P and P.Dataset
+    local facts
+    if D and D.RecipeItemSpell then
+        local spell = D.RecipeItemSpell(itemID)
+        if spell and D.RecipeFacts then facts = D.RecipeFacts(spell) end
+    end
+    Tooltips._recipeFacts[itemID] = facts or false
+    return facts
+end
+
+-- Append the recipe block to a tooltip that has just been populated for an item.
+function Tooltips.AppendRecipeLines(tt)
+    if type(tt) ~= "table" and type(tt) ~= "userdata" then return end
+    if tt.__dsnRecipeShown then return end            -- one block per populate
+    local active, why = Tooltips.RecipeStatus()
+    if not active then
+        -- Only the third-party collision is worth a word; "the module is off"
+        -- is the player's own doing and needs no announcement.
+        if why and why:find(Tooltips.MTSL_ADDON, 1, true) then
+            Tooltips.NoteRecipeStandDown(why)
+        end
+        return
+    end
+
+    local getItem = tt.GetItem
+    if not getItem then return end
+    local _, link = getItem(tt)
+    if not link then return end
+    local getInstant = _G.GetItemInfoInstant
+        or (_G.C_Item and _G.C_Item.GetItemInfoInstant)
+    if not getInstant then return end
+    -- The id comes out of the LINK, not out of the item cache, so a cold item
+    -- resolves exactly as well as a warm one (the addendum's §5.5 "no item-cache
+    -- guard" defect cannot occur here: there is nothing to be cold about).
+    local itemID, _, _, _, _, classID = getInstant(link)
+    if not itemID then return end
+    -- Cheap pre-filter so a player who never hovers a recipe never causes the
+    -- item index to be built at all. The class is a SHORTCUT, never the
+    -- authority: an unanswered class falls through to the dataset lookup. That
+    -- distinction is the whole of the addendum's §5.2 ceiling — the examined
+    -- implementation made a client classification the authority and lost
+    -- poisons and fishing to it permanently.
+    local RECIPE_CLASS = (_G.Enum and _G.Enum.ItemClass and _G.Enum.ItemClass.Recipe)
+        or _G.LE_ITEM_CLASS_RECIPE or 9
+    if classID ~= nil and classID ~= RECIPE_CLASS then return end
+
+    local facts = Tooltips.ResolveRecipeItem(itemID)
+    if not facts then return end                      -- not a recipe we carry
+
+    local entries = Tooltips.RecipeEntries(facts, Tooltips.SelfKey())
+    local block = Tooltips.BuildRecipeBlock(entries, facts.req, facts.specID)
+    local rows = Tooltips.RecipeRows(block, facts.req)
+    if #rows == 0 then return end
+    tt.__dsnRecipeShown = true
+
+    local r, g, b = creamRGB()
+    if tt.AddLine then tt:AddLine(" ") end
+    for _, row in ipairs(rows) do
+        -- wrap = true: a realm full of alts wraps inside the tooltip rather than
+        -- stretching it across the screen or being truncated. Nothing is hidden.
+        if tt.AddLine then tt:AddLine(row.text, r, g, b, true) end
+    end
+    if tt.Show then tt:Show() end
+end
+
+----------------------------------------------------------------------
 -- LIVE: the money tooltip
 ----------------------------------------------------------------------
 
@@ -966,12 +1393,26 @@ function Tooltips.HookTooltip()
     for _, tt in ipairs(tips) do
         if tt and tt.HookScript then
             tt:HookScript("OnTooltipSetItem", function(self)
-                if ns.SafeCall then ns:SafeCall(Tooltips.AppendCounts, self)
-                else Tooltips.AppendCounts(self) end
+                -- ONE hook, two blocks, in reading order: what this item MEANS
+                -- for the roster first (it is a recipe, and here is who wants
+                -- it), then how many of it the roster already holds. Each
+                -- appender owns its own gate and its own latch; neither can
+                -- suppress the other.
+                if ns.SafeCall then
+                    ns:SafeCall(Tooltips.AppendRecipeLines, self)
+                    ns:SafeCall(Tooltips.AppendCounts, self)
+                else
+                    Tooltips.AppendRecipeLines(self)
+                    Tooltips.AppendCounts(self)
+                end
             end)
-            -- reset the guard whenever the tooltip is cleared/reused for a new item.
-            tt:HookScript("OnTooltipCleared", function(self) self.__dsnCountsShown = nil end)
-            tt:HookScript("OnHide",           function(self) self.__dsnCountsShown = nil end)
+            -- reset the guards whenever the tooltip is cleared/reused for a new item.
+            tt:HookScript("OnTooltipCleared", function(self)
+                self.__dsnCountsShown, self.__dsnRecipeShown = nil, nil
+            end)
+            tt:HookScript("OnHide", function(self)
+                self.__dsnCountsShown, self.__dsnRecipeShown = nil, nil
+            end)
         end
     end
 end
@@ -1082,6 +1523,12 @@ end
 ns:On("STORE_REFRESHED",   function() Tooltips.Invalidate() end)
 ns:On("ACCOUNT_ID_CHANGED", function() Tooltips.Invalidate() end)
 
+-- The recipe facts cache is keyed on the FROZEN dataset, so a store refresh
+-- cannot stale it — only the module being toggled can (a disabled module has
+-- unloaded the dataset, and the cached answers came out of it). The owners the
+-- block reads are fetched live per hover, so they need no cache of their own.
+ns:On("PROFESSIONS_TOGGLED", function() Tooltips.InvalidateRecipes() end)
+
 ----------------------------------------------------------------------
 -- Diagnostics
 ----------------------------------------------------------------------
@@ -1102,6 +1549,22 @@ ns:RegisterDebugCommand("tooltips", function()
     end
     ns:Print(string.format("  owners=%d (this account %d) | total %dg | self=%s",
         n, mine, math.floor(gold / 10000), tostring(Tooltips.SelfKey())))
+    local ractive, rwhy = Tooltips.RecipeStatus()
+    ns:Print("  recipe lines: " .. (ractive and "ACTIVE" or "standing down")
+        .. " — " .. tostring(rwhy))
+    do
+        local P = ns.Professions
+        local D = P and P.Dataset
+        local nOwners = 0
+        if ns.Store and ns.Store.ProfessionsOwners then
+            for _ in pairs(ns.Store.ProfessionsOwners()) do nOwners = nOwners + 1 end
+        end
+        local nItems = 0
+        if D and D.itemOfRecipe then for _ in pairs(D.itemOfRecipe) do nItems = nItems + 1 end end
+        ns:Print(string.format("    mtsl=%s | professions owners=%d | recipe-item index=%s",
+            tostring(Tooltips.ProbeMTSL().mtslLoaded), nOwners,
+            (nItems > 0) and tostring(nItems) or "not built"))
+    end
     ns:Print(string.format("  hooks: item=%s moneyGlobal=%s moneyFrames=%s",
         tostring(Tooltips._tipHooked and true or false),
         tostring(Tooltips._moneyGlobalHooked and true or false),
@@ -1323,6 +1786,171 @@ local function selfTest(verbose)
             ck("setting/explicit-off", Tooltips.IsEnabled() == false)
             ck("setting/off-standsdown", Tooltips.Active() == false)
             db.wealthTooltips = saved
+        end
+    end
+
+    ------------------------------------------------------------------
+    -- RECIPE LINES (wave P3). The rows below are the whole contract:
+    -- who lands on which line, what an unproven alt does, and the ONE
+    -- thing the block may never say.
+    ------------------------------------------------------------------
+    do
+        local function rowKinds(rs)
+            local out = {} for i, r in ipairs(rs) do out[i] = r.kind end
+            return table.concat(out, ",")
+        end
+        local function plain(rs, kind)
+            for _, r in ipairs(rs) do if r.kind == kind then return r.plain end end
+            return nil
+        end
+
+        -- The population: one of each state, against a recipe needing skill 275.
+        local entries = {
+            { name = "Knower",  class = "MAGE",    state = "known",   skill = 300 },
+            { name = "Able",    class = "PRIEST",  state = "missing", skill = 285 },
+            { name = "Short",   class = "WARRIOR", state = "missing", skill = 120 },
+            { name = "Ghost",   class = "ROGUE",   state = "unknown", skill = 300 },
+        }
+        local block = Tooltips.BuildRecipeBlock(entries, 275, nil)
+        local rows = Tooltips.RecipeRows(block, 275, false)
+        ck("recipe/anatomy", rowKinds(rows) == "known,learnable,unscanned")
+        ck("recipe/known", plain(rows, "known") == "Known: Knower")
+        ck("recipe/learnable", plain(rows, "learnable") == "Learnable: Able (285/275)")
+        ck("recipe/skill-short-dropped",
+            not (plain(rows, "learnable") or ""):find("Short", 1, true))
+        ck("recipe/unscanned-line", plain(rows, "unscanned") == "(1 alt unscanned)")
+
+        -- THE POLARITY RED CONTROL. This is the reproduced defect
+        -- (PROFESSIONS_DATASET_ADDENDUM §5.3): an alt we have never scanned
+        -- listed as KNOWING the recipe. Our chain has no path that does it.
+        ck("recipe/polarity",
+            not (plain(rows, "known") or ""):find("Ghost", 1, true))
+        ck("recipe/polarity-not-learnable",
+            not (plain(rows, "learnable") or ""):find("Ghost", 1, true))
+        ck("recipe/polarity-counted", block.unscanned == 1)
+        -- ...and an all-unknown roster says so instead of saying nothing.
+        do
+            local dark = Tooltips.BuildRecipeBlock(
+                { { name = "A", state = "unknown" }, { name = "B", state = "unknown" } }, 275)
+            local drows = Tooltips.RecipeRows(dark, 275, false)
+            ck("recipe/all-dark", rowKinds(drows) == "unscanned")
+            ck("recipe/all-dark-count", plain(drows, "unscanned") == "(2 alts unscanned)")
+        end
+        -- A fully-proven roster shows NO third line. Absence of the line is
+        -- itself the claim "we have an answer for everyone".
+        do
+            local clean = Tooltips.BuildRecipeBlock(
+                { { name = "A", state = "known" },
+                  { name = "B", state = "missing", skill = 300 } }, 275)
+            ck("recipe/no-gap-line", #Tooltips.RecipeRows(clean, 275, false) == 2)
+        end
+
+        -- SPECIALISATION GATE: same skill, only the holder is learnable, and the
+        -- non-holder is a PROVEN negative — not a gap.
+        do
+            local spec = Tooltips.BuildRecipeBlock({
+                { name = "Gnomer", state = "missing", skill = 300, specs = { 20219 } },
+                { name = "Goblin", state = "missing", skill = 300, specs = { 20222 } },
+                { name = "Plain",  state = "missing", skill = 300 },
+            }, 275, 20219)
+            local srows = Tooltips.RecipeRows(spec, 275, false)
+            ck("recipe/spec-gate", plain(srows, "learnable") == "Learnable: Gnomer (300/275)")
+            ck("recipe/spec-not-a-gap", spec.unscanned == 0)
+            ck("recipe/spec-ok", Tooltips.RecipeSpecOK({ specs = { 1, 2, 3 } }, 2) == true
+                and Tooltips.RecipeSpecOK({ specs = { 1, 3 } }, 2) == false
+                and Tooltips.RecipeSpecOK({}, nil) == true)
+        end
+
+        -- A scanned alt whose SKILL never resolved cannot be judged, so it is a
+        -- gap, not a silent omission (truthy-zero class 5: nil ~= 0).
+        do
+            local noskill = Tooltips.BuildRecipeBlock(
+                { { name = "Blank", state = "missing", skill = nil } }, 275)
+            ck("recipe/skill-nil-is-a-gap", noskill.unscanned == 1
+                and #noskill.learnable == 0)
+            local zero = Tooltips.BuildRecipeBlock(
+                { { name = "Zero", state = "missing", skill = 0 } }, 275)
+            ck("recipe/skill-zero-is-an-answer", zero.unscanned == 0
+                and #zero.learnable == 0)
+        end
+
+        -- Ordering is fixed, not inherited from a table walk (class 8).
+        do
+            local many = Tooltips.BuildRecipeBlock({
+                { name = "Zeta",  state = "known" },
+                { name = "Alpha", state = "known" },
+                { name = "Low",   state = "missing", skill = 280 },
+                { name = "High",  state = "missing", skill = 300 },
+            }, 275)
+            local mrows = Tooltips.RecipeRows(many, 275, false)
+            ck("recipe/known-sorted", plain(mrows, "known") == "Known: Alpha, Zeta")
+            ck("recipe/learnable-best-first",
+                plain(mrows, "learnable") == "Learnable: High (300/275), Low (280/275)")
+        end
+
+        -- Empty in, empty out — no headings over nothing.
+        ck("recipe/empty", #Tooltips.RecipeRows(Tooltips.BuildRecipeBlock({}, 275), 275, false) == 0)
+        ck("recipe/nil-entries", Tooltips.BuildRecipeBlock(nil, 275).unscanned == 0)
+
+        -- Display names: bare first name, full key only when two alts collide.
+        do
+            local nm = Tooltips.RecipeDisplayNames({ "Ann-A", "Ann-B", "Bob-A" })
+            ck("recipe/name-collision", nm["Ann-A"] == "Ann-A" and nm["Ann-B"] == "Ann-B")
+            ck("recipe/name-plain", nm["Bob-A"] == "Bob")
+        end
+
+        -- STAND-DOWN vs MissingTradeSkillsList, and its independence from the
+        -- Bags stand-down that governs the count block.
+        ck("recipe/mtsl-absent", Tooltips.MTSLOwnsRecipeLines({ mtslLoaded = false }) == false)
+        ck("recipe/mtsl-loaded", Tooltips.MTSLOwnsRecipeLines({ mtslLoaded = true }) == true)
+        ck("recipe/mtsl-nil", Tooltips.MTSLOwnsRecipeLines(nil) == false)
+        do
+            local G  = { C_AddOns = { IsAddOnLoaded = function() return true end } }
+            local G2 = { IsAddOnLoaded = function() return false end }
+            ck("recipe/probe-loaded", Tooltips.ProbeMTSL(G).mtslLoaded == true)
+            ck("recipe/probe-absent", Tooltips.ProbeMTSL(G2).mtslLoaded == false)
+        end
+        do
+            -- The recipe gate follows the PROFESSIONS module, never wealthTooltips,
+            -- and the two blocks cannot switch each other off.
+            local S = ns.Store
+            local db = S and S.GetSettings and S.GetSettings()
+            local P = ns.Professions
+            if db and P and P.IsEnabled then
+                local savedW, savedP = db.wealthTooltips, db.professionsEnabled
+                db.wealthTooltips, db.professionsEnabled = false, true
+                ck("recipe/independent-of-wealth", Tooltips.RecipeActive() == true
+                    and Tooltips.Active() == false)
+                db.professionsEnabled = false
+                ck("recipe/module-off", Tooltips.RecipeActive() == false)
+                -- INERTNESS: standing down happens before the dataset is asked
+                -- anything, so a disabled module stays dataset-free.
+                local D = P.Dataset
+                if D and D.Unload then D.Unload() end
+                Tooltips.InvalidateRecipes()
+                local tt = { lines = {},
+                             GetItem = function() return "R", "|Hitem:1:|h[R]|h" end,
+                             AddLine = function(self, t) self.lines[#self.lines + 1] = t end,
+                             Show = function() end }
+                Tooltips.AppendRecipeLines(tt)
+                ck("recipe/inert-no-lines", #tt.lines == 0)
+                ck("recipe/inert-no-dataset", (D and D.IsLoaded and D.IsLoaded()) == false)
+                ck("recipe/inert-no-itemindex", (D and D.itemOfRecipe) == nil)
+                db.wealthTooltips, db.professionsEnabled = savedW, savedP
+                Tooltips.InvalidateRecipes()
+            end
+        end
+
+        -- The live entry point is a safe no-op on junk.
+        ck("recipe/live-safe", pcall(Tooltips.AppendRecipeLines, {})
+            and pcall(Tooltips.AppendRecipeLines, nil))
+        -- One block per populate: the latch survives the client's double-fire.
+        do
+            local n = 0
+            local tt = { AddLine = function() n = n + 1 end, Show = function() end,
+                         GetItem = function() return nil end, __dsnRecipeShown = true }
+            Tooltips.AppendRecipeLines(tt)
+            ck("recipe/latched", n == 0)
         end
     end
 

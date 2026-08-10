@@ -498,6 +498,82 @@ end
 
 function Dataset.IsLoaded() return Dataset.core and true or false end
 
+----------------------------------------------------------------------
+-- STAGE ITEMS — the teaching-item -> recipe relation, ALONE  (wave P3)
+--
+-- The recipe tooltip needs exactly one fact out of the source graph: "this item
+-- in my bag teaches THAT recipe". Building the whole SOURCES stage to get it
+-- would drag in the NPC / zone / quest / object / event / faction indices and
+-- the trainer sets — ~1,900 rows of graph that a hover has not asked for — on
+-- the first recipe a player mouses over in the auction house.
+--
+-- So this is a third stage, and it is the only one a tooltip ever triggers.
+-- LoadSources still builds the same map as part of its own pass; whichever runs
+-- first wins and the other is a no-op, because the map is a pure function of
+-- the frozen dataset.
+--
+-- The addendum's §5.2 finding is why the map exists at all: the shipped
+-- third-party tooltip resolves the profession from the item's recipe SUBCLASS
+-- ORDINAL through a fixed list of eight professions, so poisons and fishing
+-- recipes silently get no lines, and a client that ever renumbers subclasses
+-- re-attributes every recipe to the wrong profession. An item-id lookup into
+-- our own dataset has neither failure: it covers every profession we carry and
+-- it cannot be renumbered out from under us.
+----------------------------------------------------------------------
+
+function Dataset.LoadItemIndex()
+    if Dataset.itemOfRecipe then return true end
+    if not Professions.IsEnabled() then return false end
+    if not Dataset.LoadCore() then return false end
+    local map = {}
+    local ok = Dataset.Walk(rawText(), function(section, line)
+        if section == "recipe" then
+            local f = splitFields(line)
+            local spell = tonumber(f[2])
+            if spell then
+                for tid in tostring(f[8]):gmatch("I(%d+)") do
+                    map[tonumber(tid)] = spell
+                end
+            end
+        end
+    end)
+    if not ok then return false end
+    Dataset.itemOfRecipe = map
+    return true
+end
+
+-- itemID -> teaching spell id, or nil. The one entry point a tooltip needs.
+function Dataset.RecipeItemSpell(itemID)
+    itemID = tonumber(itemID)
+    if not itemID then return nil end
+    if not Dataset.LoadItemIndex() then return nil end
+    return Dataset.itemOfRecipe[itemID]
+end
+
+-- The learnability facts for a teaching spell: which profession it belongs to,
+-- the skill it requires, and the specialisation spell id that gates it (nil
+-- when it is ungated). Everything a reader needs to answer "could that alt
+-- learn this?" without touching the dataset itself.
+function Dataset.RecipeFacts(spellID)
+    spellID = tonumber(spellID)
+    if not spellID then return nil end
+    if not Dataset.LoadCore() then return nil end
+    local r = Dataset.recipe[spellID]
+    if not r then return nil end
+    local specID
+    if r.spec then
+        local s = Dataset.specs[r.spec]
+        specID = s and s.id or nil
+    end
+    return {
+        profKey = Dataset.ProfKey(r.p),
+        spell   = spellID,
+        req     = r.s,
+        specID  = specID,
+        prof    = (Dataset.profs[r.p] and Dataset.profs[r.p].name) or nil,
+    }
+end
+
 -- Convenience readers used by the capture layer.
 function Dataset.RecipeCount(profKey)
     if not Dataset.LoadCore() then return 0 end
@@ -797,6 +873,77 @@ function Professions.ResolveProfession(ids)
     end
     if not best then return nil, unknown end
     return Dataset.ProfKey(best), unknown
+end
+
+----------------------------------------------------------------------
+-- THE VIEW GUARD — filtering the VIEW must never filter the CAPTURE
+--
+-- Era's own client filters the trade-skill list SERVER-SIDE: with a name
+-- filter, a subclass filter or "have materials" engaged, GetNumTradeSkills()
+-- answers with the NARROWED count and the enumeration walks only the surviving
+-- rows. Nothing about that read looks broken — every row resolves, nothing is
+-- missing in the sense §7 defect 10 means — so the capture's completeness gate
+-- (`missed > 0`) cannot see it. The scan would simply write a smaller known
+-- set: the exact failure this module exists to prevent, arriving through the
+-- front door.
+--
+-- This predates wave P3's filter panel. A player who leaves Blizzard's own
+-- "Have Materials" box ticked has always been able to hand us a short list.
+--
+-- So: any surface that narrows the client's enumeration registers a witness
+-- here, and a narrowed window CAPTURES NOTHING. Refusing leaves the last proven
+-- known set standing (and the payload's `a` stamp honest about when it was
+-- taken); writing would replace it with a subset. professions_filters.lua
+-- registers its own state and re-captures the moment the narrowing clears.
+----------------------------------------------------------------------
+
+Professions._viewGuards = nil
+
+function Professions.RegisterViewGuard(fn)
+    if type(fn) ~= "function" then return false end
+    Professions._viewGuards = Professions._viewGuards or {}
+    local list = Professions._viewGuards
+    for i = 1, #list do if list[i] == fn then return true end end
+    list[#list + 1] = fn
+    return true
+end
+
+function Professions.ClearViewGuards()
+    Professions._viewGuards = nil
+end
+
+-- true when something is currently narrowing the client's own enumeration of
+-- `surface`. Anything we cannot READ we do not assert: a false "narrowed" would
+-- stop the capture forever, which is its own kind of lie.
+function Professions.ViewNarrowed(surface)
+    local list = Professions._viewGuards
+    if list then
+        for i = 1, #list do
+            local ok, narrowed = pcall(list[i], surface)
+            if ok and narrowed then return true end
+        end
+    end
+    -- Two of the client's own filter states have getters, and both survive
+    -- across window sessions, so they are worth asking even when no panel of
+    -- ours is up — a player who leaves Blizzard's own "Have Materials" ticked
+    -- has always been able to hand us a short list.
+    if surface ~= "craft" and GetTradeSkillItemNameFilter then
+        local ok, txt = pcall(GetTradeSkillItemNameFilter)
+        if ok and type(txt) == "string" and txt:gsub("%s+", "") ~= "" then return true end
+    end
+    if GetOnlyShowMakeable then
+        local ok, only = pcall(GetOnlyShowMakeable)
+        if ok and only then return true end
+    end
+    -- The subclass and inventory-slot filters have getters too
+    -- (GetTradeSkillSubClassFilter / GetTradeSkillInvSlotFilter) and they are
+    -- DELIBERATELY not asked here. Their "show everything" sentinel is a numeric
+    -- convention we cannot verify from the catalog, and reading it wrong in the
+    -- narrowing direction would wedge the capture shut forever — a refusal that
+    -- can never clear is its own kind of lie. professions_filters.lua covers
+    -- them by clearing every filter when the window opens, which is a fact we
+    -- establish rather than a value we interpret.
+    return false
 end
 
 function Professions.ScanTradeSkillWindow()
@@ -1380,6 +1527,9 @@ end
 function Professions.CaptureWindow(surface, force)
     if not Professions.IsEnabled() then return false, "disabled" end
     if not Professions.CaptureAllowed() then return false, "cold" end
+    -- A narrowed list is a SHORT list, and a short list written as the known set
+    -- is a confident lie about this character. See the view guard above.
+    if Professions.ViewNarrowed(surface) then return false, "view-filtered" end
     local now = (GetTime and GetTime()) or 0
     if not force and Professions._scanAt and (now - Professions._scanAt) < 1 then
         return false, "throttled"
@@ -1511,6 +1661,13 @@ function Professions.Activate()
             if Professions.IsEnabled() then Professions.MarkDirty() end
         end)
     end
+
+    -- The in-frame filter panel (professions_filters.lua) is a SUB-SURFACE of
+    -- this module, so it lives and dies with it: no separate setting, no
+    -- separate login hook, nothing of its own registered while the module is
+    -- off. Loaded after this file, so the lookup is deferred to runtime.
+    local F = ns.ProfessionFilters
+    if F and F.Activate then F.Activate() end
     return true
 end
 
@@ -1522,14 +1679,18 @@ function Professions.SetEnabled(on)
     local S = ns.Store
     local db = S and S.GetSettings and S.GetSettings()
     if db then db.professionsEnabled = on and true or false end
+    local F = ns.ProfessionFilters
     if on then
         if not Professions._activated then
             Professions.Activate()
         else
             Professions.CaptureStatic()
             Professions.MarkDirty()
+            if F and F.Activate then F.Activate() end
         end
     else
+        if F and F.Teardown then F.Teardown() end
+        Professions.ClearViewGuards()
         cancelDirty()
         if Professions._frame then
             pcall(function() Professions._frame:UnregisterAllEvents() end)
@@ -1544,6 +1705,10 @@ function Professions.SetEnabled(on)
         Professions._harvested = nil
         Dataset.Unload()
     end
+    -- Readers that cache anything derived from the dataset (the recipe tooltip's
+    -- item->recipe answers) drop it here: a disabled module has unloaded the
+    -- dataset those answers came out of.
+    if ns.Fire then ns:Fire("PROFESSIONS_TOGGLED", Professions.IsEnabled()) end
     return Professions.IsEnabled()
 end
 
