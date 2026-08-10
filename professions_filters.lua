@@ -466,10 +466,105 @@ local function noteProbe(surface, what, detail)
     })
 end
 
+----------------------------------------------------------------------
+-- CONVENTION PERSISTENCE  (perf/professions-scan)
+--
+-- The measured argument forms are a property of the CLIENT BINARY, not of a
+-- session: within one build a setter does not change its calling convention.
+-- So the four learned forms are mirrored into the store keyed by GetBuildInfo,
+-- and a fresh session seeds its session table from there instead of paying the
+-- full sweep (and its update-echo burst) on every first window open.
+--
+-- The class-5 rule stands in FULL: the persisted form is still a HYPOTHESIS.
+-- ShowAll re-measures it against the live row count on every use and drops it
+-- (session AND store) the moment it stops producing the effect it was learned
+-- for; Narrow does the same. A build change wipes the whole record. Everything
+-- that is window state — settled, darkProbes, interfere, degraded — remains
+-- session-only and is never persisted.
+----------------------------------------------------------------------
+
+function Filters.ClientBuild()
+    local P = ns.Professions
+    if P and P.ClientBuild then return P.ClientBuild() end
+    return "?"
+end
+
+-- The per-build store record, or nil. With `create`, a record left by another
+-- build is wiped and re-stamped rather than read.
+function Filters.ConvStoreArea(create)
+    local S = ns.Store
+    local area = S and S.ProfessionsFilterConv and S.ProfessionsFilterConv(create)
+    if not area then return nil end
+    local build = Filters.ClientBuild()
+    if area.build ~= build then
+        if not create then return nil end
+        for k in pairs(area) do area[k] = nil end
+        area.build = build
+    end
+    return area
+end
+
+Filters.PERSISTED_FORMS = { "subAll", "slotAll", "subPick", "slotPick" }
+
+-- Mirror one learned (or forgotten: form=nil) argument form into the store.
+-- Learning may CREATE the store area only while the module is enabled — the
+-- teardown path clears filters on the way out, and a disabled module writing
+-- its first saved-variable key during its own teardown would break the
+-- inertness rule sideways. Deletions never create anything.
+function Filters.RememberForm(surface, key, form)
+    local area = Filters.ConvStoreArea(form ~= nil and Filters.IsEnabled())
+    if not area then return false end
+    local mine = area[surface]
+    if type(mine) ~= "table" then
+        if form == nil then return true end
+        mine = {}
+        area[surface] = mine
+    end
+    if form == nil then
+        mine[key] = nil
+    else
+        mine[key] = { n = form.n, form[1], form[2] }
+    end
+    return true
+end
+
+-- Drop every remembered convention for `surface` (nil: for both), session and
+-- store. The manual-rescan path calls this so a rescan re-measures from
+-- scratch; the self-tests call it between simulated clients.
+function Filters.ForgetConventions(surface)
+    if surface then
+        if Filters._conv then Filters._conv[surface] = nil end
+        local area = Filters.ConvStoreArea(false)
+        if area then area[surface] = nil end
+    else
+        Filters._conv = nil
+        local S = ns.Store
+        local area = S and S.ProfessionsFilterConv and S.ProfessionsFilterConv(false)
+        if area then for k in pairs(area) do area[k] = nil end end
+    end
+    return true
+end
+
 function Filters.Conv(surface)
     Filters._conv = Filters._conv or {}
-    Filters._conv[surface] = Filters._conv[surface] or {}
-    return Filters._conv[surface]
+    local conv = Filters._conv[surface]
+    if not conv then
+        conv = {}
+        Filters._conv[surface] = conv
+        -- Seed the measured forms persisted for this client build. Copied, not
+        -- referenced: the session table grows window state the store must not.
+        local area = Filters.ConvStoreArea(false)
+        local mine = area and area[surface]
+        if type(mine) == "table" then
+            for _, key in ipairs(Filters.PERSISTED_FORMS) do
+                local form = mine[key]
+                if type(form) == "table" and type(form.n) == "number" then
+                    conv[key] = { n = form.n, form[1], form[2] }
+                end
+            end
+        end
+    end
+    return conv
 end
 
 -- SHOW EVERYTHING, by measurement. Returns the row count we ended on.
@@ -493,6 +588,26 @@ function Filters.ShowAll(surface, api, G)
     local function search(setter, key)
         if not setter then return end
         local start = Filters.RowCount(surface, G) or 0
+        -- THE REMEMBERED FORM FIRST (persisted per client build). If it still
+        -- leaves at least as many rows enumerated as we started with — and any
+        -- rows at all — the sweep is skipped: within one build the sweep could
+        -- only re-elect the same winner. A remembered form that LOSES rows has
+        -- stopped meaning what it was measured to mean, so it is dropped from
+        -- session and store and the full sweep re-measures (class 5). A dark
+        -- window (start == 0) never takes the fast path: zero proves nothing.
+        local cached = conv[key]
+        if cached then
+            local ok = callForm(setter, 0, cached)
+            local n = ok and Filters.RowCount(surface, G) or nil
+            if n and n > 0 and n >= start then
+                applied = true
+                if n > bestCount then bestCount = n end
+                return
+            end
+            conv[key] = nil
+            Filters.RememberForm(surface, key, nil)
+            noteProbe(surface, "recalibrate", key)
+        end
         local winner, winnerCount = nil, -1
         for i = 1, #ALL_FORMS do
             local form = ALL_FORMS[i]
@@ -509,7 +624,10 @@ function Filters.ShowAll(surface, api, G)
         if winner then
             callForm(setter, 0, winner)
             applied = true
-            if winnerCount > 0 then conv[key] = winner end     -- never cache off an empty window
+            if winnerCount > 0 then                 -- never cache off an empty window
+                conv[key] = winner
+                Filters.RememberForm(surface, key, winner)
+            end
             if winnerCount > bestCount then bestCount = winnerCount end
             if winnerCount < start then
                 -- No form we know reaches the state we found the client in. We
@@ -572,6 +690,7 @@ function Filters.Narrow(surface, api, setter, key, index, baseline, G)
         local n = try(cached)
         if n and n > 0 and n < baseline then return true end
         conv[key] = nil                              -- it stopped working: forget it
+        Filters.RememberForm(surface, key, nil)      -- ...in the store too (class 5)
         noteProbe(surface, "recalibrate", key)
     end
     for i = 1, #PICK_FORMS do
@@ -579,6 +698,7 @@ function Filters.Narrow(surface, api, setter, key, index, baseline, G)
         local n = try(form)
         if n and n > 0 and n < baseline then
             conv[key] = form
+            Filters.RememberForm(surface, key, form) -- persisted per client build
             noteProbe(surface, "form-learned", key .. "=" .. Filters.FormName(form)
                 .. " rows " .. tostring(n) .. "/" .. tostring(baseline))
             return true
@@ -889,7 +1009,24 @@ function Filters.EnsurePanel(surface)
     })
     clear:SetPoint("LEFT", panel, "LEFT", x, 0)
     controls.clear = clear
-    x = x + 56 + PAD
+    x = x + 56 + GAP
+
+    -- The manual full-rescan affordance (perf/professions-scan): window opens
+    -- now verify a cheap settled signature instead of re-running the full
+    -- capture, and this button is the owner's override — signature ignored,
+    -- full capture, reagent re-harvest, filter probe re-measured. Same quiet
+    -- variant and row as Clear: it belongs to the same "reset something" family.
+    local rescan = UI.MakeButton(panel, {
+        text = "Rescan", variant = "quiet", width = 64, height = 22,
+        tooltip = "Force a full re-capture of this profession (recipes, reagents, cooldowns)",
+        onClick = function()
+            local P = ns.Professions
+            if P and P.ForceRescan then P.ForceRescan(surface) end
+        end,
+    })
+    rescan:SetPoint("LEFT", panel, "LEFT", x, 0)
+    controls.rescan = rescan
+    x = x + 64 + PAD
 
     panel:SetWidth(x)                    -- hug the content; never the host's width
     panel._controls = controls
@@ -1473,8 +1610,10 @@ local function testCaptureInterlock(fails)
 
     local savedTime = _G.GetTime
     local savedLatch = { P._leavingWorld, P._loggingOut, P._enteredWorldAt, P._live, P._scanAt }
+    local savedPerf = { P._settled, P._stale, P._harvested, P._harvestJob }
     local savedState = Filters._state
     local savedTimer = _G.C_Timer
+    local savedArea = ns.Store and ns.Store.data and ns.Store.data.professions
 
     local ok, err = pcall(function()
         sim:install()
@@ -1483,6 +1622,8 @@ local function testCaptureInterlock(fails)
         P._leavingWorld, P._loggingOut = false, false
         P._enteredWorldAt = 0
         P._live, P._scanAt = nil, nil
+        P._settled, P._stale = nil, nil
+        P._harvested, P._harvestJob = nil, nil
         Filters._state = { [TRADESKILL] = Filters.NewState() }
         P.RegisterViewGuard(Filters.ViewGuard)
 
@@ -1583,7 +1724,10 @@ local function testCaptureInterlock(fails)
     _G.C_Timer = savedTimer
     P._leavingWorld, P._loggingOut = savedLatch[1], savedLatch[2]
     P._enteredWorldAt, P._live, P._scanAt = savedLatch[3], savedLatch[4], savedLatch[5]
+    P._settled, P._stale = savedPerf[1], savedPerf[2]
+    P._harvested, P._harvestJob = savedPerf[3], savedPerf[4]
     Filters._state = savedState
+    if ns.Store and ns.Store.data then ns.Store.data.professions = savedArea end
     P.ClearViewGuards()
     if not ok then fails[#fails + 1] = "error in interlock fixtures: " .. tostring(err) end
 end
@@ -1756,6 +1900,10 @@ local function testNativeConventions(fails)
     end
 
     local function reset()
+        -- Session AND store: the persisted forms would otherwise leak between
+        -- the three simulated clients, which are three different "builds" of
+        -- the world sharing one store.
+        Filters.ForgetConventions(nil)
         Filters._conv, Filters._unhonored, Filters._probing = nil, nil, nil
         Filters._redrawFn, Filters._toldUnhonored = nil, nil
     end
@@ -1993,6 +2141,64 @@ local function testNativeConventions(fails)
             _G.GetNumTradeSkills = realNum
             Filters._state = nil
             sim:restore()
+        end
+
+        -- ══ (8) PERSISTENCE ACROSS SESSIONS, per client build ════════════════
+        -- The forms learned by measurement seed the next session from the store
+        -- instead of re-running the sweep — and the class-5 rule survives the
+        -- persistence: a stored form that stops working is dropped, store and
+        -- session both, and re-measured.
+        do
+            local sim = newConventionSim("triple")
+            sim:install()
+            reset()
+            -- Learn the expensive way once.
+            Filters.ApplyNative(TRADESKILL, freshState(function(st) st.subclass = 1 end))
+            local learned = Filters.FormName(Filters._conv[TRADESKILL].subPick)
+            ck(learned ~= "none", "no category form was learned to persist")
+
+            -- "Relog": session mirror gone, store intact.
+            Filters._conv = nil
+            local conv = Filters.Conv(TRADESKILL)
+            ck(Filters.FormName(conv.subPick) == learned,
+               "the persisted category form did not seed the new session ("
+               .. Filters.FormName(conv.subPick) .. " vs " .. learned .. ")")
+
+            -- The seeded clear takes the FAST PATH: the remembered show-all
+            -- form is verified against the live count instead of re-sweeping
+            -- every candidate. Two calls (fast path + the interference
+            -- re-assert), where the sweep costs four candidates or more.
+            local calls = 0
+            local realSetSub = _G.SetTradeSkillSubClassFilter
+            _G.SetTradeSkillSubClassFilter = function(...)
+                calls = calls + 1
+                return realSetSub(...)
+            end
+            Filters.ClearNative(TRADESKILL)
+            ck(_G.GetNumTradeSkills() == 7,
+               "the seeded clear did not leave the full list ("
+               .. _G.GetNumTradeSkills() .. "/7)")
+            ck(calls <= 2, "the seeded clear still swept the candidates ("
+               .. calls .. " subclass setter calls)")
+            _G.SetTradeSkillSubClassFilter = realSetSub
+            sim:restore()
+
+            -- CLASS 5: the same store, but the client's convention has moved
+            -- out from under it (the inverted client). The persisted show-all
+            -- form now EMPTIES the window; it must be dropped and re-measured,
+            -- never trusted, and the clear must still end on the full list.
+            local sim2 = newConventionSim("inverted")
+            sim2:install()
+            Filters._conv = nil                    -- fresh session, seeded from store
+            Filters.ClearNative(TRADESKILL)
+            ck(_G.GetNumTradeSkills() == 7,
+               "a persisted form that stopped working was kept: the clear left "
+               .. _G.GetNumTradeSkills() .. " rows on the changed client")
+            local area = Filters.ConvStoreArea(false)
+            local storedSubAll = area and area[TRADESKILL] and area[TRADESKILL].subAll
+            ck(storedSubAll == nil or Filters.FormName(storedSubAll) ~= "(i,1,1)",
+               "the store still carries the dead (i,1,1) show-all form")
+            sim2:restore()
         end
     end)
 

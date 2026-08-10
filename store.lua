@@ -4485,6 +4485,56 @@ function Store.ProfessionsTrace(create, build)
     return t
 end
 
+-- The SETTLED SIGNATURES (perf/professions-scan): per LOCAL character, the
+-- cheap per-window fingerprint of the last accepted full scan, so a warm
+-- window open can verify "nothing changed" against the live window instead of
+-- re-running the full resolve. The record is EVIDENCE, not truth: professions.lua
+-- re-verifies every component against the live window before honoring it, and
+-- any mismatch simply falls back to a full capture. Shape:
+--   settled[ownerKey][profKey] = { prof, surface, line, l, m, n, known,
+--                                  names = { 1..n }, rows = { [i]=spell },
+--                                  at, ds, build }
+function Store.ProfessionsSettled(create)
+    local a = Store.ProfessionsArea(create)
+    if not a then return nil end
+    if type(a.settled) ~= "table" then
+        if not create then return nil end
+        a.settled = {}
+    end
+    return a.settled
+end
+
+-- Reagent-harvest completeness stamps (perf/professions-scan): a profession is
+-- re-harvested once per DATASET version rather than once per session — reagents
+-- are game facts and the dataset stamp is the invalidator. A stamp is only ever
+-- written for a harvest that covered EVERY recipe of a proven-complete scan;
+-- manual rescan deletes it. Shape: harvestStamps[profKey] = { ds, at }.
+function Store.ProfessionsHarvestStamps(create)
+    local a = Store.ProfessionsArea(create)
+    if not a then return nil end
+    if type(a.harvestStamps) ~= "table" then
+        if not create then return nil end
+        a.harvestStamps = {}
+    end
+    return a.harvestStamps
+end
+
+-- The filter panel's MEASURED setter conventions (professions_filters.lua),
+-- persisted per CLIENT BUILD: the argument forms are a property of the client
+-- binary, not of a session. A form that stops producing its measured effect is
+-- dropped and re-measured (class 5); a build change drops the whole record.
+-- Shape: filterConv = { build = "<GetBuildInfo>", tradeskill = { subAll=form,
+-- subPick=form, slotAll=form, slotPick=form }, craft = { ... } }.
+function Store.ProfessionsFilterConv(create)
+    local a = Store.ProfessionsArea(create)
+    if not a then return nil end
+    if type(a.filterConv) ~= "table" then
+        if not create then return nil end
+        a.filterConv = {}
+    end
+    return a.filterConv
+end
+
 -- Owner-wins-by-rev with a timestamp tiebreak — the same merge the inventory
 -- owners graph uses, and for the same reason: two inputs (our own capture and
 -- the mesh) count revisions independently and meet here.
