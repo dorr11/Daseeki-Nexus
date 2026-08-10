@@ -868,16 +868,17 @@ end
 -- WHAT IT DRAWS. On a RECIPE ITEM (a plan / pattern / formula / recipe /
 -- schematic — anything the dataset maps to a teaching spell), two lines:
 --
---     Known: Poonyx, Zug
+--     Known: You, Zug
 --     Learnable: Puucons (285/275)
---     (2 alts unscanned)
+--     (2 characters unscanned)
 --
--- Known = alts we have PROVEN know it. Learnable = alts we have proven do NOT
--- know it, who have the profession, whose current skill meets the requirement,
--- and who hold the specialisation when the recipe is gated on one. The owner's
--- ruling was "just learned and can learn is fine" — so an alt whose skill is
--- short, or who lacks the gating specialisation, appears in NEITHER line. There
--- is no craftable-by line.
+-- Known = characters we have PROVEN know it. Learnable = characters we have
+-- proven do NOT know it, who have the profession, whose current skill meets
+-- the requirement, and who hold the specialisation when the recipe is gated on
+-- one. The owner's ruling was "just learned and can learn is fine" — so a
+-- character whose skill is short, or who lacks the gating specialisation,
+-- appears in NEITHER line. There is no craftable-by line. The viewer is one of
+-- these characters, shown as "You", first in its line (see WHICH CHARACTERS).
 --
 -- WHY THE THIRD LINE EXISTS — the defect we refuse to reproduce.
 -- PROFESSIONS_DATASET_ADDENDUM §5.3: the shipped third-party equivalent stores
@@ -894,13 +895,18 @@ end
 -- profession. That is the whole difference between this and the thing it
 -- replaces.
 --
--- WHICH ALTS. Every character in the professions owners graph — this account's
--- and every peer account's, since the mesh is the point — that HAS the
--- profession recorded. A character with no record of that profession is not a
--- data gap, it is a proven negative, and it is counted nowhere. The VIEWER's
--- own character is excluded: Blizzard's own tooltip already says "Already
--- known" in red, and already colours the skill requirement, so repeating
--- ourselves would only create a surface that can disagree with the client.
+-- WHICH CHARACTERS. Every character in the professions owners graph — this
+-- account's and every peer account's, since the mesh is the point — that HAS
+-- the profession recorded. A character with no record of that profession is
+-- not a data gap, it is a proven negative, and it is counted nowhere. The
+-- VIEWER's own character is INCLUDED, under the exact same eligibility rules,
+-- rendered as "You" and listed FIRST in whichever line it lands in (owner
+-- ruling, 2026-08: hovering a learnable recipe on the very character that
+-- could learn it used to answer with everyone BUT them). Its record is read
+-- from the same store bucket as every alt's — Store.ProfessionsOwners()
+-- [selfKey], the record Publish keeps projected via ProjectOwner, which is
+-- also what the professions tab's payloadLookup reads for the local
+-- character — so self is never a special data path, only a special label.
 --
 -- PROFESSION RESOLUTION is an item-id lookup into our dataset
 -- (Dataset.RecipeItemSpell), never the item's recipe SUBCLASS ORDINAL. The
@@ -988,7 +994,7 @@ end
 --
 -- `entries` is one record per candidate character:
 --   { key=, name=, class=, state="known"|"missing"|"unknown", skill=<n|nil>,
---     specs={ <spec spell ids> } }
+--     specs={ <spec spell ids> }, isSelf=<true on the viewer's own entry|nil> }
 -- `req` is the recipe's required skill; `specID` the gating specialisation spell
 -- id or nil. Neither the dataset nor any client API is touched here.
 ----------------------------------------------------------------------
@@ -1006,7 +1012,8 @@ end
 
 -- PURE. entries -> { known = {entry,...}, learnable = {entry,...}, unscanned = n }.
 --
--- The three-way sort is deterministic by construction (class 8): known by name,
+-- The three-way sort is deterministic by construction (class 8): in BOTH lists
+-- the viewer's own entry (isSelf) is pinned first, then known by name, and
 -- learnable by skill DESCENDING then name, so the alt best placed to learn it
 -- reads first. `unscanned` counts every character that has the profession and
 -- about whom we cannot give a proven answer — the never-scanned window, the
@@ -1040,8 +1047,16 @@ function Tooltips.BuildRecipeBlock(entries, req, specID)
         end
     end
 
-    table.sort(block.known, function(a, b) return tostring(a.name) < tostring(b.name) end)
+    -- Self first is not a preference, it is part of the class-8 pin: isSelf is
+    -- normalised to 0/1 so a nil flag can never make the comparator flap.
+    table.sort(block.known, function(a, b)
+        local as, bs = a.isSelf and 1 or 0, b.isSelf and 1 or 0
+        if as ~= bs then return as > bs end
+        return tostring(a.name) < tostring(b.name)
+    end)
     table.sort(block.learnable, function(a, b)
+        local as, bs = a.isSelf and 1 or 0, b.isSelf and 1 or 0
+        if as ~= bs then return as > bs end
         local sa, sb = tonumber(a.skill) or 0, tonumber(b.skill) or 0
         if sa ~= sb then return sa > sb end
         return tostring(a.name) < tostring(b.name)
@@ -1061,16 +1076,21 @@ function Tooltips.RecipeRows(block, req, colorize)
         or (type(colorize) == "function" and colorize)
         or function(class, n) return hex(classColor(class)) .. n .. "|r" end
     local wrapQuiet = plainMode and function(s) return s end or gray
+    -- The viewer's own entry is labelled "You", never the character name, in
+    -- BOTH the coloured and the plain form — the colorize seam changes the
+    -- wrapping, never the word. The class colour still comes from e.class, so
+    -- "You" wears the viewer's own class colour like any other name.
+    local function dispName(e) return e.isSelf and "You" or e.name end
     req = tonumber(req)
 
     if #block.known > 0 then
         local parts = {}
-        for i, e in ipairs(block.known) do parts[i] = wrapName(e.class, e.name) end
+        for i, e in ipairs(block.known) do parts[i] = wrapName(e.class, dispName(e)) end
         rows[#rows + 1] = {
             kind  = "known",
             text  = wrapQuiet("Known:") .. " " .. table.concat(parts, ", "),
             plain = "Known: " .. (function()
-                local p = {} for i, e in ipairs(block.known) do p[i] = e.name end
+                local p = {} for i, e in ipairs(block.known) do p[i] = dispName(e) end
                 return table.concat(p, ", ") end)(),
         }
     end
@@ -1084,8 +1104,8 @@ function Tooltips.RecipeRows(block, req, colorize)
             -- shows, from the other character's side.
             local suffix = (skill and req) and string.format(" (%d/%d)", skill, req)
                 or (skill and string.format(" (%d)", skill) or "")
-            parts[i]  = wrapName(e.class, e.name) .. wrapQuiet(suffix)
-            plains[i] = e.name .. suffix
+            parts[i]  = wrapName(e.class, dispName(e)) .. wrapQuiet(suffix)
+            plains[i] = dispName(e) .. suffix
         end
         rows[#rows + 1] = {
             kind  = "learnable",
@@ -1096,7 +1116,12 @@ function Tooltips.RecipeRows(block, req, colorize)
 
     if (block.unscanned or 0) > 0 then
         local n = block.unscanned
-        local label = string.format("(%d %s unscanned)", n, (n == 1) and "alt" or "alts")
+        -- "characters", not "alts": the gap count can now include the VIEWER
+        -- (a fresh character is unscanned like anyone else — no special-casing
+        -- beyond the name and the ordering), and calling yourself an alt on
+        -- your own screen would be a small lie.
+        local label = string.format("(%d %s unscanned)", n,
+            (n == 1) and "character" or "characters")
         rows[#rows + 1] = { kind = "unscanned", text = wrapQuiet(label), plain = label }
     end
 
@@ -1158,7 +1183,12 @@ end
 
 -- The candidate list for one recipe, read from the professions owners graph.
 -- Every character that HAS the profession contributes exactly one entry; a
--- character with no record of it contributes nothing at all.
+-- character with no record of it contributes nothing at all. The VIEWER is a
+-- candidate like any other — same bucket (their record is projected into
+-- Store.ProfessionsOwners() by Publish/ProjectOwner, the same record the
+-- professions tab reads), same eligibility, same gap accounting — the only
+-- differences are the "You" label and the ordering pin, and both of those
+-- live downstream of here (RecipeRows / BuildRecipeBlock) off the isSelf flag.
 function Tooltips.RecipeEntries(facts, viewerKey)
     local out = {}
     local P, S = ns.Professions, ns.Store
@@ -1168,12 +1198,18 @@ function Tooltips.RecipeEntries(facts, viewerKey)
     local owners = S.ProfessionsOwners()
     if type(owners) ~= "table" then return out end
 
-    local keys = {}
+    local keys, otherKeys = {}, {}
     for key in pairs(owners) do
-        if type(key) == "string" and key ~= "" and key ~= viewerKey then keys[#keys + 1] = key end
+        if type(key) == "string" and key ~= "" then
+            keys[#keys + 1] = key
+            if key ~= viewerKey then otherKeys[#otherKeys + 1] = key end
+        end
     end
     table.sort(keys)                          -- class 8: one order, every hover
-    local names = Tooltips.RecipeDisplayNames(keys)
+    -- Collision detection runs over the OTHER characters only: the viewer's
+    -- entry always renders as "You", so their bare name can never be the
+    -- second meaning of a label, and a same-named alt keeps its short form.
+    local names = Tooltips.RecipeDisplayNames(otherKeys)
     local meta  = Tooltips.CharMeta()
 
     for i = 1, #keys do
@@ -1186,12 +1222,13 @@ function Tooltips.RecipeEntries(facts, viewerKey)
             local state, skill = P.KnownState(payload, facts.profKey, facts.spell)
             local m = meta[key] or EMPTY
             out[#out + 1] = {
-                key   = key,
-                name  = names[key] or key,
-                class = m.class,
-                state = state,
-                skill = skill,
-                specs = (type(prec.s) == "table") and prec.s or nil,
+                key    = key,
+                name   = names[key] or key:match("^([^%-]+)") or key,
+                class  = m.class,
+                state  = state,
+                skill  = skill,
+                specs  = (type(prec.s) == "table") and prec.s or nil,
+                isSelf = (viewerKey ~= nil and key == viewerKey) or nil,
             }
         end
     end
@@ -1818,7 +1855,7 @@ local function selfTest(verbose)
         ck("recipe/learnable", plain(rows, "learnable") == "Learnable: Able (285/275)")
         ck("recipe/skill-short-dropped",
             not (plain(rows, "learnable") or ""):find("Short", 1, true))
-        ck("recipe/unscanned-line", plain(rows, "unscanned") == "(1 alt unscanned)")
+        ck("recipe/unscanned-line", plain(rows, "unscanned") == "(1 character unscanned)")
 
         -- THE POLARITY RED CONTROL. This is the reproduced defect
         -- (PROFESSIONS_DATASET_ADDENDUM §5.3): an alt we have never scanned
@@ -1834,7 +1871,7 @@ local function selfTest(verbose)
                 { { name = "A", state = "unknown" }, { name = "B", state = "unknown" } }, 275)
             local drows = Tooltips.RecipeRows(dark, 275, false)
             ck("recipe/all-dark", rowKinds(drows) == "unscanned")
-            ck("recipe/all-dark-count", plain(drows, "unscanned") == "(2 alts unscanned)")
+            ck("recipe/all-dark-count", plain(drows, "unscanned") == "(2 characters unscanned)")
         end
         -- A fully-proven roster shows NO third line. Absence of the line is
         -- itself the claim "we have an answer for everyone".
@@ -1886,6 +1923,85 @@ local function selfTest(verbose)
             ck("recipe/known-sorted", plain(mrows, "known") == "Known: Alpha, Zeta")
             ck("recipe/learnable-best-first",
                 plain(mrows, "learnable") == "Learnable: High (300/275), Low (280/275)")
+        end
+
+        -- SELF (owner ruling 2026-08). The viewer is a candidate like any
+        -- other — same eligibility, same gap accounting — rendered "You" and
+        -- PINNED first in its line, ahead of the deterministic order.
+        do
+            -- Learnable: self's skill is deliberately the LOWEST qualifying
+            -- one, so only the pin (not skill-desc) can put "You" first.
+            local sl = Tooltips.BuildRecipeBlock({
+                { name = "High",   class = "MAGE",   state = "missing", skill = 300 },
+                { name = "Mid",    class = "DRUID",  state = "missing", skill = 295 },
+                { name = "Poonyx", class = "PRIEST", state = "missing", skill = 280, isSelf = true },
+            }, 275)
+            local slr = Tooltips.RecipeRows(sl, 275, false)
+            ck("recipe/self-learnable-you-first", plain(slr, "learnable")
+                == "Learnable: You (280/275), High (300/275), Mid (295/275)")
+            -- ...and the character's own name never leaks past the label.
+            ck("recipe/self-name-hidden",
+                not (plain(slr, "learnable") or ""):find("Poonyx", 1, true))
+
+            -- Known: self would sort LAST by name; the pin still wins.
+            local sk = Tooltips.BuildRecipeBlock({
+                { name = "Zzz",   class = "PRIEST", state = "known", isSelf = true },
+                { name = "Alpha", class = "MAGE",   state = "known" },
+            }, 275)
+            local skr = Tooltips.RecipeRows(sk, 275, false)
+            ck("recipe/self-known-you-first", plain(skr, "known") == "Known: You, Alpha")
+            -- The coloured path wraps "You" in the VIEWER's class, through the
+            -- injectable colorize seam.
+            local ckr = Tooltips.RecipeRows(sk, 275,
+                function(class, n) return "[" .. tostring(class) .. "]" .. n end)
+            local ktext
+            for _, r in ipairs(ckr) do if r.kind == "known" then ktext = r.text end end
+            ck("recipe/self-you-class-colored",
+                (ktext or ""):find("[PRIEST]You", 1, true) ~= nil)
+
+            -- An unscanned self counts in the gap like anyone else — the name
+            -- and the ordering are the ONLY special-casing.
+            local su = Tooltips.BuildRecipeBlock({
+                { name = "Poonyx", class = "PRIEST", state = "unknown", isSelf = true },
+                { name = "Knower", class = "MAGE",   state = "known" },
+            }, 275)
+            local sur = Tooltips.RecipeRows(su, 275, false)
+            ck("recipe/self-unscanned-counted", su.unscanned == 1
+                and plain(sur, "unscanned") == "(1 character unscanned)")
+            ck("recipe/self-unscanned-not-listed",
+                not (plain(sur, "known") or ""):find("You", 1, true))
+
+            -- A viewer with NO profession record contributes no entry at all
+            -- (RecipeEntries emits nothing for them), so no "You" anywhere —
+            -- the pre-ruling behaviour for that case, unchanged.
+            local noSelf = Tooltips.BuildRecipeBlock({
+                { name = "Knower", class = "MAGE",   state = "known" },
+                { name = "Able",   class = "PRIEST", state = "missing", skill = 285 },
+            }, 275)
+            for _, r in ipairs(Tooltips.RecipeRows(noSelf, 275, false)) do
+                ck("recipe/no-self-no-you", not r.plain:find("You", 1, true))
+            end
+
+            -- DETERMINISM PIN (class 8): two builds of the same block are
+            -- byte-identical, coloured and plain.
+            local function build()
+                local b = Tooltips.BuildRecipeBlock({
+                    { name = "High",   class = "MAGE",    state = "missing", skill = 300 },
+                    { name = "Mid",    class = "DRUID",   state = "missing", skill = 295 },
+                    { name = "Poonyx", class = "PRIEST",  state = "known",   isSelf = true },
+                    { name = "Alpha",  class = "WARRIOR", state = "known" },
+                    { name = "Ghost",  class = "ROGUE",   state = "unknown" },
+                }, 275)
+                local out = {}
+                for _, r in ipairs(Tooltips.RecipeRows(b, 275, false)) do
+                    out[#out + 1] = r.plain
+                end
+                for _, r in ipairs(Tooltips.RecipeRows(b, 275)) do
+                    out[#out + 1] = r.text
+                end
+                return table.concat(out, "\n")
+            end
+            ck("recipe/self-deterministic", build() == build())
         end
 
         -- Empty in, empty out — no headings over nothing.
