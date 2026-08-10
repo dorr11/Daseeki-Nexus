@@ -1231,10 +1231,69 @@ Dashboard.UIState = uiState
 
 Dashboard.tabBuilders = {}   -- id -> build(host) -> tabObj (must expose :Refresh())
 
--- Round-13: the tab strip is gone (single-page dashboard); "characters" is the only
--- registered pane and is auto-selected. RegisterTab remains the pane-builder hook.
+-- Round-13 removed the tab strip because Characters was the ONLY pane and a
+-- one-tab strip is chrome that says nothing. Wave P2 gives the window a genuine
+-- second page (Professions), so the strip returns to the titlebar it used to
+-- live in — the reclaimed 10px of round-13 stays with the body, because these
+-- buttons sit INSIDE the 34px titlebar rather than in a band of their own.
+--
+-- RegisterTab remains the pane-builder hook. The strip is built from TAB_DEFS.
 function Dashboard.RegisterTab(id, buildFn)
     Dashboard.tabBuilders[id] = buildFn
+end
+
+-- The canonical tab order + scope, owned by the shell so a tab file's load
+-- order cannot reorder the strip.
+--
+-- `gate` is what "module off = the tab is not there" means structurally: the
+-- professions view is a display surface for a user-toggleable module, and the
+-- behavioral spec's inertness rule is that a disabled module leaves nothing
+-- behind — including a tab that opens an empty page. A gated-out tab is not
+-- disabled or greyed; it does not exist, and a selection pointing at it falls
+-- back to Characters.
+--
+-- `badge` returns a count to paint after the label (0/nil = no badge).
+Dashboard.TAB_DEFS = {
+    { id = "characters", label = "Characters" },
+    {
+        id = "professions", label = "Professions",
+        gate  = function()
+            local P = ns.Professions
+            return (P and P.IsEnabled and P.IsEnabled()) and true or false
+        end,
+        badge = function()
+            local V = ns.ProfessionsUI
+            return (V and V.BadgeCount and V.BadgeCount()) or 0
+        end,
+    },
+}
+
+-- PURE. Which tab ids are visible right now, in canonical order. Split out so
+-- the gate rule is testable without a window.
+function Dashboard.VisibleTabs()
+    local out = {}
+    for i = 1, #Dashboard.TAB_DEFS do
+        local def = Dashboard.TAB_DEFS[i]
+        if (not def.gate) or def.gate() then out[#out + 1] = def.id end
+    end
+    return out
+end
+
+-- PURE. The tab that should be showing, given a remembered choice. A remembered
+-- tab whose module has since been switched off resolves to the first visible
+-- one rather than to a blank pane.
+function Dashboard.ResolveTab(wanted, visible)
+    visible = visible or Dashboard.VisibleTabs()
+    for i = 1, #visible do
+        if visible[i] == wanted then return wanted end
+    end
+    return visible[1] or "characters"
+end
+
+-- Repaint the strip (labels, active underline, badges) without touching panes.
+function Dashboard.RefreshTabStrip()
+    local w = Dashboard.window
+    if w and w._updateTabButtons then w._updateTabButtons() end
 end
 
 ----------------------------------------------------------------------
@@ -1382,10 +1441,13 @@ Dashboard._tabObjs = {}    -- id -> built tab object
 Dashboard._tabPanes = {}   -- id -> host frame
 
 -- Refresh the currently visible tab (called on engine callbacks + tab show).
+-- The strip repaints alongside it so a tab BADGE (the professions ready-cooldown
+-- count) tracks the same events the panes do rather than only the tab that owns it.
 function Dashboard.RefreshActive()
     local id = Dashboard.activeTabId
     local obj = id and Dashboard._tabObjs[id]
     if obj and obj.Refresh then ns:SafeCall(obj.Refresh) end
+    if win and win._updateTabButtons then ns:SafeCall(win._updateTabButtons) end
 end
 
 -- Current selected faction ("Alliance"/"Horde"). Defaults to the player's.
@@ -1413,6 +1475,13 @@ end
 
 function Dashboard.SelectTab(id)
     if not win then return end
+    -- A gated-out tab can still be ASKED for — a remembered `lastTab` from a
+    -- session where the module was on, a slash command, a stale button press
+    -- racing the toggle. Resolving here (rather than trusting the caller) is
+    -- what makes "module off = the tab is not there" hold for every entry
+    -- point at once: the request lands on the first visible tab instead of
+    -- building a pane for a module that is meant to be inert.
+    id = Dashboard.ResolveTab(id)
     -- Build the pane lazily on first selection.
     if not Dashboard._tabPanes[id] then
         local host = CreateFrame("Frame", nil, win.tabHost)
@@ -1578,12 +1647,89 @@ local function buildHeader(w)
     tag(settingsBtn, "shell.settings")
     w.settingsBtn = settingsBtn
 
-    -- Round-13 (owner: single-page control panel): the Characters/Help TAB STRIP is
-    -- REMOVED. The dashboard IS the Characters page and Help moved into the Settings hub
-    -- (Settings -> Nexus -> Help), so the titlebar is just [emblem] NEXUS ... Settings ✕.
-    -- The two tab-update hooks stay as no-ops (OnShow / SelectTab / SetFaction call them).
-    w._updateTabUnderlines = function() end
-    w._updateTabButtons    = function() end
+    -- TAB STRIP (wave P2). Round-13 retired it while Characters was the only page;
+    -- the professions view is a real second page, so it returns — in the titlebar,
+    -- between the wordmark and the right-hand Settings·✕ cluster, exactly where the
+    -- pre-round-13 strip sat. Two flat text buttons, active carries an accent
+    -- underline, and a gated tab is ABSENT rather than greyed (Dashboard.VisibleTabs).
+    --
+    -- THE BADGE lives here: the professions tab prints its ready-cooldown count after
+    -- its label in the accent, which is the whole "what's ready today" answer visible
+    -- without opening the page. Zero paints nothing — a badge that says 0 is noise.
+    local strip = CreateFrame("Frame", nil, header)
+    strip:SetPoint("LEFT", wordmark, "RIGHT", 22, 0)
+    strip:SetSize(1, HEADER_H)
+    tag(strip, "shell.tabstrip")
+
+    local TAB_GAP = 18
+    local tabBtns = {}
+    for i = 1, #Dashboard.TAB_DEFS do
+        local def = Dashboard.TAB_DEFS[i]
+        local b = CreateFrame("Button", nil, strip)
+        -- Both dimensions at creation (standing rule); _updateTabButtons
+        -- re-measures from the label + badge on every repaint.
+        b:SetSize(80, HEADER_H)
+        b._id = def.id
+        local lbl = b:CreateFontString(nil, "OVERLAY")
+        lbl:SetFontObject(Dashboard.Font("body"))
+        lbl:SetPoint("LEFT", b, "LEFT", 0, 0)
+        lbl:SetText(def.label)
+        b._lbl = lbl
+        local count = b:CreateFontString(nil, "OVERLAY")
+        count:SetFontObject(Dashboard.Font("numeral") or Dashboard.Font("small"))
+        count:SetPoint("LEFT", lbl, "RIGHT", 5, 0)
+        b._count = count
+        local rule = b:CreateTexture(nil, "OVERLAY")
+        rule:SetHeight(2)
+        rule:SetPoint("BOTTOMLEFT", b, "BOTTOMLEFT", 0, 4)
+        rule:SetPoint("BOTTOMRIGHT", b, "BOTTOMRIGHT", 0, 4)
+        rule:Hide()
+        b._rule = rule
+        UI.Skin(b, function(self)
+            self._rule:SetColorTexture(UI.Color("accent"))
+            self._count:SetTextColor(UI.Color("accent"))
+            self._lbl:SetTextColor(UI.Color(self._active and "text" or "muted"))
+        end)
+        b:SetScript("OnEnter", function(self)
+            if not self._active then self._lbl:SetTextColor(UI.Color("text")) end
+        end)
+        b:SetScript("OnLeave", function(self)
+            self._lbl:SetTextColor(UI.Color(self._active and "text" or "muted"))
+        end)
+        b:SetScript("OnClick", function(self) Dashboard.SelectTab(self._id) end)
+        tabBtns[i] = b
+    end
+    w._tabBtns = tabBtns
+
+    w._updateTabButtons = function()
+        local visible = Dashboard.VisibleTabs()
+        local shown = {}
+        for _, id in ipairs(visible) do shown[id] = true end
+        local prev, total = nil, 0
+        for i = 1, #tabBtns do
+            local b = tabBtns[i]
+            local def = Dashboard.TAB_DEFS[i]
+            if not shown[b._id] then
+                b:Hide()
+            else
+                b._active = (Dashboard.activeTabId == b._id)
+                b._lbl:SetTextColor(UI.Color(b._active and "text" or "muted"))
+                b._rule:SetShown(b._active and true or false)
+                local n = def.badge and def.badge() or 0
+                b._count:SetText((n and n > 0) and tostring(n) or "")
+                b:SetWidth((b._lbl:GetStringWidth() or 60)
+                    + (((n or 0) > 0) and ((b._count:GetStringWidth() or 8) + 5) or 0))
+                b:ClearAllPoints()
+                if prev then b:SetPoint("LEFT", prev, "RIGHT", TAB_GAP, 0)
+                else b:SetPoint("LEFT", strip, "LEFT", 0, 0) end
+                b:Show()
+                total = total + b:GetWidth() + (prev and TAB_GAP or 0)
+                prev = b
+            end
+        end
+        strip:SetWidth(math.max(1, total))
+    end
+    w._updateTabUnderlines = w._updateTabButtons
 
     -- Titlebar bottom rule (1px) — the seam between the titlebar and the body.
     -- Pop pass (round-4): borderLite so the seam reads like the reference's edges.
@@ -1645,9 +1791,10 @@ local function ensureWindow()
 
     restoreGeom()
 
-    -- Round-13: single-page dashboard — Characters is the only pane (Help moved to the
-    -- Settings hub). Always select it.
-    Dashboard.SelectTab("characters")
+    -- Wave P2: two pages. Reopen on the one the owner left on, unless that tab
+    -- has since been gated away (module switched off between sessions), in
+    -- which case ResolveTab lands on Characters.
+    Dashboard.SelectTab(uiState().lastTab or "characters")
 
     Dashboard.window = win
     return win
@@ -2475,6 +2622,48 @@ local function testBuffTimeRule(fails)
     ck(D.BuffTimeToken("ony", "banana") == AMBER, "non-numeric remaining reads as 0 -> yellow")
 end
 
+-- Tab-strip gating (wave P2). "Module off = the tab is not there" is a rule
+-- about a WINDOW, which a headless harness cannot paint — so the rule is
+-- expressed as two pure functions and pinned here instead. What must hold:
+-- an ungated tab is always visible; a gated tab appears only while its module
+-- answers yes; and a remembered selection pointing at a tab that has since
+-- gone away resolves to a real one rather than opening a blank pane.
+local function testTabGating(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local saved = Dashboard.TAB_DEFS
+    local answer = true
+    Dashboard.TAB_DEFS = {
+        { id = "characters", label = "Characters" },
+        { id = "professions", label = "Professions", gate = function() return answer end },
+    }
+    local ok, err = pcall(function()
+        answer = true
+        local vis = Dashboard.VisibleTabs()
+        ck(#vis == 2 and vis[1] == "characters" and vis[2] == "professions",
+           "an enabled module's tab is missing from the strip")
+        ck(Dashboard.ResolveTab("professions") == "professions",
+           "a visible tab did not resolve to itself")
+
+        answer = false
+        vis = Dashboard.VisibleTabs()
+        ck(#vis == 1 and vis[1] == "characters",
+           "a DISABLED module still contributes a tab")
+        ck(Dashboard.ResolveTab("professions") == "characters",
+           "a remembered tab for a disabled module did not fall back")
+        ck(Dashboard.ResolveTab(nil) == "characters", "no remembered tab did not fall back")
+        ck(Dashboard.ResolveTab("nonsense") == "characters", "an unknown tab id did not fall back")
+    end)
+    Dashboard.TAB_DEFS = saved
+    if not ok then fails[#fails + 1] = "error in tab-gating fixtures: " .. tostring(err) end
+
+    -- The shipped definitions themselves: exactly one gated tab, and it is the
+    -- professions view wired to the professions module.
+    local gated = 0
+    for _, def in ipairs(Dashboard.TAB_DEFS) do if def.gate then gated = gated + 1 end end
+    ck(gated == 1, "the shipped tab set has " .. gated .. " gated tabs, expected 1")
+    ck(Dashboard.TAB_DEFS[1].id == "characters", "Characters is no longer the first tab")
+end
+
     ns:RegisterSelfTest("dashboard", function(verbose)
         local cases = {
             { name = "aura slot map agreement (tracker <-> AURA_META)", fn = testAuraSlotMap },
@@ -2487,6 +2676,7 @@ end
             { name = "online exclusivity", fn = testOnlineExclusivity },
             { name = "mesh presence + 15s window (A1.1/A1.2)", fn = testMeshPresence },
             { name = "cross-bucket roster dedup", fn = testRosterDedup },
+            { name = "tab strip gating (module off = the tab is not there)", fn = testTabGating },
         }
         local allPass = true
         for _, c in ipairs(cases) do

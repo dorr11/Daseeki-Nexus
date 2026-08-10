@@ -819,9 +819,44 @@ local function buildGeneral(flow)
         end,
         set = function(v)
             local P = ns.Professions
-            if P and P.SetEnabled then P.SetEnabled(v and true or false); return end
+            if P and P.SetEnabled then P.SetEnabled(v and true or false)
+            else
+                local db = DB()
+                if db then db.professionsEnabled = v and true or false end
+            end
+            -- The VIEW half of the toggle (wave P2). SetEnabled drops the
+            -- module's frame, live capture and dataset; this drops the tab's
+            -- caches and its cold-name watcher and repaints the dashboard's tab
+            -- strip, so "off" means the Professions TAB IS GONE rather than a
+            -- tab that opens an empty page.
+            local V = ns.ProfessionsUI
+            if V and V.OnModuleToggled then V.OnModuleToggled(v and true or false) end
+        end,
+    }).Refresh)
+
+    -- The professions view's one announcement, indented under the module it
+    -- belongs to. Q6's "quiet" is the whole design: ONE chat line at login
+    -- naming who has a profession cooldown up, no popup and no sound, and this
+    -- is the switch that silences it. Default ON, and an ABSENT key reads as ON
+    -- (the house rule), so a SavedVariables file written before the view
+    -- existed behaves like a fresh one.
+    local r3pv = sec:AddRow({ vAlign = "center" })
+    r3pv._indent = r3pv._indent + 20
+    register("general", r3pv:Checkbox({
+        label = "Announce ready profession cooldowns at login",
+        tooltip = "One quiet chat line, once per login, listing the characters "
+               .. "whose profession cooldowns are ready. Never a popup, never a "
+               .. "sound. The ready count is also badged on the Professions tab, "
+               .. "which this switch does not touch.",
+        get = function()
+            local V = ns.ProfessionsUI
+            if V and V.LoginLineEnabled then return V.LoginLineEnabled() end
             local db = DB()
-            if db then db.professionsEnabled = v and true or false end
+            return not db or db.professionsLoginLine ~= false
+        end,
+        set = function(v)
+            local db = DB()
+            if db then db.professionsLoginLine = v and true or false end
         end,
     }).Refresh)
 
