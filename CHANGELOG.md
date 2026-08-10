@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- **Professions — collapsed headers can no longer shorten the truth.** A profession window
+  opened with collapsed category headers used to be scannable as if the visible rows were
+  the whole recipe list — the one narrowing the view guard couldn't witness. Header rows
+  now report their expanded state through the same reads the scan already makes
+  (boolean-and-coherent only; anything else is honestly "unreadable", never guessed). A
+  witnessed-collapsed window full-scans by expanding everything, capturing the complete
+  list, and restoring your exact collapse set — you won't see your categories move except
+  on the rare full scan. In between, the cheap settled pass recognizes your collapsed view
+  as expected rather than as drift, so there's no flicker and no rescan churn; cooldowns
+  still publish off the rows you can see. Clients where the state can't be read fall back
+  to expanding before each full scan and leaving the window expanded — visible in
+  `/nexus debug professions` as the surface's "collapse world". A collapse that can't be
+  expanded is a recorded, retryable refusal — never a shortened recipe list on the mesh.
+
 - **Fixed** — Mesh account list: the Offline status marker rendered as a tofu box because
   the suite's default font (FiraSansCondensed-Medium) ships no glyph for U+25CB WHITE
   CIRCLE. Offline now uses the same round dot as You/Online in the existing grey ink, so
