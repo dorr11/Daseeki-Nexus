@@ -176,6 +176,23 @@ local L = {
     LIST_ROW_H  = 20,   -- recipe / cooldown / search rows
     FILTER_H    = 24,   -- one filter row in the detail pane (there are two)
 
+    -- The recipe list's column geometry (detail pane). These used to live as
+    -- baked per-FontString anchors inside makeRecipeRow plus an ad-hoc titleW
+    -- in the render — the exact shape the grid's overflow lesson bans. They
+    -- are now LAYOUT constants read ONLY through ProfUI.RecipeColumns, so the
+    -- rows and the column-header band (owner, 2026-08-10: "add column headers
+    -- in the Detail list") share one x/width source and cannot drift apart.
+    REC_MARK_X     = 2,    -- the state marker's left inset
+    REC_MARK_W     = 14,   -- the state marker column
+    REC_TITLE_GAP  = 4,    -- marker -> recipe name
+    REC_TITLE_FRAC = 0.55, -- the name column's share of the real list width
+    REC_TITLE_MIN  = 140,  -- ... clamped to stay readable in a narrow pane
+    REC_TITLE_MAX  = 260,  -- ... and to leave the source column a remainder
+    REC_SKILL_GAP  = 4,    -- name -> skill requirement
+    REC_SKILL_W    = 38,   -- the skill column (right-justified numerals)
+    REC_SRC_GAP    = 10,   -- skill -> source kind
+    REC_SRC_PAD    = 4,    -- source column -> the row's right edge
+
     -- The acquisition text's line budget. One line stopped fitting the moment
     -- the acquisition phrases grew their zone suffixes ("Sold by Fradd
     -- Swiftgear \226\128\148 Gnomeregan area" style, 2026-08-10) — the owner's
@@ -274,6 +291,51 @@ end
 -- one ACQ_LINE_H of that gain back, and the self-test pins that too.
 function ProfUI.RecipeListBottomInset()
     return L.INFO_H + L.PANEL_PAD + 4
+end
+
+-- PURE. The recipe list's column geometry, from the width ACTUALLY available
+-- at render time (the grid's overflow lesson, applied to the detail pane): the
+-- state marker, the recipe name (its share of the real width, clamped), the
+-- skill requirement, and the source kind wearing the remainder. ONE reader for
+-- the rows AND the header band — they cannot disagree.
+-- Returns { mark = {x,w}, title = {x,w}, skill = {x,w}, src = {x,w} }.
+function ProfUI.RecipeColumns(availW)
+    availW = tonumber(availW) or 0
+    local titleW = math.floor(availW * L.REC_TITLE_FRAC)
+    if titleW < L.REC_TITLE_MIN then titleW = L.REC_TITLE_MIN
+    elseif titleW > L.REC_TITLE_MAX then titleW = L.REC_TITLE_MAX end
+    local titleX = L.REC_MARK_X + L.REC_MARK_W + L.REC_TITLE_GAP
+    local skillX = titleX + titleW + L.REC_SKILL_GAP
+    local srcX   = skillX + L.REC_SKILL_W + L.REC_SRC_GAP
+    local srcW   = availW - L.REC_SRC_PAD - srcX
+    if srcW < 1 then srcW = 1 end
+    return {
+        mark  = { x = L.REC_MARK_X, w = L.REC_MARK_W },
+        title = { x = titleX, w = titleW },
+        skill = { x = skillX, w = L.REC_SKILL_W },
+        src   = { x = srcX,   w = srcW },
+    }
+end
+
+-- PURE. The recipe list's header row: label + the EXACT x/width of the column
+-- it captions, derived FROM RecipeColumns (never positioned independently —
+-- the lesson the grid's header already carries). SKILL right-justifies because
+-- the skill numerals under it do.
+function ProfUI.RecipeHeaderCells(availW)
+    local c = ProfUI.RecipeColumns(availW)
+    return {
+        { label = "RECIPE", x = c.title.x, w = c.title.w, justify = "LEFT"  },
+        { label = "SKILL",  x = c.skill.x, w = c.skill.w, justify = "RIGHT" },
+        { label = "SOURCE", x = c.src.x,   w = c.src.w,   justify = "LEFT"  },
+    }
+end
+
+-- PURE. What the header band costs the recipe LIST, top to bottom: the band
+-- (HEAD_H) plus its 2px gap — exactly one LIST_ROW_H, and the self-test pins
+-- it never quietly grows past one row. The view and the pin read this same
+-- number (the grid's GridListTopInset idiom).
+function ProfUI.RecipeListHeaderHeight()
+    return L.HEAD_H + 2
 end
 
 -- PURE. The acquisition FontString's fixed height: its whole ACQ_LINES budget.
@@ -462,9 +524,16 @@ function ProfUI.ClearCaches()
     _profName, _profIcon, _cdProf = {}, {}, nil
     _spellName, _itemName = {}, {}
     _askCount = {}
+    -- The recipe-tooltip session record: which render mode won, and whether
+    -- the enchant hyperlink was proven to work/fail on this client. A module
+    -- toggle is a clean re-learn point (same rule as every cache here).
+    ProfUI._tipStats = { enchant = 0, item = 0, facts = 0 }
+    ProfUI._tipEnchantWorks = nil
     if ProfUI._clearSourceMemo then ProfUI._clearSourceMemo() end
     if ProfUI._resetWatchState then ProfUI._resetWatchState() end
 end
+ProfUI._tipStats = { enchant = 0, item = 0, facts = 0 }
+ProfUI._tipEnchantWorks = nil    -- nil = untested this session; true/false = proven
 
 local function now()
     return (Dashboard and Dashboard.Now and Dashboard.Now())
@@ -865,7 +934,11 @@ function ProfUI.CellModel(payload, profKey, nowE)
         hasSpec   = (type(p.s) == "table" and #p.s > 0) or false,
         scanned   = (state == "scanned"),
         known     = (state == "scanned") and p.n or nil,
-        total     = ProfUI.RecipeCount(profKey),
+        -- The census denominator honours the spec rule (owner, 2026-08-10):
+        -- an Armorsmith's total is "recipes obtainable as an Armorsmith" —
+        -- spec-conflicted recipes are censused out. Equals RecipeCount for a
+        -- character with no spec chosen.
+        total     = ProfUI.ObtainableTotal(payload, profKey),
         drift     = p.u,
         scannedAt = p.a,
         cd        = ProfUI.CellCooldown(payload, profKey, nowE),
@@ -1409,6 +1482,8 @@ function ProfUI.SourceModel(spellID)
     local lines, routes, blockedRoutes = {}, 0, 0
     local firstBlock = nil
     local suffix = {}
+    local teachItem = nil    -- the FIRST teaching item (I/K route) — the recipe
+                             -- tooltip's item-hyperlink fallback reads it
 
     for tok in (tostring(acq or "") .. ";"):gmatch("(.-);") do
         if tok ~= "" then
@@ -1424,6 +1499,7 @@ function ProfUI.SourceModel(spellID)
             elseif head == "I" or head == "K" then
                 routes = routes + 1
                 local itemID = tonumber(tok:sub(2))
+                if itemID and not teachItem then teachItem = itemID end
                 local parts, blocked = itemRoute(D, itemID)
                 local nm = res.item(itemID)
                 if nm == nil then coldItem = true end
@@ -1476,6 +1552,7 @@ function ProfUI.SourceModel(spellID)
     local model = { classes = classes, text = text, lines = lines,
                     suffix = suffix, unavailable = unavailable,
                     skill = rec.s, spec = (rec.spec and rec.spec > 0) and rec.spec or nil,
+                    teachItem = teachItem,
                     cold = coldItem }
     if not coldItem then _srcModel[spellID] = model end
     return model
@@ -1487,6 +1564,78 @@ function ProfUI.SpecName(specIdx)
     local D = core()
     local s = D and D.specs and D.specs[specIdx]
     return s and s.name or nil
+end
+
+----------------------------------------------------------------------
+-- THE SPEC RULE — one predicate, all consumers (owner, 2026-08-10: "we
+-- shouldnt display recipes as missing if they are for a different
+-- specialization than selected", his screenshot the Gnomish Engineer whose
+-- missing list red-flagged a Goblin-only Dimensional Ripper).
+--
+-- The dataset speaks in spec ORDINALS (rec.spec -> D.specs[idx] = { id =
+-- <spec spell id>, p = <profession idx>, name }), the payload in held spec
+-- SPELL IDS (p.s). The standing of one recipe against one character:
+--
+--   "ok"        no spec requirement, or the character HOLDS the required spec
+--   "openable"  a spec is required and the character holds NO spec in that
+--               profession's family — nothing is conflicted yet, they could
+--               still choose it (the owner's rule 3: unchanged behavior)
+--   "conflict"  the character holds a DIFFERENT spec of the same family —
+--               "a different specialization than selected", the owner's exact
+--               case. (With no spec-hierarchy data in the dataset, holding
+--               ANY other family spec reads as "selected something else",
+--               which is also the literal directive.)
+--
+-- An unknown spec ordinal fails OPEN ("ok"): hiding a recipe on a guess would
+-- be the silent-drop lie. The learnable computation (SearchRows) and the
+-- recipe-list classification (RecipeRows) both read THIS function — the
+-- self-test pins that they cannot drift into two spec rules.
+----------------------------------------------------------------------
+
+function ProfUI.SpecStanding(D, rec, heldSpecs)
+    local specIdx = rec and tonumber(rec.spec)
+    if not specIdx or specIdx == 0 then return "ok" end
+    local sp = D and D.specs and D.specs[specIdx]
+    if not sp then return "ok" end
+    if type(heldSpecs) == "table" then
+        for j = 1, #heldSpecs do
+            if heldSpecs[j] == sp.id then return "ok" end
+        end
+        for j = 1, #heldSpecs do
+            local hIdx = D.specById and D.specById[heldSpecs[j]]
+            local hs = hIdx and D.specs[hIdx]
+            if hs and hs.p == sp.p then return "conflict" end
+        end
+    end
+    return "openable"
+end
+
+-- The census DENOMINATOR for one character's profession: the dataset recipes
+-- MINUS the spec-conflicted ones (an Armorsmith's total is "recipes obtainable
+-- as an Armorsmith"), except that a recipe the character provably KNOWS always
+-- counts — a known recipe can never be censused out from under its own
+-- numerator. With no payload (or no spec chosen) this equals RecipeCount.
+-- View-layer classification only: the capture, the payload and the wire are
+-- untouched. (Unmemoised on purpose — the same render path already decodes
+-- the known bitmap per cell, and this walk is the same order of cheap.)
+function ProfUI.ObtainableTotal(payload, profKey)
+    local D = core()
+    if not D then return 0 end
+    local idx = D.profIdx and D.profIdx[profKey]
+    if not idx then return 0 end
+    local list = (D.profRecipes and D.profRecipes[idx]) or {}
+    local p = type(payload) == "table" and payload.p and payload.p[profKey] or nil
+    local held = p and p.s or nil
+    local known = ProfUI.KnownSet(payload, profKey)
+    local n = 0
+    for i = 1, #list do
+        local spell = list[i]
+        if (known and known[spell])
+            or ProfUI.SpecStanding(D, D.recipe[spell], held) ~= "conflict" then
+            n = n + 1
+        end
+    end
+    return n
 end
 
 ----------------------------------------------------------------------
@@ -1522,20 +1671,45 @@ function ProfUI.RecipeRows(payload, profKey, opts, res)
     -- nil used to mean unavailables leaked through the front door.
     local showUnav = opts.showUnavailable and true or false
 
+    -- The character's held specs for this profession travel on the payload
+    -- whether or not the window was ever scanned; the spec rule reads them.
+    local held = type(payload) == "table" and payload.p and payload.p[profKey]
+        and payload.p[profKey].s or nil
+
     for i = 1, #list do
         local spell = list[i]
         local rec = D.recipe[spell]
         local rowState = unscanned and "unknown" or (known[spell] and "known" or "missing")
 
+        -- THE SPEC RULE (the shared predicate — see SpecStanding): a recipe
+        -- locked behind a spec this character did NOT choose is not "missing",
+        -- it is unavailable-with-a-reason. A KNOWN recipe is never reclassified
+        -- (knowing it outranks any inference about specs).
+        local specConflict = (rowState ~= "known")
+            and ProfUI.SpecStanding(D, rec, held) == "conflict" or false
+
         local keep = true
-        if opts.missingOnly and rowState ~= "missing" then keep = false end
+        -- "Missing only" must agree with the owner's rule: a spec-conflicted
+        -- recipe is not missing, so it never rides that filter — not even with
+        -- Show unavailable ticked.
+        if opts.missingOnly and (rowState ~= "missing" or specConflict) then keep = false end
 
         -- Memoised (see SourceModel): a game fact looked up once per session.
         local src = keep and ProfUI.SourceModel(spell) or nil
         if keep and opts.source then
             if not (src and src.classes and src.classes[opts.source]) then keep = false end
         end
-        local unavailable = src and src.unavailable or nil
+        -- A spec conflict wears the SPEC as its visible reason (the owner's
+        -- screenshot: "Goblin Engineer" is the fact that explains the row);
+        -- otherwise the source graph's own unavailability candidate stands.
+        local unavailable = nil
+        if specConflict then
+            unavailable = { key = "spec",
+                text = "requires " .. (ProfUI.SpecName(rec and rec.spec)
+                                       or "another specialisation") }
+        else
+            unavailable = src and src.unavailable or nil
+        end
         if keep and unavailable and not showUnav then keep = false end
 
         if keep then
@@ -1557,13 +1731,174 @@ function ProfUI.RecipeRows(payload, profKey, opts, res)
                     spec    = (rec and rec.spec and rec.spec > 0) and rec.spec or nil,
                     source  = src and src.text or nil,
                     classes = src and src.classes or nil,
-                    unavailable = src and src.unavailable or nil,
+                    unavailable = unavailable,
+                    specConflict = specConflict or nil,
+                    item    = src and src.teachItem or nil,   -- teaching item, for the tooltip fallback
                 }
             end
         end
     end
     table.sort(pending)
     return rows, pending, unscanned and "unscanned" or "scanned"
+end
+
+----------------------------------------------------------------------
+-- THE RECIPE ROW TOOLTIP  (owner, 2026-08-10: "recipes in the professions tab
+-- show their tooltip when hovered over")
+--
+-- The tooltip a recipe row wants is the CRAFT tooltip — product + reagents,
+-- what the profession window itself shows — which this client family renders
+-- via GameTooltip:SetHyperlink("enchant:<teachingSpellID>"). That mechanism is
+-- UNVERIFIED on 11509 (the same client returned nil recipe LINKS in the
+-- profession window; link RETRIEVAL and hyperlink RENDERING are different
+-- mechanisms, so neither outcome is assumed), so every attempt is defensive
+-- and the chain falls through honestly:
+--
+--   1. enchant:<spellID>      the craft tooltip. A pcall error OR an empty
+--                             render latches _tipEnchantWorks=false for the
+--                             session — whichever mode wins first stays the
+--                             mode, so hovers are consistent, and the latch is
+--                             readable in /dnx professionsui.
+--   2. item:<teachingItemID>  where the dataset carries a teaching item (the
+--                             recipe scroll). This also picks up the suite's
+--                             own Known/Learnable lines from tooltips.lua for
+--                             free. CLASS 4 (cold reads): an item tooltip can
+--                             render its TITLE synchronously with the body
+--                             absent, so a render under two lines is treated
+--                             as cold, a warm load is requested, and the chain
+--                             falls through — cold is transient, so it NEVER
+--                             latches; the re-hover is the retry (no ladder).
+--   3. dataset facts          name / state / skill / source — the same strings
+--                             the pane already renders. Cannot fail, so a
+--                             hover can never leave a blank tooltip standing.
+--
+-- Everything here takes the TOOLTIP AS A PARAMETER (GameTooltip live, a
+-- recording fake under the harness — the parity gate's idiom), so the whole
+-- chain is exercised headless.
+----------------------------------------------------------------------
+
+-- PURE. The attempt chain for one row, honouring the session latch.
+function ProfUI.RecipeTooltipPlan(row)
+    local plan = {}
+    if type(row) == "table" and row.spell and ProfUI._tipEnchantWorks ~= false then
+        plan[#plan + 1] = { kind = "enchant", link = "enchant:" .. row.spell, minLines = 1 }
+    end
+    if type(row) == "table" and row.item then
+        -- minLines = 2: a title-only item tooltip is the class-4 cold read,
+        -- not an answer.
+        plan[#plan + 1] = { kind = "item", link = "item:" .. row.item, minLines = 2 }
+    end
+    plan[#plan + 1] = { kind = "facts" }
+    return plan
+end
+
+-- PURE. The dataset-facts tooltip, as { text, ink } lines — the same strings
+-- the list row and info band already render, never an empty table.
+function ProfUI.RecipeFactLines(row, res)
+    row = type(row) == "table" and row or {}
+    local out = {}
+    local name = row.name
+    if name == nil and res and res.spell and row.spell then name = res.spell(row.spell) end
+    out[#out + 1] = { text = name or ("Recipe " .. tostring(row.spell or "?")), ink = "text" }
+    if row.state == "known" then
+        out[#out + 1] = { text = ProfUI.GLYPHS.known .. " Known", ink = "ok" }
+    elseif row.state == "missing" then
+        out[#out + 1] = { text = "Not known", ink = "muted" }
+    elseif row.state == "unknown" then
+        out[#out + 1] = { text = "Not checked", ink = "faint" }
+    end
+    if row.skill then
+        out[#out + 1] = { text = "Requires skill " .. tostring(row.skill), ink = "muted" }
+    end
+    if row.source then
+        out[#out + 1] = { text = row.source, ink = "muted" }
+    end
+    if row.unavailable and row.unavailable.text then
+        out[#out + 1] = { text = "Unavailable \226\128\148 " .. row.unavailable.text, ink = "danger" }
+    end
+    return out
+end
+
+-- Drive the chain against `tip`. Returns the mode that rendered ("enchant" |
+-- "item" | "facts") and records it in _tipStats. `ask` is injectable for the
+-- harness; it defaults to the real warm-load request.
+function ProfUI.RenderRecipeTooltip(tip, row, res, ask)
+    ask = ask or function(kind, ids) return ProfUI.AskFor(kind, ids) end
+    local plan = ProfUI.RecipeTooltipPlan(row)
+    for i = 1, #plan do
+        local step = plan[i]
+        if step.kind == "facts" then
+            local lines = ProfUI.RecipeFactLines(row, res)
+            for j = 1, #lines do
+                local ln = lines[j]
+                if tip and tip.AddLine then
+                    if UI and UI.Color then tip:AddLine(ln.text, UI.Color(ln.ink))
+                    else tip:AddLine(ln.text) end
+                end
+            end
+            ProfUI._tipStats.facts = ProfUI._tipStats.facts + 1
+            return "facts"
+        end
+        local ok = false
+        if tip and tip.SetHyperlink then
+            ok = pcall(tip.SetHyperlink, tip, step.link)
+        end
+        local lines = 0
+        if ok and tip.NumLines then
+            local okN, n = pcall(tip.NumLines, tip)
+            lines = (okN and tonumber(n)) or 0
+        end
+        if ok and lines >= step.minLines then
+            if step.kind == "enchant" and ProfUI._tipEnchantWorks == nil then
+                ProfUI._tipEnchantWorks = true
+            end
+            ProfUI._tipStats[step.kind] = ProfUI._tipStats[step.kind] + 1
+            return step.kind
+        end
+        -- This step failed. An enchant failure is a fact about the CLIENT
+        -- (latch, stay consistent all session); an item failure is a fact
+        -- about a COLD CACHE (transient — request the warm load and let the
+        -- re-hover be the retry).
+        if step.kind == "enchant" then
+            ProfUI._tipEnchantWorks = false
+        elseif step.kind == "item" and row and row.item then
+            ask("item", { row.item })
+        end
+        if tip and tip.ClearLines then pcall(tip.ClearLines, tip) end
+    end
+end
+
+-- PURE. The pooled-cell lesson (Daseeki-Bags' bank tooltips): may a repaint
+-- leave the standing tooltip up? Only if this row still shows the SAME recipe.
+function ProfUI.TooltipStaleOnPaint(prevSpell, newSpell, ownedByRow)
+    return (ownedByRow and prevSpell ~= newSpell) and true or false
+end
+
+-- The three row handlers, tooltip-injected. `rr` needs only ._row / ._spell,
+-- so the harness drives these with plain tables.
+function ProfUI.RowTooltipEnter(tip, rr, res)
+    local row = rr and rr._row
+    if not row then return nil end
+    if tip and tip.SetOwner then tip:SetOwner(rr, "ANCHOR_RIGHT") end
+    local mode = ProfUI.RenderRecipeTooltip(tip, row, res)
+    if tip and tip.Show then tip:Show() end
+    return mode
+end
+
+function ProfUI.RowTooltipLeave(tip)
+    if tip and tip.Hide then tip:Hide() end
+end
+
+-- Called by paintRecipeRow BEFORE the row adopts its new spell: a recycled row
+-- must not keep the previous recipe's tooltip standing. Returns true when it
+-- hid one (the re-hover re-renders the new content naturally).
+function ProfUI.RowTooltipOnPaint(tip, rr, newSpell)
+    local owned = (tip and tip.GetOwner and tip:GetOwner() == rr) and true or false
+    if ProfUI.TooltipStaleOnPaint(rr and rr._spell, newSpell, owned) then
+        if tip.Hide then tip:Hide() end
+        return true
+    end
+    return false
 end
 
 -- PURE. The professions of ONE character, for the drill-in's left column, in
@@ -1727,16 +2062,13 @@ function ProfUI.SearchRows(query, entries, lookup, res, limit)
                                 else
                                     local lvl = tonumber(pr.l)
                                     local needSkill = rec and rec.s or 0
-                                    local specOK = true
-                                    if rec and rec.spec and rec.spec > 0 then
-                                        specOK = false
-                                        local sp = D.specs and D.specs[rec.spec]
-                                        if sp and type(pr.s) == "table" then
-                                            for j = 1, #pr.s do
-                                                if pr.s[j] == sp.id then specOK = true break end
-                                            end
-                                        end
-                                    end
+                                    -- THE SPEC RULE, through the one shared
+                                    -- predicate (SpecStanding — the recipe
+                                    -- list's classification reads the same
+                                    -- function, and the self-test pins it):
+                                    -- learnable requires HOLDING the spec.
+                                    local specOK =
+                                        ProfUI.SpecStanding(D, rec, pr.s) == "ok"
                                     if lvl == nil then
                                         row.unchecked[#row.unchecked + 1] = who
                                     elseif specOK and lvl >= needSkill then
@@ -2356,6 +2688,9 @@ local function paintCell(cell, model, ownerKey, compact)
 end
 
 -- ── the recipe list row (drill-in) ───────────────────────────────────────────
+-- NOTHING here bakes an x-position: the render calls fitRecipeRow (below) with
+-- the SAME ProfUI.RecipeColumns the header band uses, so the cells and their
+-- headers cannot disagree (the grid rows' idiom).
 local function makeRecipeRow(listChild, pane)
     local rr = CreateFrame("Button", nil, listChild)
     rr:SetSize(1, L.LIST_ROW_H)          -- width comes from the render; never born zero
@@ -2365,27 +2700,60 @@ local function makeRecipeRow(listChild, pane)
     rr:SetHighlightTexture(rh)
 
     local mark = fstr(rr, "small", "CENTER")
-    mark:SetPoint("LEFT", rr, "LEFT", 2, 0)
-    mark:SetWidth(14)
+    mark:SetPoint("LEFT", rr, "LEFT", L.REC_MARK_X, 0)     -- re-fit per render
+    mark:SetWidth(L.REC_MARK_W)
     local title = fstr(rr, "body", "LEFT")
-    title:SetPoint("LEFT", mark, "RIGHT", 4, 0)
-    title:SetWidth(250)
+    title:SetPoint("LEFT", rr, "LEFT", L.REC_MARK_X + L.REC_MARK_W + L.REC_TITLE_GAP, 0)
+    title:SetWidth(L.REC_TITLE_MIN)
     local skill = fstr(rr, "numeral", "RIGHT")
-    skill:SetPoint("LEFT", title, "RIGHT", 4, 0)
-    skill:SetWidth(38)
+    skill:SetPoint("LEFT", rr, "LEFT", 1, 0)               -- re-fit per render
+    skill:SetWidth(L.REC_SKILL_W)
     local src = fstr(rr, "small", "LEFT")
-    src:SetPoint("LEFT", skill, "RIGHT", 10, 0)
-    src:SetPoint("RIGHT", rr, "RIGHT", -4, 0)
+    src:SetPoint("LEFT", rr, "LEFT", 1, 0)                 -- re-fit per render
+    src:SetWidth(1)
 
     rr._mark, rr._title, rr._skill, rr._src = mark, title, skill, src
     rr:SetScript("OnClick", function(self)
         if self._spell then pane.SelectRecipe(self._spell) end
     end)
+    -- The hover tooltip (owner, 2026-08-10). OnEnter/OnLeave ride the SAME
+    -- Button the OnClick already lives on — no new mouse-enabling, so the
+    -- click/selection behavior is untouched.
+    rr:SetScript("OnEnter", function(self)
+        ProfUI.RowTooltipEnter(GameTooltip, self, ProfUI.LiveResolver())
+    end)
+    rr:SetScript("OnLeave", function()
+        ProfUI.RowTooltipLeave(GameTooltip)
+    end)
+    -- A pooled row hidden mid-hover (scroll re-render, filter change) may not
+    -- leave its tooltip standing either.
+    rr:SetScript("OnHide", function(self)
+        if GameTooltip and GameTooltip.GetOwner and GameTooltip:GetOwner() == self then
+            GameTooltip:Hide()
+        end
+    end)
     return rr
 end
 
+-- Re-fit one pooled row to the column geometry of THIS render (the grid's
+-- fitGridRow idiom): every text width-capped at its own column.
+local function fitRecipeRow(rr, cols)
+    rr._mark:SetPoint("LEFT", rr, "LEFT", cols.mark.x, 0)
+    rr._mark:SetWidth(math.max(1, cols.mark.w))
+    rr._title:SetPoint("LEFT", rr, "LEFT", cols.title.x, 0)
+    rr._title:SetWidth(math.max(1, cols.title.w))
+    rr._skill:SetPoint("LEFT", rr, "LEFT", cols.skill.x, 0)
+    rr._skill:SetWidth(math.max(1, cols.skill.w))
+    rr._src:SetPoint("LEFT", rr, "LEFT", cols.src.x, 0)
+    rr._src:SetWidth(math.max(1, cols.src.w))
+end
+
 local function paintRecipeRow(rr, row, selected)
+    -- The pooled-cell lesson: if the standing tooltip belongs to this row and
+    -- the row is adopting a DIFFERENT recipe, hide it before the swap.
+    ProfUI.RowTooltipOnPaint(GameTooltip, rr, row.spell)
     rr._spell = row.spell
+    rr._row = row
     local grey = row.unavailable and true or false
     if row.state == "known" then
         -- The known marker is the IN-FONT dot (see THE GLYPH REGISTRY): the
@@ -2900,8 +3268,36 @@ Dashboard.RegisterTab("professions", function(host)
     UI.Skin(recStatus, function(self) self:SetTextColor(UI.Color("muted")) end)
     pane._recStatus = recStatus
 
+    -- THE COLUMN HEADER BAND (owner, 2026-08-10: "add column headers in the
+    -- Detail list") — the grid header's idiom restated: an eyebrow row that
+    -- CLIPS, its labels positioned per render from the SAME RecipeColumns the
+    -- rows use, so the captions and the cells cannot drift apart. It costs the
+    -- list exactly one LIST_ROW_H (RecipeListHeaderHeight, pinned).
+    local recHead = CreateFrame("Frame", nil, detailP)
+    recHead:SetPoint("TOPLEFT", filter2, "BOTTOMLEFT", 0, -4)
+    recHead:SetPoint("RIGHT", detailP, "RIGHT", -L.PANEL_PAD, 0)
+    recHead:SetHeight(L.HEAD_H)
+    recHead:SetClipsChildren(true)
+    Dashboard.Tag(recHead, "prof.recipes.head")
+    local recHeadFS = {}
+    do
+        local cells = ProfUI.RecipeHeaderCells(0)
+        for i = 1, #cells do
+            local hf = eyebrow(recHead, cells[i].label, cells[i].justify)
+            hf:SetPoint("TOPLEFT", recHead, "TOPLEFT", 0, 0)   -- re-fit per render
+            recHeadFS[i] = hf
+        end
+    end
+    local function layoutRecHead(cells)
+        for i = 1, #cells do
+            local hf = recHeadFS[i]
+            hf:SetPoint("TOPLEFT", recHead, "TOPLEFT", cells[i].x, 0)
+            hf:SetWidth(math.max(1, cells[i].w))
+        end
+    end
+
     local recScroll, recChild = scroller(detailP, "prof.recipes.list")
-    recScroll:SetPoint("TOPLEFT", filter2, "BOTTOMLEFT", 0, -4)
+    recScroll:SetPoint("TOPLEFT", recHead, "BOTTOMLEFT", 0, -2)
     recScroll:SetPoint("BOTTOMRIGHT", detailP, "BOTTOMRIGHT", -L.PANEL_PAD,
                        ProfUI.RecipeListBottomInset())
     pane._recChild = recChild
@@ -3167,6 +3563,7 @@ Dashboard.RegisterTab("professions", function(host)
         tabStrip:SetShown(on)
         filter1:SetShown(on)
         filter2:SetShown(on)
+        recHead:SetShown(on)
         recScroll:SetShown(on)
         detail:SetShown(on)
     end
@@ -3257,14 +3654,15 @@ Dashboard.RegisterTab("professions", function(host)
             b:Show()
         end
 
-        -- THE RECIPE LIST (the old drill-in's right pane, re-homed). The title
-        -- column takes its share of the REAL list width so the source column
-        -- keeps a readable remainder in this narrower pane.
+        -- THE RECIPE LIST (the old drill-in's right pane, re-homed). Column
+        -- geometry — the name column's share of the REAL list width, the
+        -- source column's remainder — comes from ProfUI.RecipeColumns, and
+        -- the header band lays its captions out from the SAME columns.
         local rows, pending, state = ProfUI.RecipeRows(payload, cur, pane.filters, res)
         local listW = math.max(1, recScroll:GetWidth() or 1)
         recChild:SetWidth(listW)
-        local titleW = math.floor(listW * 0.55)
-        if titleW < 140 then titleW = 140 elseif titleW > 260 then titleW = 260 end
+        local cols = ProfUI.RecipeColumns(listW)
+        layoutRecHead(ProfUI.RecipeHeaderCells(listW))
         for _, r in ipairs(pane._recRows) do r:Hide() end
         local ry = 0
         for i = 1, #rows do
@@ -3272,7 +3670,7 @@ Dashboard.RegisterTab("professions", function(host)
             rr:ClearAllPoints()
             rr:SetPoint("TOPLEFT", recChild, "TOPLEFT", 0, -ry)
             rr:SetPoint("RIGHT", recChild, "RIGHT", 0, 0)
-            rr._title:SetWidth(titleW)
+            fitRecipeRow(rr, cols)
             paintRecipeRow(rr, rows[i], rows[i].spell == sel.spell)
             rr:Show()
             ry = ry + L.LIST_ROW_H
@@ -3501,6 +3899,13 @@ ns:RegisterDebugCommand("professionsui", function()
     end
     ns:Print("  login line: " .. (ProfUI.LoginLineEnabled() and "on" or "off")
         .. ", " .. (ProfUI._loginLineFired and "already fired this session" or "not fired yet"))
+    -- The recipe-tooltip session record: which render mode is winning, and the
+    -- enchant-hyperlink verdict this client earned.
+    local tw = ProfUI._tipEnchantWorks
+    ns:Print(string.format("  recipe tooltips: enchant %d / item %d / facts %d; "
+        .. "enchant hyperlink: %s",
+        ProfUI._tipStats.enchant, ProfUI._tipStats.item, ProfUI._tipStats.facts,
+        (tw == true and "works") or (tw == false and "REFUSED (latched off)") or "untested"))
     local grid = ProfUI.GridRows(entries, lookup, now())
     local unscanned = 0
     for i = 1, #grid do
@@ -4496,6 +4901,406 @@ local function testGridChips(fails)
        "the chip bar costs the grid two or more full rows")
 end
 
+----------------------------------------------------------------------
+-- Suite: the recipe hover tooltip (owner, 2026-08-10: "recipes in the
+-- professions tab show their tooltip when hovered over") — the enchant/item/
+-- facts chain, the session latch, cold-item honesty (class 4), pooled-row
+-- hygiene. Everything drives ProfUI.* with a RECORDING tooltip (the parity
+-- gate's idiom); the view's handlers are thin delegates over these functions.
+----------------------------------------------------------------------
+local function makeRecordingTip(behavior)
+    -- behavior[kind] = "render" (title+body) | "title" (cold: title only)
+    --                | "empty" (renders nothing) | "error" (client refuses)
+    local tip = { lines = {}, owner = nil, shown = false, hides = 0, hyperlinks = {} }
+    function tip:SetOwner(o, anchor) self.owner = o; self.anchor = anchor end
+    function tip:SetHyperlink(link)
+        self.hyperlinks[#self.hyperlinks + 1] = tostring(link)
+        local kind = tostring(link):match("^(%a+):")
+        local b = behavior and behavior[kind]
+        if b == "error" then error("refused " .. tostring(link)) end
+        if b == "render" then
+            self.lines[#self.lines + 1] = "title " .. tostring(link)
+            self.lines[#self.lines + 1] = "body " .. tostring(link)
+        elseif b == "title" then
+            self.lines[#self.lines + 1] = "title " .. tostring(link)
+        end
+    end
+    function tip:NumLines() return #self.lines end
+    function tip:ClearLines() self.lines = {} end
+    function tip:AddLine(text) self.lines[#self.lines + 1] = tostring(text) end
+    function tip:Show() self.shown = true end
+    function tip:Hide()
+        self.hides = self.hides + 1; self.shown = false
+        self.lines = {}; self.owner = nil
+    end
+    function tip:GetOwner() return self.owner end
+    return tip
+end
+
+local function testRecipeTooltips(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local savedWorks, savedStats = ProfUI._tipEnchantWorks, ProfUI._tipStats
+    ProfUI._tipStats = { enchant = 0, item = 0, facts = 0 }
+
+    local row = { spell = 12345, item = 777, name = "Fixture Robe", state = "missing",
+                  skill = 250, source = "Trainer" }
+
+    -- 1) the enchant hyperlink renders: that mode wins and latches true.
+    ProfUI._tipEnchantWorks = nil
+    local tip = makeRecordingTip({ enchant = "render" })
+    local rr = { _row = row, _spell = row.spell }
+    local mode = ProfUI.RowTooltipEnter(tip, rr, fakeResolver({}))
+    ck(mode == "enchant", "a working enchant hyperlink did not win (" .. tostring(mode) .. ")")
+    ck(tip.owner == rr and tip.anchor == "ANCHOR_RIGHT",
+       "the tooltip did not anchor ANCHOR_RIGHT on its row (the suite idiom)")
+    ck(tip.shown and #tip.lines > 0, "the enchant mode left no visible tooltip")
+    ck(ProfUI._tipEnchantWorks == true, "a working enchant hyperlink did not latch true")
+    ck(ProfUI._tipStats.enchant == 1, "the enchant win was not recorded")
+
+    -- 2) the enchant hyperlink ERRORS: fall to the teaching item, latch false,
+    --    and never try enchant again this session (consistent per session).
+    ProfUI._tipEnchantWorks = nil
+    tip = makeRecordingTip({ enchant = "error", item = "render" })
+    mode = ProfUI.RowTooltipEnter(tip, { _row = row }, fakeResolver({}))
+    ck(mode == "item", "a refused enchant did not fall through to the item tooltip")
+    ck(ProfUI._tipEnchantWorks == false, "a refused enchant hyperlink did not latch false")
+    ck(#tip.lines > 0, "the item fallback left no visible tooltip")
+    local tip2 = makeRecordingTip({ enchant = "render", item = "render" })
+    ProfUI.RowTooltipEnter(tip2, { _row = row }, fakeResolver({}))
+    for _, l in ipairs(tip2.hyperlinks) do
+        ck(not l:find("^enchant:"),
+           "the session latch did not stick: enchant was re-tried after failing")
+    end
+
+    -- 3) enchant renders EMPTY (no error): the same fall-through and latch.
+    ProfUI._tipEnchantWorks = nil
+    tip = makeRecordingTip({ enchant = "empty", item = "render" })
+    mode = ProfUI.RenderRecipeTooltip(tip, row, fakeResolver({}))
+    ck(mode == "item", "an empty enchant render was allowed to stand")
+    ck(ProfUI._tipEnchantWorks == false, "an empty enchant render did not latch false")
+
+    -- 4) COLD ITEM (class 4): a title-only item tooltip is not an answer —
+    --    the dataset facts render instead, a warm load is requested, and the
+    --    failure does NOT latch anything (the re-hover is the retry, no ladder).
+    ProfUI._tipEnchantWorks = false          -- enchant already proven broken
+    local asked = {}
+    tip = makeRecordingTip({ item = "title" })
+    mode = ProfUI.RenderRecipeTooltip(tip, row, fakeResolver({}),
+        function(kind, ids) asked[#asked + 1] = { kind = kind, id = ids and ids[1] } end)
+    ck(mode == "facts", "a title-only (cold) item tooltip was allowed to stand")
+    ck(#asked == 1 and asked[1].kind == "item" and asked[1].id == 777,
+       "a cold item tooltip did not request a warm load")
+    ck(#tip.lines > 0, "the cold fallback left a BLANK tooltip standing")
+    local blob = table.concat(tip.lines, "\n")
+    ck(blob:find("Fixture Robe", 1, true) ~= nil and blob:find("250", 1, true) ~= nil
+       and blob:find("Trainer", 1, true) ~= nil,
+       "the facts tooltip lost the name/skill/source strings (" .. blob .. ")")
+
+    -- 5) no teaching item and enchant broken: straight to facts; a cold NAME
+    --    still renders an honest identity line, never a blank tooltip.
+    local bare = { spell = 999 }
+    tip = makeRecordingTip({})
+    mode = ProfUI.RenderRecipeTooltip(tip, bare, fakeResolver({}))
+    ck(mode == "facts" and #tip.lines > 0,
+       "a bare row (no item, no name) rendered a blank tooltip")
+    ck(table.concat(tip.lines, "\n"):find("999", 1, true) ~= nil,
+       "the bare facts tooltip does not even identify the recipe")
+
+    -- 6) the plan itself honours the latch and the missing item.
+    ProfUI._tipEnchantWorks = nil
+    local plan = ProfUI.RecipeTooltipPlan(row)
+    ck(#plan == 3 and plan[1].kind == "enchant" and plan[2].kind == "item"
+       and plan[3].kind == "facts", "the untested plan is not enchant->item->facts")
+    ProfUI._tipEnchantWorks = false
+    plan = ProfUI.RecipeTooltipPlan({ spell = 1 })
+    ck(#plan == 1 and plan[1].kind == "facts",
+       "a latched-broken enchant + itemless row did not reduce to facts alone")
+
+    -- 7) POOLED-ROW HYGIENE (the Daseeki-Bags bank-tooltip lesson): a recycled
+    --    row adopting a different recipe hides the tooltip it owns; the same
+    --    recipe repainting does not; somebody else's tooltip is never touched.
+    ck(ProfUI.TooltipStaleOnPaint(1, 2, true) == true, "recycle+change did not read stale")
+    ck(ProfUI.TooltipStaleOnPaint(1, 1, true) == false, "same-recipe repaint read stale")
+    ck(ProfUI.TooltipStaleOnPaint(1, 2, false) == false, "an unowned tooltip read stale")
+    ProfUI._tipEnchantWorks = true
+    tip = makeRecordingTip({ enchant = "render" })
+    local rrP = { _row = { spell = 111 }, _spell = 111 }
+    ProfUI.RowTooltipEnter(tip, rrP, fakeResolver({}))
+    ck(tip.shown, "the recycle fixture never showed a tooltip")
+    local hid = ProfUI.RowTooltipOnPaint(tip, rrP, 222)
+    ck(hid == true and tip.shown == false and tip.hides == 1,
+       "a recycled row left the previous recipe's tooltip standing")
+    tip = makeRecordingTip({ enchant = "render" })
+    ProfUI.RowTooltipEnter(tip, rrP, fakeResolver({}))
+    ck(ProfUI.RowTooltipOnPaint(tip, rrP, 111) == false and tip.shown,
+       "a same-recipe repaint hid its own tooltip")
+    ck(ProfUI.RowTooltipOnPaint(tip, { _spell = 500 }, 501) == false and tip.shown,
+       "a repaint of a DIFFERENT row hid somebody else's tooltip")
+
+    -- 8) OnLeave hides.
+    ProfUI.RowTooltipLeave(tip)
+    ck(tip.shown == false, "OnLeave did not hide the tooltip")
+
+    -- 9) the view wiring pins (harness-only source scan, the retint-gate
+    --    idiom): the row still SELECTS on click — the hover work may not have
+    --    touched the click path — and the three hover scripts are wired.
+    if io and io.open and debug and debug.getinfo then
+        local srcPath = (debug.getinfo(ProfUI.RecipeTooltipPlan, "S").source or ""):match("^@(.*)$")
+        local fh = srcPath and io.open(srcPath, "rb")
+        if fh then
+            local text = fh:read("*a") or ""
+            fh:close()
+            ck(text:find("pane.SelectRecipe(self._spell)", 1, true) ~= nil,
+               "the recipe row's OnClick -> SelectRecipe wiring is gone (click behavior changed)")
+            ck(text:find('rr:SetScript("OnEnter"', 1, true) ~= nil
+               and text:find('rr:SetScript("OnLeave"', 1, true) ~= nil
+               and text:find('rr:SetScript("OnHide"', 1, true) ~= nil,
+               "the recipe row's hover scripts are not wired")
+        end
+    end
+
+    -- 10) the dataset really carries teaching items for the item fallback.
+    local D = sourcesDS()
+    if D then
+        local sawItem = false
+        for pIdx = 1, #D.profs do
+            local list = D.profRecipes[pIdx]
+            for i = 1, math.min(#list, 40) do
+                local m = ProfUI.SourceModel(list[i])
+                if m and m.teachItem then
+                    sawItem = true
+                    ck(type(m.teachItem) == "number", "teachItem is not an item id")
+                    break
+                end
+            end
+            if sawItem then break end
+        end
+        ck(sawItem, "no sampled recipe carries a teaching item \226\128\148 the item fallback is dead code")
+    end
+
+    ProfUI._tipEnchantWorks, ProfUI._tipStats = savedWorks, savedStats
+end
+
+----------------------------------------------------------------------
+-- Suite: the recipe list's column header band (owner, 2026-08-10: "add column
+-- headers in the Detail list") — the labels, the one-source geometry at
+-- multiple widths, and the height cost.
+----------------------------------------------------------------------
+local function testRecipeHeader(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+
+    -- The labels, in column order; SKILL right-justifies over its numerals.
+    local cells = ProfUI.RecipeHeaderCells(523)
+    ck(#cells == 3, "the header row is not three cells (" .. #cells .. ")")
+    ck(cells[1].label == "RECIPE" and cells[2].label == "SKILL"
+       and cells[3].label == "SOURCE", "the header labels are not RECIPE | SKILL | SOURCE")
+    ck(cells[2].justify == "RIGHT",
+       "SKILL does not right-justify over its right-justified numerals")
+
+    -- ONE SOURCE: at every width, each caption wears EXACTLY its column's
+    -- x/width — the header can never drift off the rows (the grid's lesson).
+    -- The widths bracket the real pane: the 700px shell (~313), the default
+    -- 1120 (~523), and points between/beyond.
+    for _, w in ipairs({ 313, 420, 523, 700 }) do
+        local c = ProfUI.RecipeColumns(w)
+        local hc = ProfUI.RecipeHeaderCells(w)
+        ck(hc[1].x == c.title.x and hc[1].w == c.title.w,
+           "RECIPE drifted off the title column at width " .. w)
+        ck(hc[2].x == c.skill.x and hc[2].w == c.skill.w,
+           "SKILL drifted off the skill column at width " .. w)
+        ck(hc[3].x == c.src.x and hc[3].w == c.src.w,
+           "SOURCE drifted off the source column at width " .. w)
+        ck(c.mark.x < c.title.x and c.title.x < c.skill.x and c.skill.x < c.src.x,
+           "the recipe columns are out of order at width " .. w)
+        ck(c.src.x + c.src.w <= w, "the source column overflows the list at width " .. w)
+        ck(c.title.w >= L.REC_TITLE_MIN and c.title.w <= L.REC_TITLE_MAX,
+           "the title column left its clamp at width " .. w)
+    end
+    -- The clamp's two ends actually engage (the pre-refactor behavior, kept).
+    ck(ProfUI.RecipeColumns(200).title.w == L.REC_TITLE_MIN,
+       "a narrow list did not floor the title column")
+    ck(ProfUI.RecipeColumns(900).title.w == L.REC_TITLE_MAX,
+       "a wide list did not cap the title column")
+
+    -- The height cost: the band + its gap == EXACTLY one list row, taken from
+    -- the list (the visible-rows arithmetic shrinks by one row, no more).
+    ck(ProfUI.RecipeListHeaderHeight() == L.HEAD_H + 2,
+       "the header height reader drifted off the LAYOUT arithmetic")
+    ck(ProfUI.RecipeListHeaderHeight() == L.LIST_ROW_H,
+       "the header band does not cost the list exactly one row ("
+       .. ProfUI.RecipeListHeaderHeight() .. " vs " .. L.LIST_ROW_H .. ")")
+end
+
+----------------------------------------------------------------------
+-- Suite: the spec rule (owner, 2026-08-10: "we shouldnt display recipes as
+-- missing if they are for a different specialization than selected"). The
+-- fixture is the owner's screenshot case generalised from the SHIPPED
+-- dataset: a character holding spec A of a family, looking at a recipe
+-- locked to sibling spec B (his Gnomish Engineer vs the Goblin-only
+-- Dimensional Ripper - Everlook).
+----------------------------------------------------------------------
+local function testSpecRule(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local P = ns.Professions
+    local D = core()
+    if not D then fails[#fails + 1] = "dataset unavailable for the spec tests" return end
+
+    -- Find a two-spec family and a recipe locked to one of its specs.
+    local specA, specB, lockedSpell
+    for idx = 1, #(D.specs or {}) do
+        local sB = D.specs[idx]
+        for spell, rec in pairs(D.recipe) do
+            if rec.spec == idx then
+                for j = 1, #D.specs do
+                    if j ~= idx and D.specs[j].p == sB.p then
+                        specA, specB, lockedSpell = D.specs[j], sB, spell
+                        break
+                    end
+                end
+            end
+            if specA then break end
+        end
+        if specA then break end
+    end
+    ck(specA ~= nil, "the dataset carries no two-spec family with a spec-locked recipe")
+    if not specA then return end
+    local profKey = D.profs[specB.p] and D.profs[specB.p].key
+    ck(profKey ~= nil, "the spec family's profession key is unresolvable")
+    if not profKey then return end
+    local rec = D.recipe[lockedSpell]
+    local NOW = 1700000000
+    local DS = ns.ProfessionsDataMeta.version
+    -- A resolver that answers EVERY spell (no cold names in these legs).
+    local res = fakeResolver(setmetatable({}, {
+        __index = function(_, id) return "R" .. tostring(id) end }))
+
+    -- THE PREDICATE, all three answers.
+    ck(ProfUI.SpecStanding(D, { spec = 0 }, { specA.id }) == "ok",
+       "a no-requirement recipe did not read ok")
+    ck(ProfUI.SpecStanding(D, rec, { specB.id }) == "ok",
+       "holding the required spec did not read ok")
+    ck(ProfUI.SpecStanding(D, rec, { specA.id }) == "conflict",
+       "holding the SIBLING spec did not read as a conflict")
+    ck(ProfUI.SpecStanding(D, rec, {}) == "openable",
+       "no spec chosen did not read openable")
+    ck(ProfUI.SpecStanding(D, rec, nil) == "openable",
+       "a payload with no spec list did not read openable")
+
+    -- Payloads: the owner's character (sibling spec, scanned, knows nothing),
+    -- the same character unspecced, and one holding the required spec.
+    local empty = P.EncodeKnown(profKey, {})
+    local function payloadWith(specList)
+        return { v = 1, ds = DS,
+                 p = { [profKey] = { l = 300, m = 300, k = empty, n = 0, a = NOW,
+                                     s = specList } }, c = {} }
+    end
+    local conflicted = payloadWith({ specA.id })
+    local unspecced  = payloadWith(nil)
+    local rightSpec  = payloadWith({ specB.id })
+
+    local function findRow(rows)
+        for _, r in ipairs(rows) do if r.spell == lockedSpell then return r end end
+        return nil
+    end
+
+    -- 1) DEFAULT VIEW: the conflicted recipe is HIDDEN (not shown missing).
+    ck(findRow(ProfUI.RecipeRows(conflicted, profKey, {}, res)) == nil,
+       "a spec-conflicted recipe still shows in the default (obtainable-now) list")
+
+    -- 2) MISSING ONLY: never rides it, even with Show unavailable ticked —
+    --    the owner's exact complaint.
+    ck(findRow(ProfUI.RecipeRows(conflicted, profKey,
+        { missingOnly = true, showUnavailable = true }, res)) == nil,
+       "a spec-conflicted recipe still counts as MISSING")
+
+    -- 3) SHOW UNAVAILABLE: present, classified unavailable(spec), the spec
+    --    named as the visible reason (the greyed-row render keys off
+    --    row.unavailable, same as every other unavailable).
+    local r = findRow(ProfUI.RecipeRows(conflicted, profKey, { showUnavailable = true }, res))
+    ck(r ~= nil, "Show unavailable does not surface the spec-conflicted recipe")
+    if r then
+        ck(r.specConflict == true, "the conflicted row does not carry its flag")
+        ck(r.unavailable ~= nil and r.unavailable.key == "spec",
+           "the conflicted row is not classified unavailable(spec)")
+        ck(r.unavailable ~= nil and specB.name ~= nil
+           and tostring(r.unavailable.text):find(specB.name, 1, true) ~= nil,
+           "the unavailable reason does not name the spec ("
+           .. tostring(r.unavailable and r.unavailable.text) .. ")")
+    end
+
+    -- 4) NO SPEC CHOSEN: unchanged — the recipe is plain missing.
+    r = findRow(ProfUI.RecipeRows(unspecced, profKey,
+        { missingOnly = true, showUnavailable = true }, res))
+    ck(r ~= nil and r.state == "missing" and not r.specConflict
+       and not (r.unavailable and r.unavailable.key == "spec"),
+       "an unspecced character's spec-locked recipe changed behavior")
+
+    -- 5) HOLDS THE REQUIRED SPEC: plain missing too.
+    r = findRow(ProfUI.RecipeRows(rightSpec, profKey,
+        { missingOnly = true, showUnavailable = true }, res))
+    ck(r ~= nil and r.state == "missing" and not r.specConflict,
+       "holding the required spec still conflicted its own recipe")
+
+    -- 6) THE CENSUS: the conflicted character's denominator shrinks by exactly
+    --    the conflicted recipes; unspecced keeps the full catalogue count; a
+    --    KNOWN conflicted recipe is never censused out from under its own
+    --    numerator; the grid cell reads the same denominator.
+    local full = ProfUI.RecipeCount(profKey)
+    local obt  = ProfUI.ObtainableTotal(conflicted, profKey)
+    ck(obt < full, "the conflicted census denominator did not shrink ("
+       .. obt .. " vs " .. full .. ")")
+    ck(ProfUI.ObtainableTotal(unspecced, profKey) == full,
+       "an unspecced census denominator moved")
+    local conflicts = 0
+    local list = D.profRecipes[D.profIdx[profKey]]
+    for i = 1, #list do
+        if ProfUI.SpecStanding(D, D.recipe[list[i]], { specA.id }) == "conflict" then
+            conflicts = conflicts + 1
+        end
+    end
+    ck(obt == full - conflicts, "the census delta is not exactly the conflicted count ("
+       .. obt .. " vs " .. full .. "-" .. conflicts .. ")")
+    local knowsIt = payloadWith({ specA.id })
+    knowsIt.p[profKey].k = P.EncodeKnown(profKey, { lockedSpell })
+    knowsIt.p[profKey].n = 1
+    ck(ProfUI.ObtainableTotal(knowsIt, profKey) == full - conflicts + 1,
+       "a KNOWN conflicted recipe was censused out from under its numerator")
+    local kr = findRow(ProfUI.RecipeRows(knowsIt, profKey, { showUnavailable = true }, res))
+    ck(kr ~= nil and kr.state == "known" and not kr.specConflict,
+       "a KNOWN recipe was reclassified by the spec rule")
+    local cell = ProfUI.CellModel(conflicted, profKey, NOW)
+    ck(cell ~= nil and cell.total == obt,
+       "the grid cell's census total is not ObtainableTotal's")
+
+    -- 7) ONE PREDICATE, ALL CONSUMERS: wrap SpecStanding and prove BOTH the
+    --    list classification and the who-can-craft learnable gate call it.
+    local realStanding = ProfUI.SpecStanding
+    local calls = 0
+    ProfUI.SpecStanding = function(...) calls = calls + 1; return realStanding(...) end
+    ProfUI.RecipeRows(conflicted, profKey, { showUnavailable = true }, res)
+    local afterRows = calls
+    local lockedName = "R" .. tostring(lockedSpell)
+    local specEntry = { { nameRealm = "Spec-Realm", rec = { classTag = "MAGE", level = 60 },
+                          online = true } }
+    ProfUI.SearchRows(lockedName, specEntry, function() return conflicted end,
+        fakeResolver({ [lockedSpell] = lockedName }))
+    local afterSearch = calls
+    ProfUI.SpecStanding = realStanding
+    ck(afterRows > 0, "RecipeRows never consulted the shared spec predicate")
+    ck(afterSearch > afterRows, "SearchRows never consulted the shared spec predicate")
+
+    -- 8) ... and the learnable gate itself: the sibling spec at full skill is
+    --    NOT learnable; the required spec is.
+    local sRows = ProfUI.SearchRows(lockedName, specEntry, function() return conflicted end,
+        fakeResolver({ [lockedSpell] = lockedName }))
+    ck(#sRows == 1 and #sRows[1].learnable == 0,
+       "who-can-craft called a spec-conflicted character learnable")
+    local sRows2 = ProfUI.SearchRows(lockedName, specEntry, function() return rightSpec end,
+        fakeResolver({ [lockedSpell] = lockedName }))
+    ck(#sRows2 == 1 and #sRows2[1].learnable == 1,
+       "who-can-craft denied the character who holds the required spec")
+end
+
 if ns.RegisterSelfTest then
     ns:RegisterSelfTest("professionsui", function(verbose)
         local suites = {
@@ -4523,6 +5328,15 @@ if ns.RegisterSelfTest then
             { name = "grid filter chips (60s/Online/faction parity with the cards, "
                   .. "no summoners, selection survives, persistence heal, chip-bar layout)",
               fn = testGridChips },
+            { name = "recipe hover tooltip (enchant/item/facts chain, session latch, "
+                  .. "cold-item honesty, pooled-row hygiene, click unchanged)",
+              fn = testRecipeTooltips },
+            { name = "recipe list column headers (RECIPE|SKILL|SOURCE, one column "
+                  .. "source at multiple widths, one-row height cost)",
+              fn = testRecipeHeader },
+            { name = "spec rule (conflicted recipes never missing, unavailable-with-"
+                  .. "reason, census denominator, one shared predicate)",
+              fn = testSpecRule },
         }
         local allPass = true
         for _, suite in ipairs(suites) do
