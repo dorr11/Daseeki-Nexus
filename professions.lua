@@ -278,6 +278,23 @@ Professions.EVENTS = {
     "CRAFT_SHOW", "CRAFT_UPDATE", "CRAFT_CLOSE",
     "SKILL_LINES_CHANGED", "SPELLS_CHANGED",
     "PLAYER_ENTERING_WORLD", "PLAYER_LEAVING_WORLD", "PLAYER_LOGOUT",
+    -- STALENESS SIGNALS (perf/professions-scan). Catalog-verified at 11509:
+    --   CHAT_MSG_SKILL              Event.ChatInfo.ChatMsgSkill — skill rank-ups.
+    --   LEARNED_SPELL_IN_SKILL_LINE Event.SpellBook.LearnedSpellInSkillLine —
+    --                               carries the spellID, so the mark can usually
+    --                               be attributed to ONE profession.
+    --   UNIT_SPELLCAST_SUCCEEDED    Event.Unit.UnitSpellcastSucceeded — a craft
+    --                               landing names its teaching spell; the hook
+    --                               that lets a consumed cooldown publish even
+    --                               when the window's own update echo goes
+    --                               missing. Unit-filtered to "player" where the
+    --                               client offers RegisterUnitEvent.
+    -- LEARNED_SPELL_IN_TAB is the pre-rename Classic spelling; it is NOT in the
+    -- 11509 event registry, but registration is pcall'd per event, so listing it
+    -- costs nothing on a client without it and covers a client that still fires
+    -- the old name. An unknown event name simply fails its own RegisterEvent.
+    "CHAT_MSG_SKILL", "LEARNED_SPELL_IN_SKILL_LINE", "LEARNED_SPELL_IN_TAB",
+    "UNIT_SPELLCAST_SUCCEEDED",
 }
 
 -- Session state. All of it is nil/false until Activate() runs.
@@ -299,6 +316,10 @@ Professions._stats         = nil    -- key -> per-profession/surface scan forens
 Professions._trace         = nil    -- the session's own copy of the bounded trace ring
 Professions._nameMap       = nil    -- memoised localized-skill-name -> profKey
 Professions._recipeNames   = nil    -- memoised per-profession recipe-name -> spell id (chain rung 3)
+Professions._settled       = nil    -- profKey -> settled-signature record (session mirror of the store)
+Professions._stale         = nil    -- profKey -> true: a learning signal fired; next look is a FULL capture
+Professions._harvestJob    = nil    -- the in-flight chunked reagent harvest, if any
+Professions._harvestGen    = 0      -- supersession counter for harvest jobs
 
 ----------------------------------------------------------------------
 -- Enablement
@@ -1253,8 +1274,28 @@ function Professions.RecordAttempt(rec)
         if rec.r == "ok" then
             st.ok = st.ok + 1
             st.lastOkAt = rec.t
+        elseif rec.r == "settled" then
+            -- A verified skip is neither a full success nor a refusal: it gets
+            -- its own tally so "247 settled, 1 ok" reads as the design working
+            -- rather than as 247 of something going wrong.
+            st.settled = (st.settled or 0) + 1
         else
             st.reasons[rec.r or "?"] = (st.reasons[rec.r or "?"] or 0) + 1
+        end
+    end
+
+    -- Settled verdicts COALESCE in the ring: a crafting spree answers "settled"
+    -- once per craft, and thirty of those would push the rows that explain
+    -- refusals off the end of the ring. Consecutive settled rows for the same
+    -- profession collapse onto one row with a running count. The session and
+    -- stored rings share row TABLES, so bumping the shared row updates both.
+    if rec.r == "settled" then
+        local ring = Professions._trace
+        local last = ring and ring[#ring]
+        if last and last.r == "settled" and last.p == rec.p and last.s == rec.s then
+            last.c = (last.c or 1) + 1
+            last.t = rec.t
+            return true
         end
     end
 
@@ -1296,6 +1337,7 @@ function Professions.FormatTraceRow(rec)
         rec.p or "(unattributed)",
         "=> " .. tostring(rec.r or "?"),
     }
+    if rec.c ~= nil then parts[#parts + 1] = "x" .. tostring(rec.c) end
     if rec.n ~= nil then parts[#parts + 1] = "rows=" .. tostring(rec.n) end
     if rec.i ~= nil then parts[#parts + 1] = "ids=" .. tostring(rec.i) end
     if rec.u ~= nil and rec.u > 0 then parts[#parts + 1] = "unresolved=" .. tostring(rec.u) end
@@ -1431,10 +1473,11 @@ function Professions.ScanTradeSkillWindow()
     local windowProf = Professions.WindowProfKey("tradeskill")
     local itemLinkFn = GetTradeSkillItemLink        -- catalog-verified at 11509
 
-    local rows, ids, missed, via = {}, {}, 0, {}
+    local rows, ids, missed, via, names = {}, {}, 0, {}, {}
     for i = 1, n do
         local ok, name, kind = pcall(GetTradeSkillInfo, i)
         if not ok then return nil, "row-error", ev end
+        names[i] = name                               -- the settled signature's per-row witness
         if kind ~= "header" then
             local okL, rl = pcall(GetTradeSkillRecipeLink, i)
             rl = okL and rl or nil
@@ -1463,12 +1506,13 @@ function Professions.ScanTradeSkillWindow()
     if not profKey then return nil, "unidentified", ev end
 
     local scan = { profKey = profKey, rows = rows, ids = ids, unknown = unknown,
-                   complete = true, surface = "tradeskill", ev = ev }
+                   complete = true, surface = "tradeskill", ev = ev, names = names }
     if GetTradeSkillLine then
-        local ok, _, rank, maxRank = pcall(GetTradeSkillLine)
+        local ok, lname, rank, maxRank = pcall(GetTradeSkillLine)
         if ok and type(rank) == "number" and type(maxRank) == "number" and maxRank > 0 then
             scan.l, scan.m = rank, maxRank
         end
+        if ok and type(lname) == "string" and lname ~= "" then scan.line = lname end
     end
     -- The evidence rides the success too: the ok trace row wants rows/ids/res.
     return scan, nil, ev
@@ -1498,10 +1542,11 @@ function Professions.ScanCraftWindow()
     local windowProf = Professions.WindowProfKey("craft")
     local itemLinkFn = GetCraftItemLink
 
-    local rows, ids, missed, via = {}, {}, 0, {}
+    local rows, ids, missed, via, names = {}, {}, 0, {}, {}
     for i = 1, n do
         local ok, name, _, kind = pcall(GetCraftInfo, i)
         if not ok then return nil, "row-error", ev end
+        names[i] = name                               -- the settled signature's per-row witness
         if kind ~= "header" then
             local okL, rl = pcall(GetCraftRecipeLink, i)
             rl = okL and rl or nil
@@ -1530,12 +1575,13 @@ function Professions.ScanCraftWindow()
     if not profKey then return nil, "unidentified", ev end
 
     local scan = { profKey = profKey, rows = rows, ids = ids, unknown = unknown,
-                   complete = true, surface = "craft", ev = ev }
+                   complete = true, surface = "craft", ev = ev, names = names }
     if GetCraftDisplaySkillLine then
-        local ok, _, rank, maxRank = pcall(GetCraftDisplaySkillLine)
+        local ok, lname, rank, maxRank = pcall(GetCraftDisplaySkillLine)
         if ok and type(rank) == "number" and type(maxRank) == "number" and maxRank > 0 then
             scan.l, scan.m = rank, maxRank
         end
+        if ok and type(lname) == "string" and lname ~= "" then scan.line = lname end
     end
     return scan, nil, ev
 end
@@ -1582,6 +1628,284 @@ function Professions.FoldCooldowns(scan, now, reader)
 end
 
 ----------------------------------------------------------------------
+-- THE SETTLED SIGNATURE  (perf/professions-scan)
+--
+-- The live defect this section answers: CaptureWindow ran the FULL resolve —
+-- 176 rows x (info + recipe link + item link + name-map lookup), a name map of
+-- up to 1,251 GetSpellInfo calls, the store diff, the cooldown fold and (first
+-- time) the reagent harvest — on EVERY window event behind a one-second
+-- throttle. Crafting a stack re-ran all of it per craft. The owner's report was
+-- "pretty significant lag whenever i open my profession menus".
+--
+-- The fix shape: scan once, then VERIFY cheaply. After a complete accepted scan
+-- the signature below is persisted; a later window event re-reads only the
+-- cheap half of the window — GetNum*, the skill line, and one GetTradeSkillInfo/
+-- GetCraftInfo per row — and compares it against the record. NO link asks, NO
+-- GetSpellInfo, NO ApplyScan, NO harvest. Only when every component matches is
+-- the event answered "settled" (a distinct trace verdict, never an "ok").
+--
+-- WHY THE COMPONENTS CANNOT LIE (the honesty argument, stated so the next
+-- reader can attack it):
+--
+--   * row count + per-row NAME + per-row header/recipe shape, in order.
+--     Learning a recipe INSERTS a row: the count changes, and every row at or
+--     after the insertion point changes name. There is no edit of the recipe
+--     list that leaves both the count and the full ordered name sequence
+--     intact. A collapsed header, a narrowed view that slipped past the guard,
+--     a client that reordered its list — all of them move names or counts.
+--   * the window's own skill line (name, rank, maxRank). A rank-up changes
+--     `rank`; a different profession in the same window changes `name`.
+--   * the LIVE record must already hold the bitmap the skip preserves (same
+--     known count as the record). A skip never substitutes for data we no
+--     longer have — a wiped store or an unseeded session falls through to a
+--     full capture instead of skipping over a hole.
+--   * ANY unreadable component — a nil name, a non-number count, a missing
+--     API — is a mismatch, and a mismatch is always answered by a FULL capture.
+--     There is no partial credit and no "probably fine".
+--   * the record is stamped with the DATASET version and the CLIENT build; a
+--     record from either other world is not evidence and is ignored.
+--
+-- The record also carries the accepted scan's row->teaching-spell mapping.
+-- Because the per-row names were just verified IDENTICAL to the enumeration
+-- the mapping was proven against, the mapping is licensed for the one job the
+-- settled path still has to do every time: reading the COOLDOWNS. Consuming a
+-- cooldown recipe fires the window's update; the settled pass folds cooldowns
+-- through the same proof-gated FoldCooldowns and publishes a consumption
+-- immediately, so "can I transmute today" never waits for a manual rescan.
+--
+-- Staleness: the learning signals (see Professions.EVENTS) mark a profession
+-- STALE, and a stale profession never settles — the next window look runs the
+-- full capture, which refreshes the record and clears the mark. A signal that
+-- cannot be attributed to one profession marks every profession that could
+-- have skipped. Manual rescan (ForceRescan) bypasses the signature entirely.
+----------------------------------------------------------------------
+
+function Professions.ClientBuild()
+    if not GetBuildInfo then return "?" end
+    local ok, v, b = pcall(GetBuildInfo)
+    if not ok then return "?" end
+    return tostring(v) .. "-" .. tostring(b)
+end
+
+-- The staleness marks. `profKey` nil means "could not attribute": every
+-- profession that holds a settled record — session or store — is marked,
+-- because those are exactly the professions a skip could otherwise hide the
+-- change from. A profession with no record always full-scans anyway.
+function Professions.MarkStale(profKey)
+    Professions._stale = Professions._stale or {}
+    if profKey then
+        Professions._stale[profKey] = true
+        return true
+    end
+    for key in pairs(Professions._settled or {}) do
+        Professions._stale[key] = true
+    end
+    local mine = Professions.SettledArea(false)
+    if mine then
+        for key in pairs(mine) do Professions._stale[key] = true end
+    end
+    return true
+end
+
+function Professions.IsStale(profKey)
+    return (Professions._stale and Professions._stale[profKey]) and true or false
+end
+
+-- The per-character slot in the store's settled area. Keyed by owner because
+-- SavedVariables are account-wide and every character shares the file.
+function Professions.SettledArea(create)
+    local S = ns.Store
+    local area = S and S.ProfessionsSettled and S.ProfessionsSettled(create)
+    if not area then return nil end
+    local key = Professions.SelfKey()
+    if key == "" then return nil end
+    local mine = area[key]
+    if type(mine) ~= "table" then
+        if not create then return nil end
+        mine = {}
+        area[key] = mine
+    end
+    return mine
+end
+
+local function settledRecordUsable(rec)
+    if type(rec) ~= "table" then return false end
+    if rec.ds ~= Dataset.Version() then return false end        -- another coordinate system
+    if rec.build ~= Professions.ClientBuild() then return false end  -- another client's names
+    if type(rec.n) ~= "number" or rec.n <= 0 then return false end
+    if type(rec.names) ~= "table" or type(rec.rows) ~= "table" then return false end
+    if type(rec.line) ~= "string" or rec.line == "" then return false end
+    if type(rec.l) ~= "number" or type(rec.m) ~= "number" then return false end
+    if type(rec.known) ~= "number" then return false end
+    return true
+end
+
+-- Session first, store second (validated and hydrated into the session mirror).
+function Professions.SettledGet(profKey)
+    local s = Professions._settled and Professions._settled[profKey]
+    if s then return s end
+    local mine = Professions.SettledArea(false)
+    local rec = mine and mine[profKey]
+    if not settledRecordUsable(rec) then return nil end
+    Professions._settled = Professions._settled or {}
+    Professions._settled[profKey] = rec
+    return rec
+end
+
+function Professions.SettledPut(profKey, rec)
+    if type(profKey) ~= "string" or type(rec) ~= "table" then return false end
+    Professions._settled = Professions._settled or {}
+    Professions._settled[profKey] = rec
+    local mine = Professions.SettledArea(true)
+    if mine then mine[profKey] = rec end
+    return true
+end
+
+-- nil clears every record for this character (manual rescan of "everything").
+function Professions.SettledClear(profKey)
+    if profKey then
+        if Professions._settled then Professions._settled[profKey] = nil end
+        local mine = Professions.SettledArea(false)
+        if mine then mine[profKey] = nil end
+    else
+        Professions._settled = nil
+        local mine = Professions.SettledArea(false)
+        if mine then
+            for key in pairs(mine) do mine[key] = nil end
+        end
+    end
+    return true
+end
+
+-- Which settled record claims this window? Matched on the window's OWN skill
+-- line string — no name map, no GetSpellInfo — plus the surface. At most a
+-- handful of records exist per character, so the walk is trivial; the store's
+-- keys are swept too so a fresh session can hydrate without a full scan.
+function Professions.SettledForWindow(surface, lineName)
+    for _, rec in pairs(Professions._settled or {}) do
+        if rec.surface == surface and rec.line == lineName then return rec end
+    end
+    local mine = Professions.SettledArea(false)
+    if mine then
+        for key in pairs(mine) do
+            local rec = Professions.SettledGet(key)     -- validates + hydrates
+            if rec and rec.surface == surface and rec.line == lineName then return rec end
+        end
+    end
+    return nil
+end
+
+-- THE VERIFY. Returns the settled record when — and only when — every
+-- component of the live window matches it, or nil. Cost: one GetNum*, one
+-- line read, and one info read per row. Nothing else. Every doubt is nil.
+function Professions.VerifySettled(surface)
+    if not Professions.CaptureAllowed() then return nil end
+    local numFn, infoFn, lineFn
+    if surface == "craft" then
+        numFn, infoFn, lineFn = GetNumCrafts, GetCraftInfo, GetCraftDisplaySkillLine
+    else
+        numFn, infoFn, lineFn = GetNumTradeSkills, GetTradeSkillInfo, GetTradeSkillLine
+    end
+    if not (numFn and infoFn and lineFn) then return nil end
+
+    local okL, lname, rank, maxRank = pcall(lineFn)
+    if not okL or type(lname) ~= "string" or lname == "" then return nil end
+    local rec = Professions.SettledForWindow(surface, lname)
+    if not rec then return nil end
+    if Professions.IsStale(rec.prof) then return nil end
+    if type(rank) ~= "number" or type(maxRank) ~= "number" then return nil end
+    if rank ~= rec.l or maxRank ~= rec.m then return nil end    -- rank drift => full
+
+    local okN, n = pcall(numFn)
+    if not okN or type(n) ~= "number" or n ~= rec.n then return nil end
+
+    -- The live record must already carry what the skip preserves.
+    local cur = Professions._live and Professions._live.p and Professions._live.p[rec.prof]
+    if not (cur and cur.k ~= nil and cur.n == rec.known) then return nil end
+
+    for i = 1, n do
+        local name, isHeader
+        if surface == "craft" then
+            local ok, nm, _, kind = pcall(infoFn, i)
+            if not ok then return nil end
+            name, isHeader = nm, (kind == "header")
+        else
+            local ok, nm, kind = pcall(infoFn, i)
+            if not ok then return nil end
+            name, isHeader = nm, (kind == "header")
+        end
+        if type(name) ~= "string" or name ~= rec.names[i] then return nil end
+        if isHeader == (rec.rows[i] ~= nil) then return nil end -- shape drifted
+    end
+    return rec
+end
+
+-- Build the record off a proven-complete scan. Conservative: a scan that could
+-- not read its own line, rank or every row name yields NO record — the window
+-- simply keeps full-scanning, which is the pre-fix behavior and always honest.
+function Professions.BuildSettledRecord(scan)
+    if not (scan and scan.complete and scan.profKey and scan.surface) then return nil end
+    if type(scan.line) ~= "string" or scan.line == "" then return nil end
+    if type(scan.l) ~= "number" or type(scan.m) ~= "number" then return nil end
+    if type(scan.names) ~= "table" or type(scan.ev) ~= "table" then return nil end
+    local n = scan.ev.n
+    if type(n) ~= "number" or n <= 0 then return nil end
+    for i = 1, n do
+        if type(scan.names[i]) ~= "string" then return nil end  -- an unreadable row is not evidence
+    end
+    local rows = {}
+    for r = 1, #scan.rows do rows[scan.rows[r].i] = scan.rows[r].spell end
+    local cur = Professions._live and Professions._live.p and Professions._live.p[scan.profKey]
+    if not (cur and cur.k ~= nil and type(cur.n) == "number") then return nil end
+    local names = {}
+    for i = 1, n do names[i] = scan.names[i] end
+    return {
+        prof = scan.profKey, surface = scan.surface, line = scan.line,
+        l = scan.l, m = scan.m, n = n, known = cur.n,
+        names = names, rows = rows,
+        at = Professions.NowEpoch(),         -- assigned below; resolved at call time
+        ds = Dataset.Version(), build = Professions.ClientBuild(),
+    }
+end
+
+-- The record's row list in FoldCooldowns' shape, ordered by row index (class 8:
+-- nothing downstream may inherit pairs() luck). Cached on the record.
+function Professions.SettledRowsArray(rec)
+    if rec._rowsArr then return rec._rowsArr end
+    local idx = {}
+    for i in pairs(rec.rows) do idx[#idx + 1] = i end
+    table.sort(idx)
+    local arr = {}
+    for j = 1, #idx do arr[j] = { i = idx[j], spell = rec.rows[idx[j]] } end
+    rec._rowsArr = arr
+    return arr
+end
+
+-- The one expensive-ish thing a settled pass still does: read every recipe
+-- row's cooldown, through the same proof-gated fold a full scan uses. The
+-- pseudo-scan is licensed by the row-for-row name verification that just
+-- passed. Returns changed(bool), consumed(bool).
+function Professions.SettledCooldownPass(rec, stamp)
+    local pseudo = { complete = true, surface = rec.surface,
+                     rows = Professions.SettledRowsArray(rec) }
+    local running, proven = Professions.FoldCooldowns(pseudo, stamp)
+    if not (running and proven) then return false, false end
+    local L = Professions._live
+    local before = {}
+    if L then
+        for key in pairs(proven) do before[key] = L.c[key] end
+    end
+    local _, consumed = Professions.ApplyCooldowns(running, proven)
+    local changed = consumed
+    if not changed and L then
+        for key in pairs(proven) do
+            if L.c[key] ~= before[key] then changed = true break end
+        end
+    end
+    return changed, consumed
+end
+
+----------------------------------------------------------------------
 -- REAGENT HARVEST
 --
 -- The materials-linkage data source, because the recipe catalogue has none.
@@ -1600,6 +1924,11 @@ end
 
 -- PURE-ish: every client call is injectable through `api` so the harness can
 -- drive cold, warm and half-warm worlds without a client.
+--
+-- Returns out, allComplete. `allComplete` is true only when EVERY row that
+-- reported reagents produced a complete entry — the witness the persistence
+-- stamp below requires, because "harvested" written over a half-warm window
+-- would freeze the holes in for a whole dataset generation.
 function Professions.HarvestReagents(scan, api)
     if not (scan and scan.complete) then return nil end
     api = api or {}
@@ -1629,7 +1958,7 @@ function Professions.HarvestReagents(scan, api)
     numMade     = api.numMade     or numMade
     if not (numReagents and reagentInfo and reagentLink) then return nil end
 
-    local out = {}
+    local out, allComplete = {}, true
     for r = 1, #scan.rows do
         local row = scan.rows[r]
         local okN, n = pcall(numReagents, row.i)
@@ -1656,10 +1985,141 @@ function Professions.HarvestReagents(scan, api)
                     if okM and type(lo) == "number" and lo > 0 then entry.n = lo end
                 end
                 out[row.spell] = entry
+            else
+                allComplete = false            -- this recipe stays unharvested today
             end
         end
     end
-    return out
+    return out, allComplete
+end
+
+----------------------------------------------------------------------
+-- HARVEST PERSISTENCE + TIME-SLICING  (perf/professions-scan)
+--
+-- Reagents are GAME FACTS: identical across sessions until the dataset (the
+-- recipe universe itself) changes. So "harvested" is now a per-profession stamp
+-- in the store keyed by the DATASET VERSION rather than a per-session latch —
+-- one complete harvest per profession per dataset generation, ever. The stamp
+-- is written only off an `allComplete` harvest; a partial one stores its
+-- complete entries (each is individually proven) and leaves the stamp absent so
+-- the next accepted scan or settled pass tries again. Manual rescan deletes the
+-- stamp.
+--
+-- TIME-SLICING. The harvest was the dominant first-open cost (~4 reagent reads
+-- per recipe x ~165 recipes, plus product link and yield — measured in the
+-- call-budget suite). Nothing consumes it synchronously — StoreReagents landing
+-- a few frames later changes no answer — so the walk is sliced into chunks of
+-- HARVEST_CHUNK rows, one chunk per timer tick. Guards per chunk, all of them
+-- aborts (never partial stamps): module disabled, teardown, window closed, a
+-- newer job superseding this one, or the window's row count drifting from the
+-- count the job was built against (the row indexes would no longer name the
+-- rows the scan proved). Without a timer service the whole walk runs inline,
+-- which is exactly the pre-fix cost and still correct.
+----------------------------------------------------------------------
+
+Professions.HARVEST_CHUNK = 24
+
+function Professions.HarvestStamps(create)
+    local S = ns.Store
+    return S and S.ProfessionsHarvestStamps and S.ProfessionsHarvestStamps(create) or nil
+end
+
+-- Is this profession's harvest already complete for THIS dataset?
+function Professions.HarvestStamped(profKey)
+    local stamps = Professions.HarvestStamps(false)
+    local rec = stamps and stamps[profKey]
+    if type(rec) ~= "table" then return false end
+    return rec.ds == Dataset.Version()
+end
+
+function Professions.ClearHarvestStamp(profKey)
+    local stamps = Professions.HarvestStamps(false)
+    if stamps and profKey then stamps[profKey] = nil end
+    if Professions._harvested then Professions._harvested[profKey or ""] = nil end
+    return true
+end
+
+local function harvestWindowStillValid(job)
+    if not Professions.IsEnabled() or Professions.IsTeardown() then return false end
+    if not (Professions._windowOpen and Professions._windowOpen[job.surface]) then return false end
+    local numFn = (job.surface == "craft") and GetNumCrafts or GetNumTradeSkills
+    if not numFn then return false end
+    local ok, n = pcall(numFn)
+    if not ok or n ~= job.n then return false end   -- the enumeration moved: indexes are stale
+    return true
+end
+
+local function finishHarvest(job)
+    Professions._harvestJob = nil
+    local stored = Professions.StoreReagents(job.out)
+    if stored == false then
+        -- No store: fall back to the session latch so an accepted scan does not
+        -- reschedule forever against a store that is not there.
+        Professions._harvested = Professions._harvested or {}
+        Professions._harvested[job.prof] = true
+        return false
+    end
+    if job.allComplete then
+        local stamps = Professions.HarvestStamps(true)
+        if stamps then
+            stamps[job.prof] = { ds = Dataset.Version(), at = Professions.NowEpoch() }
+        end
+        Professions._harvested = Professions._harvested or {}
+        Professions._harvested[job.prof] = true
+    end
+    return true
+end
+
+local function harvestStep(job)
+    if Professions._harvestJob ~= job then return end        -- superseded
+    if not harvestWindowStillValid(job) then
+        Professions._harvestJob = nil
+        -- The entries gathered so far are each individually complete facts;
+        -- store them, but the profession stays unstamped and retries later.
+        if next(job.out) then Professions.StoreReagents(job.out) end
+        return
+    end
+    local from = job.nextRow
+    local to = math.min(from + Professions.HARVEST_CHUNK - 1, #job.rows)
+    local slice = {}
+    for r = from, to do slice[#slice + 1] = job.rows[r] end
+    local part, complete = Professions.HarvestReagents(
+        { complete = true, surface = job.surface, rows = slice })
+    if part then
+        for spell, entry in pairs(part) do job.out[spell] = entry end
+        if complete == false then job.allComplete = false end
+    else
+        job.allComplete = false
+    end
+    job.nextRow = to + 1
+    if job.nextRow > #job.rows then
+        finishHarvest(job)
+        return
+    end
+    if _G.C_Timer and _G.C_Timer.After then
+        _G.C_Timer.After(0, function() harvestStep(job) end)
+    else
+        harvestStep(job)
+    end
+end
+
+-- Schedule (or run, timer-less) the harvest for a proven window. `rows` is the
+-- accepted scan's (or verified settled record's) row->spell list; `n` the row
+-- count the proof was taken against.
+function Professions.ScheduleHarvest(surface, profKey, rows, n)
+    if type(rows) ~= "table" or #rows == 0 then return false end
+    Professions._harvestGen = Professions._harvestGen + 1
+    local job = {
+        gen = Professions._harvestGen, surface = surface, prof = profKey,
+        rows = rows, n = n, nextRow = 1, out = {}, allComplete = true,
+    }
+    Professions._harvestJob = job
+    if _G.C_Timer and _G.C_Timer.After then
+        _G.C_Timer.After(0, function() harvestStep(job) end)
+    else
+        harvestStep(job)
+    end
+    return true
 end
 
 ----------------------------------------------------------------------
@@ -2139,6 +2599,36 @@ function Professions.CaptureWindow(surface, force, event)
     local narrowed, guardWhy = Professions.ViewNarrowedWhy(surface)
     if narrowed then return refuse("view-filtered", nil, guardWhy) end
 
+    -- THE SETTLED SKIP (perf/professions-scan). Before any full work — and
+    -- before the throttle, so a consumed cooldown is noticed on the very event
+    -- that announced it — the cheap signature verify runs. It matches only when
+    -- every component of the live window equals the last accepted scan's record
+    -- AND the profession is not stale; every doubt falls through to the full
+    -- path below. A manual rescan (event "rescan") never consults it.
+    if event ~= "rescan" then
+        local rec = Professions.VerifySettled(surface)
+        if rec then
+            Professions.CancelRetry(surface)
+            Professions.RecordAttempt({
+                e = event, s = surface, f = force and true or nil, p = rec.prof,
+                r = "settled", n = rec.n, g = guardWhy, d = "cleared",
+            })
+            local changed, consumed = Professions.SettledCooldownPass(
+                rec, nowEpoch())
+            -- A harvest this dataset has not completed yet still runs off the
+            -- verified row mapping — that is how an aborted (window closed
+            -- mid-slices) harvest heals without a full rescan.
+            if not Professions.HarvestStamped(rec.prof)
+               and not (Professions._harvested and Professions._harvested[rec.prof])
+               and not Professions._harvestJob then
+                Professions.ScheduleHarvest(surface, rec.prof,
+                    Professions.SettledRowsArray(rec), rec.n)
+            end
+            if changed then Professions.MarkDirty(consumed) end
+            return true, rec.prof, consumed
+        end
+    end
+
     local now = nowMono()
     if not force and Professions._scanAt and (now - Professions._scanAt) < SCAN_THROTTLE then
         return refuse("throttled", nil, guardWhy)
@@ -2168,17 +2658,26 @@ function Professions.CaptureWindow(surface, force, event)
         consumed = c
     end
 
+    -- The full capture is the moment the settled signature is (re)taken and
+    -- the staleness mark comes off: this scan just proved the current truth.
+    if Professions._stale then Professions._stale[scan.profKey] = nil end
+    local settledRec = Professions.BuildSettledRecord(scan)
+    if settledRec then
+        Professions.SettledPut(scan.profKey, settledRec)
+    else
+        -- A scan we could not fingerprint must not leave an OLD fingerprint
+        -- standing — the next event would verify against stale evidence.
+        Professions.SettledClear(scan.profKey)
+    end
+
     -- Reagents are a GAME FACT and do not change while the window is open —
-    -- or between two logins, for that matter. Harvesting once per profession
-    -- per session keeps a crafting spree from re-reading every reagent link of
-    -- every recipe on every craft.
-    Professions._harvested = Professions._harvested or {}
-    if not Professions._harvested[scan.profKey] then
-        local reagents = Professions.HarvestReagents(scan)
-        if reagents then
-            Professions.StoreReagents(reagents)
-            Professions._harvested[scan.profKey] = true
-        end
+    -- or between two logins, or until the DATASET itself changes. The harvest
+    -- runs once per profession per dataset stamp (store-persisted), is
+    -- time-sliced across frames, and a manual rescan clears the stamp first.
+    if event == "rescan"
+       or (not Professions.HarvestStamped(scan.profKey)
+           and not (Professions._harvested and Professions._harvested[scan.profKey])) then
+        Professions.ScheduleHarvest(surface, scan.profKey, scan.rows, ev and ev.n)
     end
 
     Professions.MarkDirty(consumed)
@@ -2204,6 +2703,124 @@ function Professions.StoreReagents(harvest)
     end
     return n
 end
+
+----------------------------------------------------------------------
+-- MANUAL RESCAN  (perf/professions-scan)
+--
+-- The one deliberate override of every persistence layer this branch added:
+-- the settled signature, the harvest stamp and the filter panel's measured
+-- setter conventions are all dropped, and — when the window is up — a full
+-- capture runs immediately with the signature bypassed. Two entry points call
+-- this: the Rescan button professions_filters.lua places on the Blizzard
+-- window's filter bar, and `/nexus profs rescan`. The Nexus tab UI can call
+-- Professions.ForceRescan directly when it grows the affordance.
+--
+-- `what` may be a surface ("tradeskill"/"craft"), a profession key
+-- ("blacksmithing", ...), or nil for everything this character has settled.
+----------------------------------------------------------------------
+
+local function rescanSurface(surface)
+    -- Attribute the window so the right stamps are cleared even when the
+    -- capture below cannot run (window closed).
+    local prof
+    local lineFn = (surface == "craft") and GetCraftDisplaySkillLine or GetTradeSkillLine
+    if lineFn then
+        local ok, lname = pcall(lineFn)
+        if ok and type(lname) == "string" and lname ~= "" then
+            local rec = Professions.SettledForWindow(surface, lname)
+            if rec then prof = rec.prof end
+            if not prof then prof = Professions.SkillNameMap()[lname:lower()] end
+        end
+    end
+    if prof then
+        Professions.SettledClear(prof)
+        Professions.ClearHarvestStamp(prof)
+        Professions.MarkStale(prof)
+        if Professions._recipeNames then Professions._recipeNames[prof] = nil end
+    else
+        -- Cannot attribute: drop everything rather than guess. Honest and rare.
+        Professions.SettledClear(nil)
+        Professions.MarkStale(nil)
+        Professions._recipeNames = nil
+    end
+    -- The filter probe may re-measure from scratch too.
+    local F = ns.ProfessionFilters
+    if F and F.ForgetConventions then pcall(F.ForgetConventions, surface) end
+    if Professions.WindowIsOpen(surface) then
+        Professions._scanAt = nil                      -- the rescan is never coalesced away
+        return Professions.CaptureWindow(surface, true, "rescan")
+    end
+    return false, "window-closed"
+end
+
+function Professions.ForceRescan(what)
+    if not Professions.IsEnabled() then return false, "disabled" end
+    if what == "tradeskill" or what == "craft" then
+        return rescanSurface(what)
+    end
+    if type(what) == "string" and what ~= "" then
+        -- A profession key: clear its stamps; if its window is up, rescan now.
+        local key = what:lower()
+        Professions.SettledClear(key)
+        Professions.ClearHarvestStamp(key)
+        Professions.MarkStale(key)
+        if Professions._recipeNames then Professions._recipeNames[key] = nil end
+        local surface = (key == "enchanting") and "craft" or "tradeskill"
+        local F = ns.ProfessionFilters
+        if F and F.ForgetConventions then pcall(F.ForgetConventions, surface) end
+        if Professions.WindowIsOpen(surface) then
+            Professions._scanAt = nil
+            return Professions.CaptureWindow(surface, true, "rescan")
+        end
+        return true, "marked"                          -- next window open runs full
+    end
+    -- Everything: both surfaces' stamps, every settled record.
+    Professions.SettledClear(nil)
+    Professions.MarkStale(nil)
+    Professions._recipeNames = nil
+    local stamps = Professions.HarvestStamps(false)
+    if stamps then for key in pairs(stamps) do stamps[key] = nil end end
+    Professions._harvested = nil
+    local any = false
+    for _, surface in ipairs({ "tradeskill", "craft" }) do
+        local F = ns.ProfessionFilters
+        if F and F.ForgetConventions then pcall(F.ForgetConventions, surface) end
+        if Professions.WindowIsOpen(surface) then
+            Professions._scanAt = nil
+            local ok = Professions.CaptureWindow(surface, true, "rescan")
+            any = any or (ok == true)
+        end
+    end
+    return any, any and "rescanned" or "marked"
+end
+
+-- `/nexus profs rescan [tradeskill|craft|<profession>]` — the slash path.
+-- Registered unconditionally (core.lua loads first, so the registry exists);
+-- the handler itself gates on the module being enabled.
+ns:RegisterSubcommand("profs", function(rest)
+    rest = rest and rest:match("^%s*(.-)%s*$") or ""
+    local sub, args = rest:match("^(%S*)%s*(.-)$")
+    sub = (sub or ""):lower()
+    if sub == "rescan" then
+        if not Professions.IsEnabled() then
+            ns:Print("the Professions module is switched off.")
+            return
+        end
+        local target = (args or ""):lower():match("^(%S*)") or ""
+        if target == "" then target = nil end
+        local ok, why = Professions.ForceRescan(target)
+        if ok == true then
+            ns:Print("professions: full rescan captured.")
+        elseif why == "marked" then
+            ns:Print("professions: rescan armed — the next window open runs a full capture.")
+        else
+            ns:Print("professions: rescan armed (" .. tostring(why)
+                .. ") — open the profession window to capture.")
+        end
+        return
+    end
+    ns:Print("usage: /nexus profs rescan [tradeskill|craft|<profession>]")
+end, "professions tools (rescan)")
 
 ----------------------------------------------------------------------
 -- WINDOW SESSIONS
@@ -2296,6 +2913,60 @@ local function onEvent(_, event, ...)
         Professions.MarkDirty()
     elseif event == "SKILL_LINES_CHANGED" or event == "SPELLS_CHANGED" then
         if Professions.CaptureStatic() then Professions.MarkDirty() end
+    elseif event == "CHAT_MSG_SKILL" then
+        -- A skill rank-up, in localized prose we do not parse: unattributable,
+        -- so every settled profession is marked. Marking is two table writes;
+        -- the cost lands on the NEXT window look, as one full capture.
+        Professions.MarkStale(nil)
+    elseif event == "LEARNED_SPELL_IN_SKILL_LINE" or event == "LEARNED_SPELL_IN_TAB" then
+        -- Learning a recipe (or a rank spell) — the id usually names the
+        -- profession through the dataset, so the mark can be surgical. An id we
+        -- do not carry marks everything: conservative, never silent.
+        local spellID = ...
+        local prof
+        if type(spellID) == "number" and Dataset.LoadCore() then
+            local r = Dataset.recipe[spellID]
+            if r then prof = Dataset.ProfKey(r.p) end
+            if not prof then
+                local rk = Dataset.rankSpell[spellID]
+                if rk then prof = Dataset.ProfKey(rk.p) end
+            end
+        end
+        Professions.MarkStale(prof)
+        -- An open window re-captures NOW rather than on its next event: the
+        -- learn usually fires TRADE_SKILL_UPDATE too, but the unkind profile
+        -- (rows landing with no event) has already happened once.
+        for _, surface in ipairs({ "tradeskill", "craft" }) do
+            if Professions.WindowIsOpen(surface) then
+                Professions.CaptureWindow(surface, true, "stale-learn")
+            end
+        end
+    elseif event == "UNIT_SPELLCAST_SUCCEEDED" then
+        -- A craft landed. If the spell is one of our recipes and its window is
+        -- up, run the (settled-cheap) capture so a consumed cooldown publishes
+        -- even when the window's own update echo goes missing. One table lookup
+        -- for every other player cast.
+        local unit, _, spellID = ...
+        if unit == "player" and type(spellID) == "number"
+           and Dataset.core and Dataset.recipe then
+            local r = Dataset.recipe[spellID]
+            if r then
+                local surface = (Dataset.ProfKey(r.p) == "enchanting") and "craft" or "tradeskill"
+                if Professions.WindowIsOpen(surface) then
+                    if C_Timer and C_Timer.After then
+                        -- The cooldown stamp trails the cast by a beat; read it
+                        -- after the client has had a frame to write it.
+                        C_Timer.After(0.2, function()
+                            if Professions.IsEnabled() and Professions.WindowIsOpen(surface) then
+                                Professions.CaptureWindow(surface, false, "cast-landed")
+                            end
+                        end)
+                    else
+                        Professions.CaptureWindow(surface, false, "cast-landed")
+                    end
+                end
+            end
+        end
     end
 end
 Professions._onEvent = onEvent
@@ -2309,7 +2980,15 @@ function Professions.Activate()
         local f = CreateFrame("Frame")
         f:SetScript("OnEvent", onEvent)
         for i = 1, #Professions.EVENTS do
-            pcall(function() f:RegisterEvent(Professions.EVENTS[i]) end)
+            local ev = Professions.EVENTS[i]
+            if ev == "UNIT_SPELLCAST_SUCCEEDED" and f.RegisterUnitEvent then
+                -- Unit-filtered where the client offers it: the handler only
+                -- ever cares about the player, and the raid's casts are noise.
+                local ok = pcall(function() f:RegisterUnitEvent(ev, "player") end)
+                if not ok then pcall(function() f:RegisterEvent(ev) end) end
+            else
+                pcall(function() f:RegisterEvent(ev) end)
+            end
         end
         Professions._frame = f
     end
@@ -2373,6 +3052,13 @@ function Professions.SetEnabled(on)
         Professions._scanAt, Professions._staticAt = nil, nil
         Professions._harvested = nil
         Professions._windowOpen, Professions._retry = nil, nil
+        -- The settled mirrors and the in-flight harvest are session state of a
+        -- module that is no longer running. The STORE copies stay (retained but
+        -- stale, like every other stored answer) — they are re-validated
+        -- component by component against the live window before ever being
+        -- honored again.
+        Professions._settled, Professions._stale = nil, nil
+        Professions._harvestJob = nil
         -- The forensics go too. They are session state describing a module that
         -- is no longer running, and a stats table that outlived its module would
         -- report attempts against a build path that is not there any more. The
@@ -2491,6 +3177,29 @@ ns:RegisterDebugCommand("professions", function()
         for _ in pairs(area.reagents or {}) do n = n + 1 end
         ns:Print("  reagent harvest: " .. n .. " recipe(s), taken " ..
             tostring(area.reagentsAt or "never") .. " against ds " .. tostring(area.reagentsDS or "?"))
+    end
+
+    -- The settled-signature layer: which professions can skip, which are
+    -- marked stale, and where the harvest stamps stand.
+    do
+        local parts = {}
+        local mine = P.SettledArea and P.SettledArea(false)
+        for key in pairs(mine or {}) do
+            local rec = P.SettledGet(key)
+            parts[#parts + 1] = key
+                .. (rec and ("(" .. tostring(rec.n) .. " rows)") or "(invalid)")
+                .. (P.IsStale(key) and " STALE" or "")
+        end
+        table.sort(parts)
+        ns:Print("  settled: " .. ((#parts > 0) and table.concat(parts, ", ") or "none"))
+        local stamps = P.HarvestStamps and P.HarvestStamps(false)
+        local sp = {}
+        for key, rec in pairs(stamps or {}) do
+            sp[#sp + 1] = key .. "@" .. tostring(rec.ds)
+        end
+        table.sort(sp)
+        ns:Print("  harvest stamps: " .. ((#sp > 0) and table.concat(sp, ", ") or "none")
+            .. (P._harvestJob and (" | harvest IN FLIGHT for " .. tostring(P._harvestJob.prof)) or ""))
     end
 
     -- Windows and ladders: the two pieces of state that decide whether another
@@ -2761,6 +3470,11 @@ local function testCaptureHonesty(fails)
         Professions._leavingWorld, Professions._loggingOut,
         Professions._enteredWorldAt, Professions._live, Professions._lastSig,
     }
+    local savedPerf = {
+        Professions._settled, Professions._stale, Professions._harvested,
+        Professions._harvestJob, Professions._scanAt,
+    }
+    local savedArea = ns.Store and ns.Store.data and ns.Store.data.professions
 
     local ok, err = pcall(function()
         Dataset.LoadCore()
@@ -2768,6 +3482,8 @@ local function testCaptureHonesty(fails)
         Professions._leavingWorld, Professions._loggingOut = false, false
         Professions._enteredWorldAt = 0            -- long since warm
         Professions._live = nil
+        Professions._settled, Professions._stale = nil, nil
+        Professions._harvested, Professions._harvestJob = nil, nil
 
         local bsList = Dataset.profRecipes[Dataset.profIdx.blacksmithing]
         local W = { rows = {}, coldRow = nil, cds = {} }
@@ -2791,15 +3507,36 @@ local function testCaptureHonesty(fails)
            "a complete window scan did not resolve blacksmithing by id")
         ck(scan and scan.l == 275 and scan.m == 300, "the window's level did not capture")
 
-        -- (1b) The window-update throttle coalesces a crafting spree but can
-        --      never swallow the window OPENING, which is the scan that has to
-        --      land.
+        -- (1b) A crafting spree coalesces, but never by going deaf: the first
+        --      window event lands the full scan, and every event after it on
+        --      the unchanged window is answered by the cheap SETTLED verify —
+        --      a distinct verdict, never a re-scan and never a dropped event.
         Professions._scanAt = nil
         local okFirst = Professions.CaptureWindow("tradeskill", true)
         ck(okFirst == true, "the window-open scan did not land")
+        local aStamp = Professions._live.p.blacksmithing.a
+        local okSecond, profSecond = Professions.CaptureWindow("tradeskill")
+        ck(okSecond == true and profSecond == "blacksmithing",
+           "an update on the unchanged window was not answered (" .. tostring(profSecond) .. ")")
+        local ring = Professions.TraceRows()
+        ck(ring[#ring] and ring[#ring].r == "settled",
+           "the unchanged-window answer was not the settled verdict ("
+           .. tostring(ring[#ring] and ring[#ring].r) .. ")")
+        ck(Professions._live.p.blacksmithing.a == aStamp,
+           "a settled skip re-stamped the scan epoch — it must not masquerade as a full scan")
+        ck(Professions.CaptureWindow("tradeskill", true) == true,
+           "a forced re-open of the unchanged window was refused")
+        -- The throttle still guards the UNSETTLED path: drop the record and the
+        -- live bitmap gate and an update inside the second coalesces as before.
+        Professions._settled = nil
+        local mineSA = Professions.SettledArea and Professions.SettledArea(false)
+        if mineSA then mineSA.blacksmithing = nil end
+        Professions._live.p.blacksmithing.k = nil       -- no truth to skip over
+        Professions._scanAt = 10000                     -- a scan "just" happened
         local okThrottled, whyT = Professions.CaptureWindow("tradeskill")
         ck(okThrottled == false and whyT == "throttled",
-           "an update one frame later re-scanned instead of coalescing")
+           "an unsettled update inside the throttle window re-scanned instead of coalescing")
+        Professions._scanAt = nil
         ck(Professions.CaptureWindow("tradeskill", true) == true,
            "the throttle swallowed a forced re-open")
         Professions._scanAt = nil
@@ -2992,6 +3729,10 @@ local function testCaptureHonesty(fails)
     Professions._leavingWorld, Professions._loggingOut = savedLatch[1], savedLatch[2]
     Professions._enteredWorldAt, Professions._live = savedLatch[3], savedLatch[4]
     Professions._lastSig = savedLatch[5]
+    Professions._settled, Professions._stale = savedPerf[1], savedPerf[2]
+    Professions._harvested, Professions._harvestJob = savedPerf[3], savedPerf[4]
+    Professions._scanAt = savedPerf[5]
+    if ns.Store and ns.Store.data then ns.Store.data.professions = savedArea end
 
     if not ok then fails[#fails + 1] = "error in capture-honesty fixtures: " .. tostring(err) end
 end
@@ -3016,8 +3757,9 @@ local function testReagentHarvest(fails)
         numMade  = function(i) return 1, 1 end,
     }
 
-    local out = Professions.HarvestReagents(scan, api)
+    local out, outComplete = Professions.HarvestReagents(scan, api)
     ck(out and out[bsList[1]], "a warm harvest produced nothing")
+    ck(outComplete == true, "a fully-warm harvest did not report itself complete")
     if out and out[bsList[1]] then
         local e = out[bsList[1]]
         ck(e.r[1011] == 2 and e.r[1012] == 4, "reagent counts did not capture")
@@ -3029,11 +3771,14 @@ local function testReagentHarvest(fails)
     -- entirely. A partial reagent list understates the cost of a craft, and an
     -- understated cost is worse than no answer.
     cold[1] = true
-    local partial = Professions.HarvestReagents(scan, api)
+    local partial, partComplete = Professions.HarvestReagents(scan, api)
     ck(partial and partial[bsList[1]] == nil,
        "a recipe with one unresolved reagent was harvested anyway")
     ck(partial and partial[bsList[2]] ~= nil,
        "the cold row poisoned a sibling recipe that resolved fine")
+    ck(partComplete == false,
+       "a harvest that skipped a cold recipe still reported itself complete — "
+       .. "the persistence stamp would freeze the hole in")
 end
 
 local function testPublishDelta(fails)
@@ -3418,6 +4163,7 @@ local function testComposedChain(fails)
         Professions._windowOpen, Professions._retry, Professions._stats,
         Professions._trace, Professions._lastSig,
     }
+    local savedPerf = { Professions._settled, Professions._stale, Professions._harvestJob }
     local savedFilters = F and { F._state, F._prof, F._panels, F._hooked, F._activated }
     local savedGuards = Professions._viewGuards
     local savedStore = ns.Store and ns.Store.data and ns.Store.data.professions
@@ -3447,6 +4193,7 @@ local function testComposedChain(fails)
         Professions._live, Professions._scanAt = nil, nil
         Professions._harvested, Professions._windowOpen, Professions._retry = nil, nil, nil
         Professions._stats, Professions._trace = nil, nil
+        Professions._settled, Professions._stale, Professions._harvestJob = nil, nil, nil
         Professions._viewGuards = nil
         if F then
             F._state, F._prof, F._panels, F._hooked = nil, nil, nil, nil
@@ -3574,6 +4321,7 @@ local function testComposedChain(fails)
             Professions._live, Professions._scanAt = nil, nil
             Professions._windowOpen, Professions._retry = nil, nil
             Professions._stats, Professions._trace = nil, nil
+            Professions._settled, Professions._stale = nil, nil
             local function totalAttempts()
                 return ((Professions.Stats("blacksmithing") or {}).attempts or 0)
                      + ((Professions.Stats("surface:tradeskill") or {}).attempts or 0)
@@ -3618,6 +4366,7 @@ local function testComposedChain(fails)
             Professions._live, Professions._scanAt = nil, nil
             Professions._windowOpen, Professions._retry = nil, nil
             Professions._stats, Professions._trace = nil, nil
+            Professions._settled, Professions._stale = nil, nil
             local okRun = pcall(function()
                 sim.emit("TRADE_SKILL_SHOW")
                 clock:pump(3000 + 1)
@@ -3649,6 +4398,8 @@ local function testComposedChain(fails)
     Professions._windowOpen, Professions._retry = savedLatch[7], savedLatch[8]
     Professions._stats, Professions._trace = savedLatch[9], savedLatch[10]
     Professions._lastSig = savedLatch[11]
+    Professions._settled, Professions._stale = savedPerf[1], savedPerf[2]
+    Professions._harvestJob = savedPerf[3]
     Professions._viewGuards = savedGuards
     if F then
         F._state, F._prof, F._panels = savedFilters[1], savedFilters[2], savedFilters[3]
@@ -3724,6 +4475,7 @@ local function testResolutionChain(fails)
         Professions._trace, Professions._lastSig, Professions._nameMap,
         Professions._recipeNames, Professions._viewGuards,
     }
+    local savedPerf = { Professions._settled, Professions._stale, Professions._harvestJob }
     local savedArea = ns.Store and ns.Store.data and ns.Store.data.professions
 
     local ok, err = pcall(function()
@@ -3734,6 +4486,7 @@ local function testResolutionChain(fails)
         Professions._windowOpen, Professions._retry = nil, nil
         Professions._stats, Professions._trace = nil, nil
         Professions._nameMap, Professions._recipeNames = nil, nil
+        Professions._settled, Professions._stale, Professions._harvestJob = nil, nil, nil
         Professions._viewGuards = nil
         -- No client filter narrows the unkind window; the guard has real
         -- getters to ask so its verdict is "clear", not luck.
@@ -3995,8 +4748,360 @@ local function testResolutionChain(fails)
     Professions._stats, Professions._trace = savedState[9], savedState[10]
     Professions._lastSig, Professions._nameMap = savedState[11], savedState[12]
     Professions._recipeNames, Professions._viewGuards = savedState[13], savedState[14]
+    Professions._settled, Professions._stale = savedPerf[1], savedPerf[2]
+    Professions._harvestJob = savedPerf[3]
     if ns.Store and ns.Store.data then ns.Store.data.professions = savedArea end
     if not ok then fails[#fails + 1] = "error in resolution-chain fixtures: " .. tostring(err) end
+end
+
+----------------------------------------------------------------------
+-- THE SETTLED-SIGNATURE BUDGET — the suite whose currency is API CALL COUNTS
+--
+-- The live problem this branch fixes was never a wrong answer; it was the same
+-- right answer re-derived at full price on every window event. So this suite's
+-- assertions are CEILINGS on an instrumented client: a warm reopen of a settled
+-- profession may read the cheap half of the window (GetNum*, the line, one info
+-- per row) and NOTHING else — zero recipe links, zero GetSpellInfo, zero
+-- reagent reads. A crafting spree performs zero full resolves. And the moments
+-- that MUST re-pay full price — a learned recipe, a rank-up, a staleness
+-- signal, a manual rescan — are each asserted to actually pay it, exactly once.
+--
+-- The RED CONTROL is the pre-fix cost model run against the same instrumented
+-- window: one full resolve per non-coalesced event, which is what CaptureWindow
+-- did before the signature existed. Crafts land seconds apart, so the throttle
+-- never coalesced them — ten crafts really were ten full resolves.
+----------------------------------------------------------------------
+
+local function testSettledBudget(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    if not Dataset.LoadCore() then
+        fails[#fails + 1] = "the dataset would not load"
+        return
+    end
+
+    local G = _G
+    local saved = {
+        numTS = G.GetNumTradeSkills, tsInfo = G.GetTradeSkillInfo,
+        tsRecipe = G.GetTradeSkillRecipeLink, tsItem = G.GetTradeSkillItemLink,
+        tsLine = G.GetTradeSkillLine, tsCD = G.GetTradeSkillCooldown,
+        rgN = G.GetTradeSkillNumReagents, rgI = G.GetTradeSkillReagentInfo,
+        rgL = G.GetTradeSkillReagentItemLink, rgM = G.GetTradeSkillNumMade,
+        spellInfo = G.GetSpellInfo,
+        unitName = G.UnitName, realm = G.GetRealmName, fullName = G.UnitFullName,
+        daseeki = G.Daseeki,
+        nameF = G.GetTradeSkillItemNameFilter, makeF = G.GetOnlyShowMakeable,
+        upsF = G.GetOnlyShowSkillUps,
+    }
+    local savedState = {
+        Professions._leavingWorld, Professions._loggingOut, Professions._enteredWorldAt,
+        Professions._live, Professions._scanAt, Professions._harvested,
+        Professions._windowOpen, Professions._retry, Professions._stats,
+        Professions._trace, Professions._lastSig, Professions._nameMap,
+        Professions._recipeNames, Professions._viewGuards,
+        Professions._settled, Professions._stale, Professions._harvestJob,
+    }
+    local savedArea = ns.Store and ns.Store.data and ns.Store.data.professions
+    local F = ns.ProfessionFilters
+    local savedConvSession = F and F._conv
+
+    local clock = newClock(100000)
+
+    local ok, err = pcall(function()
+        clock:install()
+        G.UnitName = function() return "BudgetTester" end
+        G.GetRealmName = function() return "TestRealm" end
+        G.UnitFullName = nil
+        G.Daseeki = nil                              -- no mesh: Publish stays inert
+        Professions._leavingWorld, Professions._loggingOut = false, false
+        Professions._enteredWorldAt = 0
+        Professions._live, Professions._scanAt, Professions._harvested = nil, nil, nil
+        Professions._windowOpen, Professions._retry = nil, nil
+        Professions._stats, Professions._trace = nil, nil
+        Professions._nameMap, Professions._recipeNames = nil, nil
+        Professions._settled, Professions._stale, Professions._harvestJob = nil, nil, nil
+        Professions._viewGuards = nil
+        Professions._lastSig = nil
+        if F then F._conv = nil end
+        if ns.Store and ns.Store.data then ns.Store.data.professions = nil end
+
+        -- ══ THE INSTRUMENTED WINDOW ══════════════════════════════════════════
+        -- 33 rows: 3 headers, 30 real blacksmithing recipes, enchant links (the
+        -- kind client), reagents warm, every read COUNTED.
+        local bs = Dataset.profRecipes[Dataset.profIdx.blacksmithing]
+        local count = { num = 0, info = 0, link = 0, item = 0, line = 0,
+                        cd = 0, spell = 0, rgN = 0, rgI = 0, rgL = 0 }
+        local function zero() for k in pairs(count) do count[k] = 0 end end
+
+        local W = { rows = {}, cds = {}, rank = 275 }
+        local function rebuild(nRecipes)
+            W.rows = {}
+            local ri = 0
+            for i = 1, nRecipes + 3 do
+                if i == 1 or i == 12 or i == 23 then
+                    W.rows[i] = { kind = "header", name = "Header " .. i }
+                else
+                    ri = ri + 1
+                    W.rows[i] = { kind = "recipe", spell = bs[ri], name = "Recipe " .. bs[ri] }
+                end
+            end
+            return ri
+        end
+        ck(rebuild(30) == 30, "the fixture did not build 30 recipe rows")
+
+        G.GetNumTradeSkills = function() count.num = count.num + 1 return #W.rows end
+        G.GetTradeSkillInfo = function(i)
+            count.info = count.info + 1
+            local r = W.rows[i]
+            if not r then return nil end
+            if r.kind == "header" then return r.name, "header", 0, false end
+            return r.name, "optimal", 1, false
+        end
+        G.GetTradeSkillRecipeLink = function(i)
+            count.link = count.link + 1
+            local r = W.rows[i]
+            if not r or r.kind == "header" then return nil end
+            return "|cffffd000|Henchant:" .. tostring(r.spell) .. "|h[x]|h|r"
+        end
+        G.GetTradeSkillItemLink = function(i)
+            count.item = count.item + 1
+            local r = W.rows[i]
+            if not r or r.kind == "header" then return nil end
+            return "|cffffffff|Hitem:" .. tostring(60000 + i) .. ":0|h[o]|h|r"
+        end
+        G.GetTradeSkillLine = function()
+            count.line = count.line + 1
+            return "Blacksmithing", W.rank, 300
+        end
+        G.GetTradeSkillCooldown = function(i)
+            count.cd = count.cd + 1
+            return W.cds[i]
+        end
+        G.GetSpellInfo = function(id)
+            count.spell = count.spell + 1
+            return "Spell " .. tostring(id)
+        end
+        G.GetTradeSkillNumReagents = function() count.rgN = count.rgN + 1 return 2 end
+        G.GetTradeSkillReagentInfo = function(i, j)
+            count.rgI = count.rgI + 1
+            return "reagent", nil, j
+        end
+        G.GetTradeSkillReagentItemLink = function(i, j)
+            count.rgL = count.rgL + 1
+            return "|cffffffff|Hitem:" .. tostring(1000 + i * 10 + j) .. ":0|h[r]|h|r"
+        end
+        G.GetTradeSkillNumMade = function() return 1, 1 end
+        -- The view guard's readable witnesses all answer "clear", so the suite
+        -- measures the capture rather than a refusal.
+        G.GetTradeSkillItemNameFilter = function() return "" end
+        G.GetOnlyShowMakeable = function() return false end
+        G.GetOnlyShowSkillUps = function() return false end
+
+        local nRows = #W.rows
+        Professions.OpenWindow("tradeskill", true)
+
+        -- ══ RED CONTROL: the pre-fix cost of a ten-craft spree ═══════════════
+        -- Before the signature, every craft's update re-ran the FULL resolve
+        -- (crafts land seconds apart; the one-second throttle never coalesced
+        -- them). Ten crafts: ten full walks of every link.
+        zero()
+        for i = 1, 10 do
+            local s = Professions.ScanTradeSkillWindow()
+            ck(s ~= nil, "the red-control scan refused")
+        end
+        local legacyLink, legacyInfo = count.link, count.info
+        ck(legacyLink >= 10 * 30,
+           "RED CONTROL DID NOT REPRODUCE: ten pre-fix scans cost only "
+           .. legacyLink .. " recipe-link reads")
+
+        -- ══ (1) THE GENUINELY-FIRST CAPTURE pays full price ONCE ═════════════
+        zero()
+        Professions._live, Professions._scanAt = nil, nil
+        ck(Professions.CaptureWindow("tradeskill", true, "TRADE_SKILL_SHOW") == true,
+           "the first capture did not land")
+        clock:pump(clock.now + 1)              -- run the time-sliced harvest out
+        local firstLink, firstRgL = count.link, count.rgL
+        ck(firstLink >= 30, "the first capture did not walk the links (" .. firstLink .. ")")
+        ck(firstRgL >= 60, "the harvest did not read the reagent links (" .. firstRgL .. ")")
+        ck(Professions.HarvestStamped("blacksmithing"),
+           "a complete harvest did not stamp the store")
+        ck(Professions.SettledGet("blacksmithing") ~= nil,
+           "the accepted scan left no settled record")
+        local mineStore = Professions.SettledArea(false)
+        ck(mineStore ~= nil and mineStore.blacksmithing ~= nil,
+           "the settled record was not persisted in the store")
+
+        -- ══ (2) WARM REOPEN: the signature pass and NOTHING else ═════════════
+        zero()
+        ck(Professions.CaptureWindow("tradeskill", true, "TRADE_SKILL_SHOW") == true,
+           "the warm reopen was refused")
+        ck(count.link == 0, "a settled reopen read " .. count.link .. " recipe links; the ceiling is 0")
+        ck(count.spell == 0, "a settled reopen called GetSpellInfo " .. count.spell .. " times; the ceiling is 0")
+        ck(count.item == 0, "a settled reopen read " .. count.item .. " item links; the ceiling is 0")
+        ck(count.rgL == 0, "a settled reopen re-read the reagent harvest")
+        ck(count.info <= nRows,
+           "a settled reopen read " .. count.info .. " rows of info; the ceiling is " .. nRows)
+        local ring = Professions.TraceRows()
+        ck(ring[#ring] and ring[#ring].r == "settled",
+           "the warm reopen's verdict was '" .. tostring(ring[#ring] and ring[#ring].r)
+           .. "', expected 'settled'")
+        Professions._measuredWarmReopen = { info = count.info, num = count.num,
+                                            line = count.line, cd = count.cd }
+
+        -- ══ (3) A TEN-CRAFT SPREE performs ZERO full resolves ════════════════
+        zero()
+        for i = 1, 10 do
+            clock:pump(clock.now + 1.5)        -- crafts land outside the throttle
+            ck(Professions.CaptureWindow("tradeskill", false, "TRADE_SKILL_UPDATE") == true,
+               "a spree update was refused")
+        end
+        ck(count.link == 0 and count.spell == 0,
+           "the spree performed a full resolve (links=" .. count.link
+           .. " spellinfo=" .. count.spell .. "); the pre-fix cost of the same spree was "
+           .. legacyLink .. " link reads")
+        local st = Professions.Stats("blacksmithing")
+        ck(st and st.ok == 1, "the spree re-ran the full capture "
+           .. tostring(st and st.ok) .. " time(s); only the first open may")
+        ck(st and (st.settled or 0) >= 11, "the settled tally reads "
+           .. tostring(st and st.settled) .. ", expected the reopen plus ten crafts")
+
+        -- ══ (4) A CONSUMED COOLDOWN publishes off the settled pass ═══════════
+        -- (f): crafting a cooldown recipe mid-spree must be noticed WITHOUT a
+        -- full resolve and without a manual rescan.
+        W.cds[2] = 3600                        -- row 2's recipe went on cooldown
+        zero()
+        clock:pump(clock.now + 1.5)
+        ck(Professions.CaptureWindow("tradeskill", false, "TRADE_SKILL_UPDATE") == true,
+           "the cooldown-carrying update was refused")
+        local cdKey = tostring(W.rows[2].spell)
+        ck(Professions.Live().c[cdKey] ~= nil,
+           "the consumed cooldown did not reach the live record off a settled pass")
+        ck(count.link == 0, "noticing the cooldown cost a full resolve")
+        ck(count.cd >= 30, "the settled pass did not actually read the cooldowns ("
+           .. count.cd .. ")")
+        W.cds[2] = nil
+        clock:pump(clock.now + 1.5)
+        Professions.CaptureWindow("tradeskill", false, "TRADE_SKILL_UPDATE")
+        ck(Professions.Live().c[cdKey] == nil,
+           "the proven-ready cooldown was not cleared by the settled pass")
+
+        -- ══ (5) LEARNING A RECIPE: drift => exactly ONE full rescan ══════════
+        rebuild(31)                            -- the sim adds a row
+        nRows = #W.rows
+        zero()
+        clock:pump(clock.now + 1.5)
+        ck(Professions.CaptureWindow("tradeskill", false, "TRADE_SKILL_UPDATE") == true,
+           "the drifted window was refused")
+        ck(count.link >= 31, "the learned recipe did not force a full rescan ("
+           .. count.link .. " links)")
+        ck(Professions._live.p.blacksmithing.n == 31,
+           "the rescan did not pick up the new recipe ("
+           .. tostring(Professions._live.p.blacksmithing.n) .. ")")
+        zero()
+        clock:pump(clock.now + 1.5)
+        ck(Professions.CaptureWindow("tradeskill", false, "TRADE_SKILL_UPDATE") == true,
+           "the re-settled window was refused")
+        ck(count.link == 0, "the window did not re-settle after the rescan")
+
+        -- ══ (6) RANK-UP => full rescan, both through the signature and the
+        --        staleness mark ══════════════════════════════════════════════
+        W.rank = 276                           -- the signature's own rank component
+        zero()
+        clock:pump(clock.now + 1.5)
+        Professions.CaptureWindow("tradeskill", false, "TRADE_SKILL_UPDATE")
+        ck(count.link >= 31, "a rank-up did not drift the signature")
+        Professions._onEvent(nil, "CHAT_MSG_SKILL")     -- the event mark, unattributed
+        ck(Professions.IsStale("blacksmithing"),
+           "CHAT_MSG_SKILL did not mark the settled profession stale")
+        zero()
+        clock:pump(clock.now + 1.5)
+        Professions.CaptureWindow("tradeskill", false, "TRADE_SKILL_UPDATE")
+        ck(count.link >= 31, "a stale profession settled instead of re-scanning")
+        ck(not Professions.IsStale("blacksmithing"),
+           "the full rescan did not clear the staleness mark")
+
+        -- ...and an ATTRIBUTED learn marks only its own profession.
+        local alSpell = Dataset.profRecipes[Dataset.profIdx.alchemy][1]
+        Professions._onEvent(nil, "LEARNED_SPELL_IN_SKILL_LINE", alSpell)
+        ck(Professions.IsStale("alchemy") == true,
+           "an attributed learn did not mark its profession")
+        ck(Professions.IsStale("blacksmithing") == false,
+           "an attributed alchemy learn marked blacksmithing stale")
+        Professions._stale = nil
+
+        -- ══ (7) MANUAL RESCAN: signature ignored, full capture, re-harvest,
+        --        probe re-measure allowed ═════════════════════════════════════
+        if F and F.RememberForm then
+            F.RememberForm("tradeskill", "subAll", { n = 1 })
+            F.Conv("tradeskill")               -- seed the session mirror too
+        end
+        zero()
+        ck(Professions.ForceRescan("tradeskill") == true, "the manual rescan did not capture")
+        ck(count.link >= 31, "the manual rescan honored the signature it must ignore")
+        clock:pump(clock.now + 1)              -- the re-harvest slices
+        ck(count.rgL >= 62, "the manual rescan did not re-harvest (" .. count.rgL .. ")")
+        ck(Professions.HarvestStamped("blacksmithing"),
+           "the re-harvest did not re-stamp")
+        if F and F.ConvStoreArea then
+            local area = F.ConvStoreArea(false)
+            ck(not (area and area.tradeskill and area.tradeskill.subAll),
+               "the manual rescan kept the persisted filter conventions")
+        end
+
+        -- ══ (8) "RELOG": the store's settled record carries a warm first open —
+        --        zero links, zero GetSpellInfo, on the session's very first look.
+        Professions._settled = nil             -- session mirror gone
+        Professions._nameMap, Professions._recipeNames = nil, nil
+        Professions._stale = nil
+        zero()
+        ck(Professions.CaptureWindow("tradeskill", true, "TRADE_SKILL_SHOW") == true,
+           "the post-relog open was refused")
+        ck(count.link == 0 and count.spell == 0,
+           "the post-relog open re-ran the full resolve (links=" .. count.link
+           .. " spellinfo=" .. count.spell .. ") — the store record did not carry")
+
+        -- ══ (9) A HARVEST ABORTED MID-SLICE heals off the settled pass ═══════
+        Professions.ClearHarvestStamp("blacksmithing")
+        Professions._scanAt = nil
+        clock:pump(clock.now + 1.5)
+        ck(Professions.CaptureWindow("tradeskill", false, "TRADE_SKILL_UPDATE") == true,
+           "the pre-abort update was refused")
+        Professions.CloseWindow("tradeskill")  -- the player walks away mid-harvest
+        clock:pump(clock.now + 1)
+        ck(not Professions.HarvestStamped("blacksmithing"),
+           "an aborted harvest still stamped the store")
+        Professions.OpenWindow("tradeskill", true)
+        ck(Professions.CaptureWindow("tradeskill", true, "TRADE_SKILL_SHOW") == true,
+           "the post-abort reopen was refused")
+        clock:pump(clock.now + 1)
+        ck(Professions.HarvestStamped("blacksmithing"),
+           "the settled pass did not heal the aborted harvest")
+
+        Professions._measuredSpree = { legacyLink = legacyLink, legacyInfo = legacyInfo }
+    end)
+
+    clock:restore()
+    G.GetNumTradeSkills, G.GetTradeSkillInfo = saved.numTS, saved.tsInfo
+    G.GetTradeSkillRecipeLink, G.GetTradeSkillItemLink = saved.tsRecipe, saved.tsItem
+    G.GetTradeSkillLine, G.GetTradeSkillCooldown = saved.tsLine, saved.tsCD
+    G.GetTradeSkillNumReagents, G.GetTradeSkillReagentInfo = saved.rgN, saved.rgI
+    G.GetTradeSkillReagentItemLink, G.GetTradeSkillNumMade = saved.rgL, saved.rgM
+    G.GetSpellInfo = saved.spellInfo
+    G.UnitName, G.GetRealmName, G.UnitFullName = saved.unitName, saved.realm, saved.fullName
+    G.Daseeki = saved.daseeki
+    G.GetTradeSkillItemNameFilter, G.GetOnlyShowMakeable = saved.nameF, saved.makeF
+    G.GetOnlyShowSkillUps = saved.upsF
+    Professions._leavingWorld, Professions._loggingOut = savedState[1], savedState[2]
+    Professions._enteredWorldAt, Professions._live = savedState[3], savedState[4]
+    Professions._scanAt, Professions._harvested = savedState[5], savedState[6]
+    Professions._windowOpen, Professions._retry = savedState[7], savedState[8]
+    Professions._stats, Professions._trace = savedState[9], savedState[10]
+    Professions._lastSig, Professions._nameMap = savedState[11], savedState[12]
+    Professions._recipeNames, Professions._viewGuards = savedState[13], savedState[14]
+    Professions._settled, Professions._stale = savedState[15], savedState[16]
+    Professions._harvestJob = savedState[17]
+    if ns.Store and ns.Store.data then ns.Store.data.professions = savedArea end
+    if F then F._conv = savedConvSession end
+    if not ok then fails[#fails + 1] = "error in settled-budget fixtures: " .. tostring(err) end
 end
 
 local function testInertness(fails)
@@ -4066,6 +5171,8 @@ function Professions.RunSelfTests(verbose)
           fn = testComposedChain },
         { name = "resolution chain (the live 11509 nil-recipe-link window, with the red control)",
           fn = testResolutionChain },
+        { name = "settled-signature budget (warm reopens and sprees by API call count, with the red control)",
+          fn = testSettledBudget },
         { name = "publish delta detector", fn = testPublishDelta },
         { name = "module inertness (off = no frame, no events, no dataset, no SV)",
           fn = testInertness },
@@ -4089,6 +5196,15 @@ function Professions.RunSelfTests(verbose)
             tostring(Professions._measuredBitmapBytes or "?"),
             tostring(Professions._measuredPayloadBytes or "n/a"),
             tostring(Professions._measuredMixedBytes or "n/a")))
+        local warm, spree = Professions._measuredWarmReopen, Professions._measuredSpree
+        if warm and spree then
+            ns:Print(string.format(
+                "  professions: warm reopen costs %d info + %d num + %d line + %d cooldown"
+                .. " reads and 0 links / 0 GetSpellInfo; the pre-fix ten-craft spree cost"
+                .. " %d link + %d info reads",
+                warm.info or -1, warm.num or -1, warm.line or -1, warm.cd or -1,
+                spree.legacyLink or -1, spree.legacyInfo or -1))
+        end
     end
     return allPass
 end
