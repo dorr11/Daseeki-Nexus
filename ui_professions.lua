@@ -14,10 +14,12 @@
 --
 --   THE DETAIL      top-right pane, always there: the selected character's
 --                   professions as TABS across the top (a rogue's Poisons tab
---                   included), the picked tab showing the recipe census — the
---                   filter band, the known/missing list, and the selected
---                   recipe's SOURCE and MATERIALS. This pane REPLACES the old
---                   mode-swap drill-in outright.
+--                   included; zero-recipe professions earn none — see
+--                   DetailTabs), the picked tab showing the recipe census —
+--                   the filter band, the known/missing list, and the selected
+--                   recipe's SOURCE info band. This pane REPLACES the old
+--                   mode-swap drill-in outright. (The MATERIALS block was
+--                   retired 2026-08-10; the list wears its height.)
 --
 --   THE COOLDOWNS   bottom-right pane: ONE ROW PER COOLDOWN KIND the store has
 --                   seen (Mooncloth, the transmute group, …), each naming the
@@ -163,7 +165,10 @@ local L = {
 
     LIST_ROW_H  = 20,   -- recipe / cooldown / search rows
     FILTER_H    = 24,   -- one filter row in the detail pane (there are two)
-    DETAIL_H    = 132,  -- the selected-recipe detail band (source + materials)
+    INFO_H      = 44,   -- the selected-recipe info band: name + acquisition.
+                        -- (Was DETAIL_H = 132 when a MATERIALS block lived here;
+                        -- the owner retired that block, 2026-08-10, and the
+                        -- freed height belongs to the recipe LIST above.)
     SCROLL_STEP = 40,
 }
 ProfUI.LAYOUT = L
@@ -237,6 +242,15 @@ function ProfUI.RightSplitHeights(total)
     return detailH, avail - detailH
 end
 
+-- PURE. The recipe list's bottom inset inside the detail pane: the info band
+-- plus its breathing room. The list owns everything between the filter rows and
+-- this inset — retiring the materials block (info band 132 -> INFO_H) is what
+-- bought the list its extra rows, and the self-test pins that the inset never
+-- quietly grows back.
+function ProfUI.RecipeListBottomInset()
+    return L.INFO_H + L.PANEL_PAD + 4
+end
+
 -- PURE. The detail pane's profession-tab strip: n tabs in availW. Tabs share
 -- the width evenly, cap at DTAB_MAX (so two tabs hug the left rather than
 -- stretching), and the last tab's right edge stays inside availW.
@@ -252,6 +266,66 @@ function ProfUI.DetailTabLayout(availW, n)
     for i = 1, n do xs[i] = (i - 1) * (w + L.DTAB_GAP) end
     return { w = w, xs = xs }
 end
+
+----------------------------------------------------------------------
+-- THE GLYPH REGISTRY  (the tofu lesson, 2026-08-10)
+--
+-- The suite font is whatever face the owner picked in Daseeki-Core — the
+-- fresh-install default is the vendored FiraSansCondensed-Medium.ttf, and
+-- EVERY font role follows the picked face (theme.lua retired the hardcoded
+-- ARIALN roles). A glyph the face does not carry renders as a TOFU BOX wearing
+-- whatever ink the surrounding text was given, which is how the spec marker
+-- became a "mystery green square" in the owner's screenshots.
+--
+-- So: every non-ASCII marker this file prints lives HERE, and each entry is a
+-- glyph PROVEN to render — proven means its codepoint is present in the
+-- vendored face's cmap table (checked directly against the TTF) AND/OR it is
+-- already rendering in shipped suite text:
+--
+--   spec   U+25CA LOZENGE          in the vendored cmap; the diamond shape the
+--                                  tooltip's "Specialisation:" line explains.
+--                                  (U+25C6 BLACK DIAMOND is NOT in the face —
+--                                  that was the green square.)
+--   known  U+25CF BLACK CIRCLE     in the vendored cmap; already shipped by
+--                                  options.lua's mesh list ("\226\151\143 Online").
+--                                  (U+2713 CHECK MARK is NOT in the face —
+--                                  the recipe list's green box.)
+--   dash   U+2014 EM DASH          rendering across the whole suite (the very
+--                                  "— not checked" the owner could read).
+--   dots   U+2026 ELLIPSIS         shipped in Bags/Nexus status lines.
+--   middot U+00B7 MIDDLE DOT       the suite separator, everywhere.
+--   range  U+2013 EN DASH          world-drop level ranges.
+--   times  U+00D7 MULTIPLICATION   shipped as the suite's close-button "x".
+--
+-- (A texture is the other honest option — Dashboard.MakeDiamond draws a
+-- token-tinted diamond pip — but a text marker rides the FontString it
+-- annotates for free, so the in-cmap lozenge wins.)
+--
+-- BANNED_GLYPHS is the other half: sequences that have ALREADY shipped as tofu
+-- once. The self-test fails if any of them reappears — in the registry, in any
+-- pure-layer output it can reach, and (under the harness, where io exists) as
+-- raw bytes or decimal escapes anywhere in this file's source.
+----------------------------------------------------------------------
+
+ProfUI.GLYPHS = {
+    spec   = "\226\151\138",   -- U+25CA lozenge (the spec marker)
+    known  = "\226\151\143",   -- U+25CF black circle (recipe known / cd ready)
+    dash   = "\226\128\148",   -- U+2014 em dash
+    dots   = "\226\128\166",   -- U+2026 ellipsis
+    middot = "\194\183",       -- U+00B7 middle dot
+    range  = "\226\128\147",   -- U+2013 en dash
+    times  = "\195\151",       -- U+00D7 multiplication sign
+    absent = "--",             -- ASCII: the never-learned secondary cell
+}
+
+-- Codepoints that shipped as tofu boxes once. Stored as BYTE TRIPLES so the
+-- banned sequences themselves never appear in this file in either matchable
+-- form (raw UTF-8 or decimal escapes) — the self-test builds both forms at
+-- runtime and scans for them.
+ProfUI.BANNED_GLYPH_BYTES = {
+    { name = "U+25C6 black diamond (the mystery green square)", 226, 151, 134 },
+    { name = "U+2713 check mark (the known-row green box)",     226, 156, 147 },
+}
 
 ----------------------------------------------------------------------
 -- PROFESSION ORDER
@@ -399,6 +473,23 @@ function ProfUI.RecipeCount(profKey)
     local idx = D.profIdx and D.profIdx[profKey]
     if not idx then return 0 end
     return #((D.profRecipes and D.profRecipes[idx]) or {})
+end
+
+-- A profession you can OPEN. The owner's rule ("Fishing doesnt need a tab",
+-- "skinnign is not something that can be opened") made DATA-DRIVEN: a
+-- profession with ZERO recipes in the dataset has no craft window, no recipe
+-- census, nothing to browse and nothing to scan — the catalogue's own count is
+-- the gate, never a hardcoded name list. In the shipped dataset that is
+-- fishing, herbalism and skinning (mining keeps its 12 Smelting recipes, so
+-- mining keeps its tab). The two refusals fail OPEN on purpose: an unloadable
+-- dataset or an unknown key cannot prove "nothing to browse", and hiding a tab
+-- on a guess would be the silent-drop lie.
+function ProfUI.HasBrowsableRecipes(profKey)
+    local D = core()
+    if not D then return true end
+    local idx = D.profIdx and D.profIdx[profKey]
+    if not idx then return true end
+    return #((D.profRecipes and D.profRecipes[idx]) or {}) > 0
 end
 
 ----------------------------------------------------------------------
@@ -685,9 +776,32 @@ end
 ProfUI.ERA_CAP = 300
 function ProfUI.LevelInk(level)
     local n = tonumber(level)
-    if not n then return "\226\128\148", "faint" end
+    if not n then return ProfUI.GLYPHS.dash, "faint" end
     if n >= ProfUI.ERA_CAP then return tostring(n), "ok" end
     return tostring(n), "warn"
+end
+
+-- PURE. The census half of a grid cell's bottom line — text, ink, or NIL for
+-- "render nothing". Nil is the whole point for a ZERO-RECIPE profession
+-- (fishing, herbalism, skinning): there is no window to open and no census to
+-- take, so neither "— not checked" nor a known/total count may ever appear —
+-- the level alone is the whole truth (owner's rule, 2026-08-10).
+function ProfUI.CensusText(model)
+    if type(model) ~= "table" then return nil end
+    if (tonumber(model.total) or 0) == 0 then return nil end
+    if model.scanned then
+        return tostring(model.known or 0) .. "/" .. tostring(model.total), "muted"
+    end
+    return ProfUI.GLYPHS.dash .. " not checked", "faint"
+end
+
+-- PURE. One SECONDARY chip's text + ink. A character who never learned the
+-- profession renders the ASCII "--" placeholder in the faint ink (the
+-- never-recorded family) — a quiet "nothing here", never an empty cell that
+-- reads as "not painted yet". A learned profession is the level, as ever.
+function ProfUI.SecondaryCellText(model)
+    if type(model) ~= "table" then return ProfUI.GLYPHS.absent, "faint" end
+    return ProfUI.LevelInk(model.level)
 end
 
 -- One profession cell. nil when the character does not have that profession at
@@ -874,16 +988,37 @@ function ProfUI.CooldownKindRows(entries, lookup, nowE, res)
     return order
 end
 
--- PURE. The detail pane's tab list for one character: every profession the
--- payload proves they hold, primaries first then secondaries, each block
--- sorted — the same order ProfessionList renders, reduced to keys. A rogue's
--- poisons rides in payload.p and therefore gets its tab; a character without
--- it cannot, because the probe never invents a profession.
+-- PURE apart from the dataset read. The detail pane's tab list for one
+-- character: every profession the payload proves they hold AND that has
+-- recipes to browse, primaries first then secondaries, each block sorted —
+-- the same order ProfessionList renders, reduced to keys. A rogue's poisons
+-- rides in payload.p and therefore gets its tab; a character without it
+-- cannot, because the probe never invents a profession. A ZERO-RECIPE
+-- profession (fishing, herbalism, skinning — by dataset count, see
+-- HasBrowsableRecipes) gets NO tab: there is no window behind it and nothing a
+-- tab could show. It stays in the grid, the payload and the mesh — level
+-- tracking is the part the owner wants — it just cannot be "opened" here any
+-- more than it can in the game.
 function ProfUI.DetailTabs(payload)
     local out = {}
     local list = ProfUI.ProfessionList(payload)
-    for i = 1, #list do out[i] = list[i].key end
+    for i = 1, #list do
+        local key = list[i].key
+        if ProfUI.HasBrowsableRecipes(key) then out[#out + 1] = key end
+    end
     return out
+end
+
+-- PURE. Which tab actually shows: the remembered one if it is still eligible,
+-- else the character's FIRST eligible profession. This is the same fallback
+-- that already caught "remembered tab the character no longer holds"; the
+-- zero-recipe exclusion routes through it too, so a session that left
+-- Skinning selected lands on the first real tab instead of a blank pane.
+function ProfUI.ResolveDetailTab(tabs, want)
+    for i = 1, #(tabs or {}) do
+        if tabs[i] == want then return want end
+    end
+    return tabs and tabs[1] or nil
 end
 
 ----------------------------------------------------------------------
@@ -960,9 +1095,55 @@ local function npcWhere(D, id)
     return npc.name
 end
 
+-- The zone an NPC stands in, alone — nil when the indices cannot say.
+local function npcZone(D, id)
+    local npc = D.npc and D.npc[id]
+    local zone = npc and npc.zone and D.zone and D.zone[npc.zone]
+    return zone and zone.name or nil
+end
+
 local function plusMore(n)
     if n > 1 then return " +" .. (n - 1) .. " more" end
     return ""
+end
+
+-- PURE over the dataset. The vendor half of an acquisition line, WITH ZONES
+-- (owner's directive, 2026-08-10): "Sold by Dan Golthas \226\128\148 Badlands",
+-- up to VENDOR_NAMES of them comma-joined, then the current idiom's "+N more"
+-- for the rest. An NPC the indices cannot place keeps its name alone rather
+-- than inventing a zone; an NPC the indices do not carry at all reads "?".
+ProfUI.VENDOR_NAMES = 2
+function ProfUI.VendorPhrase(D, npcList)
+    local ids = {}
+    for id in tostring(npcList or ""):gmatch("%d+") do ids[#ids + 1] = tonumber(id) end
+    if #ids == 0 then return "Sold by ?" end
+    local named = {}
+    for i = 1, math.min(#ids, ProfUI.VENDOR_NAMES) do
+        local npc = D.npc and D.npc[ids[i]]
+        local part = npc and npc.name or "?"
+        local zone = npcZone(D, ids[i])
+        if zone then part = part .. " " .. ProfUI.GLYPHS.dash .. " " .. zone end
+        named[#named + 1] = part
+    end
+    local tail = ""
+    if #ids > ProfUI.VENDOR_NAMES then
+        tail = " +" .. (#ids - ProfUI.VENDOR_NAMES) .. " more"
+    end
+    return "Sold by " .. table.concat(named, ", ") .. tail
+end
+
+-- PURE over the dataset. A quest acquisition WITH ITS ZONE:
+-- "Quest: Goretusk Liver Pie \226\128\148 Westfall". The [quest] rows carry no
+-- zone of their own — the zone is where the quest GIVER stands, via the same
+-- npc -> zone link the vendors use — so a giver-less quest (the dataset holds
+-- seven) keeps its bare name rather than guessing.
+function ProfUI.QuestPhrase(D, questID)
+    local q = D.quest and D.quest[questID]
+    if not q then return "Quest: ?" end
+    local text = "Quest: " .. (q.name or "?")
+    local zone = npcZone(D, firstNumber(q.givers))
+    if zone then text = text .. " " .. ProfUI.GLYPHS.dash .. " " .. zone end
+    return text
 end
 
 -- Walk ONE recipe-item's acquisition relations into display parts. Returns
@@ -982,10 +1163,9 @@ local function itemRoute(D, itemID)
             local head = tok:sub(1, 1)
             if head == "V" then
                 local cost, npcs = tok:match("^V(%d+)@([%d%+]+)$")
-                local where = npcWhere(D, firstNumber(npcs))
                 local m = money(tonumber(cost))
-                parts[#parts + 1] = "Vendor: " .. (where or "?")
-                    .. plusMore(countNumbers(npcs)) .. (m and (" \194\183 " .. m) or "")
+                parts[#parts + 1] = ProfUI.VendorPhrase(D, npcs)
+                    .. (m and (" \194\183 " .. m) or "")
             elseif head == "D" then
                 local npcs = tok:sub(2)
                 parts[#parts + 1] = "Drops from " .. (npcWhere(D, firstNumber(npcs)) or "?")
@@ -994,8 +1174,7 @@ local function itemRoute(D, itemID)
                 local lo, hi = tok:match("^W(%d+)%-(%d+)$")
                 parts[#parts + 1] = "World drop (mobs " .. tostring(lo) .. "\226\128\147" .. tostring(hi) .. ")"
             elseif head == "Q" then
-                local q = D.quest and D.quest[firstNumber(tok:sub(2))]
-                parts[#parts + 1] = "Quest: " .. ((q and q.name) or "?")
+                parts[#parts + 1] = ProfUI.QuestPhrase(D, firstNumber(tok:sub(2)))
             elseif head == "O" then
                 local o = D.object and D.object[firstNumber(tok:sub(2))]
                 parts[#parts + 1] = "World object: " .. ((o and o.name) or "?")
@@ -1089,8 +1268,7 @@ function ProfUI.SourceModel(spellID)
                 end
             elseif head == "Q" then
                 routes = routes + 1
-                local q = D.quest and D.quest[firstNumber(tok:sub(2))]
-                lines[#lines + 1] = "Quest: " .. ((q and q.name) or "?")
+                lines[#lines + 1] = ProfUI.QuestPhrase(D, firstNumber(tok:sub(2)))
             elseif head == "O" then
                 routes = routes + 1
                 local o = D.object and D.object[firstNumber(tok:sub(2))]
@@ -1494,11 +1672,6 @@ local function inventoryLookup()
     end
 end
 ProfUI.InventoryLookup = inventoryLookup
-
-local function reagentStore()
-    local S = ns.Store
-    return (S and S.ProfessionsReagents and S.ProfessionsReagents(false)) or nil
-end
 
 -- The roster, in the SAME order the character cards use — the brief's "roster
 -- order matching the cards" is not a coincidence to be re-derived, it is
@@ -1953,9 +2126,17 @@ local function paintCell(cell, model, ownerKey, compact)
         cell._icon:SetTexture(nil)
         if cell._top then cell._top:SetText("") end
         if cell._bot then cell._bot:SetText("") end
-        if cell._text then cell._text:SetText("") end
+        if cell._text then
+            -- An absent SECONDARY says so out loud: the ASCII "--" in the
+            -- faint ink (owner's directive — an empty cell reads as "not
+            -- painted yet", which is a different claim). No icon: there is no
+            -- profession to draw one for.
+            local at, ai = ProfUI.SecondaryCellText(nil)
+            cell._text:SetText(at)
+            cell._text:SetTextColor(UI.Color(ai))
+        end
         cell:EnableMouse(false)
-        cell:SetAlpha(0.35)
+        cell:SetAlpha(cell._text and 1 or 0.35)
         return
     end
     cell:EnableMouse(true)
@@ -1964,8 +2145,10 @@ local function paintCell(cell, model, ownerKey, compact)
     -- A DESATURATED ICON is the third state at a glance: we know this character
     -- has the profession, we have never looked inside it. The secondary chips
     -- have no room for the words, so this is the only signal they carry — and
-    -- the primaries wear it too so the two blocks mean the same thing.
-    cell._icon:SetDesaturated(not model.scanned)
+    -- the primaries wear it too so the two blocks mean the same thing. A
+    -- ZERO-RECIPE profession has no window to look inside, so "never looked"
+    -- is not a fact about it and its icon stays saturated.
+    cell._icon:SetDesaturated(((model.total or 0) > 0 and not model.scanned) and true or false)
 
     -- Owner's rule (ProfUI.LevelInk): current level only, green at the Era
     -- cap, yellow below it, em dash when never recorded.
@@ -1976,25 +2159,30 @@ local function paintCell(cell, model, ownerKey, compact)
         return
     end
 
-    cell._top:SetText(lvlText .. (model.hasSpec and "  \226\151\134" or ""))
+    -- The spec marker: an IN-FONT lozenge (see THE GLYPH REGISTRY — the black
+    -- diamond was a tofu box), inked accent so it reads as an annotation, not
+    -- as part of the green/yellow level. The cell tooltip stays the explainer.
+    cell._top:SetText(lvlText .. (model.hasSpec
+        and ("  " .. Dashboard.Colored(ProfUI.GLYPHS.spec, "accent")) or ""))
     cell._top:SetTextColor(UI.Color(lvlInk))
 
     -- The bottom line answers the most URGENT thing we know, in this order:
-    -- a ready cooldown, a running one, then the recipe census — and the census
-    -- is an EM DASH when the window has never been opened, never a zero.
+    -- a ready cooldown, a running one, then the recipe census — which is an EM
+    -- DASH + "not checked" when the window has never been opened, never a
+    -- zero, and NOTHING AT ALL for a zero-recipe profession (CensusText's
+    -- rule: no window exists, so there is nothing to have checked).
     local cd = model.cd
     if cd and cd.state == "ready" then
-        cell._bot:SetText("\226\156\147 ready" .. (cd.ready > 1 and (" \195\151" .. cd.ready) or ""))
+        cell._bot:SetText(ProfUI.GLYPHS.known .. " ready"
+            .. (cd.ready > 1 and (" " .. ProfUI.GLYPHS.times .. cd.ready) or ""))
         cell._bot:SetTextColor(UI.Color("ok"))
     elseif cd and cd.state == "running" then
         cell._bot:SetText(Dashboard.FormatDuration(cd.remaining, "compact"))
         cell._bot:SetTextColor(UI.Color("warn"))
-    elseif model.scanned then
-        cell._bot:SetText(tostring(model.known or 0) .. "/" .. tostring(model.total))
-        cell._bot:SetTextColor(UI.Color("muted"))
     else
-        cell._bot:SetText("\226\128\148 not checked")
-        cell._bot:SetTextColor(UI.Color("faint"))
+        local ct, ci = ProfUI.CensusText(model)
+        cell._bot:SetText(ct or "")
+        if ci then cell._bot:SetTextColor(UI.Color(ci)) end
     end
 end
 
@@ -2031,7 +2219,10 @@ local function paintRecipeRow(rr, row, selected)
     rr._spell = row.spell
     local grey = row.unavailable and true or false
     if row.state == "known" then
-        rr._mark:SetText("\226\156\147"); rr._mark:SetTextColor(UI.Color("ok"))
+        -- The known marker is the IN-FONT dot (see THE GLYPH REGISTRY): the
+        -- check mark it replaces is not in the suite face and shipped as a
+        -- green tofu box. options.lua's mesh list already renders this dot.
+        rr._mark:SetText(ProfUI.GLYPHS.known); rr._mark:SetTextColor(UI.Color("ok"))
     elseif row.state == "missing" then
         rr._mark:SetText("+"); rr._mark:SetTextColor(UI.Color("accentDim"))
     else
@@ -2090,23 +2281,11 @@ local function makeSearchRow(searchChild)
     return sr
 end
 
--- ── the material row (recipe detail band) ────────────────────────────────────
-local function makeMatRow(matHost)
-    local mt = CreateFrame("Frame", nil, matHost)
-    mt:SetSize(1, L.LIST_ROW_H - 2)
-    local micon = mt:CreateTexture(nil, "ARTWORK")
-    micon:SetSize(14, 14)
-    micon:SetPoint("LEFT", mt, "LEFT", 2, 0)
-    micon:SetTexCoord(0.07, 0.93, 0.07, 0.93)
-    local mtext = fstr(mt, "body", "LEFT")
-    mtext:SetPoint("LEFT", micon, "RIGHT", 5, 0)
-    local melse = fstr(mt, "small", "RIGHT")
-    melse:SetPoint("RIGHT", mt, "RIGHT", -4, 0)
-    melse:SetWidth(190)
-    mtext:SetPoint("RIGHT", melse, "LEFT", -6, 0)
-    mt._icon, mt._text, mt._else = micon, mtext, melse
-    return mt
-end
+-- (The material-row factory lived here until the owner retired the MATERIALS
+-- block from the detail pane, 2026-08-10. The DATA layer stays: MaterialRows /
+-- MaterialText above are the reagent join, professions.lua still harvests, and
+-- the tooltip/mesh consumers still read the store — only the pane stopped
+-- painting it, and the recipe list wears the freed height.)
 
 -- Class-colored short name. `extra` appends an honest overflow marker.
 local function nameInk(fs, nameRealm, classTag, extra)
@@ -2129,7 +2308,7 @@ Dashboard.RegisterTab("professions", function(host)
         query   = "",
         filters = { search = "", source = nil, missingOnly = false, showUnavailable = false },
         obj     = {},
-        _gridRows = {}, _cdRows = {}, _recRows = {}, _searchRows = {}, _matRows = {},
+        _gridRows = {}, _cdRows = {}, _recRows = {}, _searchRows = {},
         _tabBtns = {},
     }
     thePane = pane
@@ -2388,7 +2567,7 @@ Dashboard.RegisterTab("professions", function(host)
     local recScroll, recChild = scroller(detailP, "prof.recipes.list")
     recScroll:SetPoint("TOPLEFT", filter2, "BOTTOMLEFT", 0, -4)
     recScroll:SetPoint("BOTTOMRIGHT", detailP, "BOTTOMRIGHT", -L.PANEL_PAD,
-                       L.DETAIL_H + L.PANEL_PAD + 4)
+                       ProfUI.RecipeListBottomInset())
     pane._recChild = recChild
 
     local recEmpty = fstr(recChild, "muted", "LEFT")
@@ -2396,12 +2575,15 @@ Dashboard.RegisterTab("professions", function(host)
     recEmpty:Hide()
     pane._recEmpty = recEmpty
 
-    -- The selected recipe's SOURCE + MATERIALS, pinned to the bottom of the
-    -- detail pane so the list above it never has to reflow.
+    -- The selected recipe's INFO BAND — name + where it comes from — pinned to
+    -- the bottom of the detail pane so the list above it never has to reflow.
+    -- The MATERIALS block that used to live under it is retired (owner's
+    -- rework, 2026-08-10): the band shrank to its two lines of content and the
+    -- recipe list above owns the freed height.
     local detail = CreateFrame("Frame", nil, detailP)
     detail:SetPoint("BOTTOMLEFT", detailP, "BOTTOMLEFT", L.PANEL_PAD, L.PANEL_PAD)
     detail:SetPoint("BOTTOMRIGHT", detailP, "BOTTOMRIGHT", -L.PANEL_PAD, L.PANEL_PAD)
-    detail:SetHeight(L.DETAIL_H)
+    detail:SetHeight(L.INFO_H)
     Dashboard.Tag(detail, "prof.recipe.detail")
     pane._detail = detail
 
@@ -2411,23 +2593,7 @@ Dashboard.RegisterTab("professions", function(host)
     local dSource = fstr(detail, "small", "LEFT")
     dSource:SetPoint("TOPLEFT", dTitle, "BOTTOMLEFT", 0, -3)
     dSource:SetPoint("RIGHT", detail, "RIGHT", -2, 0)
-    local dMats = eyebrow(detail, "MATERIALS", "LEFT")
-    dMats:SetPoint("TOPLEFT", dSource, "BOTTOMLEFT", 0, -6)
-    -- The note and the reagent rows are MUTUALLY EXCLUSIVE — either we have the
-    -- materials or we are saying why we do not — so they share one origin under
-    -- the MATERIALS eyebrow rather than stacking with a permanently blank line
-    -- between them (style rule 4: no unexplained vertical gaps). Their shared
-    -- anchor is `dMats`, not the pane, so the static overlap gate's shared-parent
-    -- rule is not tripped by a pair that genuinely cannot both be visible.
-    local dNote = fstr(detail, "small", "LEFT")
-    dNote:SetPoint("TOPLEFT", dMats, "BOTTOMLEFT", 0, -3)
-    dNote:SetPoint("RIGHT", detail, "RIGHT", -2, 0)
-    pane._dTitle, pane._dSource, pane._dMats, pane._dNote = dTitle, dSource, dMats, dNote
-
-    local matHost = CreateFrame("Frame", nil, detail)
-    matHost:SetPoint("TOPLEFT", dMats, "BOTTOMLEFT", 0, -3)
-    matHost:SetPoint("BOTTOMRIGHT", detail, "BOTTOMRIGHT", 0, 0)
-    pane._matHost = matHost
+    pane._dTitle, pane._dSource = dTitle, dSource
 
     -- ══ THE SEARCH OVERLAY: the who-can-craft results (typing in the toolbar
     -- box swaps the three panes for this, clearing it swaps them back) ═══════
@@ -2506,17 +2672,23 @@ Dashboard.RegisterTab("professions", function(host)
             end
             GameTooltip:AddLine("Specialisation: " .. table.concat(names, ", "), UI.Color("accent"))
         end
-        if m.scanned then
-            GameTooltip:AddLine(tostring(m.known or 0) .. " of " .. tostring(m.total)
-                .. " recipes known", UI.Color("muted"))
-            if m.drift and m.drift > 0 then
-                GameTooltip:AddLine(m.drift .. " known recipe(s) our catalogue does not carry",
-                    UI.Color("warn"))
+        -- The recipe-census lines exist only for professions that HAVE a
+        -- census. A zero-recipe profession (fishing, herbalism, skinning) has
+        -- no window to open, so "NOT CHECKED — open it once" would be an
+        -- instruction the game cannot follow (owner's rule, 2026-08-10).
+        if (m.total or 0) > 0 then
+            if m.scanned then
+                GameTooltip:AddLine(tostring(m.known or 0) .. " of " .. tostring(m.total)
+                    .. " recipes known", UI.Color("muted"))
+                if m.drift and m.drift > 0 then
+                    GameTooltip:AddLine(m.drift .. " known recipe(s) our catalogue does not carry",
+                        UI.Color("warn"))
+                end
+            else
+                GameTooltip:AddLine("Recipes NOT CHECKED \226\128\148 open this profession's window",
+                    UI.Color("faint"))
+                GameTooltip:AddLine("on that character once to fill it in.", UI.Color("faint"))
             end
-        else
-            GameTooltip:AddLine("Recipes NOT CHECKED \226\128\148 open this profession's window",
-                UI.Color("faint"))
-            GameTooltip:AddLine("on that character once to fill it in.", UI.Color("faint"))
         end
         if m.cd then
             if m.cd.state == "ready" then
@@ -2551,11 +2723,6 @@ Dashboard.RegisterTab("professions", function(host)
     local function getSearchRow(i)
         local r = pane._searchRows[i]
         if not r then r = makeSearchRow(searchChild); pane._searchRows[i] = r end
-        return r
-    end
-    local function getMatRow(i)
-        local r = pane._matRows[i]
-        if not r then r = makeMatRow(matHost); pane._matRows[i] = r end
         return r
     end
 
@@ -2644,48 +2811,6 @@ Dashboard.RegisterTab("professions", function(host)
         notePending("spell", pendingIDs)
     end
 
-    local function renderMaterials(spell, ownerKey, res)
-        for _, r in ipairs(pane._matRows) do r:Hide() end
-        if not spell then
-            pane._dNote:SetText("Select a recipe to see what it costs.")
-            pane._dNote:SetTextColor(UI.Color("faint"))
-            pane._dNote:Show()
-            return
-        end
-        local rows, state, pending = ProfUI.MaterialRows(spell, reagentStore(), ownerKey,
-                                                         inventoryLookup(), res)
-        -- ABSENCE IS NOT ZERO. No harvest for this recipe means nobody on this
-        -- account has had its window open since the module arrived — so the
-        -- panel says exactly that, and exactly what fixes it, instead of drawing
-        -- a materials list of nothing.
-        if state == "unharvested" then
-            pane._dNote:SetText("Materials not yet harvested \226\128\148 open "
-                .. ProfUI.ProfName(pane.sel and pane.sel.profKey or "")
-                .. " on " .. Dashboard.ShortName(ownerKey) .. " once.")
-            pane._dNote:SetTextColor(UI.Color("warn"))
-            pane._dNote:Show()
-            return
-        end
-        pane._dNote:Hide()
-        local y = 0
-        for i = 1, #rows do
-            local row = rows[i]
-            local mt = getMatRow(i)
-            mt:ClearAllPoints()
-            mt:SetPoint("TOPLEFT", matHost, "TOPLEFT", 0, -y)
-            mt:SetPoint("RIGHT", matHost, "RIGHT", 0, 0)
-            mt._icon:SetTexture(Dashboard.ItemIcon(row.itemID))
-            local left, right = ProfUI.MaterialText(row)
-            mt._text:SetText(left)
-            mt._text:SetTextColor(UI.Color(row.enough and "ok" or (row.mine == nil and "faint" or "warn")))
-            mt._else:SetText(right or "")
-            mt._else:SetTextColor(UI.Color("muted"))
-            mt:Show()
-            y = y + (L.LIST_ROW_H - 2)
-        end
-        notePending("item", pending)
-    end
-
     -- Show/hide the detail pane's working furniture in one motion (the empty
     -- state hides all of it behind the hint line).
     local function setDetailShown(on)
@@ -2701,29 +2826,40 @@ Dashboard.RegisterTab("professions", function(host)
         local payload = sel and lookup(sel.owner) or nil
         local tabs = ProfUI.DetailTabs(payload)
 
-        -- EMPTY STATES: nothing selected, or a selected character the store
-        -- holds no professions record for. A quiet hint, not a blank pane.
+        -- EMPTY STATES: nothing selected, a selected character the store holds
+        -- no professions record for, or a character whose recorded professions
+        -- are all zero-recipe (nothing here can be "opened"). A quiet hint,
+        -- not a blank pane — and NEVER "open X once" about a profession that
+        -- has no window (owner's rule, 2026-08-10).
         if not sel or #tabs == 0 then
             for _, b in ipairs(pane._tabBtns) do b:Hide() end
             setDetailShown(false)
             dWho:SetText(sel and Dashboard.ShortName(sel.owner) or "")
             dWho:SetTextColor(UI.Color("muted"))
-            dHint:SetText(sel
-                and ("No professions recorded for " .. Dashboard.ShortName(sel.owner)
-                     .. " yet \226\128\148 open a profession window on that character once.")
-                or "Select a character to inspect their professions.")
+            local hint = "Select a character to inspect their professions."
+            if sel then
+                local held = ProfUI.ProfessionList(payload)
+                if #held > 0 then
+                    hint = Dashboard.ShortName(sel.owner)
+                        .. "'s recorded professions have no recipe lists to browse."
+                else
+                    hint = "No professions recorded for " .. Dashboard.ShortName(sel.owner)
+                        .. " yet \226\128\148 open a profession window on that character once."
+                end
+            end
+            dHint:SetText(hint)
             dHint:Show()
             return
         end
         dHint:Hide()
         setDetailShown(true)
 
-        -- A remembered tab that character no longer holds falls back to their
-        -- first profession rather than to a blank list.
-        local cur = nil
-        for i = 1, #tabs do if tabs[i] == sel.profKey then cur = sel.profKey break end end
-        if not cur then
-            cur = tabs[1]
+        -- A remembered tab that is no longer eligible — the character dropped
+        -- the profession, or the tab belongs to a zero-recipe profession that
+        -- no longer earns one — falls back to their first eligible profession
+        -- rather than to a blank list (ProfUI.ResolveDetailTab).
+        local cur = ProfUI.ResolveDetailTab(tabs, sel.profKey)
+        if cur ~= sel.profKey then
             sel.profKey = cur
             sel.spell = nil
         end
@@ -2788,7 +2924,9 @@ Dashboard.RegisterTab("professions", function(host)
         pane._recEmpty:SetShown(#rows == 0)
         recStatus:SetText(statusText or "")
 
-        -- The selected recipe's source + materials.
+        -- The selected recipe's INFO BAND: its name and where it comes from.
+        -- (The MATERIALS block is retired; the reagent data still lives in the
+        -- store for its other consumers.)
         if sel.spell then
             local nm = res.spell and res.spell(sel.spell) or nil
             pane._dTitle:SetText(nm or "\226\128\166")
@@ -2802,9 +2940,9 @@ Dashboard.RegisterTab("professions", function(host)
             pane._dSource:SetTextColor(UI.Color(src and src.unavailable and "danger" or "muted"))
         else
             pane._dTitle:SetText("")
-            pane._dSource:SetText("")
+            pane._dSource:SetText("Select a recipe to see where it comes from.")
+            pane._dSource:SetTextColor(UI.Color("faint"))
         end
-        renderMaterials(sel.spell, sel.owner, res)
         notePending("spell", pending)
     end
 
@@ -3261,10 +3399,13 @@ local function testDetailAndKinds(fails)
     local sawPoisons = false
     for _, k in ipairs(rt) do if k == "poisons" then sawPoisons = true end end
     ck(sawPoisons, "the rogue did not get a Poisons tab")
+    -- The mage HOLDS fishing, but fishing carries zero dataset recipes, so it
+    -- earns NO tab (the owner's "Fishing doesnt need a tab", data-driven).
     local mt = ProfUI.DetailTabs(mage)
-    ck(#mt == 3, "the mage's tab count is wrong (" .. #mt .. ")")
+    ck(#mt == 2, "the mage's tab count is wrong (" .. #mt .. ")")
     for _, k in ipairs(mt) do
         ck(k ~= "poisons", "a non-rogue grew a Poisons tab")
+        ck(k ~= "fishing", "a zero-recipe profession earned a detail tab")
     end
     ck(#ProfUI.DetailTabs(nil) == 0, "no payload still produced tabs")
 
@@ -3650,6 +3791,199 @@ local function testSourceModel(fails)
     ProfUI._measuredUnavailable = unavailable
 end
 
+local function testDetailRework(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local D = core()
+    if not D then fails[#fails + 1] = "dataset unavailable for the rework tests" return end
+
+    ------------------------------------------------------------------
+    -- GLYPH PINS. The two sequences that shipped as tofu boxes (the spec
+    -- diamond, the known check mark) may never come back — not in the
+    -- registry, not in the pure outputs, and under the harness not anywhere
+    -- in this file's source, in either raw-UTF-8 or decimal-escape form.
+    ------------------------------------------------------------------
+    ck(ProfUI.GLYPHS.spec == string.char(226, 151, 138),
+       "the spec marker is not the in-font lozenge U+25CA")
+    ck(ProfUI.GLYPHS.known == string.char(226, 151, 143),
+       "the known marker is not the in-font dot U+25CF")
+    for _, bad in ipairs(ProfUI.BANNED_GLYPH_BYTES) do
+        local raw = string.char(bad[1], bad[2], bad[3])
+        local esc = "\\" .. bad[1] .. "\\" .. bad[2] .. "\\" .. bad[3]
+        for key, g in pairs(ProfUI.GLYPHS) do
+            if tostring(g):find(raw, 1, true) then
+                fails[#fails + 1] = "GLYPHS." .. key .. " carries the banned " .. bad.name
+            end
+        end
+        -- Pure outputs that carry markers.
+        local lvl = ProfUI.LevelInk(nil) or ""
+        local cen = ProfUI.CensusText({ total = 5, scanned = false }) or ""
+        ck(not lvl:find(raw, 1, true), "LevelInk emits the banned " .. bad.name)
+        ck(not cen:find(raw, 1, true), "CensusText emits the banned " .. bad.name)
+        -- The whole-file scan: harness only (io exists there; the client has
+        -- no file access, and the registry/output pins above still hold).
+        if io and io.open and debug and debug.getinfo then
+            local src = debug.getinfo(ProfUI.CensusText, "S").source or ""
+            local path = src:match("^@(.*)$")
+            local fh = path and io.open(path, "rb")
+            if fh then
+                local text = fh:read("*a") or ""
+                fh:close()
+                ck(not text:find(raw, 1, true),
+                   "this file carries the banned " .. bad.name .. " as raw bytes")
+                ck(not text:find(esc, 1, true),
+                   "this file carries the banned " .. bad.name .. " as decimal escapes")
+            end
+        end
+    end
+
+    ------------------------------------------------------------------
+    -- WINDOWLESS PROFESSIONS — the zero-recipe rule, data-driven.
+    ------------------------------------------------------------------
+    ck(ProfUI.RecipeCount("fishing") == 0, "fishing grew dataset recipes")
+    ck(ProfUI.RecipeCount("herbalism") == 0, "herbalism grew dataset recipes")
+    ck(ProfUI.RecipeCount("skinning") == 0, "skinning grew dataset recipes")
+    ck(ProfUI.HasBrowsableRecipes("fishing") == false, "fishing claims a browsable window")
+    ck(ProfUI.HasBrowsableRecipes("herbalism") == false, "herbalism claims a browsable window")
+    ck(ProfUI.HasBrowsableRecipes("skinning") == false, "skinning claims a browsable window")
+    -- Mining is the deliberate NON-member: the dataset carries its Smelting
+    -- recipes, so mining KEEPS its tab. The rule is the count, not the name.
+    ck(ProfUI.RecipeCount("mining") > 0, "mining lost its Smelting recipes")
+    ck(ProfUI.HasBrowsableRecipes("mining") == true, "mining lost its tab despite Smelting")
+    ck(ProfUI.HasBrowsableRecipes("cooking") == true, "cooking lost its tab")
+    ck(ProfUI.HasBrowsableRecipes("no-such-profession") == true,
+       "an unknown key was silently hidden instead of failing open")
+
+    -- The Senche case: Skinning remembered/selected, and the character's tabs
+    -- no longer offer it — the fallback lands on the first eligible tab.
+    local senche = { p = { skinning = { l = 300, m = 300 }, herbalism = { l = 225, m = 300 },
+                          alchemy = { l = 265, m = 300 }, fishing = { l = 40, m = 150 } }, c = {} }
+    local tabs = ProfUI.DetailTabs(senche)
+    ck(#tabs == 1 and tabs[1] == "alchemy",
+       "skinning/herbalism/fishing leaked into the tab strip (" .. #tabs .. ")")
+    ck(ProfUI.ResolveDetailTab(tabs, "skinning") == "alchemy",
+       "a remembered excluded tab did not fall back to the first eligible one")
+    ck(ProfUI.ResolveDetailTab(tabs, "alchemy") == "alchemy",
+       "an eligible remembered tab was not kept")
+    ck(ProfUI.ResolveDetailTab({}, "skinning") == nil,
+       "no eligible tabs still resolved a tab")
+
+    -- No census, no "not checked", for a zero-recipe profession — the level
+    -- alone is the whole truth. A recipe-bearing profession keeps both forms.
+    local fishCell = ProfUI.CellModel(senche, "fishing", 1700000000)
+    ck(fishCell ~= nil and fishCell.total == 0, "the fishing cell lost its zero-recipe fact")
+    ck(ProfUI.CensusText(fishCell) == nil,
+       "a zero-recipe profession still renders a census / 'not checked' line")
+    local ct, ci = ProfUI.CensusText({ total = 81, scanned = true, known = 12 })
+    ck(ct == "12/81" and ci == "muted", "a scanned census stopped rendering known/total")
+    local ut, ui2 = ProfUI.CensusText({ total = 81, scanned = false })
+    ck(ut == ProfUI.GLYPHS.dash .. " not checked" and ui2 == "faint",
+       "an unscanned recipe-bearing profession lost its 'not checked' line")
+
+    ------------------------------------------------------------------
+    -- ABSENT SECONDARY: the "--" placeholder, faint, and only for absence.
+    ------------------------------------------------------------------
+    local at, ai = ProfUI.SecondaryCellText(nil)
+    ck(at == "--" and ai == "faint",
+       "an absent secondary does not render the faint '--' placeholder")
+    local lt2, li2 = ProfUI.SecondaryCellText({ level = 300 })
+    ck(lt2 == "300" and li2 == "ok", "a learned secondary stopped rendering its level")
+    local nt, ni = ProfUI.SecondaryCellText({ level = nil })
+    ck(nt == ProfUI.GLYPHS.dash and ni == "faint",
+       "a learned-but-unrecorded secondary lost its em-dash state")
+
+    ------------------------------------------------------------------
+    -- THE FREED SPACE: retiring the materials band (132px) shrank the info
+    -- band to content and the recipe list owns the difference.
+    ------------------------------------------------------------------
+    ck(ProfUI.RecipeListBottomInset() == L.INFO_H + L.PANEL_PAD + 4,
+       "the list's bottom inset drifted off the LAYOUT reader")
+    local RETIRED_MATERIALS_BAND = 132
+    ck(L.INFO_H < RETIRED_MATERIALS_BAND,
+       "the info band grew back toward the retired materials height")
+    ck(math.floor((RETIRED_MATERIALS_BAND - L.INFO_H) / L.LIST_ROW_H) >= 4,
+       "the recipe list did not gain at least four rows from the retired band")
+
+    ------------------------------------------------------------------
+    -- ACQUISITION LINES WITH ZONES — fixture first, then the real dataset.
+    ------------------------------------------------------------------
+    local FD = {
+        zone  = { [1] = { name = "Badlands" }, [2] = { name = "Westfall" } },
+        npc   = { [10] = { zone = 1, name = "Dan Golthas" },
+                  [11] = { zone = 2, name = "Kriggon Talsone" },
+                  [12] = { name = "Wandering Trader" } },
+        quest = { [22] = { name = "Goretusk Liver Pie", givers = "11" },
+                  [40] = { name = "The Spectral Chalice", givers = "-" } },
+    }
+    ck(ProfUI.VendorPhrase(FD, "10") == "Sold by Dan Golthas \226\128\148 Badlands",
+       "the single-vendor line is not 'Sold by <name> \226\128\148 <zone>'")
+    ck(ProfUI.VendorPhrase(FD, "10+11+12") ==
+       "Sold by Dan Golthas \226\128\148 Badlands, Kriggon Talsone \226\128\148 Westfall +1 more",
+       "the multi-vendor line does not name " .. ProfUI.VENDOR_NAMES .. " then '+N more'")
+    ck(ProfUI.VendorPhrase(FD, "12") == "Sold by Wandering Trader",
+       "a zone-less vendor invented a zone")
+    ck(ProfUI.VendorPhrase(FD, "999") == "Sold by ?",
+       "an unindexed vendor NPC did not degrade to '?'")
+    ck(ProfUI.QuestPhrase(FD, 22) == "Quest: Goretusk Liver Pie \226\128\148 Westfall",
+       "the quest line is not 'Quest: <name> \226\128\148 <zone>'")
+    ck(ProfUI.QuestPhrase(FD, 40) == "Quest: The Spectral Chalice",
+       "a giver-less quest invented a zone")
+    ck(ProfUI.QuestPhrase(FD, 12345) == "Quest: ?",
+       "an unindexed quest did not degrade to '?'")
+
+    -- The real dataset speaks the owner's own example, through the same path
+    -- the info band renders: quest 22's giver stands in Westfall.
+    local SD = sourcesDS()
+    if not SD then fails[#fails + 1] = "the source graph would not load for the zone tests" return end
+    ck(ProfUI.QuestPhrase(SD, 22) == "Quest: Goretusk Liver Pie \226\128\148 Westfall",
+       "the shipped dataset does not resolve quest 22 to Westfall ("
+       .. tostring(ProfUI.QuestPhrase(SD, 22)) .. ")")
+
+    -- Every shipped vendor token must produce a zoned "Sold by" phrase (the
+    -- referential gate guarantees every [npc] row carries a zone ordinal), and
+    -- at least one recipe-item must exercise the "+N more" overflow. World
+    -- drops keep their existing note untouched.
+    local vendors, zoned, overflowed, worldDrops = 0, 0, 0, 0
+    for itemID, acq in pairs(SD.itemAcq or {}) do
+        for tok in (tostring(acq) .. ";"):gmatch("(.-);") do
+            local npcs = tok:match("^V%d+@([%d%+]+)$")
+            if npcs then
+                vendors = vendors + 1
+                local phrase = ProfUI.VendorPhrase(SD, npcs)
+                if phrase:find("^Sold by ") and phrase:find("\226\128\148", 1, true) then
+                    zoned = zoned + 1
+                end
+                local ids = 0
+                for _ in npcs:gmatch("%d+") do ids = ids + 1 end
+                if ids > ProfUI.VENDOR_NAMES then
+                    if phrase:find("%+%d+ more") then overflowed = overflowed + 1 end
+                end
+            elseif tok:find("^W%d") then
+                worldDrops = worldDrops + 1
+            end
+        end
+    end
+    ck(vendors > 0, "the dataset stopped carrying vendor routes")
+    ck(zoned == vendors, (vendors - zoned) .. " of " .. vendors
+       .. " vendor phrases came out without a zone")
+    ck(overflowed > 0, "no multi-vendor recipe exercised the '+N more' overflow")
+    ck(worldDrops > 0, "the dataset stopped carrying world-drop routes")
+
+    -- A world-drop teaching item still reads with its untouched note.
+    for itemID, acq in pairs(SD.itemAcq or {}) do
+        local lo, hi = tostring(acq):match("W(%d+)%-(%d+)")
+        if lo then
+            local spell = SD.itemOfRecipe and SD.itemOfRecipe[itemID]
+            local m = spell and ProfUI.SourceModel(spell)
+            if m then
+                local all = table.concat(m.lines, "; ")
+                ck(all:find("World drop (mobs ", 1, true) ~= nil,
+                   "the world-drop note changed shape (" .. all .. ")")
+            end
+            break
+        end
+    end
+end
+
 if ns.RegisterSelfTest then
     ns:RegisterSelfTest("professionsui", function(verbose)
         local suites = {
@@ -3671,6 +4005,9 @@ if ns.RegisterSelfTest then
               fn = testBadgeAndLoginLine },
             { name = "source display (mask reader + every sampled recipe answers)",
               fn = testSourceModel },
+            { name = "detail rework (glyph pins, windowless professions, absent "
+                  .. "secondaries, freed list space, zoned acquisitions)",
+              fn = testDetailRework },
         }
         local allPass = true
         for _, suite in ipairs(suites) do
