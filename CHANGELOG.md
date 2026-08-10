@@ -2,12 +2,20 @@
 
 ## Unreleased
 
-- **Professions tab — grid polish.** The character grid now takes 75% of the tab (cooldowns
-  25%), and uses the room: the secondary columns wear their full names — Cooking, First Aid,
-  Fishing, Poisons — with wider, evenly redistributed spacing throughout. Skill levels print
-  just the current level, green at the Era cap of 300 and yellow on the way there; the
-  em-dash "not checked" state and specialization markers are unchanged, and the per-rank cap
-  still shows in the cell tooltip.
+- **Professions tab, reworked into three permanent panes.** The character grid takes the
+  left ~60% with a CHARACTER | PRIMARY | PRIMARY | COOKING | FIRST AID | FISHING header —
+  the Poisons column is gone from the grid (the data is still captured and shows on the
+  rogue's detail tab). Skill levels print just the current level, green at the Era cap of
+  300 and yellow on the way there, with the per-rank cap in the cell tooltip. Clicking a
+  character selects them, and the new top-right detail pane shows their professions as
+  tabs — secondaries and a rogue's Poisons included — with the full recipe census (filters,
+  known/missing, source, materials) that used to live behind the drill-in, which is
+  retired. The bottom-right cooldowns pane now shows one row per cooldown kind (Mooncloth,
+  transmutes, and whatever else the store has seen) naming the class-colored characters
+  ready to craft it right now — characters still on cooldown simply aren't listed. Under
+  the hood, every column and pane now derives from the real pane size at render time, which
+  fixes the live defect where the FISHING/POISONS columns could escape the grid pane; the
+  self-tests now prove the fit at multiple window widths instead of one.
 
 - **Fixed:** **opening a profession window now actually records what is in it.** Every
   profession was reading "not checked" no matter how many times you opened its window. The
