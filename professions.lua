@@ -188,9 +188,11 @@
 --   group ("g1" is alchemy's transmutes).
 --
 --   A profKey present with `k` absent means: this character HAS the profession
---   (we proved it from the rank spells) and has NOT opened its window since we
---   started looking. Render the level, render the cooldowns, render the recipe
---   list as UNKNOWN. Do not render it as empty.
+--   (proved by the rank spells, or by a witnessed skill-panel row — herbalism
+--   and mining hold their profession with ZERO book-known tier spells) and has
+--   NOT opened its window since we started looking. Render the level, render
+--   the cooldowns, render the recipe list as UNKNOWN. Do not render it as
+--   empty.
 --
 -- Clean-room: no third-party source was read. The facts come through our own
 -- Room-1 addendum; the wire and store shapes are ours.
@@ -801,12 +803,21 @@ end
 -- The addendum's §4.7 finding: rank detection in the examined implementation is
 -- an equality test on the reported skill ceiling with a silent fall-through to
 -- "apprentice", so any unexpected ceiling marks the character as missing every
--- tier. We do not infer the rank from a number at all — each rank tier IS a
--- spell, and IsSpellKnown answers for it directly. The rank is the highest tier
--- whose spell the character knows. There is nothing to fall through.
+-- tier. Where spells answer we do not infer the rank from a number at all —
+-- each rank tier IS a spell, and IsSpellKnown answers for it directly. The
+-- rank is the highest tier whose spell the character knows. There is nothing
+-- to fall through.
 --
 -- The same query answers "does this character have this profession" without
 -- reading one localized string, which is what §7 defect 17's deviation asks for.
+--
+-- BUT THE SPELL WITNESS IS NOT SUFFICIENT — proven live 2026-08 on Orn:
+-- Herbalism 300 answered false to IsSpellKnown for every tier spell (its only
+-- book spell is "Find Herbs"), so the profession was invisible and its level
+-- with it. The skill panel is therefore a SECOND presence witness (see
+-- ProbePanelPresence below), and its tier statement obeys §4.7 the other way
+-- round: a strict ceiling->tier map, and an unexpected ceiling degrades to the
+-- floor tier the RANK VALUE proves — never to a silent apprentice.
 ----------------------------------------------------------------------
 
 -- A positive witness that the client's spell/skill data is populated. Class 6:
@@ -818,9 +829,138 @@ function Professions.SpellDataWitnessed()
     return ok and type(n) == "number" and n > 0
 end
 
--- Returns { [profKey] = { t = <tier>, s = { specIDs } } } or nil when the
--- client could not be witnessed. An EMPTY table is a real answer ("this
--- character has no professions") and is only ever produced under a witness.
+----------------------------------------------------------------------
+-- THE TIER STATEMENT FOR A PANEL-WITNESSED PROFESSION
+--
+-- The spell probe's tier is exact where it answers: each tier IS a spell. But
+-- HERBALISM's tier entries are not book-known spells on the live client —
+-- IsSpellKnown answered false for a character with Herbalism 300 (Orn,
+-- 2026-08) — so a panel-witnessed profession needs its tier stated from the
+-- panel's own numbers, and the addendum §4.7 rule holds with full force: an
+-- unexpected ceiling must NEVER fall through to apprentice.
+--
+-- Two pure readers, both against the DATASET'S OWN tier ceilings (75/150/225/
+-- 300 in this Era, but read from the rank rows so a dataset change cannot
+-- desynchronise them from a hard-coded map):
+--
+--   TierFromCeiling  the strict map: a maxRank that IS a tier's ceiling names
+--                    that tier exactly. Anything else answers nil — never a
+--                    guess.
+--   TierFloorFromRank  the honest fallback when the ceiling is unexpected: a
+--                    character whose RANK is 280 provably holds at least the
+--                    tier whose ceiling covers 280, because a rank cannot
+--                    exceed its tier's cap. This is a statement justified by
+--                    the rank VALUE, not a default — rank 80 under a weird
+--                    ceiling of 90 answers tier 2 (150 covers 80), never a
+--                    silent tier 1. A rank past every ceiling clamps to the
+--                    top tier: "at least artisan" is the best honest statement
+--                    the 1..4 vocabulary can make.
+----------------------------------------------------------------------
+
+function Professions.TierFromCeiling(profIdx, maxRank)
+    if type(maxRank) ~= "number" then return nil end
+    local tiers = Dataset.ranks and Dataset.ranks[profIdx]
+    if not tiers then return nil end
+    for tier = 1, 4 do
+        local t = tiers[tier]
+        if t and t.ceil == maxRank then return tier end
+    end
+    return nil
+end
+
+function Professions.TierFloorFromRank(profIdx, rank)
+    if type(rank) ~= "number" or rank < 1 then return nil end
+    local tiers = Dataset.ranks and Dataset.ranks[profIdx]
+    if not tiers then return nil end
+    local top
+    for tier = 1, 4 do
+        local t = tiers[tier]
+        if t then
+            top = tier
+            if t.ceil >= rank then return tier end
+        end
+    end
+    return top                       -- rank beyond every ceiling: at least the top tier
+end
+
+----------------------------------------------------------------------
+-- THE PANEL WITNESS (the second presence witness)
+--
+-- The live defect this answers: Orn has Herbalism 300, and the spell probe
+-- reported only Alchemy. Herbalism grants the character "Find Herbs" — its
+-- rank-tier entries are NOT book-known spells, so IsSpellKnown answers false
+-- for every tier and the profession never existed in the record, which also
+-- silenced its LEVEL (ApplySkillLines only writes onto professions that
+-- exist). Mining is built the same way (its book spell is Smelting; the
+-- dataset's mining tiers 2575/2576/3564/10248 are the Mining rank line, not
+-- book spells), so it is presumed to share the failure. Skinning does NOT —
+-- its tier-1 spell IS the book spell "Skinning" (live-confirmed on Senche).
+--
+-- So presence gains the skill panel as a second witness. Rows are matched
+-- through the same client-built name map the level reader uses (the client's
+-- own GetSpellInfo names first, dataset English as fallback — the locale rule
+-- holds), and a matched row with rank >= 1 is a profession this character
+-- holds, spell answer or no spell answer.
+--
+-- Class-6 rules, verbatim:
+--   * no GetSkillLineInfo, an unreadable count, or an enumeration in which
+--     ZERO rows could be read is UNWITNESSED: nil, never "no professions";
+--   * a row that could not be read is SKIPPED and poisons only `complete` —
+--     it never erases, because the unreadable row could have been ours;
+--   * `complete` is the erase licence: only a panel whose every row was read
+--     may later prove a profession ABSENT (see ApplyProbe).
+--
+-- Returns rows, complete — rows = { [profKey] = { l = rank, m = maxRank } } —
+-- or nil when the panel could not be witnessed at all.
+----------------------------------------------------------------------
+
+function Professions.ProbePanelPresence()
+    if not (GetNumSkillLines and GetSkillLineInfo) then return nil end
+    local okN, n = pcall(GetNumSkillLines)
+    if not okN or type(n) ~= "number" or n <= 0 then return nil end
+
+    local map = Professions.SkillNameMap()
+    local rows, readable, complete = {}, 0, true
+    for i = 1, n do
+        local ok, name, isHeader, _, rank, _, _, maxRank = pcall(GetSkillLineInfo, i)
+        if not ok or (not isHeader and type(name) ~= "string") then
+            complete = false          -- an unreadable row could be any profession
+        elseif isHeader then
+            readable = readable + 1   -- a header is a read row, just not a skill
+        else
+            readable = readable + 1
+            local key = map[name:lower()]
+            if key then
+                if type(rank) == "number" and rank >= 1 then
+                    rows[key] = { l = rank, m = maxRank }
+                else
+                    -- OUR row with a cold rank: skip it, and the panel can no
+                    -- longer prove any absence (class 4 — partial is not full).
+                    complete = false
+                end
+            end
+            -- an unrecognised name is riding / defense / a language: skipped
+            -- in silence, and it does not poison completeness.
+        end
+    end
+    if readable == 0 then return nil end     -- enumerated nothing: unwitnessed
+    return rows, complete
+end
+
+-- Returns probe, panelSound.
+--   probe       { [profKey] = { t = <tier>, s = { specIDs } } } or nil when the
+--               client could not be witnessed. An EMPTY table is a real answer
+--               ("this character has no professions") and is only ever produced
+--               under a witness.
+--   panelSound  true only when the skill panel was witnessed AND every row was
+--               read — the licence ApplyProbe needs before it may treat absence
+--               from this probe as proof of unlearning. The spell probe alone
+--               can no longer carry that licence: Herbalism proved that a
+--               profession can be held with ZERO book-known tier spells.
+--
+-- The spell probe stays primary and authoritative where it answers; the panel
+-- only ADDS professions the spells missed. It never removes or overrides a
+-- spell-probe result.
 function Professions.ProbeProfessions()
     if not Professions.CaptureAllowed() then return nil end
     if not IsSpellKnown then return nil end
@@ -843,9 +983,27 @@ function Professions.ProbeProfessions()
         end
     end
 
+    -- THE SECOND WITNESS: a skill-panel row with rank >= 1 marks a profession
+    -- PRESENT even when no tier spell answered (the Orn defect). Additive
+    -- only — a spell-probed profession keeps its spell-derived tier untouched.
+    local panel, panelComplete = Professions.ProbePanelPresence()
+    if panel then
+        for key, row in pairs(panel) do
+            if not out[key] then
+                local pIdx = Dataset.profIdx[key]
+                local tier = Professions.TierFromCeiling(pIdx, row.m)
+                          or Professions.TierFloorFromRank(pIdx, row.l)
+                if tier then out[key] = { t = tier, s = {} } end
+            end
+        end
+    end
+    local panelSound = (panel ~= nil and panelComplete == true) or false
+
     -- Specialisations: one spell query each, and only for a profession the
     -- character actually has (a specialisation without its profession is not a
-    -- fact, it is a leak).
+    -- fact, it is a leak). A panel-witnessed profession takes part exactly like
+    -- a spell-witnessed one — its spec spells ARE book-known even when its
+    -- tier spells are not.
     for i = 1, #Dataset.specs do
         local sp = Dataset.specs[i]
         local key = Dataset.ProfKey(sp.p)
@@ -856,7 +1014,7 @@ function Professions.ProbeProfessions()
         end
     end
     for _, rec in pairs(out) do table.sort(rec.s) end
-    return out
+    return out, panelSound
 end
 
 ----------------------------------------------------------------------
@@ -2167,7 +2325,17 @@ function Professions.SeedFromStore()
 end
 
 -- Merge a professions probe (presence, rank, specialisations) into the record.
-function Professions.ApplyProbe(probe)
+--
+-- `panelSound` is ProbeProfessions' second return: true only when the skill
+-- panel was witnessed and COMPLETELY read. It is the erase licence. Presence
+-- has two witnesses (tier spells, panel rows) and either alone may ADD; but
+-- absence can only be proven by the panel, because Herbalism showed live that
+-- a held profession can answer false to every tier-spell query. The panel
+-- lists every skill the character holds, so a completely-read panel that
+-- lacks a profession — with the spells also silent — is a real unlearn, and
+-- the drop below fires. An unsound or unwitnessed panel drops NOTHING: a nil
+-- read skips a row, it never erases (class 6).
+function Professions.ApplyProbe(probe, panelSound)
     if type(probe) ~= "table" then return false end
     local L = live()
     for key, rec in pairs(probe) do
@@ -2176,12 +2344,14 @@ function Professions.ApplyProbe(probe)
         cur.s = (#rec.s > 0) and rec.s or nil
         L.p[key] = cur
     end
-    -- A profession the witness says this character no longer has is dropped —
+    -- A profession the witnesses say this character no longer has is dropped —
     -- professions CAN be unlearned, and a stale row would claim a skill the
     -- character does not have. Secondary professions cannot be unlearned, but
-    -- the witness answers for them too, so no exception is needed.
-    for key in pairs(L.p) do
-        if not probe[key] then L.p[key] = nil end
+    -- the witnesses answer for them too, so no exception is needed.
+    if panelSound then
+        for key in pairs(L.p) do
+            if not probe[key] then L.p[key] = nil end
+        end
     end
     return true
 end
@@ -2475,9 +2645,9 @@ function Professions.CaptureStatic(force)
         return false
     end
     Professions._staticAt = now
-    local probe = Professions.ProbeProfessions()
+    local probe, panelSound = Professions.ProbeProfessions()
     if not probe then return false end
-    Professions.ApplyProbe(probe)
+    Professions.ApplyProbe(probe, panelSound)
     local levels = Professions.CaptureSkillLines()
     if levels then Professions.ApplySkillLines(levels) end
     return true
@@ -3735,6 +3905,284 @@ local function testCaptureHonesty(fails)
     if ns.Store and ns.Store.data then ns.Store.data.professions = savedArea end
 
     if not ok then fails[#fails + 1] = "error in capture-honesty fixtures: " .. tostring(err) end
+end
+
+----------------------------------------------------------------------
+-- PANEL-WITNESSED PRESENCE (the Orn defect, 2026-08)
+--
+-- The live bug: Orn holds Herbalism 300 + Alchemy, and the module reported
+-- only Alchemy. Herbalism's rank-tier entries are not book-known spells —
+-- IsSpellKnown answers false for all four — so the spell-only probe never
+-- created the profession, and ApplySkillLines (which only writes onto
+-- professions that exist) silenced the level too. Mining shares the build
+-- (book spell Smelting, tiers on the Mining rank line) and is pinned here.
+----------------------------------------------------------------------
+
+local function testPanelPresence(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+
+    local saved = {
+        known = _G.IsSpellKnown, numSkill = _G.GetNumSkillLines,
+        skillInfo = _G.GetSkillLineInfo, spellInfo = _G.GetSpellInfo,
+        getTime = _G.GetTime,
+    }
+    local savedLatch = {
+        Professions._leavingWorld, Professions._loggingOut,
+        Professions._enteredWorldAt, Professions._live, Professions._lastSig,
+        Professions._staticAt, Professions._nameMap,
+    }
+
+    local ok, err = pcall(function()
+        Dataset.LoadCore()
+        _G.GetTime = function() return 10000 end
+        Professions._leavingWorld, Professions._loggingOut = false, false
+        Professions._enteredWorldAt = 0
+        Professions._live, Professions._staticAt = nil, nil
+        Professions._nameMap = nil
+        _G.GetSpellInfo = function() return nil end     -- English-fallback map
+
+        local hIdx = Dataset.profIdx.herbalism
+        local mIdx = Dataset.profIdx.mining
+        local aIdx = Dataset.profIdx.alchemy
+        local hName = Dataset.profs[hIdx].name
+        local mName = Dataset.profs[mIdx].name
+        local aName = Dataset.profs[aIdx].name
+
+        local knownSpells = {}
+        _G.IsSpellKnown = function(id) return knownSpells[id] == true end
+
+        local function setPanel(rows)
+            _G.GetNumSkillLines = function() return #rows end
+            _G.GetSkillLineInfo = function(i)
+                local r = rows[i]
+                if not r or r.dead then return nil end
+                if r.header then return r.name, true, true, 0, 0, 0, 0 end
+                return r.name, false, true, r.rank, 0, 0, r.max
+            end
+        end
+
+        -- The OLD probe, written out as the legacy control: presence solely
+        -- from IsSpellKnown over the rank-tier spells. This is the shipped
+        -- 1.1.x behavior that made Orn's herbalism invisible.
+        local function legacyProbe()
+            local out = {}
+            for idx, prof in pairs(Dataset.profs) do
+                local tiers = Dataset.ranks[idx]
+                if tiers then
+                    local best
+                    for tier = 1, 4 do
+                        local t = tiers[tier]
+                        if t and _G.IsSpellKnown(t.spell) then best = tier end
+                    end
+                    if best then out[prof.key] = { t = best, s = {} } end
+                end
+            end
+            return out
+        end
+
+        -- (1) RED CONTROL. A gathering-only character: herbalism 300 on the
+        --     panel, zero book-known tier spells. Legacy: invisible. New:
+        --     present, tier 4, and the LEVEL flows in through the full
+        --     CaptureStatic path.
+        knownSpells = {}
+        setPanel({
+            { name = "Class Skills", header = true },
+            { name = hName, rank = 300, max = 300 },
+            { name = "Riding", rank = 75, max = 75 },
+        })
+        local legacy = legacyProbe()
+        local nLegacy = 0
+        for _ in pairs(legacy) do nLegacy = nLegacy + 1 end
+        ck(nLegacy == 0,
+           "RED: the legacy spell-only probe saw a gathering-only character (fixture broken)")
+        local probe, sound = Professions.ProbeProfessions()
+        ck(probe and probe.herbalism and probe.herbalism.t == 4,
+           "a panel-witnessed herbalism 300 did not probe as present at tier 4")
+        ck(sound == true, "a fully-read panel did not report itself sound")
+        Professions._live = nil
+        ck(Professions.CaptureStatic(true) == true, "the static capture refused the fixture")
+        local rec = Professions.Live().p.herbalism
+        ck(rec and rec.l == 300 and rec.m == 300 and rec.t == 4,
+           "herbalism's level did not flow through CaptureStatic ("
+           .. tostring(rec and rec.l) .. "/" .. tostring(rec and rec.m) .. ")")
+        local payload = Professions.BuildPayload()
+        ck(payload and payload.p.herbalism and payload.p.herbalism.k == nil
+           and payload.p.herbalism.a == nil,
+           "a panel-witnessed profession invented a known-set")
+        local st, lvl = Professions.KnownState(payload, "herbalism", 999)
+        ck(st == "unknown" and lvl == 300,
+           "a panel-witnessed never-scanned profession did not read unknown-with-level")
+
+        -- (2) ORN'S EXACT SHAPE: alchemy book-known (tiers 1-2 only, so the
+        --     spell answer is DISTINGUISHABLE from the panel's ceiling), plus
+        --     panel-only herbalism. Both present; alchemy's tier from spells,
+        --     never overridden by the panel's implied tier 4.
+        knownSpells = {}
+        knownSpells[Dataset.ranks[aIdx][1].spell] = true
+        knownSpells[Dataset.ranks[aIdx][2].spell] = true
+        setPanel({
+            { name = "Class Skills", header = true },
+            { name = aName, rank = 280, max = 300 },      -- panel would say tier 4
+            { name = hName, rank = 300, max = 300 },
+        })
+        probe = Professions.ProbeProfessions()
+        ck(probe and probe.alchemy and probe.alchemy.t == 2,
+           "the panel overrode the spell probe's alchemy tier ("
+           .. tostring(probe and probe.alchemy and probe.alchemy.t) .. ")")
+        ck(probe and probe.herbalism and probe.herbalism.t == 4,
+           "Orn's herbalism was missed beside a spell-probed alchemy")
+
+        -- (3) UNEXPECTED CEILING (the §4.7 defect, inverted). A ceiling the
+        --     strict map does not know still marks the profession PRESENT,
+        --     with the floor tier the rank value proves — never apprentice.
+        knownSpells = {}
+        setPanel({ { name = hName, rank = 80, max = 90 } })
+        probe = Professions.ProbeProfessions()
+        ck(probe and probe.herbalism and probe.herbalism.t == 2,
+           "an unexpected ceiling did not degrade to the rank-proven floor tier ("
+           .. tostring(probe and probe.herbalism and probe.herbalism.t) .. ")")
+        setPanel({ { name = hName, rank = 280, max = 290 } })
+        probe = Professions.ProbeProfessions()
+        ck(probe and probe.herbalism and probe.herbalism.t == 4,
+           "rank 280 under a weird ceiling did not prove at least tier 4")
+        ck(Professions.TierFloorFromRank(hIdx, 400) == 4,
+           "a rank past every ceiling did not clamp to the top tier")
+
+        -- (4) CLASS 6. An unwitnessed panel adds nothing and erases nothing.
+        setPanel({})                                     -- zero rows: unwitnessed
+        ck(Professions.ProbeProfessions() == nil,
+           "a zero-row panel did not refuse the whole probe (witness gate)")
+        -- Panel present but every row unreadable: the probe still answers from
+        -- spells, but the panel is unsound — so ApplyProbe may not erase.
+        _G.GetNumSkillLines = function() return 3 end
+        _G.GetSkillLineInfo = function() return nil end
+        ck(Professions.ProbePanelPresence() == nil,
+           "a panel whose every row was unreadable was witnessed anyway")
+        knownSpells = {}
+        for tier = 1, 4 do knownSpells[Dataset.ranks[aIdx][tier].spell] = true end
+        local probe2, sound2 = Professions.ProbeProfessions()
+        ck(probe2 and probe2.alchemy and sound2 == false,
+           "the spell probe did not answer past a dead panel")
+        Professions._live = nil
+        local L = Professions.Live()
+        L.p.herbalism = { t = 4, l = 300, m = 300 }      -- last session's truth
+        Professions.ApplyProbe(probe2, sound2)
+        ck(L.p.herbalism ~= nil,
+           "an UNSOUND panel erased a panel-only profession (class 6: nil reads never erase)")
+        ck(L.p.alchemy ~= nil, "the spell-probed profession did not merge past a dead panel")
+        -- ...and a SOUND panel that lacks the row IS proof: the unlearn drop.
+        setPanel({ { name = aName, rank = 300, max = 300 } })
+        local probe3, sound3 = Professions.ProbeProfessions()
+        ck(sound3 == true, "a readable panel did not report sound")
+        Professions.ApplyProbe(probe3, sound3)
+        ck(L.p.herbalism == nil,
+           "a sound panel plus silent spells did not drop an unlearned profession")
+
+        -- (5) LOCALIZED NAMES. The panel speaks the client's language; the map
+        --     is built from the client's own GetSpellInfo answers, so a
+        --     non-English row resolves without one shipped string.
+        Professions._nameMap = nil
+        local hTierSpells = {}
+        for tier = 1, 4 do hTierSpells[Dataset.ranks[hIdx][tier].spell] = true end
+        _G.GetSpellInfo = function(id)
+            if hTierSpells[id] then return "Kr\195\164uterkunde" end
+            return nil
+        end
+        knownSpells = {}
+        setPanel({ { name = "Kr\195\164uterkunde", rank = 150, max = 150 } })
+        probe = Professions.ProbeProfessions()
+        ck(probe and probe.herbalism and probe.herbalism.t == 2,
+           "a localized panel row did not resolve through the client's own spell name")
+        Professions._nameMap = nil
+        _G.GetSpellInfo = function() return nil end
+
+        -- (6) MINING, pinned. Its book spell is Smelting — which is NOT one of
+        --     the dataset's mining rank tiers — so even a character whose book
+        --     answers for Smelting is invisible to the legacy probe and needs
+        --     the panel witness, exactly like herbalism.
+        local SMELTING = 2656
+        for tier = 1, 4 do
+            ck(Dataset.ranks[mIdx][tier].spell ~= SMELTING,
+               "fixture premise broken: a mining rank tier IS the Smelting spell")
+        end
+        knownSpells = { [SMELTING] = true }
+        setPanel({ { name = mName, rank = 150, max = 150 } })
+        legacy = legacyProbe()
+        ck(legacy.mining == nil,
+           "RED: the legacy probe saw mining without its tier spells (fixture broken)")
+        probe = Professions.ProbeProfessions()
+        ck(probe and probe.mining and probe.mining.t == 2,
+           "a panel-witnessed mining 150 did not probe as present at tier 2")
+
+        -- (6b) A panel-witnessed profession still hangs its SPECIALISATIONS off
+        --      the spell probe — spec spells ARE book-known even when the tier
+        --      spells are not.
+        local lwIdx = Dataset.profIdx.leatherworking
+        local lwSpec
+        for i = 1, #Dataset.specs do
+            if Dataset.specs[i].p == lwIdx then lwSpec = Dataset.specs[i].id break end
+        end
+        if lwSpec then
+            knownSpells = { [lwSpec] = true }
+            setPanel({ { name = Dataset.profs[lwIdx].name, rank = 250, max = 300 } })
+            probe = Professions.ProbeProfessions()
+            ck(probe and probe.leatherworking and probe.leatherworking.s
+               and probe.leatherworking.s[1] == lwSpec,
+               "a panel-witnessed profession did not pick up its book-known specialisation")
+        end
+
+        -- (7) WIRE ROUND-TRIP. A panel-witnessed profession rides the payload
+        --     in the frozen shape — every field one an old reader already
+        --     knows, t always 1..4 — and survives the mesh packer intact.
+        knownSpells = {}
+        for tier = 1, 4 do knownSpells[Dataset.ranks[aIdx][tier].spell] = true end
+        setPanel({
+            { name = aName, rank = 300, max = 300 },
+            { name = hName, rank = 300, max = 300 },
+        })
+        Professions._live = nil
+        ck(Professions.CaptureStatic(true) == true, "the round-trip fixture refused capture")
+        payload = Professions.BuildPayload()
+        ck(payload and payload.p.herbalism and payload.p.alchemy,
+           "the round-trip payload lost a profession")
+        local FROZEN = { l = true, m = true, t = true, s = true, k = true,
+                         n = true, u = true, a = true }
+        for k in pairs(payload.p.herbalism) do
+            ck(FROZEN[k], "a panel-witnessed profession grew a field old readers"
+               .. " have never seen: " .. tostring(k))
+        end
+        ck(payload.p.herbalism.t == 4 and payload.p.herbalism.l == 300,
+           "the panel-witnessed record did not carry tier and level onto the wire")
+        if ns.Mesh and ns.Mesh.Pack and ns.Mesh.Unpack then
+            local packed = ns.Mesh.Pack(payload)
+            ck(packed ~= nil, "the mesh packer refused a panel-witnessed payload")
+            local back = packed and ns.Mesh.Unpack(packed)
+            ck(type(back) == "table" and back.p and back.p.herbalism
+               and back.p.herbalism.t == 4 and back.p.herbalism.l == 300
+               and back.p.herbalism.k == nil,
+               "a panel-witnessed profession did not survive the mesh round-trip")
+            if type(back) == "table" then
+                local stBack, lvlBack = Professions.KnownState(back, "herbalism", 999)
+                ck(stBack == "unknown" and lvlBack == 300,
+                   "the decoded payload did not read as unknown-with-level")
+            end
+        end
+        -- The delta detector sees a panel-witnessed profession appear.
+        local without = { v = 1, ds = payload.ds, ts = payload.ts,
+                          p = { alchemy = payload.p.alchemy }, c = payload.c }
+        ck(Professions.PayloadSignature(without) ~= Professions.PayloadSignature(payload),
+           "gaining a panel-witnessed profession did not change the publish signature")
+    end)
+
+    _G.IsSpellKnown, _G.GetNumSkillLines = saved.known, saved.numSkill
+    _G.GetSkillLineInfo, _G.GetSpellInfo = saved.skillInfo, saved.spellInfo
+    _G.GetTime = saved.getTime
+    Professions._leavingWorld, Professions._loggingOut = savedLatch[1], savedLatch[2]
+    Professions._enteredWorldAt, Professions._live = savedLatch[3], savedLatch[4]
+    Professions._lastSig, Professions._staticAt = savedLatch[5], savedLatch[6]
+    Professions._nameMap = savedLatch[7]
+
+    if not ok then fails[#fails + 1] = "error in panel-presence fixtures: " .. tostring(err) end
 end
 
 local function testReagentHarvest(fails)
@@ -5166,6 +5614,8 @@ function Professions.RunSelfTests(verbose)
         { name = "wire encoding round-trip + payload budget", fn = testEncodingRoundTrip },
         { name = "capture honesty gates (class 4/6/7: cold, partial, polarity, cooldown proof)",
           fn = testCaptureHonesty },
+        { name = "panel-witnessed presence (the Orn herbalism defect, with the red control)",
+          fn = testPanelPresence },
         { name = "reagent harvest (class 4: partial lists are not lists)", fn = testReagentHarvest },
         { name = "composed chain (open -> clears -> deferral -> landing, with the red control)",
           fn = testComposedChain },
