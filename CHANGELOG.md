@@ -2,6 +2,47 @@
 
 ## Unreleased
 
+- **Added:** **the Professions tab — the half you can actually look at.** Nexus has a second
+  page now, next to Characters in the title bar, and it opens on a grid: one row per
+  character in the same order your cards are in, with each profession's icon, skill, its
+  specialisation mark, and its cooldown right there in the cell. Beside it, every profession
+  cooldown you own, across every character on every account, ready ones first and then
+  whichever comes back soonest — so "what can I make today" is answered before you have
+  clicked anything. The tab label carries the ready count as a small number, and once per
+  login Nexus says the same thing in one quiet line of chat. No popup, no sound, and a
+  checkbox in settings if you would rather it said nothing at all.
+
+  **Click any profession cell** and the tab becomes that character's workbench: their
+  professions down the left, that profession's whole recipe list on the right. Recipes you
+  already know are ticked; the ones you are missing say where to get them — which trainer,
+  which vendor and in which zone, which drop, which quest, which reputation. You can search
+  the list, filter it to one kind of source, show only what is missing, and the handful of
+  recipes that are not obtainable right now (the holiday ones) are hidden until you ask for
+  them, and then greyed with the reason. **Pick a recipe you know** and Nexus adds up the
+  materials against your bags: *8 / 10 Runecloth*, and beside it the alt who is sitting on
+  200 of it. That last part is the whole reason both halves of this exist.
+
+  **And there is a search box at the top of the tab: type an item and Nexus tells you who
+  can make it** — who already knows the recipe, and who could learn it today because they
+  have the profession and the skill for it.
+
+- **Added:** three things this view will never do, because they were the point of building
+  it carefully. It will not tell you a character is *missing* recipes on a profession whose
+  window you have never opened — that profession reads **"not checked"**, with a dashed
+  count and a dimmed icon, and it is left out of the missing-only list and counted separately
+  in the who-can-craft search rather than quietly filed under "cannot". It will not report a
+  material count of zero for a character whose bags it has never seen; that reads "?". And it
+  will not invent a recipe name while your client is still loading — it says how many names
+  it is waiting on, fills them in as they arrive, and then stops talking about loading.
+
+- **Added:** an **"Announce ready profession cooldowns at login"** switch in Nexus settings,
+  under the professions module and ticked by default. Untick it and the login line stops; the
+  count on the tab stays. Turning the professions module itself off removes the tab entirely
+  rather than leaving one that opens an empty page.
+
+- **Added:** `/nexus debug professionsui` — what the view is showing, the cooldown rollup as
+  text, and how many never-scanned professions are in the grid.
+
 - **Added:** **Nexus has started keeping track of your professions.** This is the first half
   of the profession tracker — the half that quietly gathers the facts. There is no new tab to
   look at yet; that arrives next. What happens now is that every time you open a profession
