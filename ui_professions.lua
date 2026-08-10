@@ -1743,6 +1743,368 @@ function ProfUI.RecipeRows(payload, profKey, opts, res)
 end
 
 ----------------------------------------------------------------------
+-- THE SHOPPING LIST  (owner, 2026-08-10: "similar to how we built a way to
+-- generate a shopping list for all missing consumes with Raid Prep, can we do
+-- the same thing with missing recipes via professions? should only be recipes
+-- that are actually tradable via the AH.")
+--
+-- Raid Prep's shopping list is a ONE-CLICK VERB, not a window: the checklist's
+-- gavel collects what you are short on and hands the names to Auctionator's
+-- Shopping tab (MultiSearchExact), with branded chat prints carrying the edge
+-- cases. This is the same verb scoped to ONE character's ONE profession: the
+-- chat list is the render (item links in chat are shift-clickable into the AH
+-- search box), and with Auctionator loaded at an open auction house the names
+-- land in the Shopping tab exactly as the gavel's do.
+--
+-- WHAT QUALIFIES ("actually tradable via the AH" made mechanical):
+--   1. The recipe is MISSING for that character — through RecipeRows'
+--      missingOnly seam, so the spec rule (SpecStanding, the shared predicate)
+--      and the unavailable classification apply unchanged: a spec-conflicted
+--      or genuinely-unobtainable recipe can never ride this list, and an
+--      unscanned profession produces NO list (the third state, not zero).
+--   2. Its teaching source is an ITEM — the dataset's I/K acquisition
+--      relation. Trainer-taught-only and quest-taught-only recipes have no
+--      teaching item and are excluded by that fact.
+--   3. The teaching ITEM can reach the open world: its own acquisition facts
+--      carry a vendor / mob-drop / world-drop / world-object route. An item
+--      whose only route is a quest reward cannot be posted by anyone; an
+--      event-gated or source-less item mirrors itemRoute's own blocked
+--      classification. All exclusions are sourced from the dataset's
+--      acquisition facts, never guessed.
+--   4. The item is BoE or unbound, read LIVE from the client. Item data is
+--      ASYNC (CLIENT_ASYNC_LESSONS class 4): a cold item's bind is UNKNOWN,
+--      so the row renders in a distinct UNRESOLVED state — never silently
+--      included as tradable, never silently dropped — one warm load is
+--      requested, and re-running the list is the retry.
+--
+-- Vendor-sold teaching items ARE included (someone can flip them onto the AH)
+-- but wear their vendor + zone tag, so the owner can see when the AH is the
+-- expensive path for that recipe.
+----------------------------------------------------------------------
+
+-- PURE. Is this bindType an AH-postable bind? true = BoE or no bind; false =
+-- provably bound (pickup/use/quest); nil = NOT A NUMBER, which is either a
+-- cold read or a client whose GetItemInfo signature drifted — both are "we do
+-- not know", and unknown may never masquerade as either verdict. The 0/2
+-- literals are Enum.ItemBind's None/OnEquip; the live Enum wins where the
+-- client carries one (the catalog is names-only, so positions and values are
+-- never trusted blind — see LiveItemInfo).
+function ProfUI.BindTradable(bind)
+    if type(bind) ~= "number" then return nil end
+    local E = _G.Enum and _G.Enum.ItemBind or nil
+    local none    = (E and type(E.None) == "number") and E.None or 0
+    local onEquip = (E and type(E.OnEquip) == "number") and E.OnEquip or 2
+    return (bind == none or bind == onEquip)
+end
+
+-- The live item-info reader, resolver-shaped so the harness can inject a fake
+-- (the cold/bind sim idiom): reader(itemID) -> { name, link, bind } or nil
+-- meaning "the client has not answered" (class 4: cold, not empty). Every
+-- return position is TYPE-CHECKED, never trusted: bindType is the 14th return
+-- of GetItemInfo on this client family (verified against the API catalog's
+-- C_Item.GetItemInfo signature), but if that slot is not a number the reader
+-- reports bind = nil and the row lands in the unresolved state rather than a
+-- confident wrong verdict.
+function ProfUI.LiveItemInfo()
+    return function(id)
+        if not id then return nil end
+        local r = nil
+        if C_Item and C_Item.GetItemInfo then
+            local t = { pcall(C_Item.GetItemInfo, id) }
+            if t[1] and type(t[2]) == "string" and t[2] ~= "" then r = t end
+        end
+        if not r and GetItemInfo then
+            local t = { pcall(GetItemInfo, id) }
+            if t[1] and type(t[2]) == "string" and t[2] ~= "" then r = t end
+        end
+        if not r then return nil end                       -- cold: no answer yet
+        local link = (type(r[3]) == "string" and r[3]:find("|H", 1, true)) and r[3] or nil
+        local bind = (type(r[15]) == "number") and r[15] or nil   -- 14th return, +1 for pcall's ok
+        return { name = r[2], link = link, bind = bind }
+    end
+end
+
+-- PURE over the dataset. Can this teaching ITEM reach the open world, and how
+-- would a row describe that? Walks the item's own acquisition tokens (the same
+-- grammar itemRoute reads) into:
+--   { reachable = bool,           -- a vendor / drop / world-drop / object route exists
+--     vendor    = phrase|nil,     -- "Sold by X — Zone · cost" when vendor-sold
+--     tag       = string|nil }    -- the row's source tag (vendor first, then
+--                                 -- World drop, mob drop, world object)
+-- Quest tokens are NOT routes (a quest reward cannot be posted); E/X tokens
+-- (and the generator's e/x candidate flags) mirror itemRoute's blocked
+-- classification, so an event-gated or source-less item is not reachable.
+function ProfUI.ItemTradeRoutes(D, itemID)
+    local out = { reachable = false, vendor = nil, tag = nil }
+    local acq = D and D.itemAcq and D.itemAcq[itemID]
+    local item = D and D.item and D.item[itemID]
+    local flags = (item and item.flags) or "-"
+    if type(acq) ~= "string" or acq == "" then return out end
+    local vendorTag, dropTag, worldTag, objectTag, blocked = nil, nil, nil, nil, false
+    for tok in (acq .. ";"):gmatch("(.-);") do
+        if tok ~= "" then
+            local head = tok:sub(1, 1)
+            if head == "V" then
+                local cost, npcs = tok:match("^V(%d+)@([%d%+]+)$")
+                local m = money(tonumber(cost))
+                vendorTag = ProfUI.VendorPhrase(D, npcs) .. (m and (" \194\183 " .. m) or "")
+            elseif head == "D" then
+                local npcs = tok:sub(2)
+                dropTag = "Drops from " .. (npcWhere(D, firstNumber(npcs)) or "?")
+                    .. plusMore(countNumbers(npcs))
+            elseif head == "W" then
+                worldTag = "World drop"
+            elseif head == "O" then
+                local o = D.object and D.object[firstNumber(tok:sub(2))]
+                objectTag = "World object: " .. ((o and o.name) or "?")
+            elseif head == "E" or head == "X" then
+                blocked = true
+            end
+            -- Q is not a route to the AH; R/S are riders, not routes.
+        end
+    end
+    if blocked or flags:find("e", 1, true) or flags:find("x", 1, true) then return out end
+    out.vendor = vendorTag
+    out.tag = vendorTag or worldTag or dropTag or objectTag
+    out.reachable = (out.tag ~= nil)
+    return out
+end
+
+-- PURE apart from the injected reader. One recipe's AH-tradability verdict:
+--   { state = "tradable",   item, name, link, tag, vendor }  -- buy this
+--   { state = "unresolved", item, tag, vendor }              -- bind unknown (cold)
+--   { state = "excluded",   reason = "no-item"|"unreachable"|"bound" }
+-- The FIRST teaching item that proves tradable wins; a cold/type-drifted read
+-- on a reachable item is held as an unresolved CANDIDATE (never a verdict)
+-- unless a later item settles it.
+function ProfUI.ShopTradability(D, spellID, iteminfo)
+    local sawItem, sawBound, unresolved = false, false, nil
+    local acq = D and D.acq and D.acq[spellID]
+    for tok in (tostring(acq or "") .. ";"):gmatch("(.-);") do
+        local head = tok:sub(1, 1)
+        if head == "I" or head == "K" then
+            local itemID = tonumber(tok:sub(2))
+            if itemID then
+                sawItem = true
+                local route = ProfUI.ItemTradeRoutes(D, itemID)
+                if route.reachable then
+                    local info = iteminfo and iteminfo(itemID) or nil
+                    -- Class 5 (truthy-zero/false): `a and b or c` would collapse
+                    -- a FALSE verdict into nil, scoring "provably bound" as
+                    -- "unknown". Explicit branch, no fallback chain.
+                    local ok = nil
+                    if info then ok = ProfUI.BindTradable(info.bind) end
+                    if info and ok == true then
+                        return { state = "tradable", item = itemID, name = info.name,
+                                 link = info.link, tag = route.tag,
+                                 vendor = route.vendor and true or false }
+                    elseif info and ok == false then
+                        sawBound = true
+                    else
+                        -- Cold item, or a bind slot that failed the type check:
+                        -- UNKNOWN, held (class 4) — never included, never dropped.
+                        unresolved = unresolved or { item = itemID, tag = route.tag,
+                                                     vendor = route.vendor and true or false }
+                    end
+                end
+            end
+        end
+    end
+    if unresolved then
+        return { state = "unresolved", item = unresolved.item, tag = unresolved.tag,
+                 vendor = unresolved.vendor }
+    end
+    local reason = "no-item"
+    if sawBound then reason = "bound" elseif sawItem then reason = "unreachable" end
+    return { state = "excluded", reason = reason }
+end
+
+-- The list itself. Base set = RecipeRows' missingOnly seam (spec rule +
+-- unavailable classification ride along unchanged; unscanned professions
+-- return NOTHING with state "unscanned"). Returns rows, pendingItems (cold
+-- teaching-item ids, sorted — class 8: this feeds a bounded re-ask), state,
+-- and the MISSING count before the tradability filter (the empty-state
+-- message needs to tell "all known" from "nothing tradable").
+-- Rows are sorted by skill requirement ASCENDING (the owner reads it as a
+-- levelling path; Raid Prep's checklist order is user-authored so there was
+-- no deliberate ordering to inherit), spell id as the deterministic tiebreak.
+function ProfUI.ShoplistRows(payload, profKey, res, iteminfo)
+    res = res or ProfUI.LiveResolver()
+    iteminfo = iteminfo or ProfUI.LiveItemInfo()
+    local base, _, state = ProfUI.RecipeRows(payload, profKey, { missingOnly = true }, res)
+    local rows, pendingItems = {}, {}
+    local D = sourcesDS()
+    if not D then return rows, pendingItems, "nodata", #base end
+    for i = 1, #base do
+        local br = base[i]
+        local v = ProfUI.ShopTradability(D, br.spell, iteminfo)
+        if v.state == "tradable" then
+            rows[#rows + 1] = { spell = br.spell, name = br.name, skill = br.skill,
+                item = v.item, itemName = v.name, link = v.link,
+                tag = v.tag, vendor = v.vendor, unresolved = false }
+        elseif v.state == "unresolved" then
+            rows[#rows + 1] = { spell = br.spell, name = br.name, skill = br.skill,
+                item = v.item, tag = v.tag, vendor = v.vendor, unresolved = true }
+            pendingItems[#pendingItems + 1] = v.item
+        end
+    end
+    table.sort(rows, function(a, b)
+        local sa, sb = tonumber(a.skill) or 0, tonumber(b.skill) or 0
+        if sa ~= sb then return sa < sb end
+        return a.spell < b.spell
+    end)
+    table.sort(pendingItems)
+    return rows, pendingItems, state, #base
+end
+
+-- PURE. The chat render, as plain lines (ns:Print wears the brand tag). The
+-- unresolved rows wear their state IN the line — a cold bind is a fact worth
+-- printing, not a row to hide — and re-running the list is the retry.
+function ProfUI.ShoplistLines(ownerKey, profKey, rows, state, missingN)
+    local who = tostring(ownerKey or "?"):match("^([^%-]+)") or tostring(ownerKey or "?")
+    local prof = ProfUI.ProfName(profKey)
+    local out = {}
+    if state == "nodata" then
+        out[1] = "shopping list: the professions dataset is unavailable."
+        return out
+    end
+    if state ~= "scanned" then
+        out[1] = "Not checked yet \226\128\148 open " .. prof .. " on " .. who
+            .. " once and run this again."
+        return out
+    end
+    if #rows == 0 then
+        if (missingN or 0) == 0 then
+            out[1] = "Nothing to buy \226\128\148 " .. who .. " already knows every "
+                .. prof .. " recipe they can obtain."
+        else
+            out[1] = "Nothing to buy \226\128\148 none of " .. who .. "'s "
+                .. tostring(missingN) .. " missing " .. prof
+                .. " recipe(s) is tradable on the AH."
+        end
+        return out
+    end
+    out[1] = "Shopping list \226\128\148 " .. who .. "'s " .. prof .. " ("
+        .. #rows .. (#rows == 1 and " recipe" or " recipes") .. " buyable on the AH):"
+    for i = 1, #rows do
+        local r = rows[i]
+        local label
+        if r.unresolved then
+            label = "item " .. tostring(r.item)
+                .. "  [unresolved \226\128\148 item data still loading; run this again]"
+        else
+            label = r.link or r.itemName or ("item " .. tostring(r.item))
+        end
+        out[#out + 1] = "  " .. label
+            .. " \226\128\148 skill " .. tostring(r.skill or "?")
+            .. (r.tag and (" \226\128\148 " .. r.tag) or "")
+    end
+    return out
+end
+
+-- PURE. The Auctionator hand-off: resolved teaching-item NAMES only, deduped,
+-- in list order. Unresolved rows never ride — an unproven bind may not be
+-- shopped for as if it were proven.
+function ProfUI.ShoplistSearchTerms(rows)
+    local seen, out = {}, {}
+    for i = 1, #(rows or {}) do
+        local r = rows[i]
+        if not r.unresolved and type(r.itemName) == "string" and r.itemName ~= ""
+            and not seen[r.itemName] then
+            seen[r.itemName] = true
+            out[#out + 1] = r.itemName
+        end
+    end
+    return out
+end
+
+-- PURE apart from core()/DetailTabs. Resolve `/nexus profs shoplist
+-- [character] [profession]` against the roster. Both arguments optional:
+-- the pane's selection is the default, then the player's own character; a
+-- character with exactly one browsable profession needs no second argument.
+-- Returns ownerKey, profKey or nil, nil, err.
+function ProfUI.ShoplistTarget(rest, entries, lookup, defaults)
+    defaults = defaults or {}
+    entries = entries or {}
+    rest = tostring(rest or ""):match("^%s*(.-)%s*$") or ""
+    local t1, t2 = rest:match("^(%S*)%s*(%S*)")
+    t1, t2 = t1 or "", t2 or ""
+
+    local function findOwner(token)
+        token = token:lower()
+        for i = 1, #entries do
+            local nr = entries[i].nameRealm or ""
+            if nr:lower() == token
+                or ((nr:match("^([^%-]+)") or nr):lower() == token) then
+                return nr
+            end
+        end
+        return nil
+    end
+    local function findProf(token)
+        local D = core()
+        if not D or token == "" then return nil end
+        token = token:lower()
+        local prefix = nil
+        for i = 1, #(D.profs or {}) do
+            local p = D.profs[i]
+            local key = tostring(p.key or ""):lower()
+            local nm  = tostring(p.name or ""):lower()
+            if key == token or nm == token then return p.key end
+            if key:find(token, 1, true) == 1 or nm:find(token, 1, true) == 1 then
+                if prefix and prefix ~= p.key then prefix = false else prefix = p.key end
+            end
+        end
+        return prefix or nil     -- false (ambiguous) collapses to nil
+    end
+    local function selfOwner()
+        for i = 1, #entries do
+            if entries[i].isSelf then return entries[i].nameRealm end
+        end
+        return nil
+    end
+
+    local owner, profKey = nil, nil
+    if t1 == "" then
+        owner = defaults.owner or selfOwner()
+    else
+        owner = findOwner(t1)
+        if not owner then
+            -- One argument that is not a character may be a profession.
+            profKey = findProf(t1)
+            if not profKey then
+                return nil, nil, "no character (or profession) named '" .. t1 .. "'."
+            end
+            owner = defaults.owner or selfOwner()
+        end
+    end
+    if not owner then
+        return nil, nil, "select a character in the Professions tab, or name one: "
+            .. "/nexus profs shoplist <character> [profession]"
+    end
+    if t2 ~= "" then
+        profKey = findProf(t2)
+        if not profKey then return nil, nil, "no profession named '" .. t2 .. "'." end
+    end
+    if not profKey then
+        if defaults.owner == owner and defaults.prof then
+            profKey = defaults.prof
+        else
+            local tabs = ProfUI.DetailTabs(lookup and lookup(owner) or nil)
+            if #tabs == 1 then
+                profKey = tabs[1]
+            elseif #tabs == 0 then
+                return nil, nil, "no browsable professions recorded for "
+                    .. (tostring(owner):match("^([^%-]+)") or owner) .. " yet."
+            else
+                return nil, nil, "which profession? " .. table.concat(tabs, ", ")
+            end
+        end
+    end
+    return owner, profKey
+end
+
+----------------------------------------------------------------------
 -- THE RECIPE ROW TOOLTIP  (owner, 2026-08-10: "recipes in the professions tab
 -- show their tooltip when hovered over")
 --
@@ -3263,6 +3625,45 @@ Dashboard.RegisterTab("professions", function(host)
         function(v) pane.filters.showUnavailable = v; persist(); pane.obj.Refresh() end)
     unavChk:SetPoint("LEFT", missChk, "RIGHT", L.GUTTER, 0)
 
+    -- THE SHOPPING LIST BUTTON (owner's directive; see the pure layer's header
+    -- beside RecipeRows). Raid Prep's shopping list is a one-click verb on the
+    -- window that owns the data, so this one rides the detail pane's own
+    -- control band, scoped to the selected character + profession tab. The
+    -- render is a branded chat list (links shift-click into the AH search
+    -- box); with Auctionator loaded at an open AH the names also fill the
+    -- Shopping tab — the checklist gavel's behavior, scoped down.
+    local shopBtn = CreateFrame("Button", nil, filter2, "BackdropTemplate")
+    shopBtn:SetSize(108, 22)
+    local shopLbl = fstr(shopBtn, "small", "CENTER")
+    shopLbl:SetPoint("TOPLEFT", shopBtn, "TOPLEFT", 4, 0)
+    shopLbl:SetPoint("BOTTOMRIGHT", shopBtn, "BOTTOMRIGHT", -4, 0)
+    shopLbl:SetText("SHOPPING LIST")
+    shopBtn._lbl = shopLbl
+    UI.Skin(shopBtn, function(self)
+        self:SetBackdrop(UI.FLAT_BACKDROP)
+        self:SetBackdropColor(UI.Color("control"))
+        self:SetBackdropBorderColor(UI.Color("controlBorder"))
+        self._lbl:SetTextColor(UI.Color("muted"))
+    end)
+    shopBtn:SetScript("OnEnter", function(self)
+        self._lbl:SetTextColor(UI.Color("text"))
+        GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+        GameTooltip:AddLine("Shopping list", 1, 1, 1)
+        GameTooltip:AddLine("Chat list of this character's missing recipes that can"
+            .. " be bought on the AH. With Auctionator loaded and the auction"
+            .. " house open, the names also fill the Shopping tab.",
+            0.8, 0.8, 0.8, true)
+        GameTooltip:Show()
+    end)
+    shopBtn:SetScript("OnLeave", function(self)
+        self._lbl:SetTextColor(UI.Color("muted"))
+        GameTooltip:Hide()
+    end)
+    shopBtn:SetScript("OnClick", function()
+        ProfUI.RunShoplist(pane.sel and pane.sel.owner, pane.sel and pane.sel.profKey)
+    end)
+    shopBtn:SetPoint("LEFT", unavChk, "RIGHT", L.GUTTER, 0)
+
     local recStatus = fstr(filter2, "small", "RIGHT")
     recStatus:SetPoint("RIGHT", filter2, "RIGHT", 0, 0)
     UI.Skin(recStatus, function(self) self:SetTextColor(UI.Color("muted")) end)
@@ -3877,6 +4278,80 @@ ns:On("LOGIN", function()
         C_Timer.After(12, function() ns:SafeCall(ProfUI.FireLoginLine) end)
     end
 end)
+
+----------------------------------------------------------------------
+-- THE SHOPPING LIST VERB  (the side-effect half; the pure layer lives beside
+-- RecipeRows). One entry for both the detail-pane button and the slash.
+----------------------------------------------------------------------
+
+-- Is the auction house open? Read the OBJECT live (Raid Prep's RP-1 lesson,
+-- class 2: the AH frame globals are load-on-demand, so an event-time snapshot
+-- can freeze "no auction house" forever). Re-asked on every click instead.
+function ProfUI.AHIsShown()
+    local f = _G.AuctionFrame or _G.AuctionHouseFrame
+    if not (f and f.IsShown) then return false end
+    local ok, shown = pcall(f.IsShown, f)
+    return (ok and shown) and true or false
+end
+
+function ProfUI.RunShoplist(ownerKey, profKey)
+    if not enabled() then
+        ns:Print("the professions module is disabled.")
+        return false
+    end
+    if not (ownerKey and profKey) then
+        ns:Print("shopping list: select a character and profession first, or use "
+            .. "/nexus profs shoplist <character> [profession].")
+        return false
+    end
+    local payload = payloadLookup()(ownerKey)
+    local rows, pendingItems, state, missingN =
+        ProfUI.ShoplistRows(payload, profKey, ProfUI.LiveResolver(), ProfUI.LiveItemInfo())
+    -- Cold teaching items: ONE bounded warm-load request per id (class 4's fix
+    -- shape — ask, never guess). No ladder here on purpose: the brief's rule
+    -- is that re-running the list is the retry.
+    if #pendingItems > 0 then ProfUI.AskFor("item", pendingItems) end
+    local lines = ProfUI.ShoplistLines(ownerKey, profKey, rows, state, missingN)
+    for i = 1, #lines do ns:Print(lines[i]) end
+    -- The Raid Prep hand-off, verbatim in spirit: with Auctionator loaded and
+    -- the AH open, the resolved names fill the Shopping tab. Everything
+    -- defensive — a missing API is a quiet no (the chat list already stands).
+    local terms = ProfUI.ShoplistSearchTerms(rows)
+    if #terms > 0 and ProfUI.AHIsShown()
+        and _G.Auctionator and Auctionator.API and Auctionator.API.v1
+        and Auctionator.API.v1.MultiSearchExact then
+        pcall(Auctionator.API.v1.MultiSearchExact, "Daseeki Nexus", terms)
+        ns:Print("sent " .. #terms .. " name(s) to Auctionator's Shopping tab.")
+    end
+    return true
+end
+
+-- `/nexus profs shoplist [character] [profession]` — the module-owned
+-- subcommand idiom (core.lua's dispatcher; import.lua registers the same way).
+-- Defaults ride the pane's persisted selection, then the player's own
+-- character; a character holding exactly one browsable profession needs no
+-- second argument.
+ns:RegisterSubcommand("profs", function(rest)
+    rest = tostring(rest or ""):match("^%s*(.-)%s*$") or ""
+    local verb, args = rest:match("^(%S*)%s*(.-)$")
+    verb = (verb or ""):lower()
+    if verb ~= "shoplist" then
+        ns:Print("usage: /nexus profs shoplist [character] [profession]")
+        return
+    end
+    if not enabled() then
+        ns:Print("the professions module is disabled.")
+        return
+    end
+    local sel = thePane and thePane.sel or nil
+    local owner, profKey, err = ProfUI.ShoplistTarget(args, ProfUI.Roster(),
+        payloadLookup(), { owner = sel and sel.owner, prof = sel and sel.profKey })
+    if not (owner and profKey) then
+        ns:Print("shopping list: " .. (err or "could not resolve a character and profession."))
+        return
+    end
+    ProfUI.RunShoplist(owner, profKey)
+end, "professions shopping list (missing AH-tradable recipes)")
 
 ----------------------------------------------------------------------
 -- DIAGNOSTICS  (the style guide's standing rule: every visual system ships a
@@ -5301,6 +5776,288 @@ local function testSpecRule(fails)
        "who-can-craft denied the character who holds the required spec")
 end
 
+----------------------------------------------------------------------
+-- Suite: the shopping list (owner, 2026-08-10: "can we do the same thing with
+-- missing recipes via professions? should only be recipes that are actually
+-- tradable via the AH"). The tradability matrix runs on a SYNTHETIC dataset
+-- (every acquisition shape pinned by construction); the seams — known never
+-- rides, the shared spec predicate, unscanned honesty, ordering — run on the
+-- SHIPPED dataset like every other suite here. Item bind/cold is modeled with
+-- an injected reader, the resolver-fake idiom.
+----------------------------------------------------------------------
+local function testShoplist(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local P = ns.Professions
+    local D = core()
+    if not D then fails[#fails + 1] = "dataset unavailable for the shoplist tests" return end
+
+    -- (a) Bind classification is position-DEFENSIVE: a non-number is UNKNOWN,
+    -- never a verdict (the catalog is names-only; the 14th-return convention
+    -- is verified live, not trusted).
+    ck(ProfUI.BindTradable(0) == true,  "no-bind did not read tradable")
+    ck(ProfUI.BindTradable(2) == true,  "BoE did not read tradable")
+    ck(ProfUI.BindTradable(1) == false, "BoP read tradable")
+    ck(ProfUI.BindTradable(3) == false, "bind-on-use read tradable")
+    ck(ProfUI.BindTradable(4) == false, "quest-bind read tradable")
+    ck(ProfUI.BindTradable("2") == nil, "a string bind did not read UNKNOWN")
+    ck(ProfUI.BindTradable(nil) == nil, "a missing bind did not read UNKNOWN")
+
+    -- (b) THE TRADABILITY MATRIX, on a synthetic dataset whose shapes are
+    -- pinned by construction.
+    local SD = {
+        acq = {
+            [101] = "T500@1",           -- trainer only: no teaching item
+            [102] = "I9001",            -- teaching item is a quest reward only
+            [103] = "I9002",            -- BoP vendor item
+            [104] = "I9003",            -- BoE vendor item
+            [105] = "I9004",            -- no-bind world drop
+            [106] = "I9005",            -- BoE mob drop
+            [107] = "I9006",            -- COLD item on a vendor route
+            [108] = "Q777",             -- quest-taught, no item at all
+            [109] = "I9007",            -- event-gated vendor item
+            [110] = "T500@1;I9003",     -- trainer AND a BoE item: item route includes
+        },
+        itemAcq = {
+            [9001] = "Q777",
+            [9002] = "V2000@77",
+            [9003] = "V2000@77",
+            [9004] = "W40-50",
+            [9005] = "D88",
+            [9006] = "V150@77",
+            [9007] = "V100@77;E5",
+        },
+        npc  = { [77] = { name = "Vendor Vic", zone = 3 }, [88] = { name = "Mob Mo", zone = 3 } },
+        zone = { [3] = { name = "Testland" } },
+        quest = { [777] = { name = "Some Quest" } },
+        event = { [5] = "Test Festival" },
+    }
+    -- The item-info fake: id -> {name, link, bind} | nil (COLD — 9006 is
+    -- absent on purpose, the class-4 cold read).
+    local info = {
+        [9001] = { name = "Plans: Quest Thing",  link = "|Hitem:9001|h[q]|h", bind = 0 },
+        [9002] = { name = "Plans: Bound Thing",  link = "|Hitem:9002|h[b]|h", bind = 1 },
+        [9003] = { name = "Plans: Vendor Thing", link = "|Hitem:9003|h[v]|h", bind = 2 },
+        [9004] = { name = "Plans: World Thing",  link = "|Hitem:9004|h[w]|h", bind = 0 },
+        [9005] = { name = "Plans: Drop Thing",   link = "|Hitem:9005|h[d]|h", bind = 2 },
+        [9007] = { name = "Plans: Event Thing",  link = "|Hitem:9007|h[e]|h", bind = 2 },
+    }
+    local fakeInfo = function(id) return info[id] end
+
+    local v = ProfUI.ShopTradability(SD, 101, fakeInfo)
+    ck(v.state == "excluded" and v.reason == "no-item",
+       "trainer-only was not excluded as no-item")
+    v = ProfUI.ShopTradability(SD, 108, fakeInfo)
+    ck(v.state == "excluded" and v.reason == "no-item",
+       "quest-taught (no item) was not excluded")
+    v = ProfUI.ShopTradability(SD, 102, fakeInfo)
+    ck(v.state == "excluded" and v.reason == "unreachable",
+       "a quest-reward-only teaching item was not excluded")
+    v = ProfUI.ShopTradability(SD, 103, fakeInfo)
+    ck(v.state == "excluded" and v.reason == "bound",
+       "a BoP teaching item was not excluded")
+    v = ProfUI.ShopTradability(SD, 104, fakeInfo)
+    ck(v.state == "tradable" and v.vendor == true,
+       "a BoE vendor item was not included with its vendor flag")
+    ck(v.tag ~= nil and v.tag:find("Vendor Vic", 1, true) ~= nil
+       and v.tag:find("Testland", 1, true) ~= nil,
+       "the vendor tag does not name vendor and zone (" .. tostring(v.tag) .. ")")
+    v = ProfUI.ShopTradability(SD, 105, fakeInfo)
+    ck(v.state == "tradable" and v.tag == "World drop" and v.vendor == false,
+       "a no-bind world drop was not included as 'World drop'")
+    v = ProfUI.ShopTradability(SD, 106, fakeInfo)
+    ck(v.state == "tradable" and v.tag ~= nil and v.tag:find("Mob Mo", 1, true) ~= nil,
+       "a BoE mob drop was not included with its drop tag")
+    v = ProfUI.ShopTradability(SD, 107, fakeInfo)
+    ck(v.state == "unresolved" and v.item == 9006,
+       "a cold teaching item was not held UNRESOLVED (" .. tostring(v.state) .. ")")
+    v = ProfUI.ShopTradability(SD, 109, fakeInfo)
+    ck(v.state == "excluded",
+       "an event-gated teaching item was not excluded")
+    v = ProfUI.ShopTradability(SD, 110, fakeInfo)
+    ck(v.state == "tradable",
+       "trainer+item did not include via the item route")
+    -- A bind slot that fails the TYPE check is the same unknown as cold.
+    v = ProfUI.ShopTradability(SD, 104, function() return { name = "N", bind = "2" } end)
+    ck(v.state == "unresolved",
+       "a type-drifted bind return was not held unresolved")
+
+    -- (c) THE SEAMS, on the shipped dataset. A scanned character missing
+    -- everything: rows exist, no known recipe rides, no unavailable rides,
+    -- ordering is skill-ascending and deterministic.
+    local NOW = 1700000000
+    local DS = ns.ProfessionsDataMeta.version
+    local names = setmetatable({}, { __index = function(_, id) return "R" .. tostring(id) end })
+    local res = fakeResolver(names)
+    local allBoE  = function(id) return { name = "Item " .. tostring(id), bind = 2 } end
+    local allCold = function() return nil end
+    local knowsNothing = { v = 1, ds = DS,
+        p = { alchemy = { l = 300, m = 300, k = P.EncodeKnown("alchemy", {}), n = 0, a = NOW } },
+        c = {} }
+
+    local rows, pendingItems, state, missingN =
+        ProfUI.ShoplistRows(knowsNothing, "alchemy", res, allBoE)
+    ck(state == "scanned", "a scanned profession did not report scanned")
+    ck(#rows > 0, "an all-missing alchemist has an empty shopping list "
+       .. "(the dataset should carry BoE-taught alchemy recipes)")
+    ck(#pendingItems == 0, "an all-warm item reader still produced pending items")
+    ck(missingN >= #rows, "the missing count is smaller than the filtered list")
+    for _, r in ipairs(rows) do
+        local src = ProfUI.SourceModel(r.spell)
+        if src and src.unavailable then
+            fails[#fails + 1] = "an unavailable recipe rode the shopping list"
+            break
+        end
+        if not r.unresolved and not (r.item and r.itemName and r.tag) then
+            fails[#fails + 1] = "a tradable row is missing item/name/tag"
+            break
+        end
+    end
+    for i = 2, #rows do
+        local sa = tonumber(rows[i - 1].skill) or 0
+        local sb = tonumber(rows[i].skill) or 0
+        if sa > sb or (sa == sb and rows[i - 1].spell >= rows[i].spell) then
+            fails[#fails + 1] = "the list is not skill-ascending with a deterministic tiebreak"
+            break
+        end
+    end
+    local again = ProfUI.ShoplistRows(knowsNothing, "alchemy", res, allBoE)
+    ck(#again == #rows, "two identical runs disagreed on the row count")
+    for i = 1, math.min(#rows, #again) do
+        if rows[i].spell ~= again[i].spell then
+            fails[#fails + 1] = "two identical runs ordered the rows differently"
+            break
+        end
+    end
+
+    -- KNOWN NEVER RIDES: know two recipes, and neither may appear.
+    local ids = pickProf(D, "alchemy", 2)
+    local knowsTwo = { v = 1, ds = DS,
+        p = { alchemy = { l = 300, m = 300, k = P.EncodeKnown("alchemy", { ids[1], ids[2] }),
+                          n = 2, a = NOW } }, c = {} }
+    local rows2 = ProfUI.ShoplistRows(knowsTwo, "alchemy", res, allBoE)
+    for _, r in ipairs(rows2) do
+        if r.spell == ids[1] or r.spell == ids[2] then
+            fails[#fails + 1] = "a KNOWN recipe rode the shopping list"
+            break
+        end
+    end
+
+    -- THE SHARED SPEC PREDICATE, pinned: the list consults SpecStanding, and a
+    -- spec-conflicted recipe never appears (the testSpecRule fixture, reused).
+    local realStanding = ProfUI.SpecStanding
+    local calls = 0
+    ProfUI.SpecStanding = function(...) calls = calls + 1; return realStanding(...) end
+    ProfUI.ShoplistRows(knowsNothing, "alchemy", res, allBoE)
+    ProfUI.SpecStanding = realStanding
+    ck(calls > 0, "the shopping list never consulted the shared spec predicate")
+    local specA, specB, lockedSpell
+    for idx = 1, #(D.specs or {}) do
+        local sB = D.specs[idx]
+        for spell, rec in pairs(D.recipe) do
+            if rec.spec == idx then
+                for j = 1, #D.specs do
+                    if j ~= idx and D.specs[j].p == sB.p then
+                        specA, specB, lockedSpell = D.specs[j], sB, spell
+                        break
+                    end
+                end
+            end
+            if specA then break end
+        end
+        if specA then break end
+    end
+    if specA then
+        local sProf = D.profs[specB.p] and D.profs[specB.p].key
+        local conflicted = { v = 1, ds = DS,
+            p = { [sProf] = { l = 300, m = 300, k = P.EncodeKnown(sProf, {}), n = 0,
+                              a = NOW, s = { specA.id } } }, c = {} }
+        local sRows = ProfUI.ShoplistRows(conflicted, sProf, res, allBoE)
+        for _, r in ipairs(sRows) do
+            if r.spell == lockedSpell then
+                fails[#fails + 1] = "a spec-conflicted recipe rode the shopping list"
+                break
+            end
+        end
+    end
+
+    -- (d) COLD ITEMS: every candidate holds UNRESOLVED — none scored tradable,
+    -- none silently dropped (row count matches the warm run), all pending, and
+    -- none leaks into the Auctionator terms.
+    local coldRows, coldPending = ProfUI.ShoplistRows(knowsNothing, "alchemy", res, allCold)
+    ck(#coldRows == #rows, "cold item reads changed the row count ("
+       .. #coldRows .. " vs " .. #rows .. ")")
+    for _, r in ipairs(coldRows) do
+        if not r.unresolved then
+            fails[#fails + 1] = "a cold item was scored tradable"
+            break
+        end
+    end
+    if #coldRows > 0 then
+        ck(#coldPending > 0, "cold items produced no pending warm-load ids")
+    end
+    ck(#ProfUI.ShoplistSearchTerms(coldRows) == 0,
+       "unresolved rows leaked into the Auctionator terms")
+
+    -- (e) THE THIRD STATE: a never-scanned profession produces NO list, and
+    -- its message says "not checked", never "nothing to buy".
+    local unscanned = { v = 1, ds = DS, p = { alchemy = { l = 300, m = 300 } }, c = {} }
+    local uRows, _, uState = ProfUI.ShoplistRows(unscanned, "alchemy", res, allBoE)
+    ck(uState == "unscanned" and #uRows == 0,
+       "a never-scanned profession invented a shopping list")
+    local uLines = ProfUI.ShoplistLines("Aaa-Realm", "alchemy", uRows, uState, 0)
+    ck(#uLines == 1 and uLines[1]:find("Not checked", 1, true) ~= nil,
+       "the unscanned message does not say 'Not checked'")
+
+    -- (f) EMPTY STATES tell "all known" from "nothing tradable".
+    local eKnown = ProfUI.ShoplistLines("Aaa-Realm", "alchemy", {}, "scanned", 0)
+    ck(#eKnown == 1 and eKnown[1]:find("already knows", 1, true) ~= nil,
+       "the all-known empty message is wrong (" .. tostring(eKnown[1]) .. ")")
+    local eTrade = ProfUI.ShoplistLines("Aaa-Realm", "alchemy", {}, "scanned", 5)
+    ck(#eTrade == 1 and eTrade[1]:find("tradable", 1, true) ~= nil,
+       "the nothing-tradable empty message is wrong (" .. tostring(eTrade[1]) .. ")")
+
+    -- (g) LINE RENDER: header + one line per row; tradable lines carry link
+    -- or name, skill and tag; unresolved lines wear their state in words; the
+    -- Auctionator terms are exactly the resolved names.
+    local fRows = {
+        { spell = 1, skill = 100, item = 9003, itemName = "Plans: Vendor Thing",
+          link = nil, tag = "Sold by Vendor Vic \226\128\148 Testland",
+          vendor = true, unresolved = false },
+        { spell = 2, skill = 150, item = 9006, tag = "World drop", unresolved = true },
+    }
+    local fLines = ProfUI.ShoplistLines("Aaa-Realm", "alchemy", fRows, "scanned", 4)
+    ck(#fLines == 3, "the header+rows line count is wrong (" .. #fLines .. ")")
+    ck(fLines[2]:find("Vendor Vic", 1, true) ~= nil
+       and fLines[2]:find("skill 100", 1, true) ~= nil,
+       "a tradable line lost its tag or skill (" .. tostring(fLines[2]) .. ")")
+    ck(fLines[3]:find("unresolved", 1, true) ~= nil,
+       "an unresolved line does not wear its state (" .. tostring(fLines[3]) .. ")")
+    local terms = ProfUI.ShoplistSearchTerms(fRows)
+    ck(#terms == 1 and terms[1] == "Plans: Vendor Thing",
+       "the search terms are not exactly the resolved item names")
+
+    -- (h) THE SLASH TARGET RESOLVER.
+    local entries = {
+        { nameRealm = "Aaa-Realm", isSelf = false },
+        { nameRealm = "Bbb-Realm", isSelf = true },
+    }
+    local lookup = function(k) return (k == "Aaa-Realm") and knowsNothing or nil end
+    local o, pk = ProfUI.ShoplistTarget("aaa alchemy", entries, lookup, {})
+    ck(o == "Aaa-Realm" and pk == "alchemy", "explicit character+profession did not resolve")
+    o, pk = ProfUI.ShoplistTarget("", entries, lookup, { owner = "Aaa-Realm", prof = "alchemy" })
+    ck(o == "Aaa-Realm" and pk == "alchemy", "the pane-selection default did not resolve")
+    o, pk = ProfUI.ShoplistTarget("aaa", entries, lookup, {})
+    ck(o == "Aaa-Realm" and pk == "alchemy", "a sole recorded profession was not defaulted")
+    o, pk = ProfUI.ShoplistTarget("alchemy", entries, lookup, {})
+    ck(o == "Bbb-Realm" and pk == "alchemy", "profession-only did not target the self character")
+    local o2, pk2, err = ProfUI.ShoplistTarget("nosuch", entries, lookup, {})
+    ck(o2 == nil and pk2 == nil and type(err) == "string",
+       "an unknown name did not error usefully")
+    local o3, pk3, err3 = ProfUI.ShoplistTarget("aaa e", entries, lookup, {})
+    ck(pk3 == nil and type(err3) == "string",
+       "an ambiguous profession prefix resolved instead of erroring")
+end
+
 if ns.RegisterSelfTest then
     ns:RegisterSelfTest("professionsui", function(verbose)
         local suites = {
@@ -5337,6 +6094,10 @@ if ns.RegisterSelfTest then
             { name = "spec rule (conflicted recipes never missing, unavailable-with-"
                   .. "reason, census denominator, one shared predicate)",
               fn = testSpecRule },
+            { name = "shopping list (AH-tradability matrix, defensive bind read, "
+                  .. "cold-item unresolved, known/spec seams, ordering, empty "
+                  .. "messages, slash target)",
+              fn = testShoplist },
         }
         local allPass = true
         for _, suite in ipairs(suites) do
