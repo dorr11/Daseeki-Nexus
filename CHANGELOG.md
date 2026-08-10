@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- **Professions tab — grid polish.** The character grid now takes 75% of the tab (cooldowns
+  25%), and uses the room: the secondary columns wear their full names — Cooking, First Aid,
+  Fishing, Poisons — with wider, evenly redistributed spacing throughout. Skill levels print
+  just the current level, green at the Era cap of 300 and yellow on the way there; the
+  em-dash "not checked" state and specialization markers are unchanged, and the per-rank cap
+  still shows in the cell tooltip.
+
 - **Fixed:** **opening a profession window now actually records what is in it.** Every
   profession was reading "not checked" no matter how many times you opened its window. The
   window announces itself before the server has sent the recipe list, so Nexus's first look
