@@ -71,8 +71,9 @@
 -- hunting anchor arithmetic through a thousand lines.
 --
 -- DREW_UI_STYLE compliance notes, so the next reader can check them:
---   1 fixed-width bands, content hugging its natural width (the grid is a fixed
---     616-wide band inside its panel; the rollup is a fixed 300 column).
+--   1 fixed-width bands, content hugging its natural width (the grid's columns
+--     are a fixed ProfUI.GridWidth() band sitting inside the 75% pane of the
+--     owner's 75/25 grid/rollup split — ProfUI.SplitWidths).
 --   3 the two-pane drill-in is the Armory-Sets shape: ~300 list left, editor
 --     right.
 --   4 no dead bands: every panel's first content row sits one PANEL_PAD under
@@ -115,14 +116,19 @@ local L = {
     SIDE_W      = 300,  -- style guide rule 10: list column is ~300
     HEAD_H      = 18,   -- column-header band inside the grid panel
 
+    -- The owner's split for the grid view: 75% of the body to the grid pane,
+    -- the remaining 25% to the cooldown rollup. ProfUI.SplitWidths() is the
+    -- only reader.
+    GRID_FRACTION = 0.75,
+
     ROW_H       = 32,   -- one character row in the grid
-    NAME_W      = 132,  -- the class-colored name column
-    CELL_W      = 116,  -- one PRIMARY profession cell
-    CELL_GAP    = 6,
+    NAME_W      = 150,  -- the class-colored name column
+    CELL_W      = 140,  -- one PRIMARY profession cell
+    CELL_GAP    = 8,
     PRIMARIES   = 2,    -- a character may hold two primaries; the slots are fixed
-    SEC_W       = 58,   -- one SECONDARY chip
-    SEC_GAP     = 4,
-    GROUP_GAP   = 12,   -- primaries block -> secondaries block
+    SEC_W       = 78,   -- one SECONDARY chip (wide enough for its full-name header)
+    SEC_GAP     = 6,
+    GROUP_GAP   = 16,   -- primaries block -> secondaries block
 
     ICON        = 18,
     SEC_ICON    = 14,
@@ -145,6 +151,17 @@ function ProfUI.GridWidth()
 end
 -- The x of the right pane in a two-pane split of `total` width.
 function ProfUI.SplitX()             return L.SIDE_W + L.GUTTER end
+-- PURE. The grid-view pane split: grid pane width, rollup pane width, as a
+-- function of the body's total width. The two panes plus the gutter always
+-- conserve the total, so a rounding slop can never open a stray column of
+-- background between the rollup and the body's right edge.
+function ProfUI.SplitWidths(total)
+    total = tonumber(total) or 0
+    local avail = total - L.GUTTER
+    if avail < 0 then avail = 0 end
+    local gridW = math.floor(avail * L.GRID_FRACTION + 0.5)
+    return gridW, avail - gridW
+end
 
 ----------------------------------------------------------------------
 -- PROFESSION ORDER
@@ -159,7 +176,12 @@ function ProfUI.SplitX()             return L.SIDE_W + L.GUTTER end
 ----------------------------------------------------------------------
 
 ProfUI.SECONDARY_ORDER = { "cooking", "firstaid", "fishing", "poisons" }
-ProfUI.SECONDARY_SHORT = { cooking = "COOK", firstaid = "AID", fishing = "FISH", poisons = "POIS" }
+-- Full names, per the owner's header pass — the columns are wide enough now
+-- that abbreviating them ("COOK", "AID") was pure information loss. Uppercase
+-- because the grid's header band is an eyebrow row (CHARACTER, PRIMARY, …).
+ProfUI.SECONDARY_LABEL = {
+    cooking = "COOKING", firstaid = "FIRST AID", fishing = "FISHING", poisons = "POISONS",
+}
 ProfUI.SECONDARY = {}
 for _, k in ipairs(ProfUI.SECONDARY_ORDER) do ProfUI.SECONDARY[k] = true end
 
@@ -543,6 +565,20 @@ end
 -- off a fixture with no SavedVariables, including the never-scanned case, which
 -- is the one that has to be right.
 ----------------------------------------------------------------------
+
+-- PURE. The level display, owner's rule: ONLY the current level ("300", never
+-- "300/300" — the cap is a constant of the Era, printing it per cell was noise),
+-- inked "ok" (green) at the absolute Era skill cap, "warn" (yellow) anywhere
+-- below it, "faint" behind an em dash when the level was never recorded. The
+-- character's own per-rank cap (p.m) still travels on the model and still
+-- speaks in the tooltip; it just no longer costs grid width.
+ProfUI.ERA_CAP = 300
+function ProfUI.LevelInk(level)
+    local n = tonumber(level)
+    if not n then return "\226\128\148", "faint" end
+    if n >= ProfUI.ERA_CAP then return tostring(n), "ok" end
+    return tostring(n), "warn"
+end
 
 -- One profession cell. nil when the character does not have that profession at
 -- all (which is a proven fact — P1's probe drops a profession the character no
@@ -1712,15 +1748,17 @@ local function paintCell(cell, model, ownerKey, compact)
     -- the primaries wear it too so the two blocks mean the same thing.
     cell._icon:SetDesaturated(not model.scanned)
 
-    local skill = model.level and (tostring(model.level) .. "/" .. tostring(model.cap or "?")) or "\226\128\148"
+    -- Owner's rule (ProfUI.LevelInk): current level only, green at the Era
+    -- cap, yellow below it, em dash when never recorded.
+    local lvlText, lvlInk = ProfUI.LevelInk(model.level)
     if compact then
-        cell._text:SetText(skill)
-        cell._text:SetTextColor(UI.Color(model.level and "text" or "faint"))
+        cell._text:SetText(lvlText)
+        cell._text:SetTextColor(UI.Color(lvlInk))
         return
     end
 
-    cell._top:SetText(skill .. (model.hasSpec and "  \226\151\134" or ""))
-    cell._top:SetTextColor(UI.Color(model.level and "text" or "faint"))
+    cell._top:SetText(lvlText .. (model.hasSpec and "  \226\151\134" or ""))
+    cell._top:SetTextColor(UI.Color(lvlInk))
 
     -- The bottom line answers the most URGENT thing we know, in this order:
     -- a ready cooldown, a running one, then the recipe census — and the census
@@ -1929,16 +1967,27 @@ Dashboard.RegisterTab("professions", function(host)
     Dashboard.Tag(body, "prof.body")
 
     -- ══ MODE A: the grid + the rollup ═══════════════════════════════════════
-    -- Style rule 1, content hugs its natural width: the grid panel is exactly as
-    -- wide as the columns it holds (name + two primaries + four secondary chips
-    -- + its own padding), NOT "everything left over". The leftover goes to the
-    -- rollup, which is the pane that actually wants it — recipe names are long
-    -- and a cramped cooldown column is the one thing this view cannot afford to
-    -- truncate.
+    -- The owner's split, from the live-screenshot pass: 75% of the body to the
+    -- grid pane, 25% to the cooldown rollup (ProfUI.SplitWidths — one pure
+    -- reader, so the self-test and this anchor agree by construction). The
+    -- COLUMNS inside the grid pane still hug their natural width (style rule
+    -- 1): they are a fixed ProfUI.GridWidth() band sized to sit inside the 75%
+    -- pane at the shell's fixed window width, which the self-test pins.
     local gridP = panel(body, "prof.grid")
     gridP:SetPoint("TOPLEFT", body, "TOPLEFT", 0, 0)
     gridP:SetPoint("BOTTOMLEFT", body, "BOTTOMLEFT", 0, 0)
+    -- Born at its natural-content width (standing rule: both dimensions at
+    -- creation, never zero); applySplit below re-fits it to 75% the moment the
+    -- body has a real width, and again if the body's ever changes.
     gridP:SetWidth(ProfUI.GridWidth() + 2 * L.PANEL_PAD)
+    local function applySplit()
+        local total = body:GetWidth()
+        if not total or total <= 0 then return end
+        local gridW = ProfUI.SplitWidths(total)
+        if math.abs((gridP:GetWidth() or 0) - gridW) > 0.5 then gridP:SetWidth(gridW) end
+    end
+    body:SetScript("OnSizeChanged", applySplit)
+    applySplit()
 
     local gridHead = CreateFrame("Frame", nil, gridP)
     gridHead:SetPoint("TOPLEFT", gridP, "TOPLEFT", L.PANEL_PAD, -L.PANEL_PAD)
@@ -1952,7 +2001,7 @@ Dashboard.RegisterTab("professions", function(host)
             ph:SetPoint("TOPLEFT", gridHead, "TOPLEFT", ProfUI.CellX(slot) + 2, 0)
         end
         for i, key in ipairs(ProfUI.SECONDARY_ORDER) do
-            local sh = eyebrow(gridHead, ProfUI.SECONDARY_SHORT[key] or key, "LEFT")
+            local sh = eyebrow(gridHead, ProfUI.SECONDARY_LABEL[key] or key, "LEFT")
             sh:SetPoint("TOPLEFT", gridHead, "TOPLEFT", ProfUI.SecondaryX(i), 0)
         end
     end
@@ -2225,7 +2274,7 @@ Dashboard.RegisterTab("professions", function(host)
             pn:SetPoint("LEFT", pi, "RIGHT", 6, 0)
             local pl = fstr(pr, "numeral", "RIGHT")
             pl:SetPoint("RIGHT", pr, "RIGHT", -4, 0)
-            pl:SetWidth(64)
+            pl:SetWidth(40)      -- fits "300" / the em dash; the cap no longer prints here
             pn:SetPoint("RIGHT", pl, "LEFT", -4, 0)
             pr._icon, pr._name, pr._lvl = pi, pn, pl
             pr:SetScript("OnClick", function(self)
@@ -2365,8 +2414,9 @@ Dashboard.RegisterTab("professions", function(host)
             pr._icon:SetTexture(ProfUI.ProfIcon(m.key) or "Interface\\Icons\\INV_Misc_QuestionMark")
             pr._name:SetText(ProfUI.ProfName(m.key))
             pr._name:SetTextColor(UI.Color(m.key == d.profKey and "accent" or "text"))
-            pr._lvl:SetText(m.level and (m.level .. "/" .. tostring(m.cap or "?")) or "\226\128\148")
-            pr._lvl:SetTextColor(UI.Color(m.level and "muted" or "faint"))
+            local lvlText, lvlInk = ProfUI.LevelInk(m.level)
+            pr._lvl:SetText(lvlText)
+            pr._lvl:SetTextColor(UI.Color(lvlInk))
             pr:Show()
             y = y + (L.ROW_H - 4)
         end
@@ -2482,6 +2532,8 @@ Dashboard.RegisterTab("professions", function(host)
             gridP:Hide(); rollP:Hide(); listP:Hide(); recP:Hide(); searchP:Hide()
             return
         end
+        applySplit()      -- belt to OnSizeChanged's braces: a body whose width
+                          -- resolved after build still lands on the 75/25 split
         local nowE = now()
         local res = ProfUI.LiveResolver()
         local entries = ProfUI.Roster()
@@ -2746,6 +2798,37 @@ local function testGridModel(fails)
     ck(ProfUI.SecondaryX(2) - ProfUI.SecondaryX(1) == L.SEC_W + L.SEC_GAP,
        "the secondary chips are mis-pitched")
     ck(ProfUI.GridRowY(3) == 2 * L.ROW_H, "the grid row pitch is not ROW_H")
+
+    -- The 75/25 pane split is a pure function of the body width, and it
+    -- conserves it: grid + rollup + gutter == body, always.
+    local HOST_W = 1096      -- ui_shell: DEFAULT_W 1120 minus its PAD 12 insets
+    local gw, rw = ProfUI.SplitWidths(HOST_W)
+    ck(gw + rw + L.GUTTER == HOST_W, "the pane split does not conserve the body width")
+    ck(gw == math.floor((HOST_W - L.GUTTER) * L.GRID_FRACTION + 0.5),
+       "the grid pane is not GRID_FRACTION of the body")
+    ck(ProfUI.GridWidth() + 2 * L.PANEL_PAD <= gw,
+       "the grid columns overflow the 75% pane at the shell's fixed width")
+    local zg, zr = ProfUI.SplitWidths(0)
+    ck(zg == 0 and zr == 0, "a zero-width body produced a negative pane")
+
+    -- Level ink, the owner's rule: current level ONLY (no /max), green at the
+    -- Era cap, yellow below it, an em dash — never 0 — when never recorded.
+    local lt, li = ProfUI.LevelInk(300)
+    ck(lt == "300" and li == "ok", "the Era-cap level did not ink green")
+    lt, li = ProfUI.LevelInk(299)
+    ck(lt == "299" and li == "warn", "a below-cap level did not ink yellow")
+    lt, li = ProfUI.LevelInk(nil)
+    ck(lt == "\226\128\148" and li == "faint", "an unrecorded level did not render as the em dash")
+
+    -- The secondary headers carry the FULL profession names (owner's header
+    -- pass; the abbreviations COOK/AID/FISH/POIS are retired).
+    local wantHeader = { cooking = "COOKING", firstaid = "FIRST AID",
+                         fishing = "FISHING", poisons = "POISONS" }
+    for _, key in ipairs(ProfUI.SECONDARY_ORDER) do
+        ck(ProfUI.SECONDARY_LABEL[key] == wantHeader[key],
+           "secondary '" .. key .. "' does not wear its full-name header ("
+           .. tostring(ProfUI.SECONDARY_LABEL[key]) .. ")")
+    end
 end
 
 local function testRollup(fails)
