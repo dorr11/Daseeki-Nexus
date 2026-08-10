@@ -349,6 +349,228 @@ end
 local VERSION = "p1-" .. hash32(PAYLOAD)
 
 ----------------------------------------------------------------------
+-- RECIPE-SET IDENTITY  (feat/dataset-migration)
+--
+-- The version stamp above hashes EVERYTHING — sources, zones, spec edges,
+-- prose notes. But the known-recipe bitmaps depend on exactly one thing: the
+-- per-profession teaching-spell ordering. The 2026-08-10 incident was the gap
+-- between those two facts: a spec-tree addition moved the stamp without moving
+-- one recipe, and every character's record went "not checked" — a full re-scan
+-- tour of the alts, twice in one day.
+--
+-- So the dataset also ships a SET HASH: a content hash over the canonical
+-- membership-and-ordering string, "<profOrdinal>:<teachingSpellID>" per recipe
+-- row in bitmap order. Two builds with the same set hash have byte-identical
+-- bitmap coordinate systems, whatever else changed. ONE GLOBAL HASH, not one
+-- per profession, deliberately: the wire pays one short field beside `ds`
+-- instead of one per profession record, one gate answers validity, and the
+-- per-profession precision a split hash would buy is already delivered by the
+-- migrations section below (an untouched profession's map is the identity,
+-- represented in a handful of bytes).
+----------------------------------------------------------------------
+
+local canonRows, profOrder = {}, {}
+section = nil
+for _, line in ipairs(kept) do
+    local s = line:match("^%[(%a+)%]$")
+    if s then
+        section = s
+    elseif section == "recipe" then
+        local p, spell = line:match("^(%d+)|(%d+)|")
+        canonRows[#canonRows + 1] = p .. ":" .. spell
+        local pi = tonumber(p)
+        profOrder[pi] = profOrder[pi] or {}
+        profOrder[pi][#profOrder[pi] + 1] = spell
+    end
+end
+
+-- PURE over an orderings table { [profIdx] = { id, id, ... } }: the canonical
+-- string, so a historical snapshot hashes through the very same function the
+-- live facts do — one definition of "same set", not two.
+local function canonOf(orderings, profTotal)
+    local rows = {}
+    for pi = 1, profTotal do
+        local ids = orderings[pi]
+        if ids then
+            for i = 1, #ids do rows[#rows + 1] = pi .. ":" .. ids[i] end
+        end
+    end
+    return table.concat(rows, "\n") .. "\n"
+end
+
+local PROF_TOTAL = tonumber(meta.professions)
+local SETHASH = "s1-" .. hash32(canonOf(profOrder, PROF_TOTAL))
+
+----------------------------------------------------------------------
+-- ORDERING SNAPSHOTS  (dev/professions-orderings/)
+--
+-- One compact file per historical stamp, listing each profession's teaching
+-- spells in bitmap order. They are the generator's MEMORY: the shipped
+-- migrations section below is derived from them, so a record written under any
+-- snapshotted build can be translated instead of discarded. The dir carries an
+-- index.txt because plain Lua 5.1 cannot list a directory; the generator
+-- maintains it (sorted — class 8, the emission may never inherit file-system
+-- enumeration luck).
+--
+-- DISCIPLINE: the current run's snapshot is written if absent, and an EXISTING
+-- snapshot for the same stamp that disagrees byte-for-byte is a hard refusal —
+-- two different orderings under one stamp would make the stamp a lie and every
+-- migration derived from it a corruption.
+----------------------------------------------------------------------
+
+local SNAP_DIR   = DEV_DIR .. "/professions-orderings"
+local INDEX_PATH = SNAP_DIR .. "/index.txt"
+
+local function snapshotBody(stamp, sethash, orderings)
+    local out = {
+        "# Daseeki Nexus - professions ordering snapshot. GENERATED; never hand-edit.",
+        "# One line per profession: o|<prof ordinal>|<prof key>|<teaching spell ids, bitmap order>",
+        "stamp|" .. stamp,
+        "sethash|" .. sethash,
+    }
+    for pi = 1, PROF_TOTAL do
+        out[#out + 1] = "o|" .. pi .. "|" .. (profKey[pi] or "?") .. "|"
+            .. table.concat(orderings[pi] or {}, ",")
+    end
+    return table.concat(out, "\n") .. "\n"
+end
+
+local function readAll(path)
+    local fh2 = io.open(path, "rb")
+    if not fh2 then return nil end
+    local body = fh2:read("*a")
+    fh2:close()
+    return body
+end
+
+local function writeAll(path, body)
+    local fo2 = io.open(path, "wb")
+    if not fo2 then
+        die("cannot write " .. path .. " (does dev/professions-orderings/ exist?)")
+    end
+    fo2:write(body)
+    fo2:close()
+end
+
+-- Parse a snapshot back into { stamp, sethash, orderings }. Every gate dies:
+-- a half-read snapshot silently dropped would ship as "that build never
+-- existed", which renders as the exact re-scan tour this layer exists to end.
+local function parseSnapshot(path)
+    local body = readAll(path)
+    if not body then die("index.txt names a snapshot that does not exist: " .. path) end
+    local snap = { orderings = {} }
+    for line in (body .. "\n"):gmatch("(.-)\n") do
+        line = line:gsub("\r$", "")
+        if line ~= "" and line:sub(1, 1) ~= "#" then
+            local k, v = line:match("^(%a+)|(.*)$")
+            if k == "stamp" then
+                snap.stamp = v
+            elseif k == "sethash" then
+                snap.sethash = v
+            elseif k == "o" then
+                local pi, _, ids = line:match("^o|(%d+)|([^|]*)|(.*)$")
+                if not pi then die("malformed ordering row in " .. path .. ": " .. line) end
+                local list = {}
+                for id in ids:gmatch("(%d+)") do list[#list + 1] = id end
+                snap.orderings[tonumber(pi)] = list
+            end
+        end
+    end
+    if not (snap.stamp and snap.sethash) then
+        die("snapshot " .. path .. " is missing its stamp or sethash header")
+    end
+    local recomputed = "s1-" .. hash32(canonOf(snap.orderings, PROF_TOTAL))
+    if recomputed ~= snap.sethash then
+        die("snapshot " .. path .. " does not hash to its own sethash ("
+            .. recomputed .. " vs " .. snap.sethash .. ") - corrupted or hand-edited")
+    end
+    return snap
+end
+
+-- The current snapshot: write-if-absent, refuse a mismatched overwrite.
+local SNAP_BODY = snapshotBody(VERSION, SETHASH, profOrder)
+do
+    local existing = readAll(SNAP_DIR .. "/" .. VERSION .. ".txt")
+    if existing == nil then
+        writeAll(SNAP_DIR .. "/" .. VERSION .. ".txt", SNAP_BODY)
+    elseif existing ~= SNAP_BODY then
+        die("ordering snapshot for stamp " .. VERSION .. " already exists and DISAGREES"
+            .. " with this run - two orderings under one stamp is a corrupted history;"
+            .. " refusing to overwrite")
+    end
+end
+
+-- The index: every known stamp, sorted, current one included.
+local stamps, stampSeen = {}, {}
+do
+    local idx = readAll(INDEX_PATH)
+    for line in ((idx or "") .. "\n"):gmatch("(.-)\n") do
+        line = line:gsub("\r$", "")
+        if line ~= "" and line:sub(1, 1) ~= "#" and not stampSeen[line] then
+            stampSeen[line] = true
+            stamps[#stamps + 1] = line
+        end
+    end
+    if not stampSeen[VERSION] then
+        stampSeen[VERSION] = true
+        stamps[#stamps + 1] = VERSION
+    end
+    table.sort(stamps)
+    writeAll(INDEX_PATH, table.concat(stamps, "\n") .. "\n")
+end
+
+----------------------------------------------------------------------
+-- MIGRATIONS — old set-hash -> current, per profession, ordinal to ordinal
+--
+-- Derived, never authored: for every snapshot whose set hash differs from the
+-- current one, each profession's map is old ordinal -> new ordinal by teaching
+-- spell id (0 = the recipe left the dataset). A profession whose membership
+-- and order survived intact is emitted as "=<n>" — the identity, in five
+-- bytes. Snapshots whose set hash EQUALS the current one need no migration at
+-- all (that is Layer 1's whole point); they contribute only their stamp
+-- association, so a record carrying nothing but the old `ds` can still be
+-- named and rescued.
+----------------------------------------------------------------------
+
+local spellNewOrd = {}          -- profIdx -> spellID(string) -> new ordinal
+for pi = 1, PROF_TOTAL do
+    spellNewOrd[pi] = {}
+    local ids = profOrder[pi] or {}
+    for i = 1, #ids do spellNewOrd[pi][ids[i]] = i end
+end
+
+local compatRows = { "[stampset]" }
+local snapsBySethash, migrationRows = {}, {}
+for i = 1, #stamps do                                  -- sorted: class 8
+    local snap = (stamps[i] == VERSION) and { stamp = VERSION, sethash = SETHASH, orderings = profOrder }
+        or parseSnapshot(SNAP_DIR .. "/" .. stamps[i] .. ".txt")
+    if snap.stamp ~= stamps[i] then
+        die("snapshot file " .. stamps[i] .. ".txt declares stamp " .. tostring(snap.stamp))
+    end
+    compatRows[#compatRows + 1] = snap.stamp .. "|" .. snap.sethash
+    if snap.sethash ~= SETHASH and not snapsBySethash[snap.sethash] then
+        snapsBySethash[snap.sethash] = true
+        for pi = 1, PROF_TOTAL do
+            local oldIds = snap.orderings[pi] or {}
+            if #oldIds > 0 then
+                local identity = (#oldIds == #(profOrder[pi] or {}))
+                local mapped = {}
+                for o = 1, #oldIds do
+                    local nn = spellNewOrd[pi][oldIds[o]] or 0
+                    mapped[o] = tostring(nn)
+                    if nn ~= o then identity = false end
+                end
+                migrationRows[#migrationRows + 1] = snap.sethash .. "|" .. pi .. "|"
+                    .. (identity and ("=" .. #oldIds) or table.concat(mapped, ","))
+            end
+        end
+    end
+end
+compatRows[#compatRows + 1] = "[migration]"
+for i = 1, #migrationRows do compatRows[#compatRows + 1] = migrationRows[i] end
+local COMPAT = table.concat(compatRows, "\n") .. "\n"
+
+----------------------------------------------------------------------
 -- Emit
 ----------------------------------------------------------------------
 
@@ -386,9 +608,17 @@ local HEADER = [==[
 --                             npc, quest, object, event, faction, standing,
 --                             spec, rank, trainerset, recipe, item.
 --
---   ns.ProfessionsDataMeta    { version, recipes, items, npcs, ... } — the
---                             counts as literals, so the load-time census gate
---                             never costs a parse, plus the version stamp.
+--   ns.ProfessionsDataMeta    { version, setHash, recipes, items, npcs, ... }
+--                             — the counts as literals, so the load-time census
+--                             gate never costs a parse, plus the version stamp
+--                             and the recipe-set hash.
+--
+--   ns.ProfessionsDataCompat  the migration blob: [stampset] rows naming every
+--                             historical dataset stamp's recipe-set hash, and
+--                             [migration] rows translating each historical
+--                             recipe set's ordinals into this build's. Parsed
+--                             lazily by professions.lua, only when a record
+--                             from another build shows up.
 --
 --   Parse it through ns.Professions.Dataset — the parser lives there, staged,
 --   so the capture layer's needs (the recipe index) are built without building
@@ -410,6 +640,14 @@ local HEADER = [==[
 -- renders as "not scanned", decoding wrongly renders as a list of recipes that
 -- character does not know.
 --
+-- SET HASH (feat/dataset-migration). The version stamp hashes EVERYTHING, but
+-- the bitmaps depend only on the recipe membership-and-ordering, so
+-- ns.ProfessionsDataMeta.setHash names exactly that. A stamp bump that leaves
+-- the set hash unchanged (sources, zones, spec edges, notes) invalidates
+-- NOTHING: professions.lua rescues such records through the [stampset] table
+-- in ns.ProfessionsDataCompat, and genuine set changes are translated through
+-- its [migration] rows instead of being discarded.
+--
 -- Clean-room: the facts are game facts, extracted through our own Room-1
 -- addendum. No third-party code, identifiers or file structure appear here.
 
@@ -421,6 +659,7 @@ local out = {}
 out[#out + 1] = HEADER
 out[#out + 1] = "ns.ProfessionsDataMeta = {\n"
 out[#out + 1] = string.format("    version     = %q,\n", VERSION)
+out[#out + 1] = string.format("    setHash     = %q,\n", SETHASH)
 local metaOrder = {
     "professions", "recipes", "items", "npcs", "zones", "quests", "objects",
     "events", "factions", "specs", "ranks", "notes", "grantOnLearn",
@@ -434,10 +673,24 @@ out[#out + 1] = "}\n\n"
 out[#out + 1] = "ns.ProfessionsDataRaw = [==[\n"
 out[#out + 1] = PAYLOAD
 out[#out + 1] = "]==]\n"
+out[#out + 1] = "\n"
+out[#out + 1] = "-- COMPAT (feat/dataset-migration). Derived from dev/professions-orderings/,\n"
+out[#out + 1] = "-- OUTSIDE the version-stamped payload on purpose: the stamp names the facts'\n"
+out[#out + 1] = "-- coordinate system, and shipping a better memory of old builds is not a new\n"
+out[#out + 1] = "-- coordinate system. [stampset] rows associate every historical stamp with its\n"
+out[#out + 1] = "-- recipe-set hash (so a record carrying only `ds` can be named); [migration]\n"
+out[#out + 1] = "-- rows are <old set-hash>|<prof ordinal>|<old ordinal -> new ordinal map>,\n"
+out[#out + 1] = "-- \"=<n>\" for the identity, 0 for a recipe that left the dataset.\n"
+out[#out + 1] = "ns.ProfessionsDataCompat = [==[\n"
+out[#out + 1] = COMPAT
+out[#out + 1] = "]==]\n"
 
 local body = table.concat(out)
 if PAYLOAD:find("]==]", 1, true) then
     die("the payload contains a long-bracket terminator; the quoting level must change")
+end
+if COMPAT:find("]==]", 1, true) then
+    die("the compat blob contains a long-bracket terminator; the quoting level must change")
 end
 
 local fo = io.open(OUT_PATH, "wb")
@@ -451,7 +704,9 @@ if not chunk then die("the generated file does not compile: " .. tostring(err)) 
 
 io.write(string.format(
     "gen-professions-data: wrote %s\n  file %d bytes | payload %d bytes | %d rows | version %s\n"
-    .. "  %d recipes | %d recipe-items | %d NPCs | %d zones | %d quests | %d specs | %d ranks\n",
+    .. "  %d recipes | %d recipe-items | %d NPCs | %d zones | %d quests | %d specs | %d ranks\n"
+    .. "  set-hash %s | %d ordering snapshot(s) | %d migration row(s)\n",
     OUT_PATH, #body, #PAYLOAD, #kept, VERSION,
     tonumber(meta.recipes), tonumber(meta.items), tonumber(meta.npcs),
-    tonumber(meta.zones), tonumber(meta.quests), tonumber(meta.specs), tonumber(meta.ranks)))
+    tonumber(meta.zones), tonumber(meta.quests), tonumber(meta.specs), tonumber(meta.ranks),
+    SETHASH, #stamps, #migrationRows))
