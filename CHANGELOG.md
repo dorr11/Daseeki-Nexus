@@ -1,5 +1,40 @@
 # Changelog
 
+## 1.1.7 — 2026-08-10
+
+- **Fixed:** **Sayge no longer gives you the wrong fortune.** This is the one that cost two
+  characters their Darkmoon Faire buff on the same weekend — ask for one thing, watch Sayge
+  hand you another, wait out the four-hour cooldown, and it wasn't the answer maps that were
+  wrong. When Sayge presents his choices, the game hands Nexus a *list*, and Nexus assumed
+  that list was in the same order you see on screen. It is not guaranteed to be: each choice
+  carries its own little "I am displayed at position so-and-so" tag, and the list itself
+  arrives in whatever order the game's database felt like serving it. So "click the first
+  option" clicked whatever happened to be first in the list — sometimes the right answer,
+  sometimes somebody else's fortune. Nexus now puts the choices into the order you actually
+  see before it counts anything, on every page, and clicks the choice by its own identity
+  rather than its position in the raw list. The same correction is applied everywhere Nexus
+  picks a gossip option by position — the Dire Maul tribute guards and the Blackwing Lair orb
+  included — because they all read the same list the same way. And if the game ever serves a
+  page *without* saying what order it is displayed in, Nexus refuses to answer and tells you
+  to pick by hand: one manual click beats four lost hours.
+- **Changed:** **the Damage answer takes the scenic route now, on purpose.** Damage happened
+  to be the first answer on every page, so the old flow blind-fired "first option" a hundred
+  times in five seconds to blast through Sayge's pages without waiting. That blind fire is
+  exactly what the bug above turned into wrong buffs, so it is gone entirely: Damage now
+  answers page by page like every other fortune — two or three clicks with a server reply
+  between each, a couple of seconds slower and aimed every time. Nexus also keeps track of
+  *where it is* in Sayge's script now: the four-answer page must come before the three-answer
+  page, and a page arriving out of order — or a shape Sayge has never shown before — is
+  refused rather than guessed at. Walking away mid-fortune, closing his window, or zoning out
+  cleanly abandons the attempt instead of leaving a half-answered fortune armed.
+- **Added:** **Sayge visits are recorded, so the next oddity is a report instead of a
+  mystery.** The wrong-buff incident was diagnosed from memory, because nothing wrote down
+  what Sayge showed or what Nexus clicked. Now every visit keeps a short record — each page
+  he presented, every option's position, display tag, identity and text, what was clicked or
+  refused and why, which buff was wanted, on which class, under which addon version. The last
+  ten visits are kept, and `/dsn debug sayge` prints them. If Sayge ever surprises us again,
+  the receipt is already in hand.
+
 ## 1.1.6 — 2026-08-08
 
 - **Added:** **Rin'wosho repairs your gear again.** Nexus has always been able to auto-repair,

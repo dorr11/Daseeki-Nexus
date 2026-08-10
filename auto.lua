@@ -1320,9 +1320,27 @@ Auto.BWL_BLOCKING_QUESTS = { 85556, 85557, 85558 }
 -- Darkmoon Faire fortune teller (spec §14).
 Auto.SAYGE_NPC           = 14822
 Auto.SAYGE_DEFAULT_BUFF  = "damage"     -- spec: default Damage for every class
-Auto.SAYGE_SPAM_REPEATS  = 100          -- spec: 100 repeats…
-Auto.SAYGE_SPAM_INTERVAL = 0.05         -- …at 50 ms
 Auto.SAYGE_REENTRY_LOCK  = 5            -- spec: 5 s re-entry lock
+-- Grace window for the between-pages GOSSIP_CLOSED coin flip (1.1.7). On this
+-- client family selecting a gossip option that leads to another page MAY fire
+-- GOSSIP_CLOSED before the next GOSSIP_SHOW (CLIENT_ASYNC_LESSONS Class 2:
+-- event order between two listeners is a coin flip, and the client's own page
+-- transition is one of the listeners). So a close does not tear the visit down
+-- synchronously: mid-flow state younger than this many seconds is a page
+-- transition, older is an abandoned visit. Every failure mode of this rule is
+-- a REFUSAL (double-4 / cold-3 below), never a wrong click.
+Auto.SAYGE_PAGE_GRACE    = 2
+
+-- THE 100x50ms DAMAGE SPAM LADDER IS GONE (1.1.7 hotfix). Spec §14 described
+-- blast-firing "array position 1" through the pages without waiting for the
+-- server. On this client family C_GossipInfo.GetOptions() array order is NOT
+-- display order (each option carries its own orderIndex — see
+-- Auto.SortGossipOptions), so the ladder clicked whatever the database
+-- happened to order first: the owner's WRONG-BUFF incident, twice, on two
+-- classes, 4-hour cooldown lost each time. Damage now walks the same
+-- page-map stepping as every other buff type — 2-3 answers, one server
+-- round-trip per page, NPC identity re-checked on every step by the
+-- OnGossipShow gate. Owner-approved spec divergence, 2026-08-10.
 
 -- Spec §14 page maps, keyed by the number of options the page presents. This is
 -- the whole selection mechanism for every buff type except Damage: an option
@@ -1366,6 +1384,45 @@ local function optionSelector(options, index)
     local opt = options and options[index]
     if not opt then return nil end
     return opt.gossipOptionID
+end
+
+-- DISPLAY ORDER, NOT ARRAY ORDER (1.1.7 hotfix — the root cause of the owner's
+-- wrong-Sayge-buff incident). C_GossipInfo.GetOptions() returns an ARRAY whose
+-- order is whatever the database served — on this client family it is NOT
+-- guaranteed to be the order the player sees. Each option carries its own
+-- `orderIndex` field, and THAT is the display order. Every positional rule in
+-- this file ("option 1", "page 1 option 2") is a statement about what the
+-- player SEES, so every handler must select through a display-sorted view of
+-- the list, never through raw array positions. This is CLIENT_ASYNC_LESSONS
+-- Class 8 (nondeterministic ordering on the wire) wearing a gossip skin, and
+-- the fix shape is the catalog's: sort before any positional logic.
+--
+-- PURE. Returns (sortedCopy, ordered). The copy is sorted by orderIndex
+-- ascending; the input array is never mutated. `ordered` is false when the
+-- display order is UNPROVABLE: any option missing a numeric orderIndex, or two
+-- options sharing one (a tie makes the positions between them ambiguous — for
+-- a click that costs a 4-hour cooldown, ambiguous IS unordered). When ordered
+-- is false the copy keeps raw array order; multi-option positional callers
+-- must refuse, single-option callers may proceed (the order of one is trivial).
+function Auto.SortGossipOptions(options)
+    local out, ordered = {}, true
+    if type(options) ~= "table" then return out, false end
+    local seen = {}
+    for i, opt in ipairs(options) do
+        out[i] = opt
+        local ord = (type(opt) == "table") and tonumber(opt.orderIndex) or nil
+        if ord == nil or seen[ord] then
+            ordered = false
+        else
+            seen[ord] = true
+        end
+    end
+    if ordered and #out > 1 then
+        table.sort(out, function(a, b)
+            return tonumber(a.orderIndex) < tonumber(b.orderIndex)
+        end)
+    end
+    return out, ordered
 end
 
 -- PURE. Dire Maul tribute guard decision. ctx: enabled, npcID, optionCount.
@@ -1420,9 +1477,11 @@ end
 
 Auto._saygeDone        = false   -- the fortune has been answered this visit
 Auto._saygeAt          = nil     -- GetTime() of that answer (5 s re-entry lock)
-Auto._saygeSpam        = 0       -- remaining ticks of the Damage spam ladder
-Auto._saygeShapeWarned = false   -- one unknown-shape chat line per visit
+Auto._saygeSeen4       = false   -- the 4-option page has been ANSWERED this visit
+Auto._saygePageAt      = nil     -- GetTime() of the last page this visit touched
+Auto._saygeShapeWarned = false   -- one refusal chat line per visit
 Auto._saygeInteractAt  = nil     -- stamped on ANY Sayge gossip, setting or not
+Auto._saygeVisit       = nil     -- in-flight trace record (committed to the SV ring)
 
 -- The class default answer path. Spec: default Damage for every class. The
 -- store now seeds that for all nine classes, and this is the belt to that
@@ -1440,84 +1499,148 @@ function Auto.SaygeLocked(now)
     return ((now or nowSecs()) - Auto._saygeAt) < Auto.SAYGE_REENTRY_LOCK
 end
 
--- PURE. Spec's positional selection for a non-Damage buff type.
--- Returns (optionIndex|nil, reason). "final" is true when answering this page
--- completes the fortune (page 2), false while we are still walking pages.
+-- PURE. Spec's positional selection, SEQUENCE-AWARE (1.1.7). `seen4` is the
+-- per-visit fact "the 4-option page has already been answered this visit".
+-- Returns (optionIndex|nil, reason, final). "final" is true when answering
+-- this page completes the fortune (the 3-option page), false while we are
+-- still walking pages.
 --
--- SHAPE GUARD. Any option count the spec does not describe returns nil. This is
--- the deliberately paranoid half of the feature: Sayge's fortune is a permanent
--- daily buff, so refusing costs the owner one manual click, while a misclick
--- costs a day. Row 75/76 of the audit are implemented from the spec's page maps
--- and the "Damage is option 1 on both pages" premise is flagged
--- UNKNOWN-NEEDS-INGAME-VERIFY — hence the guard rather than a best guess.
-function Auto.DecideSaygeOption(want, optionCount)
+-- SHAPE + SEQUENCE GUARD. Any option count the spec does not describe refuses,
+-- and so does a DESCRIBED count arriving out of sequence: the 4-option map
+-- applies only to the FIRST multi-option page of the visit, the 3-option map
+-- only AFTER a 4-option answer was given this visit. A 3-option page arriving
+-- cold, or a second 4-option page, means our idea of where we are in Sayge's
+-- script is wrong — and a positional click from the wrong page is exactly the
+-- wrong-buff incident this build fixes. Refusing costs the owner one manual
+-- click; a misclick costs the 4-hour cooldown. Transitional single-option
+-- pages are legal at any time.
+function Auto.DecideSaygeOption(want, optionCount, seen4)
     local n = tonumber(optionCount) or 0
     if n == 1 then return 1, "transitional", false end   -- single-option page
     local page = Auto.SAYGE_PAGE[n]
     if not page then return nil, "unexpected-shape", false end
+    if n == 4 and seen4 then return nil, "double-4-page", false end
+    if n == 3 and not seen4 then return nil, "cold-3-page", false end
     local idx = page[want]
     if not idx then return nil, "unknown-bufftype", false end
     if idx > n then return nil, "index-out-of-range", false end
     return idx, "page-" .. n, (n == 3)
 end
 
--- One chat line per visit when the page shape is not one the spec describes,
--- plus the full detail on the debug channel so the owner can capture it.
+----------------------------------------------------------------------
+-- Sayge visit trace (1.1.7) — the persisted flight recorder.
+--
+-- House doctrine: bounded, build-stamped, additive SavedVariables. Every visit
+-- appends ONE record to a small ring in the data SV (Store.AppendSaygeVisit,
+-- ~10 visits): for each page seen — the option count, whether the display
+-- order was provable, and per option its raw array position, orderIndex,
+-- gossipOptionID and (truncated) name — plus what was clicked or refused and
+-- why, the resolved want, and the class. The owner's incident was only
+-- diagnosable from memory and a lost cooldown; the next anomaly will be
+-- diagnosable from `/dsn debug sayge`.
+----------------------------------------------------------------------
+
+local SAYGE_NAME_TRUNC = 60
+
+function Auto.SaygeVisitBegin(classTag, want)
+    if Auto._saygeVisit then return Auto._saygeVisit end
+    Auto._saygeVisit = {
+        at    = Store.Now and Store.Now() or 0,
+        build = ns.VERSION,
+        class = classTag,
+        want  = want,
+        pages = {},
+    }
+    return Auto._saygeVisit
+end
+
+-- Append one page record to the in-flight visit. `disp` is the DISPLAY-sorted
+-- list actually used for selection; each option row records where it sat in
+-- the RAW array (pos) next to the orderIndex that put it where it is, which is
+-- exactly the pair of facts the incident diagnosis needed.
+function Auto.SaygeTracePage(disp, raw, ordered)
+    local v = Auto._saygeVisit
+    if not v then return nil end
+    local page = { n = #disp, ordered = ordered and true or false, options = {} }
+    local rawPos = {}
+    for i, opt in ipairs(raw or {}) do rawPos[opt] = i end
+    for i, opt in ipairs(disp or {}) do
+        page.options[i] = {
+            pos  = rawPos[opt] or i,
+            ord  = type(opt) == "table" and tonumber(opt.orderIndex) or nil,
+            id   = type(opt) == "table" and opt.gossipOptionID or nil,
+            name = type(opt) == "table" and tostring(opt.name or ""):sub(1, SAYGE_NAME_TRUNC) or "",
+        }
+    end
+    v.pages[#v.pages + 1] = page
+    return page
+end
+
+-- Close the in-flight visit record with its outcome and hand it to the store
+-- ring. Idempotent: a committed visit is gone, a second commit is a no-op.
+function Auto.SaygeCommitVisit(outcome)
+    local v = Auto._saygeVisit
+    Auto._saygeVisit = nil
+    if not v then return end
+    v.outcome = outcome
+    if Store.AppendSaygeVisit then Store.AppendSaygeVisit(v) end
+    gdbg("sayge: visit committed -- %s (%d page(s))", tostring(outcome), #v.pages)
+end
+
+-- Per-visit state teardown. Commits any in-flight trace first (so an abandoned
+-- visit is still a visible visit), then clears the sequence + warn flags. The
+-- 5 s re-entry lock (_saygeAt) is deliberately NOT touched — it is a time
+-- guard, and the state it protects (the answered fortune) is already history.
+function Auto.SaygeResetVisit(reason)
+    if Auto._saygeVisit then Auto.SaygeCommitVisit(reason) end
+    Auto._saygeSeen4       = false
+    Auto._saygePageAt      = nil
+    Auto._saygeShapeWarned = false
+end
+
+-- Is the mid-flow state stale? True when a page was touched more than the
+-- grace window ago: a real page transition (answer -> next GOSSIP_SHOW) is a
+-- server round-trip measured in milliseconds, an owner who closed the window
+-- and came back is measured in seconds. PURE over the injected clock.
+function Auto.SaygeVisitStale(now)
+    if Auto._saygePageAt == nil then return false end
+    return ((now or nowSecs()) - Auto._saygePageAt) > Auto.SAYGE_PAGE_GRACE
+end
+
+-- One chat line per visit when a page is refused, plus the full detail on the
+-- debug channel, plus the trace commit — a refusal IS the visit's outcome.
 function Auto.SaygeShapeWarn(reason, options, want)
     local n = options and #options or 0
     if not Auto._saygeShapeWarned then
         Auto._saygeShapeWarned = true
-        ns:Print(("Sayge: refused to answer — a %d-option page is not a shape spec §14 "
-            .. "describes (%s). No fortune was taken; choose it by hand. "
-            .. "Run |cffffd100/dsn debug gossip|r and re-open him to capture the options.")
-            :format(n, tostring(reason)))
+        local head
+        if reason == "unordered-options" then
+            head = ("Sayge: refused to answer — the client did not prove what order his "
+                .. "%d options are displayed in, and a misclick costs the 4-hour cooldown."):format(n)
+        else
+            head = ("Sayge: refused to answer — a %d-option page is not a shape spec §14 "
+                .. "describes here (%s)."):format(n, tostring(reason))
+        end
+        ns:Print(head .. " No fortune was taken; choose it by hand. "
+            .. "|cffffd100/dsn debug sayge|r shows the recorded visit.")
     end
-    gdbg("sayge shape mismatch: reason=%s options=%d want=%s", tostring(reason), n, tostring(want))
+    gdbg("sayge refusal: reason=%s options=%d want=%s", tostring(reason), n, tostring(want))
     for i, opt in ipairs(options or {}) do
-        gdbg("  option %d: id=%s name=%s", i, tostring(opt.gossipOptionID), tostring(opt.name))
+        gdbg("  option %d: ord=%s id=%s name=%s", i, tostring(opt.orderIndex),
+             tostring(opt.gossipOptionID), tostring(opt.name))
     end
+    Auto.SaygeCommitVisit("refused:" .. tostring(reason))
 end
 
--- The Damage fast path (spec §14): option 1 is Damage on BOTH pages, so the
--- flow blasts option 1 through the pages instead of waiting for a server
--- round-trip per page — 100 repeats at 50 ms.
+-- Called ONLY from Auto.OnGossipShow, and only once the NPC is confirmed
+-- 14822 — which IS the per-step identity re-check: every page of the visit
+-- re-enters through that gate, so a click can never land at another NPC.
 --
--- IDENTITY IS RE-CHECKED ON EVERY TICK. A blind 5 s ladder of "click option 1"
--- is precisely the hazard this whole brief exists to remove: if the player
--- walks away from Sayge and opens another NPC mid-ladder, an un-gated tick
--- would click that NPC's first option. So each tick refuses (and stops) unless
--- UnitGUID("npc") still parses to 14822. It never WAITS on anything, so the
--- spec's reason for spamming is preserved.
-function Auto.SaygeSpamTick()
-    if (Auto._saygeSpam or 0) <= 0 then return end
-    Auto._saygeSpam = Auto._saygeSpam - 1
-
-    if Auto.NpcID() ~= Auto.SAYGE_NPC then
-        gdbg("sayge spam: NPC is no longer Sayge -- ladder stopped with %d tick(s) left",
-            Auto._saygeSpam)
-        Auto._saygeSpam = 0
-        return
-    end
-    local options = C_GossipInfo and C_GossipInfo.GetOptions and C_GossipInfo.GetOptions()
-    if options and options[1] then
-        selectGossipOption(optionSelector(options, 1))
-    end
-    if Auto._saygeSpam > 0 and C_Timer and C_Timer.After then
-        C_Timer.After(Auto.SAYGE_SPAM_INTERVAL, function() ns:SafeCall(Auto.SaygeSpamTick) end)
-    end
-end
-
-function Auto.StartSaygeSpam()
-    Auto._saygeSpam = Auto.SAYGE_SPAM_REPEATS
-    Auto.SaygeSpamTick()
-end
-
--- Called ONLY from Auto.OnGossipShow, and only once the NPC is confirmed 14822.
-function Auto.HandleSayge(options, dmf)
-    -- The spam ladder owns the window while it runs: a cookie-close here would
-    -- shut the gossip out from under it.
-    if (Auto._saygeSpam or 0) > 0 then return true end
-
+-- `options` is the DISPLAY-sorted list from Auto.SortGossipOptions and
+-- `ordered` its provability verdict. EVERY buff type — Damage included —
+-- walks the page maps one GOSSIP_SHOW at a time now; there is no fast path
+-- (see the constants block for the ladder's obituary).
+function Auto.HandleSayge(options, ordered, dmf)
     -- Inside the 5 s re-entry lock the fortune is already answered. The only
     -- thing left to do is close the fortune-cookie dialog (default on).
     if Auto.SaygeLocked() then
@@ -1528,34 +1651,61 @@ function Auto.HandleSayge(options, dmf)
         return true
     end
 
-    local _, classTag = UnitClass("player")
-    local want = Auto.SaygeBuffType(dmf, classTag)
-
-    if want == Auto.SAYGE_DEFAULT_BUFF then
-        Auto._saygeAt   = nowSecs()
-        Auto._saygeDone = true
-        gdbg("sayge: Damage fast path -- spamming option 1 x%d", Auto.SAYGE_SPAM_REPEATS)
-        Auto.StartSaygeSpam()
-        return true
+    -- Lock expired: whatever visit that lock belonged to is over. So is a
+    -- mid-flow visit whose last page is older than the grace window (the owner
+    -- closed the window mid-fortune and came back later).
+    if Auto._saygeDone then
+        Auto._saygeDone = false
+        Auto.SaygeResetVisit("lock-expired")
+    elseif Auto.SaygeVisitStale() then
+        Auto.SaygeResetVisit("abandoned-mid-flow")
     end
 
-    local idx, why, final = Auto.DecideSaygeOption(want, #options)
+    -- A visit that refused STAYS refused until it is torn down (lock expiry,
+    -- staleness, NPC change, close, zone). The same page re-firing GOSSIP_SHOW
+    -- must not append one ring record — or one chat line — per re-show.
+    if Auto._saygeShapeWarned then return false end
+
+    local _, classTag = UnitClass("player")
+    local want = Auto.SaygeBuffType(dmf, classTag)
+    local raw  = Auto._saygeRawOptions   -- set by OnGossipShow for the trace
+    Auto.SaygeVisitBegin(classTag, want)
+    local page = Auto.SaygeTracePage(options, raw, ordered)
+    Auto._saygePageAt = nowSecs()
+
+    -- UNORDERED WORLD (Class 8). The display order is unprovable, so every
+    -- positional statement below is evidence-free. A single-option page is
+    -- trivially ordered and proceeds; anything wider refuses out loud.
+    if not ordered and #options > 1 then
+        if page then page.refused = "unordered-options" end
+        Auto.SaygeShapeWarn("unordered-options", options, want)
+        return false
+    end
+
+    local idx, why, final = Auto.DecideSaygeOption(want, #options, Auto._saygeSeen4)
     if idx == nil then
+        if page then page.refused = why end
         Auto.SaygeShapeWarn(why, options, want)
         return false
     end
     local selector = optionSelector(options, idx)
     if selector == nil then
+        if page then page.refused = "no-option-id" end
         Auto.SaygeShapeWarn("no-option-id", options, want)
         return false
     end
     if not selectGossipOption(selector) then return false end
-    gdbg("sayge: want=%s options=%d -> option %d (%s)", want, #options, idx, why)
+    if page then page.clicked, page.why = idx, why end
+    if #options == 4 then Auto._saygeSeen4 = true end
+    gdbg("sayge: want=%s options=%d -> display option %d (%s)", want, #options, idx, why)
     if final then
-        -- Page 2 is the last page: the buff is chosen. Arm the lock so the
-        -- fortune-cookie page that follows is closed, not answered.
+        -- The 3-option page is the last page: the buff is chosen. Arm the lock
+        -- so the fortune-cookie page that follows is closed, not answered.
         Auto._saygeAt   = nowSecs()
         Auto._saygeDone = true
+        Auto.SaygeCommitVisit("answered")
+        Auto._saygeSeen4  = false
+        Auto._saygePageAt = nil
     end
     return true
 end
@@ -1615,11 +1765,26 @@ function Auto.OnGossipShow()
 
     if not (C_GossipInfo and C_GossipInfo.GetOptions) then return end
     local ago = agoBlock()
-    local options = C_GossipInfo.GetOptions()
-    if not options or #options == 0 then return end
+    local raw = C_GossipInfo.GetOptions()
+    if not raw or #raw == 0 then return end
 
     local npcID = Auto.NpcID()
-    local n     = #options
+
+    -- DISPLAY ORDER FIRST (1.1.7). Every positional handler below reads the
+    -- SORTED view; the raw array is kept only for the Sayge trace. `ordered`
+    -- is the provability verdict — a multi-option positional pick in an
+    -- unordered world is a guess, and no handler here guesses.
+    local options, ordered = Auto.SortGossipOptions(raw)
+    local n = #options
+
+    -- A Sayge page arriving while a DIFFERENT NPC's mid-flow state is alive
+    -- cannot happen (state is only built at 14822) — but the reverse can: a
+    -- mid-flow Sayge visit followed by gossip at another NPC means the owner
+    -- walked away mid-fortune. Commit the abandoned visit and clear the
+    -- sequence state so the next Sayge page cannot be mis-read as page 2.
+    if npcID ~= Auto.SAYGE_NPC and Auto._saygeVisit then
+        Auto.SaygeResetVisit("npc-changed")
+    end
 
     -- Spec §14: "Interacting with Sayge is timestamped regardless of the
     -- setting." Stamped before the dmf.enabled test for exactly that reason.
@@ -1630,14 +1795,21 @@ function Auto.OnGossipShow()
     -- pickable turn-in has already consumed the interaction and returned, so
     -- repair can only ever take a visit on which the zanza flow is idle. The
     -- NPC test is repeated inside Auto.DecideRinwoshoRepair — this one is a
-    -- cheap short-circuit, that one is the guard.
+    -- cheap short-circuit, that one is the guard. (The vendor pick matches by
+    -- ICON, not position, so display order cannot change what it matches; it
+    -- reads the sorted view for uniformity.)
     if npcID == Auto.ZANZA_NPC and Auto.TryRinwoshoRepair(options) then return end
 
     local idx, why = Auto.DecideDmtOption({
         enabled = ago.dmt, npcID = npcID, optionCount = n,
     })
     if idx then
-        if selectGossipOption(optionSelector(options, idx)) then return end
+        -- "Option 1" is a statement about the DISPLAYED list. On a multi-option
+        -- page an unprovable order refuses (one manual click at a tribute NPC
+        -- beats eating a quest); the order of one option is trivially proven.
+        if not ordered and n > 1 then
+            gdbg("dmt: refused at %s -- unordered-options (%d option(s))", tostring(npcID), n)
+        elseif selectGossipOption(optionSelector(options, idx)) then return end
     elseif ago.dmt and (Auto.DMT_NPCS[npcID or -1] or npcID == Auto.DMT_NPC_KOMCRUSH) then
         gdbg("dmt: refused at %s -- %s (%d option(s))", tostring(npcID), tostring(why), n)
     end
@@ -1647,13 +1819,39 @@ function Auto.OnGossipShow()
         enabled = ago.bwl, npcID = npcID, optionCount = n, onBlockingQuest = onBlocking,
     })
     if idx then
+        -- The orb only ever fires on exactly ONE option (its own guard), so an
+        -- unordered verdict cannot ambiguate the pick.
         if selectGossipOption(optionSelector(options, idx)) then return end
     elseif ago.bwl and npcID == Auto.BWL_ORB then
         gdbg("bwl orb: refused -- %s (%d option(s))", tostring(why), n)
     end
 
     if ago.dmf and ago.dmf.enabled and npcID == Auto.SAYGE_NPC then
-        Auto.HandleSayge(options, ago.dmf)
+        Auto._saygeRawOptions = raw
+        Auto.HandleSayge(options, ordered, ago.dmf)
+        Auto._saygeRawOptions = nil
+    end
+end
+
+-- GOSSIP_CLOSED (1.1.7). Between-pages transitions MAY fire a close before the
+-- next page's GOSSIP_SHOW (Class 2 coin flip — see SAYGE_PAGE_GRACE), so the
+-- teardown is deferred by the grace window rather than performed here: if the
+-- close was a page transition the next page arrives within milliseconds and
+-- finds live state; if it was a real walk-away the deferred check finds the
+-- state untouched and stale, commits the abandoned visit, and clears the
+-- sequence flags. Headless (no C_Timer), the same staleness rule runs at the
+-- next Sayge GOSSIP_SHOW instead — either path, a cold re-open never inherits
+-- the dead visit's page position.
+function Auto.OnGossipClosed()
+    if not Auto._saygeVisit then return end
+    if C_Timer and C_Timer.After then
+        C_Timer.After(Auto.SAYGE_PAGE_GRACE + 0.1, function()
+            ns:SafeCall(function()
+                if Auto._saygeVisit and Auto.SaygeVisitStale() then
+                    Auto.SaygeResetVisit("closed-mid-flow")
+                end
+            end)
+        end)
     end
 end
 
@@ -3300,13 +3498,13 @@ end
 ----------------------------------------------------------------------
 
 function Auto.OnZoneChanged()
-    Auto._saygeDone        = false
-    Auto._saygeShapeWarned = false
-    -- The spam ladder is torn down on a zone change: its per-tick NPC check
-    -- would stop it anyway, this just does not wait for the next tick. The 5 s
+    Auto._saygeDone = false
+    -- Zoning away mid-fortune ends the visit: commit the trace (so the ring
+    -- shows the abandonment) and clear the page-sequence + warn flags. The 5 s
     -- re-entry lock (_saygeAt) is NOT cleared — spec makes it a time guard, and
-    -- clearing it on zone change is the very approximation this wave removed.
-    Auto._saygeSpam = 0
+    -- clearing it on zone change is the very approximation the 1.1.4 wave
+    -- removed.
+    Auto.SaygeResetVisit("zone-changed")
     -- Walking away ends any dialog we were holding open. The rejection stamps
     -- are NOT cleared: they are a 30 s time-based guard, not a location one.
     Auto._zanzaChoices = nil
@@ -3350,6 +3548,10 @@ function Auto.OnLogin()
 
     ns:RegisterEvent("GOSSIP_SHOW", function()
         ns:SafeCall(Auto.OnGossipShow)
+    end)
+    -- 1.1.7: deferred Sayge visit teardown — see Auto.OnGossipClosed.
+    ns:RegisterEvent("GOSSIP_CLOSED", function()
+        ns:SafeCall(Auto.OnGossipClosed)
     end)
 
     ns:RegisterEvent("QUEST_GREETING", function() ns:SafeCall(Auto.OnQuestGreeting) end)
@@ -4130,14 +4332,15 @@ local function testBwlGate()
     return true
 end
 
--- RULE: Sayge's two page maps (spec §14) are positional, and ANY page shape the
--- spec does not describe is refused rather than guessed.
+-- RULE: Sayge's two page maps (spec §14) are positional over DISPLAY order,
+-- sequence-aware (1.1.7), and ANY page shape or sequence the spec does not
+-- describe is refused rather than guessed.
 local function testSaygePageMaps()
     local page1 = { damage = 1, resistance = 1, armor = 1,
                     intellect = 2, spirit = 2,
                     agility = 3, stamina = 3, strength = 3 }
     for want, expect in pairs(page1) do
-        local idx, why, final = Auto.DecideSaygeOption(want, 4)
+        local idx, why, final = Auto.DecideSaygeOption(want, 4, false)
         if idx ~= expect then
             return false, ("page 1: %s -> %s, expected %d (%s)")
                 :format(want, tostring(idx), expect, tostring(why))
@@ -4148,29 +4351,48 @@ local function testSaygePageMaps()
                     resistance = 2, intellect = 2, strength = 2,
                     armor = 3, agility = 3 }
     for want, expect in pairs(page2) do
-        local idx, _, final = Auto.DecideSaygeOption(want, 3)
+        local idx, _, final = Auto.DecideSaygeOption(want, 3, true)
         if idx ~= expect then
             return false, ("page 2: %s -> %s, expected %d"):format(want, tostring(idx), expect)
         end
         if not final then return false, "page 2 IS the final page (it arms the lock)" end
     end
 
-    -- A single-option transitional page always picks 1, and does NOT count as
-    -- the final answer (arming the lock there would block the real buff page).
-    local idx, why, final = Auto.DecideSaygeOption("armor", 1)
-    if idx ~= 1 or why ~= "transitional" or final then
-        return false, "a single-option page picks 1 and is not final"
+    -- A single-option transitional page always picks 1 — before, between or
+    -- after the mapped pages — and does NOT count as the final answer (arming
+    -- the lock there would block the real buff page).
+    for _, seen4 in ipairs({ false, true }) do
+        local idx, why, final = Auto.DecideSaygeOption("armor", 1, seen4)
+        if idx ~= 1 or why ~= "transitional" or final then
+            return false, "a single-option page picks 1 and is not final (seen4=" .. tostring(seen4) .. ")"
+        end
+    end
+
+    -- THE SEQUENCE GUARD (1.1.7). A 3-option page with no 4-option answer
+    -- behind it, or a second 4-option page, means we are lost in Sayge's
+    -- script — and a positional click from the wrong page is the wrong-buff
+    -- incident. Both refuse.
+    local i, r = Auto.DecideSaygeOption("damage", 3, false)
+    if i ~= nil or r ~= "cold-3-page" then
+        return false, "a COLD 3-option page must refuse, got " .. tostring(i) .. "/" .. tostring(r)
+    end
+    i, r = Auto.DecideSaygeOption("damage", 4, true)
+    if i ~= nil or r ~= "double-4-page" then
+        return false, "a SECOND 4-option page must refuse, got " .. tostring(i) .. "/" .. tostring(r)
     end
 
     -- THE SHAPE GUARD. Refusing costs one manual click; a misclick costs a
-    -- permanent daily buff. Every unknown shape refuses.
+    -- permanent daily buff. Every unknown shape refuses, in either sequence
+    -- state.
     for _, n in ipairs({ 0, 2, 5, 6, 12 }) do
-        local i, r = Auto.DecideSaygeOption("damage", n)
-        if i ~= nil or r ~= "unexpected-shape" then
-            return false, ("a %d-option page must be refused, got %s/%s"):format(n, tostring(i), tostring(r))
+        for _, seen4 in ipairs({ false, true }) do
+            local ii, rr = Auto.DecideSaygeOption("damage", n, seen4)
+            if ii ~= nil or rr ~= "unexpected-shape" then
+                return false, ("a %d-option page must be refused, got %s/%s"):format(n, tostring(ii), tostring(rr))
+            end
         end
     end
-    local i, r = Auto.DecideSaygeOption("nonsense", 4)
+    i, r = Auto.DecideSaygeOption("nonsense", 4, false)
     if i ~= nil or r ~= "unknown-bufftype" then return false, "an unmappable buff type refuses" end
 
     -- The class-default answer path: nil / "" / an alias all resolve.
@@ -4190,6 +4412,60 @@ local function testSaygePageMaps()
     return true
 end
 
+-- RULE (1.1.7): array order is NOT display order. The sorter re-orders a COPY
+-- by orderIndex, never mutates the input, and calls the order UNPROVEN the
+-- moment any option lacks a numeric orderIndex or two options share one.
+local function testSortGossipOptions()
+    local function o(ord, id) return { orderIndex = ord, gossipOptionID = id, name = "opt" .. id } end
+
+    -- The incident's shape: the database served the array BACKWARDS relative
+    -- to what the player saw. Display order must come out of orderIndex.
+    local raw = { o(3, 104), o(2, 103), o(1, 102), o(0, 101) }
+    local disp, ordered = Auto.SortGossipOptions(raw)
+    if not ordered then return false, "fully-indexed options are an ordered world" end
+    for i = 1, 4 do
+        if disp[i].gossipOptionID ~= 100 + i then
+            return false, ("display slot %d holds id %s, expected %d")
+                :format(i, tostring(disp[i].gossipOptionID), 100 + i)
+        end
+    end
+    if raw[1].gossipOptionID ~= 104 then return false, "the input array must not be mutated" end
+
+    -- Already-sorted input survives untouched.
+    disp, ordered = Auto.SortGossipOptions({ o(0, 101), o(1, 102), o(2, 103) })
+    if not ordered or disp[1].gossipOptionID ~= 101 or disp[3].gossipOptionID ~= 103 then
+        return false, "an already-display-ordered list sorts to itself"
+    end
+
+    -- orderIndex is not required to be 0-based or contiguous — only ordered.
+    disp, ordered = Auto.SortGossipOptions({ o(30, 113), o(5, 111), o(12, 112) })
+    if not ordered or disp[1].gossipOptionID ~= 111 or disp[2].gossipOptionID ~= 112
+       or disp[3].gossipOptionID ~= 113 then
+        return false, "sparse orderIndex values still sort by rank"
+    end
+
+    -- UNPROVEN worlds: a missing orderIndex, a non-numeric one, a duplicate.
+    -- The copy keeps raw order (no half-sorted lie) and ordered=false.
+    disp, ordered = Auto.SortGossipOptions({ o(1, 102), { gossipOptionID = 101, name = "no ord" } })
+    if ordered then return false, "a missing orderIndex is an unordered world" end
+    if disp[1].gossipOptionID ~= 102 then return false, "unordered keeps raw array order" end
+    disp, ordered = Auto.SortGossipOptions({ o(1, 102), { orderIndex = "x", gossipOptionID = 101 } })
+    if ordered then return false, "a non-numeric orderIndex is an unordered world" end
+    disp, ordered = Auto.SortGossipOptions({ o(1, 101), o(1, 102) })
+    if ordered then return false, "a duplicated orderIndex is ambiguous = unordered" end
+
+    -- The trivial worlds.
+    disp, ordered = Auto.SortGossipOptions({ o(7, 101) })
+    if not ordered or disp[1].gossipOptionID ~= 101 then return false, "one indexed option is ordered" end
+    disp, ordered = Auto.SortGossipOptions({ { gossipOptionID = 101 } })
+    if ordered then return false, "one UNindexed option is still an unproven order (callers decide)" end
+    disp, ordered = Auto.SortGossipOptions({})
+    if not ordered or #disp ~= 0 then return false, "an empty list is trivially ordered" end
+    disp, ordered = Auto.SortGossipOptions(nil)
+    if ordered or #disp ~= 0 then return false, "a nil list is an empty unordered answer, not an error" end
+    return true
+end
+
 ----------------------------------------------------------------------
 -- LIVE PATH. Every rule above, re-asserted through Auto.OnGossipShow itself
 -- against a stubbed gossip API — because the defect this replaces was never in
@@ -4200,8 +4476,15 @@ end
 -- option list contains "Spare King Gordok", "Free the prisoner" and "Enter
 -- Blackwing Lair" — every keyword the deleted pools carried. Nothing may fire.
 --
--- Every global is saved and restored, including C_Timer (so the Damage spam
--- ladder cannot escape the test and click at a real NPC afterwards).
+-- THE SIM IS UNKIND BY DEFAULT (1.1.7, CLIENT_ASYNC_LESSONS doctrine). Every
+-- multi-option list this test serves is SHUFFLED in array order, with
+-- orderIndex carrying the display order — the exact world that produced the
+-- owner's wrong-Sayge-buff incident. Code that indexes the raw array picks
+-- the wrong option on every multi-option page of this test.
+--
+-- Every global is saved and restored, including C_Timer (timers are captured,
+-- never run — a click that only exists behind a timer is a click this test
+-- must see scheduled, and the Sayge flow must schedule none).
 ----------------------------------------------------------------------
 local function testGossipLivePath()
     local SAVE = {}
@@ -4214,24 +4497,27 @@ local function testGossipLivePath()
         return false, "the live autoGossip block is reachable"
     end
     local savedAGO = fs.autoGossip
-    local savedSayge = { Auto._saygeDone, Auto._saygeAt, Auto._saygeSpam,
-                         Auto._saygeShapeWarned, Auto._saygeInteractAt }
+    local savedSayge = { Auto._saygeDone, Auto._saygeAt, Auto._saygeSeen4,
+                         Auto._saygePageAt, Auto._saygeShapeWarned,
+                         Auto._saygeInteractAt, Auto._saygeVisit }
+    local savedTrace = (type(Store.data) == "table") and Store.data.saygeTrace or nil
 
     -- The world.
     local W = { guid = nil, shift = false, options = {}, onQuest = {}, class = "MAGE", clock = 5000 }
-    local CALLS, said
+    local CALLS, said, timers
     local function reset()
-        CALLS = { select = {}, close = 0, getOptions = 0 }
-        said  = {}
+        CALLS  = { select = {}, close = 0, getOptions = 0 }
+        said   = {}
+        timers = {}
     end
     reset()
 
     _G.GetTime        = function() return W.clock end
     _G.IsShiftKeyDown = function() return W.shift end
     _G.UnitGUID       = function(unit) if unit == "npc" then return W.guid end return nil end
-    _G.UnitClass      = function() return "Mage", W.class end
+    _G.UnitClass      = function() return "Any", W.class end
     _G.C_QuestLog     = { IsOnQuest = function(q) return W.onQuest[q] == true end }
-    _G.C_Timer        = { After = function() end }      -- the ladder cannot escape
+    _G.C_Timer        = { After = function(delay, cb) timers[#timers + 1] = { delay = delay, cb = cb } end }
     _G.print          = function(...)
         local p = {}
         for i = 1, select("#", ...) do p[i] = tostring((select(i, ...))) end
@@ -4249,11 +4535,23 @@ local function testGossipLivePath()
 
     -- Option-list builders. IDs are deliberately NOT 1..n so an index/ID mixup
     -- in the engine shows up as a wrong value rather than an accidental pass.
-    local function opts(...)
+    -- `dispOpts` builds a list whose DISPLAY order is the argument order
+    -- (orderIndex 0..n-1, id = base + display slot); `shuffled` REVERSES the
+    -- array order — maximally wrong for any raw-position indexer; `opts` is
+    -- the unkind default every scene uses.
+    local function dispOpts(base, ...)
         local out = {}
-        for i, name in ipairs({ ... }) do out[i] = { name = name, gossipOptionID = 100 + i } end
+        for i, name in ipairs({ ... }) do
+            out[i] = { name = name, gossipOptionID = base + i, orderIndex = i - 1 }
+        end
         return out
     end
+    local function shuffled(list)
+        local out = {}
+        for i = #list, 1, -1 do out[#out + 1] = list[i] end
+        return out
+    end
+    local function opts(...) return shuffled(dispOpts(100, ...)) end
     -- Every keyword the deleted pools carried, in one list.
     local function poisonList()
         return opts("Spare King Gordok", "Free the prisoner", "Enter Blackwing Lair",
@@ -4278,30 +4576,48 @@ local function testGossipLivePath()
         reset()
         W.guid, W.shift, W.options, W.onQuest = nil, false, {}, {}
         W.class, W.clock = "MAGE", 5000
-        Auto._saygeDone, Auto._saygeAt, Auto._saygeSpam = false, nil, 0
+        Auto._saygeDone, Auto._saygeAt = false, nil
+        Auto._saygeSeen4, Auto._saygePageAt = false, nil
         Auto._saygeShapeWarned, Auto._saygeInteractAt = false, nil
+        Auto._saygeVisit = nil
+        if type(Store.data) == "table" then
+            Store.data.saygeTrace = { schema = 1, visits = {} }
+        end
         for k, v in pairs(t or {}) do W[k] = v end
     end
     local function picked() return CALLS.select[1] end
+    local function lastPick() return CALLS.select[#CALLS.select] end
     local function saidMatching(frag)
         for _, l in ipairs(said) do if l:lower():find(frag, 1, true) then return true end end
         return false
     end
+    local function ring() return (Store.GetSaygeTrace and Store.GetSaygeTrace()) or {} end
 
     fs.autoGossip = { dmt = true, bwl = true,
                       dmf = { enabled = true, skipCookie = true,
                               buffType = { MAGE = "damage" } } }
 
     ------------------------------------------------------------------
-    -- 1. DMT: the right NPC and the right option.
+    -- 1. DMT: the right NPC and the right option — the DISPLAYED option 1,
+    --    found through orderIndex on a shuffled array (id 101 sits at raw
+    --    array position 3 in this sim).
     ------------------------------------------------------------------
     for who, guid in pairs({ moldar = GUID.moldar, fengus = GUID.fengus,
                              slipkik = GUID.slipkik, mizzle = GUID.mizzle }) do
         scene({ guid = guid, options = opts("Moxie for me", "No thanks", "Goodbye") })
         Auto.OnGossipShow()
-        ck(picked() == 101, who .. ": must select option 1 (id 101), selected " .. tostring(picked()))
+        ck(picked() == 101, who .. ": must select DISPLAY option 1 (id 101), selected " .. tostring(picked()))
         ck(#CALLS.select == 1, who .. ": exactly one selection")
     end
+    -- A multi-option page whose display order is UNPROVABLE (no orderIndex)
+    -- refuses: "option 1" is a statement about the displayed list, and here
+    -- there is no displayed list to make it about.
+    scene({ guid = GUID.moldar, options = {
+        { name = "Moxie for me", gossipOptionID = 101 },
+        { name = "No thanks",    gossipOptionID = 102 },
+    } })
+    Auto.OnGossipShow()
+    ck(#CALLS.select == 0, "DMT multi-option page with unprovable order must refuse")
 
     ------------------------------------------------------------------
     -- 2. THE ADVERSARIAL FIXTURE. The audit's headline case: an unrelated NPC
@@ -4332,6 +4648,12 @@ local function testGossipLivePath()
     scene({ guid = GUID.komcrush, options = opts("Spare Captain Komcrush", "I need a job") })
     Auto.OnGossipShow()
     ck(#CALLS.select == 0, "Komcrush with TWO options must not eat the quest")
+    -- The order of ONE option is trivially proven: a single-option page with
+    -- no orderIndex at all still proceeds (the unordered guard is for pages
+    -- where position is ambiguous, and one option has exactly one position).
+    scene({ guid = GUID.komcrush, options = { { name = "Spare Captain Komcrush", gossipOptionID = 107 } } })
+    Auto.OnGossipShow()
+    ck(picked() == 107, "Komcrush single option with NO orderIndex still picks (order of one)")
 
     ------------------------------------------------------------------
     -- 4. THE ORB. Single option, and not on 85556/85557/85558.
@@ -4353,6 +4675,11 @@ local function testGossipLivePath()
     Auto.OnGossipShow()
     ck(#CALLS.select == 0, "orb refuses when C_QuestLog.IsOnQuest is unavailable")
     _G.C_QuestLog = { IsOnQuest = function(q) return W.onQuest[q] == true end }
+    -- The orb's own single-option guard makes display order moot: one option
+    -- with no orderIndex still fires.
+    scene({ guid = GUID.orb, options = { { name = "Enter Blackwing Lair", gossipOptionID = 109 } } })
+    Auto.OnGossipShow()
+    ck(picked() == 109, "orb single option with NO orderIndex still fires (order of one)")
 
     ------------------------------------------------------------------
     -- 5. PER-TOGGLE. Each box only arms its own NPC set.
@@ -4371,62 +4698,220 @@ local function testGossipLivePath()
     fs.autoGossip.bwl = true
 
     ------------------------------------------------------------------
-    -- 6. SAYGE, expected shapes, answered per the class config.
+    -- 6. SAYGE (1.1.7). The owner's incident, reproduced and fixed.
     ------------------------------------------------------------------
-    fs.autoGossip.dmf.buffType = { MAGE = "intellect" }
-    scene({ guid = GUID.sayge, options = opts("A", "B", "C", "D") })   -- page 1
+    -- 6a. THE RED CONTROL. The shipped 1.1.6 selection was raw array position
+    --     through optionSelector — written out here verbatim as the legacy
+    --     control. Against this sim's shuffled page it picks a DIFFERENT
+    --     option than display position 1: that is the incident. The live code
+    --     must pick the display option.
+    fs.autoGossip.dmf.buffType = { MAGE = "damage" }
+    scene({ guid = GUID.sayge })
+    W.options = shuffled(dispOpts(300, "Q1-1", "Q1-2", "Q1-3", "Q1-4"))
+    local legacyPick = (function(options, idx)   -- 1.1.6: options[idx].gossipOptionID
+        local o = options and options[idx]
+        return o and o.gossipOptionID
+    end)(W.options, 1)
     Auto.OnGossipShow()
-    ck(picked() == 102, "sayge page 1, intellect -> option 2 (id 102), got " .. tostring(picked()))
-    ck(Auto._saygeAt == nil, "page 1 does not arm the 5 s lock -- page 2 still needs answering")
-    scene({ guid = GUID.sayge, options = opts("A", "B", "C") })        -- page 2
-    Auto.OnGossipShow()
-    ck(picked() == 102, "sayge page 2, intellect -> option 2 (id 102), got " .. tostring(picked()))
-    ck(Auto._saygeAt == 5000, "page 2 IS the answer: the 5 s re-entry lock arms")
-    -- The fortune-cookie page that follows is CLOSED, not answered.
+    ck(legacyPick == 304, "control preflight: raw array position 1 is DISPLAY option 4 in this sim")
+    ck(picked() == 301, "display-order selection answers DISPLAY option 1, got " .. tostring(picked()))
+    ck(legacyPick ~= picked(),
+       "RED CONTROL: the 1.1.6 raw-array selection picks a different option than the fix -- "
+       .. "the incident is reproduced by this sim")
+
+    -- 6b. ALL EIGHT buff types, full page sequence (transitional -> Q1(4) ->
+    --     Q2(3)), every list shuffled: the canonical (Q1,Q2) answer pair.
+    local canonical = {
+        damage = { 1, 1 }, resistance = { 1, 2 }, armor = { 1, 3 },
+        spirit = { 2, 1 }, intellect = { 2, 2 },
+        stamina = { 3, 1 }, strength = { 3, 2 }, agility = { 3, 3 },
+    }
+    local function runFortune(cls, configured)
+        scene({ guid = GUID.sayge, class = cls })
+        fs.autoGossip.dmf.buffType = { [cls] = configured }
+        W.options = shuffled(dispOpts(200, "I am ready to discover my fortune!"))
+        Auto.OnGossipShow()
+        W.options = shuffled(dispOpts(300, "Q1-1", "Q1-2", "Q1-3", "Q1-4"))
+        Auto.OnGossipShow()
+        W.options = shuffled(dispOpts(400, "Q2-1", "Q2-2", "Q2-3"))
+        Auto.OnGossipShow()
+        if #CALLS.select ~= 3 or CALLS.select[1] ~= 201 then return nil, nil end
+        return (tonumber(CALLS.select[2]) or 0) - 300, (tonumber(CALLS.select[3]) or 0) - 400
+    end
+    for want, pair in pairs(canonical) do
+        local q1, q2 = runFortune("MAGE", want)
+        ck(q1 == pair[1] and q2 == pair[2],
+           ("%s: answered (%s,%s), canonical is (%d,%d)")
+               :format(want, tostring(q1), tostring(q2), pair[1], pair[2]))
+        ck(Auto._saygeDone == true and Auto._saygeAt == 5000,
+           want .. ": the final answer arms the 5 s re-entry lock")
+    end
+
+    -- 6c. THE PER-CLASS LEG — the owner's "confirm for the other classes"
+    --     guarantee. All nine classes, each with its configured buffType
+    --     (aliases included), resolved through Auto.SaygeBuffType and driven
+    --     to the final canonical pair.
+    local classCfg = {
+        WARRIOR = "damage",  PALADIN = "Resist",       HUNTER  = "agility",
+        ROGUE   = "armor",   PRIEST  = "spirit",       SHAMAN  = "intelligence",
+        MAGE    = "stamina", WARLOCK = "strength",     DRUID   = "resistance",
+    }
+    for cls, configured in pairs(classCfg) do
+        local resolved = Auto.SaygeBuffType({ buffType = { [cls] = configured } }, cls)
+        local pair = canonical[resolved]
+        ck(pair ~= nil, cls .. ": '" .. configured .. "' resolves to a mapped buff type")
+        local q1, q2 = runFortune(cls, configured)
+        ck(pair and q1 == pair[1] and q2 == pair[2],
+           ("%s ('%s' -> %s): answered (%s,%s), canonical (%s,%s)")
+               :format(cls, configured, tostring(resolved), tostring(q1), tostring(q2),
+                       tostring(pair and pair[1]), tostring(pair and pair[2])))
+    end
+
+    -- 6d. CLICK ECONOMY. Damage walks the pages like everyone else now: three
+    --     pages, three clicks, ZERO timers — and the ladder does not exist.
+    scene({ guid = GUID.sayge })
+    fs.autoGossip.dmf.buffType = { MAGE = "damage" }
+    W.options = shuffled(dispOpts(200, "ready")); Auto.OnGossipShow()
+    W.options = shuffled(dispOpts(300, "a", "b", "c", "d")); Auto.OnGossipShow()
+    W.options = shuffled(dispOpts(400, "a", "b", "c")); Auto.OnGossipShow()
+    ck(#CALLS.select == 3, "damage clicks once per page -- 3 pages, 3 clicks, got " .. #CALLS.select)
+    ck(#timers == 0, "the Sayge flow schedules NO timers -- no spam ladder, no blind clicks")
+    ck(Auto.SaygeSpamTick == nil and Auto.StartSaygeSpam == nil
+       and Auto.SAYGE_SPAM_REPEATS == nil and Auto.SAYGE_SPAM_INTERVAL == nil,
+       "the spam ladder must not exist any more (functions or constants)")
+
+    -- 6e. THE TRACE. That damage visit is one ring record: three pages, each
+    --     option's raw position / orderIndex / id / name, the click and why,
+    --     the want, the class, the build, the outcome.
+    local v = ring()[1]
+    ck(v ~= nil and v.outcome == "answered", "the visit landed in the ring as answered")
+    ck(v and v.class == "MAGE" and v.want == "damage" and v.build == ns.VERSION,
+       "the record carries class, want and the build stamp")
+    ck(v and #v.pages == 3 and v.pages[2].n == 4 and v.pages[2].ordered == true,
+       "three pages recorded; the 4-option page says display order was proven")
+    ck(v and v.pages[2].clicked == 1 and v.pages[2].why == "page-4",
+       "the 4-option page records its click and reason")
+    local o1 = v and v.pages[2].options and v.pages[2].options[1]
+    ck(o1 ~= nil and o1.pos == 4 and o1.ord == 0 and o1.id == 301,
+       "display slot 1 records raw array position 4 / orderIndex 0 / its id -- the incident's fingerprint")
+
+    -- 6f. COOKIE + LOCK. Inside the lock the cookie page is closed, not
+    --     answered; the lock is a TIME guard; expiry starts a fresh visit.
     CALLS.select, CALLS.close = {}, 0
-    W.options = opts("Take a fortune cookie")
+    W.options = shuffled(dispOpts(500, "Take a fortune cookie"))
     Auto.OnGossipShow()
     ck(#CALLS.select == 0 and CALLS.close == 1, "inside the lock the cookie page is closed, not answered")
-    -- …and the lock is a TIME guard, not a session flag.
     W.clock = 5006
     ck(Auto.SaygeLocked() == false, "the re-entry lock expires after 5 s")
+    CALLS.select, CALLS.close = {}, 0
+    W.options = shuffled(dispOpts(300, "a", "b", "c", "d"))
+    Auto.OnGossipShow()
+    ck(picked() == 301, "after lock expiry a fresh 4-option page is a fresh visit and answers")
 
     -- A class with no stored value still answers: the class default is Damage.
     fs.autoGossip.dmf.buffType = {}
-    scene({ guid = GUID.sayge, options = opts("A", "B", "C", "D") })
+    scene({ guid = GUID.sayge, options = shuffled(dispOpts(300, "a", "b", "c", "d")) })
     Auto.OnGossipShow()
-    ck(picked() == 101, "an unconfigured class takes the Damage path (option 1), got " .. tostring(picked()))
-    ck(Auto._saygeSpam >= 0 and Auto._saygeDone == true, "the Damage fast path answers immediately")
-
-    -- Damage explicitly configured -> the spam ladder, bounded and NPC-checked.
-    fs.autoGossip.dmf.buffType = { MAGE = "damage" }
-    scene({ guid = GUID.sayge, options = opts("A", "B", "C", "D") })
-    Auto.OnGossipShow()
-    ck(picked() == 101, "damage spams option 1")
-    ck(Auto.SAYGE_SPAM_REPEATS == 100 and Auto.SAYGE_SPAM_INTERVAL == 0.05,
-       "spec's spam shape is 100 repeats at 50 ms")
-    -- The ladder refuses to click once the NPC is no longer Sayge.
-    Auto._saygeSpam = 5
-    W.guid = GUID.innkeep
-    CALLS.select = {}
-    Auto.SaygeSpamTick()
-    ck(#CALLS.select == 0 and Auto._saygeSpam == 0,
-       "the spam ladder stops dead when the NPC is no longer Sayge")
+    ck(picked() == 301, "an unconfigured class defaults to Damage and answers display option 1")
 
     ------------------------------------------------------------------
-    -- 7. SAYGE, UNEXPECTED SHAPE -> refuse + a debug line the owner can act on.
-    --    (Spec's page maps rest on an in-game premise the audit flags UNKNOWN.)
+    -- 7. SAYGE REFUSALS. Never guess: unknown shapes, unprovable order,
+    --    out-of-sequence pages — refuse out loud, once, and record it.
     ------------------------------------------------------------------
+    -- 7a. Unknown shape (5 options).
     fs.autoGossip.dmf.buffType = { MAGE = "armor" }
-    scene({ guid = GUID.sayge, options = opts("A", "B", "C", "D", "E") })   -- 5 options
+    scene({ guid = GUID.sayge, options = opts("A", "B", "C", "D", "E") })
     Auto.OnGossipShow()
     ck(#CALLS.select == 0, "an unknown Sayge page shape must NOT be answered")
     ck(saidMatching("refused to answer"), "an unknown shape prints a line the owner can capture")
     ck(saidMatching("5-option"), "the printed line names the shape it saw")
-    -- One line per visit, not one per GOSSIP_SHOW.
     local before = #said
     Auto.OnGossipShow()
-    ck(#said == before, "the unknown-shape line does not repeat inside a visit")
+    ck(#said == before, "the refusal line does not repeat inside a visit")
+    ck(#ring() == 1 and ring()[1].outcome == "refused:unexpected-shape",
+       "ONE ring record per refused visit, not one per re-show")
+
+    -- 7b. UNORDERED WORLD: one option of the 4-option page lacks orderIndex.
+    scene({ guid = GUID.sayge })
+    local unordered = dispOpts(300, "a", "b", "c", "d")
+    unordered[3].orderIndex = nil
+    W.options = shuffled(unordered)
+    Auto.OnGossipShow()
+    ck(#CALLS.select == 0, "an unprovable display order refuses the page -- a misclick costs 4 hours")
+    ck(saidMatching("order"), "the refusal names the missing display order")
+    ck(ring()[1] ~= nil and ring()[1].outcome == "refused:unordered-options",
+       "the trace records the unordered world as the visit's outcome")
+    ck(ring()[1] and ring()[1].pages[1] and ring()[1].pages[1].ordered == false,
+       "the page record itself says the order was UNPROVEN")
+    before = #said
+    Auto.OnGossipShow()
+    ck(#said == before, "the unordered refusal warns once per visit")
+
+    -- 7c. A 3-option page arriving COLD (no 4-option answer this visit).
+    scene({ guid = GUID.sayge, options = shuffled(dispOpts(400, "a", "b", "c")) })
+    Auto.OnGossipShow()
+    ck(#CALLS.select == 0, "a COLD 3-option page must refuse")
+    ck(ring()[1] ~= nil and ring()[1].outcome == "refused:cold-3-page", "…and the trace says why")
+
+    -- 7d. A SECOND 4-option page in one visit.
+    scene({ guid = GUID.sayge })
+    fs.autoGossip.dmf.buffType = { MAGE = "intellect" }
+    W.options = shuffled(dispOpts(300, "a", "b", "c", "d"))
+    Auto.OnGossipShow()
+    ck(picked() == 302, "intellect answers display option 2 on the 4-option page")
+    W.options = shuffled(dispOpts(310, "a", "b", "c", "d"))
+    Auto.OnGossipShow()
+    ck(#CALLS.select == 1, "a SECOND 4-option page must not be answered")
+    ck(ring()[1] ~= nil and ring()[1].outcome == "refused:double-4-page", "…and the trace says why")
+
+    -- 7e. NPC CHANGE MID-FLOW: commit, reset, no click leaks anywhere.
+    scene({ guid = GUID.sayge })
+    W.options = shuffled(dispOpts(300, "a", "b", "c", "d"))
+    Auto.OnGossipShow()
+    ck(#CALLS.select == 1 and Auto._saygeSeen4 == true, "mid-flow: the 4-option page is answered")
+    W.guid, W.options = GUID.innkeep, poisonList()
+    Auto.OnGossipShow()
+    ck(#CALLS.select == 1, "the other NPC's options are untouched mid-flow -- no click leaks")
+    ck(Auto._saygeVisit == nil and Auto._saygeSeen4 == false,
+       "an NPC change commits the visit and resets the sequence state")
+    ck(ring()[1] ~= nil and ring()[1].outcome == "npc-changed", "the abandoned visit is in the ring")
+    W.guid = GUID.sayge
+    W.options = shuffled(dispOpts(400, "a", "b", "c"))
+    Auto.OnGossipShow()
+    ck(#CALLS.select == 1, "after the abandonment a 3-option page is COLD and refused")
+
+    -- 7f. GOSSIP CLOSE: transition-tolerant teardown. A close followed by the
+    --     next page within the grace window is a PAGE TRANSITION (the Class 2
+    --     close/show coin flip) and the fortune continues; a close with
+    --     nothing after it is a walk-away and the deferred check commits it.
+    scene({ guid = GUID.sayge })
+    W.options = shuffled(dispOpts(300, "a", "b", "c", "d"))
+    Auto.OnGossipShow()
+    ck(#CALLS.select == 1, "page 1 answered")
+    Auto.OnGossipClosed()
+    ck(#timers == 1, "a mid-flow close schedules exactly one deferred check")
+    ck(#CALLS.select == 1, "the close itself clicks nothing")
+    W.clock = 5000.3
+    W.options = shuffled(dispOpts(400, "a", "b", "c"))
+    Auto.OnGossipShow()
+    ck(#CALLS.select == 2 and lastPick() == 402,
+       "close-then-page within the grace window continues the fortune (intellect -> display 2)")
+    W.clock = 5010
+    timers[1].cb()
+    ck(ring()[1] ~= nil and ring()[1].outcome == "answered",
+       "the deferred check does not rewrite a completed visit")
+
+    scene({ guid = GUID.sayge })
+    W.options = shuffled(dispOpts(300, "a", "b", "c", "d"))
+    Auto.OnGossipShow()
+    Auto.OnGossipClosed()
+    ck(#timers == 1, "walk-away: one deferred check scheduled")
+    W.clock = 5000 + Auto.SAYGE_PAGE_GRACE + 1
+    timers[1].cb()
+    ck(Auto._saygeVisit == nil and Auto._saygeSeen4 == false,
+       "a real walk-away commits + resets on the deferred check")
+    ck(ring()[1] ~= nil and ring()[1].outcome == "closed-mid-flow", "…and the ring says closed-mid-flow")
+    ck(#CALLS.select == 1, "no click leaked from the teardown")
 
     ------------------------------------------------------------------
     -- 8. SAYGE IS TIMESTAMPED REGARDLESS OF THE SETTING (spec §14).
@@ -4455,15 +4940,19 @@ local function testGossipLivePath()
 
     ------------------------------------------------------------------
     -- 10. THE POOLS ARE GONE, not merely unused. A keyword matcher left in the
-    --     file is a keyword matcher waiting to be re-wired.
+    --     file is a keyword matcher waiting to be re-wired. (The spam ladder's
+    --     absence is asserted the same way in 6d.)
     ------------------------------------------------------------------
     ck(Auto.FindOptionByKeywords == nil,
        "the gossip-option keyword matcher must not exist any more")
 
     -- Restore.
     fs.autoGossip = savedAGO
-    Auto._saygeDone, Auto._saygeAt, Auto._saygeSpam = savedSayge[1], savedSayge[2], 0
-    Auto._saygeShapeWarned, Auto._saygeInteractAt = savedSayge[4], savedSayge[5]
+    Auto._saygeDone, Auto._saygeAt = savedSayge[1], savedSayge[2]
+    Auto._saygeSeen4, Auto._saygePageAt = savedSayge[3], savedSayge[4]
+    Auto._saygeShapeWarned, Auto._saygeInteractAt = savedSayge[5], savedSayge[6]
+    Auto._saygeVisit = savedSayge[7]
+    if type(Store.data) == "table" then Store.data.saygeTrace = savedTrace end
     for _, k in ipairs(NAMES) do _G[k] = SAVE[k] end
 
     if fail then return false, fail end
@@ -6007,7 +6496,8 @@ function Auto.RunSelfTests(verbose)
         { name = "roster membership",   fn = testRosterMembership },
         { name = "gossip: DMT npc gate + komcrush guard", fn = testDmtGate },
         { name = "gossip: BWL orb gate",  fn = testBwlGate },
-        { name = "gossip: sayge page maps + shape guard", fn = testSaygePageMaps },
+        { name = "gossip: sayge page maps + shape/sequence guard", fn = testSaygePageMaps },
+        { name = "gossip: display-order sort (1.1.7)", fn = testSortGossipOptions },
         { name = "gossip: npc-gated live path (adversarial)", fn = testGossipLivePath },
         { name = "auto-repair honesty",  fn = testRepairHonesty },
         { name = "rin'wosho: vendor icon 132060 (override first)",
@@ -6067,11 +6557,9 @@ end
 
 -- /dsn debug gossip -> narrate the NPC-gated gossip handlers.
 --
--- This exists for one purpose above all others: spec §14's Sayge page maps rest
--- on the premise that Damage is option 1 on BOTH pages, and the conformance
--- audit flags that premise UNKNOWN-NEEDS-INGAME-VERIFY. When Sayge presents a
--- page shape the maps do not describe, Auto.SaygeShapeWarn refuses out loud and
--- this channel prints the option list so the owner can capture the real thing.
+-- When any gossip page is refused — an undescribed shape, an out-of-sequence
+-- page, or an unprovable display order — the refusal prints out loud and this
+-- channel narrates the detail so the owner can capture the real thing.
 if ns.RegisterDebugCommand then
     ns:RegisterDebugCommand("gossip", function()
         Auto.DEBUG_GOSSIP = not Auto.DEBUG_GOSSIP
@@ -6083,6 +6571,37 @@ if ns.RegisterDebugCommand then
                 :format(Auto._saygeInteractAt and (string.format("%.1fs ago",
                         nowSecs() - Auto._saygeInteractAt)) or "never this session",
                     Auto.SaygeLocked() and "ACTIVE" or "clear"))
+        end
+    end)
+
+    -- /dsn debug sayge -> dump the persisted visit ring (1.1.7 flight
+    -- recorder). Newest first, one block per visit: what he showed (per page:
+    -- raw array position, orderIndex, option ID, name), what was clicked or
+    -- refused and why, the resolved want, class, build and outcome. This is
+    -- the record the wrong-buff incident did not have.
+    ns:RegisterDebugCommand("sayge", function()
+        local ring = Store.GetSaygeTrace and Store.GetSaygeTrace() or nil
+        if not ring or #ring == 0 then
+            ns:Print("sayge trace: no recorded visits yet -- talk to Sayge (14822) and re-check.")
+            return
+        end
+        ns:Print(("sayge trace: %d recorded visit(s), newest first:"):format(#ring))
+        for vi, v in ipairs(ring) do
+            ns:Print(("  #%d %s build=%s class=%s want=%s -> %s")
+                :format(vi, date and date("%Y-%m-%d %H:%M", v.at or 0) or tostring(v.at),
+                    tostring(v.build), tostring(v.class), tostring(v.want), tostring(v.outcome)))
+            for pi, p in ipairs(v.pages or {}) do
+                local act
+                if p.clicked then act = ("clicked display %d (%s)"):format(p.clicked, tostring(p.why))
+                elseif p.refused then act = "REFUSED: " .. tostring(p.refused)
+                else act = "no action" end
+                ns:Print(("    page %d: %d option(s), %s order -- %s")
+                    :format(pi, p.n or 0, p.ordered and "display" or "UNPROVEN", act))
+                for oi, o in ipairs(p.options or {}) do
+                    ns:Print(("      disp %d: raw=%s ord=%s id=%s %s")
+                        :format(oi, tostring(o.pos), tostring(o.ord), tostring(o.id), tostring(o.name)))
+                end
+            end
         end
     end)
 end
