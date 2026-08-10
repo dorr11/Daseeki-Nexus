@@ -4591,6 +4591,296 @@ function Store.ProfessionsDrop(ownerKey)
 end
 
 ----------------------------------------------------------------------
+-- PROFESSION DELEGATES  (designations area — profession-delegates phase 1)
+--
+-- The owner's per-FACTION collector designations, scoped to specialisation
+-- LANES within a profession (one profession can hold several primaries at
+-- once — a main Armorsmith and a main Axesmith are both Blacksmithing mains,
+-- each for their own lane), plus ONE recipe-bank character per faction. Shape:
+--
+--   professions.delegates[faction] = {
+--       profs = { [profKey] = { lanes = { [laneKey] = { p = ownerKey|nil,
+--                                                       s = ownerKey|nil } } } },
+--       bank  = ownerKey|nil,
+--   }
+--   professions.delegatesRev  monotonic LOCAL edit counter (sync rev seed)
+--   professions.delegatesAt   SERVER-TIME stamp of the last local edit (the
+--                             cross-account last-writer-wins key)
+--
+-- laneKey is "general" or tostring(<spec teaching spell id>) — spell ids, not
+-- dataset ordinals, so a designation survives a dataset reorder. Lazy and
+-- additive like the whole professions area; every setter prunes empty tables
+-- so an all-cleared config leaves no husk behind (the rev/at stamps stay:
+-- "cleared" must still out-write an older config on the wire).
+--
+-- A designation is INTENT (the owner designates PLANNED mains): nothing here
+-- ever auto-clears a designation because the character lacks the spec. Only
+-- reads against a character whose record vanished entirely heal to nil, and
+-- that healing is READ-SIDE (Professions.ResolveDelegate skips it) — a dark
+-- accounts graph must never be able to erase a designation (class 6).
+----------------------------------------------------------------------
+
+Store.DELEGATE_LANE_GENERAL = "general"
+
+-- The faction map (heals a malformed node; lazy like the whole area).
+function Store.Delegates(create)
+    local a = Store.ProfessionsArea(create)
+    if not a then return nil end
+    if type(a.delegates) ~= "table" then
+        if not create then return nil end
+        a.delegates = {}
+    end
+    return a.delegates
+end
+
+function Store.DelegatesRev()
+    local a = Store.ProfessionsArea(false)
+    return (a and tonumber(a.delegatesRev)) or 0
+end
+
+function Store.DelegatesAt()
+    local a = Store.ProfessionsArea(false)
+    return (a and tonumber(a.delegatesAt)) or 0
+end
+
+-- Every local edit lands here: rev+1, at=now. The bump is what the sync layer
+-- rides — see Professions.DelegatesMarkDirty.
+local function bumpDelegates(now)
+    local a = Store.ProfessionsArea(true)
+    if not a then return end
+    a.delegatesRev = (tonumber(a.delegatesRev) or 0) + 1
+    a.delegatesAt  = tonumber(now) or serverNow()
+end
+
+-- One faction's node, healed ({ profs = {}, bank }) — never a malformed shape.
+function Store.DelegatesFaction(faction, create)
+    if type(faction) ~= "string" or faction == "" then return nil end
+    local d = Store.Delegates(create)
+    if not d then return nil end
+    local f = d[faction]
+    if type(f) ~= "table" then
+        if not create then return nil end
+        f = {}
+        d[faction] = f
+    end
+    if type(f.profs) ~= "table" then f.profs = {} end
+    return f
+end
+
+-- One lane's { p, s } node (healed), or nil without `create`.
+function Store.DelegateLane(faction, profKey, laneKey, create)
+    if type(profKey) ~= "string" or profKey == "" then return nil end
+    if type(laneKey) ~= "string" or laneKey == "" then return nil end
+    local f = Store.DelegatesFaction(faction, create)
+    if not f then return nil end
+    local prof = f.profs[profKey]
+    if type(prof) ~= "table" then
+        if not create then return nil end
+        prof = {}
+        f.profs[profKey] = prof
+    end
+    if type(prof.lanes) ~= "table" then
+        if not create then return nil end
+        prof.lanes = {}
+    end
+    local lane = prof.lanes[laneKey]
+    if type(lane) ~= "table" then
+        if not create then return nil end
+        lane = {}
+        prof.lanes[laneKey] = lane
+    end
+    return lane
+end
+
+-- Drop empty husks after a clear: lane -> lanes -> prof -> profs -> faction.
+local function pruneDelegates(faction, profKey, laneKey)
+    local d = Store.Delegates(false)
+    local f = d and d[faction]
+    if type(f) ~= "table" then return end
+    local prof = type(f.profs) == "table" and f.profs[profKey] or nil
+    if type(prof) == "table" and type(prof.lanes) == "table" then
+        local lane = prof.lanes[laneKey]
+        if type(lane) == "table" and lane.p == nil and lane.s == nil then
+            prof.lanes[laneKey] = nil
+        end
+        if next(prof.lanes) == nil then prof.lanes = nil end
+    end
+    if type(prof) == "table" and (type(prof.lanes) ~= "table" or next(prof.lanes) == nil) then
+        f.profs[profKey] = nil
+    end
+    if next(f.profs or {}) == nil and f.bank == nil then d[faction] = nil end
+end
+
+-- Set/clear one lane role. role is "p" (primary) or "s" (secondary);
+-- ownerKey nil clears. Returns true when the stored value actually changed
+-- (diff-gated, the SetSocialSet discipline: no rev bump for a no-op).
+--
+-- WRITE-ON-TOP-OF-THE-WINNER: before mutating, adopt the cross-account
+-- effective config if a peer's copy currently wins — otherwise an edit made on
+-- the account with the OLDER local copy would publish that older world plus
+-- one change and silently revert every designation the winning account made.
+function Store.SetDelegate(faction, profKey, laneKey, role, ownerKey, now)
+    if role ~= "p" and role ~= "s" then return false end
+    if ownerKey ~= nil and (type(ownerKey) ~= "string" or ownerKey == "") then return false end
+    Store.DelegatesAdoptEffective()
+    local lane = Store.DelegateLane(faction, profKey, laneKey, true)
+    if not lane then return false end
+    if lane[role] == ownerKey then return false end
+    lane[role] = ownerKey
+    if ownerKey == nil then pruneDelegates(faction, profKey, laneKey) end
+    bumpDelegates(now)
+    return true
+end
+
+-- The per-faction recipe-bank character (one per faction, not per profession).
+function Store.SetRecipeBank(faction, ownerKey, now)
+    if ownerKey ~= nil and (type(ownerKey) ~= "string" or ownerKey == "") then return false end
+    Store.DelegatesAdoptEffective()
+    local f = Store.DelegatesFaction(faction, true)
+    if not f then return false end
+    if f.bank == ownerKey then return false end
+    f.bank = ownerKey
+    if ownerKey == nil then pruneDelegates(faction, "", "") end
+    bumpDelegates(now)
+    return true
+end
+
+-- PURE read against ANY cfg table (the effective one, a test fixture, a peer
+-- payload): the recipe-bank owner for a faction, healed.
+function Store.RecipeBank(cfg, faction)
+    local f = type(cfg) == "table" and cfg[faction] or nil
+    local b = type(f) == "table" and f.bank or nil
+    return (type(b) == "string" and b ~= "") and b or nil
+end
+
+-- Deep copy of a delegates cfg node (wire snapshot / adoption). Plain
+-- string-keyed tables of strings all the way down, so this stays simple.
+local function copyDelegatesCfg(src)
+    if type(src) ~= "table" then return {} end
+    local out = {}
+    for k, v in pairs(src) do
+        if type(v) == "table" then out[k] = copyDelegatesCfg(v)
+        elseif type(v) == "string" or type(v) == "number" or type(v) == "boolean" then
+            out[k] = v
+        end
+    end
+    return out
+end
+Store._CopyDelegatesCfg = copyDelegatesCfg
+
+-- The wire payload: { v, at, cfg }. nil until the owner has EVER edited —
+-- MarkDirty reads nil as "nothing to publish", which keeps a fresh install
+-- from broadcasting an empty config that could win nothing (rev 0 world).
+-- After the first edit an EMPTY cfg still publishes: "everything cleared" must
+-- out-write the older designations on every account.
+function Store.DelegatesSnapshot()
+    if Store.DelegatesRev() <= 0 then return nil end
+    return {
+        v   = 1,
+        at  = Store.DelegatesAt(),
+        cfg = copyDelegatesCfg(Store.Delegates(false) or {}),
+    }
+end
+
+-- PURE. Pick the cross-account winner from candidate list entries
+-- { at, rev, owner, cfg }: newest `at` wins; rev then SMALLEST owner key break
+-- ties, so two stores holding the same candidates always agree (class 8).
+function Store.DelegatesPickWinner(cands)
+    local best
+    for i = 1, #(cands or {}) do
+        local c = cands[i]
+        if type(c) == "table" and type(c.cfg) == "table" then
+            local at, rev = tonumber(c.at) or 0, tonumber(c.rev) or 0
+            if not best
+               or at > best.atN
+               or (at == best.atN and rev > best.revN)
+               or (at == best.atN and rev == best.revN
+                   and tostring(c.owner) < tostring(best.owner)) then
+                best = { atN = at, revN = rev, owner = c.owner, cfg = c.cfg }
+            end
+        end
+    end
+    return best and best.cfg or nil, best and best.owner or nil
+end
+
+-- The candidate list: our LOCAL config plus every peer account's payload from
+-- the "delegates" namespace store. Our own namespace snapshot is EXCLUDED —
+-- the live local copy replaces it (Sync.Get's self-immunity, restated).
+-- Deterministic assembly: local first, then remote owners in sorted order.
+function Store.DelegatesCandidates()
+    local out = {}
+    if Store.DelegatesRev() > 0 then
+        out[#out + 1] = {
+            at   = Store.DelegatesAt(),
+            rev  = Store.DelegatesRev(),
+            owner = (ns.GetAccountID and ns:GetAccountID()) or "",
+            cfg  = Store.Delegates(false) or {},
+        }
+    end
+    local selfAID = (ns.GetAccountID and ns:GetAccountID()) or ""
+    local nsp = Store.SyncNSAll("delegates")
+    local owners = {}
+    for ownerKey in pairs(nsp) do
+        if type(ownerKey) == "string" and ownerKey ~= selfAID then
+            owners[#owners + 1] = ownerKey
+        end
+    end
+    table.sort(owners)
+    for i = 1, #owners do
+        local e = nsp[owners[i]]
+        local data = type(e) == "table" and e.data or nil
+        if type(data) == "table" and type(data.cfg) == "table" then
+            out[#out + 1] = {
+                at    = tonumber(data.at) or 0,
+                rev   = tonumber(e.rev) or 0,
+                owner = owners[i],
+                cfg   = data.cfg,
+            }
+        end
+        -- a malformed peer payload contributes nothing (receive-side heal)
+    end
+    return out
+end
+
+-- The EFFECTIVE cross-account config every reader resolves against.
+function Store.DelegatesEffective()
+    return (Store.DelegatesPickWinner(Store.DelegatesCandidates()))
+end
+
+-- Adopt the effective winner into the LOCAL area when a peer's copy wins.
+-- Called by the setters only (an owner-initiated edit, never a receive path,
+-- so this can never loop). Keeps the local rev counter — rev is a LOCAL
+-- monotonic edit count, and the following bump makes the edit publishable.
+function Store.DelegatesAdoptEffective()
+    local cfg, owner = Store.DelegatesPickWinner(Store.DelegatesCandidates())
+    if cfg == nil then return false end
+    local selfAID = (ns.GetAccountID and ns:GetAccountID()) or ""
+    if owner == selfAID then return false end       -- our copy already wins
+    local a = Store.ProfessionsArea(true)
+    if not a then return false end
+    a.delegates = copyDelegatesCfg(cfg)
+    return true
+end
+
+-- Does ANY account bucket hold a record for this character? The read-side
+-- heal's witness (bounded: a handful of accounts, characters + homeless).
+function Store.CharacterRecordExists(nameRealm)
+    if type(nameRealm) ~= "string" or nameRealm == "" then return false end
+    local data = Store.data
+    local accounts = type(data) == "table" and data.accounts or nil
+    if type(accounts) ~= "table" then return false end
+    for _, bucket in pairs(accounts) do
+        if type(bucket) == "table" then
+            local c = bucket.characters
+            if type(c) == "table" and type(c[nameRealm]) == "table" then return true end
+            local h = bucket.homeless
+            if type(h) == "table" and type(h[nameRealm]) == "table" then return true end
+        end
+    end
+    return false
+end
+
+----------------------------------------------------------------------
 -- Convenience read accessors for other modules
 ----------------------------------------------------------------------
 
@@ -8188,6 +8478,147 @@ local function testSaygeTraceRing(fails)
     Store.data = savedData
 end
 
+----------------------------------------------------------------------
+-- SELF-TEST: profession-delegate designations (accessors, heal, prune,
+-- rev/at discipline, the cross-owner LWW winner, adoption, record witness)
+----------------------------------------------------------------------
+
+local function testDelegates(fails)
+    local function ck(cond, msg) if not cond then fails[#fails + 1] = msg end end
+    local d = Store.data
+    if type(d) ~= "table" then return end
+
+    -- Save the whole professions-area delegate state + namespace residue.
+    local a0 = Store.ProfessionsArea(false)
+    local savedD  = a0 and a0.delegates
+    local savedR  = a0 and a0.delegatesRev
+    local savedAt = a0 and a0.delegatesAt
+    local nsAll = Store.SyncNS()
+    local savedNS = nsAll.delegates
+    nsAll.delegates = nil
+    local a1 = Store.ProfessionsArea(true)
+    a1.delegates, a1.delegatesRev, a1.delegatesAt = nil, nil, nil
+
+    local ok, err = pcall(function()
+        -- LAZY + HEAL: no read creates anything; a malformed node heals.
+        ck(Store.Delegates(false) == nil, "a bare read created the delegates node")
+        ck(Store.DelegatesRev() == 0 and Store.DelegatesAt() == 0,
+           "a virgin config claims a rev or a stamp")
+        a1.delegates = "junk"
+        ck(Store.Delegates(true) ~= nil and type(a1.delegates) == "table",
+           "a malformed delegates node was not healed")
+        a1.delegates = { Horde = 7 }
+        ck(Store.DelegatesFaction("Horde", true) ~= nil
+           and type(a1.delegates.Horde) == "table"
+           and type(a1.delegates.Horde.profs) == "table",
+           "a malformed faction node was not healed")
+        a1.delegates = nil
+
+        -- SET bumps rev + stamps at; an identical set is diff-gated.
+        ck(Store.SetDelegate("Horde", "blacksmithing", "general", "p", "Poonyx-R", 100) == true,
+           "the first set did not write")
+        ck(Store.DelegatesRev() == 1 and Store.DelegatesAt() == 100,
+           "the set did not bump rev / stamp at")
+        ck(Store.SetDelegate("Horde", "blacksmithing", "general", "p", "Poonyx-R", 101) == false,
+           "an identical set was not diff-gated")
+        ck(Store.DelegatesRev() == 1 and Store.DelegatesAt() == 100,
+           "a no-op set bumped the rev anyway")
+        -- junk role / junk owner refuse.
+        ck(Store.SetDelegate("Horde", "blacksmithing", "general", "x", "A-R") == false
+           and Store.SetDelegate("Horde", "blacksmithing", "general", "p", "") == false
+           and Store.SetDelegate("Horde", "", "general", "p", "A-R") == false,
+           "a malformed set was accepted")
+
+        -- both roles on one lane; the bank is per FACTION, not per profession.
+        ck(Store.SetDelegate("Horde", "blacksmithing", "9788", "s", "Sec-R", 102) == true,
+           "the secondary set did not write")
+        ck(Store.SetRecipeBank("Horde", "Bank-R", 103) == true, "the bank set did not write")
+        ck(Store.RecipeBank(Store.Delegates(false), "Horde") == "Bank-R",
+           "the bank read is wrong")
+        ck(Store.DelegatesRev() == 3, "the rev did not count all three edits")
+
+        -- CLEAR prunes the husks but keeps the rev/at (cleared must out-write).
+        ck(Store.SetDelegate("Horde", "blacksmithing", "9788", "s", nil, 104) == true,
+           "the clear did not write")
+        local cfg = Store.Delegates(false)
+        ck(cfg.Horde.profs.blacksmithing.lanes["9788"] == nil,
+           "a cleared lane left a husk")
+        ck(Store.SetDelegate("Horde", "blacksmithing", "general", "p", nil, 105) == true,
+           "the second clear did not write")
+        ck(cfg.Horde.profs.blacksmithing == nil, "a cleared profession left a husk")
+        ck(cfg.Horde ~= nil, "clearing lanes deleted the faction that still holds a bank")
+        ck(Store.SetRecipeBank("Horde", nil, 106) == true, "the bank clear did not write")
+        ck(Store.Delegates(false).Horde == nil, "an all-cleared faction left a husk")
+        ck(Store.DelegatesRev() == 6 and Store.DelegatesAt() == 106,
+           "the clears did not keep counting the rev")
+        local snap = Store.DelegatesSnapshot()
+        ck(type(snap) == "table" and snap.at == 106 and type(snap.cfg) == "table"
+           and next(snap.cfg) == nil,
+           "an all-cleared (but ever-edited) config must still snapshot, empty")
+
+        -- SNAPSHOT is a DEEP COPY: mutating it never reaches the store.
+        Store.SetDelegate("Horde", "alchemy", "general", "p", "Al-R", 200)
+        local s2 = Store.DelegatesSnapshot()
+        s2.cfg.Horde.profs.alchemy.lanes.general.p = "Evil-R"
+        ck(Store.Delegates(false).Horde.profs.alchemy.lanes.general.p == "Al-R",
+           "the snapshot aliases the live store")
+
+        -- THE WINNER RULE, pure: newest at; rev then smallest owner break
+        -- ties; junk candidates are skipped; order of arrival is irrelevant.
+        local A = { at = 100, rev = 9, owner = "b", cfg = { tag = "A" } }
+        local B = { at = 200, rev = 1, owner = "c", cfg = { tag = "B" } }
+        local C = { at = 200, rev = 2, owner = "a", cfg = { tag = "C" } }
+        local D2 = { at = 200, rev = 2, owner = "d", cfg = { tag = "D" } }
+        local junk = { at = 999, rev = 99, owner = "z", cfg = "junk" }
+        local function winnerTag(list)
+            local w = Store.DelegatesPickWinner(list)
+            return w and w.tag or "-"
+        end
+        ck(winnerTag({ A, B }) == "B", "newest at did not win")
+        ck(winnerTag({ B, C }) == "C", "the rev tiebreak did not win")
+        ck(winnerTag({ C, D2 }) == "C" and winnerTag({ D2, C }) == "C",
+           "the owner tiebreak is not deterministic across arrival order")
+        ck(winnerTag({ junk, A }) == "A", "a junk candidate won")
+        ck(Store.DelegatesPickWinner({}) == nil and Store.DelegatesPickWinner(nil) == nil,
+           "an empty candidate list invented a winner")
+
+        -- EFFECTIVE + ADOPTION against the namespace store: a newer peer wins
+        -- the read; an edit adopts the winner first and keeps its content.
+        Store.SyncNSPut("delegates", "__store-peer", 1,
+            { v = 1, at = 5000, cfg = { Horde = { profs = { alchemy = { lanes = {
+                general = { p = "Peer-R" } } } } } } }, 5000)
+        local eff = Store.DelegatesEffective()
+        ck(eff and eff.Horde.profs.alchemy.lanes.general.p == "Peer-R",
+           "the newer peer did not win the effective read")
+        ck(Store.SetDelegate("Horde", "alchemy", "general", "s", "Mine-R", 6000) == true,
+           "the post-win edit did not write")
+        eff = Store.DelegatesEffective()
+        ck(eff.Horde.profs.alchemy.lanes.general.p == "Peer-R"
+           and eff.Horde.profs.alchemy.lanes.general.s == "Mine-R",
+           "the edit did not sit on top of the adopted winner")
+        Store.SyncNSDrop("delegates", "__store-peer")
+
+        -- THE RECORD WITNESS for the read-side heal.
+        local accounts = Store.data.accounts
+        local savedAcc = accounts and accounts["__dlgtest"]
+        Store.data.accounts = Store.data.accounts or {}
+        Store.data.accounts["__dlgtest"] = {
+            characters = { ["Real-R"] = {} }, homeless = { ["Lost-R"] = {} } }
+        ck(Store.CharacterRecordExists("Real-R") == true, "a real record was not witnessed")
+        ck(Store.CharacterRecordExists("Lost-R") == true, "a homeless record was not witnessed")
+        ck(Store.CharacterRecordExists("Gone-R") == false, "a vanished record was witnessed")
+        ck(Store.CharacterRecordExists("") == false and Store.CharacterRecordExists(nil) == false,
+           "a junk key was witnessed")
+        if savedAcc ~= nil then Store.data.accounts["__dlgtest"] = savedAcc
+        else Store.data.accounts["__dlgtest"] = nil end
+    end)
+
+    nsAll.delegates = savedNS
+    local a2 = Store.ProfessionsArea(true)
+    a2.delegates, a2.delegatesRev, a2.delegatesAt = savedD, savedR, savedAt
+    if not ok then fails[#fails + 1] = "error in delegates fixtures: " .. tostring(err) end
+end
+
 function Store.RunSelfTests(verbose)
     local suites = {
         { name = "defaults",        fn = testDefaults },
@@ -8223,6 +8654,8 @@ function Store.RunSelfTests(verbose)
         -- Brief E (Class 8): sort before the ceiling, one identity rule.
         { name = "social set: sort before the ceiling (NX-8)", fn = testSocialSetOrder },
         { name = "owner resolution: one rule, three surfaces (NX-14/NX-15)", fn = testResolveOwner },
+        { name = "profession delegates: accessors, heal, prune, cross-owner LWW, adoption",
+          fn = testDelegates },
     }
     local allPass = true
     for _, suite in ipairs(suites) do

@@ -154,6 +154,7 @@ expect("note",       "notes")
 local profCount, profKey = {}, {}
 local recipeCount, itemIds, npcIds, zoneCount = {}, {}, {}, 0
 local questIds, objectIds, eventIds, factionIds, noteIds, specCount = {}, {}, {}, {}, {}, 0
+local specRows = {}   -- ordinal -> { prof, parent } for the FIX-4 parent gate
 local trainerSets = {}
 local seenRecipe, seenItem = {}, {}
 local grantCount, noSourceCount = 0, 0
@@ -190,6 +191,14 @@ for _, line in ipairs(kept) do
         factionIds[tonumber(line:match("^(%d+)|"))] = true
     elseif section == "spec" then
         specCount = specCount + 1
+        -- FIX-4 parent edge: field 7 must be 0 or another [spec] ordinal (never
+        -- itself), and a parent must share the child's profession. Ordinals are
+        -- contiguous from the extractor, so range + prof are checkable in one
+        -- pass once every row is parsed (see the second-pass gate below).
+        local sIdx, sProf, sParent =
+            line:match("^(%d+)|%d+|(%d+)|%d+|%d+|[^|]*|(%d+)$")
+        if not sIdx then die("malformed [spec] row (seven fields expected): " .. line) end
+        specRows[tonumber(sIdx)] = { prof = tonumber(sProf), parent = tonumber(sParent) }
     elseif section == "trainerset" then
         local p, k = line:match("^(%d+)|(%d+)|")
         if not p then die("malformed [trainerset] row: " .. line) end
@@ -273,6 +282,27 @@ for idx, want in pairs(profCount) do
     if recipeCount[idx] ~= want then
         die(string.format("profession %s carries %d recipe rows but its [prof] row claims %d",
             profKey[idx] or idx, recipeCount[idx] or 0, want))
+    end
+end
+
+-- FIX-4 parent-edge gate: every [spec] parent resolves to a real spec row in
+-- the SAME profession and never to itself. A dangling parent would ship as a
+-- lane chain that silently dead-ends, which is exactly the class of quiet lie
+-- the referential gate exists to refuse.
+for idx, row in pairs(specRows) do
+    local p = row.parent or 0
+    if p ~= 0 then
+        local target = specRows[p]
+        if not target then
+            die("spec ordinal " .. idx .. " parents to " .. p .. ", which is not a [spec] row")
+        end
+        if p == idx then
+            die("spec ordinal " .. idx .. " parents to itself")
+        end
+        if target.prof ~= row.prof then
+            die("spec ordinal " .. idx .. " parents across professions (" ..
+                tostring(row.prof) .. " -> " .. tostring(target.prof) .. ")")
+        end
     end
 end
 
