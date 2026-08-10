@@ -31,9 +31,17 @@
 --                             npc, quest, object, event, faction, standing,
 --                             spec, rank, trainerset, recipe, item.
 --
---   ns.ProfessionsDataMeta    { version, recipes, items, npcs, ... } — the
---                             counts as literals, so the load-time census gate
---                             never costs a parse, plus the version stamp.
+--   ns.ProfessionsDataMeta    { version, setHash, recipes, items, npcs, ... }
+--                             — the counts as literals, so the load-time census
+--                             gate never costs a parse, plus the version stamp
+--                             and the recipe-set hash.
+--
+--   ns.ProfessionsDataCompat  the migration blob: [stampset] rows naming every
+--                             historical dataset stamp's recipe-set hash, and
+--                             [migration] rows translating each historical
+--                             recipe set's ordinals into this build's. Parsed
+--                             lazily by professions.lua, only when a record
+--                             from another build shows up.
 --
 --   Parse it through ns.Professions.Dataset — the parser lives there, staged,
 --   so the capture layer's needs (the recipe index) are built without building
@@ -55,6 +63,14 @@
 -- renders as "not scanned", decoding wrongly renders as a list of recipes that
 -- character does not know.
 --
+-- SET HASH (feat/dataset-migration). The version stamp hashes EVERYTHING, but
+-- the bitmaps depend only on the recipe membership-and-ordering, so
+-- ns.ProfessionsDataMeta.setHash names exactly that. A stamp bump that leaves
+-- the set hash unchanged (sources, zones, spec edges, notes) invalidates
+-- NOTHING: professions.lua rescues such records through the [stampset] table
+-- in ns.ProfessionsDataCompat, and genuine set changes are translated through
+-- its [migration] rows instead of being discarded.
+--
 -- Clean-room: the facts are game facts, extracted through our own Room-1
 -- addendum. No third-party code, identifiers or file structure appear here.
 
@@ -62,6 +78,7 @@ local ADDON, ns = ...
 
 ns.ProfessionsDataMeta = {
     version     = "p1-4b17878e",
+    setHash     = "s1-3dbe2152",
     professions = 13,
     recipes     = 1251,
     items       = 770,
@@ -3279,4 +3296,18 @@ FIX-4|spec-parent-edges|flat specialisation list|3 Master smith specs parent to 
 10|22773|1|5|-|R609/6;V50000@15179
 10|22774|1|5|-|R609/7;V50000@15179
 11|16083|1|1|-|V10000@2626
+]==]
+
+-- COMPAT (feat/dataset-migration). Derived from dev/professions-orderings/,
+-- OUTSIDE the version-stamped payload on purpose: the stamp names the facts'
+-- coordinate system, and shipping a better memory of old builds is not a new
+-- coordinate system. [stampset] rows associate every historical stamp with its
+-- recipe-set hash (so a record carrying only `ds` can be named); [migration]
+-- rows are <old set-hash>|<prof ordinal>|<old ordinal -> new ordinal map>,
+-- "=<n>" for the identity, 0 for a recipe that left the dataset.
+ns.ProfessionsDataCompat = [==[
+[stampset]
+p1-4b17878e|s1-3dbe2152
+p1-f84a5fa0|s1-3dbe2152
+[migration]
 ]==]

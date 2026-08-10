@@ -763,17 +763,18 @@ end
 -- a profession, so the list path and the tooltip path cannot drift.
 ----------------------------------------------------------------------
 
+-- DELEGATED (feat/dataset-migration): Professions.KnownSetFor is the one
+-- implementation — it carries the migration layer (a payload from another
+-- dataset build is rescued or translated before decoding) and the COVERAGE
+-- third return: nil = the record covers the full current set; otherwise
+-- { [spellID] = true } for exactly the recipes the record's scan could see.
+-- A recipe outside BOTH set and coverage is UNSCANNED for that character,
+-- never "missing" — the scan predates it. Keeping the ui reader a delegate is
+-- what keeps the list path and the tooltip path pinned to one truth.
 function ProfUI.KnownSet(payload, profKey)
     local P = ns.Professions
-    if not (P and type(payload) == "table") then return nil, "unscanned" end
-    local p = payload.p and payload.p[profKey]
-    if not p then return nil, "unscanned" end
-    if p.k == nil or p.a == nil then return nil, "unscanned" end
-    local ids = P.DecodeKnown and P.DecodeKnown(profKey, p.k, payload.ds)
-    if type(ids) ~= "table" then return nil, "unscanned" end
-    local set = {}
-    for i = 1, #ids do set[ids[i]] = true end
-    return set, "scanned"
+    if not (P and P.KnownSetFor) then return nil, "unscanned" end
+    return P.KnownSetFor(payload, profKey)
 end
 
 ----------------------------------------------------------------------
@@ -1907,7 +1908,7 @@ function ProfUI.RecipeRows(payload, profKey, opts, res)
     if not idx then return rows, pending, "nodata" end
     local list = (D.profRecipes and D.profRecipes[idx]) or {}
 
-    local known, state = ProfUI.KnownSet(payload, profKey)
+    local known, state, coverage = ProfUI.KnownSet(payload, profKey)
     local unscanned = (state ~= "scanned")
     local needle = tostring(opts.search or ""):lower()
     local hasSearch = (needle ~= "")
@@ -1924,7 +1925,13 @@ function ProfUI.RecipeRows(payload, profKey, opts, res)
     for i = 1, #list do
         local spell = list[i]
         local rec = D.recipe[spell]
-        local rowState = unscanned and "unknown" or (known[spell] and "known" or "missing")
+        -- The migration honesty rule rides the third return: a recipe outside
+        -- a migrated record's coverage was never seen by that record's scan,
+        -- so it is "unknown" (renders in the unscanned gap), never "missing".
+        local rowState = unscanned and "unknown"
+            or (known[spell] and "known")
+            or ((coverage and not coverage[spell]) and "unknown")
+            or "missing"
 
         -- THE SPEC RULE (the shared predicate — see SpecStanding): a recipe
         -- locked behind a spec this character did NOT choose is not "missing",
@@ -2661,11 +2668,17 @@ function ProfUI.SearchRows(query, entries, lookup, res, limit)
                             local pr = hp.p[prof.key]
                             if pr then
                                 local who = holders[h].entry
-                                local set, st = ProfUI.KnownSet(hp, prof.key)
+                                local set, st, cov = ProfUI.KnownSet(hp, prof.key)
                                 if st ~= "scanned" then
                                     row.unchecked[#row.unchecked + 1] = who
                                 elseif set[spell] then
                                     row.known[#row.known + 1] = who
+                                elseif cov and not cov[spell] then
+                                    -- Outside a migrated record's coverage:
+                                    -- the scan never saw this recipe — "not
+                                    -- checked", never "can learn" (which
+                                    -- implies proven-missing).
+                                    row.unchecked[#row.unchecked + 1] = who
                                 else
                                     local lvl = tonumber(pr.l)
                                     local needSkill = rec and rec.s or 0

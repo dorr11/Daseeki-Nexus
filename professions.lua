@@ -166,10 +166,17 @@
 --   ownerKey is "Name-Realm" — per CHARACTER, exactly like the inventory
 --   module's `bags` namespace, because professions are a character fact.
 --
---   <payload>, the wire shape, frozen for this schema:
+--   <payload>, the wire shape, frozen for this schema (sh/cv are ADDITIVE —
+--   feat/dataset-migration; a reader that ignores them is merely incomplete,
+--   never wrong, which is why v stays 1):
 --     {
 --       v  = 1,                       payload schema
 --       ds = "<dataset version>",     the bitmap's coordinate system
+--       sh = "<recipe-set hash>",     the coordinate system's IDENTITY — the
+--                                     part of ds the bitmaps actually depend
+--                                     on. Absent on pre-migration payloads;
+--                                     derived from ds via the shipped
+--                                     [stampset] table then.
 --       ts = <epoch>,                 when this payload was built
 --       p  = { [profKey] = {
 --                l = <current skill>,      nil = unknown, NEVER 0-as-unknown
@@ -180,6 +187,13 @@
 --                n = <known count>,        absent with k absent
 --                u = <known-but-not-in-our-dataset count>,   drift signal
 --                a = <epoch of the last complete window scan>,
+--                cv = "<coverage bitmap>", PRESENT ONLY on a migrated record
+--                                     whose original scan predates recipes in
+--                                     the current set: the current ordinals its
+--                                     scan actually covered. A recipe OUTSIDE
+--                                     the coverage is UNSCANNED for this
+--                                     character, never "missing" — the scan
+--                                     never saw it. Absent = full coverage.
 --              }, ... },
 --       c  = { [cdKey] = <epoch the cooldown is ready> },
 --     }
@@ -416,6 +430,7 @@ Professions.Dataset = Dataset
 
 Dataset.core    = false
 Dataset.sources = false
+Dataset.compat  = false
 
 local function rawText()
     return ns.ProfessionsDataRaw
@@ -430,8 +445,18 @@ function Dataset.Version()
     return (m and m.version) or "?"
 end
 
+-- The recipe-set hash: the version stamp names the whole content, this names
+-- the one thing the bitmaps depend on — per-profession recipe membership and
+-- ordering. Metadata-only bumps move Version() and leave SetHash() alone.
+function Dataset.SetHash()
+    local m = ns.ProfessionsDataMeta
+    return (m and m.setHash) or "?"
+end
+
 function Dataset.Unload()
     Dataset.core, Dataset.sources = false, false
+    Dataset.compat = false
+    Dataset.stampSet, Dataset.migrations = nil, nil
     Dataset.profs, Dataset.profIdx = nil, nil
     Dataset.recipe, Dataset.profRecipes = nil, nil
     Dataset.ranks, Dataset.rankSpell = nil, nil
@@ -790,23 +815,318 @@ function Professions.DecodeKnown(profKey, bits, payloadDS)
 end
 
 ----------------------------------------------------------------------
+-- DATASET MIGRATION  (feat/dataset-migration)
+--
+-- The 2026-08-10 incident: a spec-tree addition moved the dataset stamp
+-- (p1-f84a5fa0 -> p1-4b17878e) WITHOUT changing one recipe, and every
+-- character's record went "not checked" — a full re-scan tour of the alts,
+-- twice in one day. The gate was honest and wasteful: it keyed validity on the
+-- WHOLE-CONTENT stamp when the bitmaps depend only on the recipe set.
+--
+-- Two layers end that cost:
+--
+--   LAYER 1 — METADATA-IMMUNE VALIDITY. The dataset ships a recipe-SET hash
+--   (Meta.setHash) beside the stamp, plus a [stampset] table naming every
+--   historical stamp's set hash. A record whose set hash matches ours is valid
+--   VERBATIM, whatever its stamp says: same membership, same order, same bits.
+--
+--   LAYER 2 — ORDINAL TRANSLATION. When the set genuinely changed, the shipped
+--   [migration] rows translate old ordinals to current ones by teaching-spell
+--   id: survivors keep their known/missing truth, removed recipes drop
+--   silently (nothing to claim), and ADDITIONS — recipes the record's scan
+--   never saw — are tracked by a per-profession coverage bitmap (`cv`) so
+--   every reader renders them as UNSCANNED, never "missing". Migration
+--   preserves truth BETWEEN window opens; it never fakes completeness — the
+--   settled-signature layer sees the row-count drift at the next open and
+--   forces a real rescan.
+--
+-- An unknown coordinate system still refuses exactly as before: refusing
+-- renders as "not scanned", translating by guesswork would render as a
+-- confident list of recipes somebody's alt cannot make.
+----------------------------------------------------------------------
+
+-- PURE. Parse the shipped compat blob. Returns stampSet (stamp -> set hash)
+-- and migrations (old set hash -> { [profIdx] = { n, identity | map } }).
+function Professions.ParseCompat(raw)
+    local stampSet, migrations = {}, {}
+    if type(raw) ~= "string" or raw == "" then return stampSet, migrations end
+    local section
+    for line in (raw .. "\n"):gmatch("(.-)\n") do
+        line = line:gsub("\r$", "")
+        if line ~= "" and line:sub(1, 1) ~= "#" then
+            local s = line:match("^%[(%a+)%]$")
+            if s then
+                section = s
+            elseif section == "stampset" then
+                local stamp, sh = line:match("^([^|]+)|([^|]+)$")
+                if stamp then stampSet[stamp] = sh end
+            elseif section == "migration" then
+                local sh, pIdx, spec = line:match("^([^|]+)|(%d+)|(.+)$")
+                if sh then
+                    local entry = migrations[sh]
+                    if not entry then entry = {} migrations[sh] = entry end
+                    local ident = spec:match("^=(%d+)$")
+                    if ident then
+                        entry[tonumber(pIdx)] = { n = tonumber(ident), identity = true }
+                    else
+                        local map, n = {}, 0
+                        for tok in (spec .. ","):gmatch("(.-),") do
+                            n = n + 1
+                            map[n] = tonumber(tok) or 0
+                        end
+                        entry[tonumber(pIdx)] = { n = n, map = map }
+                    end
+                end
+            end
+        end
+    end
+    return stampSet, migrations
+end
+
+function Dataset.LoadCompat()
+    if Dataset.compat then return true end
+    Dataset.stampSet, Dataset.migrations = Professions.ParseCompat(ns.ProfessionsDataCompat)
+    Dataset.compat = true
+    return true
+end
+
+-- The set hash a payload's bitmaps were written against, or nil when we cannot
+-- name it: the explicit `sh` first (new payloads), the current stamp next (an
+-- own-build payload from before `sh` existed), the shipped stamp table last
+-- (old payloads that carry only a foreign `ds`).
+function Professions.ResolveSetHash(payload)
+    if type(payload) ~= "table" then return nil end
+    if type(payload.sh) == "string" then return payload.sh end
+    if payload.ds == Dataset.Version() then return Dataset.SetHash() end
+    Dataset.LoadCompat()
+    return Dataset.stampSet and Dataset.stampSet[payload.ds] or nil
+end
+
+-- Deep-enough copy for migration: fresh payload, fresh profession records
+-- (spec arrays included), fresh cooldown map. The original is NEVER mutated —
+-- it may be the sync store's cached blob, and those bytes are relay material
+-- that must stay exactly what the owning peer published.
+function Professions.CopyPayload(payload)
+    local out = {}
+    for k, v in pairs(payload) do out[k] = v end
+    if type(payload.p) == "table" then
+        local p = {}
+        for key, rec in pairs(payload.p) do
+            local r = {}
+            for k, v in pairs(rec) do r[k] = v end
+            if type(rec.s) == "table" then
+                local s = {}
+                for i = 1, #rec.s do s[i] = rec.s[i] end
+                r.s = s
+            end
+            p[key] = r
+        end
+        out.p = p
+    end
+    if type(payload.c) == "table" then
+        local c = {}
+        for k, v in pairs(payload.c) do c[k] = v end
+        out.c = c
+    end
+    return out
+end
+
+-- PURE against the injected migration entry: an old-coordinate bitmap to a
+-- current-coordinate one. Returns bits, survivors — or nil when the bitmap
+-- does not decode against the migration's own length (corruption: refuse,
+-- never guess). Deterministic output whatever the iteration luck (class 8):
+-- EncodeBits walks ordinals 1..n.
+function Professions.TranslateBits(bits, mig, nNew)
+    if type(mig) ~= "table" then return nil end
+    local set = Professions.DecodeBits(bits, mig.n or 0)
+    if not set then return nil end
+    if mig.identity then
+        local count = 0
+        for _ in pairs(set) do count = count + 1 end
+        return bits, count                -- same membership, same order, same bytes
+    end
+    local out, survivors = {}, 0
+    for oldOrd in pairs(set) do
+        local newOrd = mig.map and mig.map[oldOrd] or 0
+        if newOrd > 0 then
+            if not out[newOrd] then survivors = survivors + 1 end
+            out[newOrd] = true
+        end
+        -- newOrd 0: the recipe left the dataset — nothing to claim, drop silently.
+    end
+    return Professions.EncodeBits(out, nNew), survivors
+end
+
+-- The migration's own coverage of the CURRENT ordering: which current ordinals
+-- existed in the old set at all, as a bitmap in current coordinates.
+function Professions.MigrationCoverageBits(mig, nNew)
+    local set = {}
+    if type(mig) == "table" then
+        if mig.identity then
+            local top = mig.n or 0
+            if top > nNew then top = nNew end
+            for i = 1, top do set[i] = true end
+        else
+            for o = 1, mig.n or 0 do
+                local nn = mig.map and mig.map[o]
+                if nn and nn > 0 and nn <= nNew then set[nn] = true end
+            end
+        end
+    end
+    return Professions.EncodeBits(set, nNew)
+end
+
+-- Record-load / receive-time translation. Returns payloadOut, changed, verdict:
+--   "current"   already in current coordinates; payloadOut IS payload, untouched
+--   "rescued"   Layer 1 — the recipe set is identical to ours (metadata-only
+--               bump): bitmaps kept verbatim, only the stamps rewritten
+--   "migrated"  Layer 2 — a genuine set change we ship a migration for
+--   "unknown"   a coordinate system we cannot name: payload returned untouched
+--               and every decode gate downstream refuses exactly as before
+--   "invalid"   not a payload at all
+function Professions.MigratePayload(payload)
+    if type(payload) ~= "table" then return nil, false, "invalid" end
+    local curDS, curSH = Dataset.Version(), Dataset.SetHash()
+    if payload.ds == curDS and (payload.sh == nil or payload.sh == curSH) then
+        return payload, false, "current"
+    end
+    if not Dataset.LoadCore() then return payload, false, "unknown" end
+    local sh = Professions.ResolveSetHash(payload)
+    if sh == nil then return payload, false, "unknown" end
+    if sh == curSH then
+        local out = Professions.CopyPayload(payload)
+        out.ds, out.sh = curDS, curSH
+        return out, true, "rescued"
+    end
+    Dataset.LoadCompat()
+    local entry = Dataset.migrations and Dataset.migrations[sh]
+    if not entry then return payload, false, "unknown" end
+    local out = Professions.CopyPayload(payload)
+    out.ds, out.sh = curDS, curSH
+    for key, rec in pairs(out.p or {}) do
+        if rec.k ~= nil then
+            local idx = Dataset.profIdx[key]
+            local mig = idx and entry[idx]
+            local list = idx and Dataset.profRecipes[idx] or nil
+            local bits, survivors
+            if mig and list then
+                bits, survivors = Professions.TranslateBits(rec.k, mig, #list)
+            end
+            if bits == nil then
+                -- No map for this profession, or a bitmap that does not decode
+                -- against it: the third state, never a guess.
+                rec.k, rec.n, rec.u, rec.a, rec.cv = nil, nil, nil, nil, nil
+            else
+                rec.k, rec.n = bits, survivors
+                -- Coverage: what the record's ORIGINAL scan actually saw, in
+                -- current coordinates. A record migrated once already carries
+                -- `cv`; translating that bitmap through THIS migration keeps
+                -- the whole chain exact (old coverage ∩ every set since).
+                local cvBits
+                if rec.cv ~= nil then
+                    cvBits = Professions.TranslateBits(rec.cv, mig, #list)
+                    if cvBits == nil then
+                        rec.k, rec.n, rec.u, rec.a, rec.cv = nil, nil, nil, nil, nil
+                    end
+                else
+                    cvBits = Professions.MigrationCoverageBits(mig, #list)
+                end
+                if rec.k ~= nil then
+                    local _, covered = Professions.DecodeBits(cvBits, #list)
+                    rec.cv = (covered and covered < #list) and cvBits or nil
+                end
+            end
+        end
+    end
+    return out, true, "migrated"
+end
+
+-- One pass over the stored owners graph at activation: translate every record
+-- written under another dataset build — IN THE PROJECTION ONLY. The sync
+-- store's cached namespace blobs are relay bytes and stay exactly as the
+-- owning peer published them; each receiver translates for itself.
+function Professions.MigrateStoredOwners()
+    local S = ns.Store
+    if not (S and S.ProfessionsOwners) then return 0 end
+    local owners = S.ProfessionsOwners()
+    local keys = {}
+    for key in pairs(owners) do keys[#keys + 1] = key end
+    table.sort(keys)                       -- class 8: one order, every login
+    local n = 0
+    for i = 1, #keys do
+        local e = owners[keys[i]]
+        if type(e) == "table" and type(e.data) == "table" then
+            local mp, changed = Professions.MigratePayload(e.data)
+            if changed then
+                e.data = mp
+                n = n + 1
+            end
+        end
+    end
+    return n
+end
+
+----------------------------------------------------------------------
 -- THE THREE-STATE ANSWER
 --
--- The one function every reader (tooltip, panel, search) must go through.
+-- The one seam every reader (tooltip, panel row, census, shopping list,
+-- delegate loud line) must go through — KnownState for the per-recipe answer,
+-- KnownSetFor for the per-profession set (ui_professions.lua's KnownSet
+-- delegates here, so the list path and the tooltip path cannot drift).
 -- Returns "unknown" | "known" | "missing", plus the character's skill in that
 -- profession when we have it. There is no boolean form on purpose.
+--
+-- Migration rides INSIDE the seam: a payload from another build is translated
+-- (never mutated — the caller's table is copied) before decoding, so every
+-- consumer inherits Layer 1 and Layer 2 without knowing they exist. A recipe
+-- OUTSIDE a migrated record's coverage answers "unknown": the scan that wrote
+-- the record predates the recipe, and "missing" would be a lie about an alt.
 ----------------------------------------------------------------------
+
+-- The per-profession known set. Returns set|nil, state, coverage:
+--   set       { [spellID] = true } for every recipe the bitmap proves known
+--   state     "scanned" | "unscanned" — nil set ALWAYS means unscanned
+--   coverage  nil = the record covers the full current set; otherwise
+--             { [spellID] = true } for exactly the recipes the record's scan
+--             could see — a recipe absent from BOTH set and coverage is
+--             UNSCANNED for this character, never missing.
+function Professions.KnownSetFor(payload, profKey)
+    if type(payload) ~= "table" then return nil, "unscanned" end
+    local p0 = payload.p and payload.p[profKey]
+    if not p0 then return nil, "unscanned" end
+    if p0.k == nil or p0.a == nil then return nil, "unscanned" end   -- never scanned
+    local mp, _, verdict = Professions.MigratePayload(payload)
+    if verdict ~= "current" and verdict ~= "rescued" and verdict ~= "migrated" then
+        return nil, "unscanned"           -- a coordinate system we cannot name
+    end
+    local rec = mp.p and mp.p[profKey]
+    if not rec or rec.k == nil or rec.a == nil then return nil, "unscanned" end
+    local ids = Professions.DecodeKnown(profKey, rec.k, mp.ds)
+    if type(ids) ~= "table" then return nil, "unscanned" end
+    local set = {}
+    for i = 1, #ids do set[ids[i]] = true end
+    local cov = nil
+    if rec.cv ~= nil then
+        local idx = Dataset.profIdx and Dataset.profIdx[profKey]
+        local list = idx and Dataset.profRecipes[idx] or nil
+        local cset = list and Professions.DecodeBits(rec.cv, #list) or nil
+        if not cset then return nil, "unscanned" end    -- corrupt coverage: refuse
+        cov = {}
+        for i = 1, #list do
+            if cset[i] then cov[list[i]] = true end
+        end
+    end
+    return set, "scanned", cov
+end
 
 function Professions.KnownState(payload, profKey, spellID)
     if type(payload) ~= "table" then return "unknown" end
     local p = payload.p and payload.p[profKey]
     if not p then return "unknown" end            -- no such profession recorded
-    if p.k == nil or p.a == nil then return "unknown", p.l end   -- never scanned
-    local ids = Professions.DecodeKnown(profKey, p.k, payload.ds)
-    if not ids then return "unknown", p.l end     -- undecodable => unknown, never false
-    for i = 1, #ids do
-        if ids[i] == spellID then return "known", p.l end
-    end
+    local set, state, cov = Professions.KnownSetFor(payload, profKey)
+    if state ~= "scanned" then return "unknown", p.l end
+    if set[spellID] then return "known", p.l end
+    if cov and not cov[spellID] then return "unknown", p.l end   -- outside the scan's set
     return "missing", p.l
 end
 
@@ -2157,9 +2477,23 @@ function Professions.SettledArea(create)
     return mine
 end
 
+-- Is this stamp/set-hash pair OUR coordinate system? Same stamp always is;
+-- a different stamp is accepted when its recipe-set hash — carried on the
+-- record, or named by the shipped [stampset] table — equals ours (Layer 1:
+-- the 2026-08-10 metadata-only bump must never again cost a re-scan tour).
+local function sameRecipeSet(ds, sh)
+    if ds == Dataset.Version() then return true end
+    if sh == nil then
+        Dataset.LoadCompat()
+        sh = Dataset.stampSet and Dataset.stampSet[ds] or nil
+    end
+    return sh ~= nil and sh == Dataset.SetHash()
+end
+Professions.SameRecipeSet = sameRecipeSet
+
 local function settledRecordUsable(rec)
     if type(rec) ~= "table" then return false end
-    if rec.ds ~= Dataset.Version() then return false end        -- another coordinate system
+    if not sameRecipeSet(rec.ds, rec.sh) then return false end  -- another coordinate system
     if rec.build ~= Professions.ClientBuild() then return false end  -- another client's names
     if type(rec.n) ~= "number" or rec.n <= 0 then return false end
     if type(rec.names) ~= "table" or type(rec.rows) ~= "table" then return false end
@@ -2355,7 +2689,8 @@ function Professions.BuildSettledRecord(scan)
         l = scan.l, m = scan.m, n = n, known = cur.n,
         names = names, rows = rows,
         at = Professions.NowEpoch(),         -- assigned below; resolved at call time
-        ds = Dataset.Version(), build = Professions.ClientBuild(),
+        ds = Dataset.Version(), sh = Dataset.SetHash(),
+        build = Professions.ClientBuild(),
     }
 end
 
@@ -2523,12 +2858,14 @@ function Professions.HarvestStamps(create)
     return S and S.ProfessionsHarvestStamps and S.ProfessionsHarvestStamps(create) or nil
 end
 
--- Is this profession's harvest already complete for THIS dataset?
+-- Is this profession's harvest already complete for THIS dataset? Keyed on
+-- the recipe SET, not the whole-content stamp: reagents are per-teaching-spell
+-- facts, so a metadata-only bump invalidates none of them (Layer 1).
 function Professions.HarvestStamped(profKey)
     local stamps = Professions.HarvestStamps(false)
     local rec = stamps and stamps[profKey]
     if type(rec) ~= "table" then return false end
-    return rec.ds == Dataset.Version()
+    return Professions.SameRecipeSet(rec.ds, rec.sh)
 end
 
 function Professions.ClearHarvestStamp(profKey)
@@ -2561,7 +2898,8 @@ local function finishHarvest(job)
     if job.allComplete then
         local stamps = Professions.HarvestStamps(true)
         if stamps then
-            stamps[job.prof] = { ds = Dataset.Version(), at = Professions.NowEpoch() }
+            stamps[job.prof] = { ds = Dataset.Version(), sh = Dataset.SetHash(),
+                                 at = Professions.NowEpoch() }
         end
         Professions._harvested = Professions._harvested or {}
         Professions._harvested[job.prof] = true
@@ -2647,6 +2985,23 @@ function Professions.SeedFromStore()
     local e = S.ProfessionsGet(Professions.SelfKey())
     local d = e and e.data
     if type(d) ~= "table" then return false end
+    -- COORDINATE HONESTY (feat/dataset-migration). The stored payload may have
+    -- been written against another dataset build, and BuildPayload stamps
+    -- whatever it seeds with the CURRENT version — so seeding foreign-ordinal
+    -- bitmaps verbatim would REPUBLISH them under our stamp: a wrong decode
+    -- sent to every peer, the worst form of the lie. Rescue or translate when
+    -- the record's recipe set can be named; otherwise seed only the
+    -- coordinate-free facts and let the next window scan rebuild the bitmap.
+    local mp, _, verdict = Professions.MigratePayload(d)
+    if verdict == "current" or verdict == "rescued" or verdict == "migrated" then
+        d = mp
+    else
+        local stripped = { p = {}, c = d.c }
+        for key, rec in pairs(type(d.p) == "table" and d.p or {}) do
+            stripped.p[key] = { l = rec.l, m = rec.m, t = rec.t, s = rec.s }
+        end
+        d = stripped
+    end
     local L = live()
     if type(d.p) == "table" then
         for key, rec in pairs(d.p) do
@@ -2717,6 +3072,7 @@ function Professions.ApplyScan(scan, now)
     local bits, known, unknown = Professions.EncodeKnown(scan.profKey, scan.ids)
     if bits == nil then return false end
     cur.k, cur.n, cur.u = bits, known, unknown
+    cur.cv = nil          -- a complete window scan covers the ENTIRE current set
     cur.a = tonumber(now) or 0
     if scan.l then cur.l = scan.l end
     if scan.m then cur.m = scan.m end
@@ -2765,7 +3121,8 @@ function Professions.BuildPayload()
     local p = {}
     for key, rec in pairs(L.p) do
         local out = { l = rec.l, m = rec.m, t = rec.t, k = rec.k, n = rec.n,
-                      u = (rec.u and rec.u > 0) and rec.u or nil, a = rec.a }
+                      u = (rec.u and rec.u > 0) and rec.u or nil, a = rec.a,
+                      cv = rec.cv }
         if rec.s and #rec.s > 0 then
             local s = {}
             for i = 1, #rec.s do s[i] = rec.s[i] end
@@ -2784,6 +3141,7 @@ function Professions.BuildPayload()
     return {
         v = PAYLOAD_VERSION,
         ds = Dataset.Version(),
+        sh = Dataset.SetHash(),      -- the coordinate system's IDENTITY (additive)
         ts = (ns.Store and ns.Store.Now and ns.Store.Now()) or (time and time()) or 0,
         p = p,
         c = c,
@@ -2800,7 +3158,8 @@ function Professions.PayloadSignature(payload)
     local keys = {}
     for key in pairs(payload.p or {}) do keys[#keys + 1] = key end
     table.sort(keys)
-    local out = { "v=" .. tostring(payload.v or 0), "ds=" .. tostring(payload.ds or "") }
+    local out = { "v=" .. tostring(payload.v or 0), "ds=" .. tostring(payload.ds or ""),
+                  "sh=" .. tostring(payload.sh or "") }
     for i = 1, #keys do
         local r = payload.p[keys[i]]
         local specs = ""
@@ -2813,6 +3172,7 @@ function Professions.PayloadSignature(payload)
         out[#out + 1] = table.concat({
             keys[i], tostring(r.l or ""), tostring(r.m or ""), tostring(r.t or ""),
             specs, tostring(r.k or ""), tostring(r.n or ""), tostring(r.u or ""),
+            tostring(r.cv or ""),
         }, ":")
     end
     local ckeys = {}
@@ -2875,6 +3235,15 @@ local function onRemoteOwner(ownerKey, data)
     local S = ns.Store
     if not (S and S.ProfessionsPut) then return end
     if type(ownerKey) ~= "string" or ownerKey == "" or type(data) ~= "table" then return end
+    -- RECEIVE-TIME MIGRATION (feat/dataset-migration). A payload from a peer on
+    -- another dataset build is rescued (identical recipe set) or translated
+    -- (shipped migration) into current coordinates BEFORE projection; an
+    -- unknown coordinate system is stored untouched and every read seam
+    -- refuses it exactly as before — never a wrong decode in either case. The
+    -- sync store's cached blob (the relay bytes) is not what we write here:
+    -- MigratePayload copies, it never mutates its input.
+    local mp, changed = Professions.MigratePayload(data)
+    if changed then data = mp end
     local e = S.SyncNSGet and S.SyncNSGet(NS_KEY, ownerKey)
     local rev = (e and tonumber(e.rev)) or 0
     local at  = (e and tonumber(e.updatedAt)) or (time and time()) or 0
@@ -3719,6 +4088,11 @@ function Professions.Activate()
     end
 
     Dataset.LoadCore()
+    -- Translate every stored record written under another dataset build before
+    -- anything reads or seeds from them (feat/dataset-migration). Lazy read
+    -- seams would cope anyway; the sweep persists the translation so the store
+    -- converges once per bump instead of re-deriving per read.
+    Professions.MigrateStoredOwners()
     Professions.SeedFromStore()
     Professions.RegisterNamespace()
 
@@ -6949,11 +7323,282 @@ local function testDelegateLanes(fails)
     if not okAll then fails[#fails + 1] = "error in namespace round-trip: " .. tostring(err) end
 end
 
+----------------------------------------------------------------------
+-- DATASET MIGRATION  (feat/dataset-migration)
+--
+-- THE OWNER'S EXACT INCIDENT as the red control: 2026-08-10, the spec-tree
+-- addition moved the stamp p1-f84a5fa0 -> p1-4b17878e without touching one
+-- recipe, and every character's record went "not checked" — a full re-scan
+-- tour of the alts, twice in one day. The old whole-stamp gate is asserted
+-- STILL DISCARDING that record (it must — old peers run it forever); the
+-- set-hash layer is asserted rescuing the very same bytes.
+----------------------------------------------------------------------
+
+local function testDatasetMigration(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    Dataset.LoadCore()
+    Dataset.LoadCompat()
+    local S = ns.Store
+    local INCIDENT_STAMP = "p1-f84a5fa0"
+
+    -- The shipped compat facts: a set hash, and the incident pair recorded.
+    ck(type(Dataset.SetHash()) == "string" and Dataset.SetHash():match("^s1%-%x+$") ~= nil,
+       "the dataset ships no recipe-set hash")
+    local stampSet = Dataset.stampSet or {}
+    ck(stampSet[Dataset.Version()] == Dataset.SetHash(),
+       "[stampset] does not name the current stamp's set hash")
+    ck(stampSet[INCIDENT_STAMP] == Dataset.SetHash(),
+       "the incident stamp " .. INCIDENT_STAMP .. " is not recorded as our set - "
+       .. "the identity pair f84a5fa0<->4b17878e went missing")
+
+    ----------------------------------------------------------------
+    -- LEG 1 — the identity bump (set unchanged, stamp changed)
+    ----------------------------------------------------------------
+    local tlIdx = Dataset.profIdx.tailoring
+    local tlList = Dataset.profRecipes[tlIdx]
+    local bits, n = Professions.EncodeKnown("tailoring", { tlList[1], tlList[3] })
+    local incident = { v = 1, ds = INCIDENT_STAMP, ts = 100,
+        p = { tailoring = { l = 200, m = 300, k = bits, n = n, a = 100 } } }
+
+    -- RED: the old gate discards exactly this record (and must keep doing so —
+    -- it is what un-updated peers run against unknown stamps forever).
+    ck(Professions.DecodeKnown("tailoring", bits, INCIDENT_STAMP) == nil,
+       "RED CONTROL BROKE: the whole-stamp gate no longer refuses a foreign stamp - "
+       .. "old peers would decode wrongly")
+
+    -- GREEN: Layer 1 rescues the same bytes with zero migration.
+    local st1, skill1 = Professions.KnownState(incident, "tailoring", tlList[1])
+    ck(st1 == "known" and skill1 == 200,
+       "the incident record's known recipe did not survive the metadata-only bump")
+    ck((Professions.KnownState(incident, "tailoring", tlList[2])) == "missing",
+       "the incident record's proven-missing recipe did not stay missing")
+    local set1, state1, cov1 = Professions.KnownSetFor(incident, "tailoring")
+    ck(state1 == "scanned" and set1 and set1[tlList[1]] and set1[tlList[3]] and cov1 == nil,
+       "KnownSetFor did not rescue the incident record verbatim (full coverage)")
+    local mp1, ch1, verdict1 = Professions.MigratePayload(incident)
+    ck(verdict1 == "rescued" and ch1 == true
+       and mp1.ds == Dataset.Version() and mp1.sh == Dataset.SetHash()
+       and mp1.p.tailoring.k == bits and mp1.p.tailoring.n == n and mp1.p.tailoring.cv == nil,
+       "MigratePayload did not rescue the incident record (bitmap must be verbatim)")
+    ck(incident.ds == INCIDENT_STAMP and incident.sh == nil,
+       "MigratePayload MUTATED its input - the sync store's relay bytes are not safe")
+
+    -- An unknown coordinate system still refuses - never a wrong decode.
+    local foreign = { v = 1, ds = "p1-00000000", ts = 100,
+        p = { tailoring = { l = 5, m = 300, k = bits, n = n, a = 100 } } }
+    ck((Professions.KnownState(foreign, "tailoring", tlList[1])) == "unknown",
+       "an unknown stamp decoded instead of refusing")
+    local _, chF, verdictF = Professions.MigratePayload(foreign)
+    ck(verdictF == "unknown" and chF == false,
+       "an unknown coordinate system was 'migrated'")
+
+    ----------------------------------------------------------------
+    -- LEG 2 — a genuine set change (simulated migration injected)
+    --
+    -- Old set: today's tailoring minus current ordinal 5 (so ordinal 5 is an
+    -- ADDITION the old scan never saw) plus one phantom recipe at the end
+    -- (REMOVED today). Survivors must keep their truth by spell id, the
+    -- addition must read UNSCANNED everywhere, the phantom must drop silently.
+    ----------------------------------------------------------------
+    local nNew = #tlList
+    local nOld = nNew
+    local simMap = {}
+    do
+        local newOrd = 0
+        for o = 1, nOld - 1 do
+            newOrd = newOrd + 1
+            if newOrd == 5 then newOrd = newOrd + 1 end
+            simMap[o] = newOrd
+        end
+        simMap[nOld] = 0                          -- the removed phantom
+    end
+    local SIM_SH = "s1-simold"
+    Dataset.migrations[SIM_SH] = { [tlIdx] = { n = nOld, map = simMap } }
+
+    -- Old-coordinate record: knows old ordinals 1, 3 and the phantom.
+    local oldBits = Professions.EncodeBits({ [1] = true, [3] = true, [nOld] = true }, nOld)
+    local sim = { v = 1, ds = "p1-simstamp", sh = SIM_SH, ts = 100,
+        p = { tailoring = { l = 150, m = 300, k = oldBits, n = 3, a = 100 } } }
+
+    local mp2, ch2, verdict2 = Professions.MigratePayload(sim)
+    ck(verdict2 == "migrated" and ch2 == true and mp2.ds == Dataset.Version(),
+       "a genuine set change with a shipped migration was not translated")
+    ck(mp2.p.tailoring.n == 2,
+       "survivor count wrong after translation: the removed phantom must drop silently "
+       .. "(got " .. tostring(mp2.p.tailoring.n) .. ")")
+    ck(type(mp2.p.tailoring.cv) == "string",
+       "a migrated record with an addition carries no coverage bitmap")
+    do
+        local cset, ccount = Professions.DecodeBits(mp2.p.tailoring.cv or "", nNew)
+        ck(cset ~= nil and ccount == nNew - 1 and not cset[5],
+           "the coverage bitmap does not name exactly the old set (all but ordinal 5)")
+    end
+
+    -- Survivors keep their truth by spell id; the addition is UNSCANNED.
+    ck((Professions.KnownState(sim, "tailoring", tlList[1])) == "known",
+       "a surviving known recipe lost its truth in translation")
+    ck((Professions.KnownState(sim, "tailoring", tlList[2])) == "missing",
+       "a surviving proven-missing recipe lost its truth in translation")
+    ck((Professions.KnownState(sim, "tailoring", tlList[6])) == "missing",
+       "a shifted survivor (old ordinal 5 -> new ordinal 6) misclassified")
+    ck((Professions.KnownState(sim, "tailoring", tlList[5])) == "unknown",
+       "HONESTY BROKE: a recipe the record's scan never saw reads 'missing' - "
+       .. "the record predates it and must read unscanned")
+    local set2, state2, cov2 = Professions.KnownSetFor(sim, "tailoring")
+    ck(state2 == "scanned" and set2 and set2[tlList[1]] and not set2[tlList[5]],
+       "KnownSetFor mis-decoded the migrated record")
+    ck(type(cov2) == "table" and cov2[tlList[1]] == true and cov2[tlList[5]] == nil,
+       "KnownSetFor's coverage does not exclude the addition")
+
+    -- RED: strip the coverage and the addition reads "missing" - the exact lie
+    -- the layer exists to prevent (proves the coverage is load-bearing).
+    do
+        local lie = Professions.CopyPayload(mp2)
+        lie.p.tailoring.cv = nil
+        ck((Professions.KnownState(lie, "tailoring", tlList[5])) == "missing",
+           "RED CONTROL BROKE: without coverage the addition should read missing")
+    end
+
+    -- Determinism (class 8): the same translation twice is the same bytes.
+    do
+        local a1 = Professions.TranslateBits(oldBits, Dataset.migrations[SIM_SH][tlIdx], nNew)
+        local a2 = Professions.TranslateBits(oldBits, Dataset.migrations[SIM_SH][tlIdx], nNew)
+        ck(a1 == a2 and a1 == mp2.p.tailoring.k, "translation is not deterministic")
+    end
+
+    ----------------------------------------------------------------
+    -- LEG 3 — wire-additive compatibility, both directions
+    ----------------------------------------------------------------
+    -- A frozen transcript of the PRE-MIGRATION reader (what un-updated peers
+    -- run): gates on the whole stamp, ignores sh/cv entirely.
+    local function oldReaderState(payload, profKey, spellID)
+        if type(payload) ~= "table" then return "unknown" end
+        local p = payload.p and payload.p[profKey]
+        if not p then return "unknown" end
+        if p.k == nil or p.a == nil then return "unknown" end
+        local ids = Professions.DecodeKnown(profKey, p.k, payload.ds)
+        if not ids then return "unknown" end
+        for i = 1, #ids do if ids[i] == spellID then return "known" end end
+        return "missing"
+    end
+    -- New payload, same dataset build: the old reader decodes it correctly -
+    -- sh and cv are invisible to it and change nothing it relies on.
+    ck(oldReaderState(mp1, "tailoring", tlList[1]) == "known",
+       "an old reader mis-handles a new payload from its own build")
+    -- New payload from a FUTURE build: the old reader refuses (renders
+    -- unscanned), never decodes wrongly.
+    local future = Professions.CopyPayload(mp1)
+    future.ds, future.sh = "p1-future0", Dataset.SetHash()
+    ck(oldReaderState(future, "tailoring", tlList[1]) == "unknown",
+       "an old reader decoded a foreign-build payload instead of refusing")
+    -- ...while the NEW reader rescues that same future payload through its sh.
+    ck((Professions.KnownState(future, "tailoring", tlList[1])) == "known",
+       "the new reader did not rescue a future same-set payload through sh")
+
+    ----------------------------------------------------------------
+    -- LEG 4 — mesh receive: migrate on projection, relay bytes untouched
+    ----------------------------------------------------------------
+    if S and S.ProfessionsGetData and S.ProfessionsDrop and Professions._onRemoteFn then
+        Professions._onRemoteFn("__mig-peer", incident)
+        local got = S.ProfessionsGetData("__mig-peer")
+        ck(type(got) == "table" and got.ds == Dataset.Version()
+           and got.sh == Dataset.SetHash() and got.p.tailoring.k == bits,
+           "a rescueable peer payload was not migrated on receive")
+        ck(incident.ds == INCIDENT_STAMP,
+           "receive-time migration mutated the inbound payload table")
+        Professions._onRemoteFn("__mig-junk", foreign)
+        local got2 = S.ProfessionsGetData("__mig-junk")
+        ck(type(got2) == "table" and got2.ds == "p1-00000000",
+           "an unknown coordinate system was rewritten on receive instead of stored untouched")
+        ck((Professions.KnownState(got2, "tailoring", tlList[1])) == "unknown",
+           "the stored unknown-stamp record decodes - the refuse behavior was lost")
+        S.ProfessionsDrop("__mig-peer")
+        S.ProfessionsDrop("__mig-junk")
+    end
+
+    ----------------------------------------------------------------
+    -- LEG 5 — SeedFromStore: rescue seeds, unknown strips (republish honesty)
+    ----------------------------------------------------------------
+    local selfKey = Professions.SelfKey()
+    local area = S and S.ProfessionsArea and S.ProfessionsArea(true)
+    if area and selfKey ~= "" then
+        local savedLive = Professions._live
+        local savedEntry = area.owners[selfKey]
+        area.owners[selfKey] = { rev = 1, updatedAt = 1, data = incident }
+        Professions._live = nil
+        Professions.SeedFromStore()
+        local L = Professions.Live()
+        ck(L.p.tailoring and L.p.tailoring.k == bits and L.p.tailoring.l == 200,
+           "a rescueable stored self-record was not seeded")
+        area.owners[selfKey] = { rev = 1, updatedAt = 1, data = foreign }
+        Professions._live = nil
+        Professions.SeedFromStore()
+        L = Professions.Live()
+        ck(L.p.tailoring and L.p.tailoring.k == nil and L.p.tailoring.l == 5,
+           "an unnameable bitmap was seeded into the live record - BuildPayload "
+           .. "would republish it under OUR stamp, a wrong decode sent to every peer")
+        area.owners[selfKey] = savedEntry
+        Professions._live = savedLive
+    end
+
+    ----------------------------------------------------------------
+    -- LEG 6 — the settled layer: incident stamp stays settled, unknown falls
+    ----------------------------------------------------------------
+    local settledArea = S and S.ProfessionsSettled and S.ProfessionsSettled(true)
+    if settledArea and selfKey ~= "" then
+        local savedMine = settledArea[selfKey]
+        local savedSettled = Professions._settled
+        local rec = { prof = "tailoring", surface = "tradeskill", line = "Tailoring",
+            l = 200, m = 300, n = 3, known = 2, names = { "A", "B", "C" },
+            rows = { [2] = tlList[1], [3] = tlList[2] }, at = 1,
+            ds = INCIDENT_STAMP, build = Professions.ClientBuild() }
+        settledArea[selfKey] = { tailoring = rec }
+        Professions._settled = nil
+        ck(Professions.SettledGet("tailoring") ~= nil,
+           "a settled record from the incident stamp was discarded - "
+           .. "that IS the re-scan tour, again")
+        Professions._settled = nil
+        rec.ds = "p1-00000000"
+        ck(Professions.SettledGet("tailoring") == nil,
+           "a settled record from an unknown stamp was honored")
+        settledArea[selfKey] = savedMine
+        Professions._settled = savedSettled
+    end
+
+    ----------------------------------------------------------------
+    -- LEG 7 — the publish path stamps both coordinates, cv rides through
+    ----------------------------------------------------------------
+    do
+        local savedLive = Professions._live
+        Professions._live = { p = { tailoring = { l = 150, m = 300, k = mp2.p.tailoring.k,
+                                                  n = 2, a = 100, cv = mp2.p.tailoring.cv } },
+                              c = {} }
+        if Professions.IsEnabled() then
+            local pl = Professions.BuildPayload()
+            ck(type(pl) == "table" and pl.ds == Dataset.Version() and pl.sh == Dataset.SetHash(),
+               "BuildPayload does not stamp both coordinates")
+            ck(pl and pl.p.tailoring.cv == mp2.p.tailoring.cv,
+               "a migrated record's coverage was dropped on publish - peers would "
+               .. "read the addition as missing")
+            local withoutCv = Professions.CopyPayload(pl)
+            withoutCv.p.tailoring.cv = nil
+            ck(Professions.PayloadSignature(pl) ~= Professions.PayloadSignature(withoutCv),
+               "the delta detector is blind to coverage")
+        end
+        Professions._live = savedLive
+    end
+
+    Dataset.migrations[SIM_SH] = nil
+end
+
 function Professions.RunSelfTests(verbose)
     local suites = {
         { name = "dataset integrity (census + referential + the fixed game facts)",
           fn = testDatasetIntegrity },
         { name = "wire encoding round-trip + payload budget", fn = testEncodingRoundTrip },
+        { name = "dataset migration (set-hash validity + ordinal translation, "
+              .. "the 2026-08-10 incident as red control)",
+          fn = testDatasetMigration },
         { name = "capture honesty gates (class 4/6/7: cold, partial, polarity, cooldown proof)",
           fn = testCaptureHonesty },
         { name = "panel-witnessed presence (the Orn herbalism defect, with the red control)",
