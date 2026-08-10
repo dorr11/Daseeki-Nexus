@@ -136,6 +136,11 @@ local L = {
     PANEL_PAD   = 10,   -- panel edge -> its content
     TOOLBAR_H   = 30,   -- the who-can-craft band at the top of the tab
     HEAD_H      = 18,   -- column-header band inside the grid panel
+    CHIP_H      = 44,   -- the filter chip bar at the top of the grid panel —
+                        -- the SAME 44 the characters view's chip bar wears
+                        -- (owner, 2026-08-10: "add these same filters"), so the
+                        -- two tabs share one rhythm. Costs the grid one 32px
+                        -- row and change; the self-test pins both facts.
 
     -- The owner's rework splits: the grid pane takes GRID_FRACTION of the
     -- body's width (his boxes said "~55-60%"; 60 is the clean edge of that),
@@ -165,10 +170,24 @@ local L = {
 
     LIST_ROW_H  = 20,   -- recipe / cooldown / search rows
     FILTER_H    = 24,   -- one filter row in the detail pane (there are two)
-    INFO_H      = 44,   -- the selected-recipe info band: name + acquisition.
-                        -- (Was DETAIL_H = 132 when a MATERIALS block lived here;
-                        -- the owner retired that block, 2026-08-10, and the
-                        -- freed height belongs to the recipe LIST above.)
+
+    -- The acquisition text's line budget. One line stopped fitting the moment
+    -- the acquisition phrases grew their zone suffixes ("Sold by Fradd
+    -- Swiftgear \226\128\148 Gnomeregan area" style, 2026-08-10) — the owner's
+    -- screenshot showed the line truncating — so the band wears TWO lines and
+    -- text that still exceeds them ellipsizes (native FontString behavior,
+    -- no scrolling). ProfUI.AcqTextHeight() is the only reader of the pair.
+    ACQ_LINES   = 2,    -- how many lines the acquisition FontString may wear
+    ACQ_LINE_H  = 14,   -- one acquisition line (the small role) incl. its gap
+
+    INFO_H      = 58,   -- the selected-recipe info band: name + acquisition,
+                        -- the acquisition wearing its ACQ_LINES lines: the old
+                        -- one-line band (44) grown by exactly one ACQ_LINE_H,
+                        -- which is precisely the height the recipe LIST above
+                        -- yields back. (Was DETAIL_H = 132 when a MATERIALS
+                        -- block lived here; the owner retired that block,
+                        -- 2026-08-10, and the freed height belongs to the
+                        -- recipe LIST above.)
     SCROLL_STEP = 40,
 }
 ProfUI.LAYOUT = L
@@ -246,9 +265,29 @@ end
 -- plus its breathing room. The list owns everything between the filter rows and
 -- this inset — retiring the materials block (info band 132 -> INFO_H) is what
 -- bought the list its extra rows, and the self-test pins that the inset never
--- quietly grows back.
+-- quietly grows back. The two-line acquisition text (2026-08-10) took exactly
+-- one ACQ_LINE_H of that gain back, and the self-test pins that too.
 function ProfUI.RecipeListBottomInset()
     return L.INFO_H + L.PANEL_PAD + 4
+end
+
+-- PURE. The acquisition FontString's fixed height: its whole ACQ_LINES budget.
+-- The view sets this as the FontString's real height (TOP-justified, wrapping),
+-- so a wrapped second line can never spill past the info band, and the
+-- self-test reads the SAME number — the view and the pin cannot drift.
+function ProfUI.AcqTextHeight()
+    return L.ACQ_LINES * L.ACQ_LINE_H
+end
+
+-- PURE. The grid pane's vertical furniture, top to bottom: the chip bar
+-- (CHIP_H, the filter row), the column-header band under it, the character
+-- rows under that. Two readers so the view and the self-test share one
+-- arithmetic — the chip bar's cost to the list is these numbers, nowhere else.
+function ProfUI.GridHeaderTopInset()
+    return L.CHIP_H + L.PANEL_PAD
+end
+function ProfUI.GridListTopInset()
+    return L.CHIP_H + L.PANEL_PAD + L.HEAD_H + 2
 end
 
 -- PURE. The detail pane's profession-tab strip: n tabs in availW. Tabs share
@@ -881,6 +920,131 @@ function ProfUI.GridRows(entries, lookup, nowE)
         out[#out + 1] = ProfUI.GridRow(e, payload, nowE)
     end
     return out
+end
+
+----------------------------------------------------------------------
+-- THE GRID FILTER CHIPS  (PURE — the owner's "same filters, minus summoners",
+-- 2026-08-10)
+--
+-- The characters view's chip trio (60s | Online | Summoners) plus the faction
+-- A|H pair, brought to the professions grid with the SUMMONERS chip deliberately
+-- absent: Summoners exists to find the low-level warlocks you summon WITH,
+-- which is a world-buff-roster question, not a professions one. The faction
+-- pair needs no model here at all — it is the SAME global Dashboard faction
+-- switch the cards use (ProfUI.Roster() already gathers by it), re-surfaced as
+-- chips on this tab.
+--
+-- SEMANTICS (each one deliberate):
+--   * The chips filter THE GRID ROWS ONLY. The cooldown pane keeps reading the
+--     whole roster — a hidden-but-ready alt still matters, which is the pane's
+--     reason to exist — matching the cards' precedent, where the filter scopes
+--     the card list and no sibling panel. The who-can-craft search is likewise
+--     untouched (it answers about the account, not about the visible rows).
+--   * FILTERED IS NOT DESELECTED. A selected character the chip hides stays
+--     selected — the detail pane says so and waits — and re-admitting them
+--     (clearing the chip, or their coming online) restores the detail pane
+--     without a click. Auto-selecting someone else would silently answer a
+--     question about the wrong character.
+--   * The transition is the cards' exclusive toggle: zero-or-one chip active,
+--     clicking the active chip clears it, none active means everyone shows.
+--
+-- Where ns.Cards is loaded (always, in the real client and the harness) the
+-- predicates DELEGATE to Cards.FilterMatch/NextFilter, so the two tabs cannot
+-- drift; the local fallback exists for a headless load order without cards and
+-- restates the same two rules. The self-test pins delegate == fallback.
+----------------------------------------------------------------------
+
+ProfUI.GRID_FILTER_DEFS = {
+    { key = "60s",    label = "60s",    tip = "Level 60 characters." },
+    { key = "online", label = "Online", tip = "Currently online." },
+    -- NO summoners entry, per the owner's "minus summoners".
+}
+
+-- PURE. filter key -> its chip label (nil for an unknown key).
+function ProfUI.GridFilterLabel(filter)
+    for _, def in ipairs(ProfUI.GRID_FILTER_DEFS) do
+        if def.key == filter then return def.label end
+    end
+    return nil
+end
+
+-- PURE. Heal a persisted value: only a key with a real chip may come back from
+-- SavedVariables ("" is the none-sentinel, and a key whose chip is gone — or
+-- was never offered here, like "summoners" — must not filter invisibly).
+function ProfUI.ValidGridFilter(v)
+    for _, def in ipairs(ProfUI.GRID_FILTER_DEFS) do
+        if def.key == v then return v end
+    end
+    return nil
+end
+
+-- PURE. Does `entry` pass the (single, exclusive) active filter?
+function ProfUI.GridFilterMatch(entry, filter)
+    if not filter then return true end
+    local Cards = ns.Cards
+    if Cards and Cards.FilterMatch then
+        return Cards.FilterMatch(entry, filter) and true or false
+    end
+    if filter == "online" then return (entry and entry.online) and true or false end
+    if filter == "60s" then
+        return ((entry and entry.rec and entry.rec.level) or 0) >= 60
+    end
+    return true
+end
+
+-- PURE. The visible grid roster: `entries` arrive already in card order
+-- (ProfUI.Roster sorts), and filtering preserves that order.
+function ProfUI.FilterEntries(entries, filter)
+    local out = {}
+    for i = 1, #(entries or {}) do
+        if ProfUI.GridFilterMatch(entries[i], filter) then out[#out + 1] = entries[i] end
+    end
+    return out
+end
+
+-- PURE. The cards' exclusive-toggle transition, restated (and pinned equal to
+-- Cards.NextFilter): clicking the ACTIVE chip clears (nil = everyone), clicking
+-- another selects it exclusively.
+function ProfUI.NextGridFilter(current, clicked)
+    if current == clicked then return nil end
+    return clicked
+end
+
+-- PURE. TRUE only when the selected owner IS in the roster and the active chip
+-- hides them — the one case where the detail pane must say "hidden, kept"
+-- instead of rendering. An owner absent from the roster altogether (faction
+-- switch, deleted record) is NOT this case; those keep their existing empty
+-- states.
+function ProfUI.SelectionHiddenByFilter(entries, filter, owner)
+    if not (owner and filter) then return false end
+    for i = 1, #(entries or {}) do
+        local e = entries[i]
+        if e and e.nameRealm == owner then
+            return not ProfUI.GridFilterMatch(e, filter)
+        end
+    end
+    return false
+end
+
+-- PURE. The detail pane's line for a hidden-but-kept selection. nil when no
+-- chip is active (there is nothing to explain).
+function ProfUI.HiddenSelectionHint(shortName, filter)
+    if not filter then return nil end
+    local label = ProfUI.GridFilterLabel(filter) or tostring(filter)
+    return tostring(shortName or "?") .. " is hidden by the " .. label
+        .. " filter \226\128\148 selection kept; clear the filter to see them again."
+end
+
+-- PURE. The grid's empty-state line: with a chip active the ABSENCE has a
+-- cause, and the hint names it (and the way out) instead of claiming nothing
+-- was ever recorded.
+function ProfUI.GridEmptyText(filter)
+    if not filter then
+        return "No professions recorded yet \226\128\148 open a profession window on any character."
+    end
+    local label = ProfUI.GridFilterLabel(filter) or tostring(filter)
+    return "No characters match the " .. label
+        .. " filter \226\128\148 click it again to show everyone."
 end
 
 ----------------------------------------------------------------------
@@ -2295,6 +2459,125 @@ local function nameInk(fs, nameRealm, classTag, extra)
 end
 
 ----------------------------------------------------------------------
+-- THE GRID CHIP BAR's widgets — the characters view's segmented idiom,
+-- restated here because ui_cards.lua's factories are file-locals (the visual
+-- contract is shared; the code deliberately lives with its pane). Same shape,
+-- same inks: one housing, touching segments with 1px dividers, active = accent
+-- fill + contrast label; the faction pair is crest-only, active = faction fill.
+----------------------------------------------------------------------
+local CHIP_SEG_H = 28   -- the cards' segment height, inside the 44px bar
+
+local function makeGridFilterSegmented(parent, onClick)
+    local housing = CreateFrame("Frame", nil, parent, "BackdropTemplate")
+    housing:SetHeight(CHIP_SEG_H)
+    UI.Skin(housing, function(self)
+        self:SetBackdrop(UI.FLAT_BACKDROP)
+        self:SetBackdropColor(0, 0, 0, 0)
+        self:SetBackdropBorderColor(UI.Color("borderLite"))
+    end)
+    housing._segs = {}
+    local prevSeg
+    for i, def in ipairs(ProfUI.GRID_FILTER_DEFS) do
+        local seg = CreateFrame("Button", nil, housing, "BackdropTemplate")
+        seg:SetHeight(CHIP_SEG_H)
+        seg._key = def.key
+        -- The cards' display rule: "60s" stays lowercase, the rest uppercase.
+        local disp = (def.key == "60s") and "60s" or def.label:upper()
+        local segLbl = fstr(seg, "microLabel", "CENTER")
+        segLbl:SetPoint("CENTER", seg, "CENTER", 0, 0)
+        segLbl:SetText(disp)
+        Dashboard.SizedFont(segLbl, "microLabel", 1, "OUTLINE")
+        seg._lbl = segLbl
+        seg:SetWidth((segLbl:GetStringWidth() or 30) + 20)
+        if prevSeg then seg:SetPoint("LEFT", prevSeg, "RIGHT", 0, 0)
+        else seg:SetPoint("LEFT", housing, "LEFT", 0, 0) end
+        if i > 1 then
+            local div = housing:CreateTexture(nil, "OVERLAY")
+            div:SetSize(1, CHIP_SEG_H - 8)
+            div:SetPoint("RIGHT", seg, "LEFT", 0, 0)
+            UI.Skin(div, function(self) self:SetColorTexture(UI.Color("borderLite")) end)
+        end
+        seg:SetScript("OnEnter", function(self)
+            if not def.tip then return end
+            GameTooltip:SetOwner(self, "ANCHOR_BOTTOM")
+            GameTooltip:AddLine(def.tip, UI.Color("muted")); GameTooltip:Show()
+        end)
+        seg:SetScript("OnLeave", function() GameTooltip:Hide() end)
+        seg:SetScript("OnClick", function() onClick(def.key) end)
+        function seg:Apply(active)
+            self:SetBackdrop(UI.FLAT_BACKDROP)
+            if active then
+                local ar, ag, ab = UI.Color("accent")
+                self:SetBackdropColor(ar, ag, ab, 1)
+                self:SetBackdropBorderColor(ar, ag, ab, 1)
+                -- The cards' contrast-by-construction rule for on-accent text.
+                local C = ns.Cards
+                local tok = (C and C.OnAccentTextColor) and C.OnAccentTextColor(ar, ag, ab) or "ground"
+                self._lbl:SetTextColor(UI.Color(tok))
+            else
+                self:SetBackdropColor(0, 0, 0, 0)
+                self:SetBackdropBorderColor(0, 0, 0, 0)
+                self._lbl:SetTextColor(UI.Color("text"))
+            end
+        end
+        housing._segs[#housing._segs + 1] = seg
+        prevSeg = seg
+    end
+    function housing:Apply(filter)
+        local total = 0
+        for _, seg in ipairs(self._segs) do
+            seg:Apply(filter == seg._key); total = total + seg:GetWidth()
+        end
+        self:SetWidth(math.max(1, total))
+    end
+    -- The cards' rounded-cap overlay: the segments draw over the housing, so
+    -- the corner cover+stroke ride a non-interactive cap above them.
+    local cap = CreateFrame("Frame", nil, housing)
+    cap:SetAllPoints(housing)
+    cap:SetFrameLevel(housing:GetFrameLevel() + 10)
+    if Dashboard.RoundCorners then Dashboard.RoundCorners(cap, 5, "raised", "borderLite") end
+    return housing
+end
+
+-- The faction A|H pair: NOT a grid-local filter — the same global faction
+-- switch the cards' chip bar drives. Dashboard.SetFaction repaints the active
+-- tab itself (RefreshActive), so the click needs no local refresh call.
+local function makeGridFactionSeg(parent, faction)
+    local fbtn = CreateFrame("Button", nil, parent, "BackdropTemplate")
+    fbtn:SetSize(30, CHIP_SEG_H)
+    fbtn._faction = faction
+    local crest = fbtn:CreateTexture(nil, "ARTWORK")
+    crest:SetSize(16, 16); crest:SetPoint("CENTER", fbtn, "CENTER", 0, 0)
+    crest:SetTexture(Dashboard.FactionCrest(faction))
+    crest:SetTexCoord(0.02, 0.62, 0.03, 0.63)
+    fbtn._crest = crest
+    fbtn:SetScript("OnClick", function() Dashboard.SetFaction(faction) end)
+    fbtn:SetScript("OnEnter", function(self)
+        GameTooltip:SetOwner(self, "ANCHOR_BOTTOM")
+        GameTooltip:AddLine(faction, UI.Color("muted")); GameTooltip:Show()
+    end)
+    fbtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
+    function fbtn:Apply(active)
+        self:SetBackdrop(UI.FLAT_BACKDROP)
+        if active then
+            local r, g, bl = Dashboard.FactionColor(faction)
+            self:SetBackdropColor(r, g, bl, 0.85); self:SetBackdropBorderColor(r, g, bl, 1)
+            self._crest:SetDesaturated(false); self._crest:SetAlpha(1)
+        else
+            self:SetBackdropColor(0, 0, 0, 0)
+            self:SetBackdropBorderColor(UI.Color("borderLite"))
+            self._crest:SetDesaturated(true); self._crest:SetAlpha(0.55)
+        end
+    end
+    -- Outer corners only, so the touching pair reads as one pill (cards' rule).
+    local only = (faction == "Alliance")
+        and { TOPLEFT = true, BOTTOMLEFT = true }
+        or  { TOPRIGHT = true, BOTTOMRIGHT = true }
+    if Dashboard.RoundCorners then Dashboard.RoundCorners(fbtn, 5, "raised", "borderLite", only) end
+    return fbtn
+end
+
+----------------------------------------------------------------------
 -- THE PANE
 ----------------------------------------------------------------------
 
@@ -2307,6 +2590,8 @@ Dashboard.RegisterTab("professions", function(host)
                                        -- row, its detail tab, and its picked recipe
         query   = "",
         filters = { search = "", source = nil, missingOnly = false, showUnavailable = false },
+        gridFilter = nil,              -- the chip bar's exclusive filter key, or
+                                       -- nil = everyone (restored from st.prof below)
         obj     = {},
         _gridRows = {}, _cdRows = {}, _recRows = {}, _searchRows = {},
         _tabBtns = {},
@@ -2315,11 +2600,17 @@ Dashboard.RegisterTab("professions", function(host)
 
     -- Persisted filter choices + the selection (the cards persist theirs the
     -- same way — st.selectedCharacter — so a /reload lands where you left).
+    -- The GRID CHIP diverges from the cards' trio on purpose: the cards keep
+    -- their filter as session state, but this pane already persists every
+    -- other filter in st.prof, and the owner's directive for these chips is
+    -- persistence — healed through ValidGridFilter so a retired or never-
+    -- offered key (summoners) can never filter invisibly from SavedVariables.
     local st = Dashboard.UIState and Dashboard.UIState() or {}
     st.prof = st.prof or {}
     pane.filters.source          = st.prof.source
     pane.filters.missingOnly     = st.prof.missingOnly and true or false
     pane.filters.showUnavailable = st.prof.showUnavailable and true or false
+    pane.gridFilter              = ProfUI.ValidGridFilter(st.prof.gridFilter)
     if type(st.prof.selOwner) == "string" and st.prof.selOwner ~= "" then
         pane.sel = { owner = st.prof.selOwner, profKey = st.prof.selProf, spell = nil }
     end
@@ -2327,6 +2618,7 @@ Dashboard.RegisterTab("professions", function(host)
         st.prof.source          = pane.filters.source
         st.prof.missingOnly     = pane.filters.missingOnly
         st.prof.showUnavailable = pane.filters.showUnavailable
+        st.prof.gridFilter      = pane.gridFilter or ""   -- "" = none (selOwner's idiom)
         st.prof.selOwner        = pane.sel and pane.sel.owner or ""
         st.prof.selProf         = pane.sel and pane.sel.profKey or nil
     end
@@ -2398,12 +2690,49 @@ Dashboard.RegisterTab("professions", function(host)
     applySplit()
 
     -- ── the grid pane ────────────────────────────────────────────────────────
+    -- THE CHIP BAR (owner, 2026-08-10: "add these same filters (minus
+    -- summoners)"): the characters view's chip-bar shape at the top of the
+    -- grid panel — filter segments left, faction A|H right, hairline rule
+    -- under the band — pushing the header band and the rows down by CHIP_H
+    -- (GridHeaderTopInset / GridListTopInset, the pure readers).
+    local chipbar = CreateFrame("Frame", nil, gridP)
+    chipbar:SetPoint("TOPLEFT", gridP, "TOPLEFT", 1, -1)
+    chipbar:SetPoint("TOPRIGHT", gridP, "TOPRIGHT", -1, -1)
+    chipbar:SetHeight(L.CHIP_H)
+    Dashboard.Tag(chipbar, "prof.chipbar")
+    do
+        -- The cards' hairline rule under the bar, through the same Core guard.
+        local Hairline = ns.CoreAPI
+            and ns:CoreAPI(ns.CORE_KIT_VERSION, "the professions chip bar", UI and UI.Hairline)
+            or nil
+        if Hairline then
+            local chipRule = Hairline(gridP, { token = "borderLite" })
+            chipRule:SetPoint("BOTTOMLEFT", chipbar, "BOTTOMLEFT", 0, 0)
+            chipRule:SetPoint("BOTTOMRIGHT", chipbar, "BOTTOMRIGHT", 0, 0)
+            Dashboard.Tag(chipRule, "prof.chiprule")
+        end
+    end
+    local filterSeg = makeGridFilterSegmented(chipbar, function(key)
+        pane.gridFilter = ProfUI.NextGridFilter(pane.gridFilter, key)
+        persist()
+        pane.obj.Refresh()
+    end)
+    filterSeg:SetPoint("LEFT", chipbar, "LEFT", 6, 0)
+    pane._filterSeg = filterSeg
+    Dashboard.Tag(filterSeg, "prof.chip.filter")
+    local facA = makeGridFactionSeg(chipbar, "Alliance")
+    local facH = makeGridFactionSeg(chipbar, "Horde")
+    facH:SetPoint("RIGHT", chipbar, "RIGHT", -6, 0)
+    facA:SetPoint("RIGHT", facH, "LEFT", 0, 0)   -- touching halves
+    pane._factionSegs = { facA, facH }
+    Dashboard.Tag(facA, "prof.chip.faction")
+
     -- The header band CLIPS and its labels are positioned per render from the
     -- SAME GridColumns the rows use — the header and the cells cannot drift
     -- apart, and neither can leave the pane.
     local gridHead = CreateFrame("Frame", nil, gridP)
-    gridHead:SetPoint("TOPLEFT", gridP, "TOPLEFT", L.PANEL_PAD, -L.PANEL_PAD)
-    gridHead:SetPoint("TOPRIGHT", gridP, "TOPRIGHT", -L.PANEL_PAD, -L.PANEL_PAD)
+    gridHead:SetPoint("TOPLEFT", gridP, "TOPLEFT", L.PANEL_PAD, -ProfUI.GridHeaderTopInset())
+    gridHead:SetPoint("TOPRIGHT", gridP, "TOPRIGHT", -L.PANEL_PAD, -ProfUI.GridHeaderTopInset())
     gridHead:SetHeight(L.HEAD_H)
     gridHead:SetClipsChildren(true)
     local headFS = {}
@@ -2431,13 +2760,15 @@ Dashboard.RegisterTab("professions", function(host)
     end
 
     local gridScroll, gridChild = scroller(gridP, "prof.grid.list")
-    gridScroll:SetPoint("TOPLEFT", gridP, "TOPLEFT", L.PANEL_PAD, -(L.PANEL_PAD + L.HEAD_H + 2))
+    gridScroll:SetPoint("TOPLEFT", gridP, "TOPLEFT", L.PANEL_PAD, -ProfUI.GridListTopInset())
     gridScroll:SetPoint("BOTTOMRIGHT", gridP, "BOTTOMRIGHT", -L.PANEL_PAD, L.PANEL_PAD)
     pane._gridChild = gridChild
 
+    -- Text set per render: with a chip active the emptiness has a CAUSE, and
+    -- GridEmptyText names it instead of claiming nothing was ever recorded.
     local gridEmpty = fstr(gridChild, "muted", "LEFT")
     gridEmpty:SetPoint("TOPLEFT", gridChild, "TOPLEFT", 2, -4)
-    gridEmpty:SetText("No professions recorded yet \226\128\148 open a profession window on any character.")
+    gridEmpty:SetText(ProfUI.GridEmptyText(nil))
     gridEmpty:Hide()
     pane._gridEmpty = gridEmpty
 
@@ -2593,6 +2924,19 @@ Dashboard.RegisterTab("professions", function(host)
     local dSource = fstr(detail, "small", "LEFT")
     dSource:SetPoint("TOPLEFT", dTitle, "BOTTOMLEFT", 0, -3)
     dSource:SetPoint("RIGHT", detail, "RIGHT", -2, 0)
+    -- TWO LINES for the acquisition text (owner, 2026-08-10): the zoned
+    -- phrases ("Sold by Fradd Swiftgear \226\128\148 Gnomeregan area" style)
+    -- outgrew one line. fstr()'s no-wrap default is overridden HERE ONLY: the
+    -- wrap width is the TOPLEFT/RIGHT anchor pair above (the pane's real width,
+    -- never a constant), the height is the fixed ACQ_LINES budget from the pure
+    -- reader, and TOP justification keeps line one on the name's baseline gap
+    -- so the band never crowds the name above or the panel pad below. Where the
+    -- client offers SetMaxLines the overflow ellipsizes natively; without it
+    -- the fixed height is the cap and line three simply clips. No scrolling.
+    dSource:SetWordWrap(true)
+    dSource:SetJustifyV("TOP")
+    dSource:SetHeight(ProfUI.AcqTextHeight())
+    if dSource.SetMaxLines then dSource:SetMaxLines(L.ACQ_LINES) end
     pane._dTitle, pane._dSource = dTitle, dSource
 
     -- ══ THE SEARCH OVERLAY: the who-can-craft results (typing in the toolbar
@@ -2765,6 +3109,7 @@ Dashboard.RegisterTab("professions", function(host)
             end
         end
         gridChild:SetHeight(math.max(y, 1))
+        pane._gridEmpty:SetText(ProfUI.GridEmptyText(pane.gridFilter))
         pane._gridEmpty:SetShown(shown == 0)
     end
 
@@ -2821,8 +3166,26 @@ Dashboard.RegisterTab("professions", function(host)
         detail:SetShown(on)
     end
 
-    local function renderDetail(lookup, nowE, res)
+    local function renderDetail(lookup, nowE, res, allEntries)
         local sel = pane.sel
+
+        -- FILTERED IS NOT DESELECTED (the chip contract): a selected character
+        -- the active chip hides keeps their selection — the pane says so and
+        -- waits. Clearing the chip (or the character coming online / hitting
+        -- 60) restores the detail without a click, because pane.sel and
+        -- st.prof.selOwner were never touched. Only a roster member hidden BY
+        -- THE CHIP lands here; a character absent from the roster altogether
+        -- keeps the existing empty states below.
+        if sel and ProfUI.SelectionHiddenByFilter(allEntries, pane.gridFilter, sel.owner) then
+            for _, b in ipairs(pane._tabBtns) do b:Hide() end
+            setDetailShown(false)
+            dWho:SetText(Dashboard.ShortName(sel.owner))
+            dWho:SetTextColor(UI.Color("muted"))
+            dHint:SetText(ProfUI.HiddenSelectionHint(Dashboard.ShortName(sel.owner), pane.gridFilter))
+            dHint:Show()
+            return
+        end
+
         local payload = sel and lookup(sel.owner) or nil
         local tabs = ProfUI.DetailTabs(payload)
 
@@ -3015,6 +3378,12 @@ Dashboard.RegisterTab("professions", function(host)
         local lookup = payloadLookup()
         pane._entries, pane._lookup = entries, lookup
 
+        -- Chip repaint: at most one filter segment filled (none = everyone),
+        -- and the faction pair mirrors the global Dashboard faction.
+        pane._filterSeg:Apply(pane.gridFilter)
+        local fac = Dashboard.GetFaction and Dashboard.GetFaction() or nil
+        for _, s in ipairs(pane._factionSegs) do s:Apply(s._faction == fac) end
+
         local isSearch = (pane.mode == "search")
         gridP:SetShown(not isSearch)
         detailP:SetShown(not isSearch)
@@ -3024,8 +3393,12 @@ Dashboard.RegisterTab("professions", function(host)
         if isSearch then
             renderSearch(entries, lookup, res)
         else
-            renderGrid(entries, lookup, nowE)
-            renderDetail(lookup, nowE, res)
+            -- The chips scope THE GRID ONLY: the detail pane gets the full
+            -- roster (to tell "hidden by chip" from "gone"), and the cooldown
+            -- pane keeps every character — a hidden-but-ready alt still
+            -- matters, which is that pane's reason to exist.
+            renderGrid(ProfUI.FilterEntries(entries, pane.gridFilter), lookup, nowE)
+            renderDetail(lookup, nowE, res, entries)
             renderCooldowns(entries, lookup, nowE, res)
         end
         if Dashboard.RefreshTabStrip then Dashboard.RefreshTabStrip() end
@@ -3047,7 +3420,8 @@ Dashboard.RegisterTab("professions", function(host)
         if not (entries and lookup) then return pane.obj.Refresh() end
         local nowE = now()
         local res = ProfUI.LiveResolver()
-        renderGrid(entries, lookup, nowE)
+        -- Same scoping as Refresh: chips filter the grid, never the cooldowns.
+        renderGrid(ProfUI.FilterEntries(entries, pane.gridFilter), lookup, nowE)
         renderCooldowns(entries, lookup, nowE, res)
         if Dashboard.RefreshTabStrip then Dashboard.RefreshTabStrip() end
     end
@@ -3893,15 +4267,34 @@ local function testDetailRework(fails)
 
     ------------------------------------------------------------------
     -- THE FREED SPACE: retiring the materials band (132px) shrank the info
-    -- band to content and the recipe list owns the difference.
+    -- band to content and the recipe list owns the difference. The two-line
+    -- acquisition text (2026-08-10) then bought ONE line of it back — the
+    -- band grew by exactly one ACQ_LINE_H over its one-line form (44) — so
+    -- the list's net gain over the materials era is now at least THREE rows
+    -- (it was four when the acquisition still truncated at one line).
     ------------------------------------------------------------------
     ck(ProfUI.RecipeListBottomInset() == L.INFO_H + L.PANEL_PAD + 4,
        "the list's bottom inset drifted off the LAYOUT reader")
     local RETIRED_MATERIALS_BAND = 132
+    local ONE_LINE_INFO_BAND     = 44
     ck(L.INFO_H < RETIRED_MATERIALS_BAND,
        "the info band grew back toward the retired materials height")
-    ck(math.floor((RETIRED_MATERIALS_BAND - L.INFO_H) / L.LIST_ROW_H) >= 4,
-       "the recipe list did not gain at least four rows from the retired band")
+    ck(math.floor((RETIRED_MATERIALS_BAND - L.INFO_H) / L.LIST_ROW_H) >= 3,
+       "the recipe list did not keep at least three rows of the retired band")
+    ck(L.INFO_H == ONE_LINE_INFO_BAND + L.ACQ_LINE_H,
+       "the info band did not grow by exactly one acquisition line over its "
+       .. "one-line form (the list must yield exactly that height, no more)")
+
+    -- The acquisition text's two-line contract: the LAYOUT budget is two
+    -- lines, and the pure reader the VIEW sizes the FontString with returns
+    -- exactly that budget — the only observables the headless sim offers
+    -- (the harness never builds frames), and the ones the view consumes.
+    ck(L.ACQ_LINES == 2,
+       "the acquisition text's line budget is not two lines")
+    ck(ProfUI.AcqTextHeight() == L.ACQ_LINES * L.ACQ_LINE_H,
+       "AcqTextHeight drifted off the ACQ_LINES \195\151 ACQ_LINE_H contract")
+    ck(ProfUI.AcqTextHeight() > L.ACQ_LINE_H,
+       "the acquisition FontString's height holds fewer than two lines")
 
     ------------------------------------------------------------------
     -- ACQUISITION LINES WITH ZONES — fixture first, then the real dataset.
@@ -3984,6 +4377,120 @@ local function testDetailRework(fails)
     end
 end
 
+----------------------------------------------------------------------
+-- Suite: the grid filter chips (owner, 2026-08-10 — "same filters, minus
+-- summoners"). Pure predicates, the cards-parity pins, the selection-survives
+-- contract, the persistence heal, and the chip bar's layout cost.
+----------------------------------------------------------------------
+local function testGridChips(fails)
+    local function ck(cond, msg) if not cond then fails[#fails + 1] = msg end end
+    local L = ProfUI.LAYOUT
+
+    -- Chip roster: exactly 60s + Online, in that order, and NO summoners chip
+    -- (the owner's explicit "minus summoners" — it is a world-buff-roster
+    -- concept with no professions meaning).
+    ck(#ProfUI.GRID_FILTER_DEFS == 2, "the chip roster is not exactly two chips")
+    ck(ProfUI.GRID_FILTER_DEFS[1].key == "60s" and ProfUI.GRID_FILTER_DEFS[2].key == "online",
+       "the chip roster is not 60s then Online")
+    for _, def in ipairs(ProfUI.GRID_FILTER_DEFS) do
+        ck(def.key ~= "summoners", "the summoners chip leaked into the professions tab")
+    end
+
+    -- The predicate matrix over the fixture roster: a 60 online, a 60 offline,
+    -- a 42 offline.
+    local entries = fixtureEntries()
+    ck(#ProfUI.FilterEntries(entries, nil) == 3, "no chip active did not show everyone")
+    local sixties = ProfUI.FilterEntries(entries, "60s")
+    ck(#sixties == 2 and sixties[1].nameRealm == "Aaa-Realm" and sixties[2].nameRealm == "Bbb-Realm",
+       "the 60s chip did not keep exactly the two 60s in roster order")
+    local online = ProfUI.FilterEntries(entries, "online")
+    ck(#online == 1 and online[1].nameRealm == "Aaa-Realm",
+       "the Online chip did not keep exactly the online character")
+    ck(ProfUI.GridFilterMatch(entries[3], "60s") == false, "a 42 passed the 60s chip")
+    ck(ProfUI.GridFilterMatch(entries[2], "online") == false, "an offline 60 passed the Online chip")
+    ck(ProfUI.GridFilterMatch(entries[3], nil) == true, "nil filter rejected a character")
+
+    -- PARITY: the two tabs' predicates and transitions may never drift. The
+    -- harness always loads ui_cards.lua, so the delegate path is the live one;
+    -- this pins delegate == the fallback's own answers AND the transition
+    -- table against Cards.NextFilter.
+    local Cards = ns.Cards
+    ck(Cards and Cards.FilterMatch ~= nil, "ns.Cards.FilterMatch missing under the harness")
+    if Cards and Cards.FilterMatch then
+        for _, e in ipairs(entries) do
+            for _, f in ipairs({ "60s", "online" }) do
+                ck(ProfUI.GridFilterMatch(e, f) == (Cards.FilterMatch(e, f) and true or false),
+                   "chip predicate drifted from the cards' for " .. e.nameRealm .. "/" .. f)
+            end
+        end
+    end
+    ck(ProfUI.NextGridFilter(nil, "60s") == "60s", "click from none did not select")
+    ck(ProfUI.NextGridFilter("60s", "60s") == nil, "click the active chip did not clear")
+    ck(ProfUI.NextGridFilter("60s", "online") == "online", "click another chip did not switch")
+    if Cards and Cards.NextFilter then
+        for _, cur in ipairs({ "60s", "online" }) do
+            for _, clk in ipairs({ "60s", "online" }) do
+                ck(ProfUI.NextGridFilter(cur, clk) == Cards.NextFilter(cur, clk),
+                   "chip transition drifted from Cards.NextFilter (" .. cur .. "->" .. clk .. ")")
+            end
+        end
+        ck(ProfUI.NextGridFilter(nil, "online") == Cards.NextFilter(nil, "online"),
+           "chip transition drifted from Cards.NextFilter (none->online)")
+    end
+
+    -- SELECTION SURVIVES FILTERING: the 42 selected, the 60s chip active —
+    -- hidden (the detail pane's hint case), NOT deselected; clearing the chip
+    -- re-admits them with the selection intact (nothing here ever wrote the
+    -- selection, which is the whole mechanism).
+    ck(ProfUI.SelectionHiddenByFilter(entries, "60s", "Ccc-Realm") == true,
+       "a chip-hidden selection did not read as hidden")
+    ck(ProfUI.SelectionHiddenByFilter(entries, nil, "Ccc-Realm") == false,
+       "no chip active still read the selection as hidden")
+    ck(ProfUI.SelectionHiddenByFilter(entries, "60s", "Aaa-Realm") == false,
+       "a chip-admitted selection read as hidden")
+    ck(ProfUI.SelectionHiddenByFilter(entries, "60s", "Zzz-Realm") == false,
+       "an owner absent from the roster was blamed on the chip (that case keeps "
+       .. "its own empty states)")
+    ck(ProfUI.SelectionHiddenByFilter(entries, "60s", nil) == false,
+       "no selection still read as hidden")
+    local hint = ProfUI.HiddenSelectionHint("Ccc", "60s")
+    ck(type(hint) == "string" and hint:find("Ccc", 1, true) ~= nil
+       and hint:find("60s", 1, true) ~= nil and hint:find("kept", 1, true) ~= nil,
+       "the hidden-selection hint does not name the character, the chip, and the keeping")
+    ck(ProfUI.HiddenSelectionHint("Ccc", nil) == nil,
+       "a hint was invented with no chip active")
+
+    -- ZERO VISIBLE ROWS: the empty line names the active chip and the way out;
+    -- with no chip it keeps the original never-recorded wording.
+    local et = ProfUI.GridEmptyText("online")
+    ck(type(et) == "string" and et:find("Online", 1, true) ~= nil
+       and et:find("again", 1, true) ~= nil,
+       "the filtered empty state does not name the chip and the way out")
+    ck(ProfUI.GridEmptyText(nil):find("No professions recorded yet", 1, true) ~= nil,
+       "the unfiltered empty state lost its original wording")
+
+    -- PERSISTENCE HEAL: only a real chip key survives the round-trip; the ""
+    -- none-sentinel, the never-offered summoners, and garbage all heal to nil.
+    ck(ProfUI.ValidGridFilter("60s") == "60s", "60s did not survive persistence")
+    ck(ProfUI.ValidGridFilter("online") == "online", "online did not survive persistence")
+    ck(ProfUI.ValidGridFilter("") == nil, "the none-sentinel did not heal to nil")
+    ck(ProfUI.ValidGridFilter("summoners") == nil,
+       "a persisted summoners filter survived onto a tab that has no such chip")
+    ck(ProfUI.ValidGridFilter(nil) == nil, "nil did not heal to nil")
+    ck(ProfUI.ValidGridFilter(42) == nil, "a non-string healed to something")
+
+    -- LAYOUT: the chip bar is the cards' 44px band (one shared rhythm), the
+    -- header and list insets flow through the pure readers, and the bar costs
+    -- the grid at most one-and-a-fraction 32px rows.
+    ck(L.CHIP_H == 44, "the chip bar drifted off the cards' 44px band")
+    ck(ProfUI.GridHeaderTopInset() == L.CHIP_H + L.PANEL_PAD,
+       "the grid header inset drifted off the LAYOUT reader")
+    ck(ProfUI.GridListTopInset() == L.CHIP_H + L.PANEL_PAD + L.HEAD_H + 2,
+       "the grid list inset drifted off the LAYOUT reader")
+    ck(L.CHIP_H < 2 * L.ROW_H,
+       "the chip bar costs the grid two or more full rows")
+end
+
 if ns.RegisterSelfTest then
     ns:RegisterSelfTest("professionsui", function(verbose)
         local suites = {
@@ -4008,6 +4515,9 @@ if ns.RegisterSelfTest then
             { name = "detail rework (glyph pins, windowless professions, absent "
                   .. "secondaries, freed list space, zoned acquisitions)",
               fn = testDetailRework },
+            { name = "grid filter chips (60s/Online/faction parity with the cards, "
+                  .. "no summoners, selection survives, persistence heal, chip-bar layout)",
+              fn = testGridChips },
         }
         local allPass = true
         for _, suite in ipairs(suites) do
