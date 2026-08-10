@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- **Professions tab** — Recipes in the detail list now show a real tooltip on hover (the
+  craft tooltip, with teaching-item and dataset-fact fallbacks that never leave a blank),
+  the list wears RECIPE | SKILL | SOURCE column headers, and recipes locked to a different
+  specialisation than yours are no longer counted or shown as "missing" — they're greyed
+  under Show unavailable with the spec named, and the known/total counts now mean
+  "obtainable as your spec".
+
 - **Professions tab** — The grid/detail split is now an even 50/50 (was 60/40): the detail
   and cooldown column gains width, and the character grid re-fits its columns to the
   narrower pane at every window size.
