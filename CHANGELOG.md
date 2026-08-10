@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- **Fixed** — Mesh account list: the Offline status marker rendered as a tofu box because
+  the suite's default font (FiraSansCondensed-Medium) ships no glyph for U+25CB WHITE
+  CIRCLE. Offline now uses the same round dot as You/Online in the existing grey ink, so
+  status reads by color with one shape. Three Help/Setup hints spelling "1–2 digits" and
+  "steps 2–4" with a mistyped double-low-line character (also absent from the font) now use
+  a true en dash. A full audit of every non-ASCII character the addon displays was verified
+  against the font's character map, and a new self-test permanently bans the four
+  codepoints the font lacks from ever reappearing.
+
 - **Professions pane polish.** The specialization marker and the recipe list's "known"
   marker are now glyphs the suite font actually carries (the old diamond and check mark
   rendered as colored boxes), with a self-test that fails if either tofu glyph ever returns.
