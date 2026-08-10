@@ -1,5 +1,34 @@
 # Changelog
 
+## Unreleased
+
+- **Added:** **Nexus has started keeping track of your professions.** This is the first half
+  of the profession tracker — the half that quietly gathers the facts. There is no new tab to
+  look at yet; that arrives next. What happens now is that every time you open a profession
+  window on any character, Nexus writes down what that character can make, how far along the
+  skill is, which specialisation they picked, and when their profession cooldowns come back
+  up — Mooncloth, Cured Rugged Hide, the Salt Shaker, the transmutes — and shares it with your
+  other accounts the same way it already shares gold and bags. It also notes what each recipe
+  costs in materials while the window is open, because that is the only place the game will
+  tell anyone. **To seed a character, open each of its profession windows once.** Gathering
+  professions and skill levels are picked up on their own with nothing to open.
+
+  Two things it deliberately will not do. It will never tell you an alt "knows nothing" just
+  because you have not opened that alt's window yet — an unvisited profession reads as *not
+  yet checked*, which is a different thing, and the coming views will say so in those words.
+  And what goes over the mesh is tiny: your whole recipe list travels as about a hundred
+  characters, at the lowest priority Nexus has, so it can never be the reason a pull timer or
+  a buff warning waited. A cooldown you just used is the one exception — that goes out
+  straight away, because "can I transmute today" is the question the feature exists to answer.
+
+- **Added:** a **Cross-account professions** switch in Nexus settings, ticked by default.
+  Unticking it is a real off: no window watching, no data gathered, no recipe database held in
+  memory, and nothing new written to your saved data. Anything already collected is kept, so
+  ticking it back on picks up where it left off.
+
+- **Added:** `/nexus debug professions` — what the module has captured this session, which
+  characters it holds records for, and the dataset it is working from.
+
 ## 1.1.6 — 2026-08-08
 
 - **Added:** **Rin'wosho repairs your gear again.** Nexus has always been able to auto-repair,

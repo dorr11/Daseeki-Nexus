@@ -10,5 +10,10 @@ ignore:
   - DESCRIPTION.md
   - .github
   - _test_detail.lua
+  # dev/ holds the profession dataset pipeline (the fact source and the two
+  # generators). It is checked in so a regeneration is reproducible from the
+  # repo, and it is a BUILD tool — the client never reads it. Same treatment as
+  # Daseeki-Armory's dev/.
+  - dev
 
 manual-changelog: CHANGELOG.md

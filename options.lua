@@ -798,6 +798,33 @@ local function buildGeneral(flow)
         end
     end)
 
+    -- Professions module (professions.lua). DEFAULT ON, absent key reads ON
+    -- (Professions.IsEnabled owns that rule). Turning it off is the strong kind
+    -- of off the behavioral spec asks for: the event frame is dropped, the
+    -- shipped recipe dataset is un-parsed, and this module's saved area is never
+    -- created. Data already on disk is kept, so re-enabling keeps your alts.
+    -- Reads fall back to the raw key so the row still renders if professions.lua
+    -- somehow failed to load.
+    local r3p = sec:AddRow({ vAlign = "center" })
+    register("general", r3p:Checkbox({
+        label = "Cross-account professions",
+        tooltip = "Track professions, recipes and profession cooldowns for every "
+               .. "character on every account in your mesh. Off makes the module "
+               .. "inert; stored data is kept.",
+        get = function()
+            local P = ns.Professions
+            if P and P.IsEnabled then return P.IsEnabled() end
+            local db = DB()
+            return not db or db.professionsEnabled ~= false
+        end,
+        set = function(v)
+            local P = ns.Professions
+            if P and P.SetEnabled then P.SetEnabled(v and true or false); return end
+            local db = DB()
+            if db then db.professionsEnabled = v and true or false end
+        end,
+    }).Refresh)
+
     -- Mesh auto-friend (friends.lua). DEFAULT ON, and an ABSENT key reads as ON
     -- too, so this box shows ticked on a SavedVariables file written before the
     -- module existed. Turning it off stops future passes ONLY: no friend is ever

@@ -23,6 +23,11 @@ Store.STORAGE_VERSION  = 1     -- bump wipes character data, keeps timers/social
 -- STORAGE_VERSION: the graph is additive suite data, not mesh character data, so
 -- a character-data wipe must not take the cross-account gold with it.
 Store.INVENTORY_SCHEMA = 1
+-- Professions module store schema. Versioned independently for the same reason
+-- as INVENTORY_SCHEMA: the professions graph is additive suite data (owner
+-- records plus an account-wide reagent harvest), not mesh character data, so a
+-- character-data wipe must not take an alt's recipe list with it.
+Store.PROFESSIONS_SCHEMA = 1
 
 -- Aura-slot source codes (the numeric `source` field on each auraStates slot).
 -- LIVE   = captured live from this character's own auras (self, highest trust).
@@ -1229,6 +1234,14 @@ local function defaultSettings()
         -- a SavedVariables file written before this key existed behaves exactly
         -- like a fresh one. ADDITIVE — no settingsVersion bump needed.
         inventoryEnabled  = true,
+        -- Professions module (professions.lua): cross-account recipe, skill and
+        -- profession-cooldown tracking. Default ON, and Professions.IsEnabled
+        -- treats an ABSENT key as ON too, so a SavedVariables file written
+        -- before this key existed behaves exactly like a fresh one. ADDITIVE —
+        -- one boolean, no settingsVersion bump. Off is INERT: no frame, no
+        -- events, no parsed dataset, and this module's saved area is never
+        -- created (data already on disk is kept).
+        professionsEnabled = true,
         -- Cross-account wealth TOOLTIPS (tooltips.lua): the item-count block on an
         -- item tooltip and the gold breakdown on the money frame, for players who
         -- run the default Blizzard bags. Default ON, and Tooltips.IsEnabled treats
@@ -4385,6 +4398,81 @@ end
 
 function Store.InventoryDrop(ownerKey)
     local a = Store.InventoryArea()
+    if a then a.owners[ownerKey] = nil end
+end
+
+----------------------------------------------------------------------
+-- PROFESSIONS AREA  (DaseekiNexusData.professions) — additive, wave P1
+--
+-- Two things live here and they have different lifetimes, which is why they are
+-- siblings rather than one table:
+--
+--   owners[ownerKey] = { rev, updatedAt, data = <the "professions" payload> }
+--       Per CHARACTER ("Name-Realm"), shaped exactly like the namespace store
+--       so projecting one into the other is a copy and not a translation. It is
+--       the union of our own capture and every peer payload the mesh delivered.
+--
+--   reagents[teachingSpellID] = { o = <produced item>, n = <yield>,
+--                                 r = { [reagentItemID] = count } }
+--       ACCOUNT-WIDE, not per character, because a recipe's reagents are a game
+--       fact: identical on every character, every account, every realm. One alt
+--       opening blacksmithing fills it in for every reader on the account. The
+--       recipe catalogue ships with no reagent data at all (there is none to
+--       ship), so this harvest is the only source materials linkage will ever
+--       have — see professions.lua's REAGENTS header.
+--
+-- CREATION IS LAZY ON PURPOSE. The professions module is user-toggleable and
+-- must be inert when off, and "inert" in the behavioral spec includes writing
+-- no saved-variable keys. So nothing here is seeded at login: the area appears
+-- the first time an enabled module actually captures something.
+----------------------------------------------------------------------
+
+function Store.ProfessionsArea(create)
+    local d = Store.data
+    if type(d) ~= "table" then return nil end
+    local a = d.professions
+    if type(a) ~= "table" then
+        if not create then return nil end
+        a = {}
+        d.professions = a
+    end
+    if type(a.owners) ~= "table" then a.owners = {} end
+    if type(a.reagents) ~= "table" then a.reagents = {} end
+    if a.schema == nil then a.schema = Store.PROFESSIONS_SCHEMA end
+    return a
+end
+
+function Store.ProfessionsOwners()
+    local a = Store.ProfessionsArea()
+    return a and a.owners or {}
+end
+
+function Store.ProfessionsGet(ownerKey)
+    local a = Store.ProfessionsArea()
+    return a and a.owners[ownerKey] or nil
+end
+
+function Store.ProfessionsGetData(ownerKey)
+    local e = Store.ProfessionsGet(ownerKey)
+    return e and e.data or nil
+end
+
+function Store.ProfessionsReagents(create)
+    local a = Store.ProfessionsArea(create)
+    return a and a.reagents or nil
+end
+
+-- Owner-wins-by-rev with a timestamp tiebreak — the same merge the inventory
+-- owners graph uses, and for the same reason: two inputs (our own capture and
+-- the mesh) count revisions independently and meet here.
+function Store.ProfessionsPut(ownerKey, rev, data, now)
+    local a = Store.ProfessionsArea(true)
+    if not a then return "stale" end
+    return Store.InventoryApply(a.owners, ownerKey, rev, data, now or serverNow())
+end
+
+function Store.ProfessionsDrop(ownerKey)
+    local a = Store.ProfessionsArea()
     if a then a.owners[ownerKey] = nil end
 end
 

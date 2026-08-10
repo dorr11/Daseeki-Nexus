@@ -28,6 +28,12 @@ syncns.lua
 friends.lua
 social.lua
 inventory.lua
+# professions_data.lua is a GENERATED data file (dev/gen-professions-data.lua).
+# Era's .toc has no per-file load-on-demand, so it is listed like any other file
+# and the client holds its one string constant. Nothing is BUILT from that
+# string until the professions module is enabled and asks — see professions.lua.
+professions_data.lua
+professions.lua
 tooltips.lua
 import.lua
 ui_shell.lua
