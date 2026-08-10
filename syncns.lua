@@ -162,6 +162,15 @@ function Sync.RegisterNamespace(key, spec)
         rev      = spec.rev,
         onRemote = spec.onRemote,
         ownerKey = spec.ownerKey,
+        -- OPTIONAL scheduler tier for this namespace's own pushes, as one of
+        -- the mesh's semantic op names. Omitted means "nspush", which is what
+        -- every namespace got before this field existed and is what `bags`
+        -- still gets. A namespace whose data is a dashboard fact rather than a
+        -- live state — professions, for one — declares the backfill tier here
+        -- so its fan-out can never be the reason a pull timer waited. The value
+        -- is LOCAL SCHEDULER METADATA: it never reaches the wire, so no peer
+        -- can tell the difference and this is not a protocol change.
+        pushOp   = spec.pushOp,
     }
     return true
 end
@@ -194,7 +203,7 @@ function Sync.MarkDirty(key)
     local rev = Sync.NextLocalRev(key)
     S.SyncNSPut(key, ownerKey, rev, data, S.Now and S.Now() or nil)
     if ns.Mesh and ns.Mesh.PushNamespace then
-        ns.Mesh.PushNamespace(key, ownerKey)
+        ns.Mesh.PushNamespace(key, ownerKey, spec.pushOp)
     end
     return true
 end

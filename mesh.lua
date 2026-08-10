@@ -2803,8 +2803,19 @@ Mesh._sendNSPayloadTo = sendNSPayloadTo   -- exposed for the scheduling self-tes
 
 -- Push one owner's namespace payload to every online peer, debounced so a burst
 -- of MarkDirty calls coalesces into one propagation.
-function Mesh.PushNamespace(nsKey, ownerKey)
+--
+-- `opName` is the OPTIONAL scheduler tier a namespace declared at registration
+-- (Daseeki.Sync's `pushOp`). The default stays "nspush" — priority 4, which is
+-- what every namespace got before this argument existed and what `bags` still
+-- gets. A namespace whose payload is a dashboard fact rather than a live state
+-- can ask for the backfill tier instead, so its fan-out queues BEHIND state and
+-- behind the pushes a peer's tooltip is actually waiting on. An unknown name is
+-- ignored rather than trusted: PRIO is the only authority on what a tier means,
+-- and a typo must not silently promote a namespace to the front of the queue.
+function Mesh.PushNamespace(nsKey, ownerKey, opName)
     if not Mesh.IsEnabled() then return end
+    if opName ~= nil and PRIO[opName] == nil then opName = nil end
+    opName = opName or "nspush"
     local pendKey = tostring(nsKey) .. "\1" .. tostring(ownerKey)
     if Mesh._nsPushPending[pendKey] then return end
     Mesh._nsPushPending[pendKey] = true
@@ -2814,7 +2825,7 @@ function Mesh.PushNamespace(nsKey, ownerKey)
         -- CLASS 8 / NXM-7: shared sorted fan-out (see Mesh.SortedOnlinePeers).
         local peers = Mesh.SortedOnlinePeers()
         for i = 1, #peers do
-            sendNSPayloadTo(peers[i].name, nsKey, ownerKey, "nspush")
+            sendNSPayloadTo(peers[i].name, nsKey, ownerKey, opName)
         end
     end
     if C_Timer and C_Timer.After then

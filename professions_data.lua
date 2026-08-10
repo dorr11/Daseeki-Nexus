@@ -1,0 +1,3281 @@
+-- Daseeki Nexus — professions_data.lua
+--
+-- GENERATED FILE. Built by dev/gen-professions-data.lua out of the checked-in
+-- fact source dev/professions-facts.txt; regenerate rather than hand-edit.
+--
+-- WHAT IT IS. The Classic Era recipe universe as FACTS: teaching spell ids,
+-- skill requirements, profession ownership, specialisation gates, derived
+-- source classes, acquisition relations, and the NPC / zone / quest / object /
+-- event / faction indices those relations point at. Era is a frozen client, so
+-- this is a constant — the same on every account, realm and login — and a
+-- constant is delivered, never measured by the player.
+--
+-- WHAT IT IS NOT. There are no recipe names and no item names in here. The
+-- client resolves those from the ids, in the player's own language, always
+-- current; shipping ten translations of three thousand records is what makes
+-- the equivalent third-party dataset 2.3 MB. English names appear ONLY where
+-- the client cannot answer from an id offline: NPCs, zones, quests, world
+-- objects, world events, reputation factions and standings, profession and
+-- specialisation names, and the prose acquisition notes.
+--
+-- There are also no REAGENTS and no produced-item ids, because they are not
+-- facts anyone wrote down for us to carry — the source dataset has neither.
+-- professions.lua harvests both from the live trade-skill window while it is
+-- open and caches them per teaching-spell id.
+--
+-- THE CONTRACT the rest of the addon depends on:
+--
+--   ns.ProfessionsDataRaw     one long string, section-delimited, one record
+--                             per line, fields "|"-separated. Sections, in
+--                             order: meta, fix, prof, note, continent, zone,
+--                             npc, quest, object, event, faction, standing,
+--                             spec, rank, trainerset, recipe, item.
+--
+--   ns.ProfessionsDataMeta    { version, recipes, items, npcs, ... } — the
+--                             counts as literals, so the load-time census gate
+--                             never costs a parse, plus the version stamp.
+--
+--   Parse it through ns.Professions.Dataset — the parser lives there, staged,
+--   so the capture layer's needs (the recipe index) are built without building
+--   the source graph a view has not asked for yet.
+--
+-- WHY A STRING AND NOT A TABLE. The module has an enable switch, and the
+-- behavioral spec's inertness rule says a disabled module holds no dataset. A
+-- string constant is bytes the client read off disk either way; a table literal
+-- is thousands of permanent hash nodes built at file-parse time whether or not
+-- anybody wants them. Era's .toc has no per-file load-on-demand — only a
+-- separate load-on-demand ADDON FOLDER achieves "not read at all", and Nexus
+-- ships as one folder — so this is the honest floor: with the module off, the
+-- client holds this string and NOTHING is built from it.
+--
+-- VERSION STAMP. ns.ProfessionsDataMeta.version is a content hash, and every
+-- published mesh payload carries it, because the known-recipe bitmap's bit
+-- positions ARE this file's per-profession recipe ordering. A peer holding a
+-- different dataset must refuse to decode rather than decode wrongly: refusing
+-- renders as "not scanned", decoding wrongly renders as a list of recipes that
+-- character does not know.
+--
+-- Clean-room: the facts are game facts, extracted through our own Room-1
+-- addendum. No third-party code, identifiers or file structure appear here.
+
+local ADDON, ns = ...
+
+ns.ProfessionsDataMeta = {
+    version     = "p1-f84a5fa0",
+    professions = 13,
+    recipes     = 1251,
+    items       = 770,
+    npcs        = 734,
+    zones       = 79,
+    quests      = 109,
+    objects     = 9,
+    events      = 13,
+    factions    = 54,
+    specs       = 10,
+    ranks       = 49,
+    notes       = 10,
+    grantOnLearn = 29,
+    noSource    = 0,
+    worldDropItems = 218,
+    eventItems  = 25,
+    era         = "classic-era permanent phase 6 (interface 11509)",
+}
+
+ns.ProfessionsDataRaw = [==[
+[meta]
+source|PROFESSIONS_DATASET_ADDENDUM.md
+era|classic-era permanent phase 6 (interface 11509)
+professions|13
+recipes|1251
+items|770
+npcs|734
+zones|79
+quests|109
+objects|9
+events|13
+factions|54
+specs|10
+ranks|49
+notes|10
+grantOnLearn|29
+noSource|0
+worldDropItems|218
+eventItems|25
+[fix]
+FIX-1|fishing-artisan-spell|18260|18248|the examined data reuses the cooking artisan spell id for fishing; the fishing artisan rank is its own spell
+FIX-3|thorium-contract-plans|no source|K18628|the contract item that grants them ships in the data but is never linked
+FIX-2|duplicate-prose-note|two note keys, one text|interned by text|notes are interned on their text here, so the duplicate cannot come back
+[prof]
+1|alchemy|Alchemy|111
+2|blacksmithing|Blacksmithing|239
+3|cooking|Cooking|81
+4|enchanting|Enchanting|151
+5|engineering|Engineering|164
+6|firstaid|First Aid|13
+7|leatherworking|Leatherworking|233
+8|mining|Mining|12
+9|poisons|Poisons|21
+10|tailoring|Tailoring|226
+11|fishing|Fishing|0
+12|herbalism|Herbalism|0
+13|skinning|Skinning|0
+[note]
+1|inspect the Tablet of Madness in Zul'Gurub
+2|crafted by a Goblin engineer at 205
+3|crafted by a Gnomish engineer at 205
+4|obtained through the Thorium Brotherhood contract chain
+5|random reward
+6|floor loot near Golem Lord Argelmach (Blackrock Depths)
+7|tribute-run reward
+8|talk to the NPC after completing the quest
+9|talk to Krixix while he is mind-controlled
+10|book drops to the floor when Jandice Barov dies
+[continent]
+1|The Eastern Kingdoms
+2|Kalimdor
+3|Dungeon
+4|Raid
+5|Battleground
+[zone]
+1|1|1|1|12|Dun Morogh
+2|3|1|36|45|Badlands
+3|4|1|46|53|Blasted Lands
+4|8|1|36|43|Swamp of Sorrows
+5|10|1|20|30|Duskwood
+6|11|1|20|30|Wetlands
+7|12|1|1|10|Elwynn Forest
+8|14|2|1|10|Durotar
+9|15|2|35|45|Dustwallow Marsh
+10|16|2|48|55|Azshara
+11|17|2|10|25|The Barrens
+12|25|1|0|0|Blackrock Mountain
+13|28|1|50|60|Western Plaguelands
+14|33|1|30|45|Stranglethorn Vale
+15|36|1|30|40|Alterac Mountains
+16|38|1|10|20|Loch Modan
+17|40|1|10|20|Westfall
+18|41|1|50|60|Deadwind Pass
+19|44|1|15|25|Redridge Mountains
+20|45|1|30|40|Arathi Highlands
+21|46|1|50|60|Burning Steppes
+22|47|1|40|50|The Hinterlands
+23|51|1|40|50|Searing Gorge
+24|85|1|1|10|Tirisfal Glades
+25|130|1|10|20|Silverpine Forest
+26|139|1|55|60|Eastern Plaguelands
+27|141|2|1|10|Teldrassil
+28|148|2|10|20|Darkshore
+29|209|3|0|0|Shadowfang Keep
+30|215|2|1|10|Mulgore
+31|267|1|20|30|Hillsbrad Foothills
+32|331|2|1|10|Ashenvale
+33|357|2|40|50|Feralas
+34|361|2|48|55|Felwood
+35|400|2|25|35|Thousand Needles
+36|405|2|30|40|Desolace
+37|406|2|15|27|Stonetalon Mountains
+38|440|2|40|50|Tanaris
+39|490|2|48|55|Un'Goro Crater
+40|491|3|0|0|Razorfen Kraul
+41|493|2|0|0|Moonglade
+42|618|2|55|60|Winterspring
+43|717|3|0|0|The Stockade
+44|718|3|0|0|Wailing Caverns
+45|719|3|0|0|Blackfathom Deeps
+46|721|3|0|0|Gnomeregan
+47|722|3|0|0|Razorfen Downs
+48|796|3|0|0|Scarlet Monastery
+49|1176|3|0|0|Zul'Farrak
+50|1337|3|0|0|Uldaman
+51|1377|2|55|60|Silithus
+52|1417|3|0|0|Sunken Temple
+53|1477|3|0|0|The Temple of Atal'Hakkar
+54|1497|1|0|0|Undercity
+55|1519|1|0|0|Stormwind City
+56|1537|1|0|0|Ironforge
+57|1581|3|0|0|The Deadmines
+58|1583|3|0|0|Blackrock Spire
+59|1584|3|0|0|Blackrock Depths
+60|1637|2|0|0|Orgrimmar
+61|1638|2|0|0|Thunder Bluff
+62|1657|2|0|0|Darnassus
+63|1941|3|0|0|Caverns of Time
+64|1977|4|0|0|Zul'Gurub
+65|2017|3|0|0|Stratholme
+66|2057|3|0|0|Scholomance
+67|2100|3|0|0|Maraudon
+68|2159|4|0|0|Onyxia's Lair
+69|2257|1|0|0|Deeprun Tram
+70|2437|3|0|0|Ragefire Chasm
+71|2557|3|0|0|Dire Maul
+72|2597|5|0|0|Alterac Valley
+73|2677|4|0|0|Blackwing Lair
+74|2717|4|0|0|Molten Core
+75|3277|5|0|0|Warsong Gulch
+76|3358|5|0|0|Arathi Basin
+77|3428|4|0|0|Ahn'Qiraj
+78|3429|4|0|0|Ruins of Ahn'Qiraj
+79|3456|4|0|0|Naxxramas
+[npc]
+66|7|4182|6716|A|10|10|0|Tharynn Bouden
+223|54|7093|5841|H|23|23|0|Dan Golthas
+235|17|5642|3052|A|20|20|0|Salma Saldean
+272|5|7389|4345|A|30|30|0|Chef Grual
+332|55|5980|7580|A|62|62|0|Master Mathias Shaw
+340|55|7469|3651|A|50|50|0|Kendor Kabonka
+343|19|2268|4384|A|19|19|0|Chef Breanna
+381|19|2772|4738|A|20|20|0|Dockmaster Baren
+417|56|4985|620|A|60|60|0|Felhunter
+445|19|2572|2341|X|21|22|0|Redridge Alpha
+450|57|-1|-1|X|18|19|0|Defias Renegade Mage
+514|7|4171|6554|A|24|24|0|Smith Argus
+590|17|4601|7112|X|13|14|0|Defias Looter
+657|57|-1|-1|X|18|20|1|Defias Pirate
+674|14|4202|4630|X|40|41|0|Venture Co. Strip Miner
+734|14|3796|299|A|40|40|0|Corporal Bluth
+764|4|1577|4078|X|38|39|0|Swampwalker
+765|4|1292|3251|X|39|40|0|Swampwalker Elder
+766|4|7720|8109|X|40|41|0|Tangled Horror
+777|19|2913|4732|A|20|20|0|Amy Davenport
+812|19|2180|4580|A|20|20|0|Alma Jainrose
+843|17|5764|5405|A|15|15|0|Gina MacGregor
+908|14|2760|7780|A|44|44|0|Flora Silverwind
+910|5|4881|7749|X|26|27|1|Defias Enchanter
+917|7|6580|4380|A|11|11|0|Keryn Sylvius
+918|55|5280|7460|A|60|60|0|Osborne the Night Man
+938|14|4596|866|X|33|35|0|Kurzen Commando
+957|55|5744|1630|A|30|30|0|Dane Lindgren
+989|4|4477|5663|H|50|50|0|Banalash
+1051|6|6302|2957|X|27|28|1|Dark Iron Dwarf
+1052|6|6327|2878|X|28|29|1|Dark Iron Saboteur
+1053|6|4606|1662|X|29|30|1|Dark Iron Tunneler
+1054|6|4739|1514|X|30|31|1|Dark Iron Demolitionist
+1078|6|3818|5089|A|25|25|0|Ormer Ironbraid
+1081|4|549|3138|X|42|42|0|Mire Lord
+1103|7|7922|6902|A|22|22|0|Eldrin
+1146|14|3236|2795|H|40|40|0|Vharr
+1148|14|3270|2923|H|40|40|0|Nerrist
+1149|14|3155|2795|H|40|40|0|Uthok
+1154|16|8176|6166|A|15|15|0|Marek Ironheart
+1215|7|3984|4823|A|26|26|0|Alchemist Mallory
+1218|7|3980|4840|A|10|10|0|Herbalist Pomeroy
+1234|1|5760|4260|A|12|12|0|Hogral Bakkan
+1241|1|4534|5194|A|30|30|0|Tognus Flintfire
+1246|56|6633|5569|A|30|30|0|Vosur Brakthel
+1250|7|8331|6669|A|10|10|0|Drake Lindgren
+1267|1|4683|5236|A|30|30|0|Ragnar Thunderbrew
+1292|55|6780|4900|A|35|35|0|Maris Granger
+1300|55|4369|7371|A|25|25|0|Lawrence Schneider
+1304|55|2942|6785|A|30|30|0|Darian Singh
+1313|55|4681|7909|A|30|30|0|Maria Lumere
+1317|55|4294|6465|A|35|35|0|Lucan Cordell
+1318|55|4281|6439|A|30|30|0|Jessara Cordell
+1346|55|4317|7355|A|46|46|0|Georgio Bolero
+1347|55|4325|7408|A|30|30|0|Alexandra Bolero
+1355|1|6838|5449|A|9|9|0|Cook Ghilm
+1364|6|6249|2842|X|34|34|1|Balgaras the Foul
+1382|14|3134|2797|H|40|40|0|Mudduk
+1383|60|7960|2331|H|31|31|0|Snarl
+1385|14|3174|2890|H|35|35|0|Brawn
+1386|4|4853|5585|H|53|53|0|Rogvar
+1411|14|7720|2680|N|47|47|0|Ian Strom
+1430|7|4437|6599|A|10|10|0|Tomas
+1454|6|812|5584|A|25|25|0|Jennabink Powerseam
+1458|6|800|5580|A|25|25|0|Telurinon Moonshadow
+1465|16|3557|4915|A|15|15|0|Drac Roughcut
+1466|56|3881|3288|A|24|24|0|Gretta Finespindle
+1470|16|3707|4938|A|25|25|0|Ghak Healtouch
+1471|20|4598|4772|A|46|46|0|Jannos Ironwill
+1473|16|3665|4847|A|14|14|0|Kali Healtouch
+1474|16|3595|4587|A|15|15|0|Rann Flamespinner
+1561|14|3307|7396|X|39|41|0|Bloodsail Raider
+1632|7|4638|6204|A|22|22|0|Adele Fielder
+1651|7|4638|6204|A|8|8|0|Lee Brown
+1669|17|4347|6676|N|20|20|0|Defias Profiteer
+1676|5|7738|4882|A|31|31|0|Finbus Geargrind
+1680|19|2680|5040|A|10|10|0|Matthew Hooper
+1681|16|3702|4781|A|15|15|0|Brock Stoneseeker
+1683|16|4060|3960|A|15|15|0|Warg Deepwater
+1684|16|4028|3928|A|15|15|0|Khara Deepwater
+1685|16|8247|6335|A|15|15|0|Xandar Goodbeard
+1699|1|4767|5231|A|10|10|0|Gremlock Pilsnor
+1700|1|3560|4040|A|10|10|0|Paxton Ganter
+1701|1|6932|5546|A|10|10|0|Dank Drizzlecut
+1702|1|5018|5038|A|24|24|0|Bronk Guzzlegear
+1703|56|4382|2786|A|24|24|0|Uthrar Threx
+1732|57|-1|-1|X|19|20|1|Defias Squallshaper
+1783|13|5460|8098|X|50|51|0|Skeletal Flayer
+1791|13|4961|8277|X|50|52|0|Slavering Ghoul
+1812|13|6656|3909|X|55|56|0|Rotting Behemoth
+1813|13|6163|3621|X|56|57|0|Decaying Horror
+1836|13|4190|1545|X|56|58|1|Scarlet Cavalier
+1844|13|4904|3273|X|58|58|1|Foreman Marcrid
+1853|66|-1|-1|X|61|61|1|Darkmaster Gandling
+1885|13|4363|1290|X|60|60|1|Scarlet Smith
+1950|25|5346|1343|H|15|15|0|Rane Yorick
+1963|16|3483|4928|A|10|10|0|Vidra Hearthstove
+2094|6|855|5574|A|25|25|0|James Halloran
+2114|24|5980|5200|H|5|5|0|Faruza
+2118|24|6103|5237|H|9|9|0|Abigail Shiel
+2130|24|5200|6160|H|13|13|0|Marion Call
+2132|24|5943|5219|H|25|25|0|Carolai Anise
+2216|31|6144|1906|H|35|35|0|Apothecary Lydon
+2229|31|6324|2066|H|25|25|0|Krusk
+2242|15|5791|4879|X|35|36|0|Syndicate Spy
+2246|15|4064|2254|X|38|39|0|Syndicate Assassin
+2264|31|3676|4448|A|24|25|0|Hillsbrad Tailor
+2326|1|4718|5261|A|8|8|0|Thamner Pol
+2327|55|4308|2612|A|35|35|0|Shaina Fuller
+2329|7|4339|6555|A|11|11|0|Michelle Belle
+2337|28|5621|2637|X|28|29|0|Dark Strand Voidcaller
+2367|31|5060|6100|A|31|31|0|Donald Rabonne
+2374|31|2560|7643|X|28|29|0|Torn Fin Muckdweller
+2375|31|3193|7628|X|29|30|0|Torn Fin Coastrunner
+2376|31|3802|7283|X|30|31|0|Torn Fin Oracle
+2377|31|3995|7282|X|31|32|0|Torn Fin Tidehunter
+2380|31|5093|5710|A|34|34|0|Nandar Branson
+2381|31|4894|5503|A|40|40|0|Micha Yance
+2382|31|5242|5596|A|30|30|0|Darren Malvew
+2383|31|5063|6095|A|29|29|0|Lindea Rabonne
+2390|31|6163|3119|H|29|29|0|Aranae Venomblood
+2391|31|6163|3119|H|32|32|0|Serge Hinott
+2393|31|6229|1904|H|32|32|0|Christoph Jeffcoat
+2394|31|6190|2098|H|32|32|0|Mallen Swain
+2397|31|6309|1941|H|32|32|0|Derak Nightfall
+2399|31|6375|2079|H|56|56|0|Daryl Stack
+2430|31|5189|5868|A|35|35|0|Chef Jessen
+2434|31|-1|-1|N|37|38|0|Shadowy Assassin
+2480|15|3824|3887|N|49|49|0|Bro'kin
+2481|5|1804|5436|N|36|36|0|Bliztik
+2482|14|2834|7546|N|43|43|0|Zarena Cromwind
+2483|14|3575|1066|N|39|39|0|Jaquilina Dramet
+2556|20|6919|8241|X|34|35|0|Witherbark Headhunter
+2557|20|6699|8233|X|35|36|0|Witherbark Shadow Hunter
+2558|20|2427|6625|X|36|37|1|Witherbark Berserker
+2606|20|-1|-1|N|37|37|1|Nimar the Slayer
+2626|14|2745|7700|N|43|43|0|Old Man Heming
+2627|14|2877|7684|N|34|34|0|Grarnik Goodstitch
+2636|20|3280|8199|N|38|38|0|Blackwater Deckhand
+2642|22|6527|7340|X|47|48|1|Vilebranch Shadowcaster
+2644|22|6693|7548|X|48|49|1|Vilebranch Hideskinner
+2663|14|2813|7442|N|42|42|0|Narkk
+2664|14|2823|7434|N|43|43|0|Kelsey Yance
+2668|5|7587|4556|A|27|27|0|Danielle Zipstitch
+2669|5|7568|4557|A|31|31|0|Sheri Zipstitch
+2670|14|2871|7689|N|43|43|0|Xizk Goodstitch
+2672|14|2700|8248|N|40|40|0|Cowardly Crosby
+2679|6|2561|2580|A|28|28|0|Wenna Silkbeard
+2682|6|2640|2576|A|24|24|0|Fradd Swiftgear
+2683|46|-1|-1|A|24|24|0|Namdo Bizzfizzle
+2684|15|4730|3516|N|31|31|0|Rizz Loosebolt
+2685|14|2850|7512|N|36|36|0|Mazk Snipeshot
+2687|14|5098|3521|N|42|42|0|Gnaz Blunderflame
+2688|22|3433|3776|N|52|52|0|Ruppo Zipcoil
+2697|19|8902|7087|A|31|31|0|Clyde Ranthal
+2698|31|9202|3823|H|31|31|0|George Candarte
+2699|14|2849|7605|N|43|43|0|Rikqiz
+2798|61|2970|2120|H|35|35|0|Pand Stonebinder
+2803|34|6232|2564|A|55|55|0|Malygen
+2805|20|2697|5883|A|45|45|0|Deneb Walker
+2806|34|3475|5323|H|55|55|0|Bale
+2810|20|4649|4741|A|35|35|0|Hammon Karwn
+2812|20|4632|4705|A|40|40|0|Drovnar Strongbrew
+2814|20|4554|4761|A|39|39|0|Narj Deepslice
+2816|20|4508|4683|A|37|37|0|Androd Fadran
+2817|2|4239|5293|N|37|37|0|Rigglefuzz
+2819|20|7486|3458|H|34|34|0|Tunkk
+2821|20|7409|3273|H|33|33|0|Keena
+2834|20|2760|7700|N|43|43|0|Myizz Luckycatch
+2836|14|2899|7556|N|54|54|0|Brikk Keencraft
+2837|14|2804|7799|N|46|46|0|Jaxin Chong
+2838|14|2836|7666|N|46|46|0|Crazk Sparks
+2843|14|2746|7755|N|43|43|0|Jutak
+2846|14|2825|7754|N|43|43|0|Blixrez Goodstitch
+2848|14|2814|7811|N|45|45|0|Glyx Brewright
+2855|60|6293|4924|H|24|24|0|Snang
+2856|14|3220|2760|H|40|40|0|Angrun
+2857|60|7596|2415|H|23|23|0|Thund
+2920|2|2582|4424|N|31|31|0|Lucien Tosselwrench
+2998|61|3940|5510|H|35|35|0|Karn Stonehoof
+3001|61|3440|5790|H|35|35|0|Brek Stonehoof
+3004|61|4450|4540|H|35|35|0|Tepa
+3005|61|4380|4510|H|30|30|0|Mahu
+3007|61|4150|4260|H|46|46|0|Una
+3008|61|4210|4350|H|24|24|0|Mak
+3009|61|4660|3320|H|35|35|0|Bena Winterhoof
+3011|61|4490|3750|H|35|35|0|Teg Dawnstrider
+3012|61|4500|3880|H|30|30|0|Nata Dawnstrider
+3013|61|4980|3980|H|35|35|0|Komin Winterhoof
+3026|61|5070|5310|H|45|45|0|Aska Mistrunner
+3027|61|5100|5250|H|40|40|0|Naal Mistrunner
+3028|61|5600|4680|H|45|45|0|Kah Mistrunner
+3029|61|5580|4700|H|40|40|0|Sewa Mistrunner
+3050|61|4440|4470|H|21|21|0|Veren Tallstrider
+3067|30|4540|5810|H|12|12|0|Pyall Silentstride
+3069|30|4540|5790|H|23|23|0|Chaw Stronghide
+3081|30|4620|5820|H|10|10|0|Wunna Darkmane
+3085|19|2666|4351|A|20|20|0|Gloria Femmel
+3087|19|2278|4347|A|22|22|0|Crystal Boughman
+3134|5|8182|1977|N|25|25|0|Kzixx
+3136|5|7400|4855|A|31|31|0|Clarise Gnarltree
+3137|5|7407|4963|A|20|20|0|Matt Johnson
+3170|8|4360|5200|H|14|14|0|Kaplak
+3174|8|5203|4072|H|27|27|0|Dwukk
+3175|8|5181|4088|H|16|16|0|Krunn
+3178|6|801|5833|A|25|25|0|Stuart Fleming
+3179|6|820|5860|A|25|25|0|Harold Riggs
+3181|6|1082|6140|A|30|30|0|Fremal Doohickey
+3184|8|5541|7395|H|25|25|0|Miao'zan
+3185|8|5540|7500|H|14|14|0|Mishiki
+3290|16|4591|1344|A|27|27|0|Deek Fizzlebizz
+3327|60|5160|4280|H|40|40|0|Gest
+3328|60|5460|4400|H|50|50|0|Ormok
+3332|60|6980|2960|H|35|35|0|Lumak
+3333|60|6999|2977|H|30|30|0|Shankys
+3335|60|4599|4568|H|30|30|0|Hagrus
+3345|60|5390|3867|H|35|35|0|Godan
+3346|60|5388|3802|H|35|35|0|Kithas
+3347|60|5684|3303|H|35|35|0|Yelmak
+3348|60|5605|3412|H|30|30|0|Kor'geld
+3355|60|8235|2297|H|45|45|0|Saru Steelfury
+3356|60|8260|2396|H|30|30|0|Sumi
+3357|60|7312|2608|H|35|35|0|Makaru
+3363|60|6365|4993|H|35|35|0|Magar
+3364|60|6308|5145|H|30|30|0|Borya
+3365|60|6281|4415|H|35|35|0|Karolek
+3366|60|6305|4553|H|30|30|0|Tamar
+3373|60|3418|8458|H|35|35|0|Arnok
+3385|11|6297|5669|A|15|16|0|Theramore Marine
+3386|11|6309|5674|A|16|17|0|Theramore Preserver
+3399|60|5740|5396|H|35|35|0|Zamja
+3400|60|5757|5290|H|30|30|0|Xen'to
+3401|60|5360|4300|H|60|60|0|Shenthul
+3404|60|5560|3960|H|35|35|0|Jandi
+3412|60|7599|2541|H|35|35|0|Nogg
+3413|60|2520|7560|H|30|30|0|Sovik
+3443|11|5531|3179|H|13|13|0|Grub
+3478|11|5130|2891|H|31|31|0|Traugh
+3482|11|5168|3004|H|14|14|0|Tari'qa
+3484|11|5220|3170|H|25|25|0|Kil'hala
+3485|11|5225|3169|H|18|18|0|Wrahk
+3489|11|5262|2984|H|16|16|0|Zargh
+3490|11|5139|3020|H|30|30|0|Hula'mahi
+3494|11|6267|3631|N|25|25|0|Tinkerwiz
+3495|11|6264|3627|N|20|20|0|Gagsprocket
+3497|11|6277|3824|N|24|24|0|Kilxx
+3499|11|6193|3870|N|22|22|0|Ranik
+3522|24|5260|5577|H|10|10|0|Constance Brisboise
+3523|24|5259|5552|H|24|24|0|Bowen Brisboise
+3530|25|4655|7239|A|12|15|1|Pyrewood Tailor
+3531|25|4655|7239|X|14|15|1|Moonrage Tailor
+3537|31|5565|3478|N|32|32|0|Zixil
+3549|24|6543|6012|H|25|25|0|Shelene Rhobart
+3550|24|6586|5964|H|15|15|0|Martine Tramblay
+3555|25|4341|4045|H|19|19|0|Johan Focht
+3556|25|4322|4066|H|18|18|0|Andrew Hilbert
+3557|25|4320|4108|H|28|28|0|Guillaume Sorouy
+3599|27|6000|5620|A|20|20|0|Jannok Breezesong
+3603|27|5760|6080|A|28|28|0|Cyndra Kindwhisper
+3604|27|5760|6060|A|17|17|0|Malorne Bladeleaf
+3605|27|4190|4940|A|30|30|0|Nadyia Maneweaver
+3606|27|3670|3420|A|29|29|0|Alanna Raveneye
+3607|27|5580|9340|A|37|37|0|Androl Oakhand
+3683|11|4179|3869|N|32|32|0|Kiknikle
+3702|28|3769|4066|A|19|19|0|Alanndarian Nightsong
+3703|11|4484|5946|H|42|42|0|Krulmoo Fullmoon
+3704|11|4493|5939|H|31|31|0|Mahani
+3834|32|6197|4454|X|27|28|0|Crazed Ancient
+3881|8|5113|4263|H|14|14|0|Grimtak
+3919|34|5390|9927|X|26|27|0|Withered Ancient
+3954|32|3512|5212|A|24|24|0|Dalria
+3955|32|4948|6709|A|24|24|0|Shandrina
+3956|32|5084|6700|A|24|24|0|Harklan Moongrove
+3958|32|3479|4984|A|25|25|0|Lardan
+3960|32|5001|6664|A|26|26|0|Ulthaan
+3964|32|5085|6711|A|31|31|0|Kylanna
+3965|32|5060|6700|A|24|24|0|Cylania Rootstalker
+3967|32|3598|5210|A|37|37|0|Aayndia Floralwind
+4028|37|3273|7279|X|25|26|0|Charred Ancient
+4029|37|3089|6473|X|27|28|0|Blackened Ancient
+4030|37|3045|6808|X|30|30|1|Vengeful Ancient
+4083|37|4761|6159|H|24|24|0|Jeeda
+4086|37|5822|5174|N|24|24|0|Veenix
+4156|62|4760|5660|A|35|35|0|Astaia
+4159|62|6340|2240|A|35|35|0|Me'lynn
+4160|62|5490|2400|A|46|46|0|Ainethil
+4163|62|2180|3680|A|40|40|0|Syurna
+4168|62|6460|2160|A|30|30|0|Elynna
+4186|28|3700|4120|A|18|18|0|Mavralyn
+4189|28|3815|4060|A|14|14|0|Valdaron
+4193|28|3824|4053|A|29|29|0|Grondal Moonbreeze
+4200|28|3677|4428|A|14|14|0|Laird
+4204|62|4800|6860|A|35|35|0|Firodren Mooncaller
+4210|62|4900|2120|A|35|35|0|Alegorn
+4211|62|5170|1220|A|35|35|0|Dannelor
+4212|62|6440|2150|A|46|46|0|Telonis
+4213|62|5840|1310|A|35|35|0|Taladan
+4214|62|2520|3520|A|60|60|0|Erion Shadewhisper
+4215|62|-1|-1|A|50|50|0|Anishar
+4223|62|4850|2160|A|30|30|0|Fyldan
+4225|62|6370|2230|A|30|30|0|Saenorion
+4226|62|5580|2450|A|30|30|0|Ulthir
+4228|62|5860|1470|A|30|30|0|Vaean
+4229|62|6100|1770|A|30|30|0|Mythrin'dir
+4254|56|5000|2629|A|35|35|0|Geofram Bouldertoe
+4258|56|5255|4145|A|45|45|0|Bengus Deepforge
+4265|27|5720|6130|A|20|20|0|Nyoma
+4289|48|-1|-1|X|36|37|1|Scarlet Evoker
+4295|48|-1|-1|X|37|38|1|Scarlet Myrmidon
+4305|17|3623|9019|A|25|25|0|Kriggon Talsone
+4307|28|3697|5635|A|25|25|0|Heldan Galesong
+4364|9|7547|2150|X|59|60|1|Strashaz Warrior
+4366|9|7562|2201|X|59|61|1|Strashaz Serpent Guard
+4368|9|7707|1954|X|60|61|1|Strashaz Myrmidon
+4494|13|5737|3566|X|57|58|0|Scarlet Spellbinder
+4552|54|6214|4491|H|35|35|0|Eunice Burch
+4553|54|6231|4309|H|30|30|0|Ronald Burch
+4561|54|6405|3737|H|30|30|0|Daniel Bartlett
+4573|54|8080|3120|H|35|35|0|Armand Cromwell
+4574|54|8104|3075|H|30|30|0|Lizbeth Cromwell
+4576|54|7076|3069|H|45|45|0|Josef Gregorian
+4577|54|7059|3014|H|30|30|0|Millie Gregorian
+4578|54|8665|2208|H|45|45|0|Josephine Lister
+4582|54|7160|8380|H|40|40|0|Carolyn Ward
+4583|54|7120|8500|H|50|50|0|Miles Dexter
+4584|54|8460|7360|H|60|60|0|Gregory Charles
+4585|54|5160|7560|H|30|30|0|Ezekiel Graves
+4586|54|7534|7313|H|30|30|0|Graham Van Talen
+4588|54|7018|5742|H|35|35|0|Arthur Moore
+4589|54|7007|5844|H|30|30|0|Joseph Moore
+4591|54|7316|5515|H|35|35|0|Mary Edras
+4596|54|6126|3063|H|35|35|0|James Van Brunt
+4598|54|5603|3745|H|35|35|0|Brom Killian
+4605|54|6017|2909|H|26|26|0|Basil Frye
+4609|54|5093|7456|H|35|35|0|Doctor Marsh
+4610|54|5171|7467|H|30|30|0|Algernon
+4611|54|4777|7334|H|50|50|0|Doctor Herbert Halsey
+4614|54|5440|4940|H|35|35|0|Martha Alliestar
+4616|54|6247|6180|H|35|35|0|Lavinia Crowe
+4617|54|6238|6098|H|30|30|0|Thaddeus Webb
+4782|31|9984|90|A|50|50|0|Truk Wildbeard
+4834|9|3804|3741|N|35|36|0|Theramore Infiltrator
+4877|35|4621|5150|H|37|37|0|Jandia
+4878|35|4515|5079|H|36|36|0|Montarr
+4879|9|3670|3097|H|40|40|0|Ogg'marr
+4897|9|6644|5146|A|34|34|0|Helenia Olden
+4898|9|6400|4760|A|37|37|0|Brant Jasperbloom
+4900|9|6394|4764|A|37|37|0|Alchemist Narett
+5127|56|4024|3368|A|35|35|0|Fimble Finespindle
+5128|56|3962|3449|A|30|30|0|Bombus Finespindle
+5137|56|5560|5880|A|35|35|0|Reyna Stonebranch
+5150|56|5509|5826|A|35|35|0|Nissa Firestone
+5153|56|4315|2936|A|35|35|0|Jormund Stonebrow
+5157|56|5977|4545|A|35|35|0|Gimble Thistlefuzz
+5158|56|6103|4400|A|30|30|0|Tilli Thistlefuzz
+5159|56|6007|3643|A|35|35|0|Daryl Riknussun
+5160|56|5988|3737|A|30|30|0|Emrul Riknussun
+5161|56|4840|640|A|35|35|0|Grimnur Stonebrand
+5162|56|4818|651|A|30|30|0|Tansy Puddlefizz
+5164|56|4996|4281|A|60|60|0|Grumnus Steelshaper
+5165|56|1460|5160|A|60|60|0|Hulfdan Blackbeard
+5166|56|1480|5260|A|50|50|0|Ormyr Flinteye
+5167|56|1500|5160|A|40|40|0|Fenthwick
+5174|56|6846|4354|A|45|45|0|Springspindle Fizzlegear
+5175|56|6784|4250|A|30|30|0|Gearcutter Cogspinner
+5177|56|6662|5569|A|35|35|0|Tally Berryfizz
+5178|56|6623|5452|A|30|30|0|Soolie Berryfizz
+5226|52|6237|5344|X|47|48|1|Murk Worm
+5259|52|7328|7180|X|48|50|1|Atal'ai Witch Doctor
+5392|1|5001|5031|A|10|10|0|Yarr Hammerstone
+5411|38|5146|2881|N|40|40|0|Krinkle Goodsteel
+5482|55|7560|3704|A|35|35|0|Stephen Ryback
+5483|55|7606|3676|A|30|30|0|Erika Tate
+5493|55|4580|5820|A|35|35|0|Arnold Leland
+5494|55|4577|5858|A|30|30|0|Catherine Leland
+5499|55|4651|7968|A|35|35|0|Lilyssia Nightbreeze
+5500|55|4625|7911|A|31|31|0|Tel'Athir
+5502|55|1560|5000|A|35|35|0|Shylamiir
+5511|55|5684|1619|A|33|33|0|Therum Deepforge
+5512|55|5631|1697|A|30|30|0|Kaita Deepforge
+5513|55|5119|1731|A|35|35|0|Gelman Stonehand
+5518|55|5481|760|A|35|35|0|Lilliam Sparkspindle
+5564|55|6722|4983|A|35|35|0|Simon Tanner
+5566|55|4480|7700|A|35|35|0|Tannysa
+5567|55|4206|7577|A|31|31|0|Sellandus
+5594|38|5089|2696|N|45|45|0|Alchemist Pestlezugg
+5615|38|5936|4107|X|43|44|0|Wastewander Rogue
+5616|38|6361|3270|X|40|41|0|Wastewander Thief
+5617|38|6376|4064|X|41|43|0|Wastewander Shadow Mage
+5618|38|6296|2992|X|41|42|0|Wastewander Bandit
+5623|38|5899|3995|X|44|45|0|Wastewander Assassin
+5690|24|6720|5100|H|16|16|0|Clyde Kellen
+5695|24|6177|5156|H|31|31|0|Vance Undergloom
+5748|25|3300|1785|H|18|18|0|Killian Sanatha
+5757|25|4302|5082|H|19|19|0|Lilly
+5758|25|5389|8221|H|18|18|0|Leo Sarn
+5759|24|6182|5283|H|10|10|0|Nurse Neela
+5768|11|4601|3574|N|14|14|0|Ebru
+5783|11|4589|3570|N|27|27|0|Kalldan Felmoon
+5784|11|4597|3585|N|28|28|0|Waldor
+5811|60|6328|4475|H|26|26|0|Kamari
+5844|23|3800|5940|X|45|46|0|Dark Iron Slaver
+5846|23|4291|5491|X|47|48|0|Dark Iron Taskmaster
+5861|23|2567|3028|X|48|49|1|Twilight Fire Guard
+5938|30|4460|6060|H|14|14|0|Uthan Stillwater
+5939|30|4680|6080|H|13|13|0|Vira Younghoof
+5940|30|4750|5510|H|9|9|0|Harn Longcast
+5941|8|5320|8160|H|14|14|0|Lau'Tiki
+5942|8|5606|7339|H|14|14|0|Zansoa
+5943|8|5417|4193|H|15|15|0|Rawrk
+5944|11|4501|5933|H|25|25|0|Yonada
+5981|3|4520|3520|X|51|53|0|Portal Seeker
+6031|56|4864|4248|A|30|30|0|Tormus Deepforge
+6034|62|6440|2220|A|35|35|0|Lotherias
+6094|27|5530|5680|A|22|22|0|Byancie
+6138|10|7833|4275|X|54|55|0|Arkkoran Oracle
+6144|10|5949|6466|X|54|55|1|Son of Arkkoroc
+6146|10|4858|8325|X|54|55|1|Cliff Breaker
+6195|10|3902|5310|X|50|52|0|Spitelash Siren
+6201|10|6113|2645|X|51|53|0|Legashi Rogue
+6286|27|5710|6130|A|13|13|0|Zarrin
+6287|27|4200|5000|A|19|19|0|Radnaal Maneweaver
+6288|32|5000|6720|A|23|23|0|Jayla
+6289|24|6560|6000|H|13|13|0|Rand Rhobart
+6290|30|4560|5780|H|8|8|0|Yonn Deepcut
+6291|56|3960|3260|A|35|35|0|Balthus Stoneflayer
+6292|62|6400|2200|A|35|35|0|Eladriel
+6295|19|8885|7101|A|29|29|0|Wilma Ranthal
+6297|28|3825|4101|A|35|35|0|Kurdram Stonehammer
+6299|28|3819|4093|A|25|25|0|Delfrum Flintbeard
+6306|7|4620|6220|A|12|12|0|Helene Peltskinner
+6387|11|4500|5900|H|15|15|0|Dranh
+6556|39|7263|6811|X|48|50|0|Muculent Ooze
+6557|39|5754|8297|X|50|52|0|Primal Ooze
+6559|39|3761|8145|X|52|54|0|Glutinous Ooze
+6567|11|5371|6994|H|43|43|0|Ghok'kah
+6568|38|5101|2736|N|50|50|0|Vizzklick
+6574|20|7269|3645|H|31|31|0|Jun'ha
+6576|35|699|1804|A|40|40|0|Brienna Starglow
+6707|15|8020|8460|N|60|60|0|Fahrad
+6730|35|7768|7790|N|30|30|0|Jinky Twizzlefixxit
+6731|37|5318|1694|A|27|27|0|Harlown Darkweave
+6777|31|8406|1841|N|60|60|0|Zan Shivsproket
+6779|31|8421|1807|N|45|45|0|Smudge Thunderwood
+6868|23|8141|3720|H|35|35|0|Jarkal Mossmeld
+7024|17|6849|7008|A|22|22|0|Agent Kearnen
+7025|21|4885|5919|X|55|56|0|Blackrock Soldier
+7027|21|5095|5350|X|56|57|0|Blackrock Slayer
+7029|21|3917|3499|X|57|58|0|Blackrock Battlemaster
+7035|21|7957|4199|X|52|53|0|Firegut Brute
+7037|21|6624|4418|X|53|55|0|Thaurissan Firewalker
+7087|54|7060|5920|H|35|35|0|Killian Hagey
+7088|60|7060|5920|H|35|35|0|Thuwd
+7089|61|4460|1280|H|35|35|0|Mooranta
+7106|34|3629|6687|X|50|51|0|Jadefire Rogue
+7107|34|3667|5680|X|52|53|0|Jadefire Trickster
+7112|34|3651|6142|X|51|52|0|Jaedenar Cultist
+7156|34|6254|1321|X|53|54|0|Deadwood Den Watcher
+7158|34|6256|1111|X|53|54|0|Deadwood Shaman
+7230|60|8024|2344|H|60|60|0|Shayis Steelfury
+7231|60|8195|1802|H|60|60|0|Kelgruk Bloodaxe
+7232|55|5149|1296|A|60|60|0|Borgus Steelhand
+7233|11|5544|556|X|30|30|1|Taskmaster Fizzule
+7372|18|6277|7712|X|57|58|0|Deadwind Warlock
+7406|14|2836|7635|N|50|50|0|Oglethorpe Obnoticus
+7428|42|6379|7160|X|58|60|1|Frostmaul Giant
+7437|42|5479|5254|X|57|58|1|Cobalt Mageweaver
+7438|42|6729|3996|X|57|58|0|Winterfall Ursa
+7440|42|4159|4265|X|55|56|0|Winterfall Den Watcher
+7441|42|3942|4468|X|54|55|0|Winterfall Totemic
+7524|42|5119|4693|X|55|56|0|Anguished Highborne
+7733|38|5251|2791|N|30|30|0|Innkeeper Fizzgrimble
+7790|60|7924|2240|H|45|45|0|Orokk Omosh
+7792|60|8094|2332|H|50|50|0|Aturk the Anvil
+7798|55|5600|1541|A|50|50|0|Hank the Hammer
+7800|46|1680|4386|X|34|34|1|Mekgineer Thermaplugg
+7802|14|5062|2048|N|60|60|0|Galvan the Ancient
+7804|38|5141|2875|N|55|55|0|Trenton Lighthammer
+7805|38|-1|-1|X|45|45|0|Wastewander Scofflaw
+7852|33|3063|4271|A|55|55|0|Pratt McGrubben
+7854|33|7443|4291|H|49|49|0|Jangdor Swiftstrider
+7856|38|7302|4523|X|44|45|0|Southsea Freebooter
+7864|10|3883|6057|X|48|50|0|Lingering Highborne
+7866|10|3759|6542|A|50|50|0|Peter Galen
+7867|2|6270|5740|H|50|50|0|Thorkaf Dragoneye
+7868|23|6356|7597|A|50|50|0|Sarah Tanner
+7869|20|2827|4509|H|50|50|0|Brumn Winterhoof
+7870|35|772|1898|A|50|50|0|Caryssia Moonhunter
+7871|14|3655|3409|H|50|50|0|Se'Jib
+7883|38|7337|4714|X|45|45|0|Andre Firebeard
+7940|41|5148|3326|N|53|53|0|Darnall
+7944|56|6955|5033|A|57|57|0|Tinkmaster Overspark
+7946|33|3220|4160|A|52|52|0|Brannock
+7947|33|3130|4346|A|52|52|0|Vivianna
+7948|33|3263|4378|A|52|52|0|Kylanna Windwhisper
+7949|33|3155|4425|A|51|51|0|Xylinnia Starshine
+8125|38|5263|2811|N|43|43|0|Dirge Quikcleave
+8126|38|5248|2733|N|55|55|0|Nixx Sprocketspring
+8128|38|5108|2810|N|40|40|0|Pikkle
+8131|38|5074|2753|N|43|43|0|Blizrik Buckshot
+8137|38|6664|2208|N|40|40|0|Gikkix
+8139|38|6701|2199|N|40|40|0|Jabbey
+8144|33|7440|4300|H|51|51|0|Kulleg Stonehorn
+8145|33|7449|4273|H|50|50|0|Sheendra Tallgrass
+8146|33|7600|4340|H|50|50|0|Ruw
+8150|37|4072|8174|A|40|40|0|Janet Hommers
+8153|36|5525|5634|H|42|42|0|Narv Hidecrafter
+8157|33|3267|4403|A|52|52|0|Logannas
+8158|33|7606|4328|H|49|49|0|Bronk
+8160|31|9855|218|A|50|50|0|Nioma
+8161|31|9869|311|A|49|49|0|Harggan
+8176|4|4546|5141|N|45|45|0|Gharash
+8177|4|4539|5687|H|45|45|0|Rartar
+8178|3|6687|1824|A|49|49|0|Nina Lightbrew
+8306|11|5529|3178|H|18|18|0|Duhng
+8307|11|5515|3209|H|22|22|0|Tarban Hearthgrain
+8439|23|4099|7495|N|48|48|0|Nilith Lokrav
+8508|1|3153|4465|A|10|10|0|Gretta Ganter
+8526|26|5918|7097|X|56|57|0|Dark Caster
+8538|26|6007|7260|X|55|56|0|Unseen Servant
+8546|26|4047|5485|X|59|59|0|Dark Adept
+8550|26|3934|5148|X|59|60|0|Shadowmage
+8551|26|6038|7092|X|55|56|0|Dark Summoner
+8561|26|7163|1483|X|58|59|0|Mossflayer Shadowhunter
+8598|26|6987|4955|X|57|58|0|Frenzied Plaguehound
+8637|23|6234|6237|X|44|45|0|Dark Iron Watchman
+8678|10|4528|9095|N|55|55|0|Jubie Gadgetspring
+8679|14|5105|3523|N|42|42|0|Knaz Blunderflame
+8681|56|4337|2931|A|35|35|0|Outfitter Eric
+8696|47|7986|1074|N|36|36|0|Henry Stern
+8736|38|5234|2772|N|53|53|0|Buzzek Bracketswing
+8738|11|6269|3625|N|40|40|0|Vazario Linkgrease
+8878|36|5559|5650|H|40|40|0|Muuran
+8897|59|-1|-1|X|52|54|0|Doomforge Craftsman
+8898|59|-1|-1|X|54|55|1|Anvilrage Marshal
+8900|59|-1|-1|X|54|55|0|Doomforge Arcanasmith
+8903|59|-1|-1|X|54|56|1|Anvilrage Captain
+8920|59|-1|-1|X|55|56|0|Weapon Technician
+9024|59|-1|-1|X|52|52|1|Pyromancer Loregrain
+9025|59|-1|-1|X|51|51|1|Lord Roccor
+9026|23|2733|7735|X|52|52|1|Overmaster Pyron
+9028|59|-1|-1|X|54|54|1|Grizzle
+9179|2|4247|5250|N|38|38|0|Jazzrik
+9198|58|-1|-1|X|58|58|1|Spirestone Mystic
+9216|58|-1|-1|X|57|58|1|Spirestone Warlord
+9259|58|-1|-1|X|56|57|1|Firebrand Grunt
+9260|58|-1|-1|X|57|58|1|Firebrand Legionnaire
+9262|58|-1|-1|X|56|57|1|Firebrand Invoker
+9264|58|-1|-1|X|57|58|1|Firebrand Pyromancer
+9274|39|720|4360|N|45|45|0|Dadanga
+9447|26|8377|7955|X|53|54|1|Scarlet Warder
+9449|26|8028|8436|X|54|55|1|Scarlet Cleric
+9450|26|8734|8734|X|55|56|1|Scarlet Curate
+9451|26|8590|8722|X|55|57|1|Scarlet Archmage
+9452|26|8264|8486|X|53|55|1|Scarlet Enchanter
+9477|39|-1|-1|X|50|52|0|Cloned Ooze
+9499|59|-1|-1|N|55|55|1|Plugger Spazzring
+9543|59|-1|-1|N|52|53|1|Ribbly Screwspigot
+9544|21|6606|2195|N|51|51|0|Yuka Screwspigot
+9554|59|-1|-1|N|48|52|1|Hammered Patron
+9584|55|2672|7778|A|45|45|0|Jalane Ayrole
+9596|58|-1|-1|N|59|59|1|Bannok Grimaxe
+9636|36|5098|5355|H|41|41|0|Kireena
+9736|58|-1|-1|X|59|59|1|Quartermaster Zigris
+10043|59|-1|-1|N|47|52|1|Ribbly's Crony
+10118|27|5630|9240|A|25|25|0|Nessa Shadowsong
+10119|21|8209|5697|X|59|60|1|Volchan
+10264|58|-1|-1|X|60|60|1|Solakar Flamewreath
+10266|60|8077|2370|H|25|25|0|Ug'thok
+10276|56|5236|4255|A|31|31|0|Rotgath Stonebeard
+10277|56|5226|4194|A|25|25|0|Groum Stonebeard
+10278|61|3940|5670|H|24|24|0|Thrag Stonehoof
+10305|42|6088|3762|N|57|57|0|Umi Rumplesnicker
+10317|58|-1|-1|X|60|61|1|Blackhand Elite
+10339|58|-1|-1|X|62|62|1|Gyth
+10363|58|-1|-1|X|62|62|1|General Drakkisath
+10384|65|4518|8578|N|55|56|1|Spectral Citizen
+10398|65|7730|4380|X|58|59|1|Thuzadin Shadowcaster
+10406|65|7366|4680|X|58|59|1|Ghoul Ravener
+10422|65|2743|9005|X|58|59|1|Crimson Sorcerer
+10425|65|2794|9102|X|59|60|1|Crimson Battle Mage
+10426|65|2838|8295|X|59|60|1|Crimson Inquisitor
+10438|65|7320|1901|X|61|61|1|Maleki the Pallid
+10469|66|2091|6946|X|58|59|1|Scholomance Adept
+10499|66|3978|3517|X|58|60|1|Spectral Researcher
+10508|66|1873|8317|X|62|62|1|Ras Frostwhisper
+10637|42|6099|3878|N|59|59|0|Malyfous Darkhammer
+10813|65|-1|-1|X|62|62|1|Balnazzar
+10856|24|8326|6814|N|58|58|0|Argent Quartermaster Hasana
+10857|13|4284|8372|N|58|58|0|Argent Quartermaster Lightspark
+10899|58|-1|-1|X|61|61|1|Goraluk Anvilcrack
+10918|42|6379|7376|N|61|61|0|Lorax
+10993|30|6185|3141|N|25|25|0|Twizwick Sprocketgrind
+10997|65|1553|7457|X|59|60|1|Cannon Master Willey
+11017|60|7617|2517|H|46|46|0|Roxxik
+11025|8|5218|4080|H|26|26|0|Mukdrak
+11026|55|5455|794|A|24|24|0|Sprite Jumpsprocket
+11028|56|6766|4421|A|24|24|0|Jemma Quikswitch
+11029|56|6748|4291|A|31|31|0|Trixie Quikswitch
+11031|54|7612|7403|H|33|33|0|Franklin Lloyd
+11037|28|3830|4112|A|26|26|0|Jenna Lemkenilli
+11041|62|5540|2270|A|24|24|0|Milla Fairancora
+11042|62|5640|2420|A|32|32|0|Sylvanna Forestmoon
+11044|54|4661|7409|H|25|25|0|Doctor Martin Felben
+11046|60|5579|3290|H|23|23|0|Whuut
+11047|61|4670|3440|H|25|25|0|Kray
+11048|54|7008|2983|H|24|24|0|Victor Ward
+11049|54|7004|3056|H|32|32|0|Rhiannon Davis
+11050|62|6350|2120|A|25|25|0|Trianna
+11051|61|4430|4430|H|26|26|0|Vhan
+11052|9|6618|5181|A|51|51|0|Timothy Worthington
+11065|56|6027|4537|A|25|25|0|Thonys Pillarstone
+11066|60|5347|3855|H|26|26|0|Jhag
+11067|54|6254|6035|H|23|23|0|Malcomb Wynn
+11068|55|4311|6370|A|25|25|0|Betty Quin
+11070|62|5880|1270|A|27|27|0|Lalina Summermoon
+11071|61|4460|3850|H|21|21|0|Mot Dawnstrider
+11072|7|6493|7071|A|44|44|0|Kitta Firewind
+11073|50|5581|6084|N|54|54|0|Annora
+11074|37|4918|5718|H|46|46|0|Hgarth
+11081|62|6480|2180|A|32|32|0|Faldron
+11083|62|6440|2090|A|24|24|0|Darianna
+11084|61|4230|4260|H|36|36|0|Tarn
+11096|55|6781|4965|A|24|24|0|Randal Worth
+11097|22|9866|232|A|55|55|0|Drakk Stonehand
+11098|33|7436|4312|H|55|55|0|Hahrana Ironhide
+11146|56|5033|4356|A|54|54|0|Ironus Coldsteel
+11177|60|7980|2406|H|52|52|0|Okothos Ironrager
+11178|60|7941|2374|H|51|51|0|Borgosh Corebender
+11185|42|6080|3860|N|57|57|0|Xizzer Fizzbolt
+11187|42|6133|3916|N|60|60|0|Himmik
+11188|42|6080|3780|N|58|58|0|Evie Whirlbrew
+11189|42|6120|3721|N|51|51|0|Qia
+11191|42|6133|3713|N|55|55|0|Lilith the Lithe
+11192|42|6130|3707|N|58|58|0|Kilram
+11193|42|6133|3719|N|57|57|0|Seril Scourgebane
+11278|13|7760|6800|N|50|50|0|Magnus Frostwake
+11448|71|4676|5424|X|59|60|1|Gordok Warlock
+11450|71|2357|4430|X|58|59|1|Gordok Reaver
+11487|71|2175|7671|X|59|60|1|Magister Kalendris
+11502|74|-1|-1|X|0|0|0|Ragnaros
+11536|26|8162|6000|N|58|58|0|Quartermaster Miranda Breechlock
+11557|34|6569|281|N|55|55|0|Meilosh
+11582|66|2784|2281|X|58|59|1|Scholomance Dark Summoner
+11663|58|-1|-1|X|60|60|1|Flamewaker Healer
+11874|4|2646|3147|N|52|52|0|Masat T'andr
+11881|51|1801|8614|X|58|60|0|Twilight Geolord
+11982|74|-1|-1|X|0|0|0|Magmadar
+11988|74|-1|-1|X|0|0|0|Golemagg the Incinerator
+12018|74|-1|-1|X|0|0|0|Majordomo Executus
+12022|41|4824|4014|N|51|51|0|Lorelae Wintersong
+12025|41|4560|4680|A|51|51|0|Malvor
+12030|36|2320|6980|H|30|30|0|Malux
+12032|36|2260|7260|H|30|30|0|Lui'Mala
+12033|36|2617|6965|H|30|30|0|Wulan
+12043|37|4539|5933|H|32|32|0|Kulwia
+12056|74|-1|-1|X|0|0|0|Baron Geddon
+12057|74|-1|-1|X|0|0|0|Garr
+12098|74|-1|-1|X|0|0|0|Sulfuron Harbinger
+12118|74|-1|-1|X|0|0|0|Lucifron
+12245|36|6030|3819|N|38|38|0|Vendor-Tron 1000
+12246|36|4049|7934|N|36|36|0|Super-Seller 680
+12259|74|-1|-1|X|0|0|0|Gehennas
+12264|74|-1|-1|X|0|0|0|Shazzrah
+12397|3|3550|7500|X|0|0|0|Lord Kazzak
+12919|9|5865|6005|N|45|45|0|Nat Pagle
+12920|20|7341|3689|H|48|48|0|Doctor Gregory Victor
+12939|9|6776|4897|A|48|48|0|Doctor Gustaf VanHowzen
+12941|26|5760|8060|N|56|56|0|Jase Farlane
+12942|13|4308|8431|A|55|55|0|Leonard Porter
+12943|24|8330|6972|H|55|55|0|Werg Thickblade
+12944|59|-1|-1|N|60|60|0|Lokhtos Darkbargainer
+12956|51|8200|1774|N|59|59|0|Zannok Hidepiercer
+12957|10|4521|9085|N|55|55|0|Blimo Gadgetspring
+12958|22|3446|3859|N|52|52|0|Gigget Zipcoil
+12959|39|4327|773|N|52|52|0|Nergal
+12961|32|1081|3360|H|30|30|0|Kil'Hiwana
+12962|32|1171|3410|H|30|30|0|Wik'Tar
+13021|71|3896|8031|X|55|56|1|Warpwood Crusher
+13283|55|5800|7820|A|60|60|0|Lord Tony Romano
+13420|60|5321|6589|N|30|30|0|Penney Copperpinch
+13429|54|6824|3886|N|30|30|0|Nardstrum Copperpinch
+13432|54|6824|3886|N|30|30|0|Seersa Copperpinch
+13433|56|3370|6723|N|30|30|0|Wulmort Jinglepocket
+13435|55|5501|5926|N|30|30|0|Khole Jinglepocket
+13476|9|3649|3036|H|43|43|0|Balai Lok'Wein
+14276|31|2908|7356|X|30|30|1|Scargil
+14338|71|2070|3080|N|50|50|0|Knot Thimblejack
+14351|71|5046|4859|X|58|59|1|Gordok Bushwacker
+14354|71|6288|7116|X|57|57|1|Pusillin
+14371|71|2873|6867|N|52|52|1|Shen'dralar Provisioner
+14392|60|5171|7546|H|60|60|1|Overlord Runthak
+14394|55|6137|7893|A|60|60|1|Major Mattingly
+14401|73|-1|-1|N|60|60|1|Master Elemental Shaper Krixix
+14448|4|3449|3884|X|42|42|1|Molt Thorn
+14454|51|2870|2680|X|60|60|1|The Windreaver
+14457|42|5500|4160|X|60|60|1|Princess Tempestria
+14567|38|5138|2867|N|52|52|0|Derotain Mudsipper
+14637|33|4481|4342|N|40|40|0|Zorbin Fandazzle
+14738|22|7938|7908|H|40|40|0|Otho Moji'ko
+14740|22|8020|8140|H|42|42|0|Katoom the Angler
+14742|42|6120|3760|N|56|56|0|Zap Farflinger
+14828|30|3730|3774|N|25|25|0|Gelvas Grimegate
+14829|7|3730|3774|N|25|25|0|Gelvas Grimegate
+14921|14|1507|1600|N|63|63|1|Rin'wosho the Trader
+15162|26|8055|8559|X|61|61|0|Scarlet Inquisitor
+15176|51|5123|3886|N|57|57|0|Vargus
+15179|51|4988|3633|N|58|58|0|Mishta
+15194|51|6960|6700|N|58|56|0|Hermit Ortell
+15263|77|-1|-1|X|0|0|0|The Prophet Skeram
+15275|77|-1|-1|X|0|0|0|Emperor Vek'nilash
+15276|77|-1|-1|X|0|0|0|Emperor Vek'lor
+15293|51|6257|4979|N|60|60|0|Aendel Windspear
+15299|77|-1|-1|X|0|0|0|Viscidus
+15339|78|-1|-1|X|0|0|0|Ossirian the Unscarred
+15340|78|-1|-1|X|0|0|0|Moam
+15341|78|-1|-1|X|0|0|0|General Rajaxx
+15348|78|-1|-1|X|0|0|0|Kurinnaxx
+15369|78|-1|-1|X|0|0|0|Ayamiss the Hunter
+15370|78|-1|-1|X|0|0|0|Buru the Gorger
+15419|51|5197|3970|N|54|54|0|Kania
+15471|77|-1|-1|N|60|60|1|Lieutenant General Andorov
+15509|77|-1|-1|X|0|0|0|Princess Huhuran
+15510|77|-1|-1|X|0|0|0|Fankriss the Unyielding
+15511|77|-1|-1|X|0|0|0|Lord Kri
+15516|77|-1|-1|X|0|0|0|Battleguard Sartura
+15517|77|-1|-1|X|0|0|0|Ouro
+15543|77|-1|-1|X|0|0|0|Princess Yauj
+15544|77|-1|-1|X|0|0|0|Vem
+15727|77|-1|-1|X|0|0|0|C'Thun
+15909|41|3530|5380|N|60|60|0|Fariel Starsong
+16072|9|7648|1947|X|62|62|1|Tidelord Rrurgaz
+16365|79|-1|-1|N|60|60|0|Master Craftsman Omarion
+16376|79|-1|-1|N|60|60|0|Craftsman Wilhelm
+[quest]
+22|9|235|Goretusk Liver Pie
+38|9|235|Westfall Stew
+90|19|272|Seasoned Wolf Kabobs
+92|15|343|Redridge Goulash
+93|17|272|Dusky Crab Cakes
+127|16|381|Selling Fish
+296|22|1078|Ormer's Revenge
+384|5|1267|Beer Basted Boar Ribs
+385|12|1154|Crocolisk Hunting
+418|9|1963|Thelsamar Blood Sausages
+429|11|1950|Wild Hearts
+471|18|2094|Apprentice's Duties
+498|17|2229|The Rescue
+501|21|2216|Elixir of Pain
+555|28|2430|Soothing Turtle Bisque
+564|30|2382|Costly Menace
+703|33|2817|Barbecued Buzzard Wings
+715|35|2920|Liquid Stone
+769|4|3050|Kodo Hide Bag
+862|15|3443|Dig Rat Stew
+1487|15|5768|Deviate Eradication
+1559|35|2817|Flash Bomb Recipe
+1582|8|6034|Moonglow Vest
+1618|10|6031|Gearing Redridge
+2178|9|3702|Easy Strider Living
+2203|42|6868|Badlands Reagent Run II
+2359|20|7024|Klaven's Tower
+2360|20|332|Mathias and the Defias
+2478|20|7233|Mission: Possible But Not Probable
+2480|20|2391|Hinott's Assistance
+2501|39|1470|Badlands Reagent Run II
+2751|32|7790|Barbaric Battlements
+2752|32|7790|On Iron Pauldrons
+2753|32|7790|Trampled Under Foot
+2754|32|7790|Horns of Frenzy
+2755|32|7790|Joys of Omosh
+2756|40|7792|The Old Ways
+2758|40|7798|The Origins of Smithing
+2761|40|7802|Smelt On Smelt Off
+2762|40|7802|The Great Silver Deceiver
+2763|40|7802|The Art of the Imbue
+2771|40|7804|A Good Head On Your Shoulders
+2772|40|7804|The World At Your Feet
+2773|40|7804|The Mithril Kid
+2848|40|7852|Wild Leather Shoulders
+2849|43|7852|Wild Leather Vest
+2850|40|7852|Wild Leather Helmet
+2851|41|7852|Wild Leather Boots
+2852|41|7852|Wild Leather Leggings
+2853|45|7852|Master of the Wild Leather
+2855|41|7854|Wild Leather Shoulders
+2856|39|7854|Wild Leather Vest
+2857|44|7854|Wild Leather Helmet
+2858|41|7854|Wild Leather Boots
+2859|41|7854|Wild Leather Leggings
+2860|45|7854|Master of the Wild Leather
+3402|40|8439|The Undermarket
+3629|30|3494+4586+5174+5518|Goblin engineering
+3630|30|3494+4586+5174+5518|Gnome Engineering
+3644|30|8126+8738|Membership Card Renewal
+3645|30|7406+7944|Membership Card Renewal
+4083|40|-|The Spectral Chalice
+4161|5|6286|Recipe of the Kaldorei
+5124|55|10637|Fiery Plate Gauntlets
+5127|55|10918|The Demon Forge
+5141|40|7866+7867|Dragonscale leatherworking
+5143|40|7870+7871|Tribal leatherworking
+5144|40|7868+7869|Elemental leatherworking
+5150|47|9274|Dadanga is Hungry!
+5283|40|5164+11177|The Art of the Armorsmith
+5284|40|11146+11178|The Way of the Weaponsmith
+5305|50|11191|Sweet Serenity
+5306|50|11192|Snakestone of the Shadow Huntress
+5307|50|11193|Corruption
+5518|57|14338|The Gordok Ogre Suit
+5519|56|14338|The Gordok Ogre Suit
+6032|50|11557|Sacred Cloth
+6607|35|12919|Nat Pagle, Angler Extreme
+6610|35|8125|Clamlette Surprise
+6622|35|12920|Triage
+6624|35|12939|Triage
+7321|28|2393|Soothing Turtle Bisque
+7493|60|14392|The Journey Has Just Begun
+7497|60|14394|The Journey Has Just Begun
+7604|60|-|A Binding Contract
+7649|50|-|Enchanted Thorium Platemail: Volume I
+7650|50|-|Enchanted Thorium Platemail: Volume II
+7651|50|-|Enchanted Thorium Platemail: Volume III
+7653|50|14567|Imperial Plate Belt
+7654|50|14567|Imperial Plate Boots
+7655|50|14567|Imperial Plate Bracer
+7656|50|14567|Imperial Plate Chest
+7657|50|14567|Imperial Plate Helm
+7658|50|14567|Imperial Plate Leggings
+7659|50|14567|Imperial Plate Shoulders
+8313|55|-|Sharing the Knowledge
+8323|40|15194|True Believers
+8586|60|8125|Dirge's Kickin' Chimaerok Chops
+8769|40|-|A Ticking Present
+8798|52|10305|A Yeti of Your Own
+8876|25|15909|Small Rockets
+8877|45|15909|Firework Launcher
+8878|50|15909|Festive Recipes
+8879|35|15909|Large Rockets
+8880|45|15909|Cluster Rockets
+8881|55|15909|Large Cluster Rockets
+8882|55|15909|Cluster Launcher
+9233|60|16365|Omarion's Handbook
+9249|45|14828+14829|40 Tickets - Schematic: Steam Tonk Controller
+[object]
+164869|59|Spectral Chalice
+173232|59|Blacksmithing Plans
+173234|59|Blacksmithing Plans
+176325|65|Blacksmithing Plans
+176327|65|Blacksmithing Plans
+179501|71|Knot Thimblejack's Cache
+180368|64|Tablet of Madness
+180503|51|Sandy Cookbook
+180794|66|Journal of Jandice Barov
+[event]
+141|Feast of Winter Veil
+181|Noblegarden
+201|Children's Week
+321|Harvest Festival
+324|Hallow's End
+327|Lunar Festival
+341|Midsummer Fire Festival
+372|Brewfest
+398|Pirates' Day
+404|Pilgrim's Bounty
+409|Day of the Dead
+423|Love is in the Air
+999999|Darkmoon Faire
+[faction]
+21|Booty Bay
+46|Blacksmithing - Armorsmithing
+47|Ironforge
+54|Gnomeregan Exiles
+59|Thorium Brotherhood
+67|Horde
+68|Undercity
+69|Darnassus
+70|Syndicate
+72|Stormwind
+76|Orgrimmar
+81|Thunder Bluff
+83|Leatherworking - Elemental
+86|Leatherworking - Dragonscale
+87|Bloodsail Buccaneers
+92|Gelkis Clan Centaur
+93|Magram Clan Centaur
+169|Steamwheedle Cartel
+270|Zandalar Tribe
+289|Blacksmithing - Weaponsmithing
+349|Ravenholdt
+369|Gadgetzan
+469|Alliance
+470|Ratchet
+471|Wildhammer Clan
+509|The League of Arathor
+510|The Defilers
+529|Argent Dawn
+530|Darkspear Trolls
+549|Leatherworking - Tribal
+550|Engineering - Goblin
+551|Engineering - Gnome
+569|Blacksmithing - Hammersmithing
+570|Blacksmithing - Axesmithing
+571|Blacksmithing - Swordsmithing
+574|Caer Darrow
+576|Timbermaw Hold
+577|Everlook
+589|Wintersaber Trainers
+609|Cenarion Circle
+629|Shatterspear Trolls
+630|Ravasaur Trainers
+709|Battleground Neutral
+729|Frostwolf Clan
+730|Stormpike Guard
+749|Hydraxian Waterlords
+789|Moro'gai
+809|Shen'dralar
+889|Warsong Outriders
+890|Silverwing Sentinels
+891|Alliance Forces
+892|Horde Forces
+909|Darkmoon Faire
+910|Brood of Nozdormu
+[standing]
+4|Neutral
+5|Friendly
+6|Honored
+7|Revered
+8|Exalted
+[spec]
+1|9787|2|200|5284|Weaponsmith
+2|9788|2|200|5283|Armorsmith
+3|17039|2|250|5307|Master Swordsmith
+4|17040|2|250|5305|Master Hammersmith
+5|17041|2|250|5306|Master Axesmith
+6|20219|5|200|3630|Gnomish Engineer
+7|20222|5|200|3629|Goblin Engineer
+8|10656|7|225|5141|Dragonscale Leatherworking
+9|10658|7|225|5144|Elemental Leatherworking
+10|10660|7|225|5143|Tribal Leatherworking
+[rank]
+1|1|2259|0|75|5|10|1215+1246+1470+2132+3184+3603+5500+11041+11044+11046+11047|0|-
+1|2|3101|50|150|10|500|2391+2837+3009+3347+3964+4609+4900+5177+5499+11042|0|-
+1|3|3464|125|225|20|5000|4160+4611|0|-
+1|4|11611|200|300|35|50000|1386+7948|0|-
+2|1|2018|0|75|5|10|514+957+1241+3174+3557+4605+6299+10266+10277+10278|0|-
+2|2|3100|50|150|10|500|1383+2998+3136+3478+4596+5511+10276|0|-
+2|3|3538|125|225|20|5000|3355+4258|0|-
+2|4|9785|200|300|35|50000|2836|0|-
+3|1|2550|0|75|1|100|1355+1382+1430+1699+3026+3067+3087+3399+4210+4552+5159+5482+6286+8306|0|-
+3|2|3102|50|150|1|500|1355+1382+1430+1699+3026+3067+3087+3399+4210+4552+5159+5482+6286+8306|0|-
+3|3|3413|125|225|1|0|-|16072|-
+3|4|18260|225|300|35|0|-|0|6610
+4|1|7411|0|75|5|10|3606+5695+11065+11066+11067+11068+11070+11071|0|-
+4|2|7412|50|150|10|500|1317+3011+3345+4213+4616+5157+7949|0|-
+4|3|7413|125|225|20|5000|11072+11074|0|-
+4|4|13920|200|300|35|50000|11073|0|-
+5|1|4036|0|75|5|10|1702+2857+3290+3494+4586+10993+11025+11026+11028+11037|0|-
+5|2|4037|50|150|10|500|1676+3412+5518+11029+11031|0|-
+5|3|4038|125|225|20|5000|5174+11017|0|-
+5|4|12656|200|300|35|50000|8736|0|-
+6|1|3273|0|75|1|100|2326+2327+2329+2798+3181+3373+4211+4591+5150+5759+5939+5943+6094|0|-
+6|2|3274|50|150|1|500|2326+2327+2329+2798+3181+3373+4211+4591+5150+5759+5939+5943+6094|0|-
+6|3|7924|125|225|1|0|-|16084|-
+6|4|10846|225|300|35|0|-|0|6622+6624
+7|1|2108|0|75|5|10|223+1466+1632+3008+3069+3549+3605+5784+5811+11083+11096|0|-
+7|2|3104|50|150|10|500|1385+3365+3703+3967+4588+5127+5564+8153+11081+11084|0|-
+7|3|3811|125|225|20|5000|3007+4212|0|-
+7|4|10662|200|300|35|50000|11097+11098|0|-
+8|1|2575|0|75|1|10|1681+1701+3001+3137+3175+3357+3555+4254+4598+5392+5513+6297+8128|0|-
+8|2|2576|50|150|1|500|1681+1701+3001+3137+3175+3357+3555+4254+4598+5392+5513+6297+8128|0|-
+8|3|3564|125|225|10|5000|1681+1701+3001+3137+3175+3357+3555+4254+4598+5392+5513+6297+8128|0|-
+8|4|10248|200|300|25|50000|1681+1701+3001+3137+3175+3357+3555+4254+4598+5392+5513+6297+8128|0|-
+9|1|2842|0|300|20|0|-|0|2359+2480
+10|1|3908|0|75|5|10|1103+1300+1703+2855+3484+3523+4193+11048+11050+11051|0|-
+10|2|3909|50|150|10|500|2627+3004+3363+3704+4159+5153+5567+11049|0|-
+10|3|3910|125|225|20|5000|1346+4576|0|-
+10|4|12180|200|300|35|50000|2399+11052+11557|0|-
+11|1|7620|0|75|1|100|1651+1680+1683+1700+2367+2834+3028+3179+3332+3607+4156+4573+5161+5493+5690+5938+5941+7946+12032+12961+14740|0|-
+11|2|7731|50|150|1|500|1651+1680+1683+1700+2367+2834+3028+3179+3332+3607+4156+4573+5161+5493+5690+5938+5941+7946+12032+12961+14740|0|-
+11|3|7732|125|225|20|0|-|16083|-
+11|4|18248|225|300|35|0|-|0|6607
+12|1|2366|0|75|1|10|812+908+1218+1458+1473+2114+2390+2856+3013+3185+3404+3604+3965+4204+4614+4898+5137+5502+5566+8146+12025|0|-
+12|2|2368|50|150|1|500|812+908+1218+1458+1473+2114+2390+2856+3013+3185+3404+3604+3965+4204+4614+4898+5137+5502+5566+8146+12025|0|-
+12|3|3570|125|225|10|5000|812+908+1218+1458+1473+2114+2390+2856+3013+3185+3404+3604+3965+4204+4614+4898+5137+5502+5566+8146+12025|0|-
+12|4|11993|200|300|25|50000|812+908+1218+1458+1473+2114+2390+2856+3013+3185+3404+3604+3965+4204+4614+4898+5137+5502+5566+8146+12025|0|-
+13|1|8613|0|75|1|10|1292+6287+6288+6289+6290+6291+6292+6295+6306+6387+7087+7088+7089+8144+12030|0|-
+13|2|8617|50|150|1|500|1292+6287+6288+6289+6290+6291+6292+6295+6306+6387+7087+7088+7089+8144+12030|0|-
+13|3|8618|125|225|10|5000|1292+6287+6288+6289+6290+6291+6292+6295+6306+6387+7087+7088+7089+8144+12030|0|-
+13|4|10768|200|300|25|50000|1292+6287+6288+6289+6290+6291+6292+6295+6306+6387+7087+7088+7089+8144+12030|0|-
+[trainerset]
+1|1|1215+1246+1386+1470+2132+2391+2837+3184+3347+3603+3964+4160+4609+4611+4900+5177+5499+5500+7948+11041+11042+11044+11046+11047
+1|2|1215+1246+1470+2132+2391+2837+3009+3184+3347+3603+3964+4609+4900+5177+5499+5500+11041+11042+11044+11046+11047
+1|3|1386+2391+2837+3009+3347+3964+4160+4609+4611+4900+5177+5499+7948+11042
+1|4|1386+4160+4611+7948
+1|5|1386+7948
+2|1|514+957+1241+1383+2836+2998+3136+3174+3355+3478+3557+4258+4596+4605+5511+6299+10266+10276+10277+10278
+2|2|1383+2836+2998+3136+3355+3478+4258+4596+5511+10276
+2|3|2836+3355+4258
+2|4|5164+7230+11177
+2|5|2836
+2|6|7231+7232+11146+11178
+2|7|16365
+3|1|1355+1382+1430+1699+3026+3067+3087+3399+4210+4552+5159+5482+6286+8306
+3|2|8696
+4|1|1317+3011+3345+3606+4213+4616+5157+5695+7949+11065+11066+11067+11068+11070+11071+11072+11073+11074
+4|2|1317+3011+3345+4213+4616+5157+7949+11072+11073+11074
+4|3|11072+11073+11074
+4|4|11073
+5|1|1676+1702+2857+3290+3412+3494+4586+5174+5518+8736+10993+11017+11025+11026+11028+11029+11031+11037
+5|2|1702+2857+3290+3412+3494+4586+5174+5518+8736+10993+11017+11025+11026+11028+11029+11031+11037
+5|3|1676+3412+5174+5518+8736+11017+11029+11031
+5|4|5174+8736+11017
+5|5|8126+8738
+5|6|8126
+5|7|7406+7944
+5|8|8736
+5|9|14742
+6|1|2326+2327+2329+2798+3181+3373+4211+4591+5150+5759+5939+5943+6094
+6|2|12920+12939
+7|1|223+1385+1466+1632+3007+3008+3069+3365+3549+3605+3703+3967+4212+4588+5127+5564+5784+5811+8153+11081+11083+11084+11096+11097+11098
+7|2|1385+3007+3365+3703+3967+4212+4588+5127+5564+8153+11081+11084+11097+11098
+7|3|1385+3365+3703+3967+4588+5127+5564+8153+11081+11084
+7|4|3007+4212+11097+11098
+7|5|7866+7867
+7|6|7870+7871
+7|7|11097+11098
+7|8|7868+7869
+7|9|16365
+8|1|1681+1701+3001+3137+3175+3357+3555+4254+4598+5392+5513+6297+8128
+8|2|14401
+9|1|917+918+1234+1411+2130+3170+3327+3328+3401+3599+4163+4214+4215+4582+4583+4584+5165+5166+5167+6707+13283
+10|1|1103+1300+1346+1703+2399+2627+2855+3004+3363+3484+3523+3704+4159+4193+4576+5153+5567+11048+11049+11050+11051+11052+11557
+10|2|1346+2399+2627+3004+3363+3704+4159+4576+5153+5567+11049+11052+11557
+10|3|1346+2399+4576+11052+11557
+10|4|4578+9584
+10|5|2399+11052+11557
+10|6|16365
+[recipe]
+1|2329|1|1|0|65|0|G
+1|2330|1|1|0|65|0|G
+1|2331|25|1|0|1|0|T100@1
+1|2332|40|1|0|1|0|T150@1
+1|2333|140|1|0|4|0|I3396
+1|2334|50|1|0|1|0|T250@1
+1|2335|60|1|0|4|0|I2555
+1|2337|55|1|0|1|0|T1000@2
+1|3170|15|1|0|1|0|T50@1
+1|3171|90|1|0|1|0|T500@3
+1|3172|110|1|0|4|0|I3393
+1|3173|120|1|0|1|0|T150@3
+1|3174|120|1|0|4|0|I3394
+1|3175|250|1|0|4|0|I3395
+1|3176|125|1|0|1|0|T1500@3
+1|3177|130|1|0|1|0|T2000@3
+1|3188|150|1|0|4|0|I6211
+1|3230|50|1|0|4|0|I2553
+1|3447|110|1|0|1|0|T4000@3
+1|3448|165|1|0|1|0|T4500@4
+1|3449|165|1|0|2|0|I6068
+1|3450|175|1|0|4|0|I3830;T5400@4
+1|3451|180|1|0|4|0|I3831
+1|3452|160|1|0|1|0|T4500@4
+1|3453|195|1|0|4|0|I3832
+1|3454|200|1|0|2|0|I14634
+1|4508|50|1|0|8|0|I4597
+1|4942|215|1|0|8|0|I4624
+1|6617|60|1|0|2|0|I5640
+1|6618|175|1|0|2|0|I5643
+1|6624|150|1|0|2|0|I5642
+1|7179|90|1|0|1|0|T450@3
+1|7181|155|1|0|1|0|T4500@4
+1|7183|1|1|0|65|0|G
+1|7255|100|1|0|2|0|I6053
+1|7256|135|1|0|2|0|I6054
+1|7257|165|1|0|2|0|I6055
+1|7258|190|1|0|2|0|I6056
+1|7259|190|1|0|2|0|I6057
+1|7836|80|1|0|1|0|T250@3
+1|7837|130|1|0|1|0|T1000@3
+1|7841|100|1|0|1|0|T1000@3
+1|7845|140|1|0|1|0|T3000@3
+1|8240|90|1|0|4|0|I6663
+1|11448|205|1|0|1|0|T8100@4
+1|11449|185|1|0|1|0|T5850@4
+1|11450|195|1|0|1|0|T6750@4
+1|11451|205|1|0|1|0|T7200@4
+1|11452|210|1|0|8|0|Q2203+2501
+1|11453|210|1|0|4|0|I9293
+1|11456|210|1|0|1|0|I10644
+1|11457|215|1|0|1|0|T9000@4
+1|11458|225|1|0|4|0|I9294
+1|11459|225|1|0|2|0|I9303
+1|11460|230|1|0|1|0|T4500@5
+1|11461|235|1|0|1|0|T9000@5
+1|11464|235|1|0|4|0|I9295
+1|11465|235|1|0|1|0|T10800@5
+1|11466|240|1|0|4|0|I9296
+1|11467|240|1|0|1|0|T10800@5
+1|11468|240|1|0|4|0|I9297
+1|11472|245|1|0|4|0|I9298
+1|11473|245|1|0|2|0|I9302
+1|11476|250|1|0|2|0|I9301
+1|11477|250|1|0|2|0|I9300
+1|11478|250|1|0|1|0|T12600@5
+1|11479|225|1|0|2|1|I9304
+1|11480|225|1|0|2|1|I9305
+1|12609|200|1|0|1|0|T7200@4
+1|15833|230|1|0|1|0|T9000@5
+1|17187|275|1|0|2|1|I12958
+1|17551|250|1|0|1|0|T13500@5
+1|17552|255|1|0|4|0|I13476
+1|17553|260|1|0|2|0|I13477
+1|17554|265|1|0|2|0|I13478
+1|17555|270|1|0|4|0|I13479
+1|17556|275|1|0|2|0|I13480
+1|17557|275|1|0|8|0|I13481
+1|17559|275|1|0|2|1|I13482
+1|17560|275|1|0|2|1|I13483
+1|17561|275|1|0|2|1|I13484
+1|17562|275|1|0|2|1|I13485
+1|17563|275|1|0|4|1|I13486
+1|17564|275|1|0|4|1|I13487
+1|17565|275|1|0|4|1|I13488
+1|17566|275|1|0|4|1|I13489
+1|17570|280|1|0|4|0|I13490
+1|17571|280|1|0|4|0|I13491
+1|17572|285|1|0|4|0|I13492
+1|17573|285|1|0|4|0|I13493
+1|17574|290|1|0|4|0|I13494
+1|17575|290|1|0|4|0|I13495
+1|17576|290|1|0|4|0|I13496
+1|17577|290|1|0|4|0|I13497
+1|17578|290|1|0|4|0|I13499
+1|17580|295|1|0|6|0|I13501
+1|17634|300|1|0|4|0|I13518
+1|17635|300|1|0|4|0|I13519
+1|17636|300|1|0|4|0|I13520
+1|17637|300|1|0|4|0|I13521
+1|17638|300|1|0|4|0|I13522
+1|21923|190|1|0|40|0|I17709
+1|22732|300|1|0|4|0|I18257
+1|22808|215|1|0|1|0|T9000@4
+1|24266|300|4|0|16|0|O180368;S1
+1|24365|275|4|0|2|0|I20011
+1|24366|275|4|0|2|0|I20012
+1|24367|285|4|0|2|0|I20013
+1|24368|290|4|0|2|0|I20014
+1|25146|300|5|0|2|1|I20761
+1|26277|250|5|0|4|0|I21547
+2|2660|1|1|0|65|0|G
+2|2661|35|1|0|1|0|T100@1
+2|2662|1|1|0|1|0|T50@1
+2|2663|1|1|0|65|0|G
+2|2664|90|1|0|1|0|T500@2
+2|2665|65|1|0|1|0|T100@1
+2|2666|70|1|0|1|0|T200@1
+2|2667|80|1|0|4|0|I2881
+2|2668|105|1|0|1|0|T300@2
+2|2670|105|1|0|1|0|T450@2
+2|2672|120|1|0|1|0|T500@2
+2|2673|130|1|0|4|0|I5578
+2|2674|125|1|0|1|0|T1000@2
+2|2675|145|1|0|1|0|T1000@2
+2|2737|15|1|0|1|0|T50@1
+2|2738|20|1|0|1|0|T50@1
+2|2739|25|1|0|1|0|T50@1
+2|2740|110|1|0|1|0|T180@2
+2|2741|115|1|0|1|0|T180@2
+2|2742|120|1|0|1|0|T180@2
+2|3115|1|1|0|65|0|G
+2|3116|65|1|0|1|0|T100@1
+2|3117|125|1|0|1|0|T1000@2
+2|3292|95|1|0|1|0|T500@2
+2|3293|35|1|0|1|0|T250@1
+2|3294|70|1|0|1|0|T500@1
+2|3295|125|1|0|4|0|I2883
+2|3296|130|1|0|1|0|T1000@2
+2|3297|145|1|0|4|0|I3608
+2|3319|20|1|0|1|0|T50@1
+2|3320|25|1|0|1|0|T100@1
+2|3321|35|1|0|4|0|I3609
+2|3323|40|1|0|1|0|T100@1
+2|3324|45|1|0|1|0|T200@1
+2|3325|60|1|0|4|0|I3610
+2|3326|75|1|0|1|0|T250@1
+2|3328|110|1|0|1|0|T500@2
+2|3330|125|1|0|4|0|I2882
+2|3331|130|1|0|1|0|T500@2
+2|3333|135|1|0|1|0|T1000@2
+2|3334|145|1|0|4|0|I3611
+2|3336|150|1|0|4|0|I3612
+2|3337|125|1|0|1|0|T1000@2
+2|3491|105|1|0|1|0|T600@2
+2|3492|160|1|0|2|0|I12162
+2|3493|175|1|0|4|0|I3866
+2|3494|155|1|0|2|0|I10858
+2|3495|170|1|0|4|0|I3867
+2|3496|180|1|0|2|0|I12163
+2|3497|200|1|0|4|0|I3868
+2|3498|185|1|0|2|0|I12164
+2|3500|200|1|0|4|0|I3869
+2|3501|165|1|0|1|0|T1000@3
+2|3502|170|1|0|1|0|T1250@3
+2|3503|190|1|0|2|0|I6047
+2|3504|160|1|0|4|0|I3870
+2|3505|175|1|0|4|0|I3871
+2|3506|155|1|0|1|0|T5000@3
+2|3507|170|1|0|4|0|I3872
+2|3508|180|1|0|1|0|T7500@3
+2|3511|195|1|0|4|0|I3873
+2|3513|185|1|0|4|0|I3874
+2|3515|200|1|0|4|0|I3875
+2|6517|115|1|0|1|0|T720@2
+2|6518|140|1|0|4|0|I5543
+2|7221|150|1|0|4|0|I6044
+2|7222|165|1|0|4|0|I6045
+2|7223|185|1|0|1|0|T1000@3
+2|7224|190|1|0|4|0|I6046
+2|7408|65|1|0|1|0|T300@1
+2|7817|95|1|0|1|0|T200@2
+2|7818|100|1|0|1|0|T100@2
+2|8367|100|1|0|8|0|I6735
+2|8768|150|1|0|1|0|T250@2
+2|8880|30|1|0|1|0|T100@1
+2|9811|160|1|0|8|0|I7978
+2|9813|160|1|0|8|0|I7979
+2|9814|175|1|0|8|0|I7980
+2|9818|180|1|0|8|0|I7981
+2|9820|185|1|0|8|0|I7982
+2|9916|200|1|0|1|0|T2500@3
+2|9918|200|1|0|1|0|T2500@3
+2|9920|200|1|0|1|0|T2500@3
+2|9921|200|1|0|1|0|T2500@3
+2|9926|205|1|0|1|0|T5000@3
+2|9928|205|1|0|1|0|T5000@3
+2|9931|210|1|0|1|0|T5000@3
+2|9933|210|1|0|4|0|I7975
+2|9935|215|1|0|1|0|T5000@3
+2|9937|215|1|0|2|0|I7995
+2|9939|215|1|0|4|0|I7976
+2|9945|220|1|0|8|0|I7983
+2|9950|220|1|0|8|0|I7984
+2|9952|225|1|0|8|0|I7985
+2|9954|225|1|2|1|0|T9000@4
+2|9957|215|1|0|8|0|Q2756
+2|9959|230|1|0|1|0|T15000@5
+2|9961|230|1|0|1|0|T15000@5
+2|9964|235|1|0|4|0|I7989
+2|9966|235|1|0|4|0|I7991
+2|9968|235|1|0|1|0|T20000@5
+2|9970|245|1|0|4|0|I7990
+2|9972|240|1|0|8|0|Q2773
+2|9974|245|1|2|1|0|T9000@4
+2|9979|245|1|0|8|0|Q2772
+2|9980|245|1|0|8|0|Q2771
+2|9983|30|1|0|1|0|T100@1
+2|9985|125|1|0|1|0|T225@2
+2|9986|130|1|0|1|0|T450@2
+2|9987|135|1|0|1|0|T450@2
+2|9993|210|1|0|1|0|T10000@3
+2|9995|220|1|0|4|0|I7992
+2|9997|225|1|0|4|0|I8029
+2|10001|230|1|0|1|0|T15000@5
+2|10003|235|1|1|1|0|T13500@6
+2|10005|240|1|0|4|0|I7993
+2|10007|245|1|1|1|0|T13500@6
+2|10009|245|1|0|4|0|I8028
+2|10011|250|1|1|1|0|T13500@6
+2|10013|255|1|0|2|0|I8030
+2|10015|260|1|1|1|0|T13500@6
+2|11454|200|1|0|1|0|I10713
+2|11643|205|1|0|8|0|I9367
+2|12259|155|1|0|4|0|I10424
+2|12260|1|1|0|65|0|G
+2|14379|150|1|0|1|0|T250@2
+2|14380|200|1|0|1|0|T2500@3
+2|15292|265|1|1|4|0|I11610
+2|15293|270|1|0|16|0|I11614
+2|15294|275|1|1|4|0|I11611
+2|15295|280|1|0|16|0|I11615
+2|15296|285|1|2|4|0|I11612
+2|15972|180|1|0|1|0|T7500@3
+2|15973|190|1|0|4|0|I12261
+2|16639|250|1|0|1|0|T10000@5
+2|16640|250|1|0|1|0|T10000@5
+2|16641|250|1|0|1|0|T10000@5
+2|16642|250|1|0|4|0|I12682
+2|16643|250|1|0|4|0|I12683
+2|16644|255|1|0|4|0|I12684
+2|16645|260|1|0|4|0|I12685
+2|16646|265|1|0|8|0|I12687
+2|16647|265|1|0|8|0|I12688
+2|16648|270|1|0|4|0|I12689
+2|16649|270|1|0|8|0|I12690
+2|16650|270|1|2|4|0|I12691
+2|16651|275|1|0|4|0|I12692
+2|16652|280|1|0|4|0|I12693
+2|16653|280|1|0|4|0|I12694
+2|16654|285|1|0|4|0|I12695
+2|16655|290|1|2|8|0|I12699
+2|16656|290|1|0|4|0|I12697
+2|16657|295|1|0|8|0|I12700
+2|16658|295|1|0|8|0|I12701
+2|16659|295|1|0|4|0|I12702
+2|16661|295|1|2|6|0|I12703
+2|16662|300|1|0|4|0|I12704
+2|16663|300|1|0|8|0|I12705
+2|16664|300|1|0|4|0|I12706
+2|16665|300|1|0|4|0|I12707
+2|16667|285|1|2|8|0|I12696
+2|16724|300|1|2|4|0|I12711
+2|16725|300|1|0|4|0|I12713
+2|16726|300|1|0|4|0|I12714
+2|16728|300|1|2|4|0|I12716
+2|16729|300|1|2|4|0|I12717
+2|16730|300|1|0|8|0|I12715
+2|16731|300|1|0|4|0|I12718
+2|16732|300|1|0|4|0|I12719
+2|16741|300|1|2|4|0|I12720
+2|16742|300|2|2|8|0|I12725
+2|16744|300|2|2|8|0|I12726
+2|16745|300|2|2|8|0|I12727
+2|16746|300|1|2|4|0|I12728
+2|16969|275|1|0|2|0|I12819
+2|16970|275|1|5|8|0|I12821
+2|16971|280|1|0|2|0|I12823
+2|16973|280|1|4|8|0|I12824
+2|16978|280|1|3|8|0|I12825
+2|16983|285|1|4|16|0|I12827
+2|16984|290|1|0|4|0|I12828
+2|16985|290|1|3|16|0|I12830
+2|16988|300|1|4|4|0|I12833
+2|16990|300|1|3|4|0|I12834
+2|16991|300|1|5|4|0|I12835
+2|16992|300|1|3|4|0|I12836
+2|16993|300|1|4|4|0|I12837
+2|16994|300|1|5|4|0|I12838
+2|16995|300|1|1|4|0|I12839
+2|19666|100|1|0|1|0|T100@2
+2|19667|150|1|0|1|0|T250@2
+2|19668|200|1|0|1|0|T2500@3
+2|19669|275|1|0|1|0|T10000@5
+2|20201|275|1|0|1|0|T10000@5
+2|20872|295|1|2|2|0|I17049
+2|20873|300|1|2|2|0|I17053
+2|20874|295|1|2|2|0|I17051
+2|20876|300|1|2|2|0|I17052
+2|20890|300|1|3|2|0|I17059
+2|20897|300|1|5|2|0|I17060
+2|21161|300|1|0|8|0|I18592
+2|21913|190|1|0|40|0|I17706
+2|22757|300|1|0|4|0|I18264
+2|23628|290|3|0|2|0|I19202
+2|23629|300|3|0|2|0|I19204
+2|23632|290|3|0|2|0|I19203
+2|23633|300|3|0|2|0|I19205
+2|23636|300|3|2|2|0|I19206
+2|23637|300|3|2|2|0|I19207
+2|23638|300|3|1|2|0|I19208
+2|23639|300|3|1|2|0|I19209
+2|23650|300|3|4|2|0|I19210
+2|23652|300|3|3|2|0|I19211
+2|23653|300|3|5|2|0|I19212
+2|24136|300|4|0|2|0|I19776
+2|24137|300|4|0|2|0|I19777
+2|24138|300|4|0|2|0|I19778
+2|24139|300|4|0|2|0|I19779
+2|24140|300|4|0|2|0|I19780
+2|24141|300|4|0|2|0|I19781
+2|24399|300|3|2|2|0|I20040
+2|24912|300|4|0|8|0|I20553
+2|24913|300|4|0|8|0|I20555
+2|24914|300|4|0|8|0|I20554
+2|27585|300|5|0|2|0|I22209
+2|27586|300|5|0|2|0|I22219
+2|27587|300|5|0|4|0|I22222
+2|27588|300|5|0|2|0|I22214
+2|27589|300|5|0|4|0|I22220
+2|27590|300|5|0|2|0|I22221
+2|27829|300|5|2|4|0|I22388
+2|27830|300|5|4|4|0|I22390
+2|27832|300|5|3|4|0|I22389
+2|28242|300|6|0|8|0|Q9233;R529/8;T0@7
+2|28243|300|6|0|8|0|Q9233;R529/7;T0@7
+2|28244|300|6|0|8|0|Q9233;R529/7;T0@7
+2|28461|300|6|0|2|0|I22766
+2|28462|300|6|0|2|0|I22767
+2|28463|300|6|0|2|0|I22768
+3|2538|1|1|0|65|0|G
+3|2539|10|1|0|1|0|T50@1
+3|2540|1|1|0|65|0|G
+3|2541|50|1|0|1|0|T100@1
+3|2542|50|1|0|10|0|I2697
+3|2543|75|1|0|10|0|I728
+3|2544|75|1|0|1|0|T200@1
+3|2545|85|1|0|6|0|I2698
+3|2546|80|1|0|1|0|T150@1
+3|2547|100|1|0|10|0|I2699
+3|2548|110|1|0|6|0|I2700
+3|2549|100|1|0|10|0|I2701
+3|2795|25|1|0|10|0|I2889
+3|3370|80|1|0|10|0|I3678
+3|3371|60|1|0|10|0|I3679
+3|3372|90|1|0|10|0|I3680
+3|3373|120|1|0|10|0|I3681
+3|3376|130|1|0|10|0|I3682
+3|3377|110|1|0|10|0|I3683
+3|3397|110|1|0|10|0|I3734
+3|3398|125|1|0|10|0|I3735
+3|3399|150|1|0|8|0|I3736
+3|3400|175|1|0|8|0|I3737
+3|4094|175|1|0|10|0|I4609
+3|6412|10|1|0|8|0|I5482
+3|6413|20|1|0|2|0|I5483
+3|6414|35|1|0|2|0|I5484
+3|6415|50|1|0|2|0|I5485
+3|6416|50|1|0|10|0|I5486
+3|6417|90|1|0|8|0|I5487
+3|6418|100|1|0|2|0|I5488
+3|6419|110|1|0|2|0|I5489
+3|6499|50|1|0|1|0|T100@1
+3|6500|125|1|0|1|0|T300@1
+3|6501|90|1|0|2|0|I5528
+3|7213|175|1|0|2|0|I6039
+3|7751|1|1|0|2|0|I6325
+3|7752|1|1|0|2|0|I6326
+3|7753|50|1|0|2|0|I6328
+3|7754|50|1|0|2|0|I6329
+3|7755|100|1|0|2|0|I6330
+3|7827|50|1|0|2|0|I6368
+3|7828|175|1|0|2|0|I6369
+3|8238|85|1|0|4|0|I6661
+3|8604|1|1|0|65|0|G
+3|8607|40|1|0|2|0|I6892
+3|9513|60|1|0|10|0|Crogue;I18160
+3|13028|125|1|0|1|0|T0@2
+3|15853|125|1|0|2|0|I12227
+3|15855|175|1|0|2|0|I12228
+3|15856|175|1|0|2|0|I12229
+3|15861|175|1|0|2|0|I12231
+3|15863|175|1|0|2|0|I12232
+3|15865|175|1|0|2|0|I12233
+3|15906|200|1|0|2|0|I12239
+3|15910|200|1|0|2|0|I12240
+3|15915|225|1|0|2|0|I16111
+3|15933|225|1|0|2|0|I16110
+3|15935|1|1|0|2|0|I12226
+3|18238|225|1|0|2|0|I13939
+3|18239|225|1|0|2|0|I13940
+3|18240|240|1|0|2|0|I13942
+3|18241|225|1|0|2|0|I13941
+3|18242|240|1|0|2|0|I13943
+3|18243|250|1|0|2|0|I13945
+3|18244|250|1|0|2|0|I13946
+3|18245|275|1|0|2|0|I13947
+3|18246|275|1|0|2|0|I13948
+3|18247|275|1|0|2|0|I13949
+3|20626|225|1|0|2|0|I16767
+3|20916|175|1|0|2|0|I17062
+3|21143|1|1|0|34|0|I17200
+3|21144|35|1|0|34|0|I17201
+3|21175|200|1|0|1|0|T4000@1
+3|22480|225|1|0|2|0|I18046
+3|22761|275|2|0|4|0|I18267
+3|24418|150|1|0|2|0|I20075
+3|24801|285|5|0|8|0|Q8313
+3|25659|300|5|0|8|0|I21025
+3|25704|80|1|0|2|0|I21099
+3|25954|175|1|0|2|0|I21219
+4|7418|1|1|0|65|0|G
+4|7420|15|1|0|1|0|T50@1
+4|7421|1|1|0|65|0|G
+4|7426|40|1|0|1|0|T100@1
+4|7428|80|1|0|65|0|G
+4|7443|20|1|0|6|0|I6342
+4|7454|45|1|0|1|0|T100@1
+4|7457|50|1|0|1|0|T250@1
+4|7745|100|1|0|1|0|T500@2
+4|7748|60|1|0|1|0|T250@1
+4|7766|60|1|0|4|0|I6344
+4|7771|70|1|0|1|0|T200@1
+4|7776|80|1|0|2|0|I6346
+4|7779|80|1|0|1|0|T400@2
+4|7782|80|1|0|4|0|I6347
+4|7786|90|1|0|4|0|I6348
+4|7788|90|1|0|1|0|T500@2
+4|7793|100|1|0|2|0|I6349
+4|7795|100|1|0|1|0|T1000@2
+4|7857|120|1|0|1|0|T1000@2
+4|7859|120|1|0|4|0|I6375
+4|7861|125|1|0|1|0|T1250@2
+4|7863|125|1|0|1|0|T1400@2
+4|7867|125|1|0|2|0|I6377
+4|13378|105|1|0|1|0|T600@2
+4|13380|110|1|0|4|0|I11038
+4|13419|110|1|0|6|0|I11039
+4|13421|115|1|0|1|0|T800@2
+4|13464|115|1|0|4|0|I11081
+4|13485|130|1|0|1|0|T1500@2
+4|13501|130|1|0|1|0|T1500@2
+4|13503|140|1|0|1|0|T2000@2
+4|13522|135|1|0|4|0|I11098
+4|13529|145|1|0|1|0|T2400@2
+4|13536|140|1|0|2|0|I11101
+4|13538|140|1|0|1|0|T2500@2
+4|13607|145|1|0|1|0|T2400@2
+4|13612|145|1|0|4|0|I11150
+4|13617|145|1|0|4|0|I11151
+4|13620|145|1|0|4|0|I11152
+4|13622|150|1|0|1|0|T2500@2
+4|13626|150|1|0|1|0|T2500@2
+4|13628|150|1|0|1|0|T2500@2
+4|13631|155|1|0|1|0|T2600@3
+4|13635|155|1|0|1|0|T2600@3
+4|13637|160|1|0|1|0|T2800@3
+4|13640|160|1|0|1|0|T2800@3
+4|13642|165|1|0|1|0|T2800@3
+4|13644|170|1|0|1|0|T2800@3
+4|13646|170|1|0|2|0|I11163
+4|13648|170|1|0|1|0|T2800@3
+4|13653|175|1|0|4|0|I11164
+4|13655|175|1|0|4|0|I11165
+4|13657|175|1|0|1|0|T3000@3
+4|13659|180|1|0|1|0|T3200@3
+4|13661|180|1|0|1|0|T3600@3
+4|13663|185|1|0|1|0|T3800@3
+4|13687|190|1|0|4|0|I11167
+4|13689|195|1|0|4|0|I11168
+4|13693|195|1|0|1|0|T4000@3
+4|13695|200|1|0|1|0|T4000@3
+4|13698|200|1|0|4|0|I11166
+4|13700|200|1|0|1|0|T4000@3
+4|13702|200|1|0|1|0|T4000@3
+4|13746|205|1|0|1|0|T4200@3
+4|13794|205|1|0|1|0|T4200@3
+4|13815|210|1|0|1|0|T4400@3
+4|13817|210|1|0|4|0|I11202
+4|13822|210|1|0|1|0|T4400@3
+4|13836|215|1|0|1|0|T4600@3
+4|13841|215|1|0|4|0|I11203
+4|13846|220|1|0|4|0|I11204
+4|13858|220|1|0|1|0|T4800@3
+4|13868|225|1|0|4|0|I11205
+4|13882|225|1|0|4|0|I11206
+4|13887|225|1|0|1|0|T5000@3
+4|13890|225|1|0|1|0|T5000@3
+4|13898|265|1|0|4|0|I11207
+4|13905|230|1|0|1|0|T5400@4
+4|13915|230|1|0|4|0|I11208
+4|13917|230|1|0|1|0|T5400@4
+4|13931|235|1|0|2|0|I11223
+4|13933|235|1|0|4|0|I11224
+4|13935|235|1|0|1|0|T5800@4
+4|13937|240|1|0|1|0|T6200@4
+4|13939|240|1|0|1|0|T6200@4
+4|13941|245|1|0|1|0|T6200@4
+4|13943|245|1|0|1|0|T6200@4
+4|13945|245|1|0|4|0|I11225
+4|13947|250|1|0|4|0|I11226
+4|13948|250|1|0|1|0|T6500@4
+4|14293|10|1|0|1|0|T50@1
+4|14807|70|1|0|1|0|T200@1
+4|14809|155|1|0|1|0|T2600@3
+4|14810|175|1|0|1|0|T3000@3
+4|15596|265|1|0|4|0|I11813
+4|17180|250|1|0|1|0|T10000@4
+4|17181|250|1|0|1|0|T10000@4
+4|20008|255|1|0|4|0|I16214
+4|20009|270|1|0|4|0|I16218
+4|20010|295|1|0|4|0|I16246
+4|20011|300|1|0|4|0|I16251
+4|20012|270|1|0|4|0|I16219
+4|20013|295|1|0|4|0|I16244
+4|20014|265|1|0|4|0|I16216
+4|20015|285|1|0|2|0|I16224
+4|20016|280|1|0|4|0|I16222
+4|20017|265|1|0|2|0|I16217
+4|20020|260|1|0|4|0|I16215
+4|20023|295|1|0|4|0|I16245
+4|20024|275|1|0|4|0|I16220
+4|20025|300|1|0|4|0|I16253
+4|20026|275|1|0|2|0|I16221
+4|20028|290|1|0|4|0|I16242
+4|20029|285|1|0|4|0|I16223
+4|20030|295|1|0|4|0|I16247
+4|20031|300|1|0|4|0|I16250
+4|20032|300|1|0|4|0|I16254
+4|20033|295|1|0|4|0|I16248
+4|20034|300|1|0|4|0|I16252
+4|20035|300|1|0|4|0|I16255
+4|20036|300|1|0|4|0|I16249
+4|20051|290|1|0|2|0|I16243
+4|21931|190|1|0|40|0|I17725
+4|22749|300|1|0|4|0|I18259
+4|22750|300|1|0|4|0|I18260
+4|23799|290|3|0|2|0|I19444
+4|23800|290|3|0|2|0|I19445
+4|23801|290|3|0|2|0|I19446
+4|23802|300|3|0|2|0|I19447
+4|23803|300|3|0|2|0|I19448
+4|23804|300|3|0|2|0|I19449
+4|25072|300|5|0|4|0|I20726
+4|25073|300|5|0|4|0|I20727
+4|25074|300|5|0|4|0|I20728
+4|25078|300|5|0|4|0|I20729
+4|25079|300|5|0|4|0|I20730
+4|25080|300|5|0|4|0|I20731
+4|25081|300|5|0|2|0|I20732
+4|25082|300|5|0|2|0|I20733
+4|25083|300|5|0|4|0|I20734
+4|25084|300|5|0|4|0|I20735
+4|25086|300|5|0|4|0|I20736
+4|25124|45|5|0|2|0|I20758
+4|25125|150|5|0|2|0|I20752
+4|25126|200|5|0|2|0|I20753
+4|25127|250|5|0|2|0|I20754
+4|25128|275|5|0|2|0|I20755
+4|25129|300|5|0|2|0|I20756
+4|25130|300|5|0|2|0|I20757
+4|27837|290|5|0|2|0|I22392
+5|3918|1|1|0|65|0|G
+5|3919|1|1|0|65|0|G
+5|3920|1|1|0|65|0|G
+5|3922|30|1|0|1|0|T115@1
+5|3923|30|1|0|1|0|T130@1
+5|3924|50|1|0|1|0|T150@1
+5|3925|50|1|0|1|0|T150@1
+5|3926|65|1|0|1|0|T225@1
+5|3928|75|1|0|4|0|I4408
+5|3929|75|1|0|1|0|T250@1
+5|3930|75|1|0|1|0|T250@1
+5|3931|75|1|0|1|0|T250@1
+5|3932|85|1|0|1|0|T300@3
+5|3933|100|1|0|4|0|I4409
+5|3934|100|1|0|1|0|T400@3
+5|3936|105|1|0|1|0|T420@3
+5|3937|105|1|0|1|0|T450@3
+5|3938|105|1|0|1|0|T450@3
+5|3939|120|1|0|2|0|I13309
+5|3940|120|1|0|4|0|I4410
+5|3941|120|1|0|1|0|T500@3
+5|3942|125|1|0|1|0|T500@3
+5|3944|125|1|0|4|0|I4411
+5|3945|125|1|0|1|0|T500@3
+5|3946|125|1|0|1|0|T500@3
+5|3947|125|1|0|1|0|T300@3
+5|3949|130|1|0|1|0|T550@3
+5|3950|140|1|0|1|0|T600@3
+5|3952|140|1|0|2|0|I14639
+5|3953|145|1|0|1|0|T600@3
+5|3954|145|1|0|4|0|I4412
+5|3955|150|1|0|1|0|T750@3
+5|3956|150|1|0|1|0|T750@3
+5|3957|155|1|0|2|0|I13308
+5|3958|160|1|0|1|0|T800@4
+5|3959|160|1|0|4|0|I4413
+5|3960|165|1|0|4|0|I4414
+5|3961|170|1|0|1|0|T900@4
+5|3962|175|1|0|1|0|T1000@4
+5|3963|175|1|0|1|0|T1000@4
+5|3965|185|1|0|1|0|T1200@4
+5|3966|185|1|0|4|0|I4415
+5|3967|190|1|0|1|0|T1400@4
+5|3968|195|1|0|4|0|I4416
+5|3969|200|1|0|2|0|I13311
+5|3971|200|1|0|6|0|I7742
+5|3972|200|1|0|4|0|I4417
+5|3973|90|1|0|1|0|T300@3
+5|3977|60|1|0|1|0|T200@2
+5|3978|110|1|0|1|0|T475@3
+5|3979|180|1|0|2|0|I13310
+5|6458|135|1|0|1|0|T400@3
+5|7430|50|1|0|1|0|T150@2
+5|8243|185|1|0|8|0|I6672
+5|8334|100|1|0|1|0|T300@3
+5|8339|100|1|0|4|0|I6716
+5|8895|130|1|0|4|0|I7192
+5|9269|125|1|0|2|0|I7560
+5|9271|150|1|0|1|0|T500@3
+5|9273|165|1|0|2|0|I7561
+5|12584|150|1|0|1|0|T1000@3
+5|12585|175|1|0|1|0|T1000@4
+5|12586|175|1|0|1|0|T1000@4
+5|12587|175|1|0|4|0|I10601
+5|12589|195|1|0|1|0|T1300@4
+5|12590|175|1|0|1|0|T1000@4
+5|12591|200|1|0|1|0|T1500@4
+5|12594|205|1|0|1|0|T1600@4
+5|12595|205|1|0|1|0|T1600@4
+5|12596|210|1|0|1|0|T1700@4
+5|12597|210|1|0|2|0|I10602
+5|12599|215|1|0|1|0|T1800@4
+5|12603|215|1|0|1|0|T1800@4
+5|12607|220|1|0|4|0|I10603
+5|12614|220|1|0|4|0|I10604
+5|12615|225|1|0|4|0|I10605
+5|12616|225|1|0|4|0|I10606
+5|12617|230|1|0|2|0|I10607
+5|12618|230|1|0|1|0|T2200@8
+5|12619|235|1|0|1|0|T2400@8
+5|12620|240|1|0|4|0|I10608
+5|12621|245|1|0|1|0|T2800@8
+5|12622|245|1|0|1|0|T2800@8
+5|12624|250|1|0|2|0|I10609
+5|12715|205|1|7|1|0|T1000@5
+5|12716|205|1|7|1|0|T0@6
+5|12717|205|1|7|1|0|T1500@5
+5|12718|205|1|7|1|0|T1500@5
+5|12754|235|1|7|1|0|T2600@5
+5|12755|230|1|7|1|0|T2400@5
+5|12758|245|1|7|1|0|T3000@5
+5|12759|240|1|6|1|0|T2800@7
+5|12760|205|1|7|1|0|T1500@5
+5|12895|205|1|6|1|0|T1500@7
+5|12897|210|1|6|1|0|T1500@7
+5|12899|205|1|6|1|0|T1500@7
+5|12902|210|1|6|1|0|T1800@7
+5|12903|215|1|6|1|0|T2000@7
+5|12905|225|1|6|1|0|T2200@7
+5|12906|230|1|6|1|0|T2400@7
+5|12907|235|1|6|1|0|T2600@7
+5|12908|240|1|7|1|0|T2800@5
+5|13240|205|1|7|1|0|T1500@5
+5|15255|200|1|0|1|0|T1500@4
+5|15628|205|1|7|8|0|I11828
+5|15633|205|1|6|8|0|I11827
+5|19567|250|1|0|1|0|T4000@8
+5|19788|250|1|0|1|0|T4000@8
+5|19790|260|1|0|2|0|I16041
+5|19791|260|1|0|2|0|I16042
+5|19792|260|1|0|4|0|I16043
+5|19793|265|1|0|4|0|I16044
+5|19794|270|1|0|4|0|I16045
+5|19795|275|1|0|2|0|I16047
+5|19796|275|1|0|4|0|I16048
+5|19799|285|1|0|4|0|I16049
+5|19800|285|1|0|4|0|I16051
+5|19814|275|1|0|2|0|I16046
+5|19815|285|1|0|2|0|I16050
+5|19819|290|1|0|4|0|I16052
+5|19825|290|1|0|4|0|I16053
+5|19830|300|1|0|4|0|I16054
+5|19831|300|1|0|4|0|I16055
+5|19833|300|1|0|4|0|I16056
+5|21940|190|1|0|40|0|I17720
+5|22704|300|1|0|1|0|I18235
+5|22793|300|1|0|4|0|I18290
+5|22795|300|1|0|4|0|I18292
+5|22797|300|1|0|4|0|I18291
+5|23066|150|1|0|2|0|I18647
+5|23067|150|1|0|2|0|I18649
+5|23068|150|1|0|2|0|I18648
+5|23069|200|1|0|2|0|I18650
+5|23070|250|1|0|1|0|T5000@8
+5|23071|260|1|0|2|0|I18651
+5|23077|260|1|0|2|0|I18652
+5|23078|265|1|7|4|0|I18653
+5|23079|275|2|0|1|0|I18655
+5|23080|275|1|0|2|0|I18656
+5|23081|290|1|0|4|0|I18657
+5|23082|300|1|0|4|0|I18658
+5|23096|265|1|6|4|0|I18654
+5|23129|260|1|6|4|0|I18661
+5|23486|260|1|7|1|0|T0@9
+5|23489|260|1|6|1|0|T0@8
+5|23507|250|1|0|2|0|I19027
+5|24356|300|4|0|2|0|I20000
+5|24357|300|4|0|2|0|I20001
+5|26011|250|1|0|8|0|Q8798
+5|26416|125|1|0|40|0|I21724
+5|26417|125|1|0|40|0|I21725
+5|26418|125|1|0|40|0|I21726
+5|26420|175|1|0|40|0|I21727
+5|26421|175|1|0|40|0|I21728
+5|26422|175|1|0|40|0|I21729
+5|26423|225|1|0|40|0|I21730
+5|26424|225|1|0|40|0|I21731
+5|26425|225|1|0|40|0|I21732
+5|26426|275|1|0|40|0|I21733
+5|26427|275|1|0|40|0|I21734
+5|26428|275|1|0|40|0|I21735
+5|26442|225|1|0|40|0|I21738
+5|26443|275|1|0|40|0|I21737
+5|28327|275|6|0|40|0|I22729
+6|3275|1|1|0|65|0|G
+6|3276|40|1|0|1|0|T100@1
+6|3277|80|1|0|1|0|T250@1
+6|3278|115|1|0|1|0|T1000@1
+6|7928|150|1|0|1|0|T5000@1
+6|7929|180|1|0|2|0|I16112
+6|7934|80|1|0|1|0|T250@1
+6|7935|130|1|0|4|0|I6454
+6|10840|210|1|0|2|0|I16113
+6|10841|240|1|0|1|0|T0@2
+6|18629|260|1|0|1|0|T0@2
+6|18630|290|1|0|1|0|T0@2
+6|23787|300|3|0|2|0|I19442
+7|2149|1|1|0|65|0|G
+7|2152|1|1|0|65|0|G
+7|2153|15|1|0|1|0|T50@1
+7|2158|90|1|0|4|0|I2406
+7|2159|85|1|0|1|0|T250@2
+7|2160|40|1|0|1|0|T100@1
+7|2161|55|1|0|1|0|T100@1
+7|2162|60|1|0|1|0|T100@1
+7|2163|60|1|0|4|0|I2407
+7|2164|75|1|0|4|0|I2408
+7|2165|100|1|0|1|0|T250@2
+7|2166|120|1|0|1|0|T450@2
+7|2167|100|1|0|1|0|T350@2
+7|2168|110|1|0|1|0|T350@2
+7|2169|100|1|0|4|0|I2409
+7|2881|1|1|0|65|0|G
+7|3753|25|1|0|1|0|T75@1
+7|3756|55|1|0|1|0|T150@1
+7|3759|75|1|0|1|0|T200@1
+7|3760|150|1|0|1|0|T600@2
+7|3761|85|1|0|1|0|T350@2
+7|3762|100|1|0|4|0|I4293
+7|3763|80|1|0|1|0|T300@2
+7|3764|145|1|0|1|0|T500@2
+7|3765|120|1|0|4|0|I7360
+7|3766|250|1|0|1|0|T400@2
+7|3767|120|1|0|4|0|I4294
+7|3768|130|1|0|1|0|T500@2
+7|3769|140|1|0|4|0|I4296
+7|3770|135|1|0|1|0|T500@2
+7|3771|150|1|0|4|0|I4297
+7|3772|155|1|0|2|0|I7613
+7|3773|175|1|0|4|0|I4299
+7|3774|160|1|0|1|0|T900@4
+7|3775|170|1|0|4|0|I4298
+7|3776|180|1|0|1|0|T1080@4
+7|3777|195|1|0|4|0|I4300
+7|3778|185|1|0|2|0|I14635
+7|3779|200|1|0|4|0|I4301
+7|3780|150|1|0|1|0|T750@2
+7|3816|35|1|0|1|0|T50@1
+7|3817|100|1|0|1|0|T200@2
+7|3818|150|1|0|1|0|T500@2
+7|4096|165|1|0|2|0|I13287
+7|4097|165|1|0|2|0|I13288
+7|5244|40|1|0|8|0|I5083
+7|6661|190|1|0|1|0|T1800@4
+7|6702|90|1|0|6|0|I5786
+7|6703|95|1|0|6|0|I5787
+7|6704|170|1|0|6|0|I5788
+7|6705|190|1|0|6|0|I5789
+7|7126|1|1|0|65|0|G
+7|7133|105|1|0|4|0|I5972
+7|7135|115|1|0|1|0|T400@2
+7|7147|160|1|0|1|0|T900@4
+7|7149|170|1|0|2|0|I5973
+7|7151|175|1|0|1|0|T1080@4
+7|7153|185|1|0|4|0|I5974
+7|7156|190|1|0|1|0|T2400@4
+7|7953|90|1|0|2|0|I6474
+7|7954|105|1|0|2|0|I6475
+7|7955|115|1|0|8|0|I6476
+7|8322|90|1|0|8|0|I6710
+7|9058|1|1|0|65|0|G
+7|9059|1|1|0|65|0|G
+7|9060|30|1|0|1|0|T100@1
+7|9062|30|1|0|1|0|T100@1
+7|9064|35|1|0|4|0|I7288
+7|9065|70|1|0|1|0|T150@1
+7|9068|95|1|0|1|0|T400@2
+7|9070|100|1|0|2|0|I7289
+7|9072|120|1|0|2|0|I7290
+7|9074|120|1|0|1|0|T500@3
+7|9145|125|1|0|1|0|T500@2
+7|9146|135|1|0|2|0|I7361
+7|9147|135|1|0|2|0|I7362
+7|9148|140|1|0|4|0|I7363
+7|9149|145|1|0|4|0|I7364
+7|9193|150|1|0|1|0|T500@2
+7|9194|150|1|0|1|0|T500@2
+7|9195|165|1|0|4|0|I7449
+7|9196|175|1|0|1|0|T1350@4
+7|9197|175|1|0|4|0|I7450
+7|9198|180|1|0|1|0|T1800@4
+7|9201|185|1|0|1|0|T1800@4
+7|9202|190|1|0|2|0|I7451
+7|9206|195|1|0|1|0|T2250@4
+7|9207|200|1|0|4|0|I7452
+7|9208|200|1|0|4|0|I7453
+7|10482|200|1|0|1|0|T1800@4
+7|10487|200|1|0|1|0|T1800@4
+7|10490|200|1|0|4|0|I8384
+7|10499|205|1|0|1|0|T2700@4
+7|10507|205|1|0|1|0|T2700@4
+7|10509|205|1|0|6|0|I8385
+7|10511|210|1|0|1|0|T2700@4
+7|10516|210|1|0|2|0|I8409
+7|10518|210|1|0|1|0|T3150@4
+7|10520|215|1|0|4|0|I8386
+7|10525|220|1|0|4|0|I8395
+7|10529|220|1|0|8|0|I8403
+7|10531|220|1|0|4|0|I8387
+7|10533|220|1|0|4|0|I8397
+7|10542|225|1|0|4|0|I8398
+7|10544|225|1|0|8|0|I8404
+7|10546|225|1|0|8|0|I8405
+7|10548|235|1|0|1|0|T4000@7
+7|10552|230|1|0|1|0|T4000@7
+7|10554|235|1|0|4|0|I8399
+7|10556|235|1|0|1|0|T4500@7
+7|10558|235|1|0|1|0|T4500@7
+7|10560|240|1|0|4|0|I8389
+7|10562|240|1|0|4|0|I8390
+7|10564|240|1|0|4|0|I8400
+7|10566|245|1|0|8|0|I8406
+7|10568|245|1|0|4|0|I8401
+7|10570|250|1|0|4|0|I8402
+7|10572|250|1|0|8|0|I8407
+7|10574|250|1|0|8|0|I8408
+7|10619|225|1|8|1|0|T9000@5
+7|10621|225|1|10|1|0|L40;T9000@6
+7|10630|230|1|9|1|0|T9000@8
+7|10632|250|1|9|1|0|T9000@8
+7|10647|250|1|10|1|0|T9000@6
+7|10650|255|1|8|1|0|T9000@5
+7|14930|225|1|0|1|0|T3240@4
+7|14932|225|1|0|1|0|T3240@4
+7|19047|250|1|0|1|0|T5000@7
+7|19048|255|1|0|2|0|I15724
+7|19049|260|1|0|2|0|I15725
+7|19050|260|1|8|2|0|I15726
+7|19051|265|1|0|4|0|I15727
+7|19052|265|1|0|4|0|I15728
+7|19053|265|1|10|2|0|I15729
+7|19054|300|1|8|4|0|I15730
+7|19055|270|1|0|4|0|I15731
+7|19058|250|1|0|1|0|T5000@7
+7|19059|270|1|9|4|0|I15732
+7|19060|270|1|8|4|0|I15733
+7|19061|270|1|9|2|0|I15734
+7|19062|270|1|10|2|0|I15735
+7|19063|275|1|10|4|0|I15737
+7|19064|275|1|0|4|0|I15738
+7|19065|275|1|0|4|0|I15739
+7|19066|275|1|10|2|0|I15740
+7|19067|275|1|9|2|0|I15741
+7|19068|275|1|10|2|0|I20253
+7|19070|280|1|0|4|0|I15743
+7|19071|280|1|0|4|0|I15744
+7|19072|280|1|0|4|0|I15745
+7|19073|280|1|10|4|0|I15746
+7|19074|285|1|10|4|0|I15747
+7|19075|285|1|0|4|0|I15748
+7|19076|285|1|9|4|0|I15749
+7|19077|285|1|8|2|0|I15751
+7|19078|285|1|9|4|0|I15752
+7|19079|285|1|9|4|0|I15753
+7|19080|285|1|10|2|0|I20254
+7|19081|290|1|10|4|0|I15755
+7|19082|290|1|0|2|0|I15756
+7|19083|290|1|0|4|0|I15757
+7|19084|290|1|10|2|0|I15758
+7|19085|290|1|8|2|0|I15759
+7|19086|290|1|10|4|0|I15760
+7|19087|295|1|10|4|0|I15761
+7|19088|295|1|0|2|0|I15762
+7|19089|295|1|8|4|0|I15763
+7|19090|295|1|9|4|0|I15764
+7|19091|300|1|0|4|0|I15765
+7|19092|300|1|0|4|0|I15768
+7|19093|300|1|0|8|0|Q7493+7497
+7|19094|300|1|8|4|0|I15770
+7|19095|300|1|9|4|0|I15771
+7|19097|300|1|10|4|0|I15772
+7|19098|300|1|0|4|0|I15773
+7|19100|300|1|0|4|0|I15774
+7|19101|300|1|9|4|0|I15775
+7|19102|300|1|0|4|0|I15776
+7|19103|300|1|0|4|0|I15777
+7|19104|300|1|10|4|0|I15779
+7|19107|300|1|8|4|0|I15781
+7|20648|100|1|0|1|0|T500@2
+7|20649|150|1|0|1|0|T1000@2
+7|20650|200|1|0|1|0|T3600@4
+7|20853|295|1|10|2|0|I17022
+7|20854|300|1|9|2|0|I17023
+7|20855|300|1|8|2|0|I17025
+7|21943|190|1|0|40|0|I17722
+7|22331|250|1|0|1|0|T5000@7
+7|22711|200|2|0|2|0|I18239
+7|22727|300|1|0|4|0|I18252
+7|22815|285|1|0|8|0|Q5518;S8
+7|22921|300|2|0|16|0|I18514
+7|22922|300|2|0|16|0|I18515
+7|22923|300|2|0|16|0|I18516
+7|22926|300|2|8|16|0|I18517
+7|22927|300|2|10|16|0|I18518
+7|22928|300|2|9|16|0|I18519
+7|23190|150|2|0|2|0|I18731
+7|23399|155|1|0|2|0|I18949
+7|23703|290|3|0|2|0|I19326
+7|23704|300|3|0|2|0|I19327
+7|23705|290|3|0|2|0|I19328
+7|23706|300|3|0|2|0|I19329
+7|23707|300|3|0|2|0|I19330
+7|23708|300|3|8|2|0|I19331
+7|23709|300|3|10|2|0|I19332
+7|23710|300|3|9|2|0|I19333
+7|24121|300|4|0|2|0|I19769
+7|24122|300|4|0|2|0|I19770
+7|24123|300|4|0|2|0|I19771
+7|24124|300|4|0|2|0|I19772
+7|24125|300|4|0|2|0|I19773
+7|24654|300|1|8|1|0|T45000@5
+7|24655|280|1|8|1|0|T27000@5
+7|24703|300|5|8|2|0|I20382
+7|24846|300|5|0|2|0|I20506
+7|24847|300|5|0|2|0|I20507
+7|24848|300|5|0|2|0|I20508
+7|24849|300|5|0|2|0|I20509
+7|24850|300|5|0|2|0|I20510
+7|24851|300|5|0|2|0|I20511
+7|24940|100|1|0|2|0|I20576
+7|26279|300|5|9|4|0|I21548
+7|28219|300|6|0|8|0|Q9233;R529/8;T0@9
+7|28220|300|6|0|8|0|Q9233;R529/7;T0@9
+7|28221|300|6|0|8|0|Q9233;R529/7;T0@9
+7|28222|300|6|0|8|0|Q9233;R529/8;T0@9
+7|28223|300|6|0|8|0|Q9233;R529/7;T0@9
+7|28224|300|6|0|8|0|Q9233;R529/7;T0@9
+7|28472|300|6|0|2|0|I22771
+7|28473|300|6|0|2|0|I22770
+7|28474|300|6|0|2|0|I22769
+8|2657|1|1|0|65|0|G
+8|2658|75|1|0|1|0|T200@1
+8|2659|65|1|0|1|0|T200@1
+8|3304|65|1|0|1|0|T50@1
+8|3307|125|1|0|1|0|T500@1
+8|3308|155|1|0|1|0|T2500@1
+8|3569|165|1|0|1|0|T2500@1
+8|10097|175|1|0|1|0|T5000@1
+8|10098|230|1|0|1|0|T10000@1
+8|14891|230|1|0|8|0|Q4083;S8
+8|16153|250|1|0|1|0|T20000@1
+8|22967|300|3|0|1|0|S9;T0@2
+9|2835|130|1|0|1|0|L30;T10000@1
+9|2837|170|1|0|1|0|L38;T18000@1
+9|3420|1|1|0|1|0|L20;T3000@1
+9|3421|230|1|0|1|0|L50;T35000@1
+9|5763|100|1|0|1|0|L24;T5000@1
+9|6510|150|1|0|1|0|L34;T14000@1
+9|8681|1|1|0|65|0|G;L20
+9|8687|120|1|0|1|0|L28;T8000@1
+9|8691|160|1|0|1|0|L36;T16000@1
+9|8694|170|1|0|1|0|L38;T18000@1
+9|11341|200|1|0|1|0|L44;T29000@1
+9|11342|240|1|0|1|0|L52;T46000@1
+9|11343|280|1|0|1|0|L60;T54000@1
+9|11357|210|1|0|1|0|L46;T31000@1
+9|11358|250|1|0|1|0|L54;T48000@1
+9|11400|240|1|0|1|0|L52;T46000@1
+9|13220|140|1|0|1|0|L32;T12000@1
+9|13228|180|1|0|1|0|L40;T20000@1
+9|13229|220|1|0|1|0|L48;T33000@1
+9|13230|260|1|0|1|0|L56;T50000@1
+9|25347|300|5|0|4|0|I21302;L60
+10|2385|10|1|0|1|0|T50@1
+10|2386|65|1|0|1|0|T200@1
+10|2387|1|1|0|65|0|G
+10|2389|40|1|0|4|0|I2598
+10|2392|40|1|0|1|0|T50@1
+10|2393|1|1|0|1|0|T25@1
+10|2394|40|1|0|1|0|T50@1
+10|2395|70|1|0|1|0|T300@1
+10|2396|70|1|0|1|0|T200@1
+10|2397|60|1|0|1|0|T200@1
+10|2399|85|1|0|1|0|T300@2
+10|2401|95|1|0|1|0|T300@2
+10|2402|75|1|0|1|0|T250@1
+10|2403|105|1|0|4|0|I2601
+10|2406|100|1|0|1|0|T200@2
+10|2963|1|1|0|65|0|G
+10|2964|75|1|0|1|0|T100@1
+10|3755|45|1|0|1|0|T100@1
+10|3757|80|1|0|1|0|T200@2
+10|3758|95|1|0|4|0|I4292
+10|3813|150|1|0|1|0|T800@2
+10|3839|125|1|0|1|0|T500@2
+10|3840|35|1|0|1|0|T100@1
+10|3841|60|1|0|1|0|T200@1
+10|3842|70|1|0|1|0|T300@1
+10|3843|85|1|0|1|0|T400@2
+10|3844|100|1|0|4|0|I4346
+10|3845|80|1|0|1|0|T300@2
+10|3847|95|1|0|4|0|I4345
+10|3848|110|1|0|1|0|T500@2
+10|3849|120|1|0|4|0|I4347
+10|3850|110|1|0|1|0|T500@2
+10|3851|125|1|0|4|0|I4349
+10|3852|130|1|0|1|0|T750@2
+10|3854|145|1|0|2|0|I7114
+10|3855|125|1|0|1|0|T750@2
+10|3856|140|1|0|4|0|I4350
+10|3857|165|1|0|2|0|I14630
+10|3858|170|1|0|4|0|I4351
+10|3859|150|1|0|1|0|T750@2
+10|3860|175|1|0|4|0|I4352
+10|3861|185|1|0|1|0|T900@3
+10|3862|200|1|0|2|0|I4355
+10|3863|180|1|0|4|0|I4353
+10|3864|200|1|0|4|0|I4356
+10|3865|175|1|0|1|0|T900@3
+10|3866|110|1|0|1|0|T250@2
+10|3868|125|1|0|4|0|I4348
+10|3869|135|1|0|2|0|I14627
+10|3870|155|1|0|2|0|I6401
+10|3871|170|1|0|1|0|T450@3
+10|3872|185|1|0|4|0|I4354
+10|3873|200|1|0|2|0|I10728
+10|3914|30|1|0|1|0|T50@1
+10|3915|1|1|0|65|0|G
+10|6521|90|1|0|1|0|T400@2
+10|6686|70|1|0|6|0|I5771
+10|6688|115|1|0|6|0|I5772
+10|6690|135|1|0|1|0|T1000@2
+10|6692|150|1|0|4|0|I5773
+10|6693|175|1|0|4|0|I5774
+10|6695|185|1|0|4|0|I5775
+10|7623|30|1|0|1|0|T50@1
+10|7624|30|1|0|1|0|T50@1
+10|7629|55|1|0|4|0|I6271
+10|7630|55|1|0|2|0|I6270
+10|7633|70|1|0|2|0|I6272
+10|7639|100|1|0|2|0|I6274
+10|7643|115|1|0|2|0|I6275
+10|7892|120|1|0|4|0|I6390
+10|7893|120|1|0|4|0|I6391
+10|8465|40|1|0|1|0|T50@1
+10|8467|110|1|0|1|0|T250@2
+10|8483|160|1|0|1|0|T450@3
+10|8489|175|1|0|1|0|T675@3
+10|8758|140|1|0|1|0|T600@2
+10|8760|145|1|0|1|0|T600@2
+10|8762|160|1|0|1|0|T675@3
+10|8764|170|1|0|1|0|T900@3
+10|8766|175|1|0|1|0|T900@3
+10|8770|190|1|0|1|0|T900@3
+10|8772|175|1|0|1|0|T900@3
+10|8774|180|1|0|1|0|T900@3
+10|8776|15|1|0|1|0|T50@1
+10|8780|145|1|0|4|0|I7092
+10|8782|150|1|0|4|0|I7091
+10|8784|165|1|0|4|0|I7090
+10|8786|175|1|0|2|0|I7089
+10|8789|180|1|0|2|0|I7087
+10|8791|185|1|0|1|0|T2250@3
+10|8793|190|1|0|4|0|I7084
+10|8795|190|1|0|4|0|I7085
+10|8797|195|1|0|4|0|I7086
+10|8799|195|1|0|1|0|T2700@3
+10|8802|205|1|0|2|0|I7088
+10|8804|210|1|0|1|0|T4500@3
+10|12044|1|1|0|65|0|G
+10|12045|20|1|0|1|0|T50@1
+10|12046|75|1|0|1|0|T300@1
+10|12047|120|1|0|4|0|I10316
+10|12048|205|1|0|1|0|T3600@3
+10|12049|205|1|0|1|0|T3600@3
+10|12050|210|1|0|1|0|T3600@3
+10|12052|210|1|0|1|0|T4500@4
+10|12053|215|1|0|1|0|T4500@3
+10|12055|215|1|0|1|0|T4950@4
+10|12056|215|1|0|4|0|I10300
+10|12059|215|1|0|4|0|I10301
+10|12060|215|1|0|4|0|I10302
+10|12061|215|1|0|1|0|T2250@3
+10|12064|220|1|0|2|0|I10311
+10|12065|225|1|0|1|0|T4500@3
+10|12066|225|1|0|4|0|I10312
+10|12067|225|1|0|1|0|T4500@3
+10|12069|225|1|0|1|0|T4500@3
+10|12070|225|1|0|1|0|T4500@3
+10|12071|225|1|0|1|0|T5400@4
+10|12072|230|1|0|1|0|T6000@5
+10|12073|230|1|0|1|0|T6000@5
+10|12074|230|1|0|1|0|T6000@5
+10|12075|230|1|0|2|0|I10314
+10|12076|235|1|0|1|0|T5850@4
+10|12077|235|1|0|1|0|T5000@5
+10|12078|235|1|0|4|0|I10315
+10|12079|235|1|0|1|0|T6500@5
+10|12080|235|1|0|2|0|I10317
+10|12081|240|1|0|2|0|I10318
+10|12082|240|1|0|1|0|T6300@4
+10|12084|240|1|0|4|0|I10320
+10|12085|240|1|0|2|0|I10321
+10|12086|245|1|0|8|0|I10463
+10|12088|245|1|0|1|0|T7500@5
+10|12089|245|1|0|2|0|I10323
+10|12091|250|1|0|2|0|I10325
+10|12092|250|1|0|1|0|T7500@5
+10|12093|250|1|0|2|0|I10326
+10|18401|250|1|0|1|0|T10000@5
+10|18402|255|1|0|1|0|T10000@5
+10|18403|255|1|0|4|0|I14466
+10|18404|255|1|0|4|0|I14467
+10|18405|260|1|0|2|0|I14468
+10|18406|260|1|0|2|0|I14469
+10|18407|260|1|0|4|0|I14470
+10|18408|260|1|0|4|0|I14471
+10|18409|265|1|0|2|0|I14472
+10|18410|265|1|0|4|0|I14473
+10|18411|265|1|0|4|0|I14474
+10|18412|270|1|0|4|0|I14476
+10|18413|270|1|0|4|0|I14477
+10|18414|270|1|0|4|0|I14478
+10|18415|270|1|0|4|0|I14479
+10|18416|275|1|0|4|0|I14480
+10|18417|275|1|0|2|0|I14481
+10|18418|275|1|0|4|0|I14482
+10|18419|275|1|0|2|0|I14483
+10|18420|275|1|0|4|0|I14484
+10|18421|275|1|0|4|0|I14485
+10|18422|275|1|0|4|0|I14486
+10|18423|280|1|0|2|0|I14488
+10|18424|280|1|0|4|0|I14489
+10|18434|280|1|0|4|0|I14490
+10|18436|285|1|0|4|0|I14493
+10|18437|285|1|0|4|0|I14492
+10|18438|285|1|0|4|0|I14491
+10|18439|290|1|0|4|0|I14494
+10|18440|290|1|0|4|0|I14497
+10|18441|290|1|0|4|0|I14495
+10|18442|290|1|0|4|0|I14496
+10|18444|295|1|0|4|0|I14498
+10|18445|300|1|0|4|0|I14499
+10|18446|300|1|0|4|0|I14500
+10|18447|300|1|0|4|0|I14501
+10|18448|300|1|0|4|0|I14507
+10|18449|300|1|0|4|0|I14504
+10|18450|300|1|0|4|0|I14505
+10|18451|300|1|0|4|0|I14506
+10|18452|300|1|0|4|0|I14509
+10|18453|300|1|0|4|0|I14508
+10|18454|300|1|0|4|0|I14511
+10|18455|300|1|0|4|0|I14510
+10|18456|300|1|0|4|0|I14512
+10|18457|300|1|0|4|0|I14513
+10|18458|300|1|0|4|0|I14514
+10|18560|250|1|0|2|0|I14526
+10|19435|290|1|0|8|0|Q6032
+10|20848|300|1|0|2|0|I17017
+10|20849|300|1|0|2|0|I17018
+10|21945|190|1|0|40|0|I17724
+10|22759|300|1|0|4|0|I18265
+10|22813|285|2|0|8|0|Q5519;S8
+10|22866|300|2|0|16|0|I18414
+10|22867|300|2|0|16|0|I18415
+10|22868|300|2|0|16|0|I18416
+10|22869|300|2|0|16|0|I18417
+10|22870|300|2|0|16|0|I18418
+10|22902|300|2|0|2|0|I18487
+10|23662|290|3|0|2|0|I19215
+10|23663|300|3|0|2|0|I19218
+10|23664|290|3|0|2|0|I19216
+10|23665|300|3|0|2|0|I19217
+10|23666|300|3|0|2|0|I19219
+10|23667|300|3|0|2|0|I19220
+10|24091|300|4|0|2|0|I19764
+10|24092|300|4|0|2|0|I19765
+10|24093|300|4|0|2|0|I19766
+10|24901|300|4|0|8|0|I20546
+10|24902|300|4|0|8|0|I20548
+10|24903|300|4|0|8|0|I20547
+10|26085|260|1|0|2|0|I21358
+10|26086|285|1|0|16|0|O180794;S10
+10|26087|300|1|0|4|0|I21371
+10|26403|250|1|0|40|0|I21722
+10|26407|250|1|0|40|0|I21723
+10|27658|225|1|0|2|0|I22307
+10|27659|275|5|0|2|0|I22308
+10|27660|300|5|0|4|0|I22309
+10|27724|275|5|0|2|0|I22310
+10|27725|300|5|0|2|0|I22312
+10|28205|300|6|0|8|0|Q9233;R529/7;T0@6
+10|28207|300|6|0|8|0|Q9233;R529/8;T0@6
+10|28208|300|6|0|8|0|Q9233;R529/7;T0@6
+10|28209|300|6|0|8|0|Q9233;R529/7;T0@6
+10|28210|300|6|0|2|0|I22683
+10|28480|300|6|0|2|0|I22774
+10|28481|300|6|0|2|0|I22773
+10|28482|300|6|0|2|0|I22772
+[item]
+1|2553|2|1|w|W6-21
+1|2555|2|1|w|W6-21
+1|3393|1|1|w|W15-30
+1|3394|1|1|w|W15-30
+1|3395|2|1|w|W40-55
+1|3396|1|1|w|W20-35
+1|3830|1|1|w|W10-41
+1|3831|1|1|w|W30-45
+1|3832|2|1|w|W30-45
+1|4597|2|1|-|Q429
+1|4624|1|1|-|Q715
+1|5640|1|1|-|V100@1669+1685+3335+3499
+1|5642|1|1|-|V1800@3348+4226+5178
+1|5643|1|1|-|V2000@3335+4226
+1|6053|1|1|-|V800@1685+3134+3490
+1|6054|1|1|-|V900@2393+3956
+1|6055|1|1|-|V1500@2380+4083
+1|6056|1|1|-|V2000@2812+2848
+1|6057|1|1|-|V2000@2848+5594+8157+8158
+1|6068|1|1|-|V1500@2481+4878
+1|6211|1|1|w|W20-35
+1|6663|2|1|w|W10-26
+1|9293|2|1|w|W35-50
+1|9294|2|1|w|W36-52
+1|9295|2|1|w|W40-55
+1|9296|2|1|-|D1783+1791
+1|9297|2|1|w|W40-63
+1|9298|2|1|w|W40-55
+1|9300|1|1|-|V10000@8177+8178
+1|9301|2|1|-|V10000@1313+4610
+1|9302|1|1|-|V9000@8157+8158
+1|9303|1|1|-|V8000@5594
+1|9304|1|1|-|V8000@5594
+1|9305|1|1|-|V8000@5594
+1|10644|1|1|-|S2
+1|12958|1|1|-|V50000@5594
+1|13476|2|1|-|D7027
+1|13477|1|1|-|V12000@4226+4610
+1|13478|1|1|-|V13000@3348+5178
+1|13479|2|1|-|D9449+9450+9451+9452+15162
+1|13480|1|1|-|V15000@11188
+1|13481|2|1|-|Q5150
+1|13482|2|1|-|R529/6;V15000@10856+10857+11536
+1|13483|2|1|-|V15000@9499
+1|13484|2|1|-|R576/5;V15000@11557
+1|13485|2|1|-|V15000@11278
+1|13486|2|1|w|W50-63
+1|13487|2|1|w|W50-63
+1|13488|2|1|w|W50-63
+1|13489|2|1|w|W50-63
+1|13490|2|1|w|W50-63
+1|13491|2|1|-|D6201+7106
+1|13492|2|1|w|W50-63
+1|13493|2|1|w|W52-63
+1|13494|2|1|-|D9262+9264
+1|13495|2|1|-|D7428
+1|13496|2|1|-|D1812+1813
+1|13497|2|1|-|D7437
+1|13499|2|1|-|D8546+8550
+1|13501|2|1|-|D1853;V30000@11278
+1|13518|2|1|w|W55-63
+1|13519|2|1|-|D10363
+1|13520|2|1|-|D10813
+1|13521|2|1|-|D10508
+1|13522|2|1|-|D10339
+1|14634|2|1|-|V2500@2480
+1|17709|1|1|e|E141;Q8769
+1|18257|3|1|-|D11982+11988+12056+12057+12118+12259+12264
+1|20011|1|4|-|R270/7;V50000@14921
+1|20012|1|4|-|R270/5;V50000@14921
+1|20013|1|4|-|R270/8;V50000@14921
+1|20014|1|4|-|R270/6;V50000@14921
+1|20761|1|5|-|R59/5;V120000@12944
+1|21547|2|5|-|D5844+5846+8637
+2|2881|2|1|w|W10-25
+2|2882|2|1|w|W15-30
+2|2883|2|1|w|W15-30
+2|3608|2|1|w|W20-35
+2|3609|2|1|w|W5-20
+2|3610|2|1|w|W5-20
+2|3611|2|1|w|W20-35
+2|3612|2|1|w|W20-35
+2|3866|2|1|w|W25-40
+2|3867|2|1|w|W25-40
+2|3868|2|1|w|W30-45
+2|3869|2|1|w|W30-45
+2|3870|2|1|w|W25-40
+2|3871|3|1|w|W25-40
+2|3872|2|1|w|W25-40
+2|3873|2|1|w|W30-45
+2|3874|2|1|w|W30-45
+2|3875|3|1|w|W30-45
+2|5543|2|1|w|W20-35
+2|5578|2|1|w|W15-30
+2|6044|2|1|w|W20-35
+2|6045|2|1|w|W25-40
+2|6046|2|1|w|W30-45
+2|6047|1|1|-|V4400@5411
+2|6735|2|1|-|Q1618
+2|7975|2|1|w|W35-50
+2|7976|3|1|w|W35-50
+2|7978|2|1|-|Q2752
+2|7979|2|1|-|Q2751
+2|7980|2|1|-|Q2754
+2|7981|2|1|-|Q2753
+2|7982|2|1|-|Q2755
+2|7983|2|1|-|Q2761
+2|7984|2|1|-|Q2762
+2|7985|2|1|-|Q2763
+2|7989|2|1|w|W40-55
+2|7990|2|1|w|W40-55
+2|7991|3|1|w|W40-55
+2|7992|2|1|w|W35-50
+2|7993|2|1|w|W40-55
+2|7995|1|1|-|V6000@8161+8176
+2|8028|3|1|w|W40-55
+2|8029|2|1|w|W35-50
+2|8030|1|1|-|V10000@11278
+2|9367|2|1|-|Q2758
+2|10424|2|1|w|W20-35
+2|10713|1|1|-|S3
+2|10858|1|1|-|V3000@1471+8878+9179
+2|11610|3|1|-|D9028
+2|11611|3|1|-|D9554+10043
+2|11612|3|1|-|D9543
+2|11614|2|1|-|O173232
+2|11615|2|1|-|O173234
+2|12162|1|1|-|V3000@2843+3356+5512
+2|12163|1|1|-|V4400@2482
+2|12164|1|1|-|V4400@1146+2483
+2|12261|2|1|w|W30-40
+2|12682|2|1|w|W45-60
+2|12683|2|1|w|W45-60
+2|12684|2|1|w|W45-60
+2|12685|2|1|w|W45-60
+2|12687|2|1|-|Q7659
+2|12688|2|1|-|Q7653
+2|12689|2|1|w|W45-60
+2|12690|2|1|-|Q7655
+2|12691|2|1|w|W45-60
+2|12692|2|1|w|W45-60
+2|12693|2|1|w|W45-60
+2|12694|2|1|w|W45-60
+2|12695|2|1|w|W50-63
+2|12696|3|1|-|Q5127
+2|12697|2|1|w|W50-63
+2|12699|3|1|-|Q5124
+2|12700|2|1|-|Q7654
+2|12701|2|1|-|Q7657
+2|12702|2|1|w|W50-63
+2|12703|3|1|w|V40000@11278;W50-63
+2|12704|2|1|w|W50-63
+2|12705|2|1|-|Q7656
+2|12706|2|1|-|D4366
+2|12707|2|1|-|D1836
+2|12711|3|1|w|W50-63
+2|12713|2|1|w|W55-63
+2|12714|2|1|-|D4364
+2|12715|2|1|-|Q7658
+2|12716|3|1|w|W60-63
+2|12717|4|1|w|W60-63
+2|12718|2|1|-|D4368+16072
+2|12719|2|1|-|D1885
+2|12720|4|1|w|W60-63
+2|12725|3|2|-|Q7651
+2|12726|3|2|-|Q7650
+2|12727|3|2|-|Q7649
+2|12728|4|1|w|W60-63
+2|12819|2|1|-|V16000@11278
+2|12821|3|1|-|Q5306
+2|12823|1|1|-|V20000@11278
+2|12824|2|1|-|Q5305
+2|12825|2|1|-|Q5307
+2|12827|2|1|-|O176325
+2|12828|2|1|-|D10119
+2|12830|1|1|-|O176327
+2|12833|3|1|-|D10438
+2|12834|3|1|-|D10899
+2|12835|3|1|-|D9736
+2|12836|3|1|-|D1844
+2|12837|3|1|-|D10899
+2|12838|3|1|-|D9596
+2|12839|3|1|-|D10997
+2|17049|3|1|-|R59/6;V90000@12944
+2|17051|3|1|-|R59/5;V70000@12944
+2|17052|3|1|-|R59/7;V180000@12944
+2|17053|3|1|-|R59/7;V200000@12944
+2|17059|3|1|-|R59/6;V220000@12944
+2|17060|3|1|-|R59/8;V220000@12944
+2|17706|2|1|e|E141;Q8769
+2|18264|3|1|-|D11982+11988+12056+12057+12118+12259+12264
+2|18592|4|1|-|Q7604
+2|18628|4|1|-|V0@12944
+2|18769|3|2|-|K18628;S4
+2|18770|3|2|-|K18628;S4
+2|18771|3|2|-|K18628;S4
+2|19202|1|3|-|R576/6;V22000@11557
+2|19203|1|3|-|R529/6;V22000@10856+10857+11536
+2|19204|1|3|-|R576/7;V40000@11557
+2|19205|1|3|-|R529/7;V40000@10856+10857+11536
+2|19206|1|3|-|R59/6;V60000@12944
+2|19207|1|3|-|R59/7;V80000@12944
+2|19208|1|3|-|R59/7;V70000@12944
+2|19209|1|3|-|R59/7;V70000@12944
+2|19210|1|3|-|R59/8;V120000@12944
+2|19211|1|3|-|R59/8;V120000@12944
+2|19212|1|3|-|R59/8;V120000@12944
+2|19776|1|4|-|R270/7;V50000@14921
+2|19777|1|4|-|R270/6;V50000@14921
+2|19778|1|4|-|R270/5;V50000@14921
+2|19779|1|4|-|R270/7;V50000@14921
+2|19780|1|4|-|R270/6;V50000@14921
+2|19781|1|4|-|R270/5;V50000@14921
+2|20040|1|3|-|R59/8;V80000@12944
+2|20553|3|4|-|Q8323;S5
+2|20554|3|4|-|Q8323;S5
+2|20555|3|4|-|Q8323;S5
+2|22209|1|5|-|R609/5;V50000@15176
+2|22214|1|5|-|R609/6;V50000@15176
+2|22219|1|5|-|R609/7;V50000@15471
+2|22220|3|5|-|D15340
+2|22221|1|5|-|R609/8;V80000@15471
+2|22222|3|5|-|D15263
+2|22388|4|5|w|W55-63
+2|22389|4|5|w|W60-63
+2|22390|4|5|w|W60-63
+2|22766|1|5|-|R609/7;V50000@15176
+2|22767|1|5|-|R609/6;V50000@15176
+2|22768|1|5|-|R609/5;V50000@15176
+3|728|1|1|-|Q38;V200@340
+3|2697|1|1|-|Q22;V400@340
+3|2698|1|1|w|V400@340;W10-20
+3|2699|1|1|-|Q92;V800@340
+3|2700|1|1|w|V400@340;W10-25
+3|2701|1|1|-|Q90;V1600@340
+3|2889|1|1|-|Q384;V240@340
+3|3678|1|1|-|Q385;V400@340
+3|3679|1|1|-|Q418;V400@340
+3|3680|1|1|-|Q127;V1600@340
+3|3681|1|1|-|Q471;V1600@340
+3|3682|1|1|-|Q296;V1600@340+1148+2821
+3|3683|1|1|-|Q93;V1600@340
+3|3734|1|1|-|Q498;V1600@3960+12246
+3|3735|1|1|-|Q501;V1800@3489+12245
+3|3736|1|1|-|Q564
+3|3737|1|1|-|Q555+7321
+3|4609|1|1|-|Q703;V1000@2814+12246
+3|5482|1|1|-|Q4161
+3|5483|1|1|-|V140@3881
+3|5484|1|1|-|V240@3081
+3|5485|1|1|-|V400@4200
+3|5486|1|1|-|Q2178;V440@3482
+3|5487|1|1|-|Q862
+3|5488|1|1|-|V400@3482
+3|5489|1|1|-|V1200@3960+12245
+3|5528|1|1|-|V800@4305+4307
+3|6039|1|1|-|V5000@2664
+3|6325|1|1|-|V40@66+1684+3029+3550+4265+4574+5494+5940+8508
+3|6326|1|1|-|V40@3550+4305+5162+5942+10118
+3|6328|1|1|-|V400@66+1684+3027+4265+4574+5162+5748+5940
+3|6329|1|1|-|V400@1684
+3|6330|1|1|-|V1200@2383+2397+3027+3029+3497+4553+5494
+3|6368|1|1|-|V400@3178+3333+3497+4305+4307+4553+5494+5748+5942+10118
+3|6369|1|1|-|V2200@2383+2664+3178+3333+4307+4574+5162+12033+12962
+3|6661|2|1|w|W10-25
+3|6892|1|1|-|V248@1465+3556
+3|12226|1|1|-|V24@2118
+3|12227|1|1|-|V1600@12246
+3|12228|1|1|-|V5000@734+1148+2810+2821+4879+4897+12245
+3|12229|1|1|-|V5000@7947+8145+12246
+3|12231|1|1|-|V3000@734+1148+12245
+3|12232|1|1|-|V5000@989+4879+9636+12245
+3|12233|1|1|-|V3000@4897+8150+12246
+3|12239|1|1|-|V7000@4879+4897+12246
+3|12240|1|1|-|V7000@8150+9636+12245
+3|13939|1|1|-|V16000@8137
+3|13940|1|1|-|V16000@2664
+3|13941|1|1|-|V16000@2664
+3|13942|1|1|-|V16000@8137
+3|13943|1|1|-|V16000@2664
+3|13945|1|1|-|V20000@8137
+3|13946|1|1|-|V20000@8137
+3|13947|1|1|-|V20000@7947+8145
+3|13948|1|1|-|V20000@7947+8145
+3|13949|1|1|-|V20000@7947+8145
+3|16072|1|1|-|V10000@3955+12033
+3|16110|1|1|-|V12000@2803+2806+11187
+3|16111|1|1|-|V12000@989+1149+4305
+3|16767|1|1|-|V3000@8139
+3|17062|1|1|-|V2200@2383+2664+3178+3333+4307+4574+5162+12033+12962
+3|17200|1|1|e|E141;V24@13420+13429+13432+13433+13435
+3|17201|1|1|e|E141;V240@13420+13429+13432+13433+13435
+3|18046|1|1|-|V12000@4782+7733+8125
+3|18160|2|1|-|Q2359+2478;V200@6779
+3|18267|2|2|-|D14354
+3|20075|1|1|-|V2000@4879
+3|21025|4|5|-|Q8586
+3|21099|1|1|-|V500@2381+2397+2664+3027+3085+3400+4223+4265+4553+5160+5483+8307+12033+14738
+3|21219|1|1|-|V5000@2381+2397+2664+3027+3085+3400+4223+4265+4553+5160+5483+8307+12033+14738
+4|6342|2|1|w|V300@1318+3012+3346+4228+4617+5158+5757+5758+15419;W5-20
+4|6344|2|1|w|W10-25
+4|6346|2|1|-|V400@3346+5757
+4|6347|2|1|w|W10-25
+4|6348|2|1|w|W10-25
+4|6349|1|1|-|V500@3012+3346+5158+5758
+4|6375|2|1|w|W15-30
+4|6377|2|1|-|V1000@3012+3537
+4|11038|2|1|w|W15-30
+4|11039|2|1|w|V800@3954+12043;W15-30
+4|11081|2|1|w|W15-30
+4|11098|2|1|w|W20-35
+4|11101|2|1|-|V2500@3954+12043
+4|11150|2|1|-|D1051+1052+1053+1054+1364
+4|11151|2|1|-|D3834+3919+4028+4029+4030
+4|11152|2|1|-|D2374+2375+2376+2377+14276
+4|11163|2|1|-|V3000@2381+2821
+4|11164|2|1|w|W25-40
+4|11165|2|1|w|W25-40
+4|11166|2|1|-|D2556+2557+2558+2606
+4|11167|2|1|w|W30-45
+4|11168|2|1|w|W30-45
+4|11202|2|1|w|W35-50
+4|11203|2|1|-|D674
+4|11204|2|1|w|W35-50
+4|11205|2|1|-|D764+765+766+1081+14448
+4|11206|2|1|-|D2246+5623+7805
+4|11207|2|1|-|D9024
+4|11208|2|1|w|W40-55
+4|11223|2|1|-|V5800@989+4229
+4|11224|2|1|w|W40-55
+4|11225|2|1|w|W40-55
+4|11226|2|1|w|W40-55
+4|11813|2|1|-|D9025
+4|16214|2|1|-|D2642
+4|16215|2|1|w|W45-60
+4|16216|2|1|-|D5259
+4|16217|1|1|-|V12000@4229+4561
+4|16218|2|1|w|W45-60
+4|16219|2|1|-|D6201
+4|16220|2|1|w|W45-60
+4|16221|1|1|-|V16000@11189
+4|16222|2|1|-|D9447
+4|16223|2|1|-|D7524
+4|16224|1|1|-|V20000@12022
+4|16242|2|1|-|D9452
+4|16243|1|1|-|V22000@12022
+4|16244|2|1|-|D9198
+4|16245|2|1|w|W50-63
+4|16246|2|1|-|D7372
+4|16247|2|1|-|D10317
+4|16248|2|1|-|D10398
+4|16249|2|1|-|D10422
+4|16250|2|1|-|D9216
+4|16251|2|1|w|W55-63
+4|16252|2|1|-|D4494+9451
+4|16253|2|1|w|W60-63
+4|16254|3|1|-|D10499
+4|16255|2|1|-|D10469
+4|17725|2|1|e|E141;Q8769
+4|18259|3|1|-|D11982+11988+12056+12057+12118+12259+12264
+4|18260|3|1|-|D11982+11988+12056+12057+12118+12259+12264
+4|19444|1|3|-|R59/5;V30000@12944
+4|19445|1|3|-|R576/6;V30000@11557
+4|19446|1|3|-|R529/6;V30000@10856+10857+11536
+4|19447|1|3|-|R529/7;V60000@10856+10857+11536
+4|19448|1|3|-|R59/6;V80000@12944
+4|19449|1|3|-|R59/7;V100000@12944
+4|20726|3|5|-|D15275+15276
+4|20727|3|5|-|D15263+15299+15339+15340+15341+15348+15369+15370+15509+15510+15511+15516+15543+15544
+4|20728|3|5|-|D15263+15299+15339+15340+15341+15348+15369+15370+15509+15510+15511+15516+15543+15544
+4|20729|3|5|-|D15263+15299+15339+15340+15341+15348+15369+15370+15509+15510+15511+15516+15543+15544
+4|20730|3|5|-|D15263+15299+15339+15340+15341+15348+15369+15370+15509+15510+15511+15516+15543+15544
+4|20731|3|5|-|D15263+15299+15339+15340+15341+15348+15369+15370+15509+15510+15511+15516+15543+15544
+4|20732|1|5|-|R609/5;V100000@15419
+4|20733|1|5|-|R609/6;V100000@15419
+4|20734|3|5|-|D15263+15299+15339+15340+15341+15348+15369+15370+15509+15510+15511+15516+15543+15544
+4|20735|3|5|-|D15275+15276
+4|20736|3|5|-|D15263+15299+15339+15340+15341+15348+15369+15370+15509+15510+15511+15516+15543+15544
+4|20752|1|5|-|V3000@1318+3012+3346+4228+4617+5158+5757+5758+15419
+4|20753|1|5|-|V4000@1318+3012+3346+4228+4617+5158+5757+5758+15419
+4|20754|1|5|-|V10000@15419
+4|20755|1|5|-|V20000@15419
+4|20756|1|5|-|R270/6;V40000@14921
+4|20757|1|5|-|R270/5;V40000@14921
+4|20758|1|5|-|V500@1318+3012+3346+4228+4617+5158+5757+5758+15419
+4|22392|1|5|-|R576/5;V25000@11557
+5|4408|2|1|w|W5-20
+5|4409|2|1|w|W10-25
+5|4410|2|1|w|W15-30
+5|4411|2|1|-|D7800
+5|4412|2|1|w|W20-35
+5|4413|2|1|-|D7800
+5|4414|2|1|w|W25-40
+5|4415|3|1|w|W30-45
+5|4416|2|1|w|W30-45
+5|4417|2|1|w|W30-45
+5|6672|2|1|-|Q1559
+5|6716|2|1|w|W10-25
+5|7192|2|1|-|D7800
+5|7560|1|1|-|V1200@5175+6730
+5|7561|1|1|-|V2000@3134+3537+4086+12246
+5|7742|1|1|-|D7800;V2400@6777
+5|10601|2|1|w|W25-40
+5|10602|1|1|-|V3000@8679+9544
+5|10603|2|1|w|W35-50
+5|10604|2|1|w|W35-50
+5|10605|3|1|w|W35-50
+5|10606|2|1|w|W35-50
+5|10607|1|1|-|V3600@8678
+5|10608|3|1|w|W40-55
+5|10609|1|1|-|V4000@2688
+5|11827|2|1|-|Q3645;S5
+5|11828|2|1|-|Q3644
+5|13308|1|1|-|V1800@2684
+5|13309|1|1|-|V1000@2682+6730
+5|13310|1|1|-|V2000@2685+12246
+5|13311|1|1|-|V10000@2687
+5|14639|1|1|-|V1500@2682+2683
+5|16041|1|1|-|V12000@3413+5175
+5|16042|1|1|-|V12000@3413+5175
+5|16043|2|1|w|W45-60
+5|16044|2|1|w|W45-60
+5|16045|2|1|-|D6195
+5|16046|1|1|-|V16000@11185
+5|16047|1|1|-|V16000@11185
+5|16048|2|1|-|D8897
+5|16049|2|1|-|D8920
+5|16050|1|1|-|V20000@11185
+5|16051|2|1|w|W50-63
+5|16052|2|1|-|D10426
+5|16053|2|1|-|D8900
+5|16054|2|1|-|D7437
+5|16055|2|1|w|W50-63
+5|16056|2|1|-|D8561
+5|17720|2|1|e|E141;Q8769
+5|18235|2|1|-|S6
+5|18290|3|1|-|D11982+11988+12056+12057+12118+12259+12264
+5|18291|3|1|-|D11982+11988+12056+12057+12118+12259+12264
+5|18292|3|1|-|D11982+11988+12056+12057+12118+12259+12264
+5|18647|1|1|-|V1800@3413
+5|18648|1|1|-|V1800@2838+3495
+5|18649|1|1|-|V1800@1304+5175
+5|18650|1|1|-|V5000@8131
+5|18651|1|1|-|V12000@2685
+5|18652|1|1|-|V12000@11185
+5|18653|2|1|-|D9499
+5|18654|2|1|-|D8920
+5|18655|2|2|-|S7
+5|18656|1|1|-|V16000@11185
+5|18657|2|1|-|D10264
+5|18658|2|1|-|D10426
+5|18661|2|1|-|D8920
+5|19027|1|1|-|S8;V5000@14637
+5|20000|1|4|-|R270/6;V120000@14921
+5|20001|1|4|-|R270/5;V50000@14921
+5|21724|2|1|e|E327;Q8876
+5|21725|2|1|e|E327;Q8876
+5|21726|2|1|e|E327;Q8876
+5|21727|2|1|e|E327;Q8879
+5|21728|2|1|e|E327;Q8879
+5|21729|2|1|e|E327;Q8879
+5|21730|2|1|e|E327;Q8880
+5|21731|2|1|e|E327;Q8880
+5|21732|2|1|e|E327;Q8880
+5|21733|2|1|e|E327;Q8881
+5|21734|2|1|e|E327;Q8881
+5|21735|2|1|e|E327;Q8881
+5|21737|2|1|e|E327;Q8882
+5|21738|2|1|e|E327;Q8877
+5|22729|1|6|e|E999999;Q9249
+6|6454|2|1|w|W20-35
+6|16084|1|1|-|V10000@2805+13476
+6|16112|1|1|-|V2200@2805+13476
+6|16113|1|1|-|V5000@2805+13476
+6|19442|1|3|-|R529/6;V100000@10856+10857+11536
+7|2406|2|1|w|W5-20
+7|2407|2|1|w|W5-20
+7|2408|2|1|w|W5-20
+7|2409|2|1|w|W10-25
+7|4293|2|1|w|W10-25
+7|4294|2|1|w|W15-30
+7|4296|2|1|w|W20-35
+7|4297|2|1|w|W20-35
+7|4298|3|1|w|W25-40
+7|4299|2|1|w|W25-40
+7|4300|2|1|w|W30-45
+7|4301|3|1|w|W35-40
+7|5083|2|1|-|Q769
+7|5786|1|1|-|D1732+3385;V548@843+3556+4186
+7|5787|1|1|-|D657+3386;V600@843+3556+4186
+7|5788|2|1|-|D938;V648@2381+2393+2846
+7|5789|2|1|-|D1561;V2800@2846+4897
+7|5972|2|1|w|W15-30
+7|5973|1|1|-|V648@2810+2821+3958+4877
+7|5974|2|1|w|W30-45
+7|6474|1|1|-|V548@5783
+7|6475|1|1|-|V1500@5783
+7|6476|2|1|-|Q1487
+7|6710|2|1|-|Q1582
+7|7288|2|1|w|W5-20
+7|7289|1|1|-|V648@2697
+7|7290|1|1|-|V1600@2679
+7|7360|2|1|w|W20-35
+7|7361|2|1|-|V1800@6731
+7|7362|1|1|-|V2000@3537
+7|7363|2|1|w|W20-35
+7|7364|2|1|w|W20-35
+7|7449|2|1|w|W25-40
+7|7450|2|1|w|W25-40
+7|7451|2|1|-|V2800@4225+4589+7852+7854
+7|7452|3|1|w|W30-40
+7|7453|2|1|w|W30-45
+7|7613|1|1|-|V2000@2679+2698
+7|8384|3|1|w|W35-45
+7|8385|1|1|w|V3500@7852+7854;W35-50
+7|8386|2|1|w|W35-50
+7|8387|2|1|w|W35-50
+7|8389|2|1|w|W40-55
+7|8390|2|1|w|W40-55
+7|8395|2|1|-|D5618
+7|8397|2|1|-|D5617
+7|8398|2|1|-|D5616
+7|8399|2|1|-|D5615
+7|8400|2|1|-|D5623+7805+7883
+7|8401|2|1|-|D5615
+7|8402|2|1|-|D5623+7805+7883
+7|8403|2|1|-|Q2848+2855
+7|8404|2|1|-|Q2849+2856
+7|8405|2|1|-|Q2850+2857
+7|8406|2|1|-|Q2851+2858
+7|8407|2|1|-|Q2852+2859
+7|8408|2|1|-|Q2853+2860
+7|8409|2|1|-|V4000@7854+8160
+7|13287|2|1|-|V2500@2819
+7|13288|2|1|-|V2500@2816
+7|14635|1|1|-|V3000@2699
+7|15724|1|1|-|V12000@12956
+7|15725|1|1|-|V12000@12942+12943
+7|15726|1|1|-|V12000@11874
+7|15727|2|1|-|D5981
+7|15728|2|1|-|D6201
+7|15729|1|1|-|V12000@12957
+7|15730|3|1|-|D10363
+7|15731|2|1|w|W45-60
+7|15732|2|1|-|D7035
+7|15733|3|1|-|D5226
+7|15734|1|1|-|V14000@7852+7854
+7|15735|1|1|-|V14000@12958
+7|15737|2|1|w|W45-60
+7|15738|2|1|-|D7025
+7|15739|2|1|-|D7112
+7|15740|1|1|-|V16000@11189
+7|15741|1|1|-|V16000@12942+12943
+7|15743|2|1|w|W50-63
+7|15744|2|1|-|D7107
+7|15745|2|1|w|W50-63
+7|15746|2|1|w|W50-63
+7|15747|2|1|-|D7440
+7|15748|2|1|-|D7027
+7|15749|2|1|-|D9259
+7|15751|1|1|-|V20000@12957
+7|15752|3|1|-|D7158
+7|15753|3|1|-|D6138
+7|15755|2|1|w|W50-63
+7|15756|1|1|-|V22000@12941
+7|15757|2|1|w|W50-63
+7|15758|1|1|-|V22000@12959
+7|15759|1|1|-|V22000@9499
+7|15760|3|1|-|D2644
+7|15761|2|1|-|D7441
+7|15762|1|1|-|V25000@12956
+7|15763|3|1|-|D6146
+7|15764|3|1|-|D6144
+7|15765|2|1|w|W55-63
+7|15768|2|1|-|D10406
+7|15770|3|1|-|D8898
+7|15771|3|1|-|D1813
+7|15772|3|1|-|D6556+6557+6559+9477
+7|15773|2|1|-|D10499
+7|15774|2|1|-|D7029
+7|15775|2|1|-|D9260
+7|15776|2|1|-|D11582
+7|15777|2|1|-|D10425
+7|15779|2|1|-|D7438
+7|15781|3|1|-|D8903
+7|17022|1|1|-|V150000@12944
+7|17023|1|1|-|V160000@12944
+7|17025|1|1|-|V160000@12944
+7|17722|2|1|e|E141;Q8769
+7|18239|1|2|-|V3500@2699
+7|18252|3|1|-|D11982+11988+12056+12057+12118+12259+12264
+7|18514|3|2|-|O179501
+7|18515|3|2|-|O179501
+7|18516|3|2|-|O179501
+7|18517|4|2|-|O179501
+7|18518|4|2|-|O179501
+7|18519|4|2|-|O179501
+7|18731|1|2|-|V2000@3366+5128
+7|18949|1|1|-|V2000@4225+4589
+7|19326|1|3|-|R576/6;V22000@11557
+7|19327|1|3|-|R576/7;V40000@11557
+7|19328|1|3|-|R529/6;V22000@10856+10857+11536
+7|19329|1|3|-|R529/7;V40000@10856+10857+11536
+7|19330|1|3|-|V60000@12944
+7|19331|1|3|-|V90000@12944
+7|19332|1|3|-|V90000@12944
+7|19333|1|3|-|V90000@12944
+7|19769|1|4|-|R270/7;V50000@14921
+7|19770|1|4|-|R270/6;V50000@14921
+7|19771|1|4|-|R270/5;V50000@14921
+7|19772|1|4|-|R270/7;V50000@14921
+7|19773|1|4|-|R270/6;V50000@14921
+7|20253|1|1|-|R576/5;V16000@11557
+7|20254|1|1|-|R576/5;V20000@11557
+7|20382|1|5|-|R609/8;V60000@15293
+7|20506|1|5|-|R609/5;V40000@15293
+7|20507|1|5|-|R609/6;V40000@15293
+7|20508|1|5|-|R609/7;V40000@15293
+7|20509|1|5|-|R609/5;V40000@15293
+7|20510|1|5|-|R609/6;V40000@15293
+7|20511|1|5|-|R609/7;V40000@15293
+7|20576|1|1|-|V1400@777
+7|21548|3|5|-|D14454+14457
+7|22694|1|6|-|R529/7;V150000@16365
+7|22769|1|5|-|R609/5;V50000@15293
+7|22770|1|5|-|R609/6;V50000@15293
+7|22771|1|5|-|R609/7;V50000@15293
+9|21302|3|5|-|D15339+15340+15341+15348+15369+15370;L60
+10|2598|2|1|w|W5-15
+10|2601|2|1|w|W15-30
+10|4292|2|1|w|W10-25
+10|4345|2|1|w|W10-25
+10|4346|2|1|w|W10-25
+10|4347|2|1|w|W15-30
+10|4348|2|1|w|W15-30
+10|4349|2|1|w|W15-30
+10|4350|2|1|w|W20-35
+10|4351|2|1|w|W25-40
+10|4352|2|1|w|W25-40
+10|4353|2|1|w|W30-45
+10|4354|3|1|w|W30-45
+10|4355|1|1|-|V1500@2381+6567
+10|4356|2|1|-|D4289+4295
+10|5771|1|1|-|D590+3530+3531;V200@843+3005+3556+4189
+10|5772|1|1|-|D450+2264;V500@777+1454+1474+3005+3364+3485+3537+3683+4189+4577+5944
+10|5773|2|1|-|D910+2337
+10|5774|2|1|w|W25-40
+10|5775|2|1|-|D2242+2434+4834
+10|6270|1|1|-|V200@66+3364+3485+3522+4189
+10|6271|2|1|w|W5-20
+10|6272|1|1|-|V300@1250+3485+3499+3556+4168
+10|6274|1|1|-|V400@843+1347+2394+3364+5944
+10|6275|1|1|-|V800@1454+1474+2669+3499+4168+4577
+10|6390|2|1|w|W15-30
+10|6391|2|1|w|W15-30
+10|6401|1|1|-|V1100@2394+2669
+10|7084|2|1|w|W30-45
+10|7085|2|1|w|W30-45
+10|7086|2|1|w|W30-45
+10|7087|1|1|-|V1200@2670+12246
+10|7088|1|1|-|V5000@6568
+10|7089|1|1|-|V1500@6574+6576
+10|7090|2|1|w|W25-40
+10|7091|2|1|w|W20-35
+10|7092|2|1|w|W20-35
+10|7114|1|1|-|V1000@2679+9636
+10|10300|2|1|w|W35-50
+10|10301|2|1|w|W35-50
+10|10302|2|1|w|W35-50
+10|10311|1|1|-|V3000@3005+4168
+10|10312|2|1|w|W35-50
+10|10314|1|1|-|V4000@3364+8681
+10|10315|2|1|w|W40-55
+10|10316|2|1|w|W15-30
+10|10317|1|1|-|V4000@3364+8681
+10|10318|1|1|-|V7000@2672
+10|10320|2|1|w|W40-55
+10|10321|1|1|-|V4500@4577+8681
+10|10323|1|1|-|V4500@4577+8681
+10|10325|1|1|-|V10000@1347+3005
+10|10326|1|1|-|V5000@4577+8681
+10|10463|2|1|-|Q3402
+10|10728|1|1|-|V1500@2663
+10|14466|2|1|w|W45-60
+10|14467|2|1|w|W45-60
+10|14468|1|1|-|V12000@11189
+10|14469|1|1|-|V12000@7940
+10|14470|2|1|w|W45-60
+10|14471|2|1|-|D5861
+10|14472|1|1|-|V12000@7940
+10|14473|2|1|-|D7864
+10|14474|2|1|w|W45-60
+10|14476|2|1|-|D5861
+10|14477|2|1|-|D7864+8538
+10|14478|2|1|w|W45-60
+10|14479|2|1|w|W45-60
+10|14480|2|1|-|D8538
+10|14481|1|1|-|V16000@11189
+10|14482|2|1|-|D7037
+10|14483|1|1|-|V16000@12022
+10|14484|2|1|w|W45-60
+10|14485|2|1|-|D8551
+10|14486|3|1|-|D9026
+10|14488|1|1|-|V20000@7940
+10|14489|2|1|w|W50-63
+10|14490|2|1|-|D7037
+10|14491|2|1|w|R576/5;W50-63
+10|14492|2|1|w|W50-63
+10|14493|3|1|-|D7437
+10|14494|2|1|w|W50-63
+10|14495|2|1|-|D10384
+10|14496|2|1|w|W50-63
+10|14497|3|1|w|W50-63
+10|14498|2|1|w|W50-63
+10|14499|2|1|w|W50-62
+10|14500|2|1|-|D8526
+10|14501|3|1|w|W55-62
+10|14504|2|1|w|W55-63
+10|14505|2|1|-|D8526
+10|14506|2|1|w|W55-63
+10|14507|3|1|w|W50-62
+10|14508|2|1|w|W55-63
+10|14509|3|1|w|W61-63
+10|14510|3|1|w|W61-63
+10|14511|4|1|w|W61-63
+10|14512|4|1|-|D10813
+10|14513|4|1|-|D9264
+10|14514|4|1|-|D1853
+10|14526|1|1|-|V20000@11189
+10|14627|1|1|-|V800@2668
+10|14630|1|1|-|V1000@2670
+10|17017|1|1|-|V180000@12944
+10|17018|1|1|-|V80000@12944
+10|17724|1|1|e|E141;Q8769
+10|18265|3|1|-|D11982+11988+12056+12057+12118+12259+12264
+10|18414|4|2|-|O179501
+10|18415|3|2|-|O179501
+10|18416|3|2|-|O179501
+10|18417|3|2|-|O179501
+10|18418|3|2|-|O179501
+10|18487|1|2|-|V40000@14371
+10|19215|1|3|-|R576/6;V22000@11557
+10|19216|1|3|-|R529/6;V22000@10856+10857+11536
+10|19217|1|3|-|R529/7;V40000@10856+10857+11536
+10|19218|1|3|-|R576/7;V40000@11557
+10|19219|1|3|-|V60000@12944
+10|19220|1|3|-|V90000@12944
+10|19764|1|4|-|R270/7;V50000@14921
+10|19765|1|4|-|R270/6;V50000@14921
+10|19766|1|4|-|R270/5;V50000@14921
+10|20546|3|5|-|Q8323;S5
+10|20547|3|5|-|Q8323;S5
+10|20548|3|5|-|Q8323;S5
+10|21358|1|1|-|V12000@6568
+10|21371|3|1|-|D11982+11988+12056+12057+12118+12259+12264
+10|21722|2|1|e|E327;Q8878
+10|21723|2|1|e|E327;Q8878
+10|22307|1|1|-|V6000@1318+3012+3346+4228+4617+5158+5757+5758
+10|22308|1|5|-|V20000@15419
+10|22309|2|5|-|D11487
+10|22310|1|5|-|R609/5;V20000@15179
+10|22312|1|5|-|R609/7;V50000@15179
+10|22683|1|5|-|R609/7;V90000@15179
+10|22684|1|6|-|R529/7;V120000@16365
+10|22686|1|6|-|R529/7;V150000@16365
+10|22687|1|6|-|R529/7;V120000@16365
+10|22772|1|5|-|R609/5;V50000@15179
+10|22773|1|5|-|R609/6;V50000@15179
+10|22774|1|5|-|R609/7;V50000@15179
+11|16083|1|1|-|V10000@2626
+]==]
