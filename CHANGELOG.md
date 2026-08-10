@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Recipe tooltip lines now include the character you're playing, shown as "You" first in
+  the Known/Learnable line (and the unscanned count says "characters", since that can be
+  you too).
+
 - **Shopping list for missing recipes.** The Professions detail pane grew Raid Prep's
   shopping-list verb: a **Shopping List** button beside the filter toggles (and
   `/nexus profs shoplist [character] [profession]`) prints a chat list of the selected
