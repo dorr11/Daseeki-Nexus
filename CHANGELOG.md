@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+- **Profession delegates (phase 1).** The professions grid now takes designations:
+  right-click a character's profession cell to name them the faction's **primary** (or
+  secondary) collector for that profession — scoped to specialisation lanes, so a main
+  Armorsmith and a main Axesmith can both stand for Blacksmithing, each for their own
+  recipes — and right-click a name to appoint the faction's **recipe bank**. The dataset
+  learned the era truth that the three Master smith specialisations sit under Weaponsmith,
+  and recipe resolution walks that tree: an Axesmith plan with no axesmith primary falls to
+  the Weaponsmith primary, then to the general one; plain recipes belong to the general
+  primary alone. Designations are intent — you can appoint a future Axesmith before
+  they've specced, from the Plan submenu. Designated cells wear a quiet 1/2, the bank a B,
+  and the whole config rides the mesh to every account (newest edit wins, from any of
+  them). The payoff on tooltips: hover any recipe and if your faction's primary for that
+  lane is proven to be missing it, one accent line says so first —
+  `Primary missing: Poonyx (280/275)` — even when their skill isn't there yet, because
+  collecting comes first. An unscanned primary stays honestly quiet. A future Conduit
+  phase will route recipe mail with these same designations.
+
 - Recipe tooltip lines now include the character you're playing, shown as "You" first in
   the Known/Learnable line (and the unscanned count says "characters", since that can be
   you too).
