@@ -1417,7 +1417,48 @@ local function defaultData()
             schema = 1,
             chars  = {},
         },
+        -- Sayge gossip flight recorder (1.1.7 hotfix). ADDITIVE and
+        -- schema-versioned independently of STORAGE_VERSION, house doctrine
+        -- for diagnostic SavedVariables: bounded (a ring of the most recent
+        -- Store.SAYGE_TRACE_MAX visits, newest first), build-stamped (each
+        -- record carries the ns.VERSION that wrote it), and never consulted by
+        -- any behaviour — auto.lua writes it, `/dsn debug sayge` reads it,
+        -- nothing steers by it. Exists because the wrong-buff incident left no
+        -- evidence: the next gossip-ordering anomaly will be diagnosable from
+        -- the SV file alone.
+        saygeTrace = {
+            schema = 1,
+            visits = {},    -- [1] = newest { at, build, class, want, pages, outcome }
+        },
     }
+end
+
+-- Cap for the Sayge visit ring (see saygeTrace above).
+Store.SAYGE_TRACE_MAX = 10
+
+-- Append one completed Sayge visit record, newest first, and trim the ring.
+-- Tolerates a pre-1.1.7 data SV (the block is lazily rebuilt) so the hotfix
+-- can never crash on the very save file it exists to diagnose.
+function Store.AppendSaygeVisit(rec)
+    if type(rec) ~= "table" then return false end
+    local data = Store.data
+    if type(data) ~= "table" then return false end
+    if type(data.saygeTrace) ~= "table" or type(data.saygeTrace.visits) ~= "table" then
+        data.saygeTrace = { schema = 1, visits = {} }
+    end
+    local ring = data.saygeTrace.visits
+    table.insert(ring, 1, rec)
+    for i = #ring, Store.SAYGE_TRACE_MAX + 1, -1 do
+        table.remove(ring, i)
+    end
+    return true
+end
+
+-- The ring, newest first (read-only by convention; the debug dump's source).
+function Store.GetSaygeTrace()
+    local data = Store.data
+    local t = type(data) == "table" and data.saygeTrace or nil
+    return type(t) == "table" and t.visits or nil
 end
 
 Store.ALERT_BUFF_KEYS    = ALERT_BUFF_KEYS
@@ -7948,9 +7989,48 @@ local function testResolveOwner(fails)
         .. tostring(flatAid) .. ")")
 end
 
+-- Sayge visit ring (1.1.7): bounded, newest-first, lazily self-healing on a
+-- pre-1.1.7 data SV, and refusing garbage. The ring is diagnostic-only, so the
+-- one thing that would make it dangerous is growing without bound — the cap is
+-- the point of the test.
+local function testSaygeTraceRing(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local savedData = Store.data
+
+    -- Fresh data SV: the block exists by default.
+    Store.data = { saygeTrace = { schema = 1, visits = {} } }
+    for i = 1, Store.SAYGE_TRACE_MAX + 2 do
+        ck(Store.AppendSaygeVisit({ n = i }) == true, "append " .. i .. " accepted")
+    end
+    local ring = Store.GetSaygeTrace()
+    ck(ring ~= nil and #ring == Store.SAYGE_TRACE_MAX,
+        "ring capped at SAYGE_TRACE_MAX (" .. tostring(ring and #ring) .. ")")
+    ck(ring[1].n == Store.SAYGE_TRACE_MAX + 2, "newest first")
+    ck(ring[#ring].n == 3, "oldest surviving record is the (max+2 - max + 1)th append")
+
+    -- Pre-1.1.7 data SV: no saygeTrace block at all. Append heals it.
+    Store.data = {}
+    ck(Store.AppendSaygeVisit({ n = 99 }) == true, "append heals a legacy data SV")
+    ring = Store.GetSaygeTrace()
+    ck(ring ~= nil and #ring == 1 and ring[1].n == 99, "healed block holds the record")
+
+    -- Garbage refuses without touching anything.
+    ck(Store.AppendSaygeVisit(nil) == false, "nil record refused")
+    ck(Store.AppendSaygeVisit("visit") == false, "non-table record refused")
+    ck(#Store.GetSaygeTrace() == 1, "refused records did not land")
+
+    -- No data SV at all (called before Init): refuse, do not error.
+    Store.data = nil
+    ck(Store.AppendSaygeVisit({ n = 1 }) == false, "no data SV refuses cleanly")
+    ck(Store.GetSaygeTrace() == nil, "no data SV reads as nil")
+
+    Store.data = savedData
+end
+
 function Store.RunSelfTests(verbose)
     local suites = {
         { name = "defaults",        fn = testDefaults },
+        { name = "sayge trace ring (1.1.7)", fn = testSaygeTraceRing },
         { name = "storage migration (AT-RISK-3)", fn = testStorageMigration },
         { name = "bags import marker (NW-2)", fn = testBagsImportMarker },
         { name = "alert migration", fn = testAlertMigration },
