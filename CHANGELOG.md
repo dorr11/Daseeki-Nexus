@@ -29,6 +29,58 @@
 - **Added:** `/nexus debug professions` — what the module has captured this session, which
   characters it holds records for, and the dataset it is working from.
 
+- **Added:** **recipe items now tell you which of your characters wants them.** Hover a plan,
+  pattern, formula, schematic or recipe — in your bags, at a vendor, on an auction house
+  listing, on a link somebody posted in chat — and Nexus adds two quiet lines underneath:
+
+      Known: Poonyx, Zug
+      Learnable: Puucons (285/275)
+
+  *Known* is the characters who already have it. *Learnable* is the characters who do not,
+  have the profession, are high enough skill, and hold the right specialisation if the recipe
+  needs one — with their current skill and the recipe's requirement, so you can see how close
+  the rest are. Your own character is left out on purpose: the game's own tooltip already
+  tells you whether *you* know it.
+
+  There is a third line you will sometimes see — `(2 alts unscanned)` — and it is the most
+  important one. It means exactly two of your characters have that profession and Nexus has
+  never been allowed to look at their recipe list, so it has no idea and refuses to guess.
+  It will never quietly file an unvisited character under "already knows it", which is the one
+  mistake that would hide the very alt you opened the tooltip to find. Open that character's
+  profession window once and the line goes away for good.
+
+- **Added:** **search and filter controls on the game's own profession windows.** Open any
+  profession and a slim Nexus bar sits above the window with a search box, a **Have
+  Materials** tick, a category picker and an equipment-slot picker. Type "arcanite" and the
+  list is just the arcanite recipes; tick Have Materials and it is just what you can make
+  right now; the pickers narrow it by category or by which slot the result goes in. **Clear**
+  puts everything back. The enchanting window gets the tick and the slot picker — the game
+  gives nobody a way to search enchants by name, and we would rather leave a control out than
+  fake one. Filters clear themselves whenever the window closes, and whenever the window
+  switches to a different profession.
+
+  Nexus does not redraw the recipe list to do any of this — it asks the game to filter its own
+  list, which is why the scrollbar, the row colours, your collapsed categories and your
+  selected recipe all keep behaving exactly as they always have.
+
+- **Fixed:** **a filtered recipe list can no longer shrink what Nexus has recorded about a
+  character.** When the game filters a profession window, it genuinely hands out a shorter
+  list — and Nexus reads that same list to learn what you can make. Left alone, searching for
+  "iron" while the window was open would have recorded that character as knowing four
+  recipes. Now a filtered window is simply not read from at all: whatever was last proven
+  stands untouched, and the full list is re-read the moment the filters come off, when the
+  window opens, and when you close them with **Clear**. That applies to a filter you left
+  behind in the game window too, not just to the Nexus bar.
+
+- **Added:** `/nexus debug proffilters` — whether the bar is up, which controls this client
+  can offer, and whether the open window is currently narrowing what Nexus is allowed to
+  read. `/nexus debug tooltips` grew a matching line for the recipe lines.
+
+- **Note for the transition:** if **MissingTradeSkillsList** or **ClassicProfessionFilter**
+  are still installed, Nexus stands its own version down — the recipe lines for the first, the
+  filter bar for the second — and says so once, so you never get two of anything on one
+  window. Uninstall them and the Nexus versions appear on the next login.
+
 ## 1.1.6 — 2026-08-08
 
 - **Added:** **Rin'wosho repairs your gear again.** Nexus has always been able to auto-repair,
