@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- **Professions: profession windows no longer lag on open.** The capture layer now scans a
+  profession once and then merely *verifies* it: after a complete scan, window opens and
+  crafting sprees are answered by a cheap settled-signature check (row count, per-row names,
+  skill rank — no link reads, no spell lookups, no re-harvest) instead of re-running the
+  full 176-row resolve on every event. A learned recipe, a rank-up, or any drift the
+  signature can see forces a real rescan automatically; consumed cooldowns still publish
+  instantly off the cheap pass. The one-time expensive work now persists where it belongs —
+  reagent harvests once per dataset, the filter bar's measured client conventions once per
+  client build — and the reagent harvest is spread across frames so even the first open
+  doesn't hitch. A new Rescan button on the profession window's filter bar (and
+  `/nexus profs rescan`) forces the full capture, re-harvest and re-measure on demand.
+
 - **Professions tab, reworked into three permanent panes.** The character grid takes the
   left ~60% with a CHARACTER | PRIMARY | PRIMARY | COOKING | FIRST AID | FISHING header —
   the Poisons column is gone from the grid (the data is still captured and shows on the
