@@ -1827,10 +1827,15 @@ function buildAccountsTable(flow)
             local peer = ns.Mesh and ns.Mesh.peers and ns.Mesh.peers[entry.aid]
             local nChars = 0; for _ in pairs(entry.bucket.characters or {}) do nChars = nChars + 1 end
             row.aid:SetText("#" .. entry.aid)
-            -- Status glyphs (round-3 item 32): ● green You / ● green Online / ○ grey Offline.
+            -- Status glyphs (round-3 item 32, glyph audit 2026-08): one dot shape,
+            -- three inks — ● green You / ● green Online / ● grey Offline. U+25CF is
+            -- the ONLY circle FiraSansCondensed-Medium.ttf ships (U+25CB WHITE
+            -- CIRCLE is absent from its cmap and rendered as a tofu box), so
+            -- online/offline reads by COLOR, not by shape. The self-test suite
+            -- below pins U+25CB as a banned glyph.
             if isSelf then row.status:SetText("|cff66dd66\226\151\143 You|r")
             elseif peer and peer.online then row.status:SetText("|cff66dd66\226\151\143 Online|r")
-            else row.status:SetText("|cff888888\226\151\139 Offline|r") end
+            else row.status:SetText("|cff888888\226\151\143 Offline|r") end
             row.chars:SetText(nChars .. " char" .. (nChars == 1 and "" or "s"))
             row.seen:SetText(agoLabel(peer and peer.lastSeen))
             local aid = entry.aid
@@ -2816,11 +2821,11 @@ local function buildHelp(flow)
 
     local g = flow:AddSection("Setup Guide")
     g:Hint("1.  Install Daseeki Nexus on every account you want connected.")
-    g:Hint("2.  On each account, open Settings \226\134\146 Setup and set a unique Account ID (1\226\128\1512 digits, different on each account).")
+    g:Hint("2.  On each account, open Settings \226\134\146 Setup and set a unique Account ID (1\226\128\1472 digits, different on each account).")
     g:Hint("3.  On the same Setup page, set the SAME Channel name (16+ letters/numbers, case sensitive) AND the SAME Token (6 letters/numbers) on every account \226\128\148 generate the credentials there, or paste a setup bundle to copy the same Channel and Token to another account.")
     g:Hint("4.  Enable the mesh, then log out and back in once on each account \226\128\148 characters appear across your accounts within seconds.")
     g:Hint("5.  Migrating from another world-buff addon? Run /nexus import to merge ShadowNetwork's settings, Channel, Token and data — it shows a confirmation with a summary of what it will add or update before applying — and /nexus import instances for NovaInstanceTracker's instance runs (see Troubleshooting).")
-    g:Hint("Prefer it guided? Settings \226\134\146 Setup has a Setup guide button that walks steps 2\226\128\1514 in a three-step dialog with a live done/needed status on each step.")
+    g:Hint("Prefer it guided? Settings \226\134\146 Setup has a Setup guide button that walks steps 2\226\128\1474 in a three-step dialog with a live done/needed status on each step.")
     g:Hint("Open this hub any time from the dashboard's Settings button, or with /nexus settings.")
 
     local c = flow:AddSection("Slash commands")
@@ -2876,7 +2881,7 @@ local function buildHelp(flow)
     ac:Hint("You can't delete your OWN account \226\128\148 change your Account ID instead.")
 
     local ds = flow:AddSection("First-time setup (detailed)")
-    ds:Hint("1.  Account ID \226\128\148 In Settings \226\134\146 Setup, give this account a short unique ID (1\226\128\1512 digits). Every connected account needs a DIFFERENT ID; this is how the mesh tells your accounts apart.")
+    ds:Hint("1.  Account ID \226\128\148 In Settings \226\134\146 Setup, give this account a short unique ID (1\226\128\1472 digits). Every connected account needs a DIFFERENT ID; this is how the mesh tells your accounts apart.")
     ds:Hint("2.  Channel \226\128\148 On the same Setup page, set a Channel name of 16+ letters and numbers. It is case sensitive and must be identical on every account \226\128\148 think of it as the room your accounts meet in.")
     ds:Hint("3.  Token \226\128\148 Set a 6-character Token (letters/numbers), also identical everywhere. Generate the credentials on the Setup page, or paste a setup bundle to copy the same Channel and Token to another account. The Channel + Token together are your mesh password; anyone with both can see your roster, so keep them private.")
     ds:Hint("4.  Same faction \226\128\148 The mesh rides a hidden faction chat channel, so each account must log in a character on the SAME faction to connect. Cross-faction characters simply will not mesh.")
@@ -3453,6 +3458,76 @@ ns:RegisterSelfTest("options", function(verbose)
         and type(ns.Store.IsTombstoned) == "function"
         and type(ns.Store.SweepTombstones) == "function",
        "item 3: the tombstone mechanism is untouched (UI removal only)")
+
+    ----------------------------------------------------------------------
+    -- BANNED-GLYPH PIN (glyph audit 2026-08). The suite ships ONE default font
+    -- (Daseeki-Core FiraSansCondensed-Medium.ttf) and its cmap does not cover
+    -- every codepoint an editor will happily paste: U+25CB WHITE CIRCLE is the
+    -- one that actually shipped (the mesh account list's Offline marker rendered
+    -- as a tofu box). A cmap sweep of every non-ASCII literal in this addon
+    -- found four codepoints the font lacks; they are pinned here so none can
+    -- reappear in the files this branch owns. Both spellings are banned — the
+    -- raw UTF-8 bytes and the decimal-escape form ("\\226...") — and both are
+    -- CONSTRUCTED at runtime from the codepoint number, so this pin can never
+    -- match its own source. Harness-only by necessity (io/arg are nil in-game):
+    -- the harness runs every chunk with plain loadfile and arg[1] is the Nexus
+    -- dir run-selftests.cmd passed, so the pin sees the real shipped bytes.
+    -- (ui_professions.lua and the professions files carry their own pin on the
+    -- professions branch; this list is deliberately this branch's territory.)
+    ----------------------------------------------------------------------
+    do
+        local BANNED = {                     -- codepoint -> name (all MISSING from the cmap)
+            [0x25CB] = "U+25CB WHITE CIRCLE",
+            [0x2017] = "U+2017 DOUBLE LOW LINE (a mistyped U+2013 en dash)",
+            [0x25C6] = "U+25C6 BLACK DIAMOND",
+            [0x2713] = "U+2713 CHECK MARK",
+        }
+        local OWNED = {
+            "_test_detail.lua", "auto.lua", "core.lua", "friends.lua", "hud.lua",
+            "import.lua", "instances.lua", "inventory.lua", "layoutaudit.lua",
+            "mesh.lua", "minimap.lua", "options.lua", "pins.lua", "protocol.lua",
+            "snbridge.lua", "social.lua", "store.lua", "syncns.lua", "timers.lua",
+            "tooltips.lua", "tracker.lua", "ui_cards.lua", "ui_detail.lua",
+            "ui_instancespanel.lua", "ui_shell.lua", "ui_timersdock.lua",
+        }
+        -- UTF-8 encode a BMP codepoint; return (raw bytes, decimal-escape text).
+        local function spellings(cp)
+            local b
+            if cp < 0x80 then b = { cp }
+            elseif cp < 0x800 then
+                b = { 0xC0 + math.floor(cp / 0x40), 0x80 + cp % 0x40 }
+            else
+                b = { 0xE0 + math.floor(cp / 0x1000),
+                      0x80 + math.floor(cp / 0x40) % 0x40,
+                      0x80 + cp % 0x40 }
+            end
+            local raw, esc = "", ""
+            for _, v in ipairs(b) do
+                raw = raw .. string.char(v)
+                esc = esc .. "\\" .. v
+            end
+            return raw, esc
+        end
+        local srcDir = type(rawget(_G, "arg")) == "table" and _G.arg[1] or nil
+        if io and io.open and type(srcDir) == "string" then
+            for _, rel in ipairs(OWNED) do
+                local f = io.open(srcDir .. "/" .. rel, "rb")
+                ck(f ~= nil, ("banned-glyph pin: cannot open %s"):format(rel))
+                if f then
+                    local src = f:read("*a"); f:close()
+                    for cp, label in pairs(BANNED) do
+                        local raw, esc = spellings(cp)
+                        local hit = src:find(raw, 1, true) or src:find(esc, 1, true)
+                        local lineNo = hit and (select(2, src:sub(1, hit):gsub("\n", "")) + 1) or 0
+                        ck(not hit,
+                           ("banned glyph %s at %s:%d — the suite font's cmap has no glyph for it; "
+                            .. "use a covered codepoint (see the glyph-audit note above this pin)")
+                           :format(label, rel, lineNo))
+                    end
+                end
+            end
+        end
+    end
 
     if verbose and pass then ns:Print("  PASS options/editbox-focus-guard") end
     return pass
