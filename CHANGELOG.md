@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- **Shopping list for missing recipes.** The Professions detail pane grew Raid Prep's
+  shopping-list verb: a **Shopping List** button beside the filter toggles (and
+  `/nexus profs shoplist [character] [profession]`) prints a chat list of the selected
+  character's missing recipes that can actually be bought on the auction house — teaching
+  item link, required skill, and where it enters the world ("World drop", "Sold by
+  Vendor — Zone · price", …), lowest skill first. Only genuinely tradable recipes make the
+  list: trainer-only and quest-only recipes are out, so are BoP scrolls and anything your
+  specialisation locks away; vendor-sold recipes are included but flagged, since the AH is
+  the expensive way to buy those. An item the client hasn't loaded yet shows as
+  *unresolved* rather than being guessed either way — run the list again a moment later.
+  With Auctionator loaded at the auction house, the names also fill its Shopping tab,
+  exactly like the Raid Prep gavel.
+
 - **Professions tab** — Recipes in the detail list now show a real tooltip on hover (the
   craft tooltip, with teaching-item and dataset-fact fallbacks that never leave a blank),
   the list wears RECIPE | SKILL | SOURCE column headers, and recipes locked to a different
