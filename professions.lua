@@ -73,16 +73,30 @@
 -- Era has two enumeration surfaces and they are not interchangeable:
 --
 --   TRADE_SKILL_*  every profession except enchanting. Rows are indexed;
---                  GetTradeSkillInfo gives a name and a row kind, and
---                  GetTradeSkillRecipeLink gives a link carrying the TEACHING
---                  SPELL ID — which is our primary key, so we match on ids and
---                  never on the localized display name (main spec §7 defect 8).
+--                  GetTradeSkillInfo gives a name and a row kind. The function
+--                  GetTradeSkillRecipeLink EXISTS on this surface but was
+--                  MEASURED LIVE (build 1.15.9 / interface 11509, blacksmithing
+--                  open) returning NIL for real recipe rows — while
+--                  GetTradeSkillItemLink answered with the crafted PRODUCT's
+--                  item link. So on this surface the teaching spell id — our
+--                  primary key — cannot come from the recipe link alone: rows
+--                  resolve through the STRATEGY CHAIN documented above
+--                  ResolveRowSpell (recipe link first, should a future client
+--                  start answering; the row name against the client's own
+--                  names for the dataset spells second). Matching stays
+--                  id-keyed on the wire; the name is only the bridge from the
+--                  client's row to the dataset's id, and it is the CLIENT'S
+--                  name via GetSpellInfo, never a shipped string (main spec
+--                  §7 defect 8's locale rule is preserved).
 --
 --   CRAFT_*        enchanting — and ALSO the hunter beast-training window,
 --                  which is not a profession at all. CraftIsEnchanting() is the
 --                  discriminator and this module refuses the craft window
 --                  without it, so a hunter opening pet training can never be
---                  mistaken for an enchanter with an empty book.
+--                  mistaken for an enchanter with an empty book. HERE the
+--                  recipe link works: GetCraftRecipeLink's "enchant:" form was
+--                  verified correct live, so the chain's first rung is the one
+--                  that fires; the name rung is its safety net only.
 --
 -- Both are catalog-verified present at interface 11509: GetNumTradeSkills,
 -- GetTradeSkillInfo, GetTradeSkillRecipeLink, GetTradeSkillNumReagents,
@@ -284,6 +298,7 @@ Professions._retry         = nil    -- surface -> { step, timer } the bounded la
 Professions._stats         = nil    -- key -> per-profession/surface scan forensics
 Professions._trace         = nil    -- the session's own copy of the bounded trace ring
 Professions._nameMap       = nil    -- memoised localized-skill-name -> profKey
+Professions._recipeNames   = nil    -- memoised per-profession recipe-name -> spell id (chain rung 3)
 
 ----------------------------------------------------------------------
 -- Enablement
@@ -397,6 +412,7 @@ function Dataset.Unload()
     Dataset.item, Dataset.acq, Dataset.itemAcq = nil, nil, nil
     Dataset.itemOfRecipe = nil
     Professions._nameMap = nil
+    Professions._recipeNames = nil
 end
 
 -- PURE. Walk the payload once, handing each row to `fn(section, line)`. Rows
@@ -915,14 +931,206 @@ end
 -- item data has not arrived (main spec §7 defect 10), and a scan missing rows
 -- understates the known set. So a scan is only usable when EVERY non-header row
 -- resolved to a spell id; anything less returns nil and waits for the window's
--- own update event to re-fire.
+-- own update event to re-fire. A non-header row whose NAME reads nil is a row
+-- the client has not filled in yet, and it counts as missed for the same
+-- reason — skipping it silently would complete a scan around a hole.
+--
+-- The evidence table `ev` both adapters return additionally carries:
+--   ev.res     which chain rung(s) resolved the rows of a usable scan
+--              ("recipe-link" / "name" / mixed tallies) — the trace renders it
+--              as res=… so the owner can see which strategy is carrying the
+--              surface on their client.
+--   ev.sample  for a refused scan, the RAW evidence of ONE missed row (row
+--              name, recipe-link string or "nil", item-link string or "nil"),
+--              bounded and defanged — the exact facts that diagnosed the live
+--              11509 miss, kept on the record so the next drift does not need
+--              a hand-typed /run to see.
 ----------------------------------------------------------------------
 
+-- Both link shapes a recipe link has been seen (or could reasonably start) to
+-- carry. The craft surface answers "enchant:<teaching spell id>" — verified
+-- correct live. "spell:" is accepted as well so a future client that starts
+-- returning spell links on either surface resolves through the cheap rung
+-- instead of falling to the name rung.
 local function spellFromRecipeLink(link)
     if type(link) ~= "string" then return nil end
-    return tonumber(link:match("enchant:(%d+)"))
+    local id = link:match("enchant:(%d+)") or link:match("spell:(%d+)")
+    return tonumber(id)
 end
 Professions.SpellFromRecipeLink = spellFromRecipeLink
+
+local function itemIDFromLink(link)
+    if type(link) ~= "string" then return nil end
+    return tonumber(link:match("item:(%d+)"))
+end
+Professions.ItemIDFromLink = itemIDFromLink
+
+----------------------------------------------------------------------
+-- THE ROW RESOLUTION CHAIN — measured, not assumed
+--
+-- The defect this section answers was measured on the owner's live client
+-- (1.15.9 / 11509, blacksmithing open, a real recipe row):
+--
+--     GetTradeSkillRecipeLink(2)  =>  nil
+--     GetTradeSkillItemLink(2)    =>  [Glinting Steel Dagger]   (an ITEM link)
+--
+-- The function exists — the no-api gate passes — and it answers nil for every
+-- real row, so a resolver built on the recipe link alone reads 165 recipes and
+-- resolves none of them: rows=176 ids=0 unresolved, forever, which is exactly
+-- what the live trace showed. The craft surface (enchanting) is DIFFERENT: its
+-- "enchant:" link was verified correct, so the link stays the chain's first
+-- rung everywhere and the surfaces simply fall through it differently.
+--
+-- The rungs, in order, per row:
+--
+--   1  RECIPE LINK   "enchant:" or "spell:" — free when the client answers.
+--   2  PRODUCT ITEM  the crafted item's id against the DATASET would be next,
+--                    but the dataset carries NO produced-item ids: the fact
+--                    source (dev/professions-facts.txt) has none to generate
+--                    from — addendum §2, the same hole that forced the reagent
+--                    harvest. The 770 [item] rows are the TEACHING items
+--                    (plans/schematics), a different thing. The one measured
+--                    source of product ids we do hold is the reagent harvest
+--                    (`reagents[spell].o`), taken live from this very window
+--                    on an earlier complete scan — so product ids serve as the
+--                    NAME-COLLISION TIEBREAK below rather than as a rung of
+--                    their own, because a cache seeded by successful scans
+--                    cannot be the thing successful scans depend on.
+--   3  NAME          the row's name from GetTradeSkillInfo/GetCraftInfo IS the
+--                    teaching spell's name, and the client resolves dataset
+--                    spell ids to names in its own locale via GetSpellInfo
+--                    (spell data is client-local on Era). The map is built
+--                    from the CLIENT'S names, so the locale rule holds; a
+--                    dataset spell whose name reads nil is a class-4 cold read
+--                    and is simply absent from the map — an unmatched row
+--                    stays MISSED, never guessed.
+--
+-- A row no rung resolves is MISSED, and the three-state honesty above does the
+-- rest: missed > 0 refuses the whole scan and writes nothing.
+----------------------------------------------------------------------
+
+-- name(lower) -> teaching spell id for ONE profession, built from the client's
+-- own spell names. Returns map, ambiguous — `ambiguous` holds the names that
+-- belong to MORE than one dataset spell in this profession (sorted candidate
+-- lists, class 8), because letting pairs()-luck pick a winner would be a wrong
+-- answer wearing a right one's name. Memoised only when EVERY spell in the
+-- profession yielded a name: a map built over a cold read must not stick for
+-- the session (class 5 — sticky calibration), so a partial build serves its one
+-- scan and is thrown away.
+function Professions.RecipeNameMap(profKey)
+    local cached = Professions._recipeNames and Professions._recipeNames[profKey]
+    if cached then return cached.map, cached.ambiguous end
+    if not GetSpellInfo then return nil end
+    if not Dataset.LoadCore() then return nil end
+    local idx = Dataset.profIdx[profKey]
+    if not idx then return nil end
+    local list = Dataset.profRecipes[idx] or {}
+
+    local byName, full = {}, true
+    for i = 1, #list do
+        local spell = list[i]
+        local ok, name = pcall(GetSpellInfo, spell)
+        if ok and type(name) == "string" and name ~= "" then
+            local nm = name:lower()
+            local b = byName[nm]
+            if b then b[#b + 1] = spell else byName[nm] = { spell } end
+        else
+            full = false               -- cold read: this spell answers nothing today
+        end
+    end
+
+    local map, ambiguous = {}, nil
+    for nm, spells in pairs(byName) do
+        if #spells == 1 then
+            map[nm] = spells[1]
+        else
+            table.sort(spells)
+            ambiguous = ambiguous or {}
+            ambiguous[nm] = spells
+        end
+    end
+
+    if full then
+        Professions._recipeNames = Professions._recipeNames or {}
+        Professions._recipeNames[profKey] = { map = map, ambiguous = ambiguous }
+    end
+    return map, ambiguous
+end
+
+-- Which of `cands` (teaching spell ids) produces item `itemID`? Answered ONLY
+-- from the harvested reagent cache — a fact measured off a live window by an
+-- earlier complete scan — and only when exactly ONE candidate claims the item.
+-- Anything less certain is nil, and the row stays missed.
+function Professions.SpellForProduct(cands, itemID)
+    itemID = tonumber(itemID)
+    if not itemID or type(cands) ~= "table" then return nil end
+    local S = ns.Store
+    local area = S and S.ProfessionsReagents and S.ProfessionsReagents(false)
+    if not area then return nil end
+    local pick
+    for i = 1, #cands do
+        local e = area[cands[i]]
+        if e and e.o == itemID then
+            if pick then return nil end          -- two claims: still ambiguous
+            pick = cands[i]
+        end
+    end
+    return pick
+end
+
+-- One row of either surface through the chain. Returns spell, how — where
+-- `how` names the rung for the forensics ("recipe-link", "name",
+-- "name+product") — or nil for a row nothing resolved.
+function Professions.ResolveRowSpell(rowName, recipeLink, itemLink, profKey)
+    local spell = spellFromRecipeLink(recipeLink)
+    if spell then return spell, "recipe-link" end
+    if profKey and type(rowName) == "string" and rowName ~= "" then
+        local map, ambiguous = Professions.RecipeNameMap(profKey)
+        if map then
+            local nm = rowName:lower()
+            local hit = map[nm]
+            if hit then return hit, "name" end
+            local cands = ambiguous and ambiguous[nm]
+            if cands then
+                local pick = Professions.SpellForProduct(cands, itemIDFromLink(itemLink))
+                if pick then return pick, "name+product" end
+            end
+        end
+    end
+    return nil
+end
+
+-- Raw-evidence sample for ONE missed row, bounded for the saved-variable ring:
+-- the link escapes are defanged (| -> !) so a pasted trace row cannot render as
+-- a live link mid-bug-report, and everything is truncated.
+local function sampleLink(v)
+    if v == nil then return "nil" end
+    if type(v) ~= "string" then return "(" .. type(v) .. ")" end
+    v = v:gsub("|", "!")
+    if #v > 70 then v = v:sub(1, 67) .. "..." end
+    return v
+end
+
+function Professions.MissSample(rowName, recipeLink, itemLink)
+    return {
+        nm = (type(rowName) == "string") and rowName:sub(1, 40) or "nil",
+        rl = sampleLink(recipeLink),
+        il = sampleLink(itemLink),
+    }
+end
+
+-- The per-scan strategy tally rendered for the trace: one rung's name when one
+-- rung did all the work (the common case), "rung=n" pairs when they mixed.
+function Professions.SummarizeVia(via)
+    local keys = {}
+    for k in pairs(via or {}) do keys[#keys + 1] = k end
+    if #keys == 0 then return nil end
+    if #keys == 1 then return keys[1] end
+    table.sort(keys)
+    local parts = {}
+    for i = 1, #keys do parts[#parts + 1] = keys[i] .. "=" .. tostring(via[keys[i]]) end
+    return table.concat(parts, ",")
+end
 
 -- Which profession do these enumerated spell ids belong to? Majority is not
 -- good enough: we require that the ids resolve to exactly one profession in the
@@ -1091,8 +1299,13 @@ function Professions.FormatTraceRow(rec)
     if rec.n ~= nil then parts[#parts + 1] = "rows=" .. tostring(rec.n) end
     if rec.i ~= nil then parts[#parts + 1] = "ids=" .. tostring(rec.i) end
     if rec.u ~= nil and rec.u > 0 then parts[#parts + 1] = "unresolved=" .. tostring(rec.u) end
+    if rec.res then parts[#parts + 1] = "res=" .. tostring(rec.res) end
     if rec.g then parts[#parts + 1] = "guard=" .. tostring(rec.g) end
     if rec.d then parts[#parts + 1] = "ladder=" .. tostring(rec.d) end
+    if type(rec.x) == "table" then
+        parts[#parts + 1] = "miss[nm=" .. tostring(rec.x.nm)
+            .. " rl=" .. tostring(rec.x.rl) .. " il=" .. tostring(rec.x.il) .. "]"
+    end
     return table.concat(parts, " | ")
 end
 
@@ -1210,22 +1423,39 @@ function Professions.ScanTradeSkillWindow()
     ev.n = n
     if n <= 0 then return nil, "empty", ev end
 
-    local rows, ids, missed = {}, {}, 0
+    -- The name rung needs to know WHICH profession's names to build; the window
+    -- names its own skill line even when the rows have not resolved, and the
+    -- same localized map the skill panel uses turns that into a profKey. nil
+    -- simply leaves the name rung unarmed — rows the link cannot resolve then
+    -- stay missed, which is the honest degradation.
+    local windowProf = Professions.WindowProfKey("tradeskill")
+    local itemLinkFn = GetTradeSkillItemLink        -- catalog-verified at 11509
+
+    local rows, ids, missed, via = {}, {}, 0, {}
     for i = 1, n do
         local ok, name, kind = pcall(GetTradeSkillInfo, i)
         if not ok then return nil, "row-error", ev end
-        if kind ~= "header" and name ~= nil then
-            local okL, link = pcall(GetTradeSkillRecipeLink, i)
-            local spell = okL and spellFromRecipeLink(link) or nil
+        if kind ~= "header" then
+            local okL, rl = pcall(GetTradeSkillRecipeLink, i)
+            rl = okL and rl or nil
+            local il
+            if itemLinkFn then
+                local okI, l = pcall(itemLinkFn, i)
+                il = okI and l or nil
+            end
+            local spell, how = Professions.ResolveRowSpell(name, rl, il, windowProf)
             if spell then
                 rows[#rows + 1] = { i = i, spell = spell }
                 ids[#ids + 1] = spell
+                via[how] = (via[how] or 0) + 1
             else
                 missed = missed + 1
+                if not ev.sample then ev.sample = Professions.MissSample(name, rl, il) end
             end
         end
     end
     ev.ids, ev.missed = #ids, missed
+    ev.res = Professions.SummarizeVia(via)
     if #ids == 0 then return nil, "unresolved", ev end
     if missed > 0 then return nil, "incomplete", ev end
 
@@ -1240,7 +1470,8 @@ function Professions.ScanTradeSkillWindow()
             scan.l, scan.m = rank, maxRank
         end
     end
-    return scan
+    -- The evidence rides the success too: the ok trace row wants rows/ids/res.
+    return scan, nil, ev
 end
 
 function Professions.ScanCraftWindow()
@@ -1258,22 +1489,40 @@ function Professions.ScanCraftWindow()
     ev.n = n
     if n <= 0 then return nil, "empty", ev end
 
-    local rows, ids, missed = {}, {}, 0
+    -- Same chain as the trade-skill surface, same order. Here the recipe link
+    -- was verified CORRECT live ("enchant:"), so rung 1 is expected to do all
+    -- the work; the name rung is the safety net should this surface ever drift
+    -- the way the trade-skill one did. Most enchants produce no item, so the
+    -- item link (GetCraftItemLink, catalog-verified) is mostly nil here — it
+    -- rides along for the forensics sample and the collision tiebreak only.
+    local windowProf = Professions.WindowProfKey("craft")
+    local itemLinkFn = GetCraftItemLink
+
+    local rows, ids, missed, via = {}, {}, 0, {}
     for i = 1, n do
         local ok, name, _, kind = pcall(GetCraftInfo, i)
         if not ok then return nil, "row-error", ev end
-        if kind ~= "header" and name ~= nil then
-            local okL, link = pcall(GetCraftRecipeLink, i)
-            local spell = okL and spellFromRecipeLink(link) or nil
+        if kind ~= "header" then
+            local okL, rl = pcall(GetCraftRecipeLink, i)
+            rl = okL and rl or nil
+            local il
+            if itemLinkFn then
+                local okI, l = pcall(itemLinkFn, i)
+                il = okI and l or nil
+            end
+            local spell, how = Professions.ResolveRowSpell(name, rl, il, windowProf)
             if spell then
                 rows[#rows + 1] = { i = i, spell = spell }
                 ids[#ids + 1] = spell
+                via[how] = (via[how] or 0) + 1
             else
                 missed = missed + 1
+                if not ev.sample then ev.sample = Professions.MissSample(name, rl, il) end
             end
         end
     end
     ev.ids, ev.missed = #ids, missed
+    ev.res = Professions.SummarizeVia(via)
     if #ids == 0 then return nil, "unresolved", ev end
     if missed > 0 then return nil, "incomplete", ev end
 
@@ -1288,7 +1537,7 @@ function Professions.ScanCraftWindow()
             scan.l, scan.m = rank, maxRank
         end
     end
-    return scan
+    return scan, nil, ev
 end
 
 ----------------------------------------------------------------------
@@ -1346,11 +1595,8 @@ end
 -- update tries again.
 ----------------------------------------------------------------------
 
-local function itemIDFromLink(link)
-    if type(link) ~= "string" then return nil end
-    return tonumber(link:match("item:(%d+)"))
-end
-Professions.ItemIDFromLink = itemIDFromLink
+-- (itemIDFromLink lives beside the row-resolution chain above; the harvest
+-- shares it.)
 
 -- PURE-ish: every client call is injectable through `api` so the harness can
 -- drive cold, warm and half-warm worlds without a client.
@@ -1877,6 +2123,10 @@ function Professions.CaptureWindow(surface, force, event)
             e = event, s = surface, f = force and true or nil,
             p = Professions.WindowProfKey(surface),
             r = reason, n = ev and ev.n, i = ev and ev.ids, u = ev and ev.missed,
+            -- The raw evidence of one missed row and the rung tally of the rows
+            -- that DID resolve: an "incomplete" that resolved 164 by name and
+            -- missed one is a different diagnosis from one that resolved none.
+            res = ev and ev.res, x = ev and ev.sample,
             g = guard, d = Professions.RetryState(surface),
         })
         Professions.ScheduleRetry(surface, reason)
@@ -1904,6 +2154,7 @@ function Professions.CaptureWindow(surface, force, event)
     Professions.RecordAttempt({
         e = event, s = surface, f = force and true or nil, p = scan.profKey,
         r = "ok", n = ev and ev.n, i = ev and ev.ids, u = ev and ev.missed,
+        res = ev and ev.res,           -- WHICH rung carried the scan (res=…)
         g = guardWhy, d = "cleared",
     })
 
@@ -3407,6 +3658,347 @@ local function testComposedChain(fails)
     if not ok then fails[#fails + 1] = "error in composed-chain fixtures: " .. tostring(err) end
 end
 
+----------------------------------------------------------------------
+-- THE RESOLUTION CHAIN — the suite that reproduces the LIVE 11509 miss
+--
+-- The measured fact this suite is built around: on the owner's client (build
+-- 1.15.9 / interface 11509) the TRADESKILL surface's GetTradeSkillRecipeLink
+-- exists and returns NIL for real recipe rows, while GetTradeSkillItemLink
+-- returns the crafted product's ITEM link. The shipped resolver accepted only
+-- "enchant:" recipe links, so a real blacksmithing window read rows=176
+-- (11 headers + 165 recipes), ids=0, unresolved=165, refused "unresolved",
+-- forever — the composed-chain suite above could not see it because its
+-- simulator handed out the enchant links the live client does not.
+--
+-- The RED CONTROL is the pre-fix resolver written out below and replayed
+-- against the same unkind simulator; the green rows then drive the chain, and
+-- the mutation legs break each rung in turn to show the degradation stays
+-- honest: missed counts up, the refusal stands, nothing partial is written.
+----------------------------------------------------------------------
+
+-- THE PRE-FIX RESOLVER, verbatim in behavior: recipe-link only, "enchant:"
+-- only, and a nil-NAME row silently skipped rather than counted. Stated here
+-- rather than derived from the current code, because the current code is the
+-- fix.
+local function legacyResolveTradeSkill()
+    local n = GetNumTradeSkills()
+    if type(n) ~= "number" or n <= 0 then return nil, "empty", { n = n or 0, ids = 0, missed = 0 } end
+    local ids, missed = {}, 0
+    for i = 1, n do
+        local name, kind = GetTradeSkillInfo(i)
+        if kind ~= "header" and name ~= nil then
+            local link = GetTradeSkillRecipeLink(i)
+            local spell = (type(link) == "string") and tonumber(link:match("enchant:(%d+)")) or nil
+            if spell then ids[#ids + 1] = spell else missed = missed + 1 end
+        end
+    end
+    local ev = { n = n, ids = #ids, missed = missed }
+    if #ids == 0 then return nil, "unresolved", ev end
+    if missed > 0 then return nil, "incomplete", ev end
+    return { ids = ids, complete = true }, nil, ev
+end
+
+local function testResolutionChain(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    if not Dataset.LoadCore() then
+        fails[#fails + 1] = "the dataset would not load"
+        return
+    end
+
+    local G = _G
+    local saved = {
+        numTS = G.GetNumTradeSkills, tsInfo = G.GetTradeSkillInfo,
+        tsRecipe = G.GetTradeSkillRecipeLink, tsItem = G.GetTradeSkillItemLink,
+        tsLine = G.GetTradeSkillLine, tsCD = G.GetTradeSkillCooldown,
+        tsNameF = G.GetTradeSkillItemNameFilter, tsMake = G.GetOnlyShowMakeable,
+        tsSkillUps = G.GetOnlyShowSkillUps,
+        numCraft = G.GetNumCrafts, craftInfo = G.GetCraftInfo,
+        craftRecipe = G.GetCraftRecipeLink, craftItem = G.GetCraftItemLink,
+        craftEnch = G.CraftIsEnchanting, craftLine = G.GetCraftDisplaySkillLine,
+        spellInfo = G.GetSpellInfo, getTime = G.GetTime,
+    }
+    local savedState = {
+        Professions._leavingWorld, Professions._loggingOut, Professions._enteredWorldAt,
+        Professions._live, Professions._scanAt, Professions._harvested,
+        Professions._windowOpen, Professions._retry, Professions._stats,
+        Professions._trace, Professions._lastSig, Professions._nameMap,
+        Professions._recipeNames, Professions._viewGuards,
+    }
+    local savedArea = ns.Store and ns.Store.data and ns.Store.data.professions
+
+    local ok, err = pcall(function()
+        G.GetTime = function() return 50000 end
+        Professions._leavingWorld, Professions._loggingOut = false, false
+        Professions._enteredWorldAt = 0
+        Professions._live, Professions._scanAt, Professions._harvested = nil, nil, nil
+        Professions._windowOpen, Professions._retry = nil, nil
+        Professions._stats, Professions._trace = nil, nil
+        Professions._nameMap, Professions._recipeNames = nil, nil
+        Professions._viewGuards = nil
+        -- No client filter narrows the unkind window; the guard has real
+        -- getters to ask so its verdict is "clear", not luck.
+        G.GetTradeSkillItemNameFilter = function() return "" end
+        G.GetOnlyShowMakeable = function() return false end
+        G.GetOnlyShowSkillUps = function() return false end
+        G.GetTradeSkillCooldown = function() return nil end
+
+        local bs = Dataset.profRecipes[Dataset.profIdx.blacksmithing]
+
+        -- The client's own name for a teaching spell, unique per id. Installed
+        -- as GetSpellInfo so the name map is built from the CLIENT's answers,
+        -- exactly as live.
+        local function clientName(spell) return "Recipe Of Trial " .. tostring(spell) end
+        G.GetSpellInfo = function(id) return clientName(id) end
+
+        -- THE UNKIND 11509 WINDOW: 176 rows — 11 headers interleaved among 165
+        -- real recipes — recipe links NIL, item links answering with the
+        -- crafted product. The exact shape the owner measured.
+        local W = { rows = {}, linkMode = "nil" }
+        do
+            local ri = 0
+            for i = 1, 176 do
+                if i % 16 == 1 then
+                    W.rows[i] = { kind = "header", name = "Header " .. i }
+                else
+                    ri = ri + 1
+                    W.rows[i] = { kind = "recipe", spell = bs[ri],
+                                  name = clientName(bs[ri]), item = 50000 + ri }
+                end
+            end
+            ck(ri == 165, "the fixture built " .. ri .. " recipe rows, wanted 165")
+        end
+        G.GetNumTradeSkills = function() return #W.rows end
+        G.GetTradeSkillInfo = function(i)
+            local r = W.rows[i]
+            if not r then return nil end
+            if r.hidden then return nil end               -- a row the client has not filled in
+            if r.kind == "header" then return r.name, "header", 0, false end
+            return r.name, "optimal", 1, false
+        end
+        G.GetTradeSkillRecipeLink = function(i)
+            local r = W.rows[i]
+            if not r or r.kind == "header" or r.hidden then return nil end
+            if W.linkMode == "nil" then return nil end
+            local form = (W.linkMode == "spell") and "Hspell:" or "Henchant:"
+            return "|cffffd000|" .. form .. tostring(r.spell) .. "|h[x]|h|r"
+        end
+        G.GetTradeSkillItemLink = function(i)
+            local r = W.rows[i]
+            if not r or r.kind == "header" or r.hidden or not r.item then return nil end
+            return "|cffffffff|Hitem:" .. tostring(r.item) .. ":0|h[" .. tostring(r.name) .. "]|h|r"
+        end
+        G.GetTradeSkillLine = function() return "Blacksmithing", 275, 300 end
+
+        -- ══ (1) RED CONTROL: the pre-fix resolver against the live shape ═════
+        local lScan, lWhy, lEv = legacyResolveTradeSkill()
+        ck(lScan == nil and lWhy == "unresolved",
+           "RED CONTROL DID NOT REPRODUCE: the legacy resolver answered '"
+           .. tostring(lWhy) .. "' against the measured 11509 window")
+        ck(lEv.n == 176 and lEv.ids == 0 and lEv.missed == 165,
+           string.format("RED: legacy evidence reads rows=%d ids=%d missed=%d, "
+           .. "the live trace read rows=176 ids=0 unresolved=165",
+           lEv.n or -1, lEv.ids or -1, lEv.missed or -1))
+
+        -- ══ (2) GREEN: the chain resolves the same window by NAME ════════════
+        local scan, why, ev = Professions.ScanTradeSkillWindow()
+        ck(scan ~= nil, "the chain did not resolve the 11509 window (" .. tostring(why) .. ")")
+        ck(scan and scan.profKey == "blacksmithing",
+           "the chain resolved the wrong profession: " .. tostring(scan and scan.profKey))
+        ck(scan and #scan.ids == 165, "the chain resolved " .. tostring(scan and #scan.ids)
+           .. " of 165 rows")
+        ck(scan and scan.ev.res == "name",
+           "the resolving rung reads '" .. tostring(scan and scan.ev.res) .. "', expected 'name'")
+        ck(scan and scan.unknown == 0, "name-resolved ids voted " .. tostring(scan and scan.unknown)
+           .. " unknowns into the profession resolve")
+        -- ...and the ids are the RIGHT ids, not merely 165 of something.
+        if scan then
+            local wantSet = {}
+            for i = 1, 165 do wantSet[bs[i]] = true end
+            local wrong = 0
+            for i = 1, #scan.ids do if not wantSet[scan.ids[i]] then wrong = wrong + 1 end end
+            ck(wrong == 0, wrong .. " name-resolved id(s) are not the fixture's spells")
+        end
+
+        -- ══ (3) The widened link parse: a client that answers "spell:" links
+        --        resolves on rung 1 and the name rung never has to fire ═══════
+        W.linkMode = "spell"
+        local s2 = Professions.ScanTradeSkillWindow()
+        ck(s2 and s2.ev.res == "recipe-link",
+           "a 'spell:' recipe link did not resolve on the link rung ("
+           .. tostring(s2 and s2.ev.res) .. ")")
+        W.linkMode = "nil"
+
+        -- ══ (4) MUTATION: kill the name rung too — the scan refuses, writes
+        --        nothing, and the trace sample carries the raw evidence ═══════
+        Professions._recipeNames = nil               -- no memoised map to coast on
+        G.GetSpellInfo = function() return nil end   -- class-4 cold spell data
+        local s3, why3, ev3 = Professions.ScanTradeSkillWindow()
+        ck(s3 == nil and why3 == "unresolved",
+           "with every rung dead the scan answered '" .. tostring(why3) .. "'")
+        ck(ev3 and ev3.n == 176 and ev3.ids == 0 and ev3.missed == 165,
+           "the dead-chain evidence is not rows=176 ids=0 missed=165")
+        ck(ev3 and type(ev3.sample) == "table", "no raw-evidence sample was recorded")
+        if ev3 and ev3.sample then
+            ck(ev3.sample.rl == "nil", "the sample's recipe link reads '"
+               .. tostring(ev3.sample.rl) .. "', expected the literal string 'nil'")
+            ck(type(ev3.sample.il) == "string" and ev3.sample.il:find("!Hitem:", 1, true) ~= nil,
+               "the sample's item link is not the defanged raw link: " .. tostring(ev3.sample.il))
+            ck(ev3.sample.nm ~= nil and ev3.sample.nm ~= "nil", "the sample lost the row name")
+        end
+        -- The cold read did not stick (class 5): warm the client back up and
+        -- the very next scan succeeds without any reset ceremony.
+        G.GetSpellInfo = function(id) return clientName(id) end
+        local s4 = Professions.ScanTradeSkillWindow()
+        ck(s4 ~= nil and s4.ev.res == "name",
+           "a cold name-map build poisoned the session: the warm rescan refused")
+
+        -- ══ (5) MUTATION: one row the dataset does not carry — missed, the
+        --        scan refuses INCOMPLETE, and no partial set is written ════════
+        Professions._live = nil
+        local kept = W.rows[2]
+        W.rows[2] = { kind = "recipe", name = "Utterly Undatasetted Widget", item = 61111 }
+        local s5, why5, ev5 = Professions.ScanTradeSkillWindow()
+        ck(s5 == nil and why5 == "incomplete",
+           "a window with one unknown row answered '" .. tostring(why5) .. "'")
+        ck(ev5 and ev5.ids == 164 and ev5.missed == 1,
+           string.format("the incomplete evidence reads ids=%s missed=%s, expected 164/1",
+           tostring(ev5 and ev5.ids), tostring(ev5 and ev5.missed)))
+        ck(ev5 and ev5.sample and ev5.sample.nm == "Utterly Undatasetted Widget",
+           "the sample did not name the row that missed")
+        ck(Professions._live == nil or (Professions._live.p and next(Professions._live.p) == nil),
+           "a refused incomplete scan still wrote a known set")
+        W.rows[2] = kept
+
+        -- ══ (6) MUTATION: a row the client has not filled in AT ALL (nil name,
+        --        nil kind). The legacy resolver silently completed AROUND it —
+        --        a 164-recipe 'complete' scan, the silent partial this module
+        --        exists to forbid — the chain counts it missed and refuses ═════
+        W.linkMode = "enchant"                       -- links work; only row 5 is dark
+        W.rows[5].hidden = true
+        local lScan2, lWhy2, lEv2 = legacyResolveTradeSkill()
+        ck(lScan2 ~= nil and lEv2.ids == 164 and lEv2.missed == 0,
+           "RED: the legacy resolver was expected to complete around the dark row "
+           .. "(got " .. tostring(lWhy2) .. " ids=" .. tostring(lEv2 and lEv2.ids) .. ")")
+        local s6, why6, ev6 = Professions.ScanTradeSkillWindow()
+        ck(s6 == nil and why6 == "incomplete" and ev6 and ev6.missed == 1,
+           "a dark row did not count as missed (" .. tostring(why6) .. ")")
+        W.rows[5].hidden = nil
+        W.linkMode = "nil"
+
+        -- ══ (7) COLLISION: two dataset spells share one client name. Neither
+        --        may win by luck; the harvested product id is the only witness
+        --        allowed to break the tie, and without it the rows miss ════════
+        Professions._recipeNames = nil
+        G.GetSpellInfo = function(id)
+            if id == bs[1] or id == bs[2] then return "The Colliding Name" end
+            return clientName(id)
+        end
+        local origRow2, origRow3 = W.rows[2], W.rows[3]
+        W.rows[2] = { kind = "recipe", spell = bs[1], name = "The Colliding Name", item = 70001 }
+        W.rows[3] = { kind = "recipe", spell = bs[2], name = "The Colliding Name", item = 70002 }
+        local s7, why7, ev7 = Professions.ScanTradeSkillWindow()
+        ck(s7 == nil and why7 == "incomplete" and ev7 and ev7.missed == 2,
+           "an unwitnessed name collision resolved anyway (" .. tostring(why7)
+           .. " missed=" .. tostring(ev7 and ev7.missed) .. ")")
+        -- Seed the witness: the reagent harvest of an earlier complete scan
+        -- measured what each teaching spell produces.
+        local S = ns.Store
+        local area = S and S.ProfessionsReagents and S.ProfessionsReagents(true)
+        ck(area ~= nil, "the reagent area would not open; the tiebreak leg cannot run")
+        if area then
+            area[bs[1]] = { o = 70001, r = { [2840] = 1 } }
+            area[bs[2]] = { o = 70002, r = { [2840] = 1 } }
+            local s8 = Professions.ScanTradeSkillWindow()
+            ck(s8 ~= nil, "the witnessed collision still refused")
+            if s8 then
+                local got = {}
+                for i = 1, #s8.rows do got[s8.rows[i].i] = s8.rows[i].spell end
+                ck(got[2] == bs[1] and got[3] == bs[2],
+                   "the product tiebreak paired the colliding rows wrongly")
+                ck(tostring(s8.ev.res):find("name%+product") ~= nil,
+                   "the tiebreak rung is invisible in res= (" .. tostring(s8.ev.res) .. ")")
+            end
+        end
+        G.GetSpellInfo = function(id) return clientName(id) end
+        W.rows[2], W.rows[3] = origRow2, origRow3
+        Professions._recipeNames = nil
+
+        -- ══ (8) THE FORENSICS RIDE THE TRACE, both directions ════════════════
+        do
+            local r0 = W.rows[2]
+            W.rows[2] = { kind = "recipe", name = "Utterly Undatasetted Widget", item = 61111 }
+            Professions._trace = nil
+            local okCap, whyCap = Professions.CaptureWindow("tradeskill", true, "test-chain")
+            ck(okCap == false and whyCap == "incomplete",
+               "the capture did not relay the refusal (" .. tostring(whyCap) .. ")")
+            local rowsT = Professions.TraceRows()
+            local last = rowsT[#rowsT]
+            ck(last and last.r == "incomplete" and type(last.x) == "table"
+               and last.x.nm == "Utterly Undatasetted Widget",
+               "the refused trace row does not carry the miss sample")
+            ck(last and Professions.FormatTraceRow(last):find("miss[nm=", 1, true) ~= nil,
+               "the rendered trace row does not show the sample")
+            W.rows[2] = r0
+            Professions._scanAt = nil
+            local okCap2 = Professions.CaptureWindow("tradeskill", true, "test-chain")
+            ck(okCap2 == true, "the healed window did not capture")
+            local rowsT2 = Professions.TraceRows()
+            local last2 = rowsT2[#rowsT2]
+            ck(last2 and last2.r == "ok" and last2.res == "name",
+               "the successful trace row does not name its rung (res="
+               .. tostring(last2 and last2.res) .. ")")
+            ck(last2 and Professions.FormatTraceRow(last2):find("res=name", 1, true) ~= nil,
+               "the rendered success row does not show res=name")
+        end
+
+        -- ══ (9) THE CRAFT SURFACE: the enchant link stays primary, and the
+        --        name rung is its safety net, not its replacement ══════════════
+        local en = Dataset.profRecipes[Dataset.profIdx.enchanting]
+        G.CraftIsEnchanting = function() return true end
+        G.GetNumCrafts = function() return 6 end
+        G.GetCraftDisplaySkillLine = function() return "Enchanting", 290, 300 end
+        G.GetCraftItemLink = function() return nil end       -- enchants make no item
+        local craftLinks = true
+        G.GetCraftInfo = function(i)
+            if i == 1 then return "Enchantments", nil, "header" end
+            return clientName(en[i]), nil, "optimal"
+        end
+        G.GetCraftRecipeLink = function(i)
+            if not craftLinks or i == 1 then return nil end
+            return "|cffffd000|Henchant:" .. tostring(en[i]) .. "|h[x]|h|r"
+        end
+        local c1 = Professions.ScanCraftWindow()
+        ck(c1 and c1.profKey == "enchanting" and c1.ev.res == "recipe-link",
+           "the craft surface's enchant link is no longer primary ("
+           .. tostring(c1 and c1.ev.res) .. ")")
+        craftLinks = false                                   -- the surface drifts like 11509 did
+        Professions._recipeNames = nil
+        local c2 = Professions.ScanCraftWindow()
+        ck(c2 and c2.profKey == "enchanting" and c2.ev.res == "name",
+           "the craft surface did not fall back to the name rung ("
+           .. tostring(c2 and c2.ev.res) .. ")")
+    end)
+
+    _G.GetNumTradeSkills, _G.GetTradeSkillInfo = saved.numTS, saved.tsInfo
+    _G.GetTradeSkillRecipeLink, _G.GetTradeSkillItemLink = saved.tsRecipe, saved.tsItem
+    _G.GetTradeSkillLine, _G.GetTradeSkillCooldown = saved.tsLine, saved.tsCD
+    _G.GetTradeSkillItemNameFilter = saved.tsNameF
+    _G.GetOnlyShowMakeable, _G.GetOnlyShowSkillUps = saved.tsMake, saved.tsSkillUps
+    _G.GetNumCrafts, _G.GetCraftInfo = saved.numCraft, saved.craftInfo
+    _G.GetCraftRecipeLink, _G.GetCraftItemLink = saved.craftRecipe, saved.craftItem
+    _G.CraftIsEnchanting, _G.GetCraftDisplaySkillLine = saved.craftEnch, saved.craftLine
+    _G.GetSpellInfo, _G.GetTime = saved.spellInfo, saved.getTime
+    Professions._leavingWorld, Professions._loggingOut = savedState[1], savedState[2]
+    Professions._enteredWorldAt, Professions._live = savedState[3], savedState[4]
+    Professions._scanAt, Professions._harvested = savedState[5], savedState[6]
+    Professions._windowOpen, Professions._retry = savedState[7], savedState[8]
+    Professions._stats, Professions._trace = savedState[9], savedState[10]
+    Professions._lastSig, Professions._nameMap = savedState[11], savedState[12]
+    Professions._recipeNames, Professions._viewGuards = savedState[13], savedState[14]
+    if ns.Store and ns.Store.data then ns.Store.data.professions = savedArea end
+    if not ok then fails[#fails + 1] = "error in resolution-chain fixtures: " .. tostring(err) end
+end
+
 local function testInertness(fails)
     local function ck(c, m) if not c then fails[#fails + 1] = m end end
 
@@ -3472,6 +4064,8 @@ function Professions.RunSelfTests(verbose)
         { name = "reagent harvest (class 4: partial lists are not lists)", fn = testReagentHarvest },
         { name = "composed chain (open -> clears -> deferral -> landing, with the red control)",
           fn = testComposedChain },
+        { name = "resolution chain (the live 11509 nil-recipe-link window, with the red control)",
+          fn = testResolutionChain },
         { name = "publish delta detector", fn = testPublishDelta },
         { name = "module inertness (off = no frame, no events, no dataset, no SV)",
           fn = testInertness },
