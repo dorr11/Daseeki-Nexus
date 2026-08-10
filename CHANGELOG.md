@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- **Professions tab** — The selected recipe's acquisition line now wraps to two lines, so
+  the new zoned sources ("Sold by Fradd Swiftgear — Gnomeregan area") read in full instead
+  of truncating; the recipe list gives up exactly one line's height for it. The character
+  grid also gains the Characters view's filter chips — 60s, Online, and the Alliance/Horde
+  toggle (no Summoners here) — filtering the grid only: cooldown readiness still shows
+  every alt, and a filtered-out selection is kept, not lost.
+
 - **Professions — collapsed headers can no longer shorten the truth.** A profession window
   opened with collapsed category headers used to be scannable as if the visible rows were
   the whole recipe list — the one narrowing the view guard couldn't witness. Header rows
