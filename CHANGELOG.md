@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- **Professions: fixed gathering professions being invisible to the presence probe.**
+  Detection relied solely on IsSpellKnown over the rank-tier spells, which Herbalism (and by
+  construction Mining) never answers — Orn's Herbalism 300 showed neither presence nor
+  level. The skill panel is now a second, additive presence witness: a panel row matched
+  through the client's own spell names marks the profession present, with its tier from a
+  strict ceiling map and an unexpected ceiling degrading to the tier the rank value proves
+  rather than a silent apprentice. The spell probe remains authoritative where it answers,
+  an unwitnessed or partially-read panel can add but never erase, and the wire shape is
+  unchanged.
+
 - **Professions: profession windows no longer lag on open.** The capture layer now scans a
   profession once and then merely *verifies* it: after a complete scan, window opens and
   crafting sprees are answered by a cheap settled-signature check (row count, per-row names,
