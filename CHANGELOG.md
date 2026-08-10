@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- **Professions — records now survive dataset updates.** Until now, any update to the
+  shipped recipe dataset — even one that touched no recipe, like the spec-tree addition —
+  reset every character's known-recipe records to "not checked" and sent you on a re-scan
+  tour of your alts. Records are now keyed to the recipe set itself rather than the whole
+  dataset: metadata-only updates invalidate nothing, and when the recipe set genuinely
+  changes, existing records are translated recipe-by-recipe instead of discarded — what a
+  character provably knew or was missing stays known or missing, and newly added recipes
+  honestly show as "not checked" for characters whose last scan predates them, until their
+  next window open trues them up. Works across the mesh too: peers on older versions keep
+  their exact old behavior, and mixed-version data can never be misread.
+
 - **Profession delegates (phase 1).** The professions grid now takes designations:
   right-click a character's profession cell to name them the faction's **primary** (or
   secondary) collector for that profession — scoped to specialisation lanes, so a main
