@@ -12,6 +12,28 @@
   ladder that stops the moment it succeeds or you close the window. The reagent list Nexus
   builds from the same window comes back with it.
 
+  With the timing untangled, the window then confessed the second half of the story: on this
+  game client the question Nexus was asking each recipe row — the link that names the recipe
+  itself — comes back **empty for every row of a crafting window**, even though the function
+  exists and the row is really there. (Measured on a live blacksmithing window: 176 rows read,
+  0 identified, every scan honestly refused.) Enchanting answers it fine; it is the crafting
+  surface that does not. So identifying a row is now a short chain of attempts instead of one
+  question: the recipe link is still asked first, in both the forms this client family has
+  been seen to use, and when it comes back empty the row's own name is matched against the
+  game's names for the recipes in Nexus's catalogue — the game's own words in your language,
+  never a shipped translation. Two recipes sharing one name are only told apart by a fact
+  Nexus has measured (which item each one crafts, learned from an earlier look at the same
+  window); a row nothing can identify still counts as a miss, and one miss still refuses the
+  whole scan rather than writing a shortened list. Nothing about the honesty rules changed —
+  the same window that used to refuse forever now actually reads, and it still never guesses.
+
+- **Added:** when a profession scan is refused because rows would not identify, the scan
+  trace (`/nexus debug professions`) now keeps the **raw evidence of one missed row** — the
+  row's name and exactly what the recipe-link and item-link questions answered, "nil"
+  included — and every successful scan records **which method identified its rows**
+  (`res=recipe-link`, `res=name`, …). The live diagnosis above took a hand-typed `/run` at
+  an open window to see those answers; the next drift will be on screen already.
+
 - **Fixed:** **the search box and the category picker on the profession window.** Typing did
   nothing and picking a category did not narrow the list. Two causes, both now handled
   honestly. Setting one of the game's own list filters changes what the game *counts* but does
