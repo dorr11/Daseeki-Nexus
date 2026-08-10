@@ -1,23 +1,29 @@
 -- Daseeki Nexus — ui_professions.lua  (THE PROFESSIONS TAB, wave P2)
 --
 -- P1 gathered the facts and said nothing. This file is the saying: a dedicated
--- tab in the dashboard shell, peer to Characters, holding the four views the
--- design settled on —
+-- tab in the dashboard shell, peer to Characters, holding the four surfaces the
+-- owner's rework settled on (annotated-screenshot pass, 2026-08-10) —
 --
---   THE GRID        one row per character in the SAME order the cards use,
---                   profession cells carrying icon + skill/cap + specialisation
---                   marker + the live cooldown state, secondaries in their own
---                   aligned sub-columns.
+--   THE GRID        left pane (GRID_FRACTION of the body): one row per
+--                   character in the SAME order the cards use, two PRIMARY
+--                   cells + the COOKING / FIRST AID / FISHING chips. Poisons
+--                   has NO grid column — the data stays captured and speaks
+--                   through the detail pane's tab instead. Clicking a row
+--                   SELECTS the character (the cards' cursor idiom: selecting
+--                   again keeps it; selection never clears itself).
 --
---   THE ROLLUP      every profession cooldown across every character, ready
---                   first then soonest. "What can I make today", answered
---                   without clicking anything.
+--   THE DETAIL      top-right pane, always there: the selected character's
+--                   professions as TABS across the top (a rogue's Poisons tab
+--                   included), the picked tab showing the recipe census — the
+--                   filter band, the known/missing list, and the selected
+--                   recipe's SOURCE and MATERIALS. This pane REPLACES the old
+--                   mode-swap drill-in outright.
 --
---   THE DRILL-IN    click a profession cell and the tab becomes the two-pane
---                   list+editor shape the style guide mandates: that character's
---                   professions on the left (~300), the recipe list on the
---                   right with its filter band, and the selected recipe's
---                   SOURCE and MATERIALS underneath it.
+--   THE COOLDOWNS   bottom-right pane: ONE ROW PER COOLDOWN KIND the store has
+--                   seen (Mooncloth, the transmute group, …), each naming the
+--                   characters READY to craft it right now, class-colored. A
+--                   character mid-cooldown is simply not listed (the owner's
+--                   rule), and a kind no character owns is not a row.
 --
 --   THE SEARCH      "who can craft X" across every character's known set, with
 --                   the learnable-by answer beside it.
@@ -66,23 +72,37 @@
 -- The owner's word on this view was "start with this. i will need to play with
 -- it a bit before I decide", which means an iteration round is already booked.
 -- Every metric therefore lives in ONE table (ProfUI.LAYOUT) and every placement
--- goes through a small PURE function over it (ProfUI.GridRowY, ProfUI.CellX,
--- ProfUI.SecondaryX, ProfUI.SplitX). Moving a column is editing one number, not
--- hunting anchor arithmetic through a thousand lines.
+-- goes through a small PURE function over it (ProfUI.GridColumns,
+-- ProfUI.GridRowY, ProfUI.SplitWidths, ProfUI.RightSplitHeights,
+-- ProfUI.DetailTabLayout). Moving a column is editing one number, not hunting
+-- anchor arithmetic through a thousand lines.
+--
+-- THE OVERFLOW LESSON (the FISHING/POISONS bleed, 2026-08-10). The previous
+-- pass placed the grid columns at CONSTANT x-offsets and "proved" the fit by
+-- comparing two constants at ONE assumed shell width (1096, eleven pixels of
+-- slack) — the columns never read the pane they lived in, the pane's real
+-- width depended on a resize-timing dance (applySplit is a no-op until the
+-- body's rect resolves), and nothing capped a cell's text at its own column
+-- pitch. Column geometry is now a function of the REAL pane width at render
+-- time: ProfUI.GridColumns(availW) shrinks every column proportionally when
+-- the pane is narrower than the natural sum, so the band's right edge can
+-- never pass the pane at ANY width; the header labels are width-capped to
+-- their own columns and the header band clips; and the self-test exercises
+-- the fit at MULTIPLE shell widths instead of pinning one.
 --
 -- DREW_UI_STYLE compliance notes, so the next reader can check them:
---   1 fixed-width bands, content hugging its natural width (the grid's columns
---     are a fixed ProfUI.GridWidth() band sitting inside the 75% pane of the
---     owner's 75/25 grid/rollup split — ProfUI.SplitWidths).
---   3 the two-pane drill-in is the Armory-Sets shape: ~300 list left, editor
---     right.
+--   1 fixed-width bands, content hugging its natural width — up to the pane:
+--     at or above the natural sum the columns sit at their LAYOUT pitch; below
+--     it, fitting the pane wins (GridColumns' proportional shrink).
+--   3 the detail pane is the list+editor shape re-homed: tabs pick the list,
+--     the recipe detail band sits under it.
 --   4 no dead bands: every panel's first content row sits one PANEL_PAD under
 --     its header rule.
---   5 one grid: the filter band's four controls share one baseline and one
---     height.
+--   5 one grid: each filter row's controls share one baseline and one height.
 --   6 every control is labeled — the search boxes carry inline labels, the
 --     source chip prints "SOURCE: …", the grid columns carry a header band.
---   7 stable layout: the window is fixed-size, so there are no layout modes.
+--   7 stable layout: no layout modes — but every pane and column re-derives
+--     from the real rect on OnSizeChanged AND at the top of every Refresh.
 --
 ----------------------------------------------------------------------
 -- INERTNESS
@@ -113,54 +133,124 @@ local L = {
     GUTTER      = 10,   -- base-colored gap between panels
     PANEL_PAD   = 10,   -- panel edge -> its content
     TOOLBAR_H   = 30,   -- the who-can-craft band at the top of the tab
-    SIDE_W      = 300,  -- style guide rule 10: list column is ~300
     HEAD_H      = 18,   -- column-header band inside the grid panel
 
-    -- The owner's split for the grid view: 75% of the body to the grid pane,
-    -- the remaining 25% to the cooldown rollup. ProfUI.SplitWidths() is the
-    -- only reader.
-    GRID_FRACTION = 0.75,
+    -- The owner's rework splits: the grid pane takes GRID_FRACTION of the
+    -- body's width (his boxes said "~55-60%"; 60 is the clean edge of that),
+    -- and the right column gives DETAIL_FRACTION of its height to the detail
+    -- pane, the rest to the cooldown kinds. ProfUI.SplitWidths() and
+    -- ProfUI.RightSplitHeights() are the only readers.
+    GRID_FRACTION   = 0.60,
+    DETAIL_FRACTION = 0.70,
 
     ROW_H       = 32,   -- one character row in the grid
-    NAME_W      = 150,  -- the class-colored name column
-    CELL_W      = 140,  -- one PRIMARY profession cell
+    NAME_W      = 150,  -- the class-colored name column (natural width)
+    CELL_W      = 140,  -- one PRIMARY profession cell (natural width)
     CELL_GAP    = 8,
     PRIMARIES   = 2,    -- a character may hold two primaries; the slots are fixed
-    SEC_W       = 78,   -- one SECONDARY chip (wide enough for its full-name header)
+    SEC_W       = 78,   -- one SECONDARY chip (natural width)
     SEC_GAP     = 6,
     GROUP_GAP   = 16,   -- primaries block -> secondaries block
 
     ICON        = 18,
     SEC_ICON    = 14,
 
-    LIST_ROW_H  = 20,   -- recipe / rollup / search rows
-    FILTER_H    = 28,   -- the drill-in filter band
+    DTAB_H      = 22,   -- one profession tab in the detail pane's strip
+    DTAB_GAP    = 4,
+    DTAB_MAX    = 120,  -- a tab never grows past this (two tabs hug left)
+
+    CD_LABEL_W  = 170,  -- the cooldown kind's name column
+
+    LIST_ROW_H  = 20,   -- recipe / cooldown / search rows
+    FILTER_H    = 24,   -- one filter row in the detail pane (there are two)
     DETAIL_H    = 132,  -- the selected-recipe detail band (source + materials)
     SCROLL_STEP = 40,
 }
 ProfUI.LAYOUT = L
 
--- PURE placement maths. Every one of these is a function of LAYOUT alone, which
--- is what makes the geometry a number to edit rather than a hunt.
+-- PURE placement maths. GridRowY is a function of LAYOUT alone; everything
+-- horizontal goes through GridColumns, which is a function of LAYOUT *and the
+-- real pane width* — the overflow lesson, spelled out in the header.
 function ProfUI.GridRowY(i)          return (i - 1) * L.ROW_H end
-function ProfUI.CellX(slot)          return L.NAME_W + (slot - 1) * (L.CELL_W + L.CELL_GAP) end
-function ProfUI.SecondaryBlockX()    return ProfUI.CellX(L.PRIMARIES + 1) - L.CELL_GAP + L.GROUP_GAP end
-function ProfUI.SecondaryX(i)        return ProfUI.SecondaryBlockX() + (i - 1) * (L.SEC_W + L.SEC_GAP) end
-function ProfUI.GridWidth()
-    return ProfUI.SecondaryX(#ProfUI.SECONDARY_ORDER) + L.SEC_W
+
+-- PURE. The grid's column geometry, derived from the width ACTUALLY available
+-- to the row band at render time. At (or above) the natural sum every column
+-- sits at its LAYOUT width; below it, every column shrinks proportionally
+-- (the gaps hold still) and each width floors, so the band's right edge can
+-- never pass availW — at any window size, with no assumed constant anywhere.
+-- Returns { name = {x,w}, prim = {{x,w},…}, sec = { cooking = {x,w}, … },
+--           width = <right edge>, scale = <1 or the shrink factor> }.
+function ProfUI.GridColumns(availW)
+    availW = tonumber(availW) or 0
+    local secs = ProfUI.GRID_SECONDARIES
+    local gaps = (L.PRIMARIES - 1) * L.CELL_GAP + L.GROUP_GAP + (#secs - 1) * L.SEC_GAP
+    local natural = L.NAME_W + L.PRIMARIES * L.CELL_W + #secs * L.SEC_W
+    local full = natural + gaps
+    local scale = 1
+    if availW < full then scale = (availW > 0) and (availW / full) or 0 end
+    -- Columns AND gaps shrink together; each floors, so the accumulated right
+    -- edge can only ever fall short of availW, never pass it.
+    local function dim(nat) return math.floor(nat * scale) end
+    local cols = { name = { x = 0, w = dim(L.NAME_W) }, prim = {}, sec = {} }
+    local x = cols.name.w
+    for slot = 1, L.PRIMARIES do
+        if slot > 1 then x = x + dim(L.CELL_GAP) end
+        cols.prim[slot] = { x = x, w = dim(L.CELL_W) }
+        x = x + cols.prim[slot].w
+    end
+    x = x + dim(L.GROUP_GAP)
+    for i, key in ipairs(secs) do
+        if i > 1 then x = x + dim(L.SEC_GAP) end
+        cols.sec[key] = { x = x, w = dim(L.SEC_W) }
+        x = x + cols.sec[key].w
+    end
+    cols.width = x
+    cols.scale = scale
+    return cols
 end
--- The x of the right pane in a two-pane split of `total` width.
-function ProfUI.SplitX()             return L.SIDE_W + L.GUTTER end
--- PURE. The grid-view pane split: grid pane width, rollup pane width, as a
+
+-- The NATURAL width of the column band (every column at its LAYOUT width) —
+-- the born-size for pooled rows and the "stop growing" point of the fit.
+function ProfUI.GridWidth()
+    return ProfUI.GridColumns(1e9).width
+end
+
+-- PURE. The horizontal pane split: grid pane width, right-column width, as a
 -- function of the body's total width. The two panes plus the gutter always
 -- conserve the total, so a rounding slop can never open a stray column of
--- background between the rollup and the body's right edge.
+-- background between the right column and the body's right edge.
 function ProfUI.SplitWidths(total)
     total = tonumber(total) or 0
     local avail = total - L.GUTTER
     if avail < 0 then avail = 0 end
     local gridW = math.floor(avail * L.GRID_FRACTION + 0.5)
     return gridW, avail - gridW
+end
+
+-- PURE. The right column's vertical split: detail pane height, cooldown pane
+-- height. Same conservation rule as SplitWidths, on the other axis.
+function ProfUI.RightSplitHeights(total)
+    total = tonumber(total) or 0
+    local avail = total - L.GUTTER
+    if avail < 0 then avail = 0 end
+    local detailH = math.floor(avail * L.DETAIL_FRACTION + 0.5)
+    return detailH, avail - detailH
+end
+
+-- PURE. The detail pane's profession-tab strip: n tabs in availW. Tabs share
+-- the width evenly, cap at DTAB_MAX (so two tabs hug the left rather than
+-- stretching), and the last tab's right edge stays inside availW.
+function ProfUI.DetailTabLayout(availW, n)
+    availW = tonumber(availW) or 0
+    n = tonumber(n) or 0
+    if n <= 0 or availW <= 0 then return { w = 0, xs = {} } end
+    local gaps = (n - 1) * L.DTAB_GAP
+    local w = math.floor((availW - gaps) / n)
+    if w > L.DTAB_MAX then w = L.DTAB_MAX end
+    if w < 1 then w = 1 end
+    local xs = {}
+    for i = 1, n do xs[i] = (i - 1) * (w + L.DTAB_GAP) end
+    return { w = w, xs = xs }
 end
 
 ----------------------------------------------------------------------
@@ -176,16 +266,36 @@ end
 ----------------------------------------------------------------------
 
 ProfUI.SECONDARY_ORDER = { "cooking", "firstaid", "fishing", "poisons" }
--- Full names, per the owner's header pass — the columns are wide enough now
--- that abbreviating them ("COOK", "AID") was pure information loss. Uppercase
+
+-- The GRID's secondary columns are a strict SUBSET: the owner removed the
+-- Poisons column outright (rework pass, 2026-08-10). Poisons remains a
+-- CLASSIFIED secondary — it still costs no primary slot, still travels on the
+-- payload, and still gets a tab in the detail pane for the character that
+-- holds it (the rogue) — it just buys no grid width for the seven characters
+-- that never will.
+ProfUI.GRID_SECONDARIES = { "cooking", "firstaid", "fishing" }
+
+-- Full names, per the owner's header pass — the columns are wide enough that
+-- abbreviating them ("COOK", "AID") was pure information loss. Uppercase
 -- because the grid's header band is an eyebrow row (CHARACTER, PRIMARY, …).
 ProfUI.SECONDARY_LABEL = {
-    cooking = "COOKING", firstaid = "FIRST AID", fishing = "FISHING", poisons = "POISONS",
+    cooking = "COOKING", firstaid = "FIRST AID", fishing = "FISHING",
 }
 ProfUI.SECONDARY = {}
 for _, k in ipairs(ProfUI.SECONDARY_ORDER) do ProfUI.SECONDARY[k] = true end
 
 function ProfUI.IsSecondary(profKey) return ProfUI.SECONDARY[profKey] and true or false end
+
+-- PURE. The grid's header row, in column order. The self-test pins this list —
+-- including the ABSENCE of POISONS.
+function ProfUI.GridHeaderLabels()
+    local out = { "CHARACTER" }
+    for _ = 1, L.PRIMARIES do out[#out + 1] = "PRIMARY" end
+    for _, key in ipairs(ProfUI.GRID_SECONDARIES) do
+        out[#out + 1] = ProfUI.SECONDARY_LABEL[key] or tostring(key):upper()
+    end
+    return out
+end
 
 ----------------------------------------------------------------------
 -- DATASET ACCESS
@@ -709,6 +819,71 @@ function ProfUI.ReadyCount(rows)
     local n = 0
     for i = 1, #(rows or {}) do if rows[i].ready then n = n + 1 end end
     return n
+end
+
+----------------------------------------------------------------------
+-- THE COOLDOWN KINDS  (PURE — the rework's bottom-right pane)
+--
+-- One row per cooldown KIND the store has seen — a kind is a cdKey, which P1
+-- already made account-stable (a teaching spell id, or "gN" for a shared
+-- group), so the kinds are ENUMERATED from the payloads rather than hardcoded:
+-- whatever the module tracks is what renders. Each kind carries the roster
+-- characters currently OFF cooldown (ready to craft), in roster order and
+-- wearing their class tags. The owner's rule is explicit: a character
+-- mid-cooldown is not listed at all, and a kind no character owns is not a
+-- row. (RollupRows stays alive underneath — the badge and the login line
+-- still count per-INSTANCE, which is the number they always meant.)
+----------------------------------------------------------------------
+
+function ProfUI.CooldownKindRows(entries, lookup, nowE, res)
+    local kinds, order = {}, {}
+    nowE = nowE or now()
+    for i = 1, #(entries or {}) do
+        local e = entries[i]
+        local payload = lookup and lookup(e.nameRealm) or nil
+        if type(payload) == "table" and type(payload.c) == "table" then
+            for cdKey, at in pairs(payload.c) do
+                local key = tostring(cdKey)
+                local k = kinds[key]
+                if not k then
+                    local profKey = ProfUI.CdKeyMeta(key)
+                    local label, pending = ProfUI.CooldownLabel(key, res)
+                    k = { cdKey = key, profKey = profKey, label = label,
+                          pending = pending and true or false,
+                          owners = 0, ready = {} }
+                    kinds[key] = k
+                    order[#order + 1] = k
+                end
+                k.owners = k.owners + 1
+                local rem = ProfUI.CooldownRemaining(at, nowE)
+                if rem == 0 then
+                    k.ready[#k.ready + 1] = { key = e.nameRealm,
+                                              classTag = e.rec and e.rec.classTag or nil }
+                end
+            end
+        end
+    end
+    -- Strict total order (class 8): label first so the pane reads
+    -- alphabetically, cdKey as the tiebreak so a pending label cannot make two
+    -- renders disagree.
+    table.sort(order, function(a, b)
+        local la, lb = a.label or "", b.label or ""
+        if la ~= lb then return la < lb end
+        return a.cdKey < b.cdKey
+    end)
+    return order
+end
+
+-- PURE. The detail pane's tab list for one character: every profession the
+-- payload proves they hold, primaries first then secondaries, each block
+-- sorted — the same order ProfessionList renders, reduced to keys. A rogue's
+-- poisons rides in payload.p and therefore gets its tab; a character without
+-- it cannot, because the probe never invents a profession.
+function ProfUI.DetailTabs(payload)
+    local out = {}
+    local list = ProfUI.ProfessionList(payload)
+    for i = 1, #list do out[i] = list[i].key end
+    return out
 end
 
 ----------------------------------------------------------------------
@@ -1651,14 +1826,32 @@ end
 -- unrelated `row` locals into a false cycle.
 ----------------------------------------------------------------------
 
--- One character row of the grid: name column + two primary cells + the
--- secondary chips.
+-- One character row of the grid: name column + two primary cells + the grid
+-- secondary chips. NOTHING here bakes an x-position: the render calls
+-- fitGridRow (below) with the SAME ProfUI.GridColumns the header uses, so the
+-- cells and their headers cannot disagree — and neither can outrun the pane
+-- that produced the columns. Clicking anywhere SELECTS the character; clicking
+-- a specific profession cell selects that profession's detail tab with it.
 local function makeGridRow(parentChild, pane)
     local gr = CreateFrame("Button", nil, parentChild)
     -- STANDING TECHNICAL RULE: both dimensions at creation. The render sets the
     -- real width from its scroll frame, but no frame here is ever born
     -- zero-sized (the class of defect that cost three iteration rounds).
     gr:SetSize(ProfUI.GridWidth(), L.ROW_H)
+
+    -- Selection affordance, the cards' vocabulary scaled to a row: an accent
+    -- wash over the fill plus a 2px accent edge on the leading side.
+    local selWash = gr:CreateTexture(nil, "BACKGROUND")
+    selWash:SetAllPoints()
+    UI.Skin(selWash, function(self) self:SetColorTexture(UI.Color("accent", 0.10)) end)
+    selWash:Hide()
+    local selEdge = gr:CreateTexture(nil, "BACKGROUND", nil, 1)
+    selEdge:SetPoint("TOPLEFT", gr, "TOPLEFT", 0, 0)
+    selEdge:SetPoint("BOTTOMLEFT", gr, "BOTTOMLEFT", 0, 0)
+    selEdge:SetWidth(2)
+    UI.Skin(selEdge, function(self) self:SetColorTexture(UI.Color("accent")) end)
+    selEdge:Hide()
+    gr._selWash, gr._selEdge = selWash, selEdge
 
     local hl = gr:CreateTexture(nil, "HIGHLIGHT")
     hl:SetAllPoints()
@@ -1670,12 +1863,16 @@ local function makeGridRow(parentChild, pane)
     nameFS:SetWidth(L.NAME_W - 6)
     gr._name = nameFS
 
+    gr:SetScript("OnClick", function(self)
+        if self._owner then pane.SelectCharacter(self._owner, nil) end
+    end)
+
     -- PRIMARY cells.
     gr._cells = {}
     for slot = 1, L.PRIMARIES do
         local cell = CreateFrame("Button", nil, gr)
         cell:SetSize(L.CELL_W, L.ROW_H - 4)
-        cell:SetPoint("TOPLEFT", gr, "TOPLEFT", ProfUI.CellX(slot), -2)
+        cell:SetPoint("TOPLEFT", gr, "TOPLEFT", L.NAME_W, -2)   -- re-fit per render
         local ch = cell:CreateTexture(nil, "HIGHLIGHT")
         ch:SetAllPoints()
         UI.Skin(ch, function(self) self:SetColorTexture(UI.Color("accent", 0.16)) end)
@@ -1690,19 +1887,19 @@ local function makeGridRow(parentChild, pane)
         bot:SetPoint("BOTTOMLEFT", cell, "BOTTOMLEFT", L.ICON + 6, 1)
         cell._icon, cell._top, cell._bot = icon, top, bot
         cell:SetScript("OnClick", function(self)
-            if self._profKey and self._owner then pane.OpenDrill(self._owner, self._profKey) end
+            if self._owner then pane.SelectCharacter(self._owner, self._profKey) end
         end)
         cell:SetScript("OnEnter", function(self) pane.CellTooltip(self) end)
         cell:SetScript("OnLeave", function() GameTooltip:Hide() end)
         gr._cells[slot] = cell
     end
 
-    -- SECONDARY chips, in fixed columns so they line up down the grid.
+    -- SECONDARY chips — the GRID subset only (no poisons column).
     gr._secs = {}
-    for i, profKey in ipairs(ProfUI.SECONDARY_ORDER) do
+    for i, profKey in ipairs(ProfUI.GRID_SECONDARIES) do
         local chip = CreateFrame("Button", nil, gr)
         chip:SetSize(L.SEC_W, L.ROW_H - 8)
-        chip:SetPoint("TOPLEFT", gr, "TOPLEFT", ProfUI.SecondaryX(i), -4)
+        chip:SetPoint("TOPLEFT", gr, "TOPLEFT", L.NAME_W, -4)   -- re-fit per render
         local sh = chip:CreateTexture(nil, "HIGHLIGHT")
         sh:SetAllPoints()
         UI.Skin(sh, function(self) self:SetColorTexture(UI.Color("accent", 0.16)) end)
@@ -1715,13 +1912,35 @@ local function makeGridRow(parentChild, pane)
         stext:SetPoint("LEFT", sicon, "RIGHT", 4, 0)
         chip._icon, chip._text, chip._profKey = sicon, stext, profKey
         chip:SetScript("OnClick", function(self)
-            if self._owner then pane.OpenDrill(self._owner, self._profKey) end
+            if self._owner then pane.SelectCharacter(self._owner, self._profKey) end
         end)
         chip:SetScript("OnEnter", function(self) pane.CellTooltip(self) end)
         chip:SetScript("OnLeave", function() GameTooltip:Hide() end)
         gr._secs[i] = chip
     end
     return gr
+end
+
+-- Re-fit one pooled row to the column geometry of THIS render. Every text is
+-- width-capped at its own column, so a cell can never spill under a neighbour
+-- (the crammed-secondaries defect of the pre-rework screenshot) — let alone
+-- out of the pane.
+local function fitGridRow(gr, cols)
+    gr._name:SetWidth(math.max(1, cols.name.w - 4))
+    for slot = 1, L.PRIMARIES do
+        local cell, cc = gr._cells[slot], cols.prim[slot]
+        cell:SetPoint("TOPLEFT", gr, "TOPLEFT", cc.x, -2)
+        cell:SetWidth(math.max(1, cc.w))
+        local tw = math.max(1, cc.w - L.ICON - 8)
+        cell._top:SetWidth(tw)
+        cell._bot:SetWidth(tw)
+    end
+    for i, profKey in ipairs(ProfUI.GRID_SECONDARIES) do
+        local chip, sc = gr._secs[i], cols.sec[profKey]
+        chip:SetPoint("TOPLEFT", gr, "TOPLEFT", sc.x, -4)
+        chip:SetWidth(math.max(1, sc.w))
+        chip._text:SetWidth(math.max(1, sc.w - L.SEC_ICON - 7))
+    end
 end
 
 -- Paint one profession cell from a CellModel. `compact` is the secondary chip
@@ -1840,21 +2059,18 @@ local function paintRecipeRow(rr, row, selected)
     if selected then rr._title:SetTextColor(UI.Color("accent")) end
 end
 
--- ── the rollup row ───────────────────────────────────────────────────────────
-local function makeRollupRow(rollChild)
-    local ru = CreateFrame("Frame", nil, rollChild)
-    ru:SetSize(1, L.LIST_ROW_H)
-    local who = fstr(ru, "body", "LEFT")
-    who:SetPoint("LEFT", ru, "LEFT", 2, 0)
-    who:SetWidth(84)
-    local what = fstr(ru, "small", "LEFT")
-    what:SetPoint("LEFT", who, "RIGHT", 4, 0)
-    local when = fstr(ru, "numeral", "RIGHT")
-    when:SetPoint("RIGHT", ru, "RIGHT", -2, 0)
-    when:SetWidth(58)
-    what:SetPoint("RIGHT", when, "LEFT", -6, 0)
-    ru._who, ru._what, ru._when = who, what, when
-    return ru
+-- ── the cooldown KIND row (name · the characters ready to craft it) ─────────
+local function makeCdRow(cdParent)
+    local kr = CreateFrame("Frame", nil, cdParent)
+    kr:SetSize(1, L.LIST_ROW_H)
+    local krWhat = fstr(kr, "body", "LEFT")
+    krWhat:SetPoint("LEFT", kr, "LEFT", 2, 0)
+    krWhat:SetWidth(L.CD_LABEL_W)
+    local krWho = fstr(kr, "small", "LEFT")
+    krWho:SetPoint("LEFT", krWhat, "RIGHT", 6, 0)
+    krWho:SetPoint("RIGHT", kr, "RIGHT", -2, 0)
+    kr._what, kr._who = krWhat, krWho
+    return kr
 end
 
 -- ── the search result block ──────────────────────────────────────────────────
@@ -1907,29 +2123,37 @@ local thePane = nil
 
 Dashboard.RegisterTab("professions", function(host)
     local pane = {
-        mode    = "grid",              -- "grid" | "drill" | "search"
-        drill   = nil,                 -- { owner =, profKey =, spell = }
+        mode    = "grid",              -- "grid" | "search"
+        sel     = nil,                 -- { owner =, profKey =, spell = } — the selected
+                                       -- row, its detail tab, and its picked recipe
         query   = "",
         filters = { search = "", source = nil, missingOnly = false, showUnavailable = false },
         obj     = {},
-        _gridRows = {}, _rollRows = {}, _recRows = {}, _searchRows = {}, _matRows = {},
-        _profRows = {},
+        _gridRows = {}, _cdRows = {}, _recRows = {}, _searchRows = {}, _matRows = {},
+        _tabBtns = {},
     }
     thePane = pane
 
-    -- Persisted filter choices (additive, optional).
+    -- Persisted filter choices + the selection (the cards persist theirs the
+    -- same way — st.selectedCharacter — so a /reload lands where you left).
     local st = Dashboard.UIState and Dashboard.UIState() or {}
     st.prof = st.prof or {}
     pane.filters.source          = st.prof.source
     pane.filters.missingOnly     = st.prof.missingOnly and true or false
     pane.filters.showUnavailable = st.prof.showUnavailable and true or false
+    if type(st.prof.selOwner) == "string" and st.prof.selOwner ~= "" then
+        pane.sel = { owner = st.prof.selOwner, profKey = st.prof.selProf, spell = nil }
+    end
     local function persist()
         st.prof.source          = pane.filters.source
         st.prof.missingOnly     = pane.filters.missingOnly
         st.prof.showUnavailable = pane.filters.showUnavailable
+        st.prof.selOwner        = pane.sel and pane.sel.owner or ""
+        st.prof.selProf         = pane.sel and pane.sel.profKey or nil
     end
 
-    -- ── TOOLBAR: the who-can-craft box + the breadcrumb ──────────────────────
+    -- ── TOOLBAR: the who-can-craft box (the drill-in breadcrumb + back button
+    -- are retired with the mode swap: the detail pane is simply always there) ─
     local toolbar = CreateFrame("Frame", nil, host)
     toolbar:SetPoint("TOPLEFT", host, "TOPLEFT", 0, 0)
     toolbar:SetPoint("TOPRIGHT", host, "TOPRIGHT", 0, 0)
@@ -1938,71 +2162,92 @@ Dashboard.RegisterTab("professions", function(host)
 
     local who = searchBox(toolbar, "WHO CAN CRAFT", 320, function(text)
         pane.query = text or ""
-        pane.mode = (pane.query ~= "") and "search" or (pane.drill and "drill" or "grid")
+        pane.mode = (pane.query ~= "") and "search" or "grid"
         pane.obj.Refresh()
     end)
     who:SetPoint("LEFT", toolbar, "LEFT", 2, 0)
 
-    local crumb = fstr(toolbar, "small", "RIGHT")
-    crumb:SetPoint("RIGHT", toolbar, "RIGHT", -2, 0)
-    UI.Skin(crumb, function(self) self:SetTextColor(UI.Color("muted")) end)
-
-    local back = UI.MakeButton(toolbar, {
-        text = "\226\128\185 All characters", variant = "quiet", width = 130, height = 22,
-        onClick = function() pane.CloseDrill() end,
-    })
-    back:SetPoint("RIGHT", crumb, "LEFT", -8, 0)
-    back:Hide()
-
-    -- ── BODY: the mode host.
-    -- Deliberately a frame of its own rather than anchoring the mode panels
-    -- straight to `host`: the grid and the drill-in are mutually exclusive and
-    -- therefore DO sit at the same origin, which the static anchor gate reads
-    -- (correctly, for its narrow rule) as two frames overlapping on a shared
-    -- parent. One container makes the exclusivity structural instead of
-    -- textual.
+    -- ── BODY: the pane host.
+    -- Deliberately a frame of its own rather than anchoring the panels straight
+    -- to `host`: the three-pane layout and the search results are mutually
+    -- exclusive and therefore DO sit at the same origin, which the static
+    -- anchor gate reads (correctly, for its narrow rule) as frames overlapping
+    -- on a shared parent. One container makes the exclusivity structural
+    -- instead of textual.
     local body = CreateFrame("Frame", nil, host)
     body:SetPoint("TOPLEFT", host, "TOPLEFT", 0, -L.TOOLBAR_H)
     body:SetPoint("BOTTOMRIGHT", host, "BOTTOMRIGHT", 0, 0)
     Dashboard.Tag(body, "prof.body")
 
-    -- ══ MODE A: the grid + the rollup ═══════════════════════════════════════
-    -- The owner's split, from the live-screenshot pass: 75% of the body to the
-    -- grid pane, 25% to the cooldown rollup (ProfUI.SplitWidths — one pure
-    -- reader, so the self-test and this anchor agree by construction). The
-    -- COLUMNS inside the grid pane still hug their natural width (style rule
-    -- 1): they are a fixed ProfUI.GridWidth() band sized to sit inside the 75%
-    -- pane at the shell's fixed window width, which the self-test pins.
+    -- ══ THE THREE PANES ═════════════════════════════════════════════════════
+    -- Grid left (GRID_FRACTION of the width), detail top-right
+    -- (DETAIL_FRACTION of the right column's height), cooldown kinds under it.
+    -- Both axes re-fit from the body's REAL rect — OnSizeChanged is the belt,
+    -- the applySplit at the top of every Refresh the braces — and the column
+    -- geometry inside the grid pane re-derives from the pane's real width on
+    -- every render, so no pane and no column ever leans on an assumed shell
+    -- constant again (the overflow lesson).
     local gridP = panel(body, "prof.grid")
     gridP:SetPoint("TOPLEFT", body, "TOPLEFT", 0, 0)
     gridP:SetPoint("BOTTOMLEFT", body, "BOTTOMLEFT", 0, 0)
     -- Born at its natural-content width (standing rule: both dimensions at
-    -- creation, never zero); applySplit below re-fits it to 75% the moment the
-    -- body has a real width, and again if the body's ever changes.
+    -- creation, never zero); applySplit re-fits it the moment the body has a
+    -- real width, and again whenever that changes.
     gridP:SetWidth(ProfUI.GridWidth() + 2 * L.PANEL_PAD)
+
+    local detailP = panel(body, "prof.detail")
+    detailP:SetPoint("TOPLEFT", gridP, "TOPRIGHT", L.GUTTER, 0)
+    detailP:SetPoint("TOPRIGHT", body, "TOPRIGHT", 0, 0)
+    detailP:SetHeight(300)               -- born non-zero; applySplit re-fits
+
+    local cdP = panel(body, "prof.cooldowns")
+    cdP:SetPoint("TOPLEFT", detailP, "BOTTOMLEFT", 0, -L.GUTTER)
+    cdP:SetPoint("BOTTOMRIGHT", body, "BOTTOMRIGHT", 0, 0)
+
     local function applySplit()
-        local total = body:GetWidth()
-        if not total or total <= 0 then return end
-        local gridW = ProfUI.SplitWidths(total)
-        if math.abs((gridP:GetWidth() or 0) - gridW) > 0.5 then gridP:SetWidth(gridW) end
+        local totalW, totalH = body:GetWidth(), body:GetHeight()
+        if totalW and totalW > 0 then
+            local gridW = ProfUI.SplitWidths(totalW)
+            if math.abs((gridP:GetWidth() or 0) - gridW) > 0.5 then gridP:SetWidth(gridW) end
+        end
+        if totalH and totalH > 0 then
+            local detailH = ProfUI.RightSplitHeights(totalH)
+            if math.abs((detailP:GetHeight() or 0) - detailH) > 0.5 then detailP:SetHeight(detailH) end
+        end
     end
     body:SetScript("OnSizeChanged", applySplit)
     applySplit()
 
+    -- ── the grid pane ────────────────────────────────────────────────────────
+    -- The header band CLIPS and its labels are positioned per render from the
+    -- SAME GridColumns the rows use — the header and the cells cannot drift
+    -- apart, and neither can leave the pane.
     local gridHead = CreateFrame("Frame", nil, gridP)
     gridHead:SetPoint("TOPLEFT", gridP, "TOPLEFT", L.PANEL_PAD, -L.PANEL_PAD)
     gridHead:SetPoint("TOPRIGHT", gridP, "TOPRIGHT", -L.PANEL_PAD, -L.PANEL_PAD)
     gridHead:SetHeight(L.HEAD_H)
+    gridHead:SetClipsChildren(true)
+    local headFS = {}
     do
-        local h = eyebrow(gridHead, "CHARACTER", "LEFT")
-        h:SetPoint("LEFT", gridHead, "LEFT", 2, 0)
-        for slot = 1, L.PRIMARIES do
-            local ph = eyebrow(gridHead, "PRIMARY", "LEFT")
-            ph:SetPoint("TOPLEFT", gridHead, "TOPLEFT", ProfUI.CellX(slot) + 2, 0)
+        local labels = ProfUI.GridHeaderLabels()
+        for i = 1, #labels do
+            local hf = eyebrow(gridHead, labels[i], "LEFT")
+            hf:SetPoint("TOPLEFT", gridHead, "TOPLEFT", 0, 0)   -- re-fit per render
+            headFS[i] = hf
         end
-        for i, key in ipairs(ProfUI.SECONDARY_ORDER) do
-            local sh = eyebrow(gridHead, ProfUI.SECONDARY_LABEL[key] or key, "LEFT")
-            sh:SetPoint("TOPLEFT", gridHead, "TOPLEFT", ProfUI.SecondaryX(i), 0)
+    end
+    local function layoutHead(cols)
+        headFS[1]:SetPoint("TOPLEFT", gridHead, "TOPLEFT", cols.name.x + 2, 0)
+        headFS[1]:SetWidth(math.max(1, cols.name.w - 2))
+        for slot = 1, L.PRIMARIES do
+            local hf = headFS[1 + slot]
+            hf:SetPoint("TOPLEFT", gridHead, "TOPLEFT", cols.prim[slot].x + 2, 0)
+            hf:SetWidth(math.max(1, cols.prim[slot].w - 2))
+        end
+        for i, key in ipairs(ProfUI.GRID_SECONDARIES) do
+            local hf = headFS[1 + L.PRIMARIES + i]
+            hf:SetPoint("TOPLEFT", gridHead, "TOPLEFT", cols.sec[key].x, 0)
+            hf:SetWidth(math.max(1, cols.sec[key].w))
         end
     end
 
@@ -2017,61 +2262,91 @@ Dashboard.RegisterTab("professions", function(host)
     gridEmpty:Hide()
     pane._gridEmpty = gridEmpty
 
-    local rollP = panel(body, "prof.rollup")
-    rollP:SetPoint("TOPLEFT", gridP, "TOPRIGHT", L.GUTTER, 0)
-    rollP:SetPoint("BOTTOMRIGHT", body, "BOTTOMRIGHT", 0, 0)
+    -- ── the cooldown kinds pane ──────────────────────────────────────────────
+    local cdHead = eyebrow(cdP, "COOLDOWNS", "LEFT")
+    cdHead:SetPoint("TOPLEFT", cdP, "TOPLEFT", L.PANEL_PAD, -L.PANEL_PAD)
+    local cdCount = fstr(cdP, "numeral", "RIGHT")
+    cdCount:SetPoint("TOPRIGHT", cdP, "TOPRIGHT", -L.PANEL_PAD, -L.PANEL_PAD)
+    pane._cdCount = cdCount
 
-    local rollHead = eyebrow(rollP, "COOLDOWNS", "LEFT")
-    rollHead:SetPoint("TOPLEFT", rollP, "TOPLEFT", L.PANEL_PAD, -L.PANEL_PAD)
-    local rollCount = fstr(rollP, "numeral", "RIGHT")
-    rollCount:SetPoint("TOPRIGHT", rollP, "TOPRIGHT", -L.PANEL_PAD, -L.PANEL_PAD)
-    pane._rollCount = rollCount
+    local cdScroll, cdChild = scroller(cdP, "prof.cooldowns.list")
+    cdScroll:SetPoint("TOPLEFT", cdP, "TOPLEFT", L.PANEL_PAD, -(L.PANEL_PAD + L.HEAD_H + 2))
+    cdScroll:SetPoint("BOTTOMRIGHT", cdP, "BOTTOMRIGHT", -L.PANEL_PAD, L.PANEL_PAD)
+    pane._cdChild = cdChild
 
-    local rollScroll, rollChild = scroller(rollP, "prof.rollup.list")
-    rollScroll:SetPoint("TOPLEFT", rollP, "TOPLEFT", L.PANEL_PAD, -(L.PANEL_PAD + L.HEAD_H + 2))
-    rollScroll:SetPoint("BOTTOMRIGHT", rollP, "BOTTOMRIGHT", -L.PANEL_PAD, L.PANEL_PAD)
-    pane._rollChild = rollChild
+    local cdEmpty = fstr(cdChild, "muted", "LEFT")
+    cdEmpty:SetPoint("TOPLEFT", cdChild, "TOPLEFT", 2, -4)
+    cdEmpty:SetText("No profession cooldowns recorded.")
+    cdEmpty:Hide()
+    pane._cdEmpty = cdEmpty
 
-    local rollEmpty = fstr(rollChild, "muted", "LEFT")
-    rollEmpty:SetPoint("TOPLEFT", rollChild, "TOPLEFT", 2, -4)
-    rollEmpty:SetText("No profession cooldowns recorded.")
-    rollEmpty:Hide()
-    pane._rollEmpty = rollEmpty
+    -- ── the detail pane: eyebrow + name, the profession TAB strip, the filter
+    -- rows, the recipe list, and the recipe detail band — the old drill-in's
+    -- content re-homed into a pane that is simply always there ────────────────
+    local dEyebrow = eyebrow(detailP, "DETAIL", "LEFT")
+    dEyebrow:SetPoint("TOPLEFT", detailP, "TOPLEFT", L.PANEL_PAD, -L.PANEL_PAD)
+    local dWho = fstr(detailP, "body", "LEFT")
+    dWho:SetPoint("LEFT", dEyebrow, "RIGHT", 8, 0)
+    pane._dWho = dWho
 
-    -- ══ MODE B: the drill-in two-pane ═══════════════════════════════════════
-    local listP = panel(body, "prof.drill.list")
-    listP:SetPoint("TOPLEFT", body, "TOPLEFT", 0, 0)
-    listP:SetPoint("BOTTOMLEFT", body, "BOTTOMLEFT", 0, 0)
-    listP:SetWidth(L.SIDE_W)
-    listP:Hide()
+    -- The quiet hint when no character row is selected (or the selected one
+    -- has no professions record at all).
+    local dHint = fstr(detailP, "muted", "LEFT")
+    dHint:SetPoint("TOPLEFT", detailP, "TOPLEFT", L.PANEL_PAD, -(L.PANEL_PAD + 24))
+    dHint:SetPoint("RIGHT", detailP, "RIGHT", -L.PANEL_PAD, 0)
+    dHint:SetText("Select a character to inspect their professions.")
+    pane._dHint = dHint
 
-    local drillWho = fstr(listP, "body", "LEFT")
-    drillWho:SetPoint("TOPLEFT", listP, "TOPLEFT", L.PANEL_PAD, -L.PANEL_PAD)
-    pane._drillWho = drillWho
-    local drillHead = eyebrow(listP, "PROFESSIONS", "LEFT")
-    drillHead:SetPoint("TOPLEFT", drillWho, "BOTTOMLEFT", 0, -6)
+    local tabStrip = CreateFrame("Frame", nil, detailP)
+    tabStrip:SetPoint("TOPLEFT", detailP, "TOPLEFT", L.PANEL_PAD, -(L.PANEL_PAD + 20))
+    tabStrip:SetPoint("RIGHT", detailP, "RIGHT", -L.PANEL_PAD, 0)
+    tabStrip:SetHeight(L.DTAB_H)
+    tabStrip:SetClipsChildren(true)
+    Dashboard.Tag(tabStrip, "prof.detail.tabs")
+    pane._tabStrip = tabStrip
 
-    local profScroll, profChild = scroller(listP, "prof.drill.profs")
-    profScroll:SetPoint("TOPLEFT", listP, "TOPLEFT", L.PANEL_PAD, -(L.PANEL_PAD + 40))
-    profScroll:SetPoint("BOTTOMRIGHT", listP, "BOTTOMRIGHT", -L.PANEL_PAD, L.PANEL_PAD)
-    pane._profChild = profChild
+    -- One profession tab (the shell titlebar's idiom: label + accent underline
+    -- when active). Pooled; positioned per render from DetailTabLayout.
+    local function getTabBtn(i)
+        local b = pane._tabBtns[i]
+        if not b then
+            local tbtn = CreateFrame("Button", nil, tabStrip)
+            tbtn:SetSize(L.DTAB_MAX, L.DTAB_H)
+            local tlab = fstr(tbtn, "small", "CENTER")
+            tlab:SetPoint("TOPLEFT", tbtn, "TOPLEFT", 2, -2)
+            tlab:SetPoint("BOTTOMRIGHT", tbtn, "BOTTOMRIGHT", -2, 3)
+            local tun = tbtn:CreateTexture(nil, "ARTWORK")
+            tun:SetPoint("BOTTOMLEFT", tbtn, "BOTTOMLEFT", 2, 0)
+            tun:SetPoint("BOTTOMRIGHT", tbtn, "BOTTOMRIGHT", -2, 0)
+            tun:SetHeight(2)
+            UI.Skin(tun, function(self) self:SetColorTexture(UI.Color("accent")) end)
+            tun:Hide()
+            local thl = tbtn:CreateTexture(nil, "HIGHLIGHT")
+            thl:SetAllPoints()
+            UI.Skin(thl, function(self) self:SetColorTexture(UI.Color("accent", 0.10)) end)
+            tbtn:SetHighlightTexture(thl)
+            tbtn._lbl, tbtn._under = tlab, tun
+            tbtn:SetScript("OnClick", function(self)
+                if self._profKey then pane.SelectProfTab(self._profKey) end
+            end)
+            b = tbtn
+            pane._tabBtns[i] = b
+        end
+        return b
+    end
 
-    local recP = panel(body, "prof.drill.recipes")
-    recP:SetPoint("TOPLEFT", body, "TOPLEFT", ProfUI.SplitX(), 0)
-    recP:SetPoint("BOTTOMRIGHT", body, "BOTTOMRIGHT", 0, 0)
-    recP:Hide()
+    -- Filter row 1: the find box + the source chip.
+    local filter1 = CreateFrame("Frame", nil, detailP)
+    filter1:SetPoint("TOPLEFT", tabStrip, "BOTTOMLEFT", 0, -6)
+    filter1:SetPoint("RIGHT", detailP, "RIGHT", -L.PANEL_PAD, 0)
+    filter1:SetHeight(L.FILTER_H)
+    Dashboard.Tag(filter1, "prof.filters")
 
-    local filterBand = CreateFrame("Frame", nil, recP)
-    filterBand:SetPoint("TOPLEFT", recP, "TOPLEFT", L.PANEL_PAD, -L.PANEL_PAD)
-    filterBand:SetPoint("TOPRIGHT", recP, "TOPRIGHT", -L.PANEL_PAD, -L.PANEL_PAD)
-    filterBand:SetHeight(L.FILTER_H)
-    Dashboard.Tag(filterBand, "prof.filters")
-
-    local rSearch = searchBox(filterBand, "FIND", 230, function(text)
+    local rSearch = searchBox(filter1, "FIND", 200, function(text)
         pane.filters.search = text or ""
         pane.obj.Refresh()
     end)
-    rSearch:SetPoint("LEFT", filterBand, "LEFT", 0, 0)
+    rSearch:SetPoint("LEFT", filter1, "LEFT", 0, 0)
 
     local SRC_VALUES = { false }
     local SRC_LABELS = { [false] = "All" }
@@ -2079,31 +2354,41 @@ Dashboard.RegisterTab("professions", function(host)
         SRC_VALUES[#SRC_VALUES + 1] = k
         SRC_LABELS[k] = ProfUI.SOURCE_LABEL[k]
     end
-    local srcChip = cycleChip(filterBand, "SOURCE", SRC_VALUES, SRC_LABELS, 150, function(v)
+    local srcChip = cycleChip(filter1, "SOURCE", SRC_VALUES, SRC_LABELS, 140, function(v)
         pane.filters.source = v or nil
         persist(); pane.obj.Refresh()
     end)
     srcChip:SetPoint("LEFT", rSearch, "RIGHT", L.GUTTER, 0)
     srcChip:SetValue(pane.filters.source or false)
 
-    local missChk = checkBox(filterBand, "Missing only",
+    -- Filter row 2: the two toggles + the cold-name status. Two rows because
+    -- the detail pane is a column, not the old full-width band — four controls
+    -- on one 24px line would not fit its width.
+    local filter2 = CreateFrame("Frame", nil, detailP)
+    filter2:SetPoint("TOPLEFT", filter1, "BOTTOMLEFT", 0, -4)
+    filter2:SetPoint("RIGHT", detailP, "RIGHT", -L.PANEL_PAD, 0)
+    filter2:SetHeight(22)
+    Dashboard.Tag(filter2, "prof.filters2")
+
+    local missChk = checkBox(filter2, "Missing only",
         function() return pane.filters.missingOnly end,
         function(v) pane.filters.missingOnly = v; persist(); pane.obj.Refresh() end)
-    missChk:SetPoint("LEFT", srcChip, "RIGHT", L.GUTTER, 0)
+    missChk:SetPoint("LEFT", filter2, "LEFT", 0, 0)
 
-    local unavChk = checkBox(filterBand, "Show unavailable",
+    local unavChk = checkBox(filter2, "Show unavailable",
         function() return pane.filters.showUnavailable end,
         function(v) pane.filters.showUnavailable = v; persist(); pane.obj.Refresh() end)
     unavChk:SetPoint("LEFT", missChk, "RIGHT", L.GUTTER, 0)
 
-    local recStatus = fstr(recP, "small", "RIGHT")
-    recStatus:SetPoint("RIGHT", filterBand, "RIGHT", 0, 0)
+    local recStatus = fstr(filter2, "small", "RIGHT")
+    recStatus:SetPoint("RIGHT", filter2, "RIGHT", 0, 0)
     UI.Skin(recStatus, function(self) self:SetTextColor(UI.Color("muted")) end)
     pane._recStatus = recStatus
 
-    local recScroll, recChild = scroller(recP, "prof.recipes.list")
-    recScroll:SetPoint("TOPLEFT", recP, "TOPLEFT", L.PANEL_PAD, -(L.PANEL_PAD + L.FILTER_H + 4))
-    recScroll:SetPoint("BOTTOMRIGHT", recP, "BOTTOMRIGHT", -L.PANEL_PAD, L.DETAIL_H + 4)
+    local recScroll, recChild = scroller(detailP, "prof.recipes.list")
+    recScroll:SetPoint("TOPLEFT", filter2, "BOTTOMLEFT", 0, -4)
+    recScroll:SetPoint("BOTTOMRIGHT", detailP, "BOTTOMRIGHT", -L.PANEL_PAD,
+                       L.DETAIL_H + L.PANEL_PAD + 4)
     pane._recChild = recChild
 
     local recEmpty = fstr(recChild, "muted", "LEFT")
@@ -2112,10 +2397,10 @@ Dashboard.RegisterTab("professions", function(host)
     pane._recEmpty = recEmpty
 
     -- The selected recipe's SOURCE + MATERIALS, pinned to the bottom of the
-    -- recipe pane so the list above it never has to reflow.
-    local detail = CreateFrame("Frame", nil, recP)
-    detail:SetPoint("BOTTOMLEFT", recP, "BOTTOMLEFT", L.PANEL_PAD, L.PANEL_PAD)
-    detail:SetPoint("BOTTOMRIGHT", recP, "BOTTOMRIGHT", -L.PANEL_PAD, L.PANEL_PAD)
+    -- detail pane so the list above it never has to reflow.
+    local detail = CreateFrame("Frame", nil, detailP)
+    detail:SetPoint("BOTTOMLEFT", detailP, "BOTTOMLEFT", L.PANEL_PAD, L.PANEL_PAD)
+    detail:SetPoint("BOTTOMRIGHT", detailP, "BOTTOMRIGHT", -L.PANEL_PAD, L.PANEL_PAD)
     detail:SetHeight(L.DETAIL_H)
     Dashboard.Tag(detail, "prof.recipe.detail")
     pane._detail = detail
@@ -2144,7 +2429,8 @@ Dashboard.RegisterTab("professions", function(host)
     matHost:SetPoint("BOTTOMRIGHT", detail, "BOTTOMRIGHT", 0, 0)
     pane._matHost = matHost
 
-    -- ══ MODE C: the who-can-craft results ═══════════════════════════════════
+    -- ══ THE SEARCH OVERLAY: the who-can-craft results (typing in the toolbar
+    -- box swaps the three panes for this, clearing it swaps them back) ═══════
     local searchP = panel(body, "prof.search")
     searchP:SetPoint("TOPLEFT", body, "TOPLEFT", 0, 0)
     searchP:SetPoint("BOTTOMRIGHT", body, "BOTTOMRIGHT", 0, 0)
@@ -2167,21 +2453,36 @@ Dashboard.RegisterTab("professions", function(host)
     pane._searchEmpty = searchEmpty
 
     ----------------------------------------------------------------------
-    -- Mode switching + tooltips
+    -- Selection + tooltips
     ----------------------------------------------------------------------
 
-    function pane.OpenDrill(ownerKey, profKey)
-        pane.drill = { owner = ownerKey, profKey = profKey, spell = nil }
-        pane.mode = "drill"
+    -- The cards' idiom, deliberately: selection is a CURSOR, not a toggle —
+    -- ui_cards re-selects on a re-click and never clears itself, so selecting
+    -- the same row again simply keeps it. Selection also survives Refresh (it
+    -- lives on the pane, and persists to the ui state like the cards' does).
+    function pane.SelectCharacter(ownerKey, profKey)
+        if pane.sel and pane.sel.owner == ownerKey then
+            if profKey and profKey ~= pane.sel.profKey then
+                pane.sel.profKey = profKey
+                pane.sel.spell = nil
+            end
+        else
+            pane.sel = { owner = ownerKey, profKey = profKey, spell = nil }
+        end
+        persist()
         pane.obj.Refresh()
     end
-    function pane.CloseDrill()
-        pane.drill = nil
-        pane.mode = (pane.query ~= "") and "search" or "grid"
+    function pane.SelectProfTab(profKey)
+        if not pane.sel then return end
+        if pane.sel.profKey ~= profKey then
+            pane.sel.profKey = profKey
+            pane.sel.spell = nil
+        end
+        persist()
         pane.obj.Refresh()
     end
     function pane.SelectRecipe(spell)
-        if pane.drill then pane.drill.spell = spell end
+        if pane.sel then pane.sel.spell = spell end
         pane.obj.Refresh()
     end
 
@@ -2237,9 +2538,9 @@ Dashboard.RegisterTab("professions", function(host)
         if not r then r = makeGridRow(gridChild, pane); pane._gridRows[i] = r end
         return r
     end
-    local function getRollRow(i)
-        local r = pane._rollRows[i]
-        if not r then r = makeRollupRow(rollChild); pane._rollRows[i] = r end
+    local function getCdRow(i)
+        local r = pane._cdRows[i]
+        if not r then r = makeCdRow(cdChild); pane._cdRows[i] = r end
         return r
     end
     local function getRecRow(i)
@@ -2257,40 +2558,20 @@ Dashboard.RegisterTab("professions", function(host)
         if not r then r = makeMatRow(matHost); pane._matRows[i] = r end
         return r
     end
-    local function getProfRow(i)
-        local r = pane._profRows[i]
-        if not r then
-            local pr = CreateFrame("Button", nil, profChild)
-            pr:SetSize(1, L.ROW_H - 4)
-            local ph = pr:CreateTexture(nil, "HIGHLIGHT")
-            ph:SetAllPoints()
-            UI.Skin(ph, function(self) self:SetColorTexture(UI.Color("accent", 0.12)) end)
-            pr:SetHighlightTexture(ph)
-            local pi = pr:CreateTexture(nil, "ARTWORK")
-            pi:SetSize(L.ICON, L.ICON)
-            pi:SetPoint("LEFT", pr, "LEFT", 2, 0)
-            pi:SetTexCoord(0.07, 0.93, 0.07, 0.93)
-            local pn = fstr(pr, "body", "LEFT")
-            pn:SetPoint("LEFT", pi, "RIGHT", 6, 0)
-            local pl = fstr(pr, "numeral", "RIGHT")
-            pl:SetPoint("RIGHT", pr, "RIGHT", -4, 0)
-            pl:SetWidth(40)      -- fits "300" / the em dash; the cap no longer prints here
-            pn:SetPoint("RIGHT", pl, "LEFT", -4, 0)
-            pr._icon, pr._name, pr._lvl = pi, pn, pl
-            pr:SetScript("OnClick", function(self)
-                if self._profKey and pane.drill then pane.OpenDrill(pane.drill.owner, self._profKey) end
-            end)
-            r = pr
-            pane._profRows[i] = r
-        end
-        return r
-    end
 
     local function renderGrid(entries, lookup, nowE)
         local rows = ProfUI.GridRows(entries, lookup, nowE)
-        local W = math.max(ProfUI.GridWidth(), gridScroll:GetWidth() or 1)
-        gridChild:SetWidth(W)
+        -- THE REAL PANE WIDTH, at render time. Before the first layout pass the
+        -- scroll may not have resolved a rect yet; the natural width stands in
+        -- (clipped by the scroll regardless) and the OnSizeChanged → Refresh
+        -- pass re-derives everything the moment the real number exists.
+        local availW = gridScroll:GetWidth() or 0
+        if availW < 2 then availW = ProfUI.GridWidth() end
+        local cols = ProfUI.GridColumns(availW)
+        layoutHead(cols)
+        gridChild:SetWidth(availW)
         for _, r in ipairs(pane._gridRows) do r:Hide() end
+        local selOwner = pane.sel and pane.sel.owner or nil
         local shown, y = 0, 0
         for i = 1, #rows do
             local model = rows[i]
@@ -2299,14 +2580,19 @@ Dashboard.RegisterTab("professions", function(host)
                 local gr = getGridRow(shown)
                 gr:ClearAllPoints()
                 gr:SetPoint("TOPLEFT", gridChild, "TOPLEFT", 0, -y)
-                gr:SetWidth(W)
+                gr:SetWidth(availW)
+                fitGridRow(gr, cols)
+                gr._owner = model.key
                 nameInk(gr._name, model.key, model.classTag, model.overflow)
                 for slot = 1, L.PRIMARIES do
                     paintCell(gr._cells[slot], model.primaries[slot], model.key, false)
                 end
-                for si, profKey in ipairs(ProfUI.SECONDARY_ORDER) do
+                for si, profKey in ipairs(ProfUI.GRID_SECONDARIES) do
                     paintCell(gr._secs[si], model.secondaries[profKey], model.key, true)
                 end
+                local isSel = (selOwner ~= nil and model.key == selOwner)
+                gr._selWash:SetShown(isSel)
+                gr._selEdge:SetShown(isSel)
                 gr:Show()
                 y = y + L.ROW_H
             end
@@ -2315,37 +2601,47 @@ Dashboard.RegisterTab("professions", function(host)
         pane._gridEmpty:SetShown(shown == 0)
     end
 
-    local function renderRollup(entries, lookup, nowE, res)
-        local rows = ProfUI.RollupRows(entries, lookup, nowE, res)
-        local ready = ProfUI.ReadyCount(rows)
-        rollCount:SetText(ready > 0 and (ready .. " ready") or "")
-        rollCount:SetTextColor(UI.Color(ready > 0 and "ok" or "muted"))
-        rollChild:SetWidth(math.max(1, rollScroll:GetWidth() or 1))
-        for _, r in ipairs(pane._rollRows) do r:Hide() end
-        local pending, y = {}, 0
+    local function renderCooldowns(entries, lookup, nowE, res)
+        local rows = ProfUI.CooldownKindRows(entries, lookup, nowE, res)
+        -- The ready count is the same number the badge counts: every ready
+        -- INSTANCE lands in exactly one kind's ready list.
+        local ready = 0
+        for i = 1, #rows do ready = ready + #rows[i].ready end
+        cdCount:SetText(ready > 0 and (ready .. " ready") or "")
+        cdCount:SetTextColor(UI.Color(ready > 0 and "ok" or "muted"))
+        cdChild:SetWidth(math.max(1, cdScroll:GetWidth() or 1))
+        for _, r in ipairs(pane._cdRows) do r:Hide() end
+        local pendingIDs, y = {}, 0
         for i = 1, #rows do
             local row = rows[i]
-            if row.pending then pending[#pending + 1] = tonumber(row.cdKey) end
-            local ru = getRollRow(i)
-            ru:ClearAllPoints()
-            ru:SetPoint("TOPLEFT", rollChild, "TOPLEFT", 0, -y)
-            ru:SetPoint("RIGHT", rollChild, "RIGHT", 0, 0)
-            nameInk(ru._who, row.owner, row.classTag)
-            ru._what:SetText(row.label or "\226\128\166")
-            ru._what:SetTextColor(UI.Color("muted"))
-            if row.ready then
-                ru._when:SetText("\226\156\147 ready")
-                ru._when:SetTextColor(UI.Color("ok"))
+            if row.pending then pendingIDs[#pendingIDs + 1] = tonumber(row.cdKey) end
+            local kr = getCdRow(i)
+            kr:ClearAllPoints()
+            kr:SetPoint("TOPLEFT", cdChild, "TOPLEFT", 0, -y)
+            kr:SetPoint("RIGHT", cdChild, "RIGHT", 0, 0)
+            kr._what:SetText(row.label or "\226\128\166")
+            kr._what:SetTextColor(UI.Color("text"))
+            if #row.ready > 0 then
+                local parts = {}
+                for j = 1, #row.ready do
+                    parts[#parts + 1] = Dashboard.ColoredName(row.ready[j].key,
+                                                              row.ready[j].classTag)
+                end
+                kr._who:SetText(table.concat(parts, ", "))
+                kr._who:SetTextColor(UI.Color("text"))
             else
-                ru._when:SetText(Dashboard.FormatDuration(row.remaining, "compact"))
-                ru._when:SetTextColor(UI.Color("warn"))
+                -- Every holder is mid-cooldown. The row stays (the kind IS
+                -- owned) but names nobody — that silence is the owner's rule,
+                -- and the em dash keeps it from reading as "not rendered yet".
+                kr._who:SetText("\226\128\148")
+                kr._who:SetTextColor(UI.Color("faint"))
             end
-            ru:Show()
+            kr:Show()
             y = y + L.LIST_ROW_H
         end
-        rollChild:SetHeight(math.max(y, 1))
-        pane._rollEmpty:SetShown(#rows == 0)
-        notePending("spell", pending)
+        cdChild:SetHeight(math.max(y, 1))
+        pane._cdEmpty:SetShown(#rows == 0)
+        notePending("spell", pendingIDs)
     end
 
     local function renderMaterials(spell, ownerKey, res)
@@ -2364,7 +2660,7 @@ Dashboard.RegisterTab("professions", function(host)
         -- a materials list of nothing.
         if state == "unharvested" then
             pane._dNote:SetText("Materials not yet harvested \226\128\148 open "
-                .. ProfUI.ProfName(pane.drill and pane.drill.profKey or "")
+                .. ProfUI.ProfName(pane.sel and pane.sel.profKey or "")
                 .. " on " .. Dashboard.ShortName(ownerKey) .. " once.")
             pane._dNote:SetTextColor(UI.Color("warn"))
             pane._dNote:Show()
@@ -2390,41 +2686,81 @@ Dashboard.RegisterTab("professions", function(host)
         notePending("item", pending)
     end
 
-    local function renderDrill(lookup, nowE, res)
-        local d = pane.drill
-        if not d then return end
-        local payload = lookup(d.owner)
-        nameInk(drillWho, d.owner, (function()
-            local rec = Dashboard.ResolveRosterOwner and select(1, Dashboard.ResolveRosterOwner(d.owner))
+    -- Show/hide the detail pane's working furniture in one motion (the empty
+    -- state hides all of it behind the hint line).
+    local function setDetailShown(on)
+        tabStrip:SetShown(on)
+        filter1:SetShown(on)
+        filter2:SetShown(on)
+        recScroll:SetShown(on)
+        detail:SetShown(on)
+    end
+
+    local function renderDetail(lookup, nowE, res)
+        local sel = pane.sel
+        local payload = sel and lookup(sel.owner) or nil
+        local tabs = ProfUI.DetailTabs(payload)
+
+        -- EMPTY STATES: nothing selected, or a selected character the store
+        -- holds no professions record for. A quiet hint, not a blank pane.
+        if not sel or #tabs == 0 then
+            for _, b in ipairs(pane._tabBtns) do b:Hide() end
+            setDetailShown(false)
+            dWho:SetText(sel and Dashboard.ShortName(sel.owner) or "")
+            dWho:SetTextColor(UI.Color("muted"))
+            dHint:SetText(sel
+                and ("No professions recorded for " .. Dashboard.ShortName(sel.owner)
+                     .. " yet \226\128\148 open a profession window on that character once.")
+                or "Select a character to inspect their professions.")
+            dHint:Show()
+            return
+        end
+        dHint:Hide()
+        setDetailShown(true)
+
+        -- A remembered tab that character no longer holds falls back to their
+        -- first profession rather than to a blank list.
+        local cur = nil
+        for i = 1, #tabs do if tabs[i] == sel.profKey then cur = sel.profKey break end end
+        if not cur then
+            cur = tabs[1]
+            sel.profKey = cur
+            sel.spell = nil
+        end
+
+        nameInk(dWho, sel.owner, (function()
+            local rec = Dashboard.ResolveRosterOwner and select(1, Dashboard.ResolveRosterOwner(sel.owner))
             return rec and rec.classTag or nil
         end)())
 
-        -- LEFT: this character's professions.
-        local list = ProfUI.ProfessionList(payload, nowE)
-        profChild:SetWidth(math.max(1, profScroll:GetWidth() or 1))
-        for _, r in ipairs(pane._profRows) do r:Hide() end
-        local y = 0
-        for i = 1, #list do
-            local m = list[i]
-            local pr = getProfRow(i)
-            pr._profKey = m.key
-            pr:ClearAllPoints()
-            pr:SetPoint("TOPLEFT", profChild, "TOPLEFT", 0, -y)
-            pr:SetPoint("RIGHT", profChild, "RIGHT", 0, 0)
-            pr._icon:SetTexture(ProfUI.ProfIcon(m.key) or "Interface\\Icons\\INV_Misc_QuestionMark")
-            pr._name:SetText(ProfUI.ProfName(m.key))
-            pr._name:SetTextColor(UI.Color(m.key == d.profKey and "accent" or "text"))
-            local lvlText, lvlInk = ProfUI.LevelInk(m.level)
-            pr._lvl:SetText(lvlText)
-            pr._lvl:SetTextColor(UI.Color(lvlInk))
-            pr:Show()
-            y = y + (L.ROW_H - 4)
+        -- THE TAB STRIP — one tab per profession this character holds (the
+        -- rogue's Poisons rides in payload.p, so its tab appears here and only
+        -- here), evenly fitted to the strip's REAL width.
+        local stripW = tabStrip:GetWidth() or 0
+        if stripW < 2 then stripW = L.DTAB_MAX end
+        local tl = ProfUI.DetailTabLayout(stripW, #tabs)
+        for _, b in ipairs(pane._tabBtns) do b:Hide() end
+        for i = 1, #tabs do
+            local b = getTabBtn(i)
+            b._profKey = tabs[i]
+            b:ClearAllPoints()
+            b:SetPoint("TOPLEFT", tabStrip, "TOPLEFT", tl.xs[i], 0)
+            b:SetWidth(math.max(1, tl.w))
+            b._lbl:SetText(ProfUI.ProfName(tabs[i]))
+            local active = (tabs[i] == cur)
+            b._lbl:SetTextColor(UI.Color(active and "text" or "muted"))
+            b._under:SetShown(active)
+            b:Show()
         end
-        profChild:SetHeight(math.max(y, 1))
 
-        -- RIGHT: the recipe list.
-        local rows, pending, state = ProfUI.RecipeRows(payload, d.profKey, pane.filters, res)
-        recChild:SetWidth(math.max(1, recScroll:GetWidth() or 1))
+        -- THE RECIPE LIST (the old drill-in's right pane, re-homed). The title
+        -- column takes its share of the REAL list width so the source column
+        -- keeps a readable remainder in this narrower pane.
+        local rows, pending, state = ProfUI.RecipeRows(payload, cur, pane.filters, res)
+        local listW = math.max(1, recScroll:GetWidth() or 1)
+        recChild:SetWidth(listW)
+        local titleW = math.floor(listW * 0.55)
+        if titleW < 140 then titleW = 140 elseif titleW > 260 then titleW = 260 end
         for _, r in ipairs(pane._recRows) do r:Hide() end
         local ry = 0
         for i = 1, #rows do
@@ -2432,7 +2768,8 @@ Dashboard.RegisterTab("professions", function(host)
             rr:ClearAllPoints()
             rr:SetPoint("TOPLEFT", recChild, "TOPLEFT", 0, -ry)
             rr:SetPoint("RIGHT", recChild, "RIGHT", 0, 0)
-            paintRecipeRow(rr, rows[i], rows[i].spell == d.spell)
+            rr._title:SetWidth(titleW)
+            paintRecipeRow(rr, rows[i], rows[i].spell == sel.spell)
             rr:Show()
             ry = ry + L.LIST_ROW_H
         end
@@ -2444,7 +2781,7 @@ Dashboard.RegisterTab("professions", function(host)
         })
         if state == "unscanned" then
             emptyText = "Not checked yet \226\128\148 open "
-                .. ProfUI.ProfName(d.profKey) .. " on " .. Dashboard.ShortName(d.owner)
+                .. ProfUI.ProfName(cur) .. " on " .. Dashboard.ShortName(sel.owner)
                 .. " once and this list fills in."
         end
         pane._recEmpty:SetText((#rows == 0) and (emptyText or "No recipes match.") or "")
@@ -2452,11 +2789,11 @@ Dashboard.RegisterTab("professions", function(host)
         recStatus:SetText(statusText or "")
 
         -- The selected recipe's source + materials.
-        if d.spell then
-            local nm = res.spell and res.spell(d.spell) or nil
+        if sel.spell then
+            local nm = res.spell and res.spell(sel.spell) or nil
             pane._dTitle:SetText(nm or "\226\128\166")
             pane._dTitle:SetTextColor(UI.Color("text"))
-            local src = ProfUI.SourceModel(d.spell)
+            local src = ProfUI.SourceModel(sel.spell)
             local line = src and (#src.lines > 0 and table.concat(src.lines, "  \194\183  ") or src.text) or ""
             if src and src.unavailable then
                 line = line .. "   [unavailable \226\128\148 " .. src.unavailable.text .. "]"
@@ -2467,7 +2804,7 @@ Dashboard.RegisterTab("professions", function(host)
             pane._dTitle:SetText("")
             pane._dSource:SetText("")
         end
-        renderMaterials(d.spell, d.owner, res)
+        renderMaterials(sel.spell, sel.owner, res)
         notePending("spell", pending)
     end
 
@@ -2529,46 +2866,42 @@ Dashboard.RegisterTab("professions", function(host)
 
     function pane.obj.Refresh()
         if not enabled() then
-            gridP:Hide(); rollP:Hide(); listP:Hide(); recP:Hide(); searchP:Hide()
+            gridP:Hide(); detailP:Hide(); cdP:Hide(); searchP:Hide()
             return
         end
-        applySplit()      -- belt to OnSizeChanged's braces: a body whose width
-                          -- resolved after build still lands on the 75/25 split
+        applySplit()      -- belt to OnSizeChanged's braces: a body whose rect
+                          -- resolved after build still lands on the splits
         local nowE = now()
         local res = ProfUI.LiveResolver()
         local entries = ProfUI.Roster()
         local lookup = payloadLookup()
         pane._entries, pane._lookup = entries, lookup
 
-        local isDrill  = (pane.mode == "drill" and pane.drill ~= nil)
         local isSearch = (pane.mode == "search")
-        gridP:SetShown(not isDrill and not isSearch)
-        rollP:SetShown(not isDrill and not isSearch)
-        listP:SetShown(isDrill)
-        recP:SetShown(isDrill)
+        gridP:SetShown(not isSearch)
+        detailP:SetShown(not isSearch)
+        cdP:SetShown(not isSearch)
         searchP:SetShown(isSearch)
-        back:SetShown(isDrill)
-        crumb:SetText(isDrill and (Dashboard.ShortName(pane.drill.owner) .. " \226\128\186 "
-            .. ProfUI.ProfName(pane.drill.profKey)) or "")
 
         if isSearch then
             renderSearch(entries, lookup, res)
-        elseif isDrill then
-            renderDrill(lookup, nowE, res)
         else
             renderGrid(entries, lookup, nowE)
-            renderRollup(entries, lookup, nowE, res)
+            renderDetail(lookup, nowE, res)
+            renderCooldowns(entries, lookup, nowE, res)
         end
         if Dashboard.RefreshTabStrip then Dashboard.RefreshTabStrip() end
     end
 
-    -- THE CHEAP HALF. Everything one second changes here is a COUNTDOWN, and a
+    -- THE CHEAP HALF. Everything one second changes here is a COUNTDOWN (the
+    -- grid cells' running timers and the cooldown pane's ready flips), and a
     -- countdown needs neither a fresh roster gather (which re-derives online
     -- winners across the whole store) nor a re-sort nor a scroll reset. So the
-    -- ticker re-renders from the entries the last full Refresh already gathered.
-    -- Membership, selection and store changes still arrive as engine events and
-    -- still run the full Refresh. Search results carry no clock at all, so that
-    -- mode simply does not tick.
+    -- ticker re-renders from the entries the last full Refresh already
+    -- gathered. The detail pane carries no clock; membership, selection and
+    -- store changes still arrive as engine events and still run the full
+    -- Refresh. Search results carry no clock either, so that mode does not
+    -- tick at all.
     function pane.obj.Repaint()
         if not enabled() then return end
         if pane.mode == "search" then return end
@@ -2576,12 +2909,8 @@ Dashboard.RegisterTab("professions", function(host)
         if not (entries and lookup) then return pane.obj.Refresh() end
         local nowE = now()
         local res = ProfUI.LiveResolver()
-        if pane.mode == "drill" and pane.drill then
-            renderDrill(lookup, nowE, res)
-        else
-            renderGrid(entries, lookup, nowE)
-            renderRollup(entries, lookup, nowE, res)
-        end
+        renderGrid(entries, lookup, nowE)
+        renderCooldowns(entries, lookup, nowE, res)
         if Dashboard.RefreshTabStrip then Dashboard.RefreshTabStrip() end
     end
     repaintPane = function() if thePane then thePane.obj.Refresh() end end
@@ -2595,7 +2924,10 @@ Dashboard.RegisterTab("professions", function(host)
         if fire then ns:SafeCall(pane.obj.Repaint) end
     end)
 
+    -- The scrolls are where the REAL widths live; when either resolves or
+    -- changes, the whole geometry re-derives (the overflow lesson again).
     gridScroll:SetScript("OnSizeChanged", function() pane.obj.Refresh() end)
+    recScroll:SetScript("OnSizeChanged", function() pane.obj.Refresh() end)
     pane.obj.Refresh()
     return pane.obj
 end)
@@ -2792,24 +3124,53 @@ local function testGridModel(fails)
     ck(ac3.cd and ac3.cd.state == "ready" and ProfUI.CooldownRemaining(NOW + 600, NOW + 99999) == 0,
        "a long-elapsed cooldown went negative instead of flooring at ready")
 
-    -- Layout maths stay a pure function of LAYOUT.
-    ck(ProfUI.CellX(1) == L.NAME_W, "the first primary column moved off the name column")
-    ck(ProfUI.CellX(2) == L.NAME_W + L.CELL_W + L.CELL_GAP, "the second primary column is mis-pitched")
-    ck(ProfUI.SecondaryX(2) - ProfUI.SecondaryX(1) == L.SEC_W + L.SEC_GAP,
+    -- Layout maths. At or above the natural width the columns sit at their
+    -- LAYOUT pitch — the constants still mean what they say.
+    local nat = ProfUI.GridColumns(ProfUI.GridWidth() + 50)
+    ck(nat.prim[1].x == L.NAME_W, "the first primary column moved off the name column")
+    ck(nat.prim[2].x - nat.prim[1].x == L.CELL_W + L.CELL_GAP,
+       "the second primary column is mis-pitched")
+    ck(nat.sec.firstaid.x - nat.sec.cooking.x == L.SEC_W + L.SEC_GAP,
        "the secondary chips are mis-pitched")
+    ck(nat.width == ProfUI.GridWidth(), "extra pane width grew the columns past natural")
+    ck(nat.sec.poisons == nil, "a poisons column crept back into the grid geometry")
     ck(ProfUI.GridRowY(3) == 2 * L.ROW_H, "the grid row pitch is not ROW_H")
 
-    -- The 75/25 pane split is a pure function of the body width, and it
-    -- conserves it: grid + rollup + gutter == body, always.
-    local HOST_W = 1096      -- ui_shell: DEFAULT_W 1120 minus its PAD 12 insets
-    local gw, rw = ProfUI.SplitWidths(HOST_W)
-    ck(gw + rw + L.GUTTER == HOST_W, "the pane split does not conserve the body width")
-    ck(gw == math.floor((HOST_W - L.GUTTER) * L.GRID_FRACTION + 0.5),
-       "the grid pane is not GRID_FRACTION of the body")
-    ck(ProfUI.GridWidth() + 2 * L.PANEL_PAD <= gw,
-       "the grid columns overflow the 75% pane at the shell's fixed width")
+    -- MULTI-WIDTH FIT — the overflow lesson. The previous pass asserted the
+    -- fit at exactly ONE assumed host width and the live pane still escaped;
+    -- now the columns are a function of the real pane width, and the fit is
+    -- exercised at several shell widths (the default 1120, the owner's
+    -- screenshot-scale 1362, and two harsher ones) plus both conservation
+    -- rules, both axes.
+    local SHELL_PAD = 12     -- ui_shell: the non-characters tab host inset per side
+    for _, shellW in ipairs({ 1120, 1362, 900, 700 }) do
+        local hostW = shellW - 2 * SHELL_PAD
+        local gw, rw = ProfUI.SplitWidths(hostW)
+        ck(gw + rw + L.GUTTER == hostW,
+           "the pane split does not conserve the body width at shell " .. shellW)
+        local availW = gw - 2 * L.PANEL_PAD
+        local cols = ProfUI.GridColumns(availW)
+        ck(cols.width <= math.max(availW, 0),
+           "the grid columns overflow their pane at shell " .. shellW
+           .. " (" .. cols.width .. " > " .. availW .. ")")
+    end
+    -- Below the natural width every column shrinks (and still fits).
+    local small = ProfUI.GridColumns(400)
+    ck(small.width <= 400, "a 400px pane did not contain the columns")
+    ck(small.name.w < L.NAME_W and small.prim[1].w < L.CELL_W and small.sec.fishing.w < L.SEC_W,
+       "a narrow pane did not shrink the columns")
+    for _, bodyH in ipairs({ 560, 820 }) do
+        local dh, chh = ProfUI.RightSplitHeights(bodyH)
+        ck(dh + chh + L.GUTTER == bodyH,
+           "the right-column split does not conserve its height at " .. bodyH)
+        ck(dh == math.floor((bodyH - L.GUTTER) * L.DETAIL_FRACTION + 0.5),
+           "the detail pane is not DETAIL_FRACTION of the column")
+    end
     local zg, zr = ProfUI.SplitWidths(0)
     ck(zg == 0 and zr == 0, "a zero-width body produced a negative pane")
+    local zd, zc = ProfUI.RightSplitHeights(0)
+    ck(zd == 0 and zc == 0, "a zero-height column produced a negative pane")
+    ck(ProfUI.GridColumns(0).width == 0, "a zero-width pane produced columns anyway")
 
     -- Level ink, the owner's rule: current level ONLY (no /max), green at the
     -- Era cap, yellow below it, an em dash — never 0 — when never recorded.
@@ -2820,15 +3181,28 @@ local function testGridModel(fails)
     lt, li = ProfUI.LevelInk(nil)
     ck(lt == "\226\128\148" and li == "faint", "an unrecorded level did not render as the em dash")
 
-    -- The secondary headers carry the FULL profession names (owner's header
-    -- pass; the abbreviations COOK/AID/FISH/POIS are retired).
-    local wantHeader = { cooking = "COOKING", firstaid = "FIRST AID",
-                         fishing = "FISHING", poisons = "POISONS" }
-    for _, key in ipairs(ProfUI.SECONDARY_ORDER) do
-        ck(ProfUI.SECONDARY_LABEL[key] == wantHeader[key],
-           "secondary '" .. key .. "' does not wear its full-name header ("
-           .. tostring(ProfUI.SECONDARY_LABEL[key]) .. ")")
+    -- THE HEADER ROW PIN (owner's rework): CHARACTER | PRIMARY | PRIMARY |
+    -- COOKING | FIRST AID | FISHING — full names, and NO POISONS column. The
+    -- poisons DATA still travels (it is still a classified secondary, so it
+    -- still costs no primary slot and still reaches the detail pane's tab).
+    local heads = ProfUI.GridHeaderLabels()
+    local wantHeads = { "CHARACTER", "PRIMARY", "PRIMARY", "COOKING", "FIRST AID", "FISHING" }
+    ck(#heads == #wantHeads, "the grid header count changed (" .. #heads .. ")")
+    for i = 1, #wantHeads do
+        ck(heads[i] == wantHeads[i], "grid header " .. i .. " reads "
+           .. tostring(heads[i]) .. ", wanted " .. wantHeads[i])
     end
+    for i = 1, #heads do
+        ck(heads[i] ~= "POISONS", "the POISONS column is back in the grid header")
+    end
+    local gridHasPoisons = false
+    for _, key in ipairs(ProfUI.GRID_SECONDARIES) do
+        if key == "poisons" then gridHasPoisons = true end
+    end
+    ck(not gridHasPoisons, "poisons is still a grid column")
+    ck(ProfUI.IsSecondary("poisons"),
+       "poisons stopped being classified a secondary (the detail tab and the "
+       .. "primaries-slot rule both need it)")
 end
 
 local function testRollup(fails)
@@ -2869,6 +3243,98 @@ local function testRollup(fails)
     local same = true
     for i = 1, #rows do if rows[i].cdKey ~= again[i].cdKey then same = false end end
     ck(same, "two rollups of the same store came out in different orders")
+end
+
+local function testDetailAndKinds(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local NOW = 1700000000
+
+    -- DETAIL TABS: one per profession the character actually holds, primaries
+    -- leading — and Poisons ONLY for the character whose payload carries it.
+    local rogue = { p = { poisons = { l = 300, m = 300 }, alchemy = { l = 240, m = 300 },
+                          cooking = { l = 150, m = 225 } }, c = {} }
+    local mage  = { p = { tailoring = { l = 300, m = 300 }, enchanting = { l = 285, m = 300 },
+                          fishing = { l = 75, m = 150 } }, c = {} }
+    local rt = ProfUI.DetailTabs(rogue)
+    ck(#rt == 3, "the rogue's tab count is wrong (" .. #rt .. ")")
+    ck(rt[1] == "alchemy", "primaries do not lead the tab strip")
+    local sawPoisons = false
+    for _, k in ipairs(rt) do if k == "poisons" then sawPoisons = true end end
+    ck(sawPoisons, "the rogue did not get a Poisons tab")
+    local mt = ProfUI.DetailTabs(mage)
+    ck(#mt == 3, "the mage's tab count is wrong (" .. #mt .. ")")
+    for _, k in ipairs(mt) do
+        ck(k ~= "poisons", "a non-rogue grew a Poisons tab")
+    end
+    ck(#ProfUI.DetailTabs(nil) == 0, "no payload still produced tabs")
+
+    -- Losing the COLUMN did not lose the CAPTURE: the grid model still carries
+    -- poisons among the secondaries (the tooltip path and the detail pane read
+    -- it from there) — the renderer just paints no column for it.
+    local rrow = ProfUI.GridRow({ nameRealm = "R-Realm", rec = { classTag = "ROGUE" } }, rogue, NOW)
+    ck(rrow.secondaries.poisons ~= nil,
+       "the poisons DATA fell out of the grid model (it lost its column, not its capture)")
+    ck(rrow.secondaries.poisons and rrow.secondaries.poisons.level == 300,
+       "the poisons cell model lost its level")
+
+    -- The tab strip fits its real width, whatever that width is.
+    local tl = ProfUI.DetailTabLayout(400, 6)
+    ck(#tl.xs == 6, "the tab layout lost a tab")
+    ck(tl.xs[6] + tl.w <= 400, "the tab strip overflows its pane")
+    ck(ProfUI.DetailTabLayout(600, 2).w <= L.DTAB_MAX,
+       "two tabs in a wide strip did not cap at DTAB_MAX")
+    ck(ProfUI.DetailTabLayout(400, 0).w == 0, "zero tabs produced a tab width")
+
+    -- COOLDOWN KIND ROWS: kinds enumerate from the payloads (never a hardcoded
+    -- list), each row names ONLY the characters ready right now, in roster
+    -- order and carrying class tags; a character mid-cooldown is not listed; a
+    -- kind nobody owns is not a row.
+    local payloads = {
+        ["Aaa-Realm"] = { p = {}, c = { ["999"] = NOW - 5, ["g1"] = NOW + 3600 } },
+        ["Bbb-Realm"] = { p = {}, c = { ["999"] = NOW + 60 } },
+        ["Ccc-Realm"] = { p = {}, c = { ["999"] = NOW - 100 } },
+    }
+    local kinds = ProfUI.CooldownKindRows(fixtureEntries(), function(k) return payloads[k] end,
+                                          NOW, fakeResolver({ [999] = "Mooncloth" }))
+    ck(#kinds == 2, "three cooldown instances did not fold into two kinds (" .. #kinds .. ")")
+    local moon, shared
+    for _, k in ipairs(kinds) do
+        if k.cdKey == "999" then moon = k elseif k.cdKey == "g1" then shared = k end
+    end
+    ck(moon ~= nil and shared ~= nil, "a cooldown kind vanished")
+    ck(moon and moon.label == "Mooncloth", "the kind row did not wear the recipe name")
+    ck(moon and moon.owners == 3, "the kind's owner count is wrong")
+    ck(moon and #moon.ready == 2, "the ready list is wrong ("
+       .. tostring(moon and #moon.ready) .. ")")
+    if moon and #moon.ready == 2 then
+        ck(moon.ready[1].key == "Aaa-Realm" and moon.ready[2].key == "Ccc-Realm",
+           "the ready names are not in roster order")
+        for _, r in ipairs(moon.ready) do
+            ck(r.key ~= "Bbb-Realm", "a character still ON cooldown was listed as ready")
+        end
+        ck(moon.ready[1].classTag == "MAGE", "a ready name lost its class tag")
+    end
+    ck(shared and shared.owners == 1, "the shared-group kind lost its owner")
+    ck(shared and #shared.ready == 0, "a kind with nobody ready invented ready names")
+
+    -- Determinism (class 8): two walks of the same store, same order.
+    local again = ProfUI.CooldownKindRows(fixtureEntries(), function(k) return payloads[k] end,
+                                          NOW, fakeResolver({ [999] = "Mooncloth" }))
+    ck(#again == #kinds, "two walks disagreed on the kind count")
+    for i = 1, math.min(#kinds, #again) do
+        if kinds[i].cdKey ~= again[i].cdKey then
+            fails[#fails + 1] = "two walks of the same store ordered the kinds differently"
+            break
+        end
+    end
+
+    -- A cold kind name is PENDING — held, never guessed (the Bags lesson).
+    local coldKinds = ProfUI.CooldownKindRows(fixtureEntries(), function(k) return payloads[k] end,
+                                              NOW, fakeResolver({}))
+    local coldMoon
+    for _, k in ipairs(coldKinds) do if k.cdKey == "999" then coldMoon = k end end
+    ck(coldMoon ~= nil and coldMoon.pending == true and coldMoon.label == nil,
+       "a cold kind name was not held as pending")
 end
 
 local function testFilters(fails)
@@ -3187,11 +3653,15 @@ end
 if ns.RegisterSelfTest then
     ns:RegisterSelfTest("professionsui", function(verbose)
         local suites = {
-            { name = "grid model (roster order, the third state, cooldown decay, layout maths)",
+            { name = "grid model (roster order, the third state, cooldown decay, "
+                  .. "multi-width fit, header pins)",
               fn = testGridModel },
             { name = "cooldown rollup (ready-first ordering, shared groups, determinism)",
               fn = testRollup },
-            { name = "drill-in filters (missing-only, source, unavailable toggle, cold search)",
+            { name = "detail tabs + cooldown kinds (rogue poisons tab, ready-only names, "
+                  .. "kind determinism)",
+              fn = testDetailAndKinds },
+            { name = "detail-pane filters (missing-only, source, unavailable toggle, cold search)",
               fn = testFilters },
             { name = "materials join (mesh counts, unknown vs zero, unharvested state)",
               fn = testMaterials },
