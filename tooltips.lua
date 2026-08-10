@@ -767,6 +767,18 @@ local function gray(text)
     return "|cffbbbbbb" .. tostring(text) .. "|r"
 end
 
+-- The suite ACCENT ink (the delegate loud line's label). The UI kit's token
+-- when DaseekiUI is up — Nexus hard-depends on Daseeki-Core, so it normally
+-- is — with a fixed literal of the same family otherwise, the creamRGB shape.
+local function accent(text)
+    local UI = _G.DaseekiUI
+    if UI and UI.Color then
+        local r, g, b = UI.Color("accent")
+        if type(r) == "number" then return hex(r, g, b) .. tostring(text) .. "|r" end
+    end
+    return "|cffd79921" .. tostring(text) .. "|r"
+end
+
 -- Daseeki-Bags/features.lua:308 / ui_owner.lua — the "Other Accounts" glyph: the
 -- retail quest-log account atlas when the client has it, the Battle.net WoW icon
 -- (which ships with the Classic client) otherwise.
@@ -1129,6 +1141,76 @@ function Tooltips.RecipeRows(block, req, colorize)
 end
 
 ----------------------------------------------------------------------
+-- THE DELEGATE LOUD LINE  (profession-delegates phase 1)
+--
+-- ONE accent line ABOVE Known/Learnable when the viewer's-faction PRIMARY for
+-- this recipe's lane is PROVEN missing it:
+--
+--     Primary missing: Poonyx (280/275)
+--
+-- The rules, each one the owner's:
+--   * proven "missing" ONLY. An unscanned primary gets NO loud line (unproven
+--     is not missing — the three-state honesty rule); they still count in the
+--     grey unscanned gap like anyone else.
+--   * ALWAYS shown when proven missing, even with the skill short of the
+--     requirement — this is COLLECTION framing (the primary collects every
+--     recipe of the lane), so the line states current skill vs req and lets
+--     the owner see the distance. A nil skill states nothing rather than
+--     inventing a number.
+--   * the primary IS the viewer -> "Primary missing: You (...)" — the same
+--     isSelf rendering (and class colour) as the lines below it.
+--   * SECONDARY delegates get no loud line. Primary only.
+--
+-- PURE: `primaryKey` arrives already resolved (Professions.ResolveDelegate
+-- owns the lane walk and the faction scoping; its self-tests own that matrix).
+-- A primaryKey with no entry in `entries` — no record of the profession at
+-- all — is unproven, so: no line.
+----------------------------------------------------------------------
+
+function Tooltips.RecipePrimaryRow(entries, primaryKey, req, colorize)
+    if type(primaryKey) ~= "string" or primaryKey == "" then return nil end
+    if type(entries) ~= "table" then return nil end
+    local e
+    for i = 1, #entries do
+        local c = entries[i]
+        if type(c) == "table" and c.key == primaryKey then e = c break end
+    end
+    if not e or e.state ~= "missing" then return nil end
+
+    local plainMode = (colorize == false)
+    local wrapName = plainMode and function(_, n) return n end
+        or (type(colorize) == "function" and colorize)
+        or function(class, n) return hex(classColor(class)) .. n .. "|r" end
+    local wrapQuiet = plainMode and function(s) return s end or gray
+    local wrapLoud  = plainMode and function(s) return s end or accent
+
+    local name = e.isSelf and "You" or e.name
+    local skill, reqN = tonumber(e.skill), tonumber(req)
+    local suffix = (skill and reqN) and string.format(" (%d/%d)", skill, reqN)
+        or (skill and string.format(" (%d)", skill) or "")
+    return {
+        kind  = "primary",
+        text  = wrapLoud("Primary missing:") .. " "
+                .. wrapName(e.class, name) .. wrapQuiet(suffix),
+        plain = "Primary missing: " .. name .. suffix,
+    }
+end
+
+-- Live: resolve the viewer's-faction primary for this recipe's lane and build
+-- the row. Degrades to nil at every rung (no module, no faction, no
+-- designation, record vanished, unproven).
+function Tooltips.RecipePrimaryRowLive(facts, entries)
+    local P = ns.Professions
+    if not (P and P.ResolvePrimary and type(facts) == "table") then return nil end
+    -- The viewer's faction, the ~1343 UnitFactionGroup precedent below.
+    local faction = (_G.UnitFactionGroup and _G.UnitFactionGroup("player")) or nil
+    if not faction then return nil end
+    local primaryKey = P.ResolvePrimary(faction, facts.profKey, facts.specID)
+    if not primaryKey then return nil end
+    return Tooltips.RecipePrimaryRow(entries, primaryKey, facts.req)
+end
+
+----------------------------------------------------------------------
 -- LIVE: collecting the candidate characters
 ----------------------------------------------------------------------
 
@@ -1306,6 +1388,10 @@ function Tooltips.AppendRecipeLines(tt)
     local entries = Tooltips.RecipeEntries(facts, Tooltips.SelfKey())
     local block = Tooltips.BuildRecipeBlock(entries, facts.req, facts.specID)
     local rows = Tooltips.RecipeRows(block, facts.req)
+    -- The delegate loud line sits ABOVE Known/Learnable (deterministic: one
+    -- resolved primary, one row, always position 1 when present).
+    local prow = Tooltips.RecipePrimaryRowLive(facts, entries)
+    if prow then table.insert(rows, 1, prow) end
     if #rows == 0 then return end
     tt.__dsnRecipeShown = true
 
@@ -2067,6 +2153,69 @@ local function selfTest(verbose)
                          GetItem = function() return nil end, __dsnRecipeShown = true }
             Tooltips.AppendRecipeLines(tt)
             ck("recipe/latched", n == 0)
+        end
+
+        ------------------------------------------------------------------
+        -- THE DELEGATE LOUD LINE (profession-delegates phase 1). The lane
+        -- walk and faction scoping live in Professions.ResolveDelegate and
+        -- are pinned THERE; this matrix owns the rendering rules: proven-
+        -- missing only, always-even-when-skill-short, "You", no line for
+        -- known/unscanned/secondary/vanished, colorize-seam parity.
+        ------------------------------------------------------------------
+        do
+            local dEntries = {
+                { key = "Prim-R",  name = "Prim",  class = "MAGE",   state = "missing", skill = 285 },
+                { key = "Short-R", name = "Short", class = "DRUID",  state = "missing", skill = 120 },
+                { key = "Know-R",  name = "Know",  class = "PRIEST", state = "known",   skill = 300 },
+                { key = "Dark-R",  name = "Dark",  class = "ROGUE",  state = "unknown" },
+                { key = "Bare-R",  name = "Bare",  class = "SHAMAN", state = "missing", skill = nil },
+                { key = "Self-R",  name = "Poonyx", class = "PRIEST", state = "missing",
+                  skill = 280, isSelf = true },
+            }
+            local P = function(k) return Tooltips.RecipePrimaryRow(dEntries, k, 275, false) end
+
+            -- proven missing -> the line, with current/required skill.
+            local r = P("Prim-R")
+            ck("primary/missing-fires", r ~= nil and r.kind == "primary"
+                and r.plain == "Primary missing: Prim (285/275)")
+            -- ALWAYS shown even when the skill is short (collection framing).
+            ck("primary/skill-short-still-fires",
+                (P("Short-R") or {}).plain == "Primary missing: Short (120/275)")
+            -- a nil skill states nothing rather than inventing a number.
+            ck("primary/nil-skill-no-numbers",
+                (P("Bare-R") or {}).plain == "Primary missing: Bare")
+            -- the primary knows it -> no line.
+            ck("primary/known-silent", P("Know-R") == nil)
+            -- unscanned primary -> no line (unproven is not missing)...
+            ck("primary/unscanned-silent", P("Dark-R") == nil)
+            -- ...and they still count in the gap line like anyone else.
+            do
+                local blk = Tooltips.BuildRecipeBlock(dEntries, 275, nil)
+                ck("primary/unscanned-still-in-gap", blk.unscanned >= 1)
+            end
+            -- the primary IS the viewer -> "You" (the isSelf rendering).
+            ck("primary/self-is-you",
+                (P("Self-R") or {}).plain == "Primary missing: You (280/275)")
+            -- a vanished/undesignated resolution (nil key) or a primary with
+            -- no record of the profession (key not among the entries) -> nil.
+            ck("primary/nil-key", P(nil) == nil)
+            ck("primary/no-entry", P("Ghost-R") == nil)
+            -- the colorize seam: the injected wrapper wears the class, the
+            -- label survives verbatim, the word "You" is never rewrapped.
+            do
+                local cr = Tooltips.RecipePrimaryRow(dEntries, "Self-R", 275,
+                    function(class, n) return "[" .. tostring(class) .. "]" .. n end)
+                ck("primary/colorize-seam", cr ~= nil
+                    and cr.text:find("[PRIEST]You", 1, true) ~= nil
+                    and cr.text:find("Primary missing:", 1, true) ~= nil)
+            end
+            -- determinism (class 8): same inputs, byte-identical row, both forms.
+            do
+                local a1, a2 = P("Prim-R"), P("Prim-R")
+                local c1 = Tooltips.RecipePrimaryRow(dEntries, "Prim-R", 275)
+                local c2 = Tooltips.RecipePrimaryRow(dEntries, "Prim-R", 275)
+                ck("primary/deterministic", a1.plain == a2.plain and c1.text == c2.text)
+            end
         end
     end
 

@@ -61,7 +61,7 @@
 local ADDON, ns = ...
 
 ns.ProfessionsDataMeta = {
-    version     = "p1-f84a5fa0",
+    version     = "p1-4b17878e",
     professions = 13,
     recipes     = 1251,
     items       = 770,
@@ -105,6 +105,7 @@ eventItems|25
 FIX-1|fishing-artisan-spell|18260|18248|the examined data reuses the cooking artisan spell id for fishing; the fishing artisan rank is its own spell
 FIX-3|thorium-contract-plans|no source|K18628|the contract item that grants them ships in the data but is never linked
 FIX-2|duplicate-prose-note|two note keys, one text|interned by text|notes are interned on their text here, so the duplicate cannot come back
+FIX-4|spec-parent-edges|flat specialisation list|3 Master smith specs parent to Weaponsmith|the era Blacksmithing tree is nested (a Master smith IS a Weaponsmith); the delegate lanes walk this edge
 [prof]
 1|alchemy|Alchemy|111
 2|blacksmithing|Blacksmithing|239
@@ -1147,16 +1148,16 @@ FIX-2|duplicate-prose-note|two note keys, one text|interned by text|notes are in
 7|Revered
 8|Exalted
 [spec]
-1|9787|2|200|5284|Weaponsmith
-2|9788|2|200|5283|Armorsmith
-3|17039|2|250|5307|Master Swordsmith
-4|17040|2|250|5305|Master Hammersmith
-5|17041|2|250|5306|Master Axesmith
-6|20219|5|200|3630|Gnomish Engineer
-7|20222|5|200|3629|Goblin Engineer
-8|10656|7|225|5141|Dragonscale Leatherworking
-9|10658|7|225|5144|Elemental Leatherworking
-10|10660|7|225|5143|Tribal Leatherworking
+1|9787|2|200|5284|Weaponsmith|0
+2|9788|2|200|5283|Armorsmith|0
+3|17039|2|250|5307|Master Swordsmith|1
+4|17040|2|250|5305|Master Hammersmith|1
+5|17041|2|250|5306|Master Axesmith|1
+6|20219|5|200|3630|Gnomish Engineer|0
+7|20222|5|200|3629|Goblin Engineer|0
+8|10656|7|225|5141|Dragonscale Leatherworking|0
+9|10658|7|225|5144|Elemental Leatherworking|0
+10|10660|7|225|5143|Tribal Leatherworking|0
 [rank]
 1|1|2259|0|75|5|10|1215+1246+1470+2132+3184+3603+5500+11041+11044+11046+11047|0|-
 1|2|3101|50|150|10|500|2391+2837+3009+3347+3964+4609+4900+5177+5499+11042|0|-

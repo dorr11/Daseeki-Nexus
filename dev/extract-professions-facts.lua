@@ -475,6 +475,41 @@ FIXES[#FIXES + 1] = { id = "FIX-2", what = "duplicate-prose-note",
     was = "two note keys, one text", now = "interned by text",
     why = "notes are interned on their text here, so the duplicate cannot come back" }
 
+-- FIX-4: the Blacksmithing specialisation tree is NESTED in the era client —
+-- the examined data lists the ten specialisations flat. Armorsmith and
+-- Weaponsmith sit under Blacksmithing, and the three Master smith specs
+-- (Swordsmith / Hammersmith / Axesmith) sit UNDER Weaponsmith: becoming one
+-- REQUIRES being a Weaponsmith, so a Master Axesmith IS a Weaponsmith. The
+-- Engineering and Leatherworking specialisations are flat single-level and get
+-- no parent. The edge is matched by the dataset's own spec NAMES and emitted
+-- as a parent ORDINAL in a NEW seventh [spec] field (appending keeps every
+-- existing six-field reader answering exactly as before). Consumed by the
+-- profession-delegate lanes: a lane with no primary walks its parent chain.
+do
+    local PARENT_EDGES = {
+        ["Master Swordsmith"]  = "Weaponsmith",
+        ["Master Hammersmith"] = "Weaponsmith",
+        ["Master Axesmith"]    = "Weaponsmith",
+    }
+    local n = 0
+    for childName, parentName in pairs(PARENT_EDGES) do
+        local ci, pi = specByName[childName], specByName[parentName]
+        if not ci then die("FIX-4 did not apply: spec '" .. childName .. "' is not in the data") end
+        if not pi then die("FIX-4 did not apply: parent spec '" .. parentName .. "' is not in the data") end
+        if specs[ci].prof ~= specs[pi].prof then
+            die("FIX-4 refused: '" .. childName .. "' and '" .. parentName
+                .. "' belong to different professions")
+        end
+        specs[ci].parent = pi
+        n = n + 1
+    end
+    if n ~= 3 then die("FIX-4 expected 3 parent edges, applied " .. n) end
+    FIXES[#FIXES + 1] = { id = "FIX-4", what = "spec-parent-edges",
+        was = "flat specialisation list", now = "3 Master smith specs parent to Weaponsmith",
+        why = "the era Blacksmithing tree is nested (a Master smith IS a Weaponsmith);"
+           .. " the delegate lanes walk this edge" }
+end
+
 ----------------------------------------------------------------------
 -- Acquisition token grammar
 --
@@ -823,8 +858,11 @@ end
 w("")
 
 w("[spec]")
+-- Field 7 (FIX-4) is the parent spec ORDINAL, 0 for a root spec. It sits AFTER
+-- the name — [prof] already carries a field after its name, and appending is
+-- what keeps a six-field reader reading exactly what it always read.
 for i, s in ipairs(specs) do
-    w(table.concat({ i, s.id, s.prof, s.minSkill, s.quest, s.name }, "|"))
+    w(table.concat({ i, s.id, s.prof, s.minSkill, s.quest, s.name, s.parent or 0 }, "|"))
 end
 w("")
 

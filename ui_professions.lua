@@ -422,6 +422,13 @@ ProfUI.GLYPHS = {
     range  = "\226\128\147",   -- U+2013 en dash
     times  = "\195\151",       -- U+00D7 multiplication sign
     absent = "--",             -- ASCII: the never-learned secondary cell
+    -- Delegate designation marks (profession-delegates phase 1): ASCII BY
+    -- CHOICE, not by accident — digits and the capital B are in every face a
+    -- user could ever pick, so the tofu class cannot reach them. The self-test
+    -- pins all three as pure ASCII.
+    primary   = "1",           -- ASCII: the cell's primary-designation badge
+    secondary = "2",           -- ASCII: the cell's secondary-designation badge
+    bank      = "B",           -- ASCII: the recipe-bank mark beside the name
 }
 
 -- Codepoints that shipped as tofu boxes once. Stored as BYTE TRIPLES so the
@@ -951,6 +958,10 @@ function ProfUI.GridRow(entry, payload, nowE)
     local row = {
         key        = entry and entry.nameRealm or "?",
         classTag   = rec and rec.classTag or nil,
+        -- The record's faction rides the row for the delegate layer: a
+        -- designation is written into the DESIGNATED CHARACTER's faction
+        -- bucket, and the badges/menu read the same fact.
+        faction    = rec and rec.faction or nil,
         level      = rec and rec.level or nil,
         online     = entry and entry.online or false,
         primaries  = {},
@@ -998,6 +1009,240 @@ function ProfUI.GridRows(entries, lookup, nowE)
         out[#out + 1] = ProfUI.GridRow(e, payload, nowE)
     end
     return out
+end
+
+----------------------------------------------------------------------
+-- DELEGATE DESIGNATIONS  (PURE model — profession-delegates phase 1)
+--
+-- The grid's face for the owner's collector designations: quiet ASCII badges
+-- on designated cells ("1" primary / "2" secondary, accent ink), a "B" beside
+-- the recipe-bank character's name, a right-click context menu per cell (lane
+-- entries, contextual Set/Clear) and per name row (recipe bank). All reads go
+-- against the cross-account EFFECTIVE config (Store.DelegatesEffective — the
+-- last-writer-wins winner), so every account renders the same designations.
+--
+-- Lanes: "general" always; plus one lane per specialisation of the profession.
+-- The menu offers, at the top level, only lanes the character can serve today
+-- (general + specs they hold) plus any lane ALREADY designated to them (the
+-- Clear entry must stay reachable even for a planned designation); the
+-- remaining spec lanes sit in a "Plan" submenu, because the owner explicitly
+-- designates FUTURE mains (a designation is intent, not a mirror of state —
+-- nothing here ever auto-clears one because the spec is not held yet).
+----------------------------------------------------------------------
+
+-- PURE. The lanes designated to THIS character in one profession cell.
+-- Returns { primary = {laneKey...}, secondary = {laneKey...} }, lane keys
+-- sorted (class 8: the badge and the tooltip may not inherit pairs() luck).
+function ProfUI.CellDelegates(cfg, faction, profKey, ownerKey)
+    local out = { primary = {}, secondary = {} }
+    if type(ownerKey) ~= "string" or ownerKey == "" then return out end
+    local f = type(cfg) == "table" and cfg[faction] or nil
+    local prof = type(f) == "table" and type(f.profs) == "table" and f.profs[profKey] or nil
+    local lanes = type(prof) == "table" and type(prof.lanes) == "table" and prof.lanes or nil
+    if not lanes then return out end
+    local keys = {}
+    for k in pairs(lanes) do keys[#keys + 1] = tostring(k) end
+    table.sort(keys)
+    for i = 1, #keys do
+        local lane = lanes[keys[i]]
+        if type(lane) == "table" then
+            if lane.p == ownerKey then out.primary[#out.primary + 1] = keys[i] end
+            if lane.s == ownerKey then out.secondary[#out.secondary + 1] = keys[i] end
+        end
+    end
+    return out
+end
+
+-- PURE. The one badge character for a cell: primary beats secondary (a cell
+-- holding both wears "1"; the tooltip names every lane). nil = no mark.
+function ProfUI.CellBadge(d)
+    if type(d) ~= "table" then return nil end
+    if #(d.primary or {}) > 0 then return ProfUI.GLYPHS.primary end
+    if #(d.secondary or {}) > 0 then return ProfUI.GLYPHS.secondary end
+    return nil
+end
+
+-- PURE. Is this character the faction's recipe bank?
+function ProfUI.IsRecipeBank(cfg, faction, ownerKey)
+    if type(ownerKey) ~= "string" or ownerKey == "" then return false end
+    local f = type(cfg) == "table" and cfg[faction] or nil
+    return (type(f) == "table" and f.bank == ownerKey) and true or false
+end
+
+-- Lane display label. "general" wears the profession's name so the menu line
+-- reads as a sentence ("Set Primary — Blacksmithing (general)"); a spec lane
+-- wears the spec's dataset name.
+function ProfUI.DelegateLaneLabel(profKey, laneKey)
+    if laneKey == "general" then
+        return (ProfUI.ProfName(profKey) or tostring(profKey)) .. " (general)"
+    end
+    local D = core()
+    local idx = D and D.specById and D.specById[tonumber(laneKey) or -1]
+    local sp = idx and D.specs[idx]
+    return (sp and sp.name) or tostring(laneKey)
+end
+
+-- The ordered lane list for one character's cell menu: general first (always
+-- servable), then the profession's spec lanes sorted by label, each flagged
+-- `held` from the character's own recorded spec list. Dataset-backed; with the
+-- module disabled (core() refuses) only the general lane is offered.
+function ProfUI.DelegateLaneList(profKey, heldSpecs)
+    local held = {}
+    for i = 1, #(heldSpecs or {}) do held[tostring(heldSpecs[i])] = true end
+    local lanes = { { key = "general",
+                      label = ProfUI.DelegateLaneLabel(profKey, "general"),
+                      held = true } }
+    local D = core()
+    local specs = {}
+    if D and D.specs and D.profIdx then
+        local pIdx = D.profIdx[profKey]
+        for i = 1, #D.specs do
+            local sp = D.specs[i]
+            if sp and sp.p == pIdx then
+                local key = tostring(sp.id)
+                specs[#specs + 1] = { key = key, label = sp.name or key,
+                                      held = held[key] or false }
+            end
+        end
+    end
+    table.sort(specs, function(a, b) return a.label < b.label end)
+    for i = 1, #specs do lanes[#lanes + 1] = specs[i] end
+    return lanes
+end
+
+-- PURE. The cell context menu's model. `lanes` is DelegateLaneList's output.
+-- Every entry is contextual: a lane this character already holds shows Clear
+-- (setting the current holder IS clearing, the owner's rule); anything else
+-- shows Set (which silently replaces another character's designation — one
+-- primary per lane is the invariant, not an error case).
+function ProfUI.DelegateMenuModel(cfg, faction, profKey, ownerKey, lanes)
+    lanes = lanes or {}
+    local f = type(cfg) == "table" and cfg[faction] or nil
+    local prof = type(f) == "table" and type(f.profs) == "table" and f.profs[profKey] or nil
+    local cfgLanes = type(prof) == "table" and type(prof.lanes) == "table" and prof.lanes or {}
+    local function holder(laneKey, role)
+        local lane = cfgLanes[laneKey]
+        return type(lane) == "table" and lane[role] or nil
+    end
+    local function act(laneKey, role, owner)
+        return { kind = "lane", faction = faction, profKey = profKey,
+                 laneKey = laneKey, role = role, owner = owner }
+    end
+    local DASH = " " .. ProfUI.GLYPHS.dash .. " "
+
+    -- Top level: lanes the character can serve today + lanes already theirs.
+    local offered, seen = {}, {}
+    for i = 1, #lanes do
+        local l = lanes[i]
+        local mine = (holder(l.key, "p") == ownerKey) or (holder(l.key, "s") == ownerKey)
+        if l.held or mine then
+            offered[#offered + 1] = l
+            seen[l.key] = true
+        end
+    end
+
+    local items = {}
+    for i = 1, #offered do
+        local l = offered[i]
+        if holder(l.key, "p") == ownerKey then
+            items[#items + 1] = { text = "Clear Primary" .. DASH .. l.label,
+                                  action = act(l.key, "p", nil) }
+        else
+            items[#items + 1] = { text = "Set Primary" .. DASH .. l.label,
+                                  action = act(l.key, "p", ownerKey) }
+        end
+    end
+    items[#items + 1] = { separator = true }
+    for i = 1, #offered do
+        local l = offered[i]
+        if holder(l.key, "s") == ownerKey then
+            items[#items + 1] = { text = "Clear Secondary" .. DASH .. l.label,
+                                  action = act(l.key, "s", nil) }
+        else
+            items[#items + 1] = { text = "Set Secondary" .. DASH .. l.label,
+                                  action = act(l.key, "s", ownerKey) }
+        end
+    end
+
+    -- The Plan submenu: spec lanes the character does NOT hold yet (and does
+    -- not already own). Primary only — a planned main is a primary.
+    local plan = {}
+    for i = 1, #lanes do
+        local l = lanes[i]
+        if not seen[l.key] then
+            plan[#plan + 1] = { text = "Set Primary" .. DASH .. l.label .. " (planned)",
+                                action = act(l.key, "p", ownerKey) }
+        end
+    end
+
+    return {
+        title = (ProfUI.ProfName(profKey) or tostring(profKey)) .. DASH .. faction,
+        items = items,
+        plan  = plan,
+    }
+end
+
+-- PURE. The name row's context menu: the per-faction recipe bank.
+function ProfUI.BankMenuModel(cfg, faction, ownerKey, shortName)
+    local item
+    if ProfUI.IsRecipeBank(cfg, faction, ownerKey) then
+        item = { text = "Clear recipe bank (" .. faction .. ")",
+                 action = { kind = "bank", faction = faction, owner = nil } }
+    else
+        item = { text = "Set as recipe bank (" .. faction .. ")",
+                 action = { kind = "bank", faction = faction, owner = ownerKey } }
+    end
+    return {
+        title = tostring(shortName or ownerKey) .. " " .. ProfUI.GLYPHS.dash .. " " .. faction,
+        items = { item },
+        plan  = {},
+    }
+end
+
+-- The tooltip's designation line: "Primary: Armorsmith, Blacksmithing
+-- (general) — Horde". Labels sorted with the general lane pinned LAST (the
+-- specific fact reads first). nil when the character holds no such role here.
+function ProfUI.DelegateTooltipLine(roleLabel, laneKeys, profKey, faction)
+    if type(laneKeys) ~= "table" or #laneKeys == 0 then return nil end
+    local labels = {}
+    for i = 1, #laneKeys do
+        labels[#labels + 1] = { label = ProfUI.DelegateLaneLabel(profKey, laneKeys[i]),
+                                general = (laneKeys[i] == "general") }
+    end
+    table.sort(labels, function(a, b)
+        if a.general ~= b.general then return b.general end
+        return a.label < b.label
+    end)
+    local parts = {}
+    for i = 1, #labels do parts[i] = labels[i].label end
+    return roleLabel .. ": " .. table.concat(parts, ", ")
+        .. " " .. ProfUI.GLYPHS.dash .. " " .. tostring(faction)
+end
+
+-- The cross-account effective config (live; nil-safe for the harness).
+function ProfUI.EffectiveDelegates()
+    local S = ns.Store
+    return (S and S.DelegatesEffective and S.DelegatesEffective()) or nil
+end
+
+-- One seam from a menu click to the store: write, then hand the change to the
+-- sync layer. Returns whether anything actually changed (no-ops publish
+-- nothing — the store's diff gate).
+function ProfUI.ApplyDelegateAction(a)
+    if type(a) ~= "table" then return false end
+    local S = ns.Store
+    if not S then return false end
+    local changed = false
+    if a.kind == "lane" and S.SetDelegate then
+        changed = S.SetDelegate(a.faction, a.profKey, a.laneKey, a.role, a.owner) and true or false
+    elseif a.kind == "bank" and S.SetRecipeBank then
+        changed = S.SetRecipeBank(a.faction, a.owner) and true or false
+    end
+    if changed then
+        local P = ns.Professions
+        if P and P.DelegatesMarkDirty then P.DelegatesMarkDirty() end
+    end
+    return changed
 end
 
 ----------------------------------------------------------------------
@@ -2868,6 +3113,118 @@ end
 -- cells and their headers cannot disagree — and neither can outrun the pane
 -- that produced the columns. Clicking anywhere SELECTS the character; clicking
 -- a specific profession cell selects that profession's detail tab with it.
+----------------------------------------------------------------------
+-- The delegate context menu (native UIDropDownMenu, the minimap.lua idiom:
+-- catalog-verified surface, built lazily on first use so the headless harness
+-- — no dropdown globals — loads without error). One frame serves both the
+-- cell menu and the name row's bank menu; the model in `delegateCtx` decides
+-- what it says. The "Plan" entries ride a level-2 submenu off hasArrow.
+----------------------------------------------------------------------
+
+local delegateMenu
+local delegateCtx
+
+local function runDelegateAction(action)
+    ProfUI.ApplyDelegateAction(action)
+    if CloseDropDownMenus then CloseDropDownMenus() end
+    local ctx = delegateCtx
+    if ctx and ctx.refresh then ctx.refresh() end
+end
+
+local function openDelegateMenu(ctx)
+    if type(UIDropDownMenu_Initialize) ~= "function"
+       or type(ToggleDropDownMenu) ~= "function" then
+        if ns.Print then ns:Print("right-click menu unavailable (dropdown API missing).") end
+        return
+    end
+    delegateCtx = ctx
+    if not delegateMenu then
+        delegateMenu = CreateFrame("Frame", "DaseekiNexusDelegateMenu", UIParent,
+                                   "UIDropDownMenuTemplate")
+        UIDropDownMenu_Initialize(delegateMenu, function(_, level)
+            local c = delegateCtx
+            if not (c and c.model and level) then return end
+            local function add(info) UIDropDownMenu_AddButton(info, level) end
+            local function item(text, fn)
+                local info = UIDropDownMenu_CreateInfo()
+                info.text, info.func, info.notCheckable = text, fn, true
+                add(info)
+            end
+            if level == 1 then
+                local title = UIDropDownMenu_CreateInfo()
+                title.text, title.isTitle, title.notCheckable = c.model.title, true, true
+                add(title)
+                for _, it in ipairs(c.model.items) do
+                    if it.separator then
+                        local sep = UIDropDownMenu_CreateInfo()
+                        sep.text, sep.disabled, sep.notClickable, sep.notCheckable =
+                            "", true, true, true
+                        add(sep)
+                    else
+                        local action = it.action
+                        item(it.text, function() runDelegateAction(action) end)
+                    end
+                end
+                if c.model.plan and #c.model.plan > 0 then
+                    local info = UIDropDownMenu_CreateInfo()
+                    info.text = "Plan: future primary" .. ProfUI.GLYPHS.dots
+                    info.hasArrow, info.notCheckable = true, true
+                    info.value = "plan"
+                    add(info)
+                end
+            elseif level == 2 and UIDROPDOWNMENU_MENU_VALUE == "plan" then
+                for _, it in ipairs(c.model.plan or {}) do
+                    local action = it.action
+                    item(it.text, function() runDelegateAction(action) end)
+                end
+            end
+        end, "MENU")
+    end
+    ToggleDropDownMenu(1, nil, delegateMenu, "cursor", 0, 0)
+end
+
+-- Right-click on a character x profession cell.
+local function cellDelegateMenu(cell, pane)
+    local gr = cell:GetParent()
+    local owner, profKey = cell._owner, cell._profKey
+    if not (owner and profKey and cell._model) then return end
+    local faction = gr and gr._faction
+    if not faction then
+        -- No recorded faction, no faction bucket to write into. Say so rather
+        -- than guessing (report-don't-crash, the delegates' own heal rule).
+        if ns.Print then
+            ns:Print("cannot designate " .. tostring(owner)
+                .. ": that character's faction is not recorded yet.")
+        end
+        return
+    end
+    local cfg = ProfUI.EffectiveDelegates()
+    local lanes = ProfUI.DelegateLaneList(profKey, cell._model.specs)
+    openDelegateMenu({
+        model   = ProfUI.DelegateMenuModel(cfg, faction, profKey, owner, lanes),
+        refresh = function() if pane.obj and pane.obj.Refresh then pane.obj.Refresh() end end,
+    })
+end
+
+-- Right-click on the character NAME row.
+local function rowBankMenu(gr, pane)
+    local owner = gr._owner
+    if not owner then return end
+    local faction = gr._faction
+    if not faction then
+        if ns.Print then
+            ns:Print("cannot designate " .. tostring(owner)
+                .. ": that character's faction is not recorded yet.")
+        end
+        return
+    end
+    openDelegateMenu({
+        model   = ProfUI.BankMenuModel(ProfUI.EffectiveDelegates(), faction, owner,
+                                       Dashboard.ShortName(owner)),
+        refresh = function() if pane.obj and pane.obj.Refresh then pane.obj.Refresh() end end,
+    })
+end
+
 local function makeGridRow(parentChild, pane)
     local gr = CreateFrame("Button", nil, parentChild)
     -- STANDING TECHNICAL RULE: both dimensions at creation. The render sets the
@@ -2899,7 +3256,14 @@ local function makeGridRow(parentChild, pane)
     nameFS:SetWidth(L.NAME_W - 6)
     gr._name = nameFS
 
-    gr:SetScript("OnClick", function(self)
+    -- Left selects (unchanged); right on the NAME ROW opens the recipe-bank
+    -- menu (profession-delegates phase 1).
+    gr:RegisterForClicks("LeftButtonUp", "RightButtonUp")
+    gr:SetScript("OnClick", function(self, button)
+        if button == "RightButton" then
+            rowBankMenu(self, pane)
+            return
+        end
         if self._owner then pane.SelectCharacter(self._owner, nil) end
     end)
 
@@ -2921,8 +3285,17 @@ local function makeGridRow(parentChild, pane)
         top:SetPoint("TOPLEFT", cell, "TOPLEFT", L.ICON + 6, -1)
         local bot = fstr(cell, "small", "LEFT")
         bot:SetPoint("BOTTOMLEFT", cell, "BOTTOMLEFT", L.ICON + 6, 1)
-        cell._icon, cell._top, cell._bot = icon, top, bot
-        cell:SetScript("OnClick", function(self)
+        -- The delegate badge: the quiet corner mark ("1"/"2", accent ink).
+        local dbadge = fstr(cell, "small", "RIGHT")
+        dbadge:SetPoint("TOPRIGHT", cell, "TOPRIGHT", -2, -1)
+        UI.Skin(dbadge, function(self) self:SetTextColor(UI.Color("accent")) end)
+        cell._icon, cell._top, cell._bot, cell._dbadge = icon, top, bot, dbadge
+        cell:RegisterForClicks("LeftButtonUp", "RightButtonUp")
+        cell:SetScript("OnClick", function(self, button)
+            if button == "RightButton" then
+                cellDelegateMenu(self, pane)
+                return
+            end
             if self._owner then pane.SelectCharacter(self._owner, self._profKey) end
         end)
         cell:SetScript("OnEnter", function(self) pane.CellTooltip(self) end)
@@ -2946,8 +3319,16 @@ local function makeGridRow(parentChild, pane)
         sicon:SetTexCoord(0.07, 0.93, 0.07, 0.93)
         local stext = fstr(chip, "numeral", "LEFT")
         stext:SetPoint("LEFT", sicon, "RIGHT", 4, 0)
-        chip._icon, chip._text, chip._profKey = sicon, stext, profKey
-        chip:SetScript("OnClick", function(self)
+        local sbadge = fstr(chip, "small", "RIGHT")
+        sbadge:SetPoint("TOPRIGHT", chip, "TOPRIGHT", -1, -1)
+        UI.Skin(sbadge, function(self) self:SetTextColor(UI.Color("accent")) end)
+        chip._icon, chip._text, chip._profKey, chip._dbadge = sicon, stext, profKey, sbadge
+        chip:RegisterForClicks("LeftButtonUp", "RightButtonUp")
+        chip:SetScript("OnClick", function(self, button)
+            if button == "RightButton" then
+                cellDelegateMenu(self, pane)
+                return
+            end
             if self._owner then pane.SelectCharacter(self._owner, self._profKey) end
         end)
         chip:SetScript("OnEnter", function(self) pane.CellTooltip(self) end)
@@ -2955,6 +3336,19 @@ local function makeGridRow(parentChild, pane)
         gr._secs[i] = chip
     end
     return gr
+end
+
+-- Paint one cell's delegate badge from the effective config. Cleared for an
+-- absent cell (no model) and for a character with no designations here.
+local function paintDelegateBadge(cell, cfg, faction, ownerKey)
+    local b = cell._dbadge
+    if not b then return end
+    local mark
+    if cfg and faction and ownerKey and cell._model and cell._profKey then
+        mark = ProfUI.CellBadge(
+            ProfUI.CellDelegates(cfg, faction, cell._profKey, ownerKey))
+    end
+    b:SetText(mark or "")
 end
 
 -- Re-fit one pooled row to the column geometry of THIS render. Every text is
@@ -3818,6 +4212,20 @@ Dashboard.RegisterTab("professions", function(host)
             end
             GameTooltip:AddLine("Specialisation: " .. table.concat(names, ", "), UI.Color("accent"))
         end
+        -- Delegate designations (profession-delegates phase 1): the tooltip is
+        -- the badge's explainer — every designated lane, by name, per faction.
+        do
+            local gr = cell.GetParent and cell:GetParent()
+            local faction = gr and gr._faction
+            local dcfg = faction and ProfUI.EffectiveDelegates() or nil
+            if dcfg and cell._owner then
+                local d = ProfUI.CellDelegates(dcfg, faction, m.key, cell._owner)
+                local pl = ProfUI.DelegateTooltipLine("Primary", d.primary, m.key, faction)
+                if pl then GameTooltip:AddLine(pl, UI.Color("accent")) end
+                local sl = ProfUI.DelegateTooltipLine("Secondary", d.secondary, m.key, faction)
+                if sl then GameTooltip:AddLine(sl, UI.Color("accent")) end
+            end
+        end
         -- The recipe-census lines exist only for professions that HAVE a
         -- census. A zero-recipe profession (fishing, herbalism, skinning) has
         -- no window to open, so "NOT CHECKED — open it once" would be an
@@ -3885,6 +4293,9 @@ Dashboard.RegisterTab("professions", function(host)
         gridChild:SetWidth(availW)
         for _, r in ipairs(pane._gridRows) do r:Hide() end
         local selOwner = pane.sel and pane.sel.owner or nil
+        -- The delegate designations, resolved ONCE per render (the effective
+        -- cross-account config; nil-safe when the store seam is absent).
+        local dcfg = ProfUI.EffectiveDelegates()
         local shown, y = 0, 0
         for i = 1, #rows do
             local model = rows[i]
@@ -3896,12 +4307,21 @@ Dashboard.RegisterTab("professions", function(host)
                 gr:SetWidth(availW)
                 fitGridRow(gr, cols)
                 gr._owner = model.key
+                gr._faction = model.faction
                 nameInk(gr._name, model.key, model.classTag, model.overflow)
+                -- The recipe-bank mark: a quiet accent "B" beside the name.
+                if dcfg and model.faction
+                   and ProfUI.IsRecipeBank(dcfg, model.faction, model.key) then
+                    gr._name:SetText(gr._name:GetText() .. " "
+                        .. Dashboard.Colored(ProfUI.GLYPHS.bank, "accent"))
+                end
                 for slot = 1, L.PRIMARIES do
                     paintCell(gr._cells[slot], model.primaries[slot], model.key, false)
+                    paintDelegateBadge(gr._cells[slot], dcfg, model.faction, model.key)
                 end
                 for si, profKey in ipairs(ProfUI.GRID_SECONDARIES) do
                     paintCell(gr._secs[si], model.secondaries[profKey], model.key, true)
+                    paintDelegateBadge(gr._secs[si], dcfg, model.faction, model.key)
                 end
                 local isSel = (selOwner ~= nil and model.key == selOwner)
                 gr._selWash:SetShown(isSel)
@@ -6058,6 +6478,187 @@ local function testShoplist(fails)
        "an ambiguous profession prefix resolved instead of erroring")
 end
 
+-- ── DELEGATE DESIGNATIONS (profession-delegates phase 1) ─────────────────────
+local function testDelegates(fails)
+    local function ck(cond, msg) if not cond then fails[#fails + 1] = msg end end
+    local DASH = ProfUI.GLYPHS.dash
+
+    -- (a) GLYPH PINS: every delegate mark is pure ASCII — the tofu class
+    -- cannot reach a badge no matter which face the owner picks.
+    for _, k in ipairs({ "primary", "secondary", "bank", "absent" }) do
+        local g = ProfUI.GLYPHS[k]
+        ck(type(g) == "string" and #g > 0, "delegate mark '" .. k .. "' is missing")
+        for i = 1, #(g or "") do
+            if g:byte(i) > 127 then
+                fails[#fails + 1] = "delegate mark '" .. k .. "' is not ASCII"
+                break
+            end
+        end
+    end
+    ck(ProfUI.GLYPHS.primary == "1" and ProfUI.GLYPHS.secondary == "2"
+       and ProfUI.GLYPHS.bank == "B", "the delegate marks changed without a design pass")
+
+    -- (b) THE CELL MODEL against a fixture config. Lane keys are spec spell
+    -- ids as STRINGS plus "general".
+    local ARMOR, AXE, WEAPON = "9788", "17041", "9787"
+    local cfg = { Horde = {
+        profs = { blacksmithing = { lanes = {
+            general = { p = "Poonyx-R", s = "Alt-R" },
+            [ARMOR]  = { p = "Poonyx-R" },
+            [AXE]    = { p = "Puunyx-R" },   -- the PLANNED axesmith main
+        } } },
+        bank = "Baa-R",
+    } }
+    local d = ProfUI.CellDelegates(cfg, "Horde", "blacksmithing", "Poonyx-R")
+    ck(#d.primary == 2 and d.primary[1] == ARMOR and d.primary[2] == "general",
+       "Poonyx's primary lanes are wrong or unsorted")
+    ck(#d.secondary == 0, "Poonyx grew a secondary lane from nowhere")
+    ck(ProfUI.CellBadge(d) == "1", "a primary cell does not wear the '1' badge")
+    ck(ProfUI.CellBadge(ProfUI.CellDelegates(cfg, "Horde", "blacksmithing", "Alt-R")) == "2",
+       "a secondary-only cell does not wear the '2' badge")
+    ck(ProfUI.CellBadge(ProfUI.CellDelegates(cfg, "Horde", "blacksmithing", "Puunyx-R")) == "1",
+       "a planned-lane primary does not wear the '1' badge")
+    ck(ProfUI.CellBadge(ProfUI.CellDelegates(cfg, "Horde", "blacksmithing", "Nobody-R")) == nil,
+       "an undesignated cell wears a badge")
+    -- MULTI-PRIMARY COEXISTENCE: two primaries in ONE profession, one per lane.
+    local dp = ProfUI.CellDelegates(cfg, "Horde", "blacksmithing", "Puunyx-R")
+    ck(#dp.primary == 1 and dp.primary[1] == AXE,
+       "the second lane primary did not coexist with the first")
+    -- FACTION ISOLATION: the Alliance view of a Horde-only config is empty.
+    ck(ProfUI.CellBadge(ProfUI.CellDelegates(cfg, "Alliance", "blacksmithing", "Poonyx-R")) == nil,
+       "a Horde designation leaked into the Alliance view")
+    ck(ProfUI.IsRecipeBank(cfg, "Horde", "Baa-R") == true
+       and ProfUI.IsRecipeBank(cfg, "Horde", "Poonyx-R") == false
+       and ProfUI.IsRecipeBank(cfg, "Alliance", "Baa-R") == false,
+       "the recipe-bank read is wrong or faction-blind")
+    -- Heal: junk shapes answer empty, never error.
+    ck(ProfUI.CellBadge(ProfUI.CellDelegates("junk", "Horde", "blacksmithing", "A-R")) == nil
+       and ProfUI.CellBadge(ProfUI.CellDelegates({ Horde = { profs = { blacksmithing = 7 } } },
+           "Horde", "blacksmithing", "A-R")) == nil,
+       "a malformed config was not healed to empty")
+
+    -- (c) THE MENU MODEL is contextual and compact. Lanes fixture: what the
+    -- live wrapper builds for a character holding Armorsmith.
+    local lanes = {
+        { key = "general", label = "Blacksmithing (general)", held = true },
+        { key = ARMOR,     label = "Armorsmith",              held = true },
+        { key = AXE,       label = "Master Axesmith",         held = false },
+        { key = WEAPON,    label = "Weaponsmith",             held = false },
+    }
+    local m = ProfUI.DelegateMenuModel(cfg, "Horde", "blacksmithing", "Poonyx-R", lanes)
+    local function itemTexts(list)
+        local out = {}
+        for _, it in ipairs(list) do out[#out + 1] = it.separator and "|" or it.text end
+        return table.concat(out, ";")
+    end
+    ck(itemTexts(m.items) ==
+        "Clear Primary" .. " " .. DASH .. " " .. "Blacksmithing (general)"
+        .. ";Clear Primary" .. " " .. DASH .. " " .. "Armorsmith"
+        .. ";|"
+        .. ";Set Secondary" .. " " .. DASH .. " " .. "Blacksmithing (general)"
+        .. ";Set Secondary" .. " " .. DASH .. " " .. "Armorsmith",
+       "the current primary's menu is not Set/Clear-contextual (" .. itemTexts(m.items) .. ")")
+    -- The plan submenu offers exactly the unheld, unowned spec lanes.
+    ck(#m.plan == 2 and m.plan[1].text:find("Master Axesmith", 1, true) ~= nil
+       and m.plan[1].text:find("(planned)", 1, true) ~= nil
+       and m.plan[2].text:find("Weaponsmith", 1, true) ~= nil,
+       "the plan submenu does not list the unheld spec lanes")
+    ck(m.plan[1].action.role == "p" and m.plan[1].action.owner == "Poonyx-R"
+       and m.plan[1].action.laneKey == AXE,
+       "a plan entry's action is not a primary designation for that lane")
+    -- A character whose PLANNED lane is designated to them keeps its Clear
+    -- entry at the TOP level even though the spec is not held.
+    local lanesPuu = {
+        { key = "general", label = "Blacksmithing (general)", held = true },
+        { key = ARMOR,     label = "Armorsmith",              held = false },
+        { key = AXE,       label = "Master Axesmith",         held = false },
+        { key = WEAPON,    label = "Weaponsmith",             held = false },
+    }
+    local mp = ProfUI.DelegateMenuModel(cfg, "Horde", "blacksmithing", "Puunyx-R", lanesPuu)
+    ck(itemTexts(mp.items):find("Clear Primary " .. DASH .. " Master Axesmith", 1, true) ~= nil,
+       "a planned designation's Clear entry is not reachable")
+    ck(#mp.plan == 2, "an owned planned lane leaked back into the plan submenu")
+    -- Another character's designation shows as Set (replace), never Clear.
+    local ms = ProfUI.DelegateMenuModel(cfg, "Horde", "blacksmithing", "Alt-R", lanes)
+    ck(itemTexts(ms.items):find("Set Primary " .. DASH .. " Armorsmith", 1, true) ~= nil
+       and itemTexts(ms.items):find("Clear Secondary " .. DASH .. " Blacksmithing (general)", 1, true) ~= nil,
+       "another character's designation is not Set-to-replace / own secondary is not Clear")
+
+    -- (d) THE BANK MENU.
+    local bm = ProfUI.BankMenuModel(cfg, "Horde", "Baa-R", "Baa")
+    ck(#bm.items == 1 and bm.items[1].text == "Clear recipe bank (Horde)"
+       and bm.items[1].action.kind == "bank" and bm.items[1].action.owner == nil,
+       "the bank character's menu is not a Clear")
+    local bm2 = ProfUI.BankMenuModel(cfg, "Horde", "Other-R", "Other")
+    ck(bm2.items[1].text == "Set as recipe bank (Horde)"
+       and bm2.items[1].action.owner == "Other-R",
+       "a non-bank character's menu is not a Set")
+
+    -- (e) THE LANE LIST against the shipped dataset: general first, then the
+    -- profession's five blacksmithing spec lanes sorted by label, held flags
+    -- from the character's own spec list.
+    local ll = ProfUI.DelegateLaneList("blacksmithing", { 9788 })
+    ck(#ll == 6 and ll[1].key == "general" and ll[1].held == true,
+       "the blacksmithing lane list is not general + 5 spec lanes")
+    local sawArmor, sawWeapon = false, false
+    for i = 2, #ll do
+        if ll[i].label == "Armorsmith" then sawArmor = ll[i].held == true end
+        if ll[i].label == "Weaponsmith" then sawWeapon = ll[i].held == false end
+        if i > 2 and ll[i].label < ll[i - 1].label then
+            fails[#fails + 1] = "the spec lanes are not label-sorted"
+        end
+    end
+    ck(sawArmor and sawWeapon, "held flags did not follow the character's spec list")
+
+    -- (f) THE TOOLTIP LINE: labels, general pinned LAST, the faction named.
+    ck(ProfUI.DelegateTooltipLine("Primary", { "general", ARMOR }, "blacksmithing", "Horde")
+        == "Primary: Armorsmith, Blacksmithing (general) " .. DASH .. " Horde",
+       "the designation tooltip line is wrong")
+    ck(ProfUI.DelegateTooltipLine("Secondary", {}, "blacksmithing", "Horde") == nil,
+       "an empty designation set produced a tooltip line")
+
+    -- (g) MENU ACTION -> STORE WRITE -> BADGE RENDER, against the real store
+    -- (saved and restored; the namespace residue too).
+    local S = ns.Store
+    if S and S.SetDelegate and S.ProfessionsArea then
+        local a0 = S.ProfessionsArea(false)
+        local savedD  = a0 and a0.delegates
+        local savedR  = a0 and a0.delegatesRev
+        local savedAt = a0 and a0.delegatesAt
+        local nsAll = S.SyncNS and S.SyncNS()
+        local savedNS = nsAll and nsAll.delegates
+        if nsAll then nsAll.delegates = nil end
+        local a1 = S.ProfessionsArea(true)
+        a1.delegates, a1.delegatesRev, a1.delegatesAt = nil, nil, nil
+
+        ck(ProfUI.ApplyDelegateAction({ kind = "lane", faction = "Horde",
+            profKey = "blacksmithing", laneKey = ARMOR, role = "p",
+            owner = "Poonyx-R" }) == true, "the menu action did not write the store")
+        local eff = ProfUI.EffectiveDelegates()
+        ck(type(eff) == "table"
+           and ProfUI.CellBadge(ProfUI.CellDelegates(eff, "Horde", "blacksmithing",
+               "Poonyx-R")) == "1",
+           "the badge did not render from the store write")
+        ck(ProfUI.ApplyDelegateAction({ kind = "lane", faction = "Horde",
+            profKey = "blacksmithing", laneKey = ARMOR, role = "p",
+            owner = "Poonyx-R" }) == false, "an identical designation was not diff-gated")
+        ck(ProfUI.ApplyDelegateAction({ kind = "bank", faction = "Horde",
+            owner = "Poonyx-R" }) == true, "the bank action did not write")
+        ck(ProfUI.IsRecipeBank(ProfUI.EffectiveDelegates(), "Horde", "Poonyx-R") == true,
+           "the bank write did not read back")
+        ck(ProfUI.ApplyDelegateAction({ kind = "lane", faction = "Horde",
+            profKey = "blacksmithing", laneKey = ARMOR, role = "p",
+            owner = nil }) == true, "the clear action did not write")
+        ck(ProfUI.CellBadge(ProfUI.CellDelegates(ProfUI.EffectiveDelegates() or {},
+            "Horde", "blacksmithing", "Poonyx-R")) == nil,
+           "the badge survived its designation being cleared")
+
+        local a2 = S.ProfessionsArea(true)
+        a2.delegates, a2.delegatesRev, a2.delegatesAt = savedD, savedR, savedAt
+        if nsAll then nsAll.delegates = savedNS end
+    end
+end
+
 if ns.RegisterSelfTest then
     ns:RegisterSelfTest("professionsui", function(verbose)
         local suites = {
@@ -6098,6 +6699,10 @@ if ns.RegisterSelfTest then
                   .. "cold-item unresolved, known/spec seams, ordering, empty "
                   .. "messages, slash target)",
               fn = testShoplist },
+            { name = "delegate designations (ASCII marks, lane badges, contextual "
+                  .. "menu + plan submenu, bank, faction isolation, action -> "
+                  .. "store -> badge)",
+              fn = testDelegates },
         }
         local allPass = true
         for _, suite in ipairs(suites) do

@@ -515,8 +515,14 @@ function Dataset.LoadCore()
         elseif section == "spec" then
             local f = splitFields(line)
             local idx, id = tonumber(f[1]), tonumber(f[2])
+            -- Field 7 (FIX-4) is the parent spec ORDINAL — the era Blacksmithing
+            -- tree is nested (the three Master smith specs sit under
+            -- Weaponsmith). 0/absent both read as "root": a pre-FIX-4 payload
+            -- has six fields and tonumber(nil) answers nil.
+            local par = tonumber(f[7])
             specs[idx] = { id = id, p = tonumber(f[3]), minSkill = tonumber(f[4]),
-                           quest = tonumber(f[5]), name = f[6] }
+                           quest = tonumber(f[5]), name = f[6],
+                           parent = (par and par > 0) and par or nil }
             specById[id] = idx
         end
     end)
@@ -802,6 +808,107 @@ function Professions.KnownState(payload, profKey, spellID)
         if ids[i] == spellID then return "known", p.l end
     end
     return "missing", p.l
+end
+
+----------------------------------------------------------------------
+-- DELEGATE LANES  (profession-delegates phase 1)
+--
+-- The owner designates, per FACTION and per PROFESSION, primary/secondary
+-- collector characters — scoped to SPECIALISATION LANES, because one
+-- profession can have several primaries at once (a main Armorsmith AND a main
+-- Axesmith are both Blacksmithing mains, each for their own lane). A lane key
+-- is "general" or the tostring() of a specialisation's teaching spell id —
+-- spell ids, not dataset ordinals, so a stored designation survives any future
+-- reordering of the [spec] section.
+--
+-- THE RESOLUTION RULE (one pure seam; the tooltip reads it today, Conduit's
+-- recipe routing will read it later):
+--   * a recipe gated on spec S resolves through lane S; a lane with no
+--     designation walks UP the parent chain (FIX-4: Master Axesmith ->
+--     Weaponsmith) and lands on "general" last.
+--   * a recipe with NO spec gate resolves through "general" ONLY — general
+--     recipes belong to the general primary; the walk never descends.
+--   * a designation is INTENT, not a mirror of current state: a character who
+--     does not (yet) hold the designated spec still resolves — the owner
+--     designates planned mains. Only a character whose RECORD no longer
+--     exists is skipped (read-side heal, report-don't-crash), letting the
+--     walk continue as if the lane were empty.
+----------------------------------------------------------------------
+
+Professions.LANE_GENERAL = "general"
+
+-- Spec spell id -> the PARENT spec's spell id, or nil for a root spec.
+function Dataset.SpecParentID(specSpellID)
+    if not Dataset.LoadCore() then return nil end
+    local idx = Dataset.specById[tonumber(specSpellID) or -1]
+    local sp = idx and Dataset.specs[idx]
+    local par = sp and sp.parent and Dataset.specs[sp.parent]
+    return par and par.id or nil
+end
+
+-- PURE core: the lane chain for a recipe's gating spec, most specific first,
+-- "general" always last. `parentOf` maps specID -> parent specID (injected so
+-- the walk is testable without the dataset). Bounded, cycle-proof.
+function Professions.LaneChainFrom(specID, parentOf)
+    local chain, seen = {}, {}
+    local id = tonumber(specID)
+    local hops = 0
+    while id and id > 0 and not seen[id] and hops < 6 do
+        seen[id] = true
+        chain[#chain + 1] = tostring(id)
+        id = parentOf and tonumber(parentOf(id)) or nil
+        hops = hops + 1
+    end
+    chain[#chain + 1] = Professions.LANE_GENERAL
+    return chain
+end
+
+-- Live: the chain against the shipped dataset's FIX-4 parent edges.
+function Professions.LaneChain(specID)
+    return Professions.LaneChainFrom(specID, Dataset.SpecParentID)
+end
+
+-- PURE. Resolve one role ("p" primary / "s" secondary) for a recipe.
+--   cfg        the delegates config table ({ [faction] = { profs=..., bank=... } })
+--   faction    the VIEWER's faction ("Alliance"/"Horde")
+--   profKey    the recipe's profession
+--   chain      Professions.LaneChain(recipe spec id)
+--   role       "p" | "s"
+--   charExists optional predicate(ownerKey) -> bool; a designation whose
+--              character record vanished is skipped, never an error.
+-- Returns ownerKey, laneKey — or nil.
+function Professions.ResolveDelegate(cfg, faction, profKey, chain, role, charExists)
+    if type(cfg) ~= "table" or type(faction) ~= "string" then return nil end
+    local fac = cfg[faction]
+    local prof = type(fac) == "table" and type(fac.profs) == "table"
+                 and fac.profs[profKey] or nil
+    local lanes = type(prof) == "table" and type(prof.lanes) == "table"
+                  and prof.lanes or nil
+    if not lanes then return nil end
+    chain = chain or { Professions.LANE_GENERAL }
+    for i = 1, #chain do
+        local lane = lanes[chain[i]]
+        local who = type(lane) == "table" and lane[role or "p"] or nil
+        if type(who) == "string" and who ~= "" then
+            if charExists == nil or charExists(who) then
+                return who, chain[i]
+            end
+            -- record gone: heal to "lane empty", keep walking (report-don't-crash)
+        end
+    end
+    return nil
+end
+
+-- Live wrapper the tooltip calls: the viewer's-faction PRIMARY for a recipe,
+-- against the cross-account EFFECTIVE config (last-writer-wins, store seam).
+function Professions.ResolvePrimary(faction, profKey, specID)
+    local S = ns.Store
+    if not (S and S.DelegatesEffective) then return nil end
+    local cfg = S.DelegatesEffective()
+    if not cfg then return nil end
+    return Professions.ResolveDelegate(cfg, faction, profKey,
+        Professions.LaneChain(specID), "p",
+        S.CharacterRecordExists and function(k) return S.CharacterRecordExists(k) end or nil)
 end
 
 ----------------------------------------------------------------------
@@ -2785,6 +2892,77 @@ function Professions.RegisterNamespace()
         onRemote = onRemoteOwner,
         pushOp   = PUSH_OP,
     })
+    Professions.RegisterDelegatesNamespace()
+    return true
+end
+
+----------------------------------------------------------------------
+-- THE "delegates" NAMESPACE  (profession-delegates phase 1)
+--
+-- Account-granular, exactly like syncns.lua's "attune" precedent: ownerKey is
+-- the DEFAULT (this Nexus account id) — one payload per ACCOUNT, one rev to
+-- gate — and the payload is { v, at, cfg } where `cfg` is the whole delegates
+-- config and `at` is the SERVER-TIME stamp of the last local edit. Per-owner
+-- transport is the store's owner-wins-by-rev; the CROSS-owner conflict rule
+-- (which account's copy IS the config) is last-writer-wins on `at`, decided at
+-- read time by Store.DelegatesPickWinner — the Daseeki.Config registry's LWW
+-- discipline lifted to cross-owner, with rev then ownerKey as deterministic
+-- tiebreaks.
+--
+-- OLD CLIENTS ARE SAFE BY CONSTRUCTION, the attune argument verbatim:
+-- Mesh.HandleNSPayload -> Sync.ApplyInbound stores ANY namespace key it is
+-- handed, registered or not; Sync._DeliverOne finds no spec and returns. An
+-- un-updated peer caches this payload silently, errors on nothing, and replays
+-- it to the consumer the moment it updates (syncns.lua's attune self-test
+-- asserts exactly this path for an unregistered key).
+--
+-- onRemote does NOT adopt anything into the local config — reads resolve
+-- through Store.DelegatesEffective every time, so a winning remote payload
+-- changes the answer without a write (and a local EDIT adopts the effective
+-- winner first, so editing from a second account never clobbers the first's
+-- designations). onRemote only pumps the repaint.
+----------------------------------------------------------------------
+
+local DELEGATES_NS_KEY = "delegates"
+Professions.DELEGATES_NS_KEY = DELEGATES_NS_KEY
+
+local function delegatesProvide()
+    local S = ns.Store
+    if not (S and S.DelegatesSnapshot) then return nil end
+    return S.DelegatesSnapshot()   -- nil until the owner ever edits => nothing to publish
+end
+Professions._delegatesProvideFn = delegatesProvide
+
+local function onRemoteDelegates(_ownerKey, _data)
+    -- The store already holds the payload (Sync.ApplyInbound put it there);
+    -- reads re-resolve lazily. One repaint, the mesh's own bulk signal.
+    local M = ns.Mesh
+    if M and M.NoteStoreChanged then M.NoteStoreChanged()
+    elseif ns.Fire then ns:Fire("STORE_REFRESHED") end
+end
+Professions._onRemoteDelegatesFn = onRemoteDelegates
+
+function Professions.RegisterDelegatesNamespace()
+    local S = suiteSync()
+    if not S then return false end
+    S.RegisterNamespace(DELEGATES_NS_KEY, {
+        -- ownerKey omitted on purpose: defaults to this account's Nexus id
+        -- (account-granular, the attune precedent).
+        provide  = delegatesProvide,
+        onRemote = onRemoteDelegates,
+        pushOp   = PUSH_OP,
+    })
+    return true
+end
+
+-- The UI's one entry point after a designation edit: snapshot + queue for the
+-- mesh (debounced there), and repaint this client immediately.
+function Professions.DelegatesMarkDirty()
+    local S = suiteSync()
+    if S and S.MarkDirty then S.MarkDirty(DELEGATES_NS_KEY) end
+    local M = ns.Mesh
+    if M and M.NoteStoreChanged then M.NoteStoreChanged()
+    elseif ns.Fire then ns:Fire("STORE_REFRESHED") end
     return true
 end
 
@@ -3832,6 +4010,33 @@ local function testDatasetIntegrity(fails)
     end
     ck(perProf.blacksmithing == 5 and perProf.leatherworking == 3 and perProf.engineering == 2,
        "the specialisation split is not 5/3/2 blacksmithing/leatherworking/engineering")
+
+    -- FIX-4: the spec PARENT edges — exactly the three Master smith specs
+    -- parent to Weaponsmith (matched by NAME, the fix's own rule), everything
+    -- else is a root. The whole delegate lane walk rests on these three edges.
+    do
+        local byName = {}
+        for i = 1, #Dataset.specs do byName[Dataset.specs[i].name] = Dataset.specs[i] end
+        local weapon = byName["Weaponsmith"]
+        ck(weapon ~= nil, "FIX-4: the Weaponsmith spec vanished from the dataset")
+        local parented = 0
+        for i = 1, #Dataset.specs do
+            local sp = Dataset.specs[i]
+            if sp.name == "Master Swordsmith" or sp.name == "Master Hammersmith"
+               or sp.name == "Master Axesmith" then
+                parented = parented + 1
+                ck(sp.parent ~= nil and Dataset.specs[sp.parent] == weapon,
+                   "FIX-4: " .. sp.name .. " does not parent to Weaponsmith")
+                ck(Dataset.SpecParentID(sp.id) == weapon.id,
+                   "FIX-4: SpecParentID does not answer Weaponsmith for " .. sp.name)
+            else
+                ck(sp.parent == nil, "FIX-4: " .. sp.name .. " grew an unexpected parent")
+                ck(Dataset.SpecParentID(sp.id) == nil,
+                   "FIX-4: SpecParentID invented a parent for " .. sp.name)
+            end
+        end
+        ck(parented == 3, "FIX-4: expected 3 Master smith specs, found " .. parented)
+    end
 
     -- FIX-1: fishing's artisan rank must NOT share cooking's spell id.
     local cookArtisan = Dataset.ranks[Dataset.profIdx.cooking][4].spell
@@ -6550,6 +6755,200 @@ local function testInertness(fails)
     if not ok then fails[#fails + 1] = "error in inertness fixtures: " .. tostring(err) end
 end
 
+----------------------------------------------------------------------
+-- SELF-TEST: delegate lanes (profession-delegates phase 1) — the resolution
+-- walk, and the "delegates" namespace round-trip against the real Sync/Store.
+----------------------------------------------------------------------
+
+local function testDelegateLanes(fails)
+    local function ck(cond, msg) if not cond then fails[#fails + 1] = msg end end
+
+    -- (a) THE LANE CHAIN, pure: most specific first, "general" always last,
+    -- cycles bounded.
+    local parentOf = function(id)
+        return ({ [17041] = 9787, [17039] = 9787, [17040] = 9787 })[id]
+    end
+    local function chainStr(c) return table.concat(c, ">") end
+    ck(chainStr(Professions.LaneChainFrom(17041, parentOf)) == "17041>9787>general",
+       "the Master Axesmith chain does not walk through Weaponsmith")
+    ck(chainStr(Professions.LaneChainFrom(9787, parentOf)) == "9787>general",
+       "the Weaponsmith chain is wrong")
+    ck(chainStr(Professions.LaneChainFrom(nil, parentOf)) == "general",
+       "a spec-free recipe's chain is not general-only")
+    ck(chainStr(Professions.LaneChainFrom(1, function() return 1 end)) == "1>general",
+       "a parent cycle was not bounded")
+    -- ...and live, against the shipped FIX-4 edges.
+    if Professions.IsEnabled() and Dataset.LoadCore() then
+        ck(chainStr(Professions.LaneChain(17041)) == "17041>9787>general",
+           "the live Axesmith chain does not match FIX-4")
+        ck(chainStr(Professions.LaneChain(9788)) == "9788>general",
+           "the live Armorsmith chain grew a parent it does not have")
+    end
+
+    -- (b) THE RESOLUTION WALK. Fixture: Poonyx is Armorsmith primary AND
+    -- general primary; Puunyx is the (planned) Axesmith primary. One
+    -- profession, several primaries — each lane resolves to its own.
+    local ARMOR, AXE, WEAPON = "9788", "17041", "9787"
+    local cfg = { Horde = { profs = { blacksmithing = { lanes = {
+        general = { p = "Poonyx-R", s = "Sec-R" },
+        [ARMOR] = { p = "Poonyx-R" },
+        [AXE]   = { p = "Puunyx-R" },
+    } } } } }
+    local R = Professions.ResolveDelegate
+    local chainAxe    = { AXE, WEAPON, "general" }
+    local chainWeapon = { WEAPON, "general" }
+    local chainArmor  = { ARMOR, "general" }
+    local chainGen    = { "general" }
+
+    -- a lane with a primary short-circuits (never walks past it)...
+    local who, lane = R(cfg, "Horde", "blacksmithing", chainArmor, "p")
+    ck(who == "Poonyx-R" and lane == ARMOR, "the armorsmith lane did not short-circuit")
+    -- ...the PLANNED axesmith lane resolves to Puunyx (intent, not state)...
+    who, lane = R(cfg, "Horde", "blacksmithing", chainAxe, "p")
+    ck(who == "Puunyx-R" and lane == AXE, "the planned axesmith primary did not resolve")
+    -- ...an EMPTY weaponsmith lane walks up: axe chain minus its own lane
+    -- lands on general THROUGH the empty weaponsmith lane...
+    local cfg2 = { Horde = { profs = { blacksmithing = { lanes = {
+        general = { p = "Poonyx-R" },
+    } } } } }
+    who, lane = R(cfg2, "Horde", "blacksmithing", chainAxe, "p")
+    ck(who == "Poonyx-R" and lane == "general",
+       "an axesmith recipe with no lane primaries did not walk to general")
+    -- ...a weaponsmith primary catches the axe walk before general...
+    local cfg3 = { Horde = { profs = { blacksmithing = { lanes = {
+        general  = { p = "Poonyx-R" },
+        [WEAPON] = { p = "Weap-R" },
+    } } } } }
+    who, lane = R(cfg3, "Horde", "blacksmithing", chainAxe, "p")
+    ck(who == "Weap-R" and lane == WEAPON,
+       "the axe walk did not stop at the weaponsmith primary")
+    -- ...and a GENERAL recipe never walks down into spec lanes.
+    who, lane = R(cfg3, "Horde", "blacksmithing", chainGen, "p")
+    ck(who == "Poonyx-R" and lane == "general", "a general recipe left the general lane")
+    who = R({ Horde = { profs = { blacksmithing = { lanes = {
+        [WEAPON] = { p = "Weap-R" } } } } } }, "Horde", "blacksmithing", chainGen, "p")
+    ck(who == nil, "a general recipe descended into a spec lane")
+
+    -- roles are independent: the secondary resolves separately, and NEVER
+    -- from the primary slot.
+    who = R(cfg, "Horde", "blacksmithing", chainGen, "s")
+    ck(who == "Sec-R", "the secondary role did not resolve")
+    who = R(cfg, "Horde", "blacksmithing", chainArmor, "s")
+    ck(who == "Sec-R", "the secondary walk did not pass an s-empty lane")
+
+    -- FACTION ISOLATION: a Horde config answers nothing for an Alliance viewer.
+    ck(R(cfg, "Alliance", "blacksmithing", chainArmor, "p") == nil,
+       "a Horde primary fired for an Alliance viewer")
+
+    -- READ-SIDE HEAL: a designation whose character record vanished is
+    -- skipped and the walk CONTINUES; nothing is erased (the cfg keeps it).
+    local exists = function(k) return k ~= "Puunyx-R" end
+    who, lane = R(cfg, "Horde", "blacksmithing", chainAxe, "p", exists)
+    ck(who == "Poonyx-R" and lane == "general",
+       "a vanished record did not heal to the next lane")
+    ck(cfg.Horde.profs.blacksmithing.lanes[AXE].p == "Puunyx-R",
+       "the read-side heal MUTATED the stored designation")
+
+    -- junk shapes answer nil, never error.
+    ck(R(nil, "Horde", "x", chainGen, "p") == nil
+       and R("junk", "Horde", "x", chainGen, "p") == nil
+       and R({ Horde = { profs = 9 } }, "Horde", "x", chainGen, "p") == nil,
+       "a malformed config was not healed to nil")
+
+    -- (c) THE NAMESPACE ROUND-TRIP, against the real Sync + Store. The
+    -- unknown-namespace old-client leg is pinned in syncns.lua's attune
+    -- self-test (ApplyInbound caches ANY key without error); this leg owns
+    -- the delegates-specific facts: registration, advertisement, cross-owner
+    -- LWW at read time, edit-on-top-of-the-winner, receive-side heal.
+    local S = ns.Store
+    local Sync = _G and _G.Daseeki and _G.Daseeki.Sync
+    if not (S and S.SetDelegate and Sync and Sync.ApplyInbound and S.SyncNS) then
+        return   -- headless world without the sync layer: the pure legs stand
+    end
+    ck(Professions.RegisterDelegatesNamespace() == true,
+       "the delegates namespace did not register")
+    ck(Sync.AllNamespaceHashes()[DELEGATES_NS_KEY] ~= nil,
+       "the delegates namespace is not advertised in the heartbeat hash bundle")
+
+    local a0 = S.ProfessionsArea(false)
+    local savedD  = a0 and a0.delegates
+    local savedR  = a0 and a0.delegatesRev
+    local savedAt = a0 and a0.delegatesAt
+    local nsAll = S.SyncNS()
+    local savedNS = nsAll[DELEGATES_NS_KEY]
+    nsAll[DELEGATES_NS_KEY] = nil
+    local a1 = S.ProfessionsArea(true)
+    a1.delegates, a1.delegatesRev, a1.delegatesAt = nil, nil, nil
+
+    local okAll, err = pcall(function()
+        -- never edited: nothing to publish, nothing effective.
+        ck(S.DelegatesSnapshot() == nil, "a never-edited config produced a snapshot")
+        ck(S.DelegatesEffective() == nil, "a never-edited config resolved an effective view")
+
+        -- a local edit at t=1000 becomes the effective view and the snapshot.
+        ck(S.SetDelegate("Horde", "blacksmithing", "general", "p", "Poonyx-R", 1000) == true,
+           "the local edit did not write")
+        local eff = S.DelegatesEffective()
+        ck(type(eff) == "table"
+           and eff.Horde.profs.blacksmithing.lanes.general.p == "Poonyx-R",
+           "the local edit is not the effective view")
+        local snap = S.DelegatesSnapshot()
+        ck(type(snap) == "table" and snap.at == 1000
+           and snap.cfg.Horde.profs.blacksmithing.lanes.general.p == "Poonyx-R",
+           "the snapshot does not carry the local edit")
+
+        -- a peer's NEWER payload wins the effective view without any write.
+        ck(Sync.ApplyInbound(DELEGATES_NS_KEY, "__delegates-peer", 1, {
+            v = 1, at = 2000,
+            cfg = { Horde = { profs = { blacksmithing = { lanes = {
+                general = { p = "Puunyx-R" } } } } } },
+        }, 2000) == "applied", "the peer payload did not apply")
+        eff = S.DelegatesEffective()
+        ck(eff.Horde.profs.blacksmithing.lanes.general.p == "Puunyx-R",
+           "the newer peer config did not win the effective view")
+        ck(S.Delegates(false).Horde.profs.blacksmithing.lanes.general.p == "Poonyx-R",
+           "the peer win MUTATED the local copy outside an edit")
+
+        -- per-owner rev gate: a stale rev is rejected (LWW discipline).
+        ck(Sync.ApplyInbound(DELEGATES_NS_KEY, "__delegates-peer", 1, {
+            v = 1, at = 9999, cfg = {} }, 2001) == "stale",
+           "a stale peer rev was applied")
+
+        -- EDIT-ON-TOP-OF-THE-WINNER: a local edit AFTER the peer win adopts
+        -- the peer's config first, so nothing of theirs is reverted.
+        ck(S.SetDelegate("Horde", "blacksmithing", "9788", "p", "Armor-R", 3000) == true,
+           "the post-win local edit did not write")
+        eff = S.DelegatesEffective()
+        ck(eff.Horde.profs.blacksmithing.lanes.general.p == "Puunyx-R"
+           and eff.Horde.profs.blacksmithing.lanes["9788"].p == "Armor-R",
+           "the post-win edit reverted the peer's designations")
+
+        -- receive-side heal: a malformed peer payload contributes nothing.
+        ck(Sync.ApplyInbound(DELEGATES_NS_KEY, "__delegates-junk", 1,
+            { v = 1, at = 9e9, cfg = "junk" }, 3001) == "applied",
+           "a junk payload did not even cache (the transport must not care)")
+        eff = S.DelegatesEffective()
+        ck(type(eff) == "table"
+           and eff.Horde.profs.blacksmithing.lanes["9788"].p == "Armor-R",
+           "a malformed peer payload was not healed out of the effective view")
+
+        -- an all-cleared config still publishes (rev survives the clears).
+        ck(S.SetDelegate("Horde", "blacksmithing", "general", "p", nil, 4000) == true
+           and S.SetDelegate("Horde", "blacksmithing", "9788", "p", nil, 4001) == true,
+           "the clears did not write")
+        local snap2 = S.DelegatesSnapshot()
+        ck(type(snap2) == "table" and snap2.at == 4001,
+           "an all-cleared config stopped publishing")
+    end)
+
+    S.SyncNSDrop(DELEGATES_NS_KEY, "__delegates-peer")
+    S.SyncNSDrop(DELEGATES_NS_KEY, "__delegates-junk")
+    nsAll[DELEGATES_NS_KEY] = savedNS
+    local a2 = S.ProfessionsArea(true)
+    a2.delegates, a2.delegatesRev, a2.delegatesAt = savedD, savedR, savedAt
+    if not okAll then fails[#fails + 1] = "error in namespace round-trip: " .. tostring(err) end
+end
+
 function Professions.RunSelfTests(verbose)
     local suites = {
         { name = "dataset integrity (census + referential + the fixed game facts)",
@@ -6571,6 +6970,10 @@ function Professions.RunSelfTests(verbose)
         { name = "publish delta detector", fn = testPublishDelta },
         { name = "module inertness (off = no frame, no events, no dataset, no SV)",
           fn = testInertness },
+        { name = "delegate lanes (FIX-4 chain walk, multi-primary resolution, "
+              .. "faction isolation, read-side heal, namespace round-trip + "
+              .. "cross-owner LWW)",
+          fn = testDelegateLanes },
     }
     local allPass = true
     for _, suite in ipairs(suites) do
