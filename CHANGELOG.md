@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- **Professions tab** — The grid/detail split is now an even 50/50 (was 60/40): the detail
+  and cooldown column gains width, and the character grid re-fits its columns to the
+  narrower pane at every window size.
+
 - **Professions tab** — The selected recipe's acquisition line now wraps to two lines, so
   the new zoned sources ("Sold by Fradd Swiftgear — Gnomeregan area") read in full instead
   of truncating; the recipe list gives up exactly one line's height for it. The character
