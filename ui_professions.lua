@@ -903,9 +903,12 @@ local function cdProfMap()
 end
 
 -- cdKey -> profKey|nil, spellID|nil, groupOrdinal|nil.
--- The group form is the alchemy transmute family: THIRTEEN recipes, ONE timer.
--- Naming such a row after any single member would be twelve wrong answers, so
--- the label is the profession plus the words "shared cooldown".
+-- A group with MANY members is the alchemy transmute family: twelve recipes,
+-- ONE timer. Naming such a row after any single member would be eleven wrong
+-- answers, so its label is the profession plus the words "shared cooldown".
+-- A group with exactly ONE member is a SOLO cooldown (FIX-5: Mooncloth is
+-- "g2"), and there the member's own name is the only right answer — see
+-- CooldownLabel, which routes on the member count rather than on the key shape.
 function ProfUI.CdKeyMeta(cdKey)
     local key = tostring(cdKey or "")
     local g = key:match("^g(%d+)$")
@@ -925,12 +928,25 @@ end
 
 -- Returns label, pending. pending=true means a teaching-spell name has not been
 -- answered yet — held, never replaced with a guess.
+--
+-- A SOLO group (FIX-5: one member, e.g. Mooncloth's "g2") wears the member's
+-- own recipe name, resolved live from its teaching spell exactly as a bare
+-- spell key is. The "shared cooldown" wording exists because naming a
+-- twelve-member row after one member is eleven lies; with one member there is
+-- nothing to lie about, and "Tailoring · shared cooldown" would itself be the
+-- wrong answer. The route is the MEMBER COUNT, never a hardcoded ordinal, so
+-- the next fact pass needs no edit here.
 function ProfUI.CooldownLabel(cdKey, res)
     local profKey, spell, group = ProfUI.CdKeyMeta(cdKey)
     if group then
-        local pn = profKey and ProfUI.ProfName(profKey) or nil
-        if pn then return pn .. " \194\183 shared cooldown", false end
-        return "shared profession cooldown", false
+        local members = ProfUI.KindMembers(cdKey)
+        if #members == 1 then
+            spell, group = members[1], nil
+        else
+            local pn = profKey and ProfUI.ProfName(profKey) or nil
+            if pn then return pn .. " \194\183 shared cooldown", false end
+            return "shared profession cooldown", false
+        end
     end
     if spell then
         local n = res and res.spell and res.spell(spell)
@@ -1533,15 +1549,19 @@ function ProfUI.RollupRows(entries, lookup, nowE, res)
         local e = entries[i]
         local payload = lookup and lookup(e.nameRealm) or nil
         if type(payload) == "table" and type(payload.c) == "table" then
-            for cdKey, at in pairs(payload.c) do
+            for rawKey, at in pairs(payload.c) do
                 local rem = ProfUI.CooldownRemaining(at, nowE)
                 if rem then
+                    -- One vocabulary (FIX-5): a legacy bare-spell stamp and this
+                    -- build's group key name the same timer, and the rollup's
+                    -- rows sort and read by that key.
+                    local cdKey = ProfUI.CanonCdKey(rawKey)
                     local profKey = ProfUI.CdKeyMeta(cdKey)
                     local label, pending = ProfUI.CooldownLabel(cdKey, res)
                     out[#out + 1] = {
                         owner     = e.nameRealm,
                         classTag  = e.rec and e.rec.classTag or nil,
-                        cdKey     = tostring(cdKey),
+                        cdKey     = cdKey,
                         profKey   = profKey,
                         label     = label,
                         pending   = pending and true or false,
@@ -1587,14 +1607,19 @@ end
 --     recipe that folds onto its cdKey (the known-recipe bitmaps, read through
 --     the same coverage-aware seam as everything else), or they hold a stamp
 --     for it (crafting it is ownership proof, bitmap or no bitmap);
---   * dataset-marked kinds (the cd>0 groups — alchemy's transmutes) enumerate
---     from the CATALOGUE, so they render with zero stamps anywhere. A solo
---     cooldown recipe (Mooncloth) is NOT marked in the dataset (cd == 0, same
---     as an ordinary recipe — the addendum records no cooldown facts to mark
---     it from), so its kind still needs at least one live stamp somewhere as
---     evidence; once every stamp is deleted the row waits for the next craft.
---     That residual is a KNOWN GAP pending a dataset marking with owner
---     sign-off — do not "fix" it here by hardcoding spell ids;
+--   * dataset-marked kinds (the cd>0 groups) enumerate from the CATALOGUE, so
+--     they render with zero stamps anywhere. That now covers SOLO cooldowns
+--     too: the 2026-08-11 fact pass (FIX-5) marks Mooncloth as group 2, a
+--     cooldown group of exactly one, so a tailor whose BITMAP proves they know
+--     18560 lists as ready on a quiet day without ever having crafted it under
+--     this addon. The KNOWN GAP that stood here — solo kinds needing a live
+--     stamp as their only evidence — is CLOSED for every cooldown the dataset
+--     knows; it survives only for a cooldown no fact pass has marked yet, and
+--     the fix for that is a fact pass in dev/, never a hardcoded id here;
+--   * a stamp keyed on a bare teaching spell that the dataset DOES mark (an
+--     older build of ours, or a peer still running one) is folded onto its
+--     group key first — otherwise one timer would enumerate as two kinds
+--     wearing one name. See Professions.CanonCdKey;
 --   * READY = owns the kind AND (no stamp, or the stamp's readyAt has passed).
 --     Mid-cooldown (future readyAt) is not listed, per the owner's standing
 --     rule. An UNSCANNED profession proves nothing: its character is neither
@@ -1607,9 +1632,10 @@ end
 -- count per-INSTANCE from the stamps, which is the number they always meant.)
 ----------------------------------------------------------------------
 
--- The kinds the DATASET itself can prove exist: one per shared-cooldown group
--- ordinal (rec.cd > 0 => "g<n>" — FoldCooldowns' own key rule). Sorted.
--- Empty when the dataset refuses to load (module off / no core).
+-- The kinds the DATASET itself can prove exist: one per cooldown group ordinal
+-- (rec.cd > 0 => "g<n>" — FoldCooldowns' own key rule), shared groups and solo
+-- groups alike. Sorted. Empty when the dataset refuses to load (module off /
+-- no core).
 function ProfUI.DatasetCooldownKinds()
     local D = core()
     if not D then return {} end
@@ -1646,6 +1672,18 @@ function ProfUI.KindMembers(cdKey)
     return out
 end
 
+-- One cdKey vocabulary for the whole pane (FIX-5). A stamp keyed on a bare
+-- teaching spell the dataset now MARKS is the same timer as its group key, and
+-- the two spellings meet here — a legacy local record, or a live peer still on
+-- the older dataset, otherwise enumerates one Mooncloth as two. The rule lives
+-- ONCE, in Professions.CanonCdKey; this is only the module-gate in front of it,
+-- because a disabled module reads no dataset and answers the key unchanged.
+function ProfUI.CanonCdKey(cdKey)
+    local P = ns.Professions
+    if not (core() and P and P.CanonCdKey) then return tostring(cdKey or "") end
+    return P.CanonCdKey(cdKey)
+end
+
 -- Proven ownership of one cooldown kind. A stored stamp (running OR expired)
 -- is craft-proof on its own; otherwise the character's known-recipe set — the
 -- coverage-aware KnownSet seam, never a re-derivation — must contain at least
@@ -1653,10 +1691,10 @@ end
 -- no record) proves nothing and answers false.
 function ProfUI.OwnsCooldownKind(payload, cdKey)
     if type(payload) ~= "table" then return false end
-    local key = tostring(cdKey or "")
+    local key = ProfUI.CanonCdKey(cdKey)
     if type(payload.c) == "table" then
         for k in pairs(payload.c) do
-            if tostring(k) == key then return true end
+            if ProfUI.CanonCdKey(k) == key then return true end
         end
     end
     local profKey = ProfUI.CdKeyMeta(key)
@@ -1706,8 +1744,16 @@ function ProfUI.CooldownKindRows(entries, lookup, nowE, res)
             local stamps = {}
             if type(payload.c) == "table" then
                 for cdKey, at in pairs(payload.c) do
-                    local key = tostring(cdKey)
-                    stamps[key] = at
+                    -- CANONICAL FIRST (FIX-5): "18560" and "g2" are one timer,
+                    -- and unioning both spellings would list Mooncloth twice.
+                    -- Where a character somehow holds both, the LATER ready-at
+                    -- wins — a running cooldown is the fact, and understating
+                    -- it renders as "go craft it", the one wrong answer here.
+                    local key = ProfUI.CanonCdKey(cdKey)
+                    local cur = stamps[key]
+                    if cur == nil or (tonumber(at) or 0) > (tonumber(cur) or 0) then
+                        stamps[key] = at
+                    end
                     if not cand[key] then cand[key] = true; keys[#keys + 1] = key end
                 end
             end
@@ -6927,13 +6973,15 @@ local function testKindOwnership(fails)
     local NOW = 1700000000
     local DSV = (D.Version and D.Version()) or ns.ProfessionsDataMeta.version
 
-    -- (a) THE KEY MAPPING, both directions. The dataset's marked kinds are the
-    -- shared groups (today: exactly the transmute group "g1"); a group key
-    -- maps to every member recipe, a solo key maps to itself, garbage to
-    -- nothing. Members come out sorted (class 8).
+    -- (a) THE KEY MAPPING, both directions. The dataset's marked kinds are its
+    -- cooldown GROUPS — today exactly two: "g1", alchemy's transmutes (many
+    -- recipes, one timer), and "g2", Mooncloth (one recipe, its own timer —
+    -- FIX-5, the 2026-08-11 fact pass). A group key maps to every member
+    -- recipe, an unmarked key maps to itself, garbage to nothing. Members come
+    -- out sorted (class 8).
     local dsKinds = ProfUI.DatasetCooldownKinds()
-    ck(#dsKinds == 1 and dsKinds[1] == "g1",
-       "the dataset's marked cooldown kinds are not exactly the transmute group")
+    ck(#dsKinds == 2 and dsKinds[1] == "g1" and dsKinds[2] == "g2",
+       "the dataset's marked cooldown kinds are not exactly {g1 transmutes, g2 Mooncloth}")
     local members = ProfUI.KindMembers("g1")
     ck(#members >= 2, "the transmute group lost its members (" .. #members .. ")")
     for i = 1, #members do
@@ -7014,12 +7062,15 @@ local function testKindOwnership(fails)
     ck(#rows == 0,
        "an unscanned or knows-nothing roster still invented a kind row (" .. #rows .. ")")
 
-    -- (e) THE STAMP-EVIDENCED SOLO KIND (the Mooncloth shape — cd == 0 in the
-    -- dataset, so knowledge alone cannot enumerate it; see the KNOWN GAP note
-    -- above CooldownKindRows). ONE character's stamp — even a mid-cooldown
-    -- one — surfaces the kind, and OTHER characters' ownership then proves
-    -- from their bitmaps: the stamp holder is mid-cooldown and unlisted, the
-    -- bitmap knower is ready.
+    -- (e) THE STAMP-EVIDENCED UNMARKED KIND. This is the residual of the gap
+    -- FIX-5 closed for Mooncloth: a recipe the dataset does NOT mark (cd == 0)
+    -- can still be witnessed by a live stamp — some client crafted something we
+    -- have no cooldown fact for — and the pane must still surface it rather
+    -- than drop evidence it cannot explain. ONE character's stamp, even a
+    -- mid-cooldown one, surfaces the kind, and OTHER characters' ownership then
+    -- proves from their bitmaps: the stamp holder is mid-cooldown and unlisted,
+    -- the bitmap knower is ready. (The fix for a REAL missing cooldown is a
+    -- fact pass in dev/, never a hardcoded id in the pane.)
     local soloKey = tostring(solo)
     payloads = {
         ["Aaa-Realm"] = { v = 1, ds = DSV,
@@ -7079,11 +7130,119 @@ local function testKindOwnership(fails)
            "two renders of the same store disagreed at row " .. i)
     end
 
-    -- (h) NO DATASET EXTENSION RODE THIS FIX: the recipe-set identity the
-    -- bitmaps depend on is untouched (nothing was regenerated), so no stored
-    -- record can have been invalidated by this change.
+    -- (h) NO UNAPPROVED MARKING. The fact pass approved exactly two cooldown
+    -- groups; a recipe outside them must still read cd == 0, so the fixture
+    -- recipe this suite leans on stays the unmarked shape it is testing.
     ck((D.recipe[solo].cd or 0) == 0,
-       "a solo recipe grew a cd marking without the owner-approved fact pass")
+       "the unmarked fixture recipe grew a cd marking without a fact pass")
+
+    ----------------------------------------------------------------
+    -- (i) THE MOONCLOTH KIND, FROM KNOWLEDGE (FIX-5, 2026-08-11)
+    --
+    -- The owner's ask, and the leg that proves it: a tailor whose BITMAP says
+    -- they know Mooncloth lists under a Mooncloth row on a quiet day, with no
+    -- stamp anywhere and no craft ever observed by this addon. Before the
+    -- marking this row could not exist — the kind was enumerable only from a
+    -- live stamp, and a proven-ready scan deletes stamps, so the pane went
+    -- blank exactly when the answer was "yes, go craft it".
+    --
+    -- OUT OF SCOPE, SETTLED — a future agent should not re-open this without a
+    -- fact pass: Refined Deeprock Salt is the USE effect of the Salt Shaker
+    -- item (15846), 3-day cooldown on the PLAYER, explicitly NOT a
+    -- leatherworking pattern. No trade-skill window reports it, so the
+    -- window-scan model cannot carry it and it is deliberately unmarked. Spell
+    -- 19567 IS in the dataset — as the ENGINEERING recipe for the device, whose
+    -- craft has no cooldown (pinned in professions.lua's dataset-integrity
+    -- suite alongside the group census).
+    ----------------------------------------------------------------
+    do
+        local MOONCLOTH = 18560
+        ck(D.recipe[MOONCLOTH] and D.recipe[MOONCLOTH].cd == 2,
+           "FIX-5: Mooncloth does not carry cooldown group 2")
+        local mm = ProfUI.KindMembers("g2")
+        ck(#mm == 1 and mm[1] == MOONCLOTH,
+           "the Mooncloth kind is not a group of exactly one")
+        -- A group of ONE wears the recipe's own name, never "shared cooldown".
+        local mlabel, mpending = ProfUI.CooldownLabel("g2",
+            fakeResolver({ [MOONCLOTH] = "Mooncloth" }))
+        ck(mlabel == "Mooncloth" and mpending == false,
+           "the solo cooldown kind did not wear its recipe name (got "
+           .. tostring(mlabel) .. ")")
+        local _, mcold = ProfUI.CooldownLabel("g2", fakeResolver({}))
+        ck(mcold == true, "a cold solo-kind name was not held as pending")
+        local mprof = ProfUI.CdKeyMeta("g2")
+        ck(mprof == "tailoring", "the Mooncloth kind is not owned by tailoring")
+
+        local function tailorKnows(spells, c)
+            return { v = 1, ds = DSV,
+                     p = { tailoring = { l = 300, m = 300, t = 4,
+                                         k = P.EncodeKnown("tailoring", spells),
+                                         n = #spells, a = NOW - 50 } },
+                     c = c or {} }
+        end
+        -- Aaa knows it, no stamp: READY (absence IS ready). Bbb knows it and is
+        -- mid-cooldown: an owner, not listed. Ccc is a tailor who has never
+        -- learned it: neither.
+        local pay = {
+            ["Aaa-Realm"] = tailorKnows({ MOONCLOTH }),
+            ["Bbb-Realm"] = tailorKnows({ MOONCLOTH }, { ["g2"] = NOW + 86400 }),
+            ["Ccc-Realm"] = tailorKnows({ solo }),
+        }
+        local mrows = ProfUI.CooldownKindRows(fixtureEntries(),
+            function(k) return pay[k] end, NOW,
+            fakeResolver({ [MOONCLOTH] = "Mooncloth" }))
+        ck(#mrows == 1 and mrows[1].cdKey == "g2",
+           "a bitmap-proven Mooncloth knower produced no kind row (" .. #mrows .. ")")
+        ck(mrows[1] and mrows[1].label == "Mooncloth",
+           "the Mooncloth row lost its name")
+        ck(mrows[1] and mrows[1].owners == 2,
+           "the Mooncloth owner count is wrong (" .. tostring(mrows[1] and mrows[1].owners) .. ")")
+        ck(mrows[1] and #mrows[1].ready == 1 and mrows[1].ready[1].key == "Aaa-Realm",
+           "the no-stamp knower is not the one ready character")
+        ck(mrows[1] and mrows[1].ready[1].classTag == "MAGE",
+           "the ready Mooncloth name lost its class tag")
+        for _, r in ipairs(mrows[1] and mrows[1].ready or {}) do
+            ck(r.key ~= "Bbb-Realm", "a mid-cooldown Mooncloth holder was listed as ready")
+            ck(r.key ~= "Ccc-Realm", "a tailor who does not know Mooncloth was listed")
+        end
+        -- The stamp expires: its holder joins the ready list, roster order.
+        pay["Bbb-Realm"].c["g2"] = NOW - 1
+        mrows = ProfUI.CooldownKindRows(fixtureEntries(),
+            function(k) return pay[k] end, NOW,
+            fakeResolver({ [MOONCLOTH] = "Mooncloth" }))
+        ck(mrows[1] and #mrows[1].ready == 2 and mrows[1].ready[1].key == "Aaa-Realm"
+           and mrows[1].ready[2].key == "Bbb-Realm",
+           "an expired Mooncloth stamp did not read as ready-awaiting-deletion")
+
+        -- THE LEGACY SPELLING. A peer still on the pre-FIX-5 dataset stamps
+        -- the bare teaching spell. One timer must stay ONE row: without the
+        -- canonicalisation the union would list Mooncloth twice, once per
+        -- spelling, which is a lie about how many cooldowns exist.
+        ck(ProfUI.CanonCdKey(MOONCLOTH) == "g2",
+           "a legacy Mooncloth stamp did not canonicalise onto g2")
+        ck(ProfUI.CanonCdKey("g2") == "g2", "a group key was rewritten")
+        ck(ProfUI.CanonCdKey(tostring(solo)) == tostring(solo),
+           "an unmarked recipe's key was invented into a group")
+        pay = {
+            ["Aaa-Realm"] = tailorKnows({ MOONCLOTH }),
+            ["Bbb-Realm"] = { v = 1, ds = "an-older-build", p = {},
+                              c = { [tostring(MOONCLOTH)] = NOW + 600 } },
+        }
+        mrows = ProfUI.CooldownKindRows(fixtureEntries(),
+            function(k) return pay[k] end, NOW,
+            fakeResolver({ [MOONCLOTH] = "Mooncloth" }))
+        ck(#mrows == 1 and mrows[1].cdKey == "g2",
+           "a legacy bare-spell stamp split Mooncloth into " .. #mrows .. " kinds")
+        ck(mrows[1] and mrows[1].owners == 2,
+           "the legacy stamp holder was not counted as an owner of the group")
+        ck(mrows[1] and #mrows[1].ready == 1 and mrows[1].ready[1].key == "Aaa-Realm",
+           "the legacy mid-cooldown holder was listed as ready")
+        -- ...and the rollup speaks the same vocabulary.
+        local roll = ProfUI.RollupRows(fixtureEntries(), function(k) return pay[k] end,
+                                       NOW, fakeResolver({ [MOONCLOTH] = "Mooncloth" }))
+        ck(#roll == 1 and roll[1].cdKey == "g2" and roll[1].label == "Mooncloth",
+           "the rollup did not canonicalise a legacy Mooncloth stamp")
+    end
 end
 
 -- ── DELEGATE DESIGNATIONS (profession-delegates phase 1) ─────────────────────

@@ -511,6 +511,65 @@ do
 end
 
 ----------------------------------------------------------------------
+-- FIX-5: SOLO CRAFT COOLDOWNS  (the 2026-08-11 fact pass)
+--
+-- THE HOLE. The addendum records no cooldown facts at all. The shared alchemy
+-- transmute family was recoverable from the data itself — every member's name
+-- begins "Transmute:" — so it was derived below and shipped as group 1. A
+-- recipe that carries its OWN cooldown leaves no such fingerprint in the
+-- addendum, so it shipped as cd == 0, indistinguishable from an ordinary
+-- craft. The cost was visible in the pane: a solo-cooldown kind could only
+-- appear AFTER some character had crafted it and a live stamp existed, and it
+-- vanished again the moment every stamp was proven-ready and deleted.
+--
+-- THE VERDICTS (owner-approved fact pass; sources in dev/COOLDOWN-FACTS.md):
+--
+--   IN — Mooncloth, teaching spell 18560, Tailoring 250. A trade-skill WINDOW
+--        recipe carrying its own cooldown (wowhead classic spell=18560 flags it
+--        "Tradeskill recipe" and prints a 4-day cooldown; classicdb.ch spell
+--        18560 gives 345600 s / 5760 min, the same number). Not shared with
+--        alchemy's transmutes and not shared with anything else on Era —
+--        Spellcloth and Shadowcloth, the only recipes it ever shared with, are
+--        TBC. It gets its own group ordinal, 2.
+--
+--   OUT — Refined Deeprock Salt. NOT a trade-skill window recipe: it is the USE
+--        effect of the Salt Shaker item (15846), which an Engineer crafts and
+--        any Leatherworker at 250+ may operate; the 3-day cooldown lives on the
+--        PLAYER, not on a recipe row. warcraft.wiki.gg states it outright —
+--        it "was NOT a Leatherworking pattern". GetTradeSkillCooldown never
+--        sees it, so the window-scan model cannot carry it honestly and it is
+--        not marked. (Spell 19567, "Salt Shaker", IS in the dataset as an
+--        Engineering 250 recipe — that is the recipe for the DEVICE, and the
+--        device's craft has no cooldown.)
+--
+--   OUT — every other profession. No Era trade-skill window recipe outside
+--        alchemy's transmutes and Mooncloth carries a cooldown; the sources
+--        that enumerate Era profession cooldowns list exactly three things, and
+--        the third is the Salt Shaker rejected above.
+--
+-- WHAT IS AND IS NOT SHIPPED. Only the GROUP ORDINAL travels. The 4 days is
+-- documentation here and nothing else: the remaining time is read live from
+-- GetTradeSkillCooldown against the player's own window, so a shipped duration
+-- could only ever be a second source of truth to disagree with the client.
+--
+-- SHAPE. A solo cooldown is a cooldown group with exactly ONE member — the
+-- same key rule (cd > 0 => "g<cd>"), no second mechanism. The fix is matched by
+-- spell id AND asserted against the recipe's name and profession, so a dataset
+-- edit that moved 18560 under another profession, or renamed it, fails the
+-- build instead of shipping a mislabelled row.
+--
+-- METADATA ONLY. This touches no recipe's membership and no recipe's ordering,
+-- so the recipe-set hash is unchanged and not one stored record is invalidated.
+----------------------------------------------------------------------
+
+local SOLO_COOLDOWNS = {
+    { spell = 18560, name = "Mooncloth", prof = "tailoring", group = 2 },
+}
+local soloBySpell = {}
+for _, s in ipairs(SOLO_COOLDOWNS) do soloBySpell[s.spell] = s end
+local soloApplied = 0
+
+----------------------------------------------------------------------
 -- Acquisition token grammar
 --
 -- Every relation becomes one token; tokens are ";"-joined in id order within a
@@ -675,14 +734,38 @@ for p = 1, #PROF_ORDER do
             mask = mask + SRC_GRANT
             census.grant = census.grant + 1
         end
-        -- Shared-cooldown group. The only shared-cooldown family in this era's
-        -- data is alchemy's transmutes: every one of them draws on ONE timer, so
-        -- a reader that treated them as thirteen independent cooldowns would
-        -- show twelve lies every time one was used. The group is derived HERE,
-        -- from the English recipe name, and only the group ordinal ships — the
-        -- name does not.
+        -- COOLDOWN GROUP. Group 1 is alchemy's transmutes: every one of them
+        -- draws on ONE timer, so a reader that treated them as twelve
+        -- independent cooldowns would show eleven lies every time one was used.
+        -- That group is derived HERE, from the English recipe name, and only
+        -- the group ordinal ships — the name does not.
+        --
+        -- Groups 2+ are the SOLO cooldowns (FIX-5): a recipe that carries its
+        -- own timer is a group with exactly one member, so the key rule
+        -- (cd > 0 => "g<cd>") stays the only rule and the pane can enumerate
+        -- the kind from the CATALOGUE instead of waiting for someone to craft
+        -- it. Matched by spell id, then asserted against the row's name and
+        -- profession — a fact pass that stops being true must break the build,
+        -- not ship a mislabelled row.
         local cdGroup = 0
         if r.name:find("^Transmute:") then cdGroup = 1 end
+        local solo = soloBySpell[r.spell]
+        if solo then
+            if cdGroup ~= 0 then
+                die("FIX-5: spell " .. r.spell .. " is claimed by both the derived"
+                    .. " shared group and the solo cooldown list", r.line)
+            end
+            if r.name ~= solo.name then
+                die("FIX-5: spell " .. r.spell .. " is named '" .. tostring(r.name)
+                    .. "' in the data, the fact pass approved '" .. solo.name .. "'", r.line)
+            end
+            if PROF_ORDER[p].key ~= solo.prof then
+                die("FIX-5: " .. solo.name .. " sits in profession '" .. PROF_ORDER[p].key
+                    .. "', the fact pass approved '" .. solo.prof .. "'", r.line)
+            end
+            cdGroup = solo.group
+            soloApplied = soloApplied + 1
+        end
         for id in acq:gmatch("I(%d+)") do referencedItems[tonumber(id)] = true end
         for id in acq:gmatch("K(%d+)") do referencedItems[tonumber(id)] = true end
         for id in acq:gmatch("T%d+@(%d+)") do
@@ -721,6 +804,26 @@ for p = 1, #PROF_ORDER do
         }, "|")
         census.items = census.items + 1
     end
+end
+
+-- FIX-5 census: every approved solo cooldown found its recipe row. A fact pass
+-- that silently matched nothing would ship as "Mooncloth has no cooldown",
+-- which is the exact hole this fix exists to close.
+do
+    if soloApplied ~= #SOLO_COOLDOWNS then
+        die("FIX-5 expected " .. #SOLO_COOLDOWNS .. " solo cooldown marking(s), applied "
+            .. soloApplied)
+    end
+    local named = {}
+    for _, s in ipairs(SOLO_COOLDOWNS) do
+        named[#named + 1] = s.name .. " (spell " .. s.spell .. ") => g" .. s.group
+    end
+    FIXES[#FIXES + 1] = { id = "FIX-5", what = "solo-craft-cooldowns",
+        was = "no cooldown facts at all outside the derived transmute group",
+        now = table.concat(named, ", "),
+        why = "the addendum records no cooldowns, so a recipe with its OWN timer"
+           .. " shipped as cd 0 and its pane row could not exist until someone"
+           .. " crafted it; a solo cooldown is a group of one, same key rule" }
 end
 
 -- Teaching items a recipe points at must exist in the recipe-item tables.

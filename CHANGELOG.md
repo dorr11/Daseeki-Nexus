@@ -2,6 +2,30 @@
 
 ## Unreleased
 
+- **Fixed: Mooncloth is on the cooldowns list even when nobody is on cooldown.**
+  Mooncloth has its own four-day timer, but Nexus had no record of that fact — the
+  only cooldown it knew about from the catalogue was alchemy's shared transmute
+  timer. So a Mooncloth row could only appear once somebody had actually crafted it
+  and the timer was still running, and it disappeared again the moment the last
+  timer expired. The list went blank on exactly the day you were asking it "who can
+  make Mooncloth today?".
+
+  Mooncloth is now a fact in the shipped recipe data, so the row is there because
+  the catalogue says the cooldown exists — and every tailor whose recipe list Nexus
+  has read is named under it, ready or counting down, whether or not anyone has ever
+  crafted it while Nexus was watching. Timers a character started before this update
+  are carried over, not double-counted, and a character on an older version of Nexus
+  still lands in the same row rather than a second one wearing the same name.
+
+  **Not included, deliberately:** Refined Deeprock Salt. Its three-day cooldown
+  belongs to *using* the Salt Shaker, not to a recipe in a profession window — no
+  profession window ever reports it, so Nexus cannot read it and will not pretend
+  to. (The Salt Shaker itself is an engineering craft with no cooldown at all.) The
+  reasoning, with sources, is written down in `dev/COOLDOWN-FACTS.md`.
+
+  Nothing was re-scanned for this: the recipe list itself did not change, so every
+  character's stored recipe data stayed valid.
+
 - **New: an Inventory tab — everything the mesh is holding, on one page.**
   A third tab beside Characters and Professions, listing every distinct item held
   anywhere across every character on every account Nexus knows about: one line per

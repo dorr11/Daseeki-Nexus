@@ -77,7 +77,7 @@
 local ADDON, ns = ...
 
 ns.ProfessionsDataMeta = {
-    version     = "p1-4b17878e",
+    version     = "p1-c1aa1cd2",
     setHash     = "s1-3dbe2152",
     professions = 13,
     recipes     = 1251,
@@ -123,6 +123,7 @@ FIX-1|fishing-artisan-spell|18260|18248|the examined data reuses the cooking art
 FIX-3|thorium-contract-plans|no source|K18628|the contract item that grants them ships in the data but is never linked
 FIX-2|duplicate-prose-note|two note keys, one text|interned by text|notes are interned on their text here, so the duplicate cannot come back
 FIX-4|spec-parent-edges|flat specialisation list|3 Master smith specs parent to Weaponsmith|the era Blacksmithing tree is nested (a Master smith IS a Weaponsmith); the delegate lanes walk this edge
+FIX-5|solo-craft-cooldowns|no cooldown facts at all outside the derived transmute group|Mooncloth (spell 18560) => g2|the addendum records no cooldowns, so a recipe with its OWN timer shipped as cd 0 and its pane row could not exist until someone crafted it; a solo cooldown is a group of one, same key rule
 [prof]
 1|alchemy|Alchemy|111
 2|blacksmithing|Blacksmithing|239
@@ -2482,7 +2483,7 @@ FIX-4|spec-parent-edges|flat specialisation list|3 Master smith specs parent to 
 10|18456|300|1|0|4|0|I14512
 10|18457|300|1|0|4|0|I14513
 10|18458|300|1|0|4|0|I14514
-10|18560|250|1|0|2|0|I14526
+10|18560|250|1|0|2|2|I14526
 10|19435|290|1|0|8|0|Q6032
 10|20848|300|1|0|2|0|I17017
 10|20849|300|1|0|2|0|I17018
@@ -3308,6 +3309,7 @@ FIX-4|spec-parent-edges|flat specialisation list|3 Master smith specs parent to 
 ns.ProfessionsDataCompat = [==[
 [stampset]
 p1-4b17878e|s1-3dbe2152
+p1-c1aa1cd2|s1-3dbe2152
 p1-f84a5fa0|s1-3dbe2152
 [migration]
 ]==]
