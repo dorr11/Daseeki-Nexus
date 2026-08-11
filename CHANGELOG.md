@@ -1,5 +1,42 @@
 # Changelog
 
+## Unreleased
+
+- **New: an Inventory tab — everything the mesh is holding, on one page.**
+  A third tab beside Characters and Professions, listing every distinct item held
+  anywhere across every character on every account Nexus knows about: one line per
+  item, with the icon, the quality-coloured name, and the quantity summed across
+  bags, bank and mail everywhere. Hovering a line breaks that number down by
+  character — your own above the line, other accounts below it, class-coloured —
+  using the exact same block the cross-account item tooltips already draw, so it
+  reads the way you already expect. Hold Shift while hovering to get the game's own
+  item tooltip instead.
+
+  A search box filters by name as you type, and a CATEGORY chip filters by the
+  client's own item classes — Weapon, Armor, Consumable, Trade Goods, and so on.
+  The chip only ever offers categories that something in your list actually belongs
+  to, and the two filters compose, so "cloth" inside Trade Goods finds exactly what
+  you would think. The list opens sorted by name; clicking the QTY column header
+  switches it to biggest-stack-first and clicking it again switches back. Both
+  choices are remembered. The footer keeps the running totals and tells you how many
+  characters are behind them and how stale the oldest of them is.
+
+  **Cold item names are handled honestly, out loud.** The game hands addons item
+  names, icons and categories asynchronously, and right after a login it often has
+  not handed them over yet. An item Nexus has counts for but no name for is not
+  hidden and is not guessed at: it shows as `item #12345` with a neutral icon and an
+  ellipsis where its category goes, it still counts toward every total, and it fills
+  itself in as the game answers. A name search cannot match it — nothing can match a
+  name that does not exist yet — so instead of quietly reporting a miss, the page
+  says how many names it is still waiting on, and stops saying so once it has waited
+  long enough to know they are never coming. Category filtering leaves those items
+  out of every named category (Nexus will not file an item under a class it was
+  never told), and gives them their own `(unresolved)` bucket so you can always find
+  them.
+
+  Built to stay quick on a big mesh: only the rows actually on screen exist as
+  frames, however many thousand items the list is long.
+
 ## 1.1.10 — 2026-08-11
 
 

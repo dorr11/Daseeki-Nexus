@@ -1266,6 +1266,16 @@ Dashboard.TAB_DEFS = {
             return (V and V.BadgeCount and V.BadgeCount()) or 0
         end,
     },
+    -- The mesh-wide item ledger (ui_inventorytab.lua). DELIBERATELY UNGATED, and
+    -- that is the difference from Professions above rather than an oversight: the
+    -- professions view is the display surface OF a user-toggleable module, so the
+    -- inertness rule makes its tab vanish with the module. This one is a view onto
+    -- data the store holds either way, and the Inventory module's own toggle only
+    -- decides whether THIS character keeps capturing — every peer's counts stay
+    -- readable regardless. So the tab is always there and explains its own
+    -- emptiness in words (InvUI.EmptyText) instead of disappearing and leaving the
+    -- owner to guess which switch hid it.
+    { id = "inventory", label = "Inventory" },
 }
 
 -- PURE. Which tab ids are visible right now, in canonical order. Split out so
