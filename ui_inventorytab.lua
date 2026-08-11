@@ -10,9 +10,10 @@
 -- summed quantity, with the per-character split one hover away.
 --
 --   ROW      [icon] Netherweave Cloth            1,204   Trade Goods
---   HOVER    the per-character breakdown, class-colored, this account above the
---            line and Other Accounts below it. Shift-hover swaps in the client's
---            real item tooltip.
+--   HOVER    the client's REAL item tooltip, with the per-character breakdown
+--            appended under it — class-colored, this account above the line and
+--            Other Accounts below it — which is the same one-tooltip shape
+--            hovering that item in a bag already gives. No modifier.
 --   FILTERS  a live name search and a CATEGORY chip built from the client's own
 --            item classes. They COMPOSE.
 --   SORT     name ascending by default; the QTY header toggles quantity-desc.
@@ -1255,6 +1256,13 @@ end
 -- across both addons by the harness's parity gate — so this tab's hover is the
 -- same block the owner already knows, not a lookalike.
 --
+-- MODEL AND RENDERER, BOTH. This function is only the MODEL half; the RENDERER is
+-- ns.Tooltips.RenderCountRows and RenderRowTooltip calls it. Reusing the model and
+-- then hand-writing the loop is exactly what shipped 1.1.11's colourless hover:
+-- the row model carries the class TAG, but the class INK is applied by the
+-- renderer, in AddDoubleLine's numeric arguments, where no string comparison can
+-- see it missing. Reuse both halves or neither.
+--
 -- Returns rows, total, or nil when the seam is absent or nobody holds the item.
 function InvUI.BreakdownRows(owners, itemID, viewerKey)
     local T = ns.Tooltips
@@ -1274,6 +1282,16 @@ function InvUI.TooltipStaleOnPaint(prevItem, newItem, ownedByRow)
     return (ownedByRow and prevItem ~= newItem) and true or false
 end
 
+-- PURE. The OTHER half of the same question, and the one the cold cache needs: a
+-- row that repaints with the SAME item under a standing tooltip is not stale, it
+-- has HEALED — GET_ITEM_INFO_RECEIVED landed and the id we could only name a
+-- moment ago now has a real item tooltip behind it. Hiding would be wrong (the
+-- mouse never moved); leaving the honest cold form up would be class-4 dishonesty
+-- in the other direction. So: re-render it in place.
+function InvUI.TooltipHealOnPaint(prevItem, newItem, ownedByRow)
+    return (ownedByRow and newItem ~= nil and prevItem == newItem) and true or false
+end
+
 -- Called by the paint path BEFORE a recycled row adopts a new item. Returns true
 -- when it hid a tooltip (the re-hover renders the new content naturally).
 function InvUI.RowTooltipOnPaint(tip, rr, newItem)
@@ -1286,45 +1304,120 @@ function InvUI.RowTooltipOnPaint(tip, rr, newItem)
     return false
 end
 
+-- PURE. After the client's own item tooltip has been populated, has the
+-- cross-account block ALREADY been drawn on it by a HOOK? Two independent ways it
+-- can have been:
+--   latched  — tooltips.lua's own one-block-per-populate mark, set by AppendCounts
+--              from the OnTooltipSetItem hook (and cleared on OnTooltipCleared /
+--              OnHide), i.e. NEXUS drew it;
+--   bagsOwns — Daseeki-Bags is installed, so Nexus stood down and BAGS drew it.
+-- Either way the block is on screen and drawing a second one is the double-block
+-- breach the suite's stand-down gate exists to prevent.
+function InvUI.BlockAlreadyDrawn(latched, bagsOwns)
+    return (latched or bagsOwns) and true or false
+end
+
+-- Live reader for the above. Both probes are guarded; an absent seam reads false,
+-- which draws the block rather than silently swallowing it.
+function InvUI.HookDrewBlock(tip)
+    local latched = false
+    if tip then
+        local ok, v = pcall(function() return tip.__dsnCountsShown end)
+        latched = (ok and v) and true or false
+    end
+    local bagsOwns = false
+    local T = ns.Tooltips
+    if T and T.BagsOwnsWealthUI and T.ProbeBags then
+        local ok, owns = pcall(function() return T.BagsOwnsWealthUI(T.ProbeBags()) end)
+        bagsOwns = (ok and owns) and true or false
+    end
+    return InvUI.BlockAlreadyDrawn(latched, bagsOwns)
+end
+
 -- Render one row's tooltip. Everything takes the TOOLTIP AS A PARAMETER (GameTooltip
 -- live, a recording fake under the harness — the parity gate's idiom), so the whole
 -- chain is exercised headless.
 --
---   ctx = { owners, viewerKey, shift, ask, colored }
+--   ctx = { owners, viewerKey, ask, colored }
 --
--- SHIFT is the real item tooltip, and it follows ProfUI.RenderRecipeTooltip's
--- precedent verbatim: SetHyperlink, then a >= 2 LINE COLD-READ CHECK — a title-only
--- item tooltip is the class-4 cold read, not an answer — and on a cold cache, ask
--- for the warm load, clear the half-drawn lines and fall through to the breakdown
--- rather than leaving a stub standing.
+-- ONE TOOLTIP, TWO PARTS, IN THE ORDER AN ORDINARY BAG ITEM ALREADY SHOWS THEM
+-- (owner, live 2026-08-11: "items are missing their tooltips"): the client's REAL
+-- item tooltip first, the per-character breakdown appended under it. That is
+-- exactly what hovering the same item in a bag gives — the item body, then the
+-- block AppendCounts hangs off OnTooltipSetItem — so the tab shows the item hover
+-- the owner already knows, with nothing hidden behind a modifier. The old build
+-- put the item tooltip behind SHIFT; a modifier nobody was told about is the same
+-- as no item tooltip at all, and this row hover has no other job.
 --
--- The DEFAULT (unshifted) hover deliberately does NOT SetHyperlink. Populating
--- GameTooltip with an item fires OnTooltipSetItem, which tooltips.lua hooks to
--- append this very block — so a hyperlink on every hover would draw the breakdown
--- twice on a Bags-less install. Shift is the one place the real tooltip is asked
--- for, and there the appended block is the same block every other item hover in
--- the game already gets.
+-- WHO DECIDES THE ITEM IS WARM: THE CACHE, NOT THE LINE COUNT. `row.resolved` is
+-- this file's one certainty per row (GetItemInfo answered, so the client HAS the
+-- item), and it is the gate on SetHyperlink. The NumLines >= 2 render witness is
+-- kept as the second gate — it is the SAME idiom, and the same threshold, as rung
+-- 2 of ProfUI.RecipeTooltipPlan ("item:<id>", minLines = 2), which is the suite's
+-- only other SetHyperlink caller and was written defensively because 11509 had
+-- already lied once about recipe links; a witness that costs one call is cheap on
+-- a hover. (That rung also records what makes the block bookkeeping below work:
+-- an item hyperlink "picks up the suite's own lines from tooltips.lua for free",
+-- i.e. the OnTooltipSetItem hooks DO fire on SetHyperlink.) It can no longer be the FIRST
+-- gate: populating a tooltip fires OnTooltipSetItem, our own hook appends the
+-- count block, and a cold item would therefore have counted its way past a
+-- line-count test while showing "Retrieving item information". A cold row never
+-- hyperlinks at all: it asks for the warm load and draws the honest header
+-- instead, and heals into the full item tooltip in place (TooltipHealOnPaint).
 --
--- Returns the mode that rendered: "item" | "breakdown" | "bare".
+-- WHO DRAWS THE BLOCK ONCE THE ITEM TOOLTIP IS UP: whoever got there first, and
+-- only one of them. SetHyperlink runs the OnTooltipSetItem hooks synchronously, so
+-- by the time it returns either Nexus has appended the block (its latch is set) or
+-- Daseeki-Bags has appended its own (Nexus stood down). InvUI.HookDrewBlock reads
+-- both, and only when NEITHER drew — the block switched off globally, or the hook
+-- never installed — does the tab append it itself. This tab is Nexus's own surface
+-- and always shows its own data; it just never shows it twice.
+--
+-- Returns mode, appended: mode is "item" | "breakdown" | "bare", and `appended` is
+-- whether THIS call drew the breakdown block (false when a hook already had).
 function InvUI.RenderRowTooltip(tip, row, ctx)
     ctx = type(ctx) == "table" and ctx or EMPTY
     if not (tip and type(row) == "table") then return nil end
 
-    if ctx.shift then
-        local ok = false
-        if tip.SetHyperlink then
-            ok = pcall(tip.SetHyperlink, tip, "item:" .. tostring(row.id))
-        end
+    -- THE BREAKDOWN, through ns.Tooltips.RenderCountRows — the one renderer the
+    -- item tooltip and Daseeki-Bags' Find both draw through, and the reason this
+    -- hover is class-colored again. The tab used to carry its own copy of that
+    -- loop; the copy dropped the class ink (which lives in AddDoubleLine's numeric
+    -- arguments, not in the strings) and the account glyph on the section header,
+    -- and the parity gate could not see it because the gate certifies the renderer
+    -- this function now calls. Everything the block knows about ink, glyphs and
+    -- section framing stays in ONE place.
+    local function breakdown(lead)
+        local rows = InvUI.BreakdownRows(ctx.owners, row.id, ctx.viewerKey)
+        if not rows then return false end
+        local T = ns.Tooltips
+        if not (T and T.RenderCountRows) then return false end
+        T.RenderCountRows(tip, rows, { lead = lead, formatTotal = InvUI.Commas })
+        return true
+    end
+
+    -- 1. THE REAL ITEM TOOLTIP, for a row whose name the client has already given us.
+    if row.resolved and tip.SetHyperlink then
+        local ok = pcall(tip.SetHyperlink, tip, "item:" .. tostring(row.id))
         local lines = 0
         if ok and tip.NumLines then
             local okN, n = pcall(tip.NumLines, tip)
             lines = (okN and tonumber(n)) or 0
         end
-        if ok and lines >= 2 then return "item" end
-        -- Cold cache: a fact about the CACHE, not about the item. Ask, wipe the
-        -- partial draw, and show what we do know.
+        if ok and lines >= 2 then
+            local appended = false
+            if not InvUI.HookDrewBlock(tip) then appended = breakdown(true) end
+            if tip.Show then tip:Show() end
+            return "item", appended
+        end
+        -- The client named the item but would not render it. A fact about the
+        -- CLIENT, not about the item: wipe the half-drawn stub and answer with what
+        -- we do know rather than leaving it standing.
         if ctx.ask then ctx.ask({ row.id }) end
         if tip.ClearLines then pcall(tip.ClearLines, tip) end
+    elseif not row.resolved then
+        -- Cold cache: ask, and heal on the answer. Never a blank tooltip.
+        if ctx.ask then ctx.ask({ row.id }) end
     end
 
     local col = ctx.colored
@@ -1337,40 +1430,22 @@ function InvUI.RenderRowTooltip(tip, row, ctx)
         tip:AddLine(text)
     end
 
-    -- The header: the item's own name, or the honest id when it has not answered.
+    -- 2. The header: the item's own name, or the honest id when it has not answered.
     line(InvUI.DisplayName(row), "text")
     if not row.resolved then
         line("name not loaded yet" .. InvUI.GLYPHS.dots, "faint")
     end
 
-    local rows = InvUI.BreakdownRows(ctx.owners, row.id, ctx.viewerKey)
-    if not rows then
+    -- No leading blank here: the header is one line and the block reads as its
+    -- continuation. The item-tooltip path leads with one, because there it is
+    -- separating our block from the client's.
+    if not breakdown(false) then
         line("Held by nobody we have counts for.", "faint")
         if tip.Show then tip:Show() end
-        return "bare"
-    end
-
-    local T = ns.Tooltips
-    for i = 1, #rows do
-        local r = rows[i]
-        if r.kind == "total" then
-            line("Total: " .. InvUI.Commas(r.total), "muted")
-        elseif r.kind == "char" then
-            local left, right = r.line.name, tostring(r.line.total or 0)
-            if T and T.RowStrings then
-                local l, rt = T.RowStrings(r.line, r.badges)
-                if l then left, right = l, rt end
-            end
-            if tip.AddDoubleLine then tip:AddDoubleLine(left, right)
-            else line(tostring(left) .. "  " .. tostring(right), "text") end
-        elseif r.kind == "spacer" then
-            line(" ", "text")
-        elseif r.kind == "section" then
-            line(tostring(r.label), "muted")
-        end
+        return "bare", false
     end
     if tip.Show then tip:Show() end
-    return "breakdown"
+    return "breakdown", true
 end
 
 ----------------------------------------------------------------------
@@ -1727,6 +1802,33 @@ local function invScroller(invParent, tagID)
     return scr, kid
 end
 
+-- Render (or RE-render) one row's hover. `healing` means the tooltip is already up
+-- and already owned by this row — the item finally answered — so its lines are
+-- cleared and rewritten in place instead of the frame being re-owned, which would
+-- flicker the anchor under a mouse that never moved.
+--
+-- The rendered mode is remembered on the frame so the heal path can tell a tooltip
+-- that has already become the real item tooltip (nothing left to heal) from one
+-- still showing the honest cold header.
+local function invShowRowTip(ir, healing)
+    if not (ir and ir._row) then return nil end
+    local GT = GameTooltip
+    if not GT then return nil end
+    if healing then
+        if GT.ClearLines then pcall(GT.ClearLines, GT) end
+    elseif GT.SetOwner then
+        GT:SetOwner(ir, "ANCHOR_RIGHT")
+    end
+    local mode = InvUI.RenderRowTooltip(GT, ir._row, {
+        owners    = InvUI.Owners(),
+        viewerKey = InvUI.ViewerKey(),
+        ask       = function(ids) return InvUI.AskFor(ids, InvUI.LiveResolver()) end,
+        colored   = function(ink) return UI.Color(ink) end,
+    })
+    ir._tipMode = mode
+    return mode
+end
+
 -- One pooled item row. NOTHING here bakes an x-position: every render calls
 -- invFitRow with the SAME InvUI.RowColumns the header band uses, so a cell and its
 -- caption cannot disagree and neither can outrun the pane that produced them.
@@ -1756,25 +1858,15 @@ local function invMakeRow(invListKid)
     ir._icon, ir._name, ir._qty, ir._cat = iIcon, iName, iQty, iCat
     ir._item = nil
 
-    ir:SetScript("OnEnter", function(self)
-        if not self._row then return end
-        if GameTooltip and GameTooltip.SetOwner then
-            GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
-        end
-        InvUI.RenderRowTooltip(GameTooltip, self._row, {
-            owners    = InvUI.Owners(),
-            viewerKey = InvUI.ViewerKey(),
-            shift     = _G.IsShiftKeyDown and _G.IsShiftKeyDown() or false,
-            ask       = function(ids) return InvUI.AskFor(ids, InvUI.LiveResolver()) end,
-            colored   = function(ink) return UI.Color(ink) end,
-        })
-    end)
-    ir:SetScript("OnLeave", function()
+    ir:SetScript("OnEnter", function(self) invShowRowTip(self, false) end)
+    ir:SetScript("OnLeave", function(self)
+        self._tipMode = nil
         if GameTooltip and GameTooltip.Hide then GameTooltip:Hide() end
     end)
     -- A pooled row hidden mid-hover (a scroll tick, a filter change) may not leave
     -- its tooltip standing either.
     ir:SetScript("OnHide", function(self)
+        self._tipMode = nil
         if GameTooltip and GameTooltip.GetOwner and GameTooltip:GetOwner() == self then
             GameTooltip:Hide()
         end
@@ -1799,8 +1891,16 @@ local INV_NEUTRAL_ICON = "Interface/Icons/INV_Misc_QuestionMark"
 
 local function invPaintRow(ir, row)
     -- The pooled-cell lesson, BEFORE the row adopts its new item.
+    local ownsTip = (GameTooltip and GameTooltip.GetOwner
+                     and GameTooltip:GetOwner() == ir) and true or false
+    -- ...and its other half: a SAME-item repaint under a standing tooltip is the
+    -- cold read healing. Only a tooltip still showing the honest cold form is
+    -- rewritten — one that already became the real item tooltip has nothing to heal.
+    local heal = InvUI.TooltipHealOnPaint(ir._item, row.id, ownsTip)
+                 and ir._tipMode ~= "item"
     InvUI.RowTooltipOnPaint(GameTooltip, ir, row.id)
     ir._item, ir._row = row.id, row
+    if heal then invShowRowTip(ir, true) end
 
     ir._icon:SetTexture(row.resolved and (row.icon or INV_NEUTRAL_ICON) or INV_NEUTRAL_ICON)
     ir._icon:SetDesaturated(not row.resolved)
@@ -2618,6 +2718,7 @@ local function testRecycleHygiene(fails)
     ck(hidden == 0, "a row hid another row's tooltip")
 
     -- ...and the RENDER path itself, driven headless through a recording tooltip.
+    -- A tooltip with NO SetHyperlink is the no-item-seam client: header + block.
     local rows, _, _, owners = builtLedger()
     local rec = { lines = {}, doubles = {}, shown = 0 }
     function rec:AddLine(t) self.lines[#self.lines + 1] = tostring(t) end
@@ -2632,8 +2733,9 @@ local function testRecycleHygiene(fails)
     ck(#rec.doubles == 3, "the breakdown drew " .. #rec.doubles .. " holder rows, expected 3")
     ck(rec.shown > 0, "the tooltip was never shown")
 
-    -- SHIFT with a COLD cache: a title-only tooltip is not an answer, so the chain
-    -- asks for the warm load and falls through instead of leaving a stub standing.
+    -- A RESOLVED row whose SetHyperlink will not render (this client has lied about
+    -- hyperlinks before): the render witness catches it, the stub is wiped, the warm
+    -- load is asked for, and the honest header + block answer instead.
     local asked = {}
     local cold = { lines = {} }
     function cold:SetHyperlink() self.lines = { "Silk Cloth" } return true end
@@ -2643,24 +2745,278 @@ local function testRecycleHygiene(fails)
     function cold:AddDoubleLine(l, r) self.lines[#self.lines + 1] = tostring(l) end
     function cold:Show() end
     local coldMode = InvUI.RenderRowTooltip(cold, rows[1], {
-        owners = owners, viewerKey = "Poonyx-Whitemane", shift = true,
+        owners = owners, viewerKey = "Poonyx-Whitemane",
         ask = function(ids) for i = 1, #ids do asked[#asked + 1] = ids[i] end end,
     })
     ck(coldMode == "breakdown",
-       "a COLD item tooltip was accepted as the real one (class 4): " .. tostring(coldMode))
+       "a stub item tooltip was accepted as the real one (class 4): " .. tostring(coldMode))
     ck(#asked == 1 and asked[1] == rows[1].id,
-       "a cold item tooltip did not request the warm load")
+       "a stub item tooltip did not request the warm load")
 
-    -- SHIFT with a WARM cache: the real item tooltip wins and nothing is appended.
-    local warm = { lines = {} }
-    function warm:SetHyperlink() self.lines = { "Silk Cloth", "Trade Goods", "Sell: 1s" } return true end
-    function warm:NumLines() return #self.lines end
-    function warm:ClearLines() self.lines = {} end
-    function warm:AddLine(t) self.lines[#self.lines + 1] = tostring(t) end
-    function warm:Show() end
-    ck(InvUI.RenderRowTooltip(warm, rows[1], { owners = owners, shift = true }) == "item",
-       "a warm item tooltip was not used for the shift hover")
-    ck(#warm.lines == 3, "the shift hover appended to the client's own item tooltip")
+    -- A WARM row: the client's real item tooltip renders AND the breakdown is
+    -- appended under it — one tooltip, item first, exactly what a bag hover shows.
+    local function newWarm()
+        local w = { lines = {}, doubles = {} }
+        function w:SetHyperlink() self.lines = { "Silk Cloth", "Trade Goods", "Sell: 1s" } return true end
+        function w:NumLines() return #self.lines end
+        function w:ClearLines() self.lines = {} end
+        function w:AddLine(t) self.lines[#self.lines + 1] = tostring(t) end
+        function w:AddDoubleLine(l, r)
+            self.doubles[#self.doubles + 1] = tostring(l) .. "=" .. tostring(r)
+        end
+        function w:Show() end
+        return w
+    end
+    local warm = newWarm()
+    local wMode, wAppended = InvUI.RenderRowTooltip(warm, rows[1], { owners = owners })
+    ck(wMode == "item", "a warm item tooltip was not used for the hover: " .. tostring(wMode))
+    ck(wAppended == true,
+       "the item tooltip rendered but the per-character breakdown was NOT appended — "
+       .. "the hover is back to hiding half of what it is for")
+    ck(#warm.doubles == 3,
+       "the appended breakdown drew " .. #warm.doubles .. " holder rows, expected 3")
+    ck(#warm.lines > 3, "the block was not appended BELOW the client's own item body")
+
+    -- ...and it is appended exactly ONCE. A hook that already drew the block (our
+    -- own latch, or Daseeki-Bags standing in for us) means the tab adds nothing:
+    -- the double-block breach the stand-down gate exists to prevent.
+    local latched = newWarm()
+    latched.__dsnCountsShown = true
+    local lMode, lAppended = InvUI.RenderRowTooltip(latched, rows[1], { owners = owners })
+    ck(lMode == "item", "the latched hover did not render the item tooltip")
+    ck(lAppended == false,
+       "DOUBLE BLOCK: the tab appended the breakdown onto a tooltip a hook had "
+       .. "already drawn it on")
+    ck(#latched.doubles == 0, "the tab drew " .. #latched.doubles
+       .. " holder row(s) on top of a block that was already there")
+    ck(InvUI.BlockAlreadyDrawn(false, false) == false, "BlockAlreadyDrawn: nobody drew")
+    ck(InvUI.BlockAlreadyDrawn(true, false) == true, "BlockAlreadyDrawn: our own latch")
+    ck(InvUI.BlockAlreadyDrawn(false, true) == true, "BlockAlreadyDrawn: Bags drew it")
+
+    -- A COLD row never hyperlinks at all: the item is not in the client's cache, so
+    -- SetHyperlink could only draw "Retrieving item information" — and OUR OWN hook
+    -- would then append the block and push it past a line-count test. The cache is
+    -- the gate, not the line count.
+    local coldRow = { id = 4306, total = 237, holders = 3, resolved = false, split = {} }
+    local unasked = {}
+    local never = newWarm()
+    local linked = false
+    function never:SetHyperlink() linked = true self.lines = { "a", "b", "c" } return true end
+    local cMode = InvUI.RenderRowTooltip(never, coldRow, {
+        owners = owners, viewerKey = "Poonyx-Whitemane",
+        ask = function(ids) for i = 1, #ids do unasked[#unasked + 1] = ids[i] end end,
+    })
+    ck(linked == false,
+       "a COLD row hyperlinked anyway — a 'Retrieving item information' stub can "
+       .. "count its way past the render witness once our own hook appends to it")
+    ck(cMode == "breakdown", "a cold row did not answer with header + breakdown: "
+       .. tostring(cMode))
+    ck(#unasked == 1 and unasked[1] == 4306, "a cold row did not ask for the warm load")
+    ck(#never.doubles == 3, "a cold row lost its breakdown (never a blank tooltip)")
+
+    -- ...and it HEALS: the same row repainting the same item under its own standing
+    -- tooltip is the answer landing, not a recycle.
+    ck(InvUI.TooltipHealOnPaint(4306, 4306, true) == true,
+       "a same-item repaint under a standing tooltip did not heal")
+    ck(InvUI.TooltipHealOnPaint(4306, 6948, true) == false,
+       "a DIFFERENT item was treated as a heal rather than a recycle")
+    ck(InvUI.TooltipHealOnPaint(4306, 4306, false) == false,
+       "a row healed a tooltip that belongs to somebody else")
+    ck(InvUI.TooltipHealOnPaint(nil, nil, true) == false,
+       "a row with no item healed something")
+end
+
+----------------------------------------------------------------------
+
+-- THE INK PIN — the gap that let a colourless hover ship past a green suite.
+--
+-- WHAT WENT WRONG (owner, live 2026-08-11: the breakdown's character names had no
+-- class colours). The row MODEL was reused correctly; the RENDERER was not. The
+-- tab hand-wrote its own copy of the render loop, and the copy called
+-- AddDoubleLine(left, right) with no colour arguments. That is invisible to every
+-- pin the suite had, because:
+--
+--   * ns.Tooltips.RowStrings returns the name BARE. Only the right-hand count
+--     carries a |cff escape of its own. The character's name is coloured ENTIRELY
+--     by the three numbers AddDoubleLine takes after the two strings — so a
+--     string-for-string comparison of the two renderers passes while one of them
+--     draws in the fallback ink;
+--   * every recording tooltip in the suite AND in the cross-addon parity gate
+--     declares AddDoubleLine(l, r) and drops the colour arguments on the floor.
+--     There was nowhere for the missing ink to be noticed;
+--   * the parity gate certifies Tooltips.AppendCounts. The tab's hover never
+--     called it, or anything it called. The gate covered a different function.
+--
+-- SO THIS PIN DOES THREE THINGS THE OLD ONES COULD NOT: it records the colour
+-- ARGUMENTS, it drives InvUI.RenderRowTooltip (the function the live hover
+-- actually calls) with store-shaped data, and it asserts the hover ROUTES through
+-- ns.Tooltips.RenderCountRows rather than resembling it. The RED CONTROL is the
+-- pre-fix shape, written out and asserted to produce no ink at all.
+local function testHoverInk(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+
+    local T = ns.Tooltips
+    if not (T and T.RenderCountRows) then
+        fails[#fails + 1] = "ns.Tooltips.RenderCountRows is gone — the hover and the "
+            .. "item tooltip no longer share one renderer, which is how the colourless "
+            .. "block shipped the first time"
+        return
+    end
+
+    -- The class colours the live client always has and the harness does not. Set for
+    -- the duration so classColor() resolves to something asserting can distinguish,
+    -- then restored — nothing else in the suite may see them.
+    local savedRAID, savedCUSTOM = _G.RAID_CLASS_COLORS, _G.CUSTOM_CLASS_COLORS
+    local CLASS = {
+        WARRIOR = { r = 0.78, g = 0.61, b = 0.43 },
+        PRIEST  = { r = 1.00, g = 1.00, b = 1.00 },
+        SHAMAN  = { r = 0.00, g = 0.44, b = 0.87 },
+        ROGUE   = { r = 1.00, g = 0.96, b = 0.41 },
+        MAGE    = { r = 0.41, g = 0.80, b = 0.94 },
+    }
+    _G.CUSTOM_CLASS_COLORS, _G.RAID_CLASS_COLORS = nil, CLASS
+
+    -- A recording tooltip that KEEPS THE COLOUR ARGUMENTS.
+    local function inkRecorder()
+        local r = { lines = {}, doubles = {}, shown = 0 }
+        function r:AddLine(t, cr, cg, cb)
+            self.lines[#self.lines + 1] = { text = tostring(t), r = cr, g = cg, b = cb }
+        end
+        function r:AddDoubleLine(l, rt, lr, lg, lb, rr, rg, rb)
+            self.doubles[#self.doubles + 1] = {
+                left = tostring(l), right = tostring(rt),
+                r = lr, g = lg, b = lb, vr = rr, vg = rg, vb = rb,
+            }
+        end
+        function r:Show() self.shown = self.shown + 1 end
+        return r
+    end
+
+    local ok, err = pcall(function()
+        local rows, _, _, owners = builtLedger()
+        -- item 6948 is held by all five characters across BOTH accounts, so the
+        -- block carries a Total, own-account rows, the spacer, the section header
+        -- and the cross-account rows — every row kind, in one hover.
+        local target
+        for i = 1, #rows do if rows[i].id == 6948 then target = rows[i] end end
+        ck(target ~= nil, "the ink fixture lost its 5-holder item")
+        if not target then return end
+
+        local classOf = {}
+        for _, o in pairs(fixtureOwners()) do classOf[o.name] = o.class end
+
+        local rec = inkRecorder()
+        InvUI.RenderRowTooltip(rec, target, { owners = owners,
+            viewerKey = "Poonyx-Whitemane" })
+
+        ck(#rec.doubles == 5, "the ink pin drew " .. #rec.doubles
+           .. " holder rows, expected 5")
+
+        -- 1. EVERY character name carries ITS OWN class colour, as numbers.
+        local distinct = {}
+        for _, d in ipairs(rec.doubles) do
+            local name = d.left:match("([%a]+)$") or d.left
+            local want = CLASS[classOf[name] or ""]
+            ck(type(d.r) == "number" and type(d.g) == "number" and type(d.b) == "number",
+               "THE BUG: holder row '" .. d.left .. "' was drawn with NO colour "
+               .. "arguments — the name renders in the tooltip's fallback ink, which "
+               .. "is exactly what the owner saw")
+            if want and type(d.r) == "number" then
+                ck(d.r == want.r and d.g == want.g and d.b == want.b,
+                   "holder row '" .. name .. "' is not in its class colour (got "
+                   .. tostring(d.r) .. "," .. tostring(d.g) .. "," .. tostring(d.b) .. ")")
+            end
+            distinct[tostring(d.r) .. "/" .. tostring(d.g) .. "/" .. tostring(d.b)] = true
+            -- the count column keeps its own escape as well
+            ck(d.right:find("|cff", 1, true) == 1,
+               "the count column for '" .. name .. "' lost its class escape: " .. d.right)
+        end
+        local n = 0
+        for _ in pairs(distinct) do n = n + 1 end
+        ck(n >= 4, "five characters of five different classes produced only " .. n
+           .. " distinct name colour(s) — the class tag is not reaching the ink")
+
+        -- 2. THE SECTION HEADER is the Find/item-tooltip one: account glyph +
+        --    LIGHTGRAY wrap, never the bare label.
+        local section
+        for _, l in ipairs(rec.lines) do
+            if l.text:find("Other Accounts", 1, true) then section = l.text end
+        end
+        ck(section ~= nil, "the cross-account section header never rendered")
+        if section then
+            ck(section ~= "Other Accounts",
+               "the section header is the BARE label — the account glyph and the "
+               .. "LIGHTGRAY wrap the item tooltip draws were dropped")
+            ck(section:find("|cff", 1, true) ~= nil,
+               "the section header lost its grey wrap: " .. section)
+        end
+
+        -- 3. THE TOTAL keeps the white-number escape the item tooltip uses.
+        local total
+        for _, l in ipairs(rec.lines) do
+            if l.text:find("Total", 1, true) then total = l.text end
+        end
+        ck(total ~= nil, "the Total header never rendered")
+        ck(total == nil or total:find("|cffffffff", 1, true) ~= nil,
+           "the Total line lost its white escape: " .. tostring(total))
+
+        -- 4. RED CONTROL. The pre-fix renderer, written out. It reuses the SAME row
+        --    model and the SAME RowStrings — everything a string comparison can
+        --    see — and it is colourless. If this ever agrees with the shipped path,
+        --    the shipped path has lost its ink again.
+        local function preFixRenderer(tt, blockRows)
+            for i = 1, #blockRows do
+                local r = blockRows[i]
+                if r.kind == "char" then
+                    local left, right = T.RowStrings(r.line, r.badges)
+                    tt:AddDoubleLine(left, right)          -- <- no colour arguments
+                elseif r.kind == "section" then
+                    tt:AddLine(tostring(r.label))          -- <- no glyph, no grey
+                end
+            end
+        end
+        local red = inkRecorder()
+        preFixRenderer(red, InvUI.BreakdownRows(owners, 6948, "Poonyx-Whitemane"))
+        local anyInk = false
+        for _, d in ipairs(red.doubles) do if type(d.r) == "number" then anyInk = true end end
+        ck(anyInk == false,
+           "the RED CONTROL is not reproducing the defect any more — rewrite it, do "
+           .. "not delete it")
+        ck(#red.doubles == #rec.doubles,
+           "the red control and the shipped renderer drew different row counts, so "
+           .. "they are not comparable")
+        local sameStrings = true
+        for i = 1, #red.doubles do
+            if red.doubles[i].left ~= rec.doubles[i].left then sameStrings = false end
+        end
+        ck(sameStrings,
+           "the red control's LEFT STRINGS differ from the shipped renderer's — the "
+           .. "point of this control is that the strings were always identical and "
+           .. "only the ink was missing")
+        ck(red.lines[1] and red.lines[1].text == "Other Accounts",
+           "the red control's section header is no longer the bare label")
+
+        -- 5. ROUTING. The hover must CALL the certified renderer, not resemble it.
+        local calledWith
+        local realRender = T.RenderCountRows
+        T.RenderCountRows = function(tt, blockRows, opts)
+            calledWith = { rows = blockRows, opts = opts }
+            return realRender(tt, blockRows, opts)
+        end
+        local spied = inkRecorder()
+        local okSpy = pcall(InvUI.RenderRowTooltip, spied, target,
+            { owners = owners, viewerKey = "Poonyx-Whitemane" })
+        T.RenderCountRows = realRender
+        ck(okSpy, "the spied hover threw")
+        ck(calledWith ~= nil,
+           "the hover did NOT route through ns.Tooltips.RenderCountRows — it is "
+           .. "rendering its own lookalike block again, which is the whole defect")
+        ck(calledWith == nil or type(calledWith.rows) == "table",
+           "the hover handed the renderer something other than the row model")
+    end)
+
+    _G.RAID_CLASS_COLORS, _G.CUSTOM_CLASS_COLORS = savedRAID, savedCUSTOM
+    if not ok then fails[#fails + 1] = "ink pin threw: " .. tostring(err) end
 end
 
 ----------------------------------------------------------------------
@@ -3297,8 +3653,12 @@ if ns.RegisterSelfTest then
               fn = testFilterCompose },
             { name = "cold-item honesty (rendered, counted, filtered, healed, RED CONTROL)",
               fn = testColdItemHonesty },
-            { name = "pooled-row recycle hygiene (tooltip never crosses rows, cold shift)",
+            { name = "row hover (item tooltip + appended breakdown, one block only, "
+                  .. "cold never hyperlinks, recycle + heal hygiene)",
               fn = testRecycleHygiene },
+            { name = "hover ink == the item tooltip's (class colours, account glyph, "
+                  .. "routed through the certified renderer, RED CONTROL)",
+              fn = testHoverInk },
             { name = "geometry (multi-width fit, header/column single source, insets)",
               fn = testGeometry },
             { name = "virtualization (viewport-bounded pool, window coverage, clamping)",

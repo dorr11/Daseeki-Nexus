@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- **Fixed: hovering a row in the Inventory tab now shows the item's own tooltip, and
+  the character names under it are in their class colours again.** The hover was
+  showing only the per-character breakdown, with the item tooltip hidden behind
+  Shift — a modifier nobody was told about — and the names in that breakdown were
+  drawn in a flat fallback ink instead of each character's class colour, with the
+  "Other Accounts" divider missing the account icon the item tooltip puts there.
+  It now reads exactly like hovering that item in your bags: the real item tooltip
+  first, the *Total / who has it* block appended under it, class colours and the
+  account divider included, and never the block twice. An item the client has not
+  finished loading still answers with its name and the full breakdown rather than a
+  blank tooltip, and fills itself in the moment the client answers — without you
+  having to move the mouse.
+
 - **Fixed: opening the Inventory tab for the first time no longer locks the game up.**
   The first click on Inventory folded every item on every character of every account
   into one table, asked the client for all ~1,600 item names at once, and then — the
