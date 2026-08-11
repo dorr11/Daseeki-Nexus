@@ -21,11 +21,16 @@
 --                   mode-swap drill-in outright. (The MATERIALS block was
 --                   retired 2026-08-10; the list wears its height.)
 --
---   THE COOLDOWNS   bottom-right pane: ONE ROW PER COOLDOWN KIND the store has
---                   seen (Mooncloth, the transmute group, …), each naming the
---                   characters READY to craft it right now, class-colored. A
---                   character mid-cooldown is simply not listed (the owner's
---                   rule), and a kind no character owns is not a row.
+--   THE COOLDOWNS   bottom-right pane: ONE ROW PER COOLDOWN KIND some roster
+--                   character PROVABLY OWNS (the transmute group from the
+--                   known-recipe bitmaps, plus any kind a stored stamp
+--                   witnesses), each naming the characters READY to craft it
+--                   right now, class-colored. READY is ownership plus the
+--                   ABSENCE of a running stamp — P1 stores only running
+--                   cooldowns and deletes proven-ready ones, so absence IS the
+--                   ready state. A character mid-cooldown is simply not listed
+--                   (the owner's rule), and a kind no character provably owns
+--                   is not a row.
 --
 --   THE SEARCH      "who can craft X" across every character's known set, with
 --                   the learnable-by answer beside it.
@@ -170,6 +175,18 @@ local L = {
     DTAB_H      = 22,   -- one profession tab in the detail pane's strip
     DTAB_GAP    = 4,
     DTAB_MAX    = 120,  -- a tab never grows past this (two tabs hug left)
+
+    -- The shopping-list GAVEL (owner, 2026-08-10: the text button moves to the
+    -- pane's upper-right corner and wears Raid Prep's gavel icon). Raid Prep's
+    -- glyph-button metrics verbatim — a 22px button holding the 64px white-mask
+    -- glyph at a 2px inset (18x18 drawn) — so the icon reads at the same
+    -- optical size in both windows. The gavel's TOP rides the pane pad; its
+    -- bottom (PANEL_PAD + 22 = 32) dips 2px into the tab row's band (the strip
+    -- tops at PANEL_PAD + 20 = 30), which is why the tab strip RESERVES the
+    -- gavel's column (DetailTabStripRightInset) instead of running to the pane
+    -- edge — at any pane width, no tab can slide under the gavel.
+    DGAVEL       = 22,  -- the gavel button's edge (Raid Prep's ICONBTN)
+    DGAVEL_INSET = 2,   -- glyph inset inside the button => 18x18 drawn
 
     CD_LABEL_W  = 170,  -- the cooldown kind's name column
 
@@ -373,6 +390,35 @@ function ProfUI.DetailTabLayout(availW, n)
     return { w = w, xs = xs }
 end
 
+-- PURE. The shopping-list gavel's slot in the detail pane's header: TOPRIGHT
+-- offsets from the pane's own corner (right-aligned with the pane's edge
+-- padding, on the title row). The ONE reader the view and the self-test share.
+function ProfUI.DetailGavel()
+    return { size = L.DGAVEL, inset = L.DGAVEL_INSET,
+             x = -L.PANEL_PAD, y = -L.PANEL_PAD }
+end
+
+-- PURE. What the profession-tab strip gives up on its right so it can never
+-- run under the gavel: the pane pad plus the gavel's column plus one tab gap
+-- of clearance. The gavel's 22px bottoms out 2px inside the tab row's band
+-- (see the DGAVEL note in LAYOUT), so this reservation is what makes the
+-- no-collision claim hold at EVERY pane width — the strip's clip edge stops
+-- where the gavel's column begins, whatever the width.
+function ProfUI.DetailTabStripRightInset()
+    return L.PANEL_PAD + L.DGAVEL + L.DTAB_GAP
+end
+
+-- PURE. The gavel's tooltip — an icon-only verb needs the explainer (owner's
+-- rule). Title + body, pinned by the self-test so the wording cannot drift
+-- silently. The BEHAVIOR the tooltip describes is untouched from the text
+-- button it replaces: RunShoplist, same arguments, same chat/Auctionator path.
+function ProfUI.ShoplistButtonTip()
+    return "Shopping list",
+        "This character's missing recipes that can be bought on the AH, as a"
+        .. " chat list. With Auctionator loaded and the auction house open,"
+        .. " the names also fill the Shopping tab."
+end
+
 ----------------------------------------------------------------------
 -- THE GLYPH REGISTRY  (the tofu lesson, 2026-08-10)
 --
@@ -422,14 +468,51 @@ ProfUI.GLYPHS = {
     range  = "\226\128\147",   -- U+2013 en dash
     times  = "\195\151",       -- U+00D7 multiplication sign
     absent = "--",             -- ASCII: the never-learned secondary cell
-    -- Delegate designation marks (profession-delegates phase 1): ASCII BY
-    -- CHOICE, not by accident — digits and the capital B are in every face a
-    -- user could ever pick, so the tofu class cannot reach them. The self-test
-    -- pins all three as pure ASCII.
-    primary   = "1",           -- ASCII: the cell's primary-designation badge
-    secondary = "2",           -- ASCII: the cell's secondary-designation badge
+    -- Delegate designation marks: ASCII BY CHOICE, not by accident — the
+    -- asterisk and the capital B are in every face a user could ever pick, so
+    -- the tofu class cannot reach them. The self-test pins both as pure ASCII.
+    -- (The phase-1 "1"/"2" corner badges are RETIRED — owner, 2026-08-10: the
+    -- designation now speaks through the level/census INK on the cell and the
+    -- asterisk beside the name, not through a corner digit. The registry
+    -- entries are gone with the badges; the self-test pins the retirement.)
+    desig     = "*",           -- ASCII: the designated-character mark by the name
     bank      = "B",           -- ASCII: the recipe-bank mark beside the name
 }
+
+----------------------------------------------------------------------
+-- DESIGNATION INKS  (profession-delegates phase 2 — owner, 2026-08-10:
+-- "use blue for primary and light blue for secondary")
+--
+-- Core's theme exposes NO blue token to borrow: `accent` is gold, crimson or
+-- slate depending on the picked theme, and nothing else in the token table is
+-- blue at all. So the two blues are NAMED CONSTANTS here — this table is the
+-- one place their values live, and every consumer (cell ink, census ink, the
+-- name asterisk, the self-test pins) reads it through InkRGB/InkHex. Both
+-- values are readable on every theme's near-black grounds.
+----------------------------------------------------------------------
+
+ProfUI.INKS = {
+    desigPrimary   = { 0.290, 0.561, 0.890 },  -- #4A8FE3  solid readable blue
+    desigSecondary = { 0.580, 0.780, 0.960 },  -- #94C7F5  light blue
+}
+
+-- PURE. r,g,b for a local ink name; nil for anything else (the frames fall
+-- back to UI.Color's theme tokens for those).
+function ProfUI.InkRGB(ink)
+    local c = ProfUI.INKS[ink]
+    if not c then return nil end
+    return c[1], c[2], c[3]
+end
+
+-- PURE. The inline |cff escape for a local ink — what mixed-content strings
+-- (the name asterisk) wear, since a FontString carries one SetTextColor.
+function ProfUI.InkHex(ink)
+    local r, g, b = ProfUI.InkRGB(ink)
+    if not r then return nil end
+    return ("|cff%02x%02x%02x"):format(
+        math.floor(r * 255 + 0.5), math.floor(g * 255 + 0.5),
+        math.floor(b * 255 + 0.5))
+end
 
 -- Codepoints that shipped as tofu boxes once. Stored as BYTE TRIPLES so the
 -- banned sequences themselves never appear in this file in either matchable
@@ -895,9 +978,18 @@ end
 -- character's own per-rank cap (p.m) still travels on the model and still
 -- speaks in the tooltip; it just no longer costs grid width.
 ProfUI.ERA_CAP = 300
-function ProfUI.LevelInk(level)
+-- `desigRole` (optional, "primary"/"secondary") is the delegate layer's ink
+-- override — owner, 2026-08-10: a DESIGNATED cell's level renders in the
+-- designation blue INSTEAD of the green/yellow cap coloring. TRADE-OFF, taken
+-- consciously: a designated cell gives up the at-a-glance green-at-cap signal;
+-- the cell tooltip still carries "Skill 300 / 300" AND the designation lines,
+-- which is the explainer. The never-recorded em dash stays faint even when
+-- designated — tinting it blue would claim a level nobody recorded.
+function ProfUI.LevelInk(level, desigRole)
     local n = tonumber(level)
     if not n then return ProfUI.GLYPHS.dash, "faint" end
+    local dink = ProfUI.DesignationInk(desigRole)
+    if dink then return tostring(n), dink end
     if n >= ProfUI.ERA_CAP then return tostring(n), "ok" end
     return tostring(n), "warn"
 end
@@ -907,11 +999,16 @@ end
 -- (fishing, herbalism, skinning): there is no window to open and no census to
 -- take, so neither "— not checked" nor a known/total count may ever appear —
 -- the level alone is the whole truth (owner's rule, 2026-08-10).
-function ProfUI.CensusText(model)
+-- `desigRole` mirrors LevelInk's override: the known/total census of a
+-- DESIGNATED cell wears the designation blue instead of muted. The unscanned
+-- "— not checked" line stays faint even when designated — it is a data-state
+-- signal, not a census count, and blue would dress the unknown up as a fact.
+function ProfUI.CensusText(model, desigRole)
     if type(model) ~= "table" then return nil end
     if (tonumber(model.total) or 0) == 0 then return nil end
     if model.scanned then
-        return tostring(model.known or 0) .. "/" .. tostring(model.total), "muted"
+        return tostring(model.known or 0) .. "/" .. tostring(model.total),
+               ProfUI.DesignationInk(desigRole) or "muted"
     end
     return ProfUI.GLYPHS.dash .. " not checked", "faint"
 end
@@ -920,9 +1017,9 @@ end
 -- profession renders the ASCII "--" placeholder in the faint ink (the
 -- never-recorded family) — a quiet "nothing here", never an empty cell that
 -- reads as "not painted yet". A learned profession is the level, as ever.
-function ProfUI.SecondaryCellText(model)
+function ProfUI.SecondaryCellText(model, desigRole)
     if type(model) ~= "table" then return ProfUI.GLYPHS.absent, "faint" end
-    return ProfUI.LevelInk(model.level)
+    return ProfUI.LevelInk(model.level, desigRole)
 end
 
 -- One profession cell. nil when the character does not have that profession at
@@ -1054,13 +1151,62 @@ function ProfUI.CellDelegates(cfg, faction, profKey, ownerKey)
     return out
 end
 
--- PURE. The one badge character for a cell: primary beats secondary (a cell
--- holding both wears "1"; the tooltip names every lane). nil = no mark.
-function ProfUI.CellBadge(d)
+-- PURE. A cell's effective designation role: primary beats secondary (a cell
+-- holding both roles reads "primary"; the tooltip names every lane). nil = no
+-- designation. This replaces the retired CellBadge — the role now picks an INK
+-- (LevelInk/CensusText override), not a corner digit.
+function ProfUI.DesignationRole(d)
     if type(d) ~= "table" then return nil end
-    if #(d.primary or {}) > 0 then return ProfUI.GLYPHS.primary end
-    if #(d.secondary or {}) > 0 then return ProfUI.GLYPHS.secondary end
+    if #(d.primary or {}) > 0 then return "primary" end
+    if #(d.secondary or {}) > 0 then return "secondary" end
     return nil
+end
+
+-- PURE. role -> the local ink name (see ProfUI.INKS). nil for no role.
+function ProfUI.DesignationInk(role)
+    if role == "primary" then return "desigPrimary" end
+    if role == "secondary" then return "desigSecondary" end
+    return nil
+end
+
+-- PURE. Does this character hold ANY lane designation, in ANY profession, in
+-- ANY faction bucket of the effective config? "primary" wins over "secondary"
+-- (primary anywhere beats secondary-only — the name asterisk's color rule).
+-- The recipe-bank role is NOT a lane designation and earns no asterisk (its
+-- mark is the "B"). Iteration order cannot matter: primary short-circuits and
+-- the secondary answer is order-independent, so pairs() luck is harmless here.
+function ProfUI.OwnerDesignationRole(cfg, ownerKey)
+    if type(cfg) ~= "table" or type(ownerKey) ~= "string" or ownerKey == "" then
+        return nil
+    end
+    local best = nil
+    for _, f in pairs(cfg) do
+        if type(f) == "table" and type(f.profs) == "table" then
+            for _, prof in pairs(f.profs) do
+                local lanes = type(prof) == "table" and type(prof.lanes) == "table"
+                              and prof.lanes or nil
+                if lanes then
+                    for _, lane in pairs(lanes) do
+                        if type(lane) == "table" then
+                            if lane.p == ownerKey then return "primary" end
+                            if lane.s == ownerKey then best = "secondary" end
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return best
+end
+
+-- PURE. The mark a designated character wears immediately after their name in
+-- the grid's CHARACTER column: the ASCII asterisk in the designation ink,
+-- inline-colored so the name itself keeps its class color. "" when the
+-- character holds no lane designation anywhere.
+function ProfUI.NameMark(role)
+    local ink = ProfUI.DesignationInk(role)
+    if not ink then return "" end
+    return ProfUI.InkHex(ink) .. ProfUI.GLYPHS.desig .. "|r"
 end
 
 -- PURE. Is this character the faction's recipe bank?
@@ -1424,43 +1570,172 @@ function ProfUI.ReadyCount(rows)
 end
 
 ----------------------------------------------------------------------
--- THE COOLDOWN KINDS  (PURE — the rework's bottom-right pane)
+-- THE COOLDOWN KINDS  (PURE apart from the dataset read — the rework's
+-- bottom-right pane)
 --
--- One row per cooldown KIND the store has seen — a kind is a cdKey, which P1
--- already made account-stable (a teaching spell id, or "gN" for a shared
--- group), so the kinds are ENUMERATED from the payloads rather than hardcoded:
--- whatever the module tracks is what renders. Each kind carries the roster
--- characters currently OFF cooldown (ready to craft), in roster order and
--- wearing their class tags. The owner's rule is explicit: a character
--- mid-cooldown is not listed at all, and a kind no character owns is not a
--- row. (RollupRows stays alive underneath — the badge and the login line
--- still count per-INSTANCE, which is the number they always meant.)
+-- OWNERSHIP FROM KNOWLEDGE, READINESS FROM ABSENCE (the 2026-08-10 semantic
+-- fix). The previous pass enumerated kinds ONLY from payload.c — but P1's
+-- store holds RUNNING cooldowns exclusively: ready is represented by ABSENCE
+-- (a proven-ready scan DELETES the stamp, see professions.lua's proof gates).
+-- So a kind with no currently-running holder produced no row, a ready
+-- character could never appear except through a stale expired stamp awaiting
+-- deletion, and the pane the owner opened on a quiet day was BLANK — the exact
+-- day it existed for ("Mooncloth: Aether, Puucons" with nobody mid-cooldown).
+--
+-- Now:
+--   * a KIND exists when some roster character PROVABLY OWNS it — they know a
+--     recipe that folds onto its cdKey (the known-recipe bitmaps, read through
+--     the same coverage-aware seam as everything else), or they hold a stamp
+--     for it (crafting it is ownership proof, bitmap or no bitmap);
+--   * dataset-marked kinds (the cd>0 groups — alchemy's transmutes) enumerate
+--     from the CATALOGUE, so they render with zero stamps anywhere. A solo
+--     cooldown recipe (Mooncloth) is NOT marked in the dataset (cd == 0, same
+--     as an ordinary recipe — the addendum records no cooldown facts to mark
+--     it from), so its kind still needs at least one live stamp somewhere as
+--     evidence; once every stamp is deleted the row waits for the next craft.
+--     That residual is a KNOWN GAP pending a dataset marking with owner
+--     sign-off — do not "fix" it here by hardcoding spell ids;
+--   * READY = owns the kind AND (no stamp, or the stamp's readyAt has passed).
+--     Mid-cooldown (future readyAt) is not listed, per the owner's standing
+--     rule. An UNSCANNED profession proves nothing: its character is neither
+--     owner nor ready and simply does not appear — no invented "maybe" states;
+--   * a kind nobody provably owns is still not a row.
+--
+-- Ready lists stay in roster order wearing class tags; rows keep the strict
+-- label/cdKey total order; the label/pending machinery is untouched.
+-- (RollupRows stays alive underneath — the badge and the login line still
+-- count per-INSTANCE from the stamps, which is the number they always meant.)
 ----------------------------------------------------------------------
+
+-- The kinds the DATASET itself can prove exist: one per shared-cooldown group
+-- ordinal (rec.cd > 0 => "g<n>" — FoldCooldowns' own key rule). Sorted.
+-- Empty when the dataset refuses to load (module off / no core).
+function ProfUI.DatasetCooldownKinds()
+    local D = core()
+    if not D then return {} end
+    local seen, out = {}, {}
+    for _, rec in pairs(D.recipe or {}) do
+        if rec.cd and rec.cd > 0 then
+            local key = "g" .. rec.cd
+            if not seen[key] then seen[key] = true; out[#out + 1] = key end
+        end
+    end
+    table.sort(out)
+    return out
+end
+
+-- The teaching spells that fold onto one cdKey — FoldCooldowns' key rule,
+-- inverted. "g<n>" maps to every recipe wearing that group ordinal (sorted,
+-- class 8); a numeric key maps to itself; garbage maps to nothing.
+function ProfUI.KindMembers(cdKey)
+    local key = tostring(cdKey or "")
+    local g = key:match("^g(%d+)$")
+    if not g then
+        local spell = tonumber(key)
+        if spell then return { spell } end
+        return {}
+    end
+    local D = core()
+    local n, out = tonumber(g), {}
+    if D then
+        for spell, rec in pairs(D.recipe or {}) do
+            if rec.cd == n then out[#out + 1] = spell end
+        end
+    end
+    table.sort(out)
+    return out
+end
+
+-- Proven ownership of one cooldown kind. A stored stamp (running OR expired)
+-- is craft-proof on its own; otherwise the character's known-recipe set — the
+-- coverage-aware KnownSet seam, never a re-derivation — must contain at least
+-- one of the kind's member recipes. nil set (unscanned / foreign dataset /
+-- no record) proves nothing and answers false.
+function ProfUI.OwnsCooldownKind(payload, cdKey)
+    if type(payload) ~= "table" then return false end
+    local key = tostring(cdKey or "")
+    if type(payload.c) == "table" then
+        for k in pairs(payload.c) do
+            if tostring(k) == key then return true end
+        end
+    end
+    local profKey = ProfUI.CdKeyMeta(key)
+    if not profKey then return false end
+    local set = ProfUI.KnownSet(payload, profKey)
+    if not set then return false end
+    local members = ProfUI.KindMembers(key)
+    for i = 1, #members do
+        if set[members[i]] then return true end
+    end
+    return false
+end
 
 function ProfUI.CooldownKindRows(entries, lookup, nowE, res)
     local kinds, order = {}, {}
     nowE = nowE or now()
+    local dsKinds = ProfUI.DatasetCooldownKinds()
+    local function kindFor(key)
+        local k = kinds[key]
+        if not k then
+            local profKey = ProfUI.CdKeyMeta(key)
+            local label, pending = ProfUI.CooldownLabel(key, res)
+            k = { cdKey = key, profKey = profKey, label = label,
+                  pending = pending and true or false,
+                  owners = 0, ready = {} }
+            kinds[key] = k
+            order[#order + 1] = k
+        end
+        return k
+    end
+    -- PASS 1 — the CANDIDATE KINDS, unioned over the whole roster: every
+    -- dataset-marked group + every kind ANY character's stamps witness. The
+    -- union matters: one character's stamp is what surfaces a solo kind, and
+    -- every OTHER character's ownership must then be asked of their bitmaps —
+    -- a per-character candidate list would hide the knowers. Visited in
+    -- sorted order (class 8: kind discovery may not inherit pairs() luck).
+    local cand, keys = {}, {}
+    local stampsByEntry = {}
+    for j = 1, #dsKinds do
+        local key = dsKinds[j]
+        if not cand[key] then cand[key] = true; keys[#keys + 1] = key end
+    end
     for i = 1, #(entries or {}) do
         local e = entries[i]
         local payload = lookup and lookup(e.nameRealm) or nil
-        if type(payload) == "table" and type(payload.c) == "table" then
-            for cdKey, at in pairs(payload.c) do
-                local key = tostring(cdKey)
-                local k = kinds[key]
-                if not k then
-                    local profKey = ProfUI.CdKeyMeta(key)
-                    local label, pending = ProfUI.CooldownLabel(key, res)
-                    k = { cdKey = key, profKey = profKey, label = label,
-                          pending = pending and true or false,
-                          owners = 0, ready = {} }
-                    kinds[key] = k
-                    order[#order + 1] = k
+        if type(payload) == "table" then
+            local stamps = {}
+            if type(payload.c) == "table" then
+                for cdKey, at in pairs(payload.c) do
+                    local key = tostring(cdKey)
+                    stamps[key] = at
+                    if not cand[key] then cand[key] = true; keys[#keys + 1] = key end
                 end
-                k.owners = k.owners + 1
-                local rem = ProfUI.CooldownRemaining(at, nowE)
-                if rem == 0 then
-                    k.ready[#k.ready + 1] = { key = e.nameRealm,
-                                              classTag = e.rec and e.rec.classTag or nil }
+            end
+            stampsByEntry[i] = { payload = payload, stamps = stamps }
+        end
+    end
+    table.sort(keys)
+    -- PASS 2 — ownership + readiness, in roster order (the ready lists
+    -- inherit it directly).
+    for i = 1, #(entries or {}) do
+        local e = entries[i]
+        local se = stampsByEntry[i]
+        if se then
+            for j = 1, #keys do
+                local key = keys[j]
+                if ProfUI.OwnsCooldownKind(se.payload, key) then
+                    local k = kindFor(key)
+                    k.owners = k.owners + 1
+                    -- READY IS ABSENCE: no stamp means off cooldown (the
+                    -- proven-ready deletion IS the ready signal); a stamp
+                    -- whose readyAt has passed means ready-awaiting-deletion.
+                    -- An unparseable stamp is held as running — never a guess.
+                    local at = se.stamps[key]
+                    local rem = (at ~= nil) and ProfUI.CooldownRemaining(at, nowE) or 0
+                    if rem == 0 then
+                        k.ready[#k.ready + 1] = { key = e.nameRealm,
+                                                  classTag = e.rec and e.rec.classTag or nil }
+                    end
                 end
             end
         end
@@ -3298,11 +3573,9 @@ local function makeGridRow(parentChild, pane)
         top:SetPoint("TOPLEFT", cell, "TOPLEFT", L.ICON + 6, -1)
         local bot = fstr(cell, "small", "LEFT")
         bot:SetPoint("BOTTOMLEFT", cell, "BOTTOMLEFT", L.ICON + 6, 1)
-        -- The delegate badge: the quiet corner mark ("1"/"2", accent ink).
-        local dbadge = fstr(cell, "small", "RIGHT")
-        dbadge:SetPoint("TOPRIGHT", cell, "TOPRIGHT", -2, -1)
-        UI.Skin(dbadge, function(self) self:SetTextColor(UI.Color("accent")) end)
-        cell._icon, cell._top, cell._bot, cell._dbadge = icon, top, bot, dbadge
+        -- (The phase-1 corner badge FontString is retired: a designation now
+        -- speaks through the level/census ink — see paintCell.)
+        cell._icon, cell._top, cell._bot = icon, top, bot
         cell:RegisterForClicks("LeftButtonUp", "RightButtonUp")
         cell:SetScript("OnClick", function(self, button)
             if button == "RightButton" then
@@ -3332,10 +3605,8 @@ local function makeGridRow(parentChild, pane)
         sicon:SetTexCoord(0.07, 0.93, 0.07, 0.93)
         local stext = fstr(chip, "numeral", "LEFT")
         stext:SetPoint("LEFT", sicon, "RIGHT", 4, 0)
-        local sbadge = fstr(chip, "small", "RIGHT")
-        sbadge:SetPoint("TOPRIGHT", chip, "TOPRIGHT", -1, -1)
-        UI.Skin(sbadge, function(self) self:SetTextColor(UI.Color("accent")) end)
-        chip._icon, chip._text, chip._profKey, chip._dbadge = sicon, stext, profKey, sbadge
+        -- (No corner badge here either — the chip's level ink is the mark.)
+        chip._icon, chip._text, chip._profKey = sicon, stext, profKey
         chip:RegisterForClicks("LeftButtonUp", "RightButtonUp")
         chip:SetScript("OnClick", function(self, button)
             if button == "RightButton" then
@@ -3351,17 +3622,13 @@ local function makeGridRow(parentChild, pane)
     return gr
 end
 
--- Paint one cell's delegate badge from the effective config. Cleared for an
--- absent cell (no model) and for a character with no designations here.
-local function paintDelegateBadge(cell, cfg, faction, ownerKey)
-    local b = cell._dbadge
-    if not b then return end
-    local mark
-    if cfg and faction and ownerKey and cell._model and cell._profKey then
-        mark = ProfUI.CellBadge(
-            ProfUI.CellDelegates(cfg, faction, cell._profKey, ownerKey))
-    end
-    b:SetText(mark or "")
+-- Ink resolver: the delegate layer's local inks (ProfUI.INKS) first, theme
+-- tokens for everything else — one seam, so a paint can hand ANY ink name to
+-- the same call.
+local function inkColor(ink)
+    local r, g, b = ProfUI.InkRGB(ink)
+    if r then return r, g, b end
+    return UI.Color(ink)
 end
 
 -- Re-fit one pooled row to the column geometry of THIS render. Every text is
@@ -3387,8 +3654,14 @@ local function fitGridRow(gr, cols)
 end
 
 -- Paint one profession cell from a CellModel. `compact` is the secondary chip
--- form (icon + skill only; the tooltip carries the rest).
-local function paintCell(cell, model, ownerKey, compact)
+-- form (icon + skill only; the tooltip carries the rest). `desigRole` is the
+-- cell's delegate designation ("primary"/"secondary"/nil, resolved by the
+-- render from the effective config): a designated cell's level AND census ink
+-- turn designation blue — the retired corner badge's replacement. TRADE-OFF,
+-- conscious (owner, 2026-08-10): a designated cell gives up the green-at-cap /
+-- yellow-below signal on those texts; the cell tooltip still says "Skill
+-- 300 / 300" and names every designated lane, which is the explainer.
+local function paintCell(cell, model, ownerKey, compact, desigRole)
     cell._owner   = ownerKey
     cell._profKey = model and model.key or cell._profKey
     cell._model   = model
@@ -3421,11 +3694,12 @@ local function paintCell(cell, model, ownerKey, compact)
     cell._icon:SetDesaturated(((model.total or 0) > 0 and not model.scanned) and true or false)
 
     -- Owner's rule (ProfUI.LevelInk): current level only, green at the Era
-    -- cap, yellow below it, em dash when never recorded.
-    local lvlText, lvlInk = ProfUI.LevelInk(model.level)
+    -- cap, yellow below it, em dash when never recorded — designation blue
+    -- overriding the green/yellow on a designated cell (see the header note).
+    local lvlText, lvlInk = ProfUI.LevelInk(model.level, desigRole)
     if compact then
         cell._text:SetText(lvlText)
-        cell._text:SetTextColor(UI.Color(lvlInk))
+        cell._text:SetTextColor(inkColor(lvlInk))
         return
     end
 
@@ -3434,7 +3708,7 @@ local function paintCell(cell, model, ownerKey, compact)
     -- as part of the green/yellow level. The cell tooltip stays the explainer.
     cell._top:SetText(lvlText .. (model.hasSpec
         and ("  " .. Dashboard.Colored(ProfUI.GLYPHS.spec, "accent")) or ""))
-    cell._top:SetTextColor(UI.Color(lvlInk))
+    cell._top:SetTextColor(inkColor(lvlInk))
 
     -- The bottom line answers the most URGENT thing we know, in this order:
     -- a ready cooldown, a running one, then the recipe census — which is an EM
@@ -3450,9 +3724,9 @@ local function paintCell(cell, model, ownerKey, compact)
         cell._bot:SetText(Dashboard.FormatDuration(cd.remaining, "compact"))
         cell._bot:SetTextColor(UI.Color("warn"))
     else
-        local ct, ci = ProfUI.CensusText(model)
+        local ct, ci = ProfUI.CensusText(model, desigRole)
         cell._bot:SetText(ct or "")
-        if ci then cell._bot:SetTextColor(UI.Color(ci)) end
+        if ci then cell._bot:SetTextColor(inkColor(ci)) end
     end
 end
 
@@ -3939,7 +4213,59 @@ Dashboard.RegisterTab("professions", function(host)
     dEyebrow:SetPoint("TOPLEFT", detailP, "TOPLEFT", L.PANEL_PAD, -L.PANEL_PAD)
     local dWho = fstr(detailP, "body", "LEFT")
     dWho:SetPoint("LEFT", dEyebrow, "RIGHT", 8, 0)
+    -- Width-capped at the gavel's column (same reader as the tab strip): a
+    -- long character name clips instead of running under the button.
+    dWho:SetPoint("RIGHT", detailP, "RIGHT", -ProfUI.DetailTabStripRightInset(), 0)
     pane._dWho = dWho
+
+    -- THE SHOPPING-LIST GAVEL (owner, 2026-08-10): the detail pane's shopping
+    -- list verb, moved from the checkbox row to the pane's upper-right corner
+    -- and wearing Raid Prep's authored gavel glyph — the suite's one icon that
+    -- means "search the auction house" (textures/icon-gavel.tga, copied
+    -- byte-identical from Daseeki-Raid-Prep/art per the suite's copy-verbatim
+    -- glyph convention). Raid Prep's glyph-button treatment verbatim: flat
+    -- backdrop, inset fill, borderLite edge, the white-mask face tinted
+    -- `muted` at rest and `accent` under the cursor. PLACEMENT + SKIN ONLY —
+    -- the click still runs ProfUI.RunShoplist with the same arguments, and
+    -- the slash command and list logic are untouched.
+    local gv = ProfUI.DetailGavel()
+    local gavelBtn = CreateFrame("Button", nil, detailP, "BackdropTemplate")
+    gavelBtn:SetSize(gv.size, gv.size)
+    gavelBtn:SetPoint("TOPRIGHT", detailP, "TOPRIGHT", gv.x, gv.y)
+    gavelBtn:RegisterForClicks("LeftButtonUp")
+    Dashboard.Tag(gavelBtn, "prof.detail.shoplist")
+    local gface = gavelBtn:CreateTexture(nil, "ARTWORK")
+    gface:SetPoint("TOPLEFT", gavelBtn, "TOPLEFT", gv.inset, -gv.inset)
+    gface:SetPoint("BOTTOMRIGHT", gavelBtn, "BOTTOMRIGHT", -gv.inset, gv.inset)
+    gface:SetTexture("Interface\\AddOns\\Daseeki-Nexus\\textures\\icon-gavel")
+    gavelBtn._face = gface
+    UI.Skin(gavelBtn, function(self)
+        self:SetBackdrop(UI.FLAT_BACKDROP)
+        self:SetBackdropColor(UI.Color("inset"))
+        self:SetBackdropBorderColor(UI.Color("borderLite"))
+        self._face:SetVertexColor(UI.Color(self._hot and "accent" or "muted"))
+    end)
+    gavelBtn:SetScript("OnEnter", function(self)
+        self._hot = true
+        self._face:SetVertexColor(UI.Color("accent"))
+        local title, body = ProfUI.ShoplistButtonTip()
+        GameTooltip:SetOwner(self, "ANCHOR_BOTTOM")
+        GameTooltip:SetText(title, UI.Color("text"))
+        -- UI.Color returns r,g,b,a; the alpha lands on AddLine's wrapText slot
+        -- (always 1, so the body wraps) — the same call shape as Raid Prep's
+        -- gavel, deliberately not "improved", so the two tooltips read alike.
+        GameTooltip:AddLine(body, UI.Color("muted"))
+        GameTooltip:Show()
+    end)
+    gavelBtn:SetScript("OnLeave", function(self)
+        self._hot = nil
+        self._face:SetVertexColor(UI.Color("muted"))
+        GameTooltip:Hide()
+    end)
+    gavelBtn:SetScript("OnClick", function()
+        ProfUI.RunShoplist(pane.sel and pane.sel.owner, pane.sel and pane.sel.profKey)
+    end)
+    pane._gavelBtn = gavelBtn
 
     -- The quiet hint when no character row is selected (or the selected one
     -- has no professions record at all).
@@ -3951,7 +4277,12 @@ Dashboard.RegisterTab("professions", function(host)
 
     local tabStrip = CreateFrame("Frame", nil, detailP)
     tabStrip:SetPoint("TOPLEFT", detailP, "TOPLEFT", L.PANEL_PAD, -(L.PANEL_PAD + 20))
-    tabStrip:SetPoint("RIGHT", detailP, "RIGHT", -L.PANEL_PAD, 0)
+    -- The strip's RIGHT stops at the gavel's column (the pure reader, shared
+    -- with the fit self-test) — the 22px gavel dips 2px into this row's band,
+    -- so at NO pane width may a tab run under it. DetailTabLayout already fits
+    -- the tabs to the strip's REAL width, so the reservation re-flows the tabs
+    -- by itself.
+    tabStrip:SetPoint("RIGHT", detailP, "RIGHT", -ProfUI.DetailTabStripRightInset(), 0)
     tabStrip:SetHeight(L.DTAB_H)
     tabStrip:SetClipsChildren(true)
     Dashboard.Tag(tabStrip, "prof.detail.tabs")
@@ -4032,44 +4363,11 @@ Dashboard.RegisterTab("professions", function(host)
         function(v) pane.filters.showUnavailable = v; persist(); pane.obj.Refresh() end)
     unavChk:SetPoint("LEFT", missChk, "RIGHT", L.GUTTER, 0)
 
-    -- THE SHOPPING LIST BUTTON (owner's directive; see the pure layer's header
-    -- beside RecipeRows). Raid Prep's shopping list is a one-click verb on the
-    -- window that owns the data, so this one rides the detail pane's own
-    -- control band, scoped to the selected character + profession tab. The
-    -- render is a branded chat list (links shift-click into the AH search
-    -- box); with Auctionator loaded at an open AH the names also fill the
-    -- Shopping tab — the checklist gavel's behavior, scoped down.
-    local shopBtn = CreateFrame("Button", nil, filter2, "BackdropTemplate")
-    shopBtn:SetSize(108, 22)
-    local shopLbl = fstr(shopBtn, "small", "CENTER")
-    shopLbl:SetPoint("TOPLEFT", shopBtn, "TOPLEFT", 4, 0)
-    shopLbl:SetPoint("BOTTOMRIGHT", shopBtn, "BOTTOMRIGHT", -4, 0)
-    shopLbl:SetText("SHOPPING LIST")
-    shopBtn._lbl = shopLbl
-    UI.Skin(shopBtn, function(self)
-        self:SetBackdrop(UI.FLAT_BACKDROP)
-        self:SetBackdropColor(UI.Color("control"))
-        self:SetBackdropBorderColor(UI.Color("controlBorder"))
-        self._lbl:SetTextColor(UI.Color("muted"))
-    end)
-    shopBtn:SetScript("OnEnter", function(self)
-        self._lbl:SetTextColor(UI.Color("text"))
-        GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
-        GameTooltip:AddLine("Shopping list", 1, 1, 1)
-        GameTooltip:AddLine("Chat list of this character's missing recipes that can"
-            .. " be bought on the AH. With Auctionator loaded and the auction"
-            .. " house open, the names also fill the Shopping tab.",
-            0.8, 0.8, 0.8, true)
-        GameTooltip:Show()
-    end)
-    shopBtn:SetScript("OnLeave", function(self)
-        self._lbl:SetTextColor(UI.Color("muted"))
-        GameTooltip:Hide()
-    end)
-    shopBtn:SetScript("OnClick", function()
-        ProfUI.RunShoplist(pane.sel and pane.sel.owner, pane.sel and pane.sel.profKey)
-    end)
-    shopBtn:SetPoint("LEFT", unavChk, "RIGHT", L.GUTTER, 0)
+    -- (The shopping-list TEXT BUTTON that used to ride this row moved to the
+    -- pane's upper-right corner as the gavel — see THE SHOPPING-LIST GAVEL by
+    -- the header. The row simply closes up: the two checkboxes keep their own
+    -- left-anchored chain and the status text keeps the row's right edge —
+    -- nothing else ever anchored to the button, so nothing needed re-flowing.)
 
     local recStatus = fstr(filter2, "small", "RIGHT")
     recStatus:SetPoint("RIGHT", filter2, "RIGHT", 0, 0)
@@ -4322,19 +4620,36 @@ Dashboard.RegisterTab("professions", function(host)
                 gr._owner = model.key
                 gr._faction = model.faction
                 nameInk(gr._name, model.key, model.classTag, model.overflow)
-                -- The recipe-bank mark: a quiet accent "B" beside the name.
+                -- The designation asterisk, IMMEDIATELY after the name (owner,
+                -- 2026-08-10): blue for a primary anywhere, light blue for
+                -- secondary-only, nothing otherwise. Inline-colored so the
+                -- name keeps its class color; the CELL tooltips enumerate the
+                -- designations (the name row has no tooltip and grows none).
+                local nameRole = dcfg and ProfUI.OwnerDesignationRole(dcfg, model.key) or nil
+                if nameRole then
+                    gr._name:SetText(gr._name:GetText() .. ProfUI.NameMark(nameRole))
+                end
+                -- The recipe-bank mark: a quiet accent "B" beside the name —
+                -- unchanged, and spaced clear of the asterisk when both show.
                 if dcfg and model.faction
                    and ProfUI.IsRecipeBank(dcfg, model.faction, model.key) then
                     gr._name:SetText(gr._name:GetText() .. " "
                         .. Dashboard.Colored(ProfUI.GLYPHS.bank, "accent"))
                 end
+                -- Per-cell designation role (primary wins over secondary when
+                -- one cell holds both) — the ink override paintCell applies.
+                local function cellRole(m)
+                    if not (dcfg and model.faction and m) then return nil end
+                    return ProfUI.DesignationRole(
+                        ProfUI.CellDelegates(dcfg, model.faction, m.key, model.key))
+                end
                 for slot = 1, L.PRIMARIES do
-                    paintCell(gr._cells[slot], model.primaries[slot], model.key, false)
-                    paintDelegateBadge(gr._cells[slot], dcfg, model.faction, model.key)
+                    local m = model.primaries[slot]
+                    paintCell(gr._cells[slot], m, model.key, false, cellRole(m))
                 end
                 for si, profKey in ipairs(ProfUI.GRID_SECONDARIES) do
-                    paintCell(gr._secs[si], model.secondaries[profKey], model.key, true)
-                    paintDelegateBadge(gr._secs[si], dcfg, model.faction, model.key)
+                    local m = model.secondaries[profKey]
+                    paintCell(gr._secs[si], m, model.key, true, cellRole(m))
                 end
                 local isSel = (selOwner ~= nil and model.key == selOwner)
                 gr._selWash:SetShown(isSel)
@@ -4400,6 +4715,10 @@ Dashboard.RegisterTab("professions", function(host)
         recHead:SetShown(on)
         recScroll:SetShown(on)
         detail:SetShown(on)
+        -- The gavel is detail furniture too: the old text button vanished with
+        -- filter2 in the empty states, and the icon keeps that behavior — no
+        -- shopping-list verb without a character/tab to scope it to.
+        gavelBtn:SetShown(on)
     end
 
     local function renderDetail(lookup, nowE, res, allEntries)
@@ -5118,10 +5437,13 @@ local function testDetailAndKinds(fails)
        "two tabs in a wide strip did not cap at DTAB_MAX")
     ck(ProfUI.DetailTabLayout(400, 0).w == 0, "zero tabs produced a tab width")
 
-    -- COOLDOWN KIND ROWS: kinds enumerate from the payloads (never a hardcoded
-    -- list), each row names ONLY the characters ready right now, in roster
-    -- order and carrying class tags; a character mid-cooldown is not listed; a
-    -- kind nobody owns is not a row.
+    -- COOLDOWN KIND ROWS, the stamp-evidenced legs (never a hardcoded list):
+    -- each row names ONLY the characters ready right now, in roster order and
+    -- carrying class tags; a character mid-cooldown is not listed; a kind
+    -- nobody provably owns is not a row. These payloads carry EMPTY p tables,
+    -- so every ownership here is stamp-proof — the knowledge-enumeration legs
+    -- (bitmap owners, ready-by-absence, the owner's blank-pane red control)
+    -- live in the kind-ownership suite.
     local payloads = {
         ["Aaa-Realm"] = { p = {}, c = { ["999"] = NOW - 5, ["g1"] = NOW + 3600 } },
         ["Bbb-Realm"] = { p = {}, c = { ["999"] = NOW + 60 } },
@@ -6491,14 +6813,289 @@ local function testShoplist(fails)
        "an ambiguous profession prefix resolved instead of erroring")
 end
 
+-- ── THE SHOPPING-LIST GAVEL (owner, 2026-08-10: corner placement + icon skin,
+-- behavior untouched) ────────────────────────────────────────────────────────
+local function testShoplistGavel(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+
+    -- (a) THE SLOT, via the pure readers the view anchors with: a 22px button
+    -- (Raid Prep's glyph-button edge), 2px glyph inset (18x18 drawn), TOPRIGHT
+    -- at the pane's own edge padding on the title row.
+    local gv = ProfUI.DetailGavel()
+    ck(gv.size == L.DGAVEL and gv.size == 22,
+       "the gavel is not Raid Prep's 22px glyph button")
+    ck(gv.inset == L.DGAVEL_INSET and gv.inset == 2,
+       "the gavel's glyph inset is not the suite's 2px (18x18 drawn)")
+    ck(gv.x == -L.PANEL_PAD and gv.y == -L.PANEL_PAD,
+       "the gavel is not right-aligned with the pane's edge padding on the title row")
+
+    -- (b) THE RESERVATION ARITHMETIC. The gavel's bottom edge (PANEL_PAD +
+    -- DGAVEL) dips below the tab strip's top (PANEL_PAD + 20), so sharing x
+    -- with the strip WOULD collide — the strip must stop where the gavel's
+    -- column begins. That is exactly what DetailTabStripRightInset reserves.
+    ck(L.PANEL_PAD + L.DGAVEL > L.PANEL_PAD + 20,
+       "the gavel no longer reaches the tab row \226\128\148 revisit whether the "
+       .. "strip still needs its reservation")
+    ck(ProfUI.DetailTabStripRightInset() == L.PANEL_PAD + L.DGAVEL + L.DTAB_GAP,
+       "the tab strip's right inset drifted off the gavel-column arithmetic")
+    ck(ProfUI.DetailTabStripRightInset() >= L.PANEL_PAD + L.DGAVEL,
+       "the tab strip's reservation is smaller than the gavel column")
+
+    -- (c) MULTI-WIDTH FIT: at every tested pane width and tab count, the last
+    -- tab's right edge stays inside the strip, and the strip's right edge
+    -- stays at or left of the gavel's left edge — no collision at ANY width.
+    -- The widths bracket the real detail pane (the 700px shell gives it ~330;
+    -- the owner's 1362 screenshot ~660).
+    for _, paneW in ipairs({ 320, 400, 523, 660, 800 }) do
+        local stripW = paneW - L.PANEL_PAD - ProfUI.DetailTabStripRightInset()
+        local gavelLeft = paneW - L.PANEL_PAD - gv.size
+        ck(L.PANEL_PAD + stripW <= gavelLeft,
+           "the tab strip runs under the gavel at pane width " .. paneW)
+        for n = 1, 6 do
+            local tl = ProfUI.DetailTabLayout(stripW, n)
+            if n > 0 and #tl.xs == n then
+                ck(L.PANEL_PAD + tl.xs[n] + tl.w <= gavelLeft,
+                   "tab " .. n .. "/" .. n .. " collides with the gavel at pane width "
+                   .. paneW)
+            end
+        end
+    end
+
+    -- (d) THE TOOLTIP PIN: an icon-only verb carries its explainer.
+    local title, body = ProfUI.ShoplistButtonTip()
+    ck(title == "Shopping list", "the gavel tooltip does not name the verb ("
+       .. tostring(title) .. ")")
+    ck(type(body) == "string" and body:find("bought on the AH", 1, true) ~= nil,
+       "the gavel tooltip body lost the missing-recipes-buyable-on-the-AH explainer")
+    ck(body:find("Auctionator", 1, true) ~= nil,
+       "the gavel tooltip body lost the Auctionator line")
+
+    -- (e) WIRING PINS (harness-only source scan, the retint-gate idiom): the
+    -- gavel exists in the header region wearing the suite's gavel glyph, the
+    -- old inline text button is GONE from the checkbox row, and the click
+    -- still runs the same RunShoplist call — placement + skin only.
+    if io and io.open and debug and debug.getinfo then
+        local srcPath = (debug.getinfo(ProfUI.ShoplistButtonTip, "S").source or ""):match("^@(.*)$")
+        local fh = srcPath and io.open(srcPath, "rb")
+        if fh then
+            local text = fh:read("*a") or ""
+            fh:close()
+            -- Every needle is built by CONCATENATION so this test's own source
+            -- can never satisfy (or, for the absence pins, break) the scan —
+            -- the BANNED_GLYPHS idiom, applied to identifiers.
+            ck(text:find("textures\\\\icon-" .. "gavel", 1, true) ~= nil,
+               "the gavel button does not wear the suite's icon-gavel glyph")
+            ck(text:find('gavelBtn:SetPoint("TOP' .. 'RIGHT", detailP, "TOP'
+               .. 'RIGHT", gv.x, gv.y)', 1, true) ~= nil,
+               "the gavel is not anchored TOPRIGHT through the pure reader")
+            ck(text:find('"SHOPPING' .. ' LIST"', 1, true) == nil,
+               "the old inline SHOPPING LIST text button is still in the file")
+            ck(text:find("shop" .. "Btn", 1, true) == nil,
+               "the old shopping-list button frame local is still built")
+            ck(text:find("ProfUI.RunShoplist(pane.sel" .. " and pane.sel.owner,"
+               .. " pane.sel and pane.sel.profKey)", 1, true) ~= nil,
+               "the gavel's click no longer runs the same RunShoplist call")
+            ck(text:find("tabStrip:SetPoint(\"RIGHT\", detailP, \"RIGHT\","
+               .. " -ProfUI.DetailTabStripRightInset(), 0)", 1, true) ~= nil,
+               "the tab strip's right edge is not reserved through the pure reader")
+        end
+        -- (f) THE ASSET: the copied-verbatim glyph ships beside the code — a
+        -- 64x64 32bpp uncompressed TGA, byte-for-byte the Raid Prep original
+        -- (18-byte header + 64*64*4 payload = 16402).
+        local texPath = srcPath and srcPath:gsub("ui_professions%.lua$",
+                                                 "textures/icon-gavel.tga")
+        local th = texPath and texPath ~= srcPath and io.open(texPath, "rb")
+        if th then
+            local blob = th:read("*a") or ""
+            th:close()
+            ck(#blob == 16402, "icon-gavel.tga is not the 64x64 32bpp shape ("
+               .. #blob .. " bytes)")
+            ck(blob:byte(3) == 2, "icon-gavel.tga is not an uncompressed true-color TGA")
+        else
+            fails[#fails + 1] = "textures/icon-gavel.tga is missing beside the code"
+        end
+    end
+end
+
+-- ── COOLDOWN-KIND OWNERSHIP (the 2026-08-10 semantic fix: ownership from
+-- knowledge, readiness from absence) ─────────────────────────────────────────
+local function testKindOwnership(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local P = ns.Professions
+    local D = core()
+    if not D then fails[#fails + 1] = "dataset unavailable for the kind-ownership tests" return end
+    local NOW = 1700000000
+    local DSV = (D.Version and D.Version()) or ns.ProfessionsDataMeta.version
+
+    -- (a) THE KEY MAPPING, both directions. The dataset's marked kinds are the
+    -- shared groups (today: exactly the transmute group "g1"); a group key
+    -- maps to every member recipe, a solo key maps to itself, garbage to
+    -- nothing. Members come out sorted (class 8).
+    local dsKinds = ProfUI.DatasetCooldownKinds()
+    ck(#dsKinds == 1 and dsKinds[1] == "g1",
+       "the dataset's marked cooldown kinds are not exactly the transmute group")
+    local members = ProfUI.KindMembers("g1")
+    ck(#members >= 2, "the transmute group lost its members (" .. #members .. ")")
+    for i = 1, #members do
+        ck(D.recipe[members[i]] and D.recipe[members[i]].cd == 1,
+           "a g1 member does not carry cd group 1")
+        if i > 1 then
+            ck(members[i] > members[i - 1], "the kind members are not sorted")
+        end
+    end
+    ck(#ProfUI.KindMembers("777") == 1 and ProfUI.KindMembers("777")[1] == 777,
+       "a solo cdKey does not map to its own teaching spell")
+    ck(#ProfUI.KindMembers("garbage") == 0, "a garbage cdKey invented members")
+
+    -- Fixtures: a transmute member the roster can "know", and any un-marked
+    -- (solo-cooldown-shaped) recipe from another profession.
+    local trans = members[1]
+    local tailoring = pickProf(D, "tailoring", 1)
+    local solo = tailoring[1]
+    ck(solo ~= nil and (D.recipe[solo].cd or 0) == 0,
+       "no un-marked recipe available for the solo-kind leg")
+    local function alchemyKnows(spells, c)
+        return { v = 1, ds = DSV,
+                 p = { alchemy = { l = 300, m = 300, t = 4,
+                                   k = P.EncodeKnown("alchemy", spells),
+                                   n = #spells, a = NOW - 50 } },
+                 c = c or {} }
+    end
+
+    -- (b) THE RED CONTROL — the owner's blank pane. A scanned character KNOWS
+    -- a transmute; NOBODY on the roster carries any c entry (P1 deletes
+    -- proven-ready stamps, so a quiet day looks exactly like this). The OLD
+    -- enumeration read kinds from payload.c alone and rendered ZERO rows here
+    -- by construction; ownership-from-knowledge must render the shared row
+    -- with the knower ready.
+    local payloads = { ["Aaa-Realm"] = alchemyKnows({ trans }) }
+    for _, p in pairs(payloads) do
+        ck(next(p.c) == nil, "the red control's premise broke: a c entry exists")
+    end
+    local rows = ProfUI.CooldownKindRows(fixtureEntries(),
+        function(k) return payloads[k] end, NOW, fakeResolver({}))
+    ck(#rows == 1 and rows[1].cdKey == "g1",
+       "a known transmute with no stamps anywhere produced no kind row ("
+       .. #rows .. ")")
+    ck(rows[1] and rows[1].owners == 1, "the proven-owner count is wrong")
+    ck(rows[1] and #rows[1].ready == 1 and rows[1].ready[1].key == "Aaa-Realm",
+       "the knowing character is not READY with no stamp stored (absence IS ready)")
+    ck(rows[1] and rows[1].ready[1].classTag == "MAGE", "the ready name lost its class tag")
+
+    -- (c) MID-COOLDOWN NOT LISTED, EXPIRED LISTED, ROSTER ORDER. Aaa knows
+    -- (no stamp: ready), Bbb knows + future stamp (owner, NOT listed), Ccc
+    -- knows + expired stamp awaiting deletion (ready).
+    payloads = {
+        ["Aaa-Realm"] = alchemyKnows({ trans }),
+        ["Bbb-Realm"] = alchemyKnows({ trans }, { ["g1"] = NOW + 600 }),
+        ["Ccc-Realm"] = alchemyKnows({ trans }, { ["g1"] = NOW - 100 }),
+    }
+    rows = ProfUI.CooldownKindRows(fixtureEntries(),
+        function(k) return payloads[k] end, NOW, fakeResolver({}))
+    ck(#rows == 1 and rows[1].owners == 3,
+       "three proven owners did not fold into one kind row")
+    ck(#rows[1].ready == 2 and rows[1].ready[1].key == "Aaa-Realm"
+       and rows[1].ready[2].key == "Ccc-Realm",
+       "the ready list is not the no-stamp + expired pair in roster order")
+    for _, r in ipairs(rows[1].ready) do
+        ck(r.key ~= "Bbb-Realm", "a mid-cooldown holder was listed as ready")
+    end
+
+    -- (d) UNPROVEN STAYS SILENT. An UNSCANNED alchemist (profession present,
+    -- no k bitmap) and a scanned one who knows NOTHING are neither owners nor
+    -- ready; alone on the roster they produce no row at all.
+    payloads = {
+        ["Aaa-Realm"] = { v = 1, ds = DSV,
+                          p = { alchemy = { l = 300, m = 300 } }, c = {} },
+        ["Bbb-Realm"] = alchemyKnows({}),
+    }
+    rows = ProfUI.CooldownKindRows(fixtureEntries(),
+        function(k) return payloads[k] end, NOW, fakeResolver({}))
+    ck(#rows == 0,
+       "an unscanned or knows-nothing roster still invented a kind row (" .. #rows .. ")")
+
+    -- (e) THE STAMP-EVIDENCED SOLO KIND (the Mooncloth shape — cd == 0 in the
+    -- dataset, so knowledge alone cannot enumerate it; see the KNOWN GAP note
+    -- above CooldownKindRows). ONE character's stamp — even a mid-cooldown
+    -- one — surfaces the kind, and OTHER characters' ownership then proves
+    -- from their bitmaps: the stamp holder is mid-cooldown and unlisted, the
+    -- bitmap knower is ready.
+    local soloKey = tostring(solo)
+    payloads = {
+        ["Aaa-Realm"] = { v = 1, ds = DSV,
+                          p = { tailoring = { l = 300, m = 300, t = 4,
+                                              k = P.EncodeKnown("tailoring", { solo }),
+                                              n = 1, a = NOW - 50 } },
+                          c = {} },
+        ["Bbb-Realm"] = { v = 1, ds = DSV, p = {}, c = { [soloKey] = NOW + 3600 } },
+    }
+    rows = ProfUI.CooldownKindRows(fixtureEntries(),
+        function(k) return payloads[k] end, NOW,
+        fakeResolver({ [solo] = "Solo Fixture" }))
+    ck(#rows == 1 and rows[1].cdKey == soloKey,
+       "a stamped solo kind did not surface (" .. #rows .. ")")
+    ck(rows[1] and rows[1].owners == 2,
+       "the bitmap knower did not join the stamp holder as an owner")
+    ck(rows[1] and #rows[1].ready == 1 and rows[1].ready[1].key == "Aaa-Realm",
+       "the bitmap knower is not the one ready character")
+    ck(rows[1] and rows[1].label == "Solo Fixture", "the solo kind lost its label")
+
+    -- ... and the flip side: with the stamp EXPIRED the holder is ready too.
+    payloads["Bbb-Realm"].c[soloKey] = NOW - 5
+    rows = ProfUI.CooldownKindRows(fixtureEntries(),
+        function(k) return payloads[k] end, NOW,
+        fakeResolver({ [solo] = "Solo Fixture" }))
+    ck(rows[1] and #rows[1].ready == 2 and rows[1].ready[1].key == "Aaa-Realm"
+       and rows[1].ready[2].key == "Bbb-Realm",
+       "an expired-stamp holder is not ready-awaiting-deletion in roster order")
+
+    -- (f) OWNERSHIP PRIMITIVES, straight. A foreign-dataset payload proves
+    -- nothing (nil set — the drift rule); a stamp is craft-proof on its own.
+    ck(ProfUI.OwnsCooldownKind(alchemyKnows({ trans }), "g1") == true,
+       "a known member did not prove group ownership")
+    ck(ProfUI.OwnsCooldownKind(alchemyKnows({}), "g1") == false,
+       "an empty known set proved ownership")
+    local foreign = alchemyKnows({ trans })
+    foreign.ds = "some-other-dataset"
+    foreign.sh = nil
+    ck(ProfUI.OwnsCooldownKind(foreign, "g1") == false,
+       "a foreign-dataset bitmap was decoded into ownership")
+    ck(ProfUI.OwnsCooldownKind({ p = {}, c = { ["g1"] = NOW + 5 } }, "g1") == true,
+       "a stored stamp did not prove ownership by itself")
+    ck(ProfUI.OwnsCooldownKind(nil, "g1") == false, "a nil payload owned something")
+
+    -- (g) DETERMINISM (class 8): same store, two renders, identical order.
+    payloads = {
+        ["Aaa-Realm"] = alchemyKnows({ trans }, { [soloKey] = NOW - 5 }),
+        ["Ccc-Realm"] = alchemyKnows({ trans }),
+    }
+    local r1 = ProfUI.CooldownKindRows(fixtureEntries(),
+        function(k) return payloads[k] end, NOW, fakeResolver({ [solo] = "Solo Fixture" }))
+    local r2 = ProfUI.CooldownKindRows(fixtureEntries(),
+        function(k) return payloads[k] end, NOW, fakeResolver({ [solo] = "Solo Fixture" }))
+    ck(#r1 == 2 and #r1 == #r2, "the two-kind fixture lost a kind")
+    for i = 1, #r1 do
+        ck(r1[i].cdKey == r2[i].cdKey and r1[i].owners == r2[i].owners,
+           "two renders of the same store disagreed at row " .. i)
+    end
+
+    -- (h) NO DATASET EXTENSION RODE THIS FIX: the recipe-set identity the
+    -- bitmaps depend on is untouched (nothing was regenerated), so no stored
+    -- record can have been invalidated by this change.
+    ck((D.recipe[solo].cd or 0) == 0,
+       "a solo recipe grew a cd marking without the owner-approved fact pass")
+end
+
 -- ── DELEGATE DESIGNATIONS (profession-delegates phase 1) ─────────────────────
 local function testDelegates(fails)
     local function ck(cond, msg) if not cond then fails[#fails + 1] = msg end end
     local DASH = ProfUI.GLYPHS.dash
 
     -- (a) GLYPH PINS: every delegate mark is pure ASCII — the tofu class
-    -- cannot reach a badge no matter which face the owner picks.
-    for _, k in ipairs({ "primary", "secondary", "bank", "absent" }) do
+    -- cannot reach a mark no matter which face the owner picks. The NameMark's
+    -- inline form is scanned whole: the |cff escape is ASCII by construction,
+    -- and the pin proves the payload character stays that way too.
+    for _, k in ipairs({ "desig", "bank", "absent" }) do
         local g = ProfUI.GLYPHS[k]
         ck(type(g) == "string" and #g > 0, "delegate mark '" .. k .. "' is missing")
         for i = 1, #(g or "") do
@@ -6508,8 +7105,80 @@ local function testDelegates(fails)
             end
         end
     end
-    ck(ProfUI.GLYPHS.primary == "1" and ProfUI.GLYPHS.secondary == "2"
-       and ProfUI.GLYPHS.bank == "B", "the delegate marks changed without a design pass")
+    ck(ProfUI.GLYPHS.desig == "*" and ProfUI.GLYPHS.bank == "B",
+       "the delegate marks changed without a design pass")
+    -- The phase-1 corner digits are RETIRED (owner, 2026-08-10): the registry
+    -- entries are gone with the badges, and nothing may quietly revive them.
+    ck(ProfUI.GLYPHS.primary == nil and ProfUI.GLYPHS.secondary == nil,
+       "the retired '1'/'2' badge glyphs crept back into the registry")
+    ck(ProfUI.CellBadge == nil, "the retired CellBadge reader is back")
+
+    -- (a2) DESIGNATION INKS: two distinct named blues, in one place, readable
+    -- through both the RGB and the inline-hex readers; the asterisk mark wears
+    -- them (primary anywhere beats secondary-only is OwnerDesignationRole's
+    -- job, pinned below).
+    local pr, pg, pb = ProfUI.InkRGB("desigPrimary")
+    local sr, sg, sb = ProfUI.InkRGB("desigSecondary")
+    ck(pr ~= nil and sr ~= nil, "a designation ink is missing from ProfUI.INKS")
+    ck(not (pr == sr and pg == sg and pb == sb),
+       "the two designation blues are not distinct")
+    ck(sr >= pr and sg >= pg and sb >= pb,
+       "the secondary blue is not the LIGHTER of the two")
+    ck(ProfUI.InkRGB("ok") == nil,
+       "InkRGB answered for a theme token (that seam belongs to UI.Color)")
+    ck(tostring(ProfUI.InkHex("desigPrimary")):find("^|cff%x%x%x%x%x%x$") ~= nil,
+       "InkHex('desigPrimary') is not a |cffrrggbb escape")
+    ck(ProfUI.InkHex("nope") == nil, "InkHex invented an escape for an unknown ink")
+    ck(ProfUI.NameMark("primary")
+        == ProfUI.InkHex("desigPrimary") .. "*|r", "the primary name mark is wrong")
+    ck(ProfUI.NameMark("secondary")
+        == ProfUI.InkHex("desigSecondary") .. "*|r", "the secondary name mark is wrong")
+    ck(ProfUI.NameMark(nil) == "", "an undesignated character grew a name mark")
+    for i = 1, #ProfUI.NameMark("primary") do
+        if ProfUI.NameMark("primary"):byte(i) > 127 then
+            fails[#fails + 1] = "the name mark is not pure ASCII"
+            break
+        end
+    end
+
+    -- (a3) THE INK OVERRIDE on the cell texts (owner: designation color
+    -- INSTEAD of the green/yellow cap coloring; primary = blue, secondary =
+    -- light blue; primary wins when both roles sit on one cell).
+    local lt, li = ProfUI.LevelInk(300, "primary")
+    ck(lt == "300" and li == "desigPrimary",
+       "a designated-primary cap level did not ink designation blue")
+    lt, li = ProfUI.LevelInk(299, "secondary")
+    ck(lt == "299" and li == "desigSecondary",
+       "a designated-secondary below-cap level did not ink light blue")
+    lt, li = ProfUI.LevelInk(nil, "primary")
+    ck(lt == ProfUI.GLYPHS.dash and li == "faint",
+       "a designated cell tinted its NEVER-RECORDED em dash blue (that claims a level)")
+    -- Undesignated cells keep the green/yellow rule, pinned here beside the
+    -- override so the pair cannot drift apart.
+    lt, li = ProfUI.LevelInk(300)
+    ck(lt == "300" and li == "ok", "an undesignated cap level lost its green")
+    lt, li = ProfUI.LevelInk(299)
+    ck(lt == "299" and li == "warn", "an undesignated below-cap level lost its yellow")
+    local ct, ci = ProfUI.CensusText({ total = 239, scanned = true, known = 165 }, "primary")
+    ck(ct == "165/239" and ci == "desigPrimary",
+       "a designated-primary census did not ink designation blue")
+    ct, ci = ProfUI.CensusText({ total = 239, scanned = true, known = 165 }, "secondary")
+    ck(ct == "165/239" and ci == "desigSecondary",
+       "a designated-secondary census did not ink light blue")
+    ct, ci = ProfUI.CensusText({ total = 239, scanned = true, known = 165 })
+    ck(ct == "165/239" and ci == "muted", "an undesignated census lost its muted ink")
+    ct, ci = ProfUI.CensusText({ total = 239, scanned = false }, "primary")
+    ck(ct == ProfUI.GLYPHS.dash .. " not checked" and ci == "faint",
+       "a designated UNSCANNED census dressed its 'not checked' up in blue")
+    local st2, si2 = ProfUI.SecondaryCellText({ level = 225 }, "secondary")
+    ck(st2 == "225" and si2 == "desigSecondary",
+       "a designated secondary chip did not ink light blue")
+    ck(ProfUI.DesignationRole({ primary = { "x" }, secondary = { "y" } }) == "primary",
+       "primary did not win a cell holding both roles")
+    ck(ProfUI.DesignationInk("primary") == "desigPrimary"
+       and ProfUI.DesignationInk("secondary") == "desigSecondary"
+       and ProfUI.DesignationInk(nil) == nil,
+       "the role -> ink mapping is wrong")
 
     -- (b) THE CELL MODEL against a fixture config. Lane keys are spec spell
     -- ids as STRINGS plus "general".
@@ -6526,27 +7195,51 @@ local function testDelegates(fails)
     ck(#d.primary == 2 and d.primary[1] == ARMOR and d.primary[2] == "general",
        "Poonyx's primary lanes are wrong or unsorted")
     ck(#d.secondary == 0, "Poonyx grew a secondary lane from nowhere")
-    ck(ProfUI.CellBadge(d) == "1", "a primary cell does not wear the '1' badge")
-    ck(ProfUI.CellBadge(ProfUI.CellDelegates(cfg, "Horde", "blacksmithing", "Alt-R")) == "2",
-       "a secondary-only cell does not wear the '2' badge")
-    ck(ProfUI.CellBadge(ProfUI.CellDelegates(cfg, "Horde", "blacksmithing", "Puunyx-R")) == "1",
-       "a planned-lane primary does not wear the '1' badge")
-    ck(ProfUI.CellBadge(ProfUI.CellDelegates(cfg, "Horde", "blacksmithing", "Nobody-R")) == nil,
-       "an undesignated cell wears a badge")
+    ck(ProfUI.DesignationRole(d) == "primary", "a primary cell does not read primary")
+    ck(ProfUI.DesignationRole(ProfUI.CellDelegates(cfg, "Horde", "blacksmithing", "Alt-R"))
+        == "secondary", "a secondary-only cell does not read secondary")
+    ck(ProfUI.DesignationRole(ProfUI.CellDelegates(cfg, "Horde", "blacksmithing", "Puunyx-R"))
+        == "primary", "a planned-lane primary does not read primary")
+    ck(ProfUI.DesignationRole(ProfUI.CellDelegates(cfg, "Horde", "blacksmithing", "Nobody-R"))
+        == nil, "an undesignated cell reads a role")
+
+    -- THE NAME ASTERISK's answer, per character over the whole config:
+    -- primary-anywhere beats secondary-only; the bank role alone earns NO
+    -- asterisk (its mark stays the "B"); junk heals to nil.
+    ck(ProfUI.OwnerDesignationRole(cfg, "Poonyx-R") == "primary",
+       "a primary-anywhere character did not read primary")
+    ck(ProfUI.OwnerDesignationRole(cfg, "Alt-R") == "secondary",
+       "a secondary-only character did not read secondary")
+    ck(ProfUI.OwnerDesignationRole(cfg, "Puunyx-R") == "primary",
+       "a planned-lane primary character did not read primary")
+    ck(ProfUI.OwnerDesignationRole(cfg, "Baa-R") == nil,
+       "the recipe bank alone earned a designation asterisk")
+    ck(ProfUI.OwnerDesignationRole(cfg, "Nobody-R") == nil,
+       "an undesignated character grew a role")
+    ck(ProfUI.OwnerDesignationRole("junk", "Poonyx-R") == nil
+       and ProfUI.OwnerDesignationRole(cfg, nil) == nil,
+       "a malformed owner-role read did not heal to nil")
+    -- Both roles on one character, across DIFFERENT lanes: primary still wins.
+    local both = { Horde = { profs = { alchemy = { lanes = {
+        general = { p = "Two-R" }, ["123"] = { s = "Two-R" } } } } } }
+    ck(ProfUI.OwnerDesignationRole(both, "Two-R") == "primary",
+       "primary-anywhere did not beat a secondary lane elsewhere")
     -- MULTI-PRIMARY COEXISTENCE: two primaries in ONE profession, one per lane.
     local dp = ProfUI.CellDelegates(cfg, "Horde", "blacksmithing", "Puunyx-R")
     ck(#dp.primary == 1 and dp.primary[1] == AXE,
        "the second lane primary did not coexist with the first")
     -- FACTION ISOLATION: the Alliance view of a Horde-only config is empty.
-    ck(ProfUI.CellBadge(ProfUI.CellDelegates(cfg, "Alliance", "blacksmithing", "Poonyx-R")) == nil,
+    ck(ProfUI.DesignationRole(
+           ProfUI.CellDelegates(cfg, "Alliance", "blacksmithing", "Poonyx-R")) == nil,
        "a Horde designation leaked into the Alliance view")
     ck(ProfUI.IsRecipeBank(cfg, "Horde", "Baa-R") == true
        and ProfUI.IsRecipeBank(cfg, "Horde", "Poonyx-R") == false
        and ProfUI.IsRecipeBank(cfg, "Alliance", "Baa-R") == false,
        "the recipe-bank read is wrong or faction-blind")
     -- Heal: junk shapes answer empty, never error.
-    ck(ProfUI.CellBadge(ProfUI.CellDelegates("junk", "Horde", "blacksmithing", "A-R")) == nil
-       and ProfUI.CellBadge(ProfUI.CellDelegates({ Horde = { profs = { blacksmithing = 7 } } },
+    ck(ProfUI.DesignationRole(ProfUI.CellDelegates("junk", "Horde", "blacksmithing", "A-R")) == nil
+       and ProfUI.DesignationRole(ProfUI.CellDelegates(
+           { Horde = { profs = { blacksmithing = 7 } } },
            "Horde", "blacksmithing", "A-R")) == nil,
        "a malformed config was not healed to empty")
 
@@ -6649,9 +7342,12 @@ local function testDelegates(fails)
             owner = "Poonyx-R" }) == true, "the menu action did not write the store")
         local eff = ProfUI.EffectiveDelegates()
         ck(type(eff) == "table"
-           and ProfUI.CellBadge(ProfUI.CellDelegates(eff, "Horde", "blacksmithing",
-               "Poonyx-R")) == "1",
-           "the badge did not render from the store write")
+           and ProfUI.DesignationRole(ProfUI.CellDelegates(eff, "Horde", "blacksmithing",
+               "Poonyx-R")) == "primary",
+           "the designation ink role did not render from the store write")
+        ck(type(eff) == "table"
+           and ProfUI.OwnerDesignationRole(eff, "Poonyx-R") == "primary",
+           "the name asterisk role did not render from the store write")
         ck(ProfUI.ApplyDelegateAction({ kind = "lane", faction = "Horde",
             profKey = "blacksmithing", laneKey = ARMOR, role = "p",
             owner = "Poonyx-R" }) == false, "an identical designation was not diff-gated")
@@ -6662,9 +7358,9 @@ local function testDelegates(fails)
         ck(ProfUI.ApplyDelegateAction({ kind = "lane", faction = "Horde",
             profKey = "blacksmithing", laneKey = ARMOR, role = "p",
             owner = nil }) == true, "the clear action did not write")
-        ck(ProfUI.CellBadge(ProfUI.CellDelegates(ProfUI.EffectiveDelegates() or {},
+        ck(ProfUI.DesignationRole(ProfUI.CellDelegates(ProfUI.EffectiveDelegates() or {},
             "Horde", "blacksmithing", "Poonyx-R")) == nil,
-           "the badge survived its designation being cleared")
+           "the designation ink survived its designation being cleared")
 
         local a2 = S.ProfessionsArea(true)
         a2.delegates, a2.delegatesRev, a2.delegatesAt = savedD, savedR, savedAt
@@ -6712,9 +7408,18 @@ if ns.RegisterSelfTest then
                   .. "cold-item unresolved, known/spec seams, ordering, empty "
                   .. "messages, slash target)",
               fn = testShoplist },
-            { name = "delegate designations (ASCII marks, lane badges, contextual "
-                  .. "menu + plan submenu, bank, faction isolation, action -> "
-                  .. "store -> badge)",
+            { name = "shopping-list gavel (header slot via pure readers, tab-strip "
+                  .. "reservation at multiple widths, tooltip pin, old button "
+                  .. "absent, asset shape, click unchanged)",
+              fn = testShoplistGavel },
+            { name = "cooldown-kind ownership (knowledge enumeration, ready-by-"
+                  .. "absence, mid-cooldown silence, unscanned silence, solo/"
+                  .. "group key mapping, determinism)",
+              fn = testKindOwnership },
+            { name = "delegate designations (ASCII marks retired to inks, level/"
+                  .. "census designation blues, name asterisk, contextual menu "
+                  .. "+ plan submenu, bank, faction isolation, action -> store "
+                  .. "-> ink)",
               fn = testDelegates },
         }
         local allPass = true
