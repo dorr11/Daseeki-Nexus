@@ -65,10 +65,16 @@ local TOMBSTONE_TTL      = 14 * 86400    -- 14 days
 -- forgives the cooldown for a character parked offline — and only when it logged
 -- out RESTING with DMF not booned (A8.3; the old code applied a flat 8h to every
 -- offline record regardless).
+-- A8.7 adds the two LONG-OFFLINE resets the reference behaviour carries and the
+-- SN model does not: 8 days offline clears UNCONDITIONALLY (the cooldown does not
+-- persist across faires, so no resting precondition applies), and the weekly
+-- server reset clears it. See Store.DMFOfflineClearable.
 local DMF_COOLDOWN_ONLINE = 14400        -- 4h of ONLINE time
 local DMF_OFFLINE_CLEAR   = 28860        -- 8h + 60s safety margin, resting-only
+local DMF_OFFLINE_LONG    = 691200       -- 8 days offline: clears unconditionally
 Store.DMF_COOLDOWN_ONLINE = DMF_COOLDOWN_ONLINE
 Store.DMF_OFFLINE_CLEAR   = DMF_OFFLINE_CLEAR
+Store.DMF_OFFLINE_LONG    = DMF_OFFLINE_LONG
 local WEEK_SECONDS       = 7 * 86400
 -- Suite-namespace store (Daseeki.Sync v2, wave N5): retention for the
 -- cross-account payloads other suite addons publish through Nexus (e.g. Bags).
@@ -178,6 +184,35 @@ local function lastWeeklyResetBoundary(now)
     return now - delta
 end
 Store.LastWeeklyResetBoundary = lastWeeklyResetBoundary
+
+-- Epoch of the most recent WEEKLY SERVER RESET, asked of the client rather than
+-- computed from a weekday we picked.
+--
+-- WHY NOT lastWeeklyResetBoundary ABOVE. That one is OUR timer-database wipe
+-- boundary — a hard-coded Wednesday 04:00 server-local, which is the reference
+-- world-buff addon's own convention and is region-WRONG for a US realm (whose
+-- weekly reset is Tuesday). Using it to forgive a DMF cooldown would invent a
+-- ~24h window each week in which a cooldown stamped after the true reset is
+-- wrongly cleared — i.e. the addon would claim DMFable while the game says no,
+-- which is the one direction this whole model refuses to err in.
+--
+-- `C_DateAndTime.GetSecondsUntilWeeklyReset` is catalog-verified on interface
+-- 11509 (build 1.15.9.68808) and is the client's OWN answer, so it is correct in
+-- every region without us knowing the region at all. Previous reset = now + that
+-- - one week.
+--
+-- Returns nil — never a guess — when the API is missing or answers outside
+-- (0, 604800]. A nil answer simply means the weekly rule does not fire; no
+-- weekday is assumed and no other rule is affected.
+function Store.LastWeeklyResetEpoch(nowE)
+    local f = C_DateAndTime and C_DateAndTime.GetSecondsUntilWeeklyReset
+    if type(f) ~= "function" then return nil end
+    local ok, secs = pcall(f)
+    if not ok then return nil end
+    secs = tonumber(secs)
+    if not secs or secs <= 0 or secs > WEEK_SECONDS then return nil end
+    return (nowE or serverNow()) + secs - WEEK_SECONDS
+end
 
 ----------------------------------------------------------------------
 -- Defaults trees
@@ -4002,11 +4037,17 @@ end
 --     timestamp advances so the freeze does not bank elapsed time).
 --   * not `dmfCooldownActive` — nothing to tick.
 --
--- The ONLY wall-clock rule is the offline forgiveness (A8.3): a character that
--- logged out RESTING, with DMF NOT booned, and has been gone >= 28,860 s has its
--- cooldown cleared. The previous code applied a flat 8h to EVERY offline record
--- with no resting/boon precondition, so a character parked in the open world got
--- a free reset.
+-- The wall-clock rules are the offline forgiveness family, all of them decided by
+-- ONE pure predicate (Store.DMFOfflineClearable) so the login-resume path and the
+-- sibling sweep can never drift:
+--   A8.3  RESTING, DMF not booned, gone >= 28,860 s        (the owner's rule 3)
+--   A8.7a gone >= 691,200 s (8 days), UNCONDITIONALLY      (new)
+--   A8.7b the WEEKLY SERVER RESET happened while offline   (new)
+-- The pre-A8.3 code applied a flat 8h to EVERY offline record with no
+-- resting/boon precondition, so a character parked in the open world got a free
+-- reset; A8.7 does not reopen that hole — its two rules are about spans an order
+-- of magnitude longer, where the reference behaviour says the cooldown is simply
+-- gone (it does not persist across faires, and the weekly reset wipes it).
 --
 -- BACKWARD COMPATIBILITY. `remainingOnlineSecs` / `lastTickEpoch` are additive.
 -- A record written before this change carries neither: it reads as "on cooldown,
@@ -4078,13 +4119,21 @@ function Store.DMFCooldownStart(rec, nowE)
 end
 
 -- Clear the cooldown. `label` (a character name) prints the spec's green line.
-function Store.DMFCooldownClear(rec, label, extra)
+--
+-- A8.6: every clear leaves a WITNESS STAMP (`cd.clearedAt`). It is not accounting
+-- — the cooldown is gone — it is the record of WHY a live Darkmoon fortune with no
+-- cooldown behind it is a legitimate state. The at-login live-aura rule reads it
+-- to tell "we missed the gain" (start one) from "we cleared it ourselves moments
+-- ago" (leave it alone); without it, a debuff-bar push followed by a /reload would
+-- resurrect the cooldown the push just legitimately evicted.
+function Store.DMFCooldownClear(rec, label, extra, nowE)
     local cd = dmfCD(rec)
     if not cd then return end
     rec.dmfCooldownActive  = false
     cd.remainingOnlineSecs = 0
     cd.lastTickEpoch       = 0
     cd.offlineSince        = 0
+    cd.clearedAt           = nowE or serverNow()
     if label then
         dmfChat("Darkmoon fortune cooldown is up for " .. label
                 .. (extra and (" (" .. extra .. ")") or "") .. " — DMFable.")
@@ -4120,7 +4169,7 @@ function Store.DMFCooldownTick(rec, nowE, label)
 
     cd.remainingOnlineSecs = cd.remainingOnlineSecs - elapsed
     if cd.remainingOnlineSecs <= 0 then
-        Store.DMFCooldownClear(rec, label)
+        Store.DMFCooldownClear(rec, label, nil, nowE)
         return true
     end
     return false
@@ -4136,18 +4185,64 @@ function Store.DMFCooldownStampOffline(rec, nowE)
     cd.offlineSince = nowE
 end
 
--- Is this record eligible for the offline forgiveness? Pure; shared by the
--- login-resume path and the sibling sweep so the two can never drift.
+-- Is this record eligible for the offline forgiveness? PURE; shared by the
+-- login-resume path and the sibling sweep so the two can never drift — which is
+-- also why the two A8.7 rules are added HERE and nowhere else: every character of
+-- our account gets them from the one function, whether it is the one we just
+-- logged into or an alt the sweep walks.
+--
+-- Returns clearable(bool), offlineFor(seconds), reason(string|nil). The reason is
+-- what the green chat line names, so the owner can tell which rule fired.
+--
+-- THE THREE RULES, in the order they are asked:
+--   A8.7a  offline >= 8 days -> clear, with NO resting and NO boon precondition.
+--          The hidden debuff does not survive a faire cycle, so after 8 days the
+--          question of where the character was parked is moot. A DMF still stashed
+--          in a boon is not an exception either: unbooning it re-stamps a fresh 4h
+--          (A8.5), so clearing here cannot leak a free fortune.
+--   A8.7b  the WEEKLY SERVER RESET fell inside the offline span -> clear, same
+--          unconditional shape, and only when the client itself told us when that
+--          reset was (Store.LastWeeklyResetEpoch; nil = the rule stays silent).
+--   A8.3   the resting rule, UNCHANGED: resting at logout, DMF not booned,
+--          offline >= 28,860 s.
+--
+-- KNOWN LIMIT, deliberate: all three need an `offlineSince` stamp, so a character
+-- that has never logged out with this addon installed is not swept. And A8.7b only
+-- forgives a reset crossed while OFFLINE — a character logged in across the reset
+-- keeps ticking its 4h down, which costs at most one 4h countdown and never claims
+-- DMFable falsely.
 function Store.DMFOfflineClearable(rec, nowE)
     if type(rec) ~= "table" or not rec.dmfCooldownActive then return false end
     local cd = rec.dmfCooldown
     if type(cd) ~= "table" then return false end
     local since = tonumber(cd.offlineSince) or 0
     if since <= 0 then return false end
-    if not rec.isResting then return false end     -- A8.3: resting at logout
-    if rec.dmfInBoon then return false end          -- A8.3: not stashed in a boon
     nowE = nowE or serverNow()
-    return (nowE - since) >= DMF_OFFLINE_CLEAR, (nowE - since)
+    local offlineFor = nowE - since
+
+    if offlineFor >= DMF_OFFLINE_LONG then          -- A8.7a
+        return true, offlineFor, "long"
+    end
+
+    local weekly = Store.LastWeeklyResetEpoch(nowE) -- A8.7b
+    if weekly and since < weekly then
+        return true, offlineFor, "weekly"
+    end
+
+    if not rec.isResting then return false, offlineFor end   -- A8.3: resting at logout
+    if rec.dmfInBoon then return false, offlineFor end        -- A8.3: not stashed in a boon
+    return offlineFor >= DMF_OFFLINE_CLEAR, offlineFor, "resting"
+end
+
+-- The green line's parenthetical, per rule. Local so the resume path and the
+-- sweep word the same clear identically.
+local function dmfClearExtra(reason, offlineFor)
+    if reason == "long" then
+        return dmfHM(offlineFor) .. " offline (8+ days)"
+    elseif reason == "weekly" then
+        return "weekly server reset"
+    end
+    return dmfHM(offlineFor) .. " offline"
 end
 
 -- Login resume for the character we just logged into (spec §5 Login resume).
@@ -4163,9 +4258,10 @@ function Store.DMFCooldownResume(rec, nowE)
         cd.lastTickEpoch = nowE
         return false
     end
-    local clearable, offlineFor = Store.DMFOfflineClearable(rec, nowE)
+    local clearable, offlineFor, reason = Store.DMFOfflineClearable(rec, nowE)
     if clearable then
-        Store.DMFCooldownClear(rec, rec.nameRealm or "you", dmfHM(offlineFor) .. " offline")
+        Store.DMFCooldownClear(rec, rec.nameRealm or "you",
+                               dmfClearExtra(reason, offlineFor), nowE)
         return true
     end
     cd.offlineSince  = 0
@@ -4174,11 +4270,13 @@ function Store.DMFCooldownResume(rec, nowE)
 end
 
 ----------------------------------------------------------------------
--- Retention: offline sibling DMF cooldown clear (resting-only, >= 8h01m)
+-- Retention: offline sibling DMF cooldown clear
 --
 -- Spec §5 "Sibling reconciliation": walk the OTHER characters of OUR OWN
--- account and apply the same offline-rest rule, bumping the data epoch so peers
--- re-sync, one green chat line per character that crossed.
+-- account and apply the same offline rules (A8.3 resting-8h, and since A8.7 the
+-- 8-day and weekly-reset clears — the sweep asks the SAME predicate, so a rule
+-- added there is automatically enjoyed by every alt), bumping the data epoch so
+-- peers re-sync, one green chat line per character that crossed.
 --
 -- ⚠ NARROWED from the previous behaviour, deliberately: the old sweep walked
 -- EVERY account bucket, so it forgave cooldowns on characters owned by other
@@ -4192,9 +4290,17 @@ function Store.SweepOfflineDMF()
     if not bucket or not bucket.characters then return 0 end
     local cleared = 0
     for nameRealm, rec in pairs(bucket.characters) do
-        local clearable, offlineFor = Store.DMFOfflineClearable(rec, now)
+        local clearable, offlineFor, reason = Store.DMFOfflineClearable(rec, now)
         if clearable then
-            Store.DMFCooldownClear(rec, nameRealm, dmfHM(offlineFor) .. " offline")
+            Store.DMFCooldownClear(rec, nameRealm, dmfClearExtra(reason, offlineFor), now)
+            -- J4 / schema v3: the WIRE MIRROR, published here and only here for a
+            -- SIBLING. captureDMF is the mirror's one writer for the character we
+            -- are playing, and it never runs for an alt — so without this line the
+            -- v3 tail would keep shipping the old countdown for a cooldown we just
+            -- forgave. (Readers gate on dmfCooldownActive, so the stale number was
+            -- never rendered; publishing 0 keeps the payload honest rather than
+            -- relying on that gate.)
+            rec.dmfCooldownRemaining = 0
             -- Bump the data epoch so peers accept our clear on the next sync.
             rec.lastDataUpdate = now
             rec.ownerEpoch     = now
@@ -6165,6 +6271,130 @@ local function testDMFCooldown(fails)
     ck(Store.DMFOfflineClearable(rec, T0 + 100000) == false,
        "offline clear: booned DMF is never forgiven, however long the logout")
     ck(Store.DMFCooldownResume(rec, T0 + 100000) == false, "resume (booned): not cleared")
+
+    -- ---- A8.7a: 8 DAYS OFFLINE CLEARS UNCONDITIONALLY ----------------------
+    -- RED CONTROL for the pre-A8.7 code: with only the resting rule, a character
+    -- parked in the open world held its cooldown FOREVER — the assertions below
+    -- at "not resting" and "booned" both read false before this change.
+    ck(Store.DMF_OFFLINE_LONG == 691200, "DMF long-offline clear is 691200s (8 days)")
+
+    rec = Store.NewCharacterRecord("Alt-Realm")
+    Store.DMFCooldownStart(rec, T0)
+    rec.isResting = false                      -- logged out in the open world
+    Store.DMFCooldownStampOffline(rec, T0 + 10)
+    ck(Store.DMFOfflineClearable(rec, T0 + 10 + 691199) == false,
+       "8-day clear: one second short is not enough (and the resting rule still refuses)")
+    local clr, secs, why = Store.DMFOfflineClearable(rec, T0 + 10 + 691200)
+    ck(clr == true, "8-day clear: 691200s exactly clears even though it was NOT resting")
+    ck(secs == 691200, "8-day clear: reports the offline span")
+    ck(why == "long", "8-day clear: names the rule that fired")
+    Store.DMFCooldownResume(rec, T0 + 10 + 691200)
+    ck(rec.dmfCooldownActive == false, "8-day clear: the resume path applies it")
+
+    -- ...and a DMF still stashed in a boon is not an exception either: unbooning
+    -- re-stamps a fresh 4h (A8.5), so clearing here cannot leak a free fortune.
+    rec = Store.NewCharacterRecord("Alt-Realm")
+    Store.DMFCooldownStart(rec, T0)
+    rec.isResting, rec.dmfInBoon = false, true
+    Store.DMFCooldownStampOffline(rec, T0 + 10)
+    ck(Store.DMFOfflineClearable(rec, T0 + 10 + 691200) == true,
+       "8-day clear: unconditional — neither resting nor booned gates it")
+
+    -- ---- A8.7b: the WEEKLY SERVER RESET clears it --------------------------
+    -- The epoch comes from the CLIENT (C_DateAndTime.GetSecondsUntilWeeklyReset),
+    -- never from a weekday we picked, so the rule is region-correct everywhere and
+    -- silent where the client will not answer.
+    local savedDT = _G.C_DateAndTime
+    local secsUntilReset = nil
+    _G.C_DateAndTime = { GetSecondsUntilWeeklyReset = function() return secsUntilReset end }
+
+    secsUntilReset = 604800 - 3600            -- the reset was 1h ago
+    ck(Store.LastWeeklyResetEpoch(T0) == T0 - 3600,
+       "weekly epoch: now + secondsUntil - one week")
+    secsUntilReset = 0
+    ck(Store.LastWeeklyResetEpoch(T0) == nil, "weekly epoch: 0 is refused, not trusted")
+    secsUntilReset = 604801
+    ck(Store.LastWeeklyResetEpoch(T0) == nil, "weekly epoch: over a week is refused")
+    secsUntilReset = "nonsense"
+    ck(Store.LastWeeklyResetEpoch(T0) == nil, "weekly epoch: a non-number is refused")
+
+    -- Offline ACROSS the reset -> cleared, however short the logout and wherever
+    -- the character was parked. Two minutes, standing in the open world.
+    secsUntilReset = 604800 - 3600            -- reset at T0 - 3600
+    rec = Store.NewCharacterRecord("Alt-Realm")
+    Store.DMFCooldownStart(rec, T0 - 7200)
+    rec.isResting = false
+    Store.DMFCooldownStampOffline(rec, T0 - 3720)   -- logged out 2 min before the reset
+    clr, secs, why = Store.DMFOfflineClearable(rec, T0)
+    ck(clr == true, "weekly clear: a logout that straddles the reset is forgiven")
+    ck(why == "weekly", "weekly clear: names the rule that fired")
+
+    -- Offline entirely AFTER the reset -> untouched.
+    rec = Store.NewCharacterRecord("Alt-Realm")
+    Store.DMFCooldownStart(rec, T0 - 1800)
+    rec.isResting = false
+    Store.DMFCooldownStampOffline(rec, T0 - 1200)   -- logged out after the reset
+    ck(Store.DMFOfflineClearable(rec, T0) == false,
+       "weekly clear: a logout entirely after the reset is NOT forgiven")
+
+    -- No client answer -> the rule is silent, and NO weekday is assumed.
+    secsUntilReset = nil
+    rec = Store.NewCharacterRecord("Alt-Realm")
+    Store.DMFCooldownStart(rec, T0 - 7200)
+    rec.isResting = false
+    Store.DMFCooldownStampOffline(rec, T0 - 3720)
+    ck(Store.DMFOfflineClearable(rec, T0) == false,
+       "weekly clear: with no client answer the rule stays silent")
+    _G.C_DateAndTime = savedDT
+    ck(Store.LastWeeklyResetEpoch(T0) == nil or type(Store.LastWeeklyResetEpoch(T0)) == "number",
+       "weekly epoch: a missing API is survivable")
+
+    -- ---- the A8.3 resting rule is UNCHANGED by all of the above ------------
+    rec = Store.NewCharacterRecord("Alt-Realm")
+    Store.DMFCooldownStart(rec, T0)
+    rec.isResting = true
+    Store.DMFCooldownStampOffline(rec, T0 + 10)
+    ck(Store.DMFOfflineClearable(rec, T0 + 10 + 28859) == false,
+       "A8.7 regression: 28859s resting is still one second short")
+    clr, secs, why = Store.DMFOfflineClearable(rec, T0 + 10 + 28860)
+    ck(clr == true and why == "resting", "A8.7 regression: the resting rule still fires at 28860s")
+
+    -- ---- A8.6: every clear leaves the witness stamp ------------------------
+    rec = Store.NewCharacterRecord("Alt-Realm")
+    Store.DMFCooldownStart(rec, T0)
+    ck((rec.dmfCooldown.clearedAt or 0) == 0, "clearedAt: a running cooldown has none")
+    Store.DMFCooldownClear(rec, nil, nil, T0 + 50)
+    ck(rec.dmfCooldown.clearedAt == T0 + 50, "clearedAt: the clear stamps when it happened")
+    Store.DMFCooldownTick(rec, T0 + 60)
+    ck(rec.dmfCooldown.clearedAt == T0 + 50, "clearedAt: survives later no-op ticks")
+
+    -- ---- the SIBLING SWEEP enjoys every rule (shared predicate) ------------
+    -- The sweep and the resume path ask the SAME function, which is what stops
+    -- them drifting; this proves an alt gets the A8.7 rules without the sweep
+    -- knowing they exist.
+    -- The sweep reads the real clock (serverNow), which the harness pins to T0, so
+    -- the fixtures are stamped BACKWARDS from T0 rather than forwards.
+    local savedSelf = Store.GetSelfAccount
+    local parked = Store.NewCharacterRecord("Parked-Realm")
+    Store.DMFCooldownStart(parked, T0 - 700000)
+    parked.isResting = false                    -- open world: only A8.7a can save it
+    Store.DMFCooldownStampOffline(parked, T0 - 691200)
+    parked.dmfCooldownRemaining = 14400         -- a stale v3 wire mirror
+    local recent = Store.NewCharacterRecord("Recent-Realm")
+    Store.DMFCooldownStart(recent, T0 - 40000)
+    recent.isResting = false                    -- open world, only 8h gone: untouched
+    Store.DMFCooldownStampOffline(recent, T0 - 30000)
+    Store.GetSelfAccount = function()
+        return { characters = { ["Parked-Realm"] = parked, ["Recent-Realm"] = recent } }
+    end
+    local sweptCount = Store.SweepOfflineDMF()
+    Store.GetSelfAccount = savedSelf
+    ck(sweptCount == 1, "sweep: exactly the 8-day alt was cleared, got " .. tostring(sweptCount))
+    ck(parked.dmfCooldownActive == false, "sweep: an alt parked 8 days is forgiven")
+    ck(parked.dmfCooldownRemaining == 0, "sweep: the stale wire mirror is republished as 0")
+    ck(parked.lastDataUpdate == T0, "sweep: the data epoch is bumped for peers")
+    ck(recent.dmfCooldownActive == true,
+       "sweep: an alt offline 8h in the OPEN WORLD still keeps its cooldown")
 
     -- ---- legacy record tolerance (additive SV) ----------------------------
     local legacy = { dmfCooldownActive = true, dmfCooldown = { offlineSince = 0 } }
