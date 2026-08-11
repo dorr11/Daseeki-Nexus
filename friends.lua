@@ -192,6 +192,17 @@ end
 --           A name is unique per realm across both factions, so a conflict is
 --           always corruption, never news.
 --
+-- CLASS 8 / NX-7b — SORT BEFORE THE CEILING, the same house rule `Reconcile`
+-- below and `Plan` (:426) already keep. The account walk was always sorted, but
+-- the NAME walk inside each bucket was a raw `pairs()`, and `consider` refuses a
+-- new key once `count` reaches MAX_ROSTER. So above the ceiling the roster was
+-- an arbitrary 400 of the mesh, re-rolled every call: two builds on one client
+-- could disagree about who exists, and the survivors differed between clients
+-- holding identical stores. That is not a cosmetic reorder — this roster is what
+-- `Plan` turns into permanent ledger entries and AddFriend calls, so iteration
+-- luck decided who ever got friended at all. Sorted, the truncation keeps the
+-- same head of the same list on every client, forever.
+--
 -- opts = { selfAID = "<our account id>" }
 ----------------------------------------------------------------------
 function Friends.CollectRoster(accounts, opts)
@@ -239,8 +250,14 @@ function Friends.CollectRoster(accounts, opts)
                     end
                 end
             end
-            for nameRealm in pairs(bucket.characters or {}) do consider(nameRealm) end
-            for nameRealm in pairs(bucket.homeless   or {}) do consider(nameRealm) end
+            -- NX-7b: sorted name order inside the bucket, so the MAX_ROSTER
+            -- truncation inside `consider` keeps a stable head instead of an
+            -- arbitrary one. No `limit` here — the ceiling is global across all
+            -- buckets and both lists, and `consider` owns it.
+            local chars = ns.SortedKeys(bucket.characters or {})
+            for i = 1, #chars do consider(chars[i]) end
+            local homeless = ns.SortedKeys(bucket.homeless or {})
+            for i = 1, #homeless do consider(homeless[i]) end
         end
     end
     return out
@@ -1196,6 +1213,93 @@ ns:RegisterSelfTest("meshfriends", function(verbose)
             "NX-7: and each verdict landed on the right entry")
     end
 
-    if verbose and pass then ns:Print("  PASS meshfriends/rules + ledger + cap + growth + NX-7 order") end
+    ------------------------------------------------------------------
+    -- NX-7b (CLASS 8): CollectRoster sorts before MAX_ROSTER.
+    --
+    -- The stake: the roster is the input to `Plan`, and `Plan`'s adds become
+    -- PERMANENT ledger entries plus real AddFriend calls. Above MAX_ROSTER the
+    -- collector kept whichever 400 names `pairs()` happened to hand it first, so
+    -- which alts of the mesh were even CANDIDATES was iteration luck — re-rolled
+    -- per call on one client, and different between two clients holding byte-
+    -- identical stores.
+    --
+    -- Same fixture discipline as NX-7: MAX_ROSTER + 200 names, three insertion
+    -- histories, identical content, divergence asserted first.
+    ------------------------------------------------------------------
+    do
+        local OF = ns.OrderFixture
+        local nkeys = {}
+        for i = 1, Friends.MAX_ROSTER + 200 do
+            nkeys[i] = string.format("Bulk%04d-TestRealm", i)
+        end
+        local mk = function() return { faction = "Horde" } end
+        local C1, C2, C3 = OF.Histories(nkeys, mk)
+
+        ck(OF.Divergent(C1, C2, C3),
+            "NX-7b fixture is not divergent — the three character-map insertion "
+            .. "histories walked in the same pairs() order, so this row proves nothing")
+
+        local function survivors(chars)
+            local roster = Friends.CollectRoster(
+                { ["9"] = { isSelf = false, characters = chars, homeless = {} } },
+                { selfAID = "1" })
+            local out = {}
+            for k in pairs(roster) do out[#out + 1] = k end
+            table.sort(out)
+            return table.concat(out, ","), #out
+        end
+        local r1, c1 = survivors(C1)
+        local r2, c2 = survivors(C2)
+        local r3, c3 = survivors(C3)
+
+        ck(c1 == Friends.MAX_ROSTER, "NX-7b: the ceiling still holds (" .. tostring(c1)
+            .. " collected, expected " .. Friends.MAX_ROSTER .. ")")
+        ck(r1 == r2 and r2 == r3 and c1 == c2 and c2 == c3,
+            "NX-7b: the SURVIVING ROSTER differed across insertion histories — a "
+            .. "mesh over MAX_ROSTER offers a different 400 names to Plan each call")
+        ck(r1:sub(1, 20) == "bulk0001-testrealm,b",
+            "NX-7b: the kept subset is the sorted head, not an arbitrary slice")
+
+        -- RED CONTROL. The pre-fix walk, transcribed: sorted account ids, raw
+        -- `pairs()` over the names, same global ceiling. On the very fixture the
+        -- shipping collector now survives, it must be seen to DISAGREE with
+        -- itself — otherwise the three rows above are passing on a fixture that
+        -- could not have caught the defect in the first place.
+        local function legacySurvivors(chars)
+            local out, count = {}, 0
+            for nameRealm in pairs(chars) do
+                local key = Friends.Key(nameRealm)
+                if key and not out[key] then
+                    if count >= Friends.MAX_ROSTER then break end
+                    count, out[key] = count + 1, true
+                end
+            end
+            local keys = {}
+            for k in pairs(out) do keys[#keys + 1] = k end
+            table.sort(keys)
+            return table.concat(keys, ",")
+        end
+        local l1, l2, l3 = legacySurvivors(C1), legacySurvivors(C2), legacySurvivors(C3)
+        ck(not (l1 == l2 and l2 == l3),
+            "NX-7b RED CONTROL: the unsorted cap agreed with itself across three "
+            .. "insertion histories — the fixture cannot expose the defect, so the "
+            .. "NX-7b rows above are vacuous")
+
+        -- Under the ceiling nothing about the collection changes: every name is
+        -- reached whatever the order, and the merge rules are order-free.
+        local small = { ["9"] = { isSelf = false, characters = {
+                ["Zed-TestRealm"] = { faction = "Horde" },
+                ["Abe-TestRealm"] = { faction = "Alliance" },
+            }, homeless = { ["Mid-TestRealm"] = { faction = "Horde" } } } }
+        local sRoster = Friends.CollectRoster(small, { selfAID = "1" })
+        ck(sRoster["zed-testrealm"] and sRoster["abe-testrealm"] and sRoster["mid-testrealm"],
+            "NX-7b: under the ceiling every name is still collected")
+        ck(sRoster["abe-testrealm"].faction == "Alliance"
+            and sRoster["zed-testrealm"].faction == "Horde"
+            and sRoster["mid-testrealm"].known == true,
+            "NX-7b: under the ceiling the merged fields are unchanged")
+    end
+
+    if verbose and pass then ns:Print("  PASS meshfriends/rules + ledger + cap + growth + NX-7/7b order") end
     return pass
 end)

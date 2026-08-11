@@ -24,6 +24,17 @@
   shopping list, who-can-craft and the Learnable line on a recipe tooltip cannot
   answer differently from each other — the item tooltip had its own copy of the old
   check and now reads the same rule as everything else.
+- **Fixed: a very large mesh could offer auto-friend a different set of names each
+  time it looked.** Auto-friend never considers more than 400 characters in one
+  pass — a deliberate ceiling so a corrupt store cannot turn a login into an
+  unbounded walk. But the collector filled those 400 slots in whatever order Lua
+  happened to hand it the names, so once a mesh grew past 400 characters, *which*
+  400 were candidates was luck of the draw: re-rolled on every pass, and different
+  between two computers holding exactly the same data. Since an add becomes a
+  permanent ledger entry, an alt could sit just outside the cut for sessions on end
+  for no reason anyone could see. The collector now takes names in a fixed order, so
+  the 400 it keeps are the same 400 every pass and on every computer. No effect
+  below 400 characters, which is every mesh we know of; nothing stored changed.
 
 - **Fixed: Mooncloth is on the cooldowns list even when nobody is on cooldown.**
   Mooncloth has its own four-day timer, but Nexus had no record of that fact — the
