@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.1.8 — 2026-08-10
 
 - Professions: the shopping-list verb moves to the detail pane's corner as Raid Prep's
   gavel icon; delegate designations now speak through blue level/census inks and a name
