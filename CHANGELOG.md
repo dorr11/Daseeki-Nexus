@@ -1,5 +1,32 @@
 # Changelog
 
+## Unreleased
+
+- **Fixed: the Darkmoon fortune cooldown could say a character was ready when the game
+  disagreed — and could hold a cooldown on a parked alt forever.** Four things were wrong.
+  *One:* releasing a chronoboon that gives you your fortune back starts a brand-new four
+  hours, and so does stashing one away — the game says so out loud on release. Nexus only
+  did that when it actually witnessed the cast, so a release during a loading screen, a
+  disconnect, or a relog left the old countdown running; it finished early and the
+  character showed as ready when Sayge would still refuse. Nexus now also watches the
+  fortune itself move in and out of the boon, which it re-reads from the game every time
+  it looks, so a cast it never saw is caught anyway. *Two:* a character parked offline for
+  more than eight days now clears its cooldown no matter where it logged out — the hidden
+  debuff does not survive from one faire to the next, and until now only a character that
+  logged out in an inn was ever forgiven, so an alt parked in the open world sat on a
+  cooldown that could never end. *Three:* the weekly server reset clears it too, asked of
+  the game itself so it is right in every region. Both of these reach *every* character on
+  your account through the same sweep that already handled the inn rule, so alts you have
+  not touched in weeks come back ready on your next login. *Four:* if you log in already
+  carrying a fortune and Nexus has no cooldown recorded for it, it now starts one — a
+  fortune lasts two hours and its cooldown four, so a live fortune means a live cooldown.
+  It will not do this when it was Nexus itself that cleared the cooldown recently (a
+  cooldown pushed off your debuff bar, or one of the offline forgiveness rules), so a
+  cooldown you genuinely escaped stays escaped across a reload. The inn rule, the eight-hour
+  threshold, the debuff-bar push and its raid announcement are all unchanged, and every new
+  clear and re-stamp is published to your other computers and to peers exactly like the old
+  ones were.
+
 ## 1.1.9 — 2026-08-10
 
 - **Fixed: opening a profession window could freeze the game with a script error.** On some

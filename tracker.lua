@@ -1176,6 +1176,10 @@ function Tracker.FinishBoonCast(rec, atFrame, atEpoch)
     if parsed.dmf and ns.Store and ns.Store.DMFCooldownStart then
         ns.Store.DMFCooldownStart(rec, atEpoch)
     end
+    -- ...and hand the capture's flip detector the transition we just made, so its
+    -- second witness sees a matched pair rather than an edge, and does not
+    -- re-stamp a second time a few milliseconds later.
+    Tracker._dmfWasInBoon = rec.dmfInBoon and true or false
 
     Tracker._boonSnapshot = nil
     Tracker._boonRemovals = {}
@@ -1224,6 +1228,9 @@ function Tracker.FinishUnboonCast(rec, atFrame, atEpoch)
     if restoredDMF and ns.Store and ns.Store.DMFCooldownStart then
         ns.Store.DMFCooldownStart(rec, atEpoch)
     end
+    -- Same hand-off as the boon side: the capture's flip detector is told what we
+    -- just did, so the two witnesses agree instead of stamping twice.
+    Tracker._dmfWasInBoon = false
     return restoredDMF
 end
 
@@ -2094,12 +2101,28 @@ end
 -- The store owns the arithmetic (Store.DMFCooldown*); this owns the EDGES that
 -- drive it: a fresh fortune starts the 4 h, every capture ticks it down by the
 -- online time that passed, logout stamps the offline epoch, and the debuff-bar
--- push clears it. The boon/unboon re-stamps live in the A7 cast handlers.
+-- push clears it.
 --
--- The FIRST capture of a session only seeds the edge detector. Login fires aura
--- events for every buff already on the character, so treating that as a fresh
--- fortune would re-stamp a full 4 h on every /reload — the exact failure the
--- reference's "login stabilized" latch exists to prevent.
+-- THE RE-STAMPS ARE WITNESSED TWICE, ON PURPOSE (A8.5). Spec §5 Start says the
+-- 4 h is "always re-stamped fresh on unboon that restores DMF, and re-stamped on
+-- entering a boon carrying DMF" — and the reference client says the quiet part
+-- out loud on release: *a new 4 hour cooldown has started*. The A7 cast handlers
+-- do it the instant the cast succeeds, which is the fast path. But a cast handler
+-- only ever fires for a cast WE SAW: a boon released while the addon was loading,
+-- a UNIT_SPELLCAST_SUCCEEDED lost to a loading screen, or a relog straddling the
+-- release all leave the transition unwitnessed, and the pre-A8.5 fresh-gain edge
+-- could not repair it — it fires only when NO cooldown is running, so a stale
+-- countdown just resumed and finished early, printing "DMFable" while the game
+-- still said no. So the capture ALSO watches `rec.dmfInBoon` flip, which is the
+-- durable fact (captureAuras rebuilds it from the client every pass, cast seen or
+-- not), and re-stamps on either edge. The two witnesses are idempotent: both write
+-- the same full 4 h, and the cast handlers seed the flip detector so the second
+-- witness does not double-stamp behind the first.
+--
+-- The FIRST capture of a session seeds the edge detectors — a boon/unboon flip
+-- cannot be inferred from a single observation, and login fires aura events for
+-- every buff already on the character, so treating those as fresh gains would
+-- re-stamp on every /reload. It is NOT inert, though: see A8.6 below.
 ----------------------------------------------------------------------
 
 -- A8.4 — DEBUFF-BAR PUSH DETECTION.
@@ -2166,8 +2189,58 @@ local function announceDMFPush()
     end
 end
 
-Tracker._dmfSeeded  = false   -- first capture only seeds the fresh-gain edge
-Tracker._dmfWasLive = false
+-- A8.6 — THE AT-LOGIN LIVE-AURA RULE (the missed 0 -> live gain).
+--
+-- The fresh-gain edge needs to SEE the transition, and the one moment it cannot
+-- is the moment it is being created: take a fortune, get disconnected, come back —
+-- the first capture seeds `_dmfWasLive = true` and no edge ever fires. The record
+-- then says DMFable while the hidden debuff is very much still on the character,
+-- and the owner walks to Sayge for nothing.
+--
+-- THE ARITHMETIC THAT MAKES THIS SAFE. Sayge's fortune lasts 7,200 s; the cooldown
+-- is 14,400 s, and both start at the same instant. So a fortune that is still LIVE
+-- was taken at most 2 h ago, which means the cooldown behind it has at least 2 h
+-- left. A live aura does not merely SUGGEST a cooldown — it implies one.
+--
+-- ...unless something evicted it early. Every eviction we know of runs through
+-- Store.DMFCooldownClear, which stamps `cd.clearedAt`, so the rule refuses within
+-- one full cooldown length of any clear WE performed. That is what keeps the three
+-- real false-positive shapes out:
+--   * DEBUFF-BAR PUSH then /reload. The push legitimately freed the fortune; the
+--     aura is still live and there is genuinely no cooldown. clearedAt is minutes
+--     old -> refused.
+--   * A LOGIN-RESUME OR SWEEP CLEAR that fires on this same login (the 8-day and
+--     weekly rules can clear a character whose 2 h fortune is still running, e.g.
+--     two minutes offline across a reset boundary). The clear stamps clearedAt
+--     first, the capture reads it -> refused, and the forgiveness stands.
+--   * A BOON RELEASE mid-session. Not this rule's business at all: the seeding
+--     branch runs once per session, and the release is covered by the A8.5
+--     unboon re-stamp above.
+-- The residual, accepted knowingly: a fortune that was pushed off the bar in a
+-- session this client never saw at all (no clearedAt) reads as a cooldown we
+-- missed, and we start one. That errs toward showing a cooldown the owner can
+-- clear again by capping the debuff bar — the correct direction. The inverse
+-- error, claiming DMFable falsely, is the bug this whole change exists to kill.
+--
+-- PURE, so the whole guard matrix is testable without a client.
+function Tracker.ShouldSeedDMFFromLiveAura(rec, live, nowE)
+    if type(rec) ~= "table" then return false end
+    if not live then return false end                  -- no fortune, nothing implied
+    if rec.dmfInBoon then return false end             -- stashed: A8.5 owns the edge
+    if rec.dmfCooldownActive then return false end     -- already tracked
+    local cd = rec.dmfCooldown
+    local clearedAt = (type(cd) == "table" and tonumber(cd.clearedAt)) or 0
+    if clearedAt > 0 then
+        local window = (ns.Store and ns.Store.DMF_COOLDOWN_ONLINE) or 14400
+        -- A future stamp (clock skew) reads as negative and refuses too.
+        if ((tonumber(nowE) or 0) - clearedAt) < window then return false end
+    end
+    return true
+end
+
+Tracker._dmfSeeded    = false   -- first capture seeds the edge detectors
+Tracker._dmfWasLive   = false
+Tracker._dmfWasInBoon = false   -- A8.5: the durable boon/unboon witness
 
 local function captureDMFEdges(rec)
     local Store = ns.Store
@@ -2187,18 +2260,38 @@ local function captureDMFEdges(rec)
                   and (tonumber(cell.duration) or 0) > 0
                   and (cell.source or 0) ~= BOON_SOURCE) and true or false
 
+    local inBoon    = rec.dmfInBoon and true or false
+    local wasInBoon = Tracker._dmfWasInBoon and true or false
+
     if not Tracker._dmfSeeded then
-        Tracker._dmfSeeded = true                       -- seed only; no edge
+        Tracker._dmfSeeded = true                       -- seed the edge detectors
+        -- A8.6: a live fortune with nothing tracked means we missed the gain.
+        if Tracker.ShouldSeedDMFFromLiveAura(rec, live, now) then
+            Store.DMFCooldownStart(rec, now)
+        end
+    elseif inBoon and not wasInBoon then
+        -- A8.5 net: entering a boon CARRYING DMF re-stamps a full 4 h. The tick
+        -- then freezes it until the buffs come back out.
+        Store.DMFCooldownStart(rec, now)
+    elseif wasInBoon and not inBoon and live then
+        -- A8.5 net: an unboon that RESTORES DMF re-stamps a full 4 h. `live` is
+        -- the restoration itself — a fortune that expired inside the boon comes
+        -- back as nothing and must not re-stamp.
+        Store.DMFCooldownStart(rec, now)
     elseif live and not Tracker._dmfWasLive
-           and not rec.dmfInBoon and not rec.dmfCooldownActive then
+           and not inBoon and not rec.dmfCooldownActive then
         Store.DMFCooldownStart(rec, now)                -- fresh fortune: 0 -> live
     end
-    Tracker._dmfWasLive = live
+    Tracker._dmfWasLive   = live
+    Tracker._dmfWasInBoon = inBoon
 
     -- A8.4: the push check runs BEFORE the tick so a cleared cooldown does not
-    -- also get billed for the elapsed time on its way out.
+    -- also get billed for the elapsed time on its way out. It runs AFTER the
+    -- re-stamps above for the same reason it exists: a full debuff bar is the
+    -- game telling us the hidden aura is gone, and that is the newer fact — so a
+    -- boon edge and a push landing in one capture end with the cooldown cleared.
     if Tracker.ShouldClearDMFOnDebuffPush(rec, visibleDebuffCount()) then
-        Store.DMFCooldownClear(rec, rec.nameRealm, "pushed off the debuff bar")
+        Store.DMFCooldownClear(rec, rec.nameRealm, "pushed off the debuff bar", now)
         announceDMFPush()
         Tracker._dmfPushes = (Tracker._dmfPushes or 0) + 1
         return
@@ -6249,6 +6342,7 @@ local function testBoonCastLifecycle(fails)
         unboon   = Tracker._unboonUntil,
         count    = Tracker._lastBoonCount,
         seeded   = Tracker._boonCountSeeded,
+        wasInBoon = Tracker._dmfWasInBoon,
     }
     local FRAME, EPOCH = 10000, 1700000000
     local frameNow = FRAME
@@ -6393,6 +6487,12 @@ local function testBoonCastLifecycle(fails)
     ck(rec.dmfInBoon == true, "A8.5: booning a live DMF sets dmfInBoon")
     ck(ns.Store.DMFCooldownRemaining(rec) == 14400,
        "A8.5: entering a boon CARRYING DMF re-stamps a full 4h (missed-unboon safety net)")
+    -- The cast is the FIRST of the two witnesses; it hands the capture's flip
+    -- detector the transition so the second witness sees a matched pair and does
+    -- not stamp a second time behind it.
+    ck(Tracker._dmfWasInBoon == true, "A8.5: the boon cast seeds the capture flip detector")
+    Tracker.FinishUnboonCast(rec, frameNow, EPOCH)
+    ck(Tracker._dmfWasInBoon == false, "A8.5: the unboon cast clears it again")
 
     -- ---- the removal recorder fires from a scan during the cast -----------
     reset()
@@ -6428,6 +6528,7 @@ local function testBoonCastLifecycle(fails)
     Tracker._unboonUntil     = savedState.unboon
     Tracker._lastBoonCount   = savedState.count
     Tracker._boonCountSeeded = savedState.seeded
+    Tracker._dmfWasInBoon    = savedState.wasInBoon
     if not ok then fails[#fails + 1] = "error in boon-cast fixtures: " .. tostring(err) end
 end
 
@@ -6484,6 +6585,7 @@ local function testDMFCapture(fails)
     local savedNow    = ns.Store.Now
     local savedDebuff = _G.C_UnitAuras
     local savedSeeded, savedWasLive = Tracker._dmfSeeded, Tracker._dmfWasLive
+    local savedWasInBoon = Tracker._dmfWasInBoon
     local savedLatch  = { Tracker._leavingWorld, Tracker._loggingOut }
     local EPOCH = 1700000000
     local epochNow = EPOCH
@@ -6503,15 +6605,59 @@ local function testDMFCapture(fails)
                  dmfCooldown = { offlineSince = 0, remainingOnlineSecs = 0, lastTickEpoch = 0 } }
     end
 
-    -- ---- the FIRST capture only seeds the edge (login must not re-stamp) ----
-    Tracker._dmfSeeded, Tracker._dmfWasLive = false, false
+    -- ---- A8.6 the FIRST capture: a LIVE fortune with nothing tracked -------
+    -- The pre-A8.6 rule was "seed only, never start", which is exactly how a
+    -- fortune taken across a disconnect became a permanent false DMFable. A live
+    -- 2h fortune cannot coexist with an expired 4h cooldown, so we start one.
+    Tracker._dmfSeeded, Tracker._dmfWasLive, Tracker._dmfWasInBoon = false, false, false
     local rec = newRec({ duration = 3000, option = 0, source = 0 })
     Tracker._captureDMF(rec)
+    ck(rec.dmfCooldownActive == true,
+       "A8.6 login seed: a live fortune with no tracked cooldown starts one")
+    ck(ns.Store.DMFCooldownRemaining(rec) == 14400, "A8.6 login seed: a full 4h is owed")
+    ck(rec.dmfCooldownRemaining == 14400,
+       "A8.6 login seed: the wire mirror is published on this edge too, got "
+       .. tostring(rec.dmfCooldownRemaining))
+
+    -- GUARD 1: a cooldown we ALREADY track is never re-stamped at login. This is
+    -- the /reload case, and re-stamping it would reset the countdown on every
+    -- reload — the failure the old seed-only rule existed to prevent.
+    Tracker._dmfSeeded, Tracker._dmfWasLive, Tracker._dmfWasInBoon = false, false, false
+    rec = newRec({ duration = 3000, option = 0, source = 0 })
+    ns.Store.DMFCooldownStart(rec, epochNow - 10000)
+    ns.Store.DMFCooldownTick(rec, epochNow)
+    Tracker._captureDMF(rec)
+    ck(ns.Store.DMFCooldownRemaining(rec) == 4400,
+       "A8.6 guard: a tracked cooldown resumes at its own value, it is not re-stamped")
+
+    -- GUARD 2: a clear WE performed inside the last 4h explains the live aura, so
+    -- the rule refuses. This is the debuff-bar push followed by a /reload — the
+    -- one shape that would otherwise resurrect a cooldown the game really did drop.
+    Tracker._dmfSeeded, Tracker._dmfWasLive, Tracker._dmfWasInBoon = false, false, false
+    rec = newRec({ duration = 3000, option = 0, source = 0 })
+    rec.dmfCooldown.clearedAt = epochNow - 600          -- pushed off 10 minutes ago
+    Tracker._captureDMF(rec)
     ck(rec.dmfCooldownActive ~= true,
-       "login seed: a fortune already live at login does NOT start a fresh 4h")
+       "A8.6 guard: a clear 10 minutes old explains the live aura -> no cooldown started")
+    -- ...and the explanation expires with the cooldown length itself.
+    Tracker._dmfSeeded, Tracker._dmfWasLive, Tracker._dmfWasInBoon = false, false, false
+    rec = newRec({ duration = 3000, option = 0, source = 0 })
+    rec.dmfCooldown.clearedAt = epochNow - 14400
+    Tracker._captureDMF(rec)
+    ck(rec.dmfCooldownActive == true,
+       "A8.6 guard: a clear a full 4h old no longer explains anything")
+
+    -- GUARD 3: no aura, stashed in a boon, or a future clearedAt (clock skew).
+    local SEED = Tracker.ShouldSeedDMFFromLiveAura
+    ck(SEED({}, false, EPOCH) == false, "A8.6 guard: no live fortune -> nothing implied")
+    ck(SEED({ dmfInBoon = true }, true, EPOCH) == false,
+       "A8.6 guard: a fortune stashed in a boon is A8.5's business, not this rule's")
+    ck(SEED({ dmfCooldown = { clearedAt = EPOCH + 5000 } }, true, EPOCH) == false,
+       "A8.6 guard: a clearedAt in the future reads as recent, not as ancient")
+    ck(SEED(nil, true, EPOCH) == false, "A8.6 guard: nil record is inert")
 
     -- ---- a genuine 0 -> live gain starts the cooldown ----------------------
-    Tracker._dmfSeeded, Tracker._dmfWasLive = true, false
+    Tracker._dmfSeeded, Tracker._dmfWasLive, Tracker._dmfWasInBoon = true, false, false
     rec = newRec({ duration = 7200, option = 0, source = 0 })
     Tracker._captureDMF(rec)
     ck(rec.dmfCooldownActive == true, "fresh gain: cooldown started")
@@ -6542,6 +6688,74 @@ local function testDMFCapture(fails)
        "J4: the teardown path skipped the wire mirror")
     Tracker._loggingOut = false
 
+    -- ---- A8.5 the CAPTURE-WITNESSED boon / unboon re-stamps ----------------
+    -- The A7 cast handlers already re-stamp when they SEE the cast. These are the
+    -- same two edges witnessed from rec.dmfInBoon, which captureAuras rebuilds
+    -- from the client on every pass — the net that catches a transition whose cast
+    -- we never saw.
+    --
+    -- RED CONTROL for the pre-fix code: the only capture-side start was the
+    -- 0 -> live fresh-gain edge, and it fires ONLY when `not rec.dmfCooldownActive`.
+    -- A running cooldown was therefore never re-stamped — both assertions below
+    -- read 120 (the stale countdown, which then expired early and printed the
+    -- false "DMFable") instead of 14400.
+    epochNow = EPOCH + 2000
+    Tracker._dmfSeeded, Tracker._dmfWasLive, Tracker._dmfWasInBoon = true, true, false
+    rec = newRec({ duration = 3000, option = 0, source = 0 })
+    rec.dmfCooldown = { offlineSince = 0, remainingOnlineSecs = 120, lastTickEpoch = epochNow }
+    rec.dmfCooldownActive = true
+    rec.dmfInBoon = true                       -- entered a boon CARRYING DMF
+    Tracker._captureDMF(rec)
+    ck(ns.Store.DMFCooldownRemaining(rec) == 14400,
+       "A8.5 capture: entering a boon carrying DMF re-stamps a full 4h, got "
+       .. tostring(ns.Store.DMFCooldownRemaining(rec)))
+    ck(rec.dmfCooldownRemaining == 14400,
+       "A8.5 capture: the boon-entry edge publishes the wire mirror")
+
+    -- ...and the boon freeze then holds it there.
+    epochNow = EPOCH + 5000
+    Tracker._captureDMF(rec)
+    ck(ns.Store.DMFCooldownRemaining(rec) == 14400,
+       "A8.5 capture: booned, the re-stamped 4h is frozen rather than ticking")
+
+    -- The unboon side, over a nearly-spent cooldown: the whole point of the fix.
+    epochNow = EPOCH + 6000
+    rec.dmfInBoon = false
+    rec.auraStates[SLOT_DMF] = { duration = 3000, option = 0, source = 0 }
+    ns.Store.DMFCooldownStart(rec, epochNow - 14280)
+    ns.Store.DMFCooldownTick(rec, epochNow)
+    ck(ns.Store.DMFCooldownRemaining(rec) == 120, "A8.5 capture: fixture is a nearly-spent CD")
+    Tracker._captureDMF(rec)
+    ck(ns.Store.DMFCooldownRemaining(rec) == 14400,
+       "A8.5 capture: an unboon that RESTORES DMF re-stamps a full 4h over a running CD, got "
+       .. tostring(ns.Store.DMFCooldownRemaining(rec)))
+    ck(rec.dmfCooldownRemaining == 14400,
+       "A8.5 capture: the unboon edge publishes the wire mirror")
+
+    -- An unboon whose fortune EXPIRED inside the boon restores nothing, so there
+    -- is no fortune to owe a cooldown for and nothing is re-stamped.
+    epochNow = EPOCH + 7000
+    Tracker._dmfSeeded, Tracker._dmfWasLive, Tracker._dmfWasInBoon = true, false, true
+    rec = newRec(nil)
+    rec.dmfCooldown = { offlineSince = 0, remainingOnlineSecs = 120, lastTickEpoch = epochNow }
+    rec.dmfCooldownActive = true
+    Tracker._captureDMF(rec)
+    ck(ns.Store.DMFCooldownRemaining(rec) == 120,
+       "A8.5 capture: an unboon that restores NO DMF does not re-stamp")
+
+    -- A relog while BOONED is a seed, not an edge. Without this the cooldown
+    -- would be re-stamped on every single /reload made while booned.
+    epochNow = EPOCH + 8000
+    Tracker._dmfSeeded, Tracker._dmfWasLive, Tracker._dmfWasInBoon = false, false, false
+    rec = newRec(nil)
+    rec.dmfCooldown = { offlineSince = 0, remainingOnlineSecs = 120, lastTickEpoch = epochNow }
+    rec.dmfCooldownActive = true
+    rec.dmfInBoon = true
+    Tracker._captureDMF(rec)
+    ck(ns.Store.DMFCooldownRemaining(rec) == 120,
+       "A8.5 capture: a relog while booned seeds the witness, it does not re-stamp")
+    ck(Tracker._dmfWasInBoon == true, "A8.5 capture: the seed adopts the observed boon state")
+
     -- ---- A8.4 debuff-bar push: the gate matrix (PURE) ----------------------
     local S = Tracker.ShouldClearDMFOnDebuffPush
     local on = { dmfCooldownActive = true, dmfInBoon = false, inInstance = false }
@@ -6557,7 +6771,7 @@ local function testDMFCapture(fails)
     ck(S(nil, 16) == false, "push: nil record is inert")
 
     -- ---- A8.4 the push actually clears, through the capture path -----------
-    Tracker._dmfSeeded, Tracker._dmfWasLive = true, true
+    Tracker._dmfSeeded, Tracker._dmfWasLive, Tracker._dmfWasInBoon = true, true, false
     rec = newRec({ duration = 7200, option = 0, source = 0 })
     ns.Store.DMFCooldownStart(rec, epochNow)
     nDebuffs = 16
@@ -6570,6 +6784,20 @@ local function testDMFCapture(fails)
     -- timer for a cooldown that is over.
     ck(rec.dmfCooldownRemaining == 0,
        "J4: the debuff-push clear must publish 0, got " .. tostring(rec.dmfCooldownRemaining))
+    ck(rec.dmfCooldown.clearedAt == epochNow,
+       "A8.6: the push stamps the witness, so a /reload cannot resurrect the cooldown")
+
+    -- COMPOSITION: a re-stamp edge and a full debuff bar in the SAME capture. The
+    -- bar is the newer fact — the game has just told us the hidden aura is gone —
+    -- so the capture ends cleared, not on a fresh 4h.
+    Tracker._dmfSeeded, Tracker._dmfWasLive, Tracker._dmfWasInBoon = true, true, true
+    rec = newRec({ duration = 3000, option = 0, source = 0 })
+    ns.Store.DMFCooldownStart(rec, epochNow)
+    rec.dmfInBoon = false                       -- an unboon edge this same capture
+    Tracker._captureDMF(rec)
+    ck(rec.dmfCooldownActive == false,
+       "A8.4/A8.5: a push landing with a re-stamp edge still ends cleared")
+    ck(rec.dmfCooldownRemaining == 0, "A8.4/A8.5: and publishes 0")
     nDebuffs = 0
 
     -- ---- A8.4 announcement routing (PURE) ----------------------------------
@@ -6595,6 +6823,7 @@ local function testDMFCapture(fails)
     ns.Store.Now   = savedNow
     _G.C_UnitAuras = savedDebuff
     Tracker._dmfSeeded, Tracker._dmfWasLive = savedSeeded, savedWasLive
+    Tracker._dmfWasInBoon = savedWasInBoon
     Tracker._leavingWorld, Tracker._loggingOut = savedLatch[1], savedLatch[2]
     if not ok then fails[#fails + 1] = "error in DMF capture fixtures: " .. tostring(err) end
 end
