@@ -198,8 +198,13 @@
 --       c  = { [cdKey] = <epoch the cooldown is ready> },
 --     }
 --
---   cdKey is the teaching spell id as a string, or "g<n>" for a shared-cooldown
---   group ("g1" is alchemy's transmutes).
+--   cdKey is the teaching spell id as a string, or "g<n>" for a dataset-marked
+--   cooldown GROUP. "g1" is alchemy's transmutes (twelve recipes, one timer);
+--   "g2" is Mooncloth, a group of exactly ONE — a solo cooldown is still a
+--   group, so the key rule stays the only rule (FIX-5, the 2026-08-11 fact
+--   pass). A bare spell id therefore means "this recipe carries a cooldown the
+--   dataset does not know about", which is where a stamp from a peer running an
+--   older dataset lands; see Professions.CanonCdKey.
 --
 --   A profKey present with `k` absent means: this character HAS the profession
 --   (proved by the rank spells, or by a witnessed skill-panel row — herbalism
@@ -2382,12 +2387,37 @@ end
 ----------------------------------------------------------------------
 -- COOLDOWNS
 --
--- Folded from a proven-complete scan. The group rule collapses alchemy's
--- transmutes onto one key; everything else keys on its own teaching spell id.
--- Returns { [cdKey] = readyAtEpoch } for the RUNNING cooldowns and a second
--- table of every key this scan PROVED is not running, which is what licenses a
--- delete.
+-- Folded from a proven-complete scan. The group rule collapses every
+-- dataset-marked cooldown onto its group key — alchemy's twelve transmutes
+-- onto "g1", Mooncloth alone onto "g2" (FIX-5) — and everything else keys on
+-- its own teaching spell id. Returns { [cdKey] = readyAtEpoch } for the RUNNING
+-- cooldowns and a second table of every key this scan PROVED is not running,
+-- which is what licenses a delete.
 ----------------------------------------------------------------------
+
+-- THE KEY, CANONICALISED (FIX-5's migration seam). A stamp written before a
+-- recipe carried its cd marking — by an older build of ours, or by a peer still
+-- running one — is keyed on the bare teaching spell id. This build folds that
+-- same recipe onto its group key, so the two spellings would enumerate as TWO
+-- cooldown kinds wearing ONE name: "Mooncloth" listed twice, which is a lie
+-- about how many timers the character has.
+--
+-- The translation is safe because it uses nothing but our own marking: a bare
+-- spell id and its group are the same fact when the group has one member, and
+-- for a shared group the id was always a member of it. A key we cannot name
+-- (garbage, or a spell outside the dataset) comes back UNCHANGED — never
+-- dropped, because a stamp we cannot explain is still a stamp somebody's client
+-- wrote and the honest answer is to carry it, not to erase it.
+function Professions.CanonCdKey(cdKey)
+    local key = tostring(cdKey or "")
+    if key:match("^g%d+$") then return key end
+    local spell = tonumber(key)
+    if not spell then return key end
+    if not Dataset.LoadCore() then return key end
+    local rec = Dataset.recipe and Dataset.recipe[spell]
+    if rec and rec.cd and rec.cd > 0 then return "g" .. rec.cd end
+    return key
+end
 
 function Professions.FoldCooldowns(scan, now, reader)
     if not (scan and scan.complete) then return nil, nil end
@@ -3061,8 +3091,26 @@ function Professions.SeedFromStore()
             L.p[key] = cur
         end
     end
+    -- COOLDOWN KEYS, CANONICALISED (FIX-5). A stamp this character wrote before
+    -- Mooncloth carried its cd marking is keyed on the bare spell id, and it
+    -- would linger FOREVER: the fold now proves "g2", never "18560", so the
+    -- proven-ready delete can never reach the old spelling. Re-key it on the
+    -- way in — the later of the two stamps wins, because a cooldown that is
+    -- running is the fact, and an older ready-at can only understate it.
     if type(d.c) == "table" then
+        local folded = {}
         for key, at in pairs(d.c) do
+            local ck = Professions.CanonCdKey(key)
+            local cur = folded[ck]
+            -- Two stored spellings of one timer: the LATER ready-at wins. A
+            -- cooldown that is running is the fact; an older stamp can only
+            -- understate it, and understating reads as "go craft it" — the one
+            -- wrong answer a cooldown pane must never give.
+            if cur == nil or (tonumber(at) or 0) > (tonumber(cur) or 0) then
+                folded[ck] = at
+            end
+        end
+        for key, at in pairs(folded) do
             if L.c[key] == nil then L.c[key] = at end
         end
     end
@@ -4605,13 +4653,52 @@ local function testDatasetIntegrity(fails)
     end
     ck(grants == 29, "expected 29 grant-on-learn recipes, found " .. grants)
 
-    -- The shared transmute cooldown group.
-    local transmutes = 0
-    for _, r in pairs(Dataset.recipe) do
-        if r.cd == 1 then transmutes = transmutes + 1 end
+    -- THE COOLDOWN MARKINGS, WHOLE (FIX-5, the 2026-08-11 fact pass). The
+    -- dataset marks exactly TWO cooldown groups and no more, because exactly
+    -- two things in Classic Era put a cooldown on a trade-skill WINDOW recipe:
+    --
+    --   g1  alchemy's transmutes — many recipes, one timer. Derived from the
+    --       recipe names, so its membership is the data's own answer.
+    --   g2  Mooncloth (18560, Tailoring 250) — one recipe, its own timer,
+    --       4 days. A solo cooldown is a group of ONE; the duration is not
+    --       shipped, only the group, because the remaining time comes live
+    --       from GetTradeSkillCooldown.
+    --
+    -- REJECTED, ON PURPOSE — do not re-litigate this without a fact pass:
+    -- Refined Deeprock Salt is NOT a leatherworking pattern. It is the use
+    -- effect of the Salt Shaker item (15846) and its 3-day cooldown sits on the
+    -- PLAYER, so no trade-skill window ever reports it and this model cannot
+    -- carry it honestly. Spell 19567 "Salt Shaker" is in the dataset as the
+    -- ENGINEERING recipe that crafts the device, and that craft has no
+    -- cooldown — asserted below so a future pass cannot quietly mark it.
+    local groups, transmutes, soloG2 = {}, 0, {}
+    for spell, r in pairs(Dataset.recipe) do
+        if r.cd and r.cd > 0 then
+            groups[r.cd] = (groups[r.cd] or 0) + 1
+            if r.cd == 1 then
+                transmutes = transmutes + 1
+                ck(Dataset.ProfKey(r.p) == "alchemy",
+                   "a non-alchemy recipe joined the transmute cooldown group")
+            elseif r.cd == 2 then
+                soloG2[#soloG2 + 1] = spell
+            end
+        end
     end
-    ck(transmutes >= 12, "the transmute cooldown group holds " .. transmutes
-       .. " recipes; alchemy's transmute line is larger than that")
+    ck(transmutes == 12, "the transmute cooldown group holds " .. transmutes
+       .. " recipes, the fact pass counted 12")
+    ck(groups[2] == 1 and soloG2[1] == 18560,
+       "FIX-5: cooldown group 2 is not exactly Mooncloth (18560)")
+    ck(Dataset.recipe[18560] and Dataset.ProfKey(Dataset.recipe[18560].p) == "tailoring",
+       "FIX-5: Mooncloth is not a tailoring recipe any more")
+    ck(Dataset.recipe[18560] and Dataset.recipe[18560].s == 250,
+       "FIX-5: Mooncloth's skill requirement moved off 250")
+    local nGroups = 0
+    for _ in pairs(groups) do nGroups = nGroups + 1 end
+    ck(nGroups == 2, "the dataset marks " .. nGroups
+       .. " cooldown groups; the fact pass approved exactly 2 (g1 transmutes, g2 Mooncloth)")
+    ck(Dataset.recipe[19567] and (Dataset.recipe[19567].cd or 0) == 0,
+       "the Salt Shaker's engineering craft was marked with a window cooldown it "
+       .. "does not have (the 3-day timer is the ITEM's use effect, on the player)")
 end
 
 local function testEncodingRoundTrip(fails)
@@ -4928,6 +5015,70 @@ local function testCaptureHonesty(fails)
         Professions.ApplyCooldowns(r4, p4)
         ck(Professions.Live().c.g1 == 99999,
            "a blacksmithing scan cleared an alchemy cooldown it never observed")
+
+        -- (7b) THE SOLO COOLDOWN, CAPTURE SIDE (FIX-5, the 2026-08-11 fact
+        --      pass). Mooncloth carries its OWN timer, so the dataset marks it
+        --      as a cooldown group of exactly one and the SAME key rule
+        --      (cd > 0 => "g<cd>") sends it to "g2". The point of the marking
+        --      is the pane, but it is worthless unless the CAPTURE writes the
+        --      same key the pane enumerates — so it is proved here, on a real
+        --      tailoring window, before the pane is asked anything.
+        --
+        --      OUT OF SCOPE, decided and not to be re-litigated: Refined
+        --      Deeprock Salt is the USE effect of the Salt Shaker item (15846)
+        --      with the 3-day cooldown on the PLAYER, not a leatherworking
+        --      window recipe — GetTradeSkillCooldown never sees it, so this
+        --      model cannot carry it and it carries no marking. Spell 19567
+        --      ("Salt Shaker") IS in the dataset, as the ENGINEERING recipe for
+        --      the device, and that craft has no cooldown of any kind.
+        Professions._live = nil
+        local MOONCLOTH = 18560
+        local tlList = Dataset.profRecipes[Dataset.profIdx.tailoring]
+        ck(Dataset.recipe[MOONCLOTH] ~= nil, "Mooncloth left the dataset")
+        ck(Dataset.recipe[MOONCLOTH] and Dataset.recipe[MOONCLOTH].cd == 2,
+           "FIX-5: Mooncloth does not carry cooldown group 2")
+        ck(Dataset.recipe[19567] ~= nil and (Dataset.recipe[19567].cd or 0) == 0,
+           "the Salt Shaker's engineering craft grew a window cooldown it does not have")
+        W.rows = { MOONCLOTH }
+        local tlFill = 0
+        for i = 1, #tlList do
+            if tlList[i] ~= MOONCLOTH and tlFill < 4 then
+                tlFill = tlFill + 1
+                W.rows[#W.rows + 1] = tlList[i]
+            end
+        end
+        W.cds = { [1] = 345600 }        -- the 4-day timer, live off the window
+        _G.GetTradeSkillLine = function() return "Tailoring", 300, 300 end
+        local tScan = Professions.ScanTradeSkillWindow()
+        ck(tScan and tScan.profKey == "tailoring", "the tailoring window did not resolve")
+        local tRun, tProven = Professions.FoldCooldowns(tScan, 1000)
+        ck(tRun and tRun.g2 == 1000 + 345600,
+           "Mooncloth did not fold onto its own group key g2")
+        ck(tRun and tRun[tostring(MOONCLOTH)] == nil,
+           "Mooncloth still folded onto its bare spell id as well as its group")
+        ck(tProven and tProven.g2 == true, "the g2 key was not proven by the scan")
+        Professions.ApplyCooldowns(tRun, tProven)
+        ck(Professions.Live().c.g2 == 1000 + 345600, "the Mooncloth stamp did not store")
+        -- ...and a proven-ready tailoring scan deletes it, same gate as g1.
+        W.cds = {}
+        local tRun2, tProven2 = Professions.FoldCooldowns(
+            Professions.ScanTradeSkillWindow(), 400000)
+        Professions.ApplyCooldowns(tRun2, tProven2)
+        ck(Professions.Live().c.g2 == nil, "a proven-ready Mooncloth cooldown was not cleared")
+
+        -- (7c) THE KEY, CANONICALISED. The legacy spelling of a now-marked
+        --      recipe is the same timer as its group, and CanonCdKey is the one
+        --      place that says so. A key we cannot name comes back unchanged —
+        --      a stamp we cannot explain is still a stamp somebody wrote.
+        ck(Professions.CanonCdKey(MOONCLOTH) == "g2",
+           "a legacy Mooncloth stamp did not canonicalise onto g2")
+        ck(Professions.CanonCdKey(tostring(transmutes[1])) == "g1",
+           "a legacy transmute stamp did not canonicalise onto g1")
+        ck(Professions.CanonCdKey("g2") == "g2", "a group key was rewritten")
+        ck(Professions.CanonCdKey(tostring(tlList[1] == MOONCLOTH and tlList[2] or tlList[1]))
+           == tostring(tlList[1] == MOONCLOTH and tlList[2] or tlList[1]),
+           "an unmarked recipe's key was invented into a group")
+        ck(Professions.CanonCdKey("nonsense") == "nonsense", "a garbage key was not carried")
 
         -- (8) THE CRAFT SURFACE refuses the hunter beast-training window.
         _G.CraftIsEnchanting = function() return false end
@@ -7932,6 +8083,21 @@ local function testDatasetMigration(fails)
     ck(stampSet[INCIDENT_STAMP] == Dataset.SetHash(),
        "the incident stamp " .. INCIDENT_STAMP .. " is not recorded as our set - "
        .. "the identity pair f84a5fa0<->4b17878e went missing")
+
+    -- THE SET-HASH PIN. A literal, deliberately. The stamp is expected to move
+    -- whenever the facts change; the SET hash may only move when the recipe
+    -- membership-or-ordering does, and that costs every character on the mesh a
+    -- re-scan tour. Pinning the value turns "did I change the coordinate
+    -- system?" from a thing an author has to remember into a thing the suite
+    -- refuses. Metadata-only work — sources, zones, spec edges, notes, and the
+    -- FIX-5 cooldown markings of 2026-08-11 — leaves this line untouched and
+    -- invalidates NOTHING. Moving it is a deliberate act with owner sign-off,
+    -- and the [migration] rows below are what pays for it.
+    local PINNED_SET = "s1-3dbe2152"
+    ck(Dataset.SetHash() == PINNED_SET,
+       "the recipe-set hash moved to " .. tostring(Dataset.SetHash()) .. " (pinned "
+       .. PINNED_SET .. ") - the bitmap coordinate system CHANGED and every stored "
+       .. "record is affected; if that was intended, re-pin it deliberately")
 
     ----------------------------------------------------------------
     -- LEG 1 — the identity bump (set unchanged, stamp changed)
