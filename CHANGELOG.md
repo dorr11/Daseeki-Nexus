@@ -2,6 +2,30 @@
 
 ## Unreleased
 
+- **New: the shopping list can go looking for holiday recipes, if you ask it to.**
+  Recipes whose only shop is a holiday vendor — the Winter Veil cooking recipes and
+  their kin — were left off the shopping list all year round, on the grounds that
+  you cannot walk up and buy them today. But the auction house does not keep a
+  calendar: somebody bought one in December and it is sitting on the AH in June,
+  which is exactly when people go looking.
+
+  A new **Include event-vendor recipes** tick sits under the Professions detail
+  pane's filters, next to "Missing only". Off by default, and with it off the
+  shopping list is precisely the list it has always been — nothing moves unless you
+  flip it. Turn it on and event recipes join the list wearing where they come from:
+  *Event vendor — Feast of Winter Veil · Sold by Penney Copperpinch — Orgrimmar…*,
+  with the event's real name from the shipped data (anything the data cannot name
+  reads "seasonal", never a guess). The printed list says "including event items" in
+  its header, so a list you scroll back to later still tells you which rule made it,
+  and Auctionator gets the extra names too.
+
+  Every other rule stands exactly as it was: a soulbound holiday recipe is still
+  left off, one you can only get as a quest reward is still left off (nobody can
+  post that), a recipe for a specialisation you did not take is still left off, and
+  an item the client has not finished loading is still held rather than guessed at.
+  The tick is remembered across sessions, and a settings file that comes back
+  scrambled reads as "off" rather than quietly widening your list.
+
 - **Fixed: a Weaponsmith is no longer told the Master smith recipes are not for him.**
   A blacksmith who had taken Weaponsmith saw every Master Swordsmith, Master
   Hammersmith and Master Axesmith recipe struck off his list as "requires another
