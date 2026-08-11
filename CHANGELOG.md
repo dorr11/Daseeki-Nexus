@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.1.9 — 2026-08-10
 
 - **Fixed: opening a profession window could freeze the game with a script error.** On some
   clients the trade-skill window would not open at all — the game reported a stack overflow
