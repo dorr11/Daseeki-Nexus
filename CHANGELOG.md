@@ -27,6 +27,13 @@
   still never auto-progressed, and the reward priority, bag-space and gold rules are
   exactly as they were.
 
+- **Fixed: Nexus no longer files a script error about an event called `LEARNED_SPELL_IN_TAB`.**
+  The professions module asked the game to tell it about a signal this version of WoW does
+  not have, and the game complained every time — once per login, over and over in your
+  error log. The name is gone (the signal it was standing in for is already covered), event
+  wiring now happens once and only once, and anything the game does refuse is recorded
+  quietly and shown by `/dsn debug professions` instead of being thrown at you again.
+
 - **New: `/dsn debug rinwosho`.** The ten most recent visits to Rin'wosho, each step with
   what was decided and why, and a one-line signature per visit saying whether the game
   handed the conversation back after the turn-in and after the vendor window. If a repair

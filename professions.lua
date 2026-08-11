@@ -294,6 +294,12 @@ Professions.TRACE_CAP = TRACE_CAP
 -- Blizzard events the module subscribes to, on ITS OWN frame, only while
 -- enabled. Listed here so the inertness self-test can assert the set rather
 -- than trusting a comment.
+--
+-- EVERY name in this list must exist in the client's event registry. That is
+-- not a convention any more: the harness gate (nexus-test-harness/harness/
+-- eventcheck.lua) derives the registry from the wow-api-catalog dump and turns
+-- the run RED on a name the client does not know. See the LEARNED_SPELL_IN_TAB
+-- note at Professions.RegisterEventList for why the gate had to exist.
 Professions.EVENTS = {
     "TRADE_SKILL_SHOW", "TRADE_SKILL_UPDATE", "TRADE_SKILL_CLOSE",
     "CRAFT_SHOW", "CRAFT_UPDATE", "CRAFT_CLOSE",
@@ -310,17 +316,18 @@ Professions.EVENTS = {
     --                               when the window's own update echo goes
     --                               missing. Unit-filtered to "player" where the
     --                               client offers RegisterUnitEvent.
-    -- LEARNED_SPELL_IN_TAB is the pre-rename Classic spelling; it is NOT in the
-    -- 11509 event registry, but registration is pcall'd per event, so listing it
-    -- costs nothing on a client without it and covers a client that still fires
-    -- the old name. An unknown event name simply fails its own RegisterEvent.
-    "CHAT_MSG_SKILL", "LEARNED_SPELL_IN_SKILL_LINE", "LEARNED_SPELL_IN_TAB",
+    "CHAT_MSG_SKILL", "LEARNED_SPELL_IN_SKILL_LINE",
     "UNIT_SPELLCAST_SUCCEEDED",
 }
 
 -- Session state. All of it is nil/false until Activate() runs.
 Professions._frame         = nil
 Professions._activated     = false
+-- Event names THIS CLIENT refused, one entry each, ever (see
+-- Professions.RegisterEventList). Deliberately NOT cleared with the rest of the
+-- session state on disable: it describes the client, not the module's run, and
+-- one entry is the whole point — a refusal that can repeat is the bug.
+Professions._refusedEvents = nil
 Professions._lastSig       = nil
 Professions._pending       = nil
 Professions._dirtyTimer    = nil
@@ -4064,7 +4071,7 @@ local function onEvent(_, event, ...)
         -- so every settled profession is marked. Marking is two table writes;
         -- the cost lands on the NEXT window look, as one full capture.
         Professions.MarkStale(nil)
-    elseif event == "LEARNED_SPELL_IN_SKILL_LINE" or event == "LEARNED_SPELL_IN_TAB" then
+    elseif event == "LEARNED_SPELL_IN_SKILL_LINE" then
         -- Learning a recipe (or a rank spell) — the id usually names the
         -- profession through the dataset, so the mark can be surgical. An id we
         -- do not carry marks everything: conservative, never silent.
@@ -4117,6 +4124,81 @@ local function onEvent(_, event, ...)
 end
 Professions._onEvent = onEvent
 
+----------------------------------------------------------------------
+-- THE REGISTRATION SEAM (fix/phantom-event, 2026-08-10).
+--
+-- Every list-driven event registration in this module goes through here, and
+-- nothing else in the file calls frame:RegisterEvent. Two rules, both scars:
+--
+--   ONCE PER FRAME. The frame carries its own ledger of what it already holds,
+--   so a second pass over the same list registers NOTHING — a toggle race, a
+--   self-test that re-enables, or a future caller that forgets the _activated
+--   guard all cost zero calls instead of a second full round. Re-registering a
+--   VALID event is silent waste; re-registering an invalid one is how one bad
+--   name became 32 lines in the owner's BugSack. (The ledger, not
+--   IsEventRegistered, is the source of truth: it is the one answer that is
+--   identical on a live frame and on the headless harness's chainable mock.
+--   The frame is dropped whole on disable, so the ledger cannot outlive the
+--   registrations it describes.)
+--
+--   ONE COMPLAINT, AS DATA. A name the client refuses is recorded ONCE in
+--   Professions._refusedEvents and printed by `/dsn debug professions`. It is
+--   never re-attempted and never becomes a repeated throw.
+--
+-- WHY THE OLD SHAPE WAS NOT SAFE: the previous code wrote
+-- `pcall(function() f:RegisterEvent(ev) end)` and a comment claiming an unknown
+-- name therefore "costs nothing". The live 1.15.9 client disagreed —
+-- "Attempt to register unknown event" reached the global error handler (which
+-- is the only reason BugGrabber ever saw it), so pcall was never the shield it
+-- was described as. pcall stays here as the belt; the braces are the harness
+-- gate (nexus-test-harness/harness/eventcheck.lua), which checks every event
+-- name in the shipped files against the catalog's registry so a phantom cannot
+-- be typed in the first place.
+--
+-- Returns registered, skipped-as-already-held, refused.
+function Professions.RegisterEventList(frame, list)
+    if not frame or type(list) ~= "table" then return 0, 0, 0 end
+    local held = frame._dsnEvents
+    if not held then held = {} frame._dsnEvents = held end
+    local registered, already, refused = 0, 0, 0
+    for i = 1, #list do
+        local ev = list[i]
+        if type(ev) == "string" and ev ~= "" then
+            if held[ev] == true then
+                already = already + 1
+            elseif held[ev] == "refused" then
+                -- Known bad on THIS frame: counted, never re-attempted. This is
+                -- the line that turns "32 occurrences" into "one".
+                refused = refused + 1
+            else
+                local ok
+                if ev == "UNIT_SPELLCAST_SUCCEEDED" and frame.RegisterUnitEvent then
+                    -- Unit-filtered where the client offers it: the handler only
+                    -- ever cares about the player, and the raid's casts are noise.
+                    ok = pcall(frame.RegisterUnitEvent, frame, ev, "player")
+                    if not ok then ok = pcall(frame.RegisterEvent, frame, ev) end
+                else
+                    ok = pcall(frame.RegisterEvent, frame, ev)
+                end
+                if ok then
+                    held[ev] = true
+                    registered = registered + 1
+                else
+                    held[ev] = "refused"
+                    refused = refused + 1
+                    -- Once. The debug command is where this is read; a
+                    -- registration the client refused is a build-time fact, not
+                    -- something to shout at the player about.
+                    local seen = Professions._refusedEvents
+                    if not seen then seen = {} Professions._refusedEvents = seen end
+                    seen[ev] = (seen[ev] or 0) + 1
+                end
+            end
+        end
+    end
+    return registered, already, refused
+end
+
 function Professions.Activate()
     if Professions._activated then return true end
     if not Professions.IsEnabled() then return false end
@@ -4125,17 +4207,7 @@ function Professions.Activate()
     if not Professions._frame and CreateFrame then
         local f = CreateFrame("Frame")
         f:SetScript("OnEvent", onEvent)
-        for i = 1, #Professions.EVENTS do
-            local ev = Professions.EVENTS[i]
-            if ev == "UNIT_SPELLCAST_SUCCEEDED" and f.RegisterUnitEvent then
-                -- Unit-filtered where the client offers it: the handler only
-                -- ever cares about the player, and the raid's casts are noise.
-                local ok = pcall(function() f:RegisterUnitEvent(ev, "player") end)
-                if not ok then pcall(function() f:RegisterEvent(ev) end) end
-            else
-                pcall(function() f:RegisterEvent(ev) end)
-            end
-        end
+        Professions.RegisterEventList(f, Professions.EVENTS)
         Professions._frame = f
     end
 
@@ -4245,7 +4317,21 @@ ns:RegisterDebugCommand("professions", function()
     local P = Professions
     ns:Print("professions: module " .. (P.IsEnabled() and "enabled" or "DISABLED")
         .. ", " .. (P._activated and "active" or "inactive")
-        .. ", frame " .. (P._frame and "up" or "none"))
+        .. ", frame " .. (P._frame and "up" or "none")
+        .. ", events " .. tostring(#P.EVENTS))
+    -- The registration seam's only voice. Empty on a healthy client, and empty
+    -- is what the harness gate (eventcheck.lua) is there to keep it.
+    if P._refusedEvents then
+        local refused = {}
+        for ev, n in pairs(P._refusedEvents) do
+            refused[#refused + 1] = ev .. " x" .. tostring(n)
+        end
+        table.sort(refused)
+        if #refused > 0 then
+            ns:Print("  |cffff5555this client refused|r: " .. table.concat(refused, ", ")
+                .. " (attempted once per frame, never retried on one)")
+        end
+    end
     local meta = Dataset.Meta()
     ns:Print(string.format("  dataset %s: %s (%s), core %s, sources %s",
         Dataset.Version(),
@@ -7479,6 +7565,153 @@ local function testInertness(fails)
 end
 
 ----------------------------------------------------------------------
+-- SELF-TEST: the registration seam (fix/phantom-event).
+--
+-- The live defect: `Frame:RegisterEvent(): Attempt to register unknown event
+-- "LEARNED_SPELL_IN_TAB"`, 32 occurrences in the owner's BugSack. The name was
+-- never in the 11509 registry, and the pcall around it was not the shield its
+-- comment claimed. Three things are asserted here, and a fourth (that no name
+-- in the list is a phantom AT ALL) is asserted statically by the harness gate
+-- eventcheck.lua, which is the only place that can see the catalog.
+----------------------------------------------------------------------
+
+local function testEventRegistration(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+
+    -- A frame that COUNTS, and can be told to refuse a name the way the client
+    -- refuses one. Deliberately not the harness's chainable mock: the point of
+    -- this suite is the call count, which the mock cannot report.
+    local function fakeFrame(bad)
+        local f = { calls = 0, unitCalls = 0, seen = {}, units = {} }
+        function f:RegisterEvent(ev)
+            self.calls = self.calls + 1
+            if bad and bad[ev] then
+                error("Frame:RegisterEvent(): Attempt to register unknown event \"" .. ev .. "\"", 0)
+            end
+            self.seen[ev] = (self.seen[ev] or 0) + 1
+        end
+        function f:RegisterUnitEvent(ev, unit)
+            self.unitCalls = self.unitCalls + 1
+            if bad and bad[ev] then
+                error("Frame:RegisterUnitEvent(): Attempt to register unknown event \"" .. ev .. "\"", 0)
+            end
+            self.seen[ev] = (self.seen[ev] or 0) + 1
+            self.units[ev] = unit
+        end
+        return f
+    end
+
+    ----------------------------------------------------------------
+    -- (a) THE PHANTOM IS GONE, and the signals it shared a line with stayed.
+    ----------------------------------------------------------------
+    local listed = {}
+    for i = 1, #Professions.EVENTS do listed[Professions.EVENTS[i]] = true end
+    ck(not listed["LEARNED_SPELL_IN_TAB"],
+       "LEARNED_SPELL_IN_TAB is back in Professions.EVENTS - it is not an event on "
+       .. "this client and registering it throws into the player's error frame")
+    ck(listed["CHAT_MSG_SKILL"] and listed["LEARNED_SPELL_IN_SKILL_LINE"]
+       and listed["UNIT_SPELLCAST_SUCCEEDED"],
+       "a staleness signal went missing from Professions.EVENTS")
+
+    ----------------------------------------------------------------
+    -- (b) ONCE. Two passes over the same list cost exactly one round of calls.
+    ----------------------------------------------------------------
+    local f = fakeFrame(nil)
+    local reg1, already1, refused1 = Professions.RegisterEventList(f, Professions.EVENTS)
+    local firstCalls = f.calls + f.unitCalls
+    ck(reg1 == #Professions.EVENTS and already1 == 0 and refused1 == 0,
+       "the first registration pass did not register the whole list exactly once "
+       .. "(got " .. reg1 .. "/" .. already1 .. "/" .. refused1 .. ")")
+    ck(firstCalls == #Professions.EVENTS,
+       "the first pass made " .. firstCalls .. " client calls for "
+       .. #Professions.EVENTS .. " events")
+    ck(f.units["UNIT_SPELLCAST_SUCCEEDED"] == "player",
+       "the craft-landed hook is no longer unit-filtered to the player")
+
+    local reg2, already2 = Professions.RegisterEventList(f, Professions.EVENTS)
+    ck(reg2 == 0 and already2 == #Professions.EVENTS,
+       "a second registration pass re-registered " .. reg2 .. " event(s) - "
+       .. "registration must happen once per frame, not once per pass")
+    ck(f.calls + f.unitCalls == firstCalls,
+       "a second pass reached the client " .. (f.calls + f.unitCalls - firstCalls)
+       .. " extra time(s); repeated registration is exactly how one bad name "
+       .. "became 32 bug reports")
+    for ev in pairs(f.seen) do
+        ck(f.seen[ev] == 1, "event " .. ev .. " was registered " .. f.seen[ev] .. " times")
+    end
+
+    ----------------------------------------------------------------
+    -- (c) A REFUSAL IS RECORDED ONCE AND NEVER RE-THROWN. The red control is
+    -- the shipped defect itself: a client that refuses a name.
+    ----------------------------------------------------------------
+    local savedRefused = Professions._refusedEvents
+    Professions._refusedEvents = nil
+    local ok, err = pcall(function()
+        local list = { "CHAT_MSG_SKILL", "LEARNED_SPELL_IN_TAB", "SPELLS_CHANGED" }
+        local g = fakeFrame({ LEARNED_SPELL_IN_TAB = true })
+        local r, a, x = Professions.RegisterEventList(g, list)
+        ck(r == 2 and a == 0 and x == 1,
+           "a refused name did not survive its list (got " .. r .. "/" .. a .. "/" .. x .. ")")
+        ck(g.seen["CHAT_MSG_SKILL"] == 1 and g.seen["SPELLS_CHANGED"] == 1,
+           "a refused name took its neighbours down with it")
+        local callsAfterFirst = g.calls
+        local r2, a2, x2 = Professions.RegisterEventList(g, list)
+        ck(r2 == 0 and a2 == 2 and x2 == 1,
+           "the second pass over a list with a refused name did not report "
+           .. "2 already-held + 1 refused (got " .. r2 .. "/" .. a2 .. "/" .. x2 .. ")")
+        ck(g.calls == callsAfterFirst,
+           "the refused name was ATTEMPTED AGAIN on the same frame - that is the "
+           .. "32-occurrences bug, restated")
+        ck(type(Professions._refusedEvents) == "table"
+           and Professions._refusedEvents["LEARNED_SPELL_IN_TAB"] == 1,
+           "the refusal ledger did not record the refused name exactly once")
+        ck(Professions._refusedEvents["CHAT_MSG_SKILL"] == nil,
+           "the refusal ledger blamed an event the client accepted")
+    end)
+    Professions._refusedEvents = savedRefused
+    if not ok then fails[#fails + 1] = "error in refusal fixtures: " .. tostring(err) end
+
+    ----------------------------------------------------------------
+    -- (d) STALENESS STILL MARKS on the two signals that remain.
+    ----------------------------------------------------------------
+    local savedStale, savedSettled = Professions._stale, Professions._settled
+    local savedWindow = Professions._windowOpen
+    local ok2, err2 = pcall(function()
+        Professions._windowOpen = nil
+
+        -- CHAT_MSG_SKILL is unattributable: every SETTLED profession is marked.
+        Professions._stale = nil
+        Professions._settled = { tailoring = { sig = "x" } }
+        Professions._onEvent(nil, "CHAT_MSG_SKILL")
+        ck(Professions.IsStale("tailoring") == true,
+           "CHAT_MSG_SKILL no longer marks a settled profession stale")
+
+        -- LEARNED_SPELL_IN_SKILL_LINE carries the spell id, so the mark is
+        -- surgical: the recipe's OWN profession and nothing else.
+        Professions._stale = nil
+        Professions._settled = { tailoring = { sig = "x" }, mining = { sig = "y" } }
+        if Dataset.LoadCore() then
+            local tlIdx = Dataset.profIdx.tailoring
+            local spellID = Dataset.profRecipes[tlIdx][1]
+            Professions._onEvent(nil, "LEARNED_SPELL_IN_SKILL_LINE", spellID)
+            ck(Professions.IsStale("tailoring") == true,
+               "LEARNED_SPELL_IN_SKILL_LINE no longer marks the learned recipe's profession")
+            ck(Professions.IsStale("mining") == false,
+               "LEARNED_SPELL_IN_SKILL_LINE marked a profession the spell id does not name")
+        end
+
+        -- An id we do not carry is unattributable, so it marks everything.
+        Professions._stale = nil
+        Professions._onEvent(nil, "LEARNED_SPELL_IN_SKILL_LINE", 987654321)
+        ck(Professions.IsStale("tailoring") and Professions.IsStale("mining"),
+           "an unrecognised learn id stopped marking conservatively")
+    end)
+    Professions._stale, Professions._settled = savedStale, savedSettled
+    Professions._windowOpen = savedWindow
+    if not ok2 then fails[#fails + 1] = "error in staleness fixtures: " .. tostring(err2) end
+end
+
+----------------------------------------------------------------------
 -- SELF-TEST: delegate lanes (profession-delegates phase 1) — the resolution
 -- walk, and the "delegates" namespace round-trip against the real Sync/Store.
 ----------------------------------------------------------------------
@@ -7964,6 +8197,9 @@ function Professions.RunSelfTests(verbose)
         { name = "publish delta detector", fn = testPublishDelta },
         { name = "module inertness (off = no frame, no events, no dataset, no SV)",
           fn = testInertness },
+        { name = "event registration seam (once per frame, phantom gone, refusal "
+              .. "recorded once, staleness still marks)",
+          fn = testEventRegistration },
         { name = "delegate lanes (FIX-4 chain walk, multi-primary resolution, "
               .. "faction isolation, read-side heal, namespace round-trip + "
               .. "cross-owner LWW)",
