@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.1.10 — 2026-08-11
 
 
 - **Fixed: handing in a Zandalar Honor Token no longer costs you the repair at Rin'wosho.**
