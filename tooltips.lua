@@ -707,6 +707,41 @@ function Tooltips.Invalidate()
     Tooltips._cache, Tooltips._cacheAt = nil, nil
 end
 
+-- LIVE, FILL-ONLY. An inventory record carries the class its own payload was
+-- published with — but a record written by an older Nexus, or lifted out of the
+-- Daseeki-Bags 1.x import, can have none, and a classless line renders in the CREAM
+-- fallback instead of that character's colour. The account ROSTER knows the class
+-- for every character in the graph (Tooltips.CharMeta, keyed by the same
+-- "Name-Realm" the inventory graph is keyed by), so a gap is filled from there.
+--
+-- FILL-ONLY IS THE WHOLE RULE: a record that states its own class keeps it, always.
+-- The roster is the weaker witness (it is whatever was last seen on the mesh), and
+-- this must never be able to REWRITE what a character published about itself.
+-- Nothing is read at all unless some record actually has a gap.
+local function fillClassGaps(owners)
+    if type(owners) ~= "table" then return owners end
+    local gap = false
+    for _, o in pairs(owners) do
+        if type(o) == "table" and (o.class == nil or o.class == "") then gap = true break end
+    end
+    if not gap then return owners end
+    local ok, meta = pcall(Tooltips.CharMeta)
+    if not (ok and type(meta) == "table") then return owners end
+    for key, o in pairs(owners) do
+        if type(o) == "table" and (o.class == nil or o.class == "") then
+            local m = meta[key]
+            if type(m) == "table" then
+                if type(m.class) == "string" and m.class ~= "" then o.class = m.class end
+                if (o.faction == nil or o.faction == "")
+                   and type(m.faction) == "string" and m.faction ~= "" then
+                    o.faction = m.faction
+                end
+            end
+        end
+    end
+    return owners
+end
+
 function Tooltips.Owners()
     local S = ns.Store
     if not (S and S.InventoryOwners) then return EMPTY end
@@ -719,10 +754,13 @@ function Tooltips.Owners()
 
     local graph = S.InventoryOwners()
     local bucket = S.GetSelfAccount and S.GetSelfAccount(false) or nil
-    local owners = Tooltips.BuildOwners(graph, Tooltips.OwnKeySet(bucket, Tooltips.SelfKey()))
+    local owners = fillClassGaps(
+        Tooltips.BuildOwners(graph, Tooltips.OwnKeySet(bucket, Tooltips.SelfKey())))
     Tooltips._cache, Tooltips._cacheAt = owners, now
     return owners
 end
+
+Tooltips._FillClassGaps = fillClassGaps   -- exposed for the self-test
 
 ----------------------------------------------------------------------
 -- LIVE presentation constants (TRANSCRIBED from Daseeki-Bags)
@@ -822,6 +860,74 @@ function Tooltips.RowStrings(line, withBadges)   -- luacheck: ignore withBadges
     return left, right
 end
 
+----------------------------------------------------------------------
+-- THE ONE RENDERER for the count block.
+--
+-- Lifted verbatim out of AppendCounts (whose body was the only copy) the moment
+-- AppendCounts stopped being the only CALLER: the Inventory tab's row hover draws
+-- this same block on its own surface. That tab shipped a hand-written second copy
+-- of this loop, and the copy dropped exactly the parts that live in the ARGUMENTS
+-- rather than in the strings —
+--
+--   * the per-row CLASS INK, which AddDoubleLine takes as numbers and which is the
+--     only colour the LEFT (name) column ever gets (RowStrings returns the name
+--     bare; only the right-hand count carries its own |cff escape), and
+--   * the account glyph + LIGHTGRAY wrap on the "Other Accounts" section header.
+--
+-- So the tab rendered colourless names and a bare section label while the
+-- cross-addon parity gate stayed green: that gate certifies RowStrings and
+-- AppendCounts, and never saw the tab's copy. One renderer means a divergence of
+-- that shape has nowhere left to live.
+--
+--   rows = Tooltips.BuildTooltipRows(...)     -- the pinned row model, unchanged
+--   opts = { lead        = bool     -- a blank line BEFORE the block (an append to
+--                                      an already-populated tooltip wants one)
+--            formatTotal = fn(n)    -- default tostring; the Inventory tab groups
+--                                      digits, every other caller prints the number }
+--
+-- Returns the number of lines drawn (the tab pins on it; nothing else reads it).
+function Tooltips.RenderCountRows(tt, rows, opts)
+    if type(tt) ~= "table" and type(tt) ~= "userdata" then return 0 end
+    if type(rows) ~= "table" then return 0 end
+    opts = opts or EMPTY
+    local fmt = opts.formatTotal
+    if type(fmt) ~= "function" then fmt = tostring end
+
+    local drawn = 0
+    if opts.lead and tt.AddLine then tt:AddLine(" ") drawn = drawn + 1 end
+    for _, row in ipairs(rows) do
+        if row.kind == "total" then
+            if tt.AddLine then
+                tt:AddLine(string.format("%s: |cffffffff%s|r", _G.TOTAL or "Total",
+                    tostring(fmt(row.total or 0))))
+                drawn = drawn + 1
+            end
+        elseif row.kind == "char" then
+            local left, right = Tooltips.RowStrings(row.line, row.badges)
+            local nr, ng, nb = classColor(row.line.class)
+            local vr, vg, vb = creamRGB()
+            -- The right column carries its own colour escape; the colour args are the
+            -- fallback for a client that strips them. The LEFT column has no escape at
+            -- all — these three numbers ARE the class colour of the character's name.
+            if tt.AddDoubleLine then
+                tt:AddDoubleLine(left, right, nr, ng, nb, vr, vg, vb)
+                drawn = drawn + 1
+            elseif tt.AddLine then
+                tt:AddLine(tostring(left) .. "  " .. tostring(right), nr, ng, nb)
+                drawn = drawn + 1
+            end
+        elseif row.kind == "spacer" then
+            if tt.AddLine then tt:AddLine(" ") drawn = drawn + 1 end
+        elseif row.kind == "section" then
+            if tt.AddLine then
+                tt:AddLine(accountGlyph() .. " " .. gray(row.label))
+                drawn = drawn + 1
+            end
+        end
+    end
+    return drawn
+end
+
 -- TRANSCRIBED: Daseeki-Bags/features.lua:359 appendCounts.
 -- Append the count block to a tooltip that has just been populated for an item.
 function Tooltips.AppendCounts(tt)
@@ -845,25 +951,7 @@ function Tooltips.AppendCounts(tt)
     tt.__dsnCountsShown = true
 
     local rows = Tooltips.BuildTooltipRows(lines)
-    if tt.AddLine then tt:AddLine(" ") end
-    for _, row in ipairs(rows) do
-        if row.kind == "total" then
-            if tt.AddLine then
-                tt:AddLine(string.format("%s: |cffffffff%d|r", _G.TOTAL or "Total", row.total))
-            end
-        elseif row.kind == "char" then
-            local left, right = Tooltips.RowStrings(row.line, row.badges)
-            local nr, ng, nb = classColor(row.line.class)
-            local vr, vg, vb = creamRGB()
-            -- The right column carries its own colour escape; the colour args are the
-            -- fallback for a client that strips them.
-            if tt.AddDoubleLine then tt:AddDoubleLine(left, right, nr, ng, nb, vr, vg, vb) end
-        elseif row.kind == "spacer" then
-            if tt.AddLine then tt:AddLine(" ") end
-        elseif row.kind == "section" then
-            if tt.AddLine then tt:AddLine(accountGlyph() .. " " .. gray(row.label)) end
-        end
-    end
+    Tooltips.RenderCountRows(tt, rows, { lead = true })
     if tt.Show then tt:Show() end   -- re-fit to the added rows
 end
 
@@ -1816,6 +1904,88 @@ local function selfTest(verbose)
                                                exact = true, bags = 770, bank = 15 }, true)
         ck("render/nobadges", not right:find("|T", 1, true))
         ck("render/count", right:find("785", 1, true) ~= nil)
+    end
+
+    -- THE INK, WHERE NO STRING COMPARISON CAN SEE IT.
+    -- RowStrings returns the character's name BARE — the only colour that name
+    -- ever gets is the three numbers RenderCountRows passes to AddDoubleLine after
+    -- the two strings. Every other recorder in this suite and in the cross-addon
+    -- parity gate declares AddDoubleLine(l, r) and drops those arguments, which is
+    -- how the Inventory tab shipped a colourless copy of this block past a green
+    -- gate (1.1.11). This recorder KEEPS them, and asserts the block is coloured:
+    -- per-row class ink on the name, an account glyph + grey wrap on the section
+    -- header, a white escape on the Total.
+    do
+        local savedRAID, savedCUSTOM = _G.RAID_CLASS_COLORS, _G.CUSTOM_CLASS_COLORS
+        _G.CUSTOM_CLASS_COLORS = nil
+        _G.RAID_CLASS_COLORS = {
+            MAGE    = { r = 0.41, g = 0.80, b = 0.94 },
+            WARRIOR = { r = 0.78, g = 0.61, b = 0.43 },
+        }
+        local rec = { lines = {}, doubles = {} }
+        function rec:AddLine(t) self.lines[#self.lines + 1] = tostring(t) end
+        function rec:AddDoubleLine(l, r, lr, lg, lb)
+            self.doubles[#self.doubles + 1] = { left = tostring(l), r = lr, g = lg, b = lb }
+        end
+        local blockRows = Tooltips.BuildTooltipRows({
+            { key = "Me-R", name = "Me", class = "MAGE", total = 5,
+              source = "full", isSelf = true, isOther = false },
+            { key = "Far-R", name = "Far", class = "WARRIOR", total = 11,
+              source = "summary", isOther = true },
+        })
+        local drawn = Tooltips.RenderCountRows(rec, blockRows, { lead = true })
+        ck("ink/drew", drawn > 0)
+        ck("ink/rows", #rec.doubles == 2)
+        ck("ink/class-me", rec.doubles[1] and rec.doubles[1].r == 0.41
+            and rec.doubles[1].g == 0.80 and rec.doubles[1].b == 0.94)
+        ck("ink/class-far", rec.doubles[2] and rec.doubles[2].r == 0.78
+            and rec.doubles[2].g == 0.61 and rec.doubles[2].b == 0.43)
+        local total, section
+        for _, t in ipairs(rec.lines) do
+            if t:find("Other Accounts", 1, true) then section = t end
+            if t:find("|cffffffff", 1, true) then total = t end
+        end
+        ck("ink/total-escape", total ~= nil)
+        ck("ink/section-wrapped", section ~= nil and section ~= "Other Accounts"
+            and section:find("|cff", 1, true) ~= nil)
+        -- an unknown class still draws SOMETHING (the cream fallback), never nil args
+        local bare = { doubles = {} }
+        function bare:AddLine() end
+        function bare:AddDoubleLine(l, r, lr) self.doubles[#self.doubles + 1] = lr end
+        Tooltips.RenderCountRows(bare, Tooltips.BuildTooltipRows({
+            { key = "?-R", name = "?", total = 1, source = "full" } }), {})
+        ck("ink/unknown-class", type(bare.doubles[1]) == "number")
+        -- the digit formatter is a hook, and the default is the plain number
+        local grouped = { lines = {} }
+        function grouped:AddLine(t) self.lines[#self.lines + 1] = tostring(t) end
+        function grouped:AddDoubleLine() end
+        Tooltips.RenderCountRows(grouped, blockRows,
+            { formatTotal = function(n) return "<" .. n .. ">" end })
+        ck("ink/format-hook", grouped.lines[1] and grouped.lines[1]:find("<16>", 1, true) ~= nil)
+        _G.RAID_CLASS_COLORS, _G.CUSTOM_CLASS_COLORS = savedRAID, savedCUSTOM
+    end
+
+    -- FILL-ONLY class meta: a record with no class of its own borrows the roster's,
+    -- and a record that HAS one is never overwritten by it.
+    do
+        local owners = {
+            ["Has-R"]  = { class = "MAGE" },
+            ["Gap-R"]  = { class = nil },
+            ["Blank-R"] = { class = "" },
+            ["Absent-R"] = {},
+        }
+        local savedMeta = Tooltips.CharMeta
+        Tooltips.CharMeta = function()
+            return { ["Has-R"] = { class = "WARLOCK" }, ["Gap-R"] = { class = "SHAMAN" },
+                     ["Blank-R"] = { class = "ROGUE", faction = "Horde" } }
+        end
+        Tooltips._FillClassGaps(owners)
+        Tooltips.CharMeta = savedMeta
+        ck("classgap/keeps-own", owners["Has-R"].class == "MAGE")
+        ck("classgap/fills-nil", owners["Gap-R"].class == "SHAMAN")
+        ck("classgap/fills-empty", owners["Blank-R"].class == "ROGUE")
+        ck("classgap/fills-faction", owners["Blank-R"].faction == "Horde")
+        ck("classgap/no-roster-row", owners["Absent-R"].class == nil)
     end
 
     ------------------------------------------------------------------
