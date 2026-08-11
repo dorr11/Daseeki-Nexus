@@ -2,6 +2,46 @@
 
 ## Unreleased
 
+- **Fixed: opening the Inventory tab for the first time no longer locks the game up.**
+  The first click on Inventory folded every item on every character of every account
+  into one table, asked the client for all ~1,600 item names at once, and then — the
+  part that actually hurt — rebuilt and re-sorted the whole table *once per answer*
+  as those names came back. Measured on a mesh the size of a well-played account,
+  that was about 13 seconds of work arriving as a stutter over the seconds after the
+  click, and it grew with the square of your item count.
+
+  Now the table is built a slice at a time. The first rows are on screen almost
+  immediately, the footer says *indexing 12 of 40 characters…* while the rest folds
+  in behind them, and the counts only appear once they are real counts — a
+  half-finished total is not a total, so it is not printed as one. Names are
+  requested in small batches rather than all at once, and **the rows you are
+  actually looking at are asked about first**, so what is on screen fills in while
+  the rest trickles in behind it (scrolling pulls the next lot forward). Answers
+  from the client are gathered up and repainted once instead of a thousand times.
+
+  Two things that were slow every time, not just the first time, are fixed with it:
+  the table is now kept between visits and only rebuilt when your stored data
+  actually changes, so the second click is instant — and it no longer rebuilds
+  itself on every world-buff tick while you have it open, which also means **it no
+  longer jumps you back to the top of the list while you are scrolling**.
+
+  The totals, the per-character breakdowns and the "still loading N names…" honesty
+  are all unchanged: the sliced build is pinned against the old one-shot build row
+  for row and character for character, so nothing about *what* the table says has
+  moved — only how long it takes to say it.
+
+- **Changed: profession cooldowns are named by what you make, with an icon.**
+  The alchemy row said *Alchemy · shared cooldown*, which is accurate and tells you
+  nothing. It now says **Transmute**, with the Arcanite Bar's icon beside it. Every
+  cooldown row carries an icon now: Mooncloth keeps its own name and picks up its
+  own spell's icon, and any cooldown added later gets a name and an icon without
+  anyone having to wire one up. If the client has not loaded an icon yet the row
+  shows a neutral one and fills it in when the answer arrives, rather than guessing.
+
+  The Professions tab's "N ready" badge counts the same as before, and the login
+  line still names the character and the profession — it prints one line for
+  everyone who is ready, so it stays the summary it always was.
+
 - **New: the shopping list can go looking for holiday recipes, if you ask it to.**
   Recipes whose only shop is a holiday vendor — the Winter Veil cooking recipes and
   their kin — were left off the shopping list all year round, on the grounds that
