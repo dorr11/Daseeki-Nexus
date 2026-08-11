@@ -1202,6 +1202,152 @@ function Professions.LaneChain(specID)
     return Professions.LaneChainFrom(specID, Dataset.SpecParentID)
 end
 
+----------------------------------------------------------------------
+-- THE SPEC STANDING — mutual exclusion is a matter of SIBLINGS, not of family
+--
+-- (owner, 2026-08-11: a plain Weaponsmith was seeing every Master Swordsmith /
+-- Axesmith / Hammersmith recipe as CONFLICTED. He can still take a Master
+-- path; the list was calling his own future unavailable.)
+--
+-- When the spec rule was written the dataset's [spec] table was FLAT, so
+-- "holds a different spec of this profession" was the only exclusion the data
+-- could express. FIX-4 then gave every spec a PARENT EDGE, and the tree says
+-- what the flat list could not: you choose ONCE PER LEVEL. Armorsmith or
+-- Weaponsmith (siblings under Blacksmithing); then, having chosen Weaponsmith,
+-- Swordsmith or Hammersmith or Axesmith (siblings under Weaponsmith).
+--
+-- So the exclusion GROUP of a spec S is its SIBLINGS — and, one level up, the
+-- siblings of each of S's ancestors. Never its own ancestors, never its own
+-- descendants. The three answers, in the tree's terms:
+--
+--   "ok"        no gate; or the character holds S; or the character holds a
+--               DESCENDANT of S, which IMPLIES S (a Master Axesmith IS a
+--               Weaponsmith — the Weaponsmith spell is still in his book, so
+--               the presence probe records BOTH ids and this arm is normally
+--               redundant. It is written anyway: the standing must be right
+--               from the ids alone, not from the probe's good manners.)
+--   "openable"  a gate the character has not chosen against — including the
+--               ANCESTOR case, which is THE FIX: a Weaponsmith holding no
+--               Master spec can still take Master Axesmith, so an Axesmith
+--               recipe is openable to him, not conflicted.
+--   "conflict"  the character holds a spec in a DIFFERENT BRANCH: a sibling of
+--               S, or a sibling of one of S's ancestors (or anything below
+--               one). An Armorsmith conflicts with the whole Weaponsmith tree;
+--               a Master Swordsmith conflicts with Master Axesmith recipes but
+--               NOT with plain Weaponsmith ones.
+--
+-- Mechanically that is one line: two specs of the same PROFESSION conflict
+-- exactly when NEITHER is an ancestor-or-self of the other. Roots of a flat
+-- family (Gnomish vs Goblin Engineer) are siblings by that rule, so the
+-- pre-FIX-4 behaviour of every flat family is unchanged.
+--
+-- This is the ONE predicate. ui_professions.lua's ProfUI.SpecStanding (list
+-- classification, census denominators, shopping list, who-can-craft) and
+-- tooltips.lua's Tooltips.RecipeSpecOK (the Learnable line) both land here;
+-- the self-tests pin that they cannot drift into two spec rules again.
+----------------------------------------------------------------------
+
+-- The tree readers for one loaded dataset table. `D` is Dataset itself in the
+-- addon; the UI passes its own handle so a fixture dataset resolves too.
+--   parentOf(specSpellID) -> the PARENT spec's spell id, or nil (root/unknown)
+--   famOf(specSpellID)    -> the profession ordinal the spec belongs to, or
+--                            nil for a spell the tree does not carry
+function Professions.SpecTreeReaders(D)
+    local specs = type(D) == "table" and D.specs or nil
+    local byId  = type(D) == "table" and D.specById or nil
+    local function node(id)
+        local idx = byId and byId[tonumber(id) or -1]
+        return (idx and specs) and specs[idx] or nil
+    end
+    local function parentOf(id)
+        local sp = node(id)
+        local par = sp and sp.parent and specs[sp.parent] or nil
+        return par and par.id or nil
+    end
+    local function famOf(id)
+        local sp = node(id)
+        return sp and sp.p or nil
+    end
+    return parentOf, famOf
+end
+
+-- PURE. One spec's lineage, SELF FIRST then each ancestor — LaneChainFrom's
+-- walk without the "general" tail. Bounded and cycle-proof for the same
+-- reason: a malformed parent edge must not hang a tooltip.
+function Professions.SpecLineage(specID, parentOf)
+    local out, seen = {}, {}
+    local id, hops = tonumber(specID), 0
+    while id and id > 0 and not seen[id] and hops < 8 do
+        seen[id] = true
+        out[#out + 1] = id
+        id = parentOf and tonumber(parentOf(id)) or nil
+        hops = hops + 1
+    end
+    return out
+end
+
+-- PURE. Is `anc` the spec `desc` itself, or one of its ancestors?
+function Professions.SpecIsSelfOrAncestor(anc, desc, parentOf)
+    anc = tonumber(anc)
+    if not anc then return false end
+    local line = Professions.SpecLineage(desc, parentOf)
+    for i = 1, #line do
+        if line[i] == anc then return true end
+    end
+    return false
+end
+
+-- PURE. The standing of one spec-gated recipe against one character's held
+-- specs. `specID` and `heldIDs` are SPELL IDS (the payload's own currency).
+-- A spec the tree does not carry is an ISLAND — no parent, no siblings, no
+-- descendants — so it degenerates to exact membership, which is exactly what
+-- the flat rule did for an unknown id.
+function Professions.SpecStandingFrom(specID, heldIDs, parentOf, famOf)
+    local want = tonumber(specID)
+    if not want or want <= 0 then return "ok" end
+    if type(heldIDs) ~= "table" then return "openable" end
+
+    -- HOLDS IT, or holds something that implies it (a descendant).
+    for i = 1, #heldIDs do
+        local h = tonumber(heldIDs[i])
+        if h and (h == want or Professions.SpecIsSelfOrAncestor(want, h, parentOf)) then
+            return "ok"
+        end
+    end
+
+    -- A DIFFERENT BRANCH at some decision level: same profession, and neither
+    -- spec on the other's line. (An ANCESTOR the character holds falls through
+    -- here to "openable" — the fix.)
+    local fam = famOf and famOf(want) or nil
+    if fam ~= nil then
+        for i = 1, #heldIDs do
+            local h = tonumber(heldIDs[i])
+            if h and famOf(h) == fam
+               and not Professions.SpecIsSelfOrAncestor(h, want, parentOf) then
+                return "conflict"
+            end
+        end
+    end
+
+    return "openable"
+end
+
+-- Live: the standing against the shipped dataset's FIX-4 tree.
+function Professions.SpecStanding(specID, heldIDs)
+    if specID == nil then return "ok" end
+    if not Dataset.LoadCore() then return "ok" end
+    local parentOf, famOf = Professions.SpecTreeReaders(Dataset)
+    return Professions.SpecStandingFrom(specID, heldIDs, parentOf, famOf)
+end
+
+-- The profession ordinal one spec belongs to (its exclusion FAMILY), or nil.
+function Dataset.SpecFamilyID(specSpellID)
+    if not Dataset.LoadCore() then return nil end
+    local idx = Dataset.specById[tonumber(specSpellID) or -1]
+    local sp = idx and Dataset.specs[idx]
+    return sp and sp.p or nil
+end
+
 -- PURE. Resolve one role ("p" primary / "s" secondary) for a recipe.
 --   cfg        the delegates config table ({ [faction] = { profs=..., bank=... } })
 --   faction    the VIEWER's faction ("Alliance"/"Horde")
@@ -7892,6 +8038,105 @@ local function testDelegateLanes(fails)
            "the live Armorsmith chain grew a parent it does not have")
     end
 
+    -- (a2) THE SPEC STANDING over those same parent edges (owner, 2026-08-11:
+    -- a plain Weaponsmith was seeing every Master smith recipe as CONFLICTED).
+    -- Pure first, on a toy tree with a third level and a second family:
+    --      1 R1        2 R2   (roots of family A, siblings)
+    --      +- 3 C1     +- 4 C2   (siblings under R1)
+    --         +- 5 G1
+    --      9 X1        (family B — a different profession entirely)
+    do
+        local TREE = {
+            [1] = { nil, "A" }, [2] = { nil, "A" },
+            [3] = { 1,   "A" }, [4] = { 1,   "A" }, [5] = { 3, "A" },
+            [9] = { nil, "B" },
+        }
+        local pOf = function(id) local n = TREE[id]; return n and n[1] or nil end
+        local fOf = function(id) local n = TREE[id]; return n and n[2] or nil end
+        local function st(want, held)
+            return Professions.SpecStandingFrom(want, held, pOf, fOf)
+        end
+        ck(st(nil, { 1 }) == "ok" and st(0, { 1 }) == "ok",
+           "an ungated recipe did not read ok")
+        ck(st(3, { 3 }) == "ok", "holding the required spec did not read ok")
+        ck(st(1, { 3 }) == "ok" and st(1, { 5 }) == "ok",
+           "a DESCENDANT did not imply its ancestor spec")
+        -- THE FIX: an ancestor-holder can still take the child.
+        ck(st(3, { 1 }) == "openable", "holding the PARENT read as a conflict")
+        ck(st(5, { 1 }) == "openable" and st(5, { 3 }) == "openable",
+           "holding a grandparent/parent read as a conflict")
+        ck(st(3, {}) == "openable" and st(3, nil) == "openable",
+           "an unspecced character did not read openable")
+        -- Conflicts: siblings, siblings of ancestors, and anything below one.
+        ck(st(3, { 4 }) == "conflict", "a SIBLING did not conflict")
+        ck(st(3, { 2 }) == "conflict" and st(5, { 2 }) == "conflict",
+           "a sibling of an ANCESTOR did not conflict")
+        ck(st(1, { 2 }) == "conflict" and st(2, { 1 }) == "conflict",
+           "two roots of one family stopped excluding each other")
+        ck(st(3, { 1, 4 }) == "conflict",
+           "holding the parent excused a sibling conflict")
+        ck(st(4, { 5 }) == "conflict",
+           "a spec below a sibling did not conflict")
+        -- A different family never conflicts; an unknown spec is an island.
+        ck(st(3, { 9 }) == "openable" and st(9, { 3 }) == "openable",
+           "a spec of another profession conflicted")
+        ck(st(77, { 77 }) == "ok" and st(77, { 1 }) == "openable"
+           and st(3, { 77 }) == "openable",
+           "an off-tree spec id did not degenerate to exact membership")
+        -- A malformed parent edge must not hang a tooltip.
+        ck(#Professions.SpecLineage(1, function() return 1 end) == 1,
+           "a self-parent cycle was not bounded")
+        ck(Professions.SpecStandingFrom(1, { 2 }, function(id) return id == 1 and 2 or 1 end,
+           function() return "A" end) ~= nil, "a parent cycle did not terminate")
+    end
+
+    -- ...and live, against the shipped FIX-4 tree. THE RED CONTROL is the
+    -- first line: under the old FLAT rule (any other spec of the profession
+    -- conflicts) a plain Weaponsmith read Master Axesmith as "conflict".
+    if Professions.IsEnabled() and Dataset.LoadCore() then
+        local byName = {}
+        for i = 1, #Dataset.specs do byName[Dataset.specs[i].name] = Dataset.specs[i].id end
+        local W, A = byName["Weaponsmith"], byName["Armorsmith"]
+        local AXE, SWORD = byName["Master Axesmith"], byName["Master Swordsmith"]
+        local GN, GO = byName["Gnomish Engineer"], byName["Goblin Engineer"]
+        local L = Professions.SpecStanding
+        ck(W and A and AXE and SWORD and GN and GO,
+           "the shipped spec names moved out from under the standing test")
+        -- the flat rule, reproduced here so the regression has a shape:
+        local function flat(want, held)
+            local fam = Dataset.SpecFamilyID(want)
+            for i = 1, #held do
+                if held[i] == want then return "ok" end
+            end
+            for i = 1, #held do
+                if Dataset.SpecFamilyID(held[i]) == fam then return "conflict" end
+            end
+            return "openable"
+        end
+        ck(flat(AXE, { W }) == "conflict",
+           "the flat rule no longer reproduces the owner's bug (fixture broken)")
+        ck(L(AXE, { W }) == "openable",
+           "a plain Weaponsmith still reads a Master Axesmith recipe as conflicted")
+        ck(L(AXE, { W, AXE }) == "ok" and L(AXE, { AXE }) == "ok",
+           "a Master Axesmith does not hold his own recipes")
+        ck(L(W, { AXE }) == "ok" and L(W, { W, AXE }) == "ok",
+           "a Master Axesmith is not credited with the Weaponsmith he already is")
+        ck(L(W, { SWORD }) == "ok", "a Master Swordsmith lost his Weaponsmith recipes")
+        ck(L(AXE, { SWORD }) == "conflict",
+           "two Master smith siblings stopped excluding each other")
+        ck(L(AXE, { A }) == "conflict" and L(W, { A }) == "conflict"
+           and L(SWORD, { A }) == "conflict",
+           "an Armorsmith is not conflicted out of the whole Weaponsmith tree")
+        ck(L(A, { W }) == "conflict" and L(A, { AXE }) == "conflict",
+           "the Weaponsmith tree is not conflicted out of Armorsmith recipes")
+        ck(L(GN, { GO }) == "conflict" and L(GO, { GN }) == "conflict",
+           "the FLAT Engineering family changed behaviour")
+        ck(L(GN, { W }) == "openable" and L(AXE, { GN }) == "openable",
+           "specs of different professions conflicted")
+        ck(L(AXE, {}) == "openable" and L(AXE, nil) == "openable",
+           "an unspecced character stopped reading openable")
+    end
+
     -- (b) THE RESOLUTION WALK. Fixture: Poonyx is Armorsmith primary AND
     -- general primary; Puunyx is the (planned) Axesmith primary. One
     -- profession, several primaries — each lane resolves to its own.
@@ -8366,7 +8611,8 @@ function Professions.RunSelfTests(verbose)
         { name = "event registration seam (once per frame, phantom gone, refusal "
               .. "recorded once, staleness still marks)",
           fn = testEventRegistration },
-        { name = "delegate lanes (FIX-4 chain walk, multi-primary resolution, "
+        { name = "delegate lanes (FIX-4 chain walk, spec standing over the tree "
+              .. "with the flat-rule red control, multi-primary resolution, "
               .. "faction isolation, read-side heal, namespace round-trip + "
               .. "cross-owner LWW)",
           fn = testDelegateLanes },

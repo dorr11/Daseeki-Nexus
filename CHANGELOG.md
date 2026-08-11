@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+- **Fixed: a Weaponsmith is no longer told the Master smith recipes are not for him.**
+  A blacksmith who had taken Weaponsmith saw every Master Swordsmith, Master
+  Hammersmith and Master Axesmith recipe struck off his list as "requires another
+  specialisation" — recipes he can still go and get, because the Master paths are
+  taken *as* a Weaponsmith. His recipe census was short by every one of them, and
+  the shopping list would not buy them for him.
+
+  Specialisations are now read as the tree they actually are: you choose once per
+  level. Armorsmith *or* Weaponsmith; then, as a Weaponsmith, Swordsmith *or*
+  Hammersmith *or* Axesmith. A recipe is only unavailable when the character has
+  chosen a different branch — an Armorsmith is still shut out of the whole
+  Weaponsmith side, and a Master Swordsmith is still shut out of Axesmith recipes,
+  but neither is ever shut out of something he can simply go and learn. A Master
+  smith is also credited with the plain Weaponsmith recipes he already qualifies
+  for, on the panel and on item tooltips alike. Gnomish and Goblin Engineering, and
+  the three Leatherworking paths, are single-level choices and behave exactly as
+  before.
+
+  This is one rule in one place, so the recipe list, the "x of y known" census, the
+  shopping list, who-can-craft and the Learnable line on a recipe tooltip cannot
+  answer differently from each other — the item tooltip had its own copy of the old
+  check and now reads the same rule as everything else.
+
 - **Fixed: Mooncloth is on the cooldowns list even when nobody is on cooldown.**
   Mooncloth has its own four-day timer, but Nexus had no record of that fact — the
   only cooldown it knew about from the catalogue was alchemy's shared transmute
