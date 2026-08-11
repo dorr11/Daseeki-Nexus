@@ -342,6 +342,8 @@ Professions._stale         = nil    -- profKey -> true: a learning signal fired;
 Professions._harvestJob    = nil    -- the in-flight chunked reagent harvest, if any
 Professions._harvestGen    = 0      -- supersession counter for harvest jobs
 Professions._collapseLatch = nil    -- surface -> true while OUR expand/collapse calls are echoing
+Professions._collapseDepth = nil    -- surface -> nesting depth of those calls (the class-9 fuse)
+Professions._collapseRefused = nil  -- how many roundtrips the depth fuse refused outright
 Professions._collapseWorld = nil    -- surface -> the last-witnessed collapse world (debug readout)
 
 ----------------------------------------------------------------------
@@ -2121,12 +2123,52 @@ end
 -- announce it (TRADE_SKILL_UPDATE / CRAFT_UPDATE). Handling our own echo as a
 -- capture opportunity mid-roundtrip would recurse into the capture that issued
 -- it. The latch is held only across the client call itself.
+--
+-- THE DISCIPLINE, STATED FOR SYNCHRONOUS DISPATCH (fix/filter-reentry, class 9):
+-- on interface 11509 the client dispatches that update INSIDE the expand call,
+-- so every handler in the session — ours, the filter sub-surface's, and every
+-- other addon's — runs before expandFn returns. Two properties make that safe
+-- and both are now explicit rather than incidental:
+--
+--   * the latch is armed BEFORE the call and released only after it returns
+--     (it always was — this is the half professions_filters.lua got wrong);
+--   * it SAVES AND RESTORES rather than clearing to nil, so a restore nested
+--     inside an expand cannot disarm the expand's own latch on the way out,
+--     and a depth fuse refuses a third level outright instead of recursing.
+--
+-- The filter sub-surface reads this latch too (Filters.PeerBusy): our expand
+-- echo must not make its clear-on-open fire in the middle of our scan.
+local MAX_ECHO_DEPTH = 2
 local function withCollapseLatch(surface, fn)
     Professions._collapseLatch = Professions._collapseLatch or {}
+    Professions._collapseDepth = Professions._collapseDepth or {}
+    local depth = Professions._collapseDepth[surface] or 0
+    if depth >= MAX_ECHO_DEPTH then
+        Professions._collapseRefused = (Professions._collapseRefused or 0) + 1
+        Professions.RecordAttempt({
+            e = "collapse", s = surface, r = "reentry-refused",
+            g = Professions.ClientBuild and Professions.ClientBuild() or nil,
+        })
+        return false
+    end
+    local was = Professions._collapseLatch[surface]
+    Professions._collapseDepth[surface] = depth + 1
     Professions._collapseLatch[surface] = true
     local ok = pcall(fn)
-    Professions._collapseLatch[surface] = nil
+    Professions._collapseLatch[surface] = was
+    Professions._collapseDepth[surface] = depth
     return ok
+end
+Professions._withCollapseLatch = withCollapseLatch   -- the self-tests drive it directly
+
+-- Is one of OUR client roundtrips in flight on this surface? The filter
+-- sub-surface asks before it acts on any window update (class 9).
+function Professions.WindowEchoLatched(surface)
+    local L = Professions._collapseLatch
+    if not L then return false end
+    if surface then return L[surface] and true or false end
+    for _, v in pairs(L) do if v then return true end end
+    return false
 end
 
 -- Find the CURRENT row index of the header named `name`. Indexes shift every
@@ -3535,6 +3577,16 @@ function Professions.CaptureWindow(surface, force, event)
     if Professions._collapseLatch and Professions._collapseLatch[surface] then
         return false, "collapse-echo"
     end
+    -- ...and the same for the filter sub-surface's own native sequence. Its
+    -- setters echo the identical events, INSIDE the call on interface 11509
+    -- (class 9), and the list it is moving is one it narrows on purpose. The
+    -- view guard would refuse this anyway ("probing"), but naming it here keeps
+    -- a burst of self-inflicted echoes out of the forensics ring and off the
+    -- retry ladder — the sequence issues its own re-capture when it finishes.
+    local FS = ns.ProfessionFilters
+    if FS and FS.NativeBusy and FS.NativeBusy(surface) then
+        return false, "filter-echo"
+    end
     event = event or (force and "forced" or "update")
 
     local wWorld = nil     -- which collapse world this attempt moved through (trace)
@@ -4159,6 +4211,7 @@ function Professions.SetEnabled(on)
         Professions._settled, Professions._stale = nil, nil
         Professions._harvestJob = nil
         Professions._collapseLatch, Professions._collapseWorld = nil, nil
+        Professions._collapseDepth, Professions._collapseRefused = nil, nil
         -- The forensics go too. They are session state describing a module that
         -- is no longer running, and a stats table that outlived its module would
         -- report attempts against a build path that is not there any more. The
@@ -5385,10 +5438,28 @@ end
 
 -- The unkind trade-skill client. `profile` is "echo" (the landing announces
 -- itself with an update) or "silent" (it does not).
-local function newWindowSim(rows, landedAt, profile)
+--
+-- `dispatch` is HOW the client delivers a setter's echo, and "sync" is the
+-- DEFAULT because it is what interface 11509 actually does (CLIENT_ASYNC_LESSONS
+-- class 9, fix/filter-reentry):
+--
+--   "sync"   the update is dispatched INSIDE the setter call. Every handler in
+--            the session runs to completion before the setter returns, so a
+--            handler that touches the client re-enters the call that woke it.
+--            This is the posture that took the owner's client down with a C
+--            stack overflow while every headless suite stayed green.
+--   "async"  the update arrives on a later frame, after the setter returned.
+--            Retained as a VARIANT — some events really do land this way, and a
+--            fix that only works when the stack is already unwound is not a fix.
+--
+-- Async needs a timer service; without one the sim falls back to sync rather
+-- than silently dropping the echo, because a dropped echo is a kinder client
+-- than any that exists.
+local function newWindowSim(rows, landedAt, profile, dispatch)
     local W = {
         rows = rows, landedAt = landedAt, profile = profile or "echo",
-        events = {}, echoes = 0, filters = { text = "", makeable = false },
+        dispatch = dispatch or "sync",
+        events = {}, echoes = 0, filters = { text = "", makeable = false, skillUps = false },
     }
     local saved = {}
     local G = _G
@@ -5397,22 +5468,28 @@ local function newWindowSim(rows, landedAt, profile)
 
     -- Emit an event to BOTH modules in registration order — professions.lua
     -- creates its frame first, then hands off to professions_filters.lua, so
-    -- that is the order the client would use.
-    function W.emit(event)
+    -- that is the order the client would use. `W.onEcho`, when a fixture sets
+    -- it, takes delivery instead: that is how a RED CONTROL replays a pre-fix
+    -- handler against this same client.
+    local function deliver(event)
         W.events[#W.events + 1] = { t = G.GetTime(), e = event }
+        if W.onEcho then W.onEcho(event) return end
         if Professions._onEvent then Professions._onEvent(nil, event) end
         local F = ns.ProfessionFilters
         if F and F._onEvent then F._onEvent(nil, event) end
     end
+    function W.emit(event) deliver(event) end
 
     -- The client's own echo: any filter setter rebuilds the list and tells the
-    -- UI about it. This is what turns one clear into four capture attempts.
+    -- UI about it. This is what turns one clear into four capture attempts —
+    -- and, in the sync posture, four RE-ENTRANT ones.
     local function echo()
         W.echoes = W.echoes + 1
-        W.events[#W.events + 1] = { t = G.GetTime(), e = "TRADE_SKILL_UPDATE" }
-        if Professions._onEvent then Professions._onEvent(nil, "TRADE_SKILL_UPDATE") end
-        local F = ns.ProfessionFilters
-        if F and F._onEvent then F._onEvent(nil, "TRADE_SKILL_UPDATE") end
+        if W.dispatch == "async" and G.C_Timer and G.C_Timer.After then
+            G.C_Timer.After(0, function() deliver("TRADE_SKILL_UPDATE") end)
+        else
+            deliver("TRADE_SKILL_UPDATE")
+        end
     end
 
     function W:install()
@@ -5426,6 +5503,7 @@ local function newWindowSim(rows, landedAt, profile)
             subs = G.GetTradeSkillSubClasses,
             setSlot = G.SetTradeSkillInvSlotFilter, getSlot = G.GetTradeSkillInvSlotFilter,
             slots = G.GetTradeSkillInvSlots,
+            setUps = G.TradeSkillOnlyShowSkillUps, getUps = G.GetOnlyShowSkillUps,
             numReagents = G.GetTradeSkillNumReagents, reagentInfo = G.GetTradeSkillReagentInfo,
             reagentLink = G.GetTradeSkillReagentItemLink, itemLink = G.GetTradeSkillItemLink,
             numMade = G.GetTradeSkillNumMade,
@@ -5452,6 +5530,16 @@ local function newWindowSim(rows, landedAt, profile)
             W.filters.makeable = v and true or false; echo()
         end
         G.GetOnlyShowMakeable = function() return W.filters.makeable end
+        -- THE FIRST NATIVE CALL OF THE CLEAR SEQUENCE, and the frame the live
+        -- 1.1.8 stack overflowed through (professions_filters.lua:803). Its
+        -- absence from this fixture is precisely why the composed chain went on
+        -- passing while the owner's window would not open: with no skill-ups
+        -- setter to call, the sequence's first echo happened one call later,
+        -- with the latch already up.
+        G.TradeSkillOnlyShowSkillUps = function(v)
+            W.filters.skillUps = v and true or false; echo()
+        end
+        G.GetOnlyShowSkillUps = function() return W.filters.skillUps end
         G.SetTradeSkillSubClassFilter = function(...) W.lastSub = { ... }; echo() end
         G.GetTradeSkillSubClassFilter = function() return 0 end
         G.GetTradeSkillSubClasses = function() return { "Weapon", "Armor" } end
@@ -5493,6 +5581,7 @@ local function newWindowSim(rows, landedAt, profile)
         G.GetTradeSkillSubClasses = saved.subs
         G.SetTradeSkillInvSlotFilter, G.GetTradeSkillInvSlotFilter = saved.setSlot, saved.getSlot
         G.GetTradeSkillInvSlots = saved.slots
+        G.TradeSkillOnlyShowSkillUps, G.GetOnlyShowSkillUps = saved.setUps, saved.getUps
         G.GetTradeSkillNumReagents, G.GetTradeSkillReagentInfo = saved.numReagents, saved.reagentInfo
         G.GetTradeSkillReagentItemLink, G.GetTradeSkillItemLink = saved.reagentLink, saved.itemLink
         G.GetTradeSkillNumMade = saved.numMade
@@ -5578,15 +5667,31 @@ local function testComposedChain(fails)
     local savedGuards = Professions._viewGuards
     local savedStore = ns.Store and ns.Store.data and ns.Store.data.professions
 
-    -- One run of the whole chain. Returns a report the rows below assert on.
-    local function runChain(profile)
+    -- One run of the whole chain. `dispatch` selects the client's echo posture
+    -- ("sync" — the live 11509 default — or "async"). Returns a report the rows
+    -- below assert on, including the RE-ENTRANCY census: how deep the filter
+    -- clear ever nested, how many of its own echoes the module swallowed, and
+    -- whether the depth fuse ever had to fire.
+    local function runChain(profile, dispatch)
         local clock = newClock(1000)
-        local sim = newWindowSim(fixtureRows(), 1000.30, profile)
+        local sim = newWindowSim(fixtureRows(), 1000.30, profile, dispatch)
         local opportunities = {}
         local realCapture = Professions.CaptureWindow
+        local realClear = F and F.ClearNative
+        local census = { calls = 0, depth = 0, deepest = 0 }
 
         clock:install()
         sim:install()
+        if F then
+            F.ClearNative = function(surface, g)
+                census.calls = census.calls + 1
+                census.depth = census.depth + 1
+                if census.depth > census.deepest then census.deepest = census.depth end
+                local a, b = realClear(surface, g)
+                census.depth = census.depth - 1
+                return a, b
+            end
+        end
         -- Wrap the capture so the RED CONTROL is replayed against exactly the
         -- opportunities the client and wave P3 handed the real module — the
         -- ladder's own rungs are excluded, because the pre-fix code had none.
@@ -5607,6 +5712,7 @@ local function testComposedChain(fails)
         Professions._viewGuards = nil
         if F then
             F._state, F._prof, F._panels, F._hooked = nil, nil, nil, nil
+            F._native, F._probing, F._reentries, F._echoes = nil, nil, nil, nil
             F._activated = false
             F.Activate()                                  -- registers the view guard
         end
@@ -5635,10 +5741,16 @@ local function testComposedChain(fails)
             attempts = (Professions.Stats("blacksmithing") or {}).attempts or 0,
             trace = Professions.TraceRows(),
             echoes = sim.echoes,
+            dispatch = sim.dispatch,
+            clears = census.calls,
+            deepestClear = census.deepest,
+            swallowed = (F and F._echoes and F._echoes["tradeskill"]) or 0,
+            fused = (F and F._reentries and F._reentries["tradeskill"]) or 0,
             err = (not ok) and err or nil,
         }
 
         Professions.CaptureWindow = realCapture
+        if F and realClear then F.ClearNative = realClear end
         sim:restore()
         clock:restore()
         return report
@@ -5646,11 +5758,20 @@ local function testComposedChain(fails)
 
     local ok, err = pcall(function()
         -- ══ (1) THE ECHO PROFILE — the live shape, exactly ═══════════════════
-        local echoRun = runChain("echo")
+        -- Run under the SYNCHRONOUS posture, which is now the default: the
+        -- client dispatches each setter's update inside the setter call.
+        local echoRun = runChain("echo", "sync")
         ck(echoRun.err == nil, "the echo chain errored: " .. tostring(echoRun.err))
+        ck(echoRun.dispatch == "sync",
+           "the composed chain no longer defaults to synchronous dispatch — the "
+           .. "kinder posture must never be the one the suite runs by default")
         ck(echoRun.echoes > 0,
            "the sim never echoed a single filter clear back as an update; the fixture "
            .. "is kinder than the client and proves nothing")
+        ck(echoRun.swallowed > 0,
+           "not one of those echoes reached the filter module's handlers; under "
+           .. "synchronous dispatch they land INSIDE the setter call and the latch "
+           .. "is the only thing refusing them")
 
         -- RED: the pre-fix gate over the pre-fix chain never captures. Every
         -- opportunity after the SHOW is either an echo inside the throttled
@@ -5691,6 +5812,32 @@ local function testComposedChain(fails)
            .. "' rather than by the update that carried the rows — the throttle "
            .. "is swallowing the settle signal again")
 
+        -- ...and it did all of that WITHOUT re-entering its own clear once
+        -- (fix/filter-reentry). This is the live defect's green row.
+        ck(echoRun.deepestClear == 1,
+           "the filter clear re-entered itself " .. tostring(echoRun.deepestClear)
+           .. " deep under synchronous dispatch — that is the 1.1.8 cycle, and on "
+           .. "the owner's client it ran to a C stack overflow")
+        ck(echoRun.fused == 0,
+           "the depth fuse had to refuse " .. tostring(echoRun.fused) .. " sequence(s); "
+           .. "the fuse is belt-and-braces and a fuse that fires means the latch above "
+           .. "it did not hold")
+
+        -- ══ (1b) THE ASYNC VARIANT — the same chain, the kinder posture ══════
+        -- Retained, never default: some events really do arrive a frame later,
+        -- and a latch that only holds because the stack is already unwound is
+        -- not a latch. Every property above must survive the change of posture.
+        local asyncRun = runChain("echo", "async")
+        ck(asyncRun.err == nil, "the async chain errored: " .. tostring(asyncRun.err))
+        ck(asyncRun.captured == true,
+           "the composed chain did not capture under asynchronous dispatch")
+        ck(asyncRun.known == 4,
+           "the async chain captured " .. tostring(asyncRun.known) .. " recipes, expected 4")
+        ck(asyncRun.deepestClear == 1,
+           "the filter clear nested " .. tostring(asyncRun.deepestClear)
+           .. " deep under asynchronous dispatch")
+        ck(asyncRun.fused == 0, "the depth fuse fired under asynchronous dispatch")
+
         -- The forensics are not decoration: the refusals BEFORE the capture are
         -- on the record with reasons, and the capture itself is on the record.
         local sawEmpty, sawOk = false, false
@@ -5705,8 +5852,11 @@ local function testComposedChain(fails)
         -- ══ (2) THE SILENT PROFILE — the rows land and nothing says so ═══════
         -- The only thing that can save this is the ladder. If it ever becomes a
         -- one-shot again this row goes red.
-        local silentRun = runChain("silent")
+        local silentRun = runChain("silent", "sync")
         ck(silentRun.err == nil, "the silent chain errored: " .. tostring(silentRun.err))
+        ck(silentRun.deepestClear == 1,
+           "the silent chain re-entered its own clear " .. tostring(silentRun.deepestClear)
+           .. " deep")
         -- The pre-fix chain minus its last row: in the silent profile nothing at
         -- all fires after the rows arrive, so there is not even a throttled
         -- opportunity to lose.
@@ -5721,6 +5871,11 @@ local function testComposedChain(fails)
            "the silent chain was landed by '" .. tostring(silentRun.landedBy)
            .. "' — this profile has no event after the landing, so only a ladder "
            .. "rung can honestly have done it")
+        local silentAsync = runChain("silent", "async")
+        ck(silentAsync.captured == true,
+           "the silent chain did not capture under asynchronous dispatch")
+        ck(silentAsync.deepestClear == 1,
+           "the async silent chain re-entered its own clear")
 
         -- ══ (3) THE LADDER IS BOUNDED AND DIES WITH THE WINDOW ═══════════════
         do
@@ -5798,6 +5953,199 @@ local function testComposedChain(fails)
                "the filtered capture replaced the known set instead of leaving it standing")
             sim:restore()
             clock:restore()
+        end
+
+        -- ══ (5) SYNCHRONOUS IN-CALL DISPATCH: THE RE-ENTRY CYCLE ═════════════
+        --     (fix/filter-reentry — CLIENT_ASYNC_LESSONS class 9)
+        --
+        -- The live 1.1.8 defect, in one leg. The owner's BugSack caught a C
+        -- stack overflow 65 frames deep every time a profession window opened
+        -- on Shalk, and the stack named the cycle exactly:
+        --
+        --   professions_filters.lua:803 ClearNative      (the skill-ups clear)
+        --     -> [C] the client dispatches TRADE_SKILL_UPDATE INSIDE the call
+        --       -> :1253 onEvent -> :1194 Settle -> :1210 ClearNative -> :803 ...
+        --
+        -- The latch existed. It was armed at ApplyNative, ONE CLIENT CALL LATE,
+        -- and the setter that dispatched the update ran before it.
+        do
+            local clock = newClock(4000)
+            local sim = newWindowSim(fixtureRows(), 4000, "echo", "sync")
+            clock:install()
+            sim:install()
+
+            -- RED CONTROL: 1.1.8's clear sequence, written out. `redLatched` is
+            -- the probing latch and it is armed exactly where 1.1.8 armed it —
+            -- after the first native call, not before it. The recursion is
+            -- BOUNDED here (a real client bounds it with its C stack); the
+            -- assertion is that the cycle exists at all.
+            local RED_CAP = 8
+            local red = { entries = 0, depth = 0, deepest = 0, cycled = false }
+            local redLatched = false
+            local redClear
+            local function redOnUpdate()          -- 1.1.8 onEvent -> OnWindowUpdate -> Settle
+                if redLatched then return end     -- the check that was looking the wrong way
+                redClear()
+            end
+            redClear = function()
+                red.entries = red.entries + 1
+                red.depth = red.depth + 1
+                if red.depth > red.deepest then red.deepest = red.depth end
+                if red.depth >= RED_CAP then
+                    red.cycled = true             -- stand-in for the client's overflow
+                    red.depth = red.depth - 1
+                    return
+                end
+                -- professions_filters.lua:803 as it shipped: naked.
+                if _G.TradeSkillOnlyShowSkillUps then
+                    pcall(_G.TradeSkillOnlyShowSkillUps, false)
+                end
+                redLatched = true                 -- ...and the latch, one call too late
+                pcall(_G.SetTradeSkillItemNameFilter, "")
+                redLatched = false
+                red.depth = red.depth - 1
+            end
+
+            sim.onEcho = redOnUpdate              -- the fixture delivers to the pre-fix handler
+            redClear()
+            sim.onEcho = nil
+
+            ck(red.cycled == true,
+               "RED CONTROL DID NOT REPRODUCE: the 1.1.8 clear sequence did not "
+               .. "re-enter itself under synchronous dispatch, so this fixture is "
+               .. "not modelling the defect that took the owner's window down")
+            ck(red.deepest >= 3,
+               "the red control only reached depth " .. tostring(red.deepest)
+               .. "; the live stack repeated the cycle to exhaustion")
+            ck(red.entries >= 3, "the red control re-entered the clear only "
+               .. tostring(red.entries) .. " time(s)")
+
+            -- GREEN: the SHIPPED code, same client, same synchronous dispatch,
+            -- the whole window-open sequence — open, clear, probe, scan, settle.
+            local realClear = F.ClearNative
+            local g = { calls = 0, depth = 0, deepest = 0 }
+            F.ClearNative = function(surface, gg)
+                g.calls = g.calls + 1
+                g.depth = g.depth + 1
+                if g.depth > g.deepest then g.deepest = g.depth end
+                local a, b = realClear(surface, gg)
+                g.depth = g.depth - 1
+                return a, b
+            end
+            Professions._live, Professions._scanAt = nil, nil
+            Professions._windowOpen, Professions._retry = nil, nil
+            Professions._stats, Professions._trace = nil, nil
+            Professions._settled, Professions._stale = nil, nil
+            Professions._harvested, Professions._harvestJob = nil, nil
+            Professions._viewGuards = nil
+            F._state, F._prof, F._panels, F._hooked = nil, nil, nil, nil
+            F._native, F._probing, F._reentries, F._echoes = nil, nil, nil, nil
+            F._conv, F._activated = nil, false
+            F.Activate()
+
+            local okGreen = pcall(function()
+                sim.emit("TRADE_SKILL_SHOW")      -- rows already landed at t=4000
+                clock:pump(4000 + 3)
+            end)
+            F.ClearNative = realClear
+
+            ck(okGreen, "the green window-open sequence errored under synchronous dispatch")
+            ck(g.calls > 0, "the window open never cleared the client's filters at all")
+            ck(g.deepest == 1,
+               "ClearNative re-entered itself to depth " .. tostring(g.deepest)
+               .. " under synchronous dispatch — the latch is armed too late again")
+            ck((F._echoes and F._echoes["tradeskill"] or 0) > 0,
+               "no echo was refused, so this leg proved nothing: the client's own "
+               .. "updates must reach our handlers mid-sequence for the latch to matter")
+            ck((F._reentries and F._reentries["tradeskill"] or 0) == 0,
+               "the depth fuse fired during an ordinary window open")
+
+            -- ...and everything the sequence exists to do still happened.
+            local grec = Professions._live and Professions._live.p
+                         and Professions._live.p.blacksmithing
+            ck(grec and grec.n == 4,
+               "the re-entrancy-safe open captured " .. tostring(grec and grec.n)
+               .. " recipes, expected 4 — a latch that also stops the work is not a fix")
+            ck(F.Conv("tradeskill").settled == true,
+               "the convention probe never settled: the latch swallowed the "
+               .. "measurement along with the echoes")
+            ck(_G.GetOnlyShowSkillUps() == false,
+               "the skill-ups leftover was never cleared — that call is the one the "
+               .. "latch now has to cover, and covering it must not mean skipping it")
+
+            -- The filters still FILTER after all that: the latch is a re-entrancy
+            -- gate, not an off switch.
+            F._state = { tradeskill = F.NewState() }
+            F.SetState("tradeskill", function(st) st.text = "arcanite" end)
+            ck(_G.GetTradeSkillItemNameFilter() == "arcanite",
+               "the search filter no longer reaches the client")
+            F.ClearNative("tradeskill")
+            ck(_G.GetTradeSkillItemNameFilter() == "",
+               "the clear no longer reaches the client")
+            F._state = nil
+            sim:restore()
+            clock:restore()
+        end
+
+        -- ══ (6) THE PEER LATCH: OUR EXPAND IS OUR ECHO TOO ═══════════════════
+        -- The collapse witness expands the window mid-scan, and on this client
+        -- that expand dispatches its update inside the call as well. The filter
+        -- sub-surface must read the professions module's latch, not only its
+        -- own: a clear fired from inside our expand would move the client's
+        -- filters in the middle of the scan that issued it.
+        do
+            local savedLatch2 = Professions._collapseLatch
+            local savedDepth2 = Professions._collapseDepth
+            local clears = 0
+            local realClear = F.ClearNative
+            F.ClearNative = function(...) clears = clears + 1 return realClear(...) end
+            F._state = { tradeskill = F.NewState() }
+            F._echoes = nil
+
+            Professions._collapseLatch = { tradeskill = true }
+            ck(F.SelfEcho("tradeskill") == true,
+               "the filter module could not see the professions module's own roundtrip")
+            F._onEvent(nil, "TRADE_SKILL_UPDATE")
+            ck(clears == 0,
+               "an expand-all echo made the filter panel clear the client in the "
+               .. "middle of the scan that issued it")
+            ck(Professions.CaptureWindow("tradeskill", true, "test") == false,
+               "the capture re-entered its own collapse roundtrip")
+
+            Professions._collapseLatch = nil
+            ck(F.SelfEcho("tradeskill") == false, "the peer latch never came back down")
+
+            -- The collapse latch itself is NEST-SAFE now: a restore nested
+            -- inside an expand used to clear the outer latch on its way out,
+            -- which reopened the very window the outer call was holding shut.
+            local inner = nil
+            Professions._withCollapseLatch("tradeskill", function()
+                Professions._withCollapseLatch("tradeskill", function() end)
+                inner = Professions.WindowEchoLatched("tradeskill")
+            end)
+            ck(inner == true,
+               "a nested collapse roundtrip disarmed the outer one's latch on the "
+               .. "way out — the outer call finished its client work unguarded")
+            ck(Professions.WindowEchoLatched("tradeskill") == false,
+               "the collapse latch outlived its roundtrip")
+
+            -- ...and the depth fuse refuses a third level rather than recursing.
+            local ranThird = false
+            Professions._withCollapseLatch("tradeskill", function()
+                Professions._withCollapseLatch("tradeskill", function()
+                    Professions._withCollapseLatch("tradeskill", function() ranThird = true end)
+                end)
+            end)
+            ck(ranThird == false,
+               "the collapse depth fuse let a third nested roundtrip through")
+            ck((Professions._collapseRefused or 0) > 0,
+               "the refused roundtrip was not recorded")
+
+            F.ClearNative = realClear
+            F._state = nil
+            Professions._collapseLatch = savedLatch2
+            Professions._collapseDepth = savedDepth2
+            Professions._collapseRefused = nil
         end
     end)
 
@@ -6707,6 +7055,7 @@ local function testCollapseHonesty(fails)
         Professions._settled, Professions._stale, Professions._harvestJob = nil, nil, nil
         Professions._viewGuards, Professions._lastSig = nil, nil
         Professions._collapseLatch, Professions._collapseWorld = nil, nil
+        Professions._collapseDepth, Professions._collapseRefused = nil, nil
         if ns.Store and ns.Store.data then ns.Store.data.professions = nil end
     end
 

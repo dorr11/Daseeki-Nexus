@@ -78,6 +78,16 @@
 --      list is captured again, so a session spent filtering is not a session
 --      spent stale.
 --
+-- ══ AND A FOURTH, WHICH IS NOT ABOUT CAPTURE AT ALL ══════════════════════════
+--
+--   4. NON-REENTRANCY (fix/filter-reentry, CLIENT_ASYNC_LESSONS class 9). The
+--      client dispatches the update these setters cause SYNCHRONOUSLY, inside
+--      the setter call, so every handler in the session — ours included — runs
+--      before the setter returns. A latch armed anywhere but BEFORE the first
+--      native call of a sequence is a latch the sequence's own first echo walks
+--      straight past. See "NON-REENTRANCY" below; v1.1.8 armed it one call too
+--      late and the owner's profession window would not open.
+--
 -- ══ STAND-DOWN ══════════════════════════════════════════════════════════════
 -- The standalone filter addon is going away, but it is installed today and it
 -- attaches its own panel to the same two frames. Two panels on one window is
@@ -126,6 +136,9 @@ Filters._conv      = nil     -- surface -> the MEASURED argument forms for the p
 Filters._probing   = nil     -- surface -> true while we are moving the client's filters
 Filters._unhonored = nil     -- surface -> { dimension -> true } this client ignores
 Filters._redrawFn  = nil     -- surface -> the client's own list-update function name
+Filters._native    = nil     -- surface -> depth of the native-call sequence in flight
+Filters._reentries = nil     -- surface -> how many sequences the depth fuse refused
+Filters._echoes    = nil     -- surface -> how many of our own echoes we swallowed
 
 ----------------------------------------------------------------------
 -- Stand-down
@@ -567,6 +580,99 @@ function Filters.Conv(surface)
     return conv
 end
 
+----------------------------------------------------------------------
+-- ══ NON-REENTRANCY: ONE LATCH FOR EVERY NATIVE SEQUENCE ═════════════════════
+--    (fix/filter-reentry — CLIENT_ASYNC_LESSONS class 9)
+--
+-- Interface 11509 does not SCHEDULE a window update when a filter setter is
+-- called. It DISPATCHES one — TRADE_SKILL_UPDATE and its craft twin — inside the
+-- setter call, and every handler registered by every addon in the session runs
+-- to completion before the setter returns.
+--
+-- v1.1.8 armed the probing latch inside ApplyNative. That was one client call
+-- too late: ClearNative's skill-ups clear was the FIRST native call of the
+-- sequence and it ran with the latch DOWN, so the update dispatched inside it
+-- reached our own OnWindowUpdate, which called Settle, which called ClearNative,
+-- which called the skill-ups clear again. On the owner's client that was a C
+-- stack overflow, 65 frames deep, every time a profession window opened. The
+-- harness never saw it because its sim delivered events after the setter
+-- returned, when the latch was up.
+--
+-- So: THE LATCH IS ARMED BEFORE THE FIRST NATIVE CALL of a sequence and released
+-- only once the whole sequence has returned, pcall-protected so an error inside
+-- it cannot leave the module wedged. Every handler in this file reads it (and
+-- the professions module's own collapse latch alongside it) and treats what it
+-- sees as our own echo: no clear, no probe, no capture trigger, a counter at
+-- most.
+--
+-- THE DEPTH FUSE is the belt to that brace. Legitimate nesting is exactly two
+-- deep — ClearNative wraps ApplyNative — so a third level can only be a
+-- composition nobody foresaw. It is REFUSED, with a build-stamped trace record,
+-- which degrades an unforeseen path into one skipped filter push instead of an
+-- overflow that takes the whole UI down.
+----------------------------------------------------------------------
+
+Filters.MAX_NATIVE_DEPTH = 2
+
+function Filters.NativeDepth(surface)
+    return (Filters._native and Filters._native[surface]) or 0
+end
+
+-- Are WE inside a native sequence on this surface? (nil surface: any surface.)
+function Filters.NativeBusy(surface)
+    if surface then return Filters.NativeDepth(surface) > 0 end
+    if not Filters._native then return false end
+    for _, d in pairs(Filters._native) do if (d or 0) > 0 then return true end end
+    return false
+end
+
+-- Is the PROFESSIONS module inside its own client roundtrip (the collapse
+-- witness's expand-all / restore)? Those calls echo the very same events ours
+-- do, and under synchronous dispatch they land in our handlers mid-flight.
+function Filters.PeerBusy(surface)
+    local P = ns.Professions
+    if not (P and P.WindowEchoLatched) then return false end
+    local ok, busy = pcall(P.WindowEchoLatched, surface)
+    return (ok and busy) and true or false
+end
+
+-- The one question every handler asks: is this event OUR OWN doing?
+function Filters.SelfEcho(surface)
+    return (Filters.NativeBusy(surface) or Filters.PeerBusy(surface)) and true or false
+end
+
+-- Run `fn` as ONE native sequence. Returns ok, err; the fuse refuses with
+-- (false, "reentry") rather than recursing.
+function Filters.WithNative(surface, what, fn)
+    Filters._native = Filters._native or {}
+    local depth = Filters._native[surface] or 0
+    if depth >= Filters.MAX_NATIVE_DEPTH then
+        Filters._reentries = Filters._reentries or {}
+        Filters._reentries[surface] = (Filters._reentries[surface] or 0) + 1
+        noteProbe(surface, "reentry-refused", tostring(what) .. " depth "
+            .. tostring(depth + 1) .. " build " .. tostring(Filters.ClientBuild()))
+        return false, "reentry"
+    end
+    Filters._native[surface] = depth + 1
+    -- The view guard's witness rides the same latch, so the capture layer sees
+    -- "probing" for exactly as long as the client's filters are ours to move.
+    Filters._probing = Filters._probing or {}
+    local wasProbing = Filters._probing[surface]
+    Filters._probing[surface] = true
+    local ok, err = pcall(fn)
+    Filters._probing[surface] = wasProbing
+    Filters._native[surface] = depth
+    return ok, err
+end
+
+-- One of our own events, swallowed. Counted so the diagnostics can say how loud
+-- this client is rather than leaving the refusal invisible.
+function Filters.NoteEcho(surface)
+    Filters._echoes = Filters._echoes or {}
+    Filters._echoes[surface] = (Filters._echoes[surface] or 0) + 1
+    return false
+end
+
 -- SHOW EVERYTHING, by measurement. Returns the row count we ended on.
 --
 -- Each candidate is applied and measured; the winner is the one that leaves the
@@ -765,26 +871,35 @@ end
 -- the client's filters on purpose and a capture that read the list mid-probe
 -- would read a deliberately narrowed one.
 function Filters.ApplyNative(surface, state, G)
-    local api = Filters.Api(surface, G)
     state = state or Filters.NewState()
-    Filters._probing = Filters._probing or {}
-    local was = Filters._probing[surface]
-    Filters._probing[surface] = true
-    local ok, err = pcall(function()
-        -- The two dimensions whose meaning is NOT in doubt: one string, one
-        -- boolean, both with getters that read back what was set.
-        if api.setText then pcall(api.setText, Filters.Trim(state.text)) end
-        if api.setMakeable then pcall(api.setMakeable, state.makeable and true or false) end
-        -- ...and the two whose argument convention the catalog does not carry.
-        Filters.ApplyPickers(surface, api, state, G)
+    local pushErr = nil
+    local ok, err = Filters.WithNative(surface, "apply", function()
+        local api = Filters.Api(surface, G)
+        local pushed, perr = pcall(function()
+            -- The two dimensions whose meaning is NOT in doubt: one string, one
+            -- boolean, both with getters that read back what was set.
+            if api.setText then pcall(api.setText, Filters.Trim(state.text)) end
+            if api.setMakeable then pcall(api.setMakeable, state.makeable and true or false) end
+            -- ...and the two whose argument convention the catalog does not carry.
+            Filters.ApplyPickers(surface, api, state, G)
+        end)
+        if not pushed then pushErr = perr end
+        -- The client filtered; now make it repaint. Without this the list on
+        -- screen is the list from before the filter, which is indistinguishable
+        -- to a player from a filter that does not work.
+        --
+        -- INSIDE the latch (class 9): the client's own list-update function runs
+        -- the game's refresh, and anything that refresh announces comes back at
+        -- our handlers synchronously. v1.1.8 released the latch first.
+        Filters.Redraw(surface, G)
     end)
-    Filters._probing[surface] = was
-    -- The client filtered; now make it repaint. Without this the list on screen
-    -- is the list from before the filter, which is indistinguishable to a player
-    -- from a filter that does not work.
-    Filters.Redraw(surface, G)
-    if not ok then noteProbe(surface, "apply-error", tostring(err)) end
-    return ok
+    if err == "reentry" then return false end
+    if not ok then pushErr = pushErr or err end
+    if pushErr then
+        noteProbe(surface, "apply-error", tostring(pushErr))
+        return false
+    end
+    return true
 end
 
 -- Everything back to "show me all of it". This is what runs on window show and
@@ -793,15 +908,28 @@ end
 -- It cannot narrow: ShowAll only ever accepts a candidate that leaves MORE rows
 -- enumerated, and the unambiguous dimensions are set to their empty values.
 function Filters.ClearNative(surface, G)
-    -- The client's own "only show skill-ups" box is not a dimension this panel
-    -- offers, but it IS one the capture layer refuses on, and it survives across
-    -- window sessions. Left engaged it would mean every open lands in a
-    -- permanent refusal that nothing this file does can lift. One boolean, no
-    -- ambiguity, cleared where every other leftover is cleared — on the way in
-    -- and on the way out, never on a keystroke.
-    local api = Filters.Api(surface, G)
-    if api.setSkillUps then pcall(api.setSkillUps, false) end
-    return Filters.ApplyNative(surface, Filters.NewState(), G)
+    -- THE LATCH IS ARMED HERE, before the first client call — this line is the
+    -- whole of fix/filter-reentry. In v1.1.8 the skill-ups clear below ran naked
+    -- and the update the client dispatched inside it walked straight back into
+    -- Settle -> ClearNative -> here (class 9).
+    local applied = false
+    local ok, err = Filters.WithNative(surface, "clear", function()
+        -- The client's own "only show skill-ups" box is not a dimension this
+        -- panel offers, but it IS one the capture layer refuses on, and it
+        -- survives across window sessions. Left engaged it would mean every open
+        -- lands in a permanent refusal that nothing this file does can lift. One
+        -- boolean, no ambiguity, cleared where every other leftover is cleared —
+        -- on the way in and on the way out, never on a keystroke.
+        local api = Filters.Api(surface, G)
+        if api.setSkillUps then pcall(api.setSkillUps, false) end
+        applied = Filters.ApplyNative(surface, Filters.NewState(), G)
+    end)
+    if err == "reentry" then return false end
+    if not ok then
+        noteProbe(surface, "clear-error", tostring(err))
+        return false
+    end
+    return applied
 end
 
 -- The witness professions.lua's capture consults. A window that is closed
@@ -846,6 +974,10 @@ end
 function Filters.SetState(surface, mutate)
     local st = Filters._state and Filters._state[surface]
     if not st then return false end
+    -- A control cannot legitimately be driven from inside one of our own native
+    -- sequences; anything that arrives there is a re-entry wearing a control's
+    -- clothes (class 9).
+    if Filters.SelfEcho(surface) then return Filters.NoteEcho(surface) end
     if type(mutate) == "function" then mutate(st) end
     Filters.ApplyNative(surface, st)
     if Filters.NoteUnhonored(surface, st) then
@@ -868,6 +1000,10 @@ function Filters.CaptureSoon(surface)
     if not (P and P.CaptureWindow) then return false end
     local run = function()
         if not Filters.IsEnabled() then return end
+        -- A client with no timer service runs this inline. Inside a native
+        -- sequence that would hand the capture a list we are deliberately
+        -- moving; the sequence's own tail re-asks (class 9).
+        if Filters.SelfEcho(surface) then return end
         P.CaptureWindow(surface, true)
     end
     if _G.C_Timer and _G.C_Timer.After then _G.C_Timer.After(0, run) else run() end
@@ -1068,6 +1204,8 @@ end
 
 function Filters.ResetSurface(surface)
     if not (Filters._state and Filters._state[surface]) then return false end
+    -- The Clear button's own path into the client. Same rule as SetState.
+    if Filters.SelfEcho(surface) then return Filters.NoteEcho(surface) end
     Filters._state[surface] = Filters.NewState()
     Filters.ApplyNative(surface, Filters._state[surface])
     local panel = Filters._panels and Filters._panels[surface]
@@ -1108,6 +1246,11 @@ function Filters.OnWindowShow(surface, retried)
         if why and why:find(Filters.CPF_ADDON, 1, true) then Filters.NoteStandDown(why) end
         return false
     end
+    -- A show that arrives INSIDE one of our own native sequences is our own echo
+    -- reaching a frame script (class 9): a third-party UI that re-shows the game
+    -- frame from an update handler is all it takes. Opening again from here would
+    -- clear the client mid-clear.
+    if Filters.SelfEcho(surface) then return Filters.NoteEcho(surface) end
     -- The game's profession UI is load-on-demand: the SHOW event can beat the
     -- frame into existence, and a third-party UI can delay it further. ONE
     -- deferred retry, not §7 defect 30's twenty-shot poll — and the frame's own
@@ -1151,8 +1294,14 @@ end
 function Filters.OnWindowHide(surface)
     -- Clear on the way out (§A.5): nothing of ours survives the window, so the
     -- next open cannot start narrowed and the next capture cannot start short.
+    --
+    -- A close that lands INSIDE a native sequence is never swallowed — the
+    -- player really did shut the window, and a swallowed close would leave the
+    -- panel on screen over a frame that is gone. What it does NOT do is start a
+    -- second clear: the sequence already in flight is one, and it is pcall'd
+    -- against a window that has just vanished (class 9).
     if Filters._state and Filters._state[surface] then
-        Filters.ClearNative(surface)
+        if not Filters.SelfEcho(surface) then Filters.ClearNative(surface) end
         Filters._state[surface] = nil
     end
     if Filters._prof then Filters._prof[surface] = nil end
@@ -1167,9 +1316,10 @@ end
 -- A filter that means something for tailoring means nothing for cooking.
 function Filters.OnWindowUpdate(surface)
     if not (Filters._state and Filters._state[surface]) then return false end
-    -- Our own probe echoes back as updates. Re-entering here mid-measurement
-    -- would measure the measurement.
-    if Filters._probing and Filters._probing[surface] then return false end
+    -- Our own probe echoes back as updates — SYNCHRONOUSLY, inside the setter
+    -- call, on interface 11509. Re-entering here mid-measurement would measure
+    -- the measurement, and (v1.1.8) recurse until the stack gave out.
+    if Filters.SelfEcho(surface) then return Filters.NoteEcho(surface) end
     local now = Filters.ProfessionName(surface)
     local was = Filters._prof and Filters._prof[surface]
     if now and was and now ~= was then
@@ -1193,7 +1343,10 @@ end
 -- `settled` is true and this cannot become a loop.
 function Filters.Settle(surface)
     if not (Filters._state and Filters._state[surface]) then return false end
-    if Filters._probing and Filters._probing[surface] then return false end
+    -- THE FRAME THE LIVE STACK BLEW UP THROUGH (class 9). This is the handler
+    -- that called ClearNative from inside ClearNative's own first setter call;
+    -- it now stands down on the latch that call arms before it fires.
+    if Filters.SelfEcho(surface) then return Filters.NoteEcho(surface) end
     local conv = Filters.Conv(surface)
     if conv.settled then return false end
     if Filters.Narrowed(Filters._state[surface]) then return false end
@@ -1244,8 +1397,30 @@ Filters.EVENTS = {
     "CRAFT_SHOW", "CRAFT_UPDATE", "CRAFT_CLOSE",
 }
 
+-- Which surface an event belongs to, and whether it may be swallowed as our own
+-- echo. The CLOSE events never may: the player really did shut the window, and
+-- a swallowed close leaves a panel floating over a frame that is gone.
+local EVENT_SURFACE = {
+    TRADE_SKILL_SHOW = TRADESKILL, TRADE_SKILL_UPDATE = TRADESKILL,
+    TRADE_SKILL_CLOSE = TRADESKILL,
+    CRAFT_SHOW = CRAFT, CRAFT_UPDATE = CRAFT, CRAFT_CLOSE = CRAFT,
+}
+local EVENT_IS_CLOSE = {
+    TRADE_SKILL_CLOSE = true, CRAFT_CLOSE = true,
+}
+
 local function onEvent(_, event)
     if not Filters.IsEnabled() then return end
+    -- ══ THE CHOKE POINT (class 9) ═══════════════════════════════════════════
+    -- On interface 11509 this handler runs INSIDE our own setter call, our own
+    -- redraw, or the professions module's own expand/collapse. Whatever the
+    -- event claims to be, at that moment it is our own echo: no clear, no probe,
+    -- no capture trigger, a counter and nothing else. Every handler below repeats
+    -- the check for itself — this one only makes the refusal cheap and total.
+    local surface = EVENT_SURFACE[event]
+    if surface and not EVENT_IS_CLOSE[event] and Filters.SelfEcho(surface) then
+        return Filters.NoteEcho(surface)
+    end
     if event == "TRADE_SKILL_SHOW" then
         Filters.HookFrame(TRADESKILL)
         Filters.OnWindowShow(TRADESKILL)
@@ -1311,6 +1486,9 @@ function Filters.Teardown()
     Filters._prof      = nil
     Filters._textTimer = nil
     Filters._probing   = nil
+    Filters._native    = nil
+    Filters._reentries = nil
+    Filters._echoes    = nil
     -- The measured conventions go too. They describe a client we are no longer
     -- talking to, and a form remembered across a teardown is the sticky
     -- calibration class 5 warns about wearing a different hat.
@@ -1340,6 +1518,16 @@ ns:RegisterDebugCommand("proffilters", function()
     ns:Print(string.format("  activated=%s | cpf=%s | panels=%s",
         tostring(Filters._activated), tostring(Filters.ProbeCPF().cpfLoaded),
         tostring(Filters._panels ~= nil)))
+    -- THE CLASS-9 READOUT. `echoes` is how many of our own update events this
+    -- client dispatched back at us mid-sequence — on a synchronous-dispatch
+    -- client it is never zero — and `fused` must stay zero: it counts sequences
+    -- the depth fuse had to refuse, which is a composition nobody foresaw.
+    for _, surface in ipairs(Filters.SURFACES) do
+        ns:Print(string.format("  %s echo discipline: depth=%d | echoes swallowed=%d"
+            .. " | fuse refusals=%d", surface, Filters.NativeDepth(surface),
+            (Filters._echoes and Filters._echoes[surface]) or 0,
+            (Filters._reentries and Filters._reentries[surface]) or 0))
+    end
     -- WHAT THIS CLIENT ACTUALLY HONORS, as measured rather than as assumed.
     -- This is the readout that answers the question P3 could only flag.
     for _, surface in ipairs(Filters.SURFACES) do
@@ -1373,14 +1561,33 @@ end)
 
 -- Build a fake client over a list model. Returns the sim; call sim:install()
 -- and sim:restore().
-local function newClientSim(model, spellOf)
-    local sim = { state = Filters.NewState(), model = model, saved = {} }
+local function newClientSim(model, spellOf, dispatch)
+    local sim = { state = Filters.NewState(), model = model, saved = {},
+                  dispatch = dispatch or "sync", echoes = 0 }
 
     function sim.surviving()
         return Filters.Select(model, sim.state)
     end
 
     local G = _G
+
+    -- Class 9: this client announces every filter change, and by default it does
+    -- so INSIDE the setter call. Both modules hear it, in the order the client
+    -- would use, so the interlock is proven against the re-entrant ordering
+    -- rather than only against the tidy one.
+    local function echo()
+        sim.echoes = sim.echoes + 1
+        local deliver = function()
+            local P = ns.Professions
+            if P and P._onEvent then P._onEvent(nil, "TRADE_SKILL_UPDATE") end
+            if Filters._onEvent then Filters._onEvent(nil, "TRADE_SKILL_UPDATE") end
+        end
+        if sim.dispatch == "async" and G.C_Timer and G.C_Timer.After then
+            G.C_Timer.After(0, deliver)
+        else
+            deliver()
+        end
+    end
     function sim:install()
         self.saved = {
             num = G.GetNumTradeSkills, info = G.GetTradeSkillInfo,
@@ -1406,16 +1613,20 @@ local function newClientSim(model, spellOf)
         end
         G.GetTradeSkillLine = function() return "Blacksmithing", 275, 300 end
         G.GetTradeSkillCooldown = function() return nil end
-        G.SetTradeSkillItemNameFilter = function(t) sim.state.text = t or "" end
+        G.SetTradeSkillItemNameFilter = function(t) sim.state.text = t or "" echo() end
         G.GetTradeSkillItemNameFilter = function() return sim.state.text end
-        G.TradeSkillOnlyShowMakeable = function(v) sim.state.makeable = v and true or false end
+        G.TradeSkillOnlyShowMakeable = function(v)
+            sim.state.makeable = v and true or false echo()
+        end
         G.GetOnlyShowMakeable = function() return sim.state.makeable end
         G.SetTradeSkillSubClassFilter = function(i, listAll)
             sim.state.subclass = (listAll == 1 or listAll == true) and 0 or (tonumber(i) or 0)
+            echo()
         end
         G.GetTradeSkillSubClasses = function() return { "Weapon", "Armor" } end
         G.SetTradeSkillInvSlotFilter = function(i, listAll)
             sim.state.slot = (listAll == 1 or listAll == true) and 0 or (tonumber(i) or 0)
+            echo()
         end
         G.GetTradeSkillInvSlots = function() return { "Head", "Chest" } end
     end
@@ -1775,11 +1986,37 @@ end
 --               the exact call P3 shipped as its blind CLEAR empties the list.
 --   "indexonly" one argument, 0 means all, extra arguments ignored, and neither
 --               setter touches the other's field.
-local function newConventionSim(convention, rows)
+--
+-- DISPATCH (fix/filter-reentry, CLIENT_ASYNC_LESSONS class 9). Every one of
+-- these setters ECHOES a window update back at this module, and on interface
+-- 11509 it does so SYNCHRONOUSLY, inside the setter call — which is how a
+-- handler of ours ends up running in the middle of the sequence that woke it.
+-- "sync" is therefore the default; "async" (a queued echo, or none if the
+-- fixture has no timer) is the kinder variant, kept so the fix is proven under
+-- both and never only under the one that unwinds the stack first.
+local function newConventionSim(convention, rows, dispatch)
     local G = _G
-    local sim = { rows = rows or convFixture(), saved = {}, redraws = 0, convention = convention }
-    sim.f = { text = "", makeable = false, sub = 0, slot = 0,
+    local sim = { rows = rows or convFixture(), saved = {}, redraws = 0,
+                  convention = convention, dispatch = dispatch or "sync", echoes = 0 }
+    sim.f = { text = "", makeable = false, sub = 0, slot = 0, skillUps = false,
               allSub = true, allSlot = true }
+
+    -- The echo goes to THIS module's handler only: the capture layer's own
+    -- composition with these events is the composed chain's territory
+    -- (professions.lua), and driving it from here would have this suite writing
+    -- known sets as a side effect of measuring argument conventions.
+    local function echo()
+        sim.echoes = sim.echoes + 1
+        local deliver = function()
+            if Filters._onEvent then Filters._onEvent(nil, "TRADE_SKILL_UPDATE") end
+        end
+        if sim.dispatch == "async" then
+            if G.C_Timer and G.C_Timer.After then G.C_Timer.After(0, deliver) end
+        else
+            deliver()
+        end
+    end
+    sim.echo = echo
 
     function sim.visible()
         local out, pending = {}, nil
@@ -1827,6 +2064,7 @@ local function newConventionSim(convention, rows)
         s.makeable, s.getMakeable = G.TradeSkillOnlyShowMakeable, G.GetOnlyShowMakeable
         s.setSub, s.subs = G.SetTradeSkillSubClassFilter, G.GetTradeSkillSubClasses
         s.setSlot, s.slots = G.SetTradeSkillInvSlotFilter, G.GetTradeSkillInvSlots
+        s.setUps, s.getUps = G.TradeSkillOnlyShowSkillUps, G.GetOnlyShowSkillUps
         s.frame, s.update = G.TradeSkillFrame, G.TradeSkillFrame_Update
 
         G.GetNumTradeSkills = function() return #sim.visible() end
@@ -1837,12 +2075,21 @@ local function newConventionSim(convention, rows)
         end
         G.GetTradeSkillRecipeLink = function() return nil end
         G.GetTradeSkillLine = function() return "Blacksmithing", 275, 300 end
-        G.SetTradeSkillItemNameFilter = function(t) sim.f.text = t or "" end
+        G.SetTradeSkillItemNameFilter = function(t) sim.f.text = t or "" echo() end
         G.GetTradeSkillItemNameFilter = function() return sim.f.text end
-        G.TradeSkillOnlyShowMakeable = function(v) sim.f.makeable = v and true or false end
+        G.TradeSkillOnlyShowMakeable = function(v)
+            sim.f.makeable = v and true or false echo()
+        end
         G.GetOnlyShowMakeable = function() return sim.f.makeable end
-        G.SetTradeSkillSubClassFilter  = function(i, a, b) setPicker("sub", i, a, b) end
-        G.SetTradeSkillInvSlotFilter   = function(i, a, b) setPicker("slot", i, a, b) end
+        -- THE FIRST CALL OF THE CLEAR SEQUENCE (professions_filters.lua:803) —
+        -- the frame the live 1.1.8 stack overflowed through, present here so the
+        -- sequence's first echo lands where the live one did.
+        G.TradeSkillOnlyShowSkillUps = function(v)
+            sim.f.skillUps = v and true or false echo()
+        end
+        G.GetOnlyShowSkillUps = function() return sim.f.skillUps end
+        G.SetTradeSkillSubClassFilter  = function(i, a, b) setPicker("sub", i, a, b) echo() end
+        G.SetTradeSkillInvSlotFilter   = function(i, a, b) setPicker("slot", i, a, b) echo() end
         G.GetTradeSkillSubClasses = function() return { "Weapon", "Armor" } end
         G.GetTradeSkillInvSlots   = function() return { "Head", "Chest" } end
         G.TradeSkillFrame = {}
@@ -1863,6 +2110,7 @@ local function newConventionSim(convention, rows)
         G.TradeSkillOnlyShowMakeable, G.GetOnlyShowMakeable = s.makeable, s.getMakeable
         G.SetTradeSkillSubClassFilter, G.GetTradeSkillSubClasses = s.setSub, s.subs
         G.SetTradeSkillInvSlotFilter, G.GetTradeSkillInvSlots = s.setSlot, s.slots
+        G.TradeSkillOnlyShowSkillUps, G.GetOnlyShowSkillUps = s.setUps, s.getUps
         G.TradeSkillFrame, G.TradeSkillFrame_Update = s.frame, s.update
     end
 
@@ -1906,10 +2154,12 @@ local function testNativeConventions(fails)
         Filters.ForgetConventions(nil)
         Filters._conv, Filters._unhonored, Filters._probing = nil, nil, nil
         Filters._redrawFn, Filters._toldUnhonored = nil, nil
+        Filters._native, Filters._reentries, Filters._echoes = nil, nil, nil
     end
 
     local savedConv = { Filters._conv, Filters._unhonored, Filters._probing,
-                        Filters._redrawFn, Filters._toldUnhonored }
+                        Filters._redrawFn, Filters._toldUnhonored,
+                        Filters._native, Filters._reentries, Filters._echoes }
 
     local ok, err = pcall(function()
         -- ══ (1) THE SHARED-RECORD CLIENT: the category picker report ═════════
@@ -2200,11 +2450,131 @@ local function testNativeConventions(fails)
                "the store still carries the dead (i,1,1) show-all form")
             sim2:restore()
         end
+
+        -- ══ (9) SYNCHRONOUS IN-CALL DISPATCH: THE PROBE MAY NOT RE-ENTER ═════
+        --     (fix/filter-reentry — CLIENT_ASYNC_LESSONS class 9)
+        --
+        -- The measurement sweep is DOZENS of setter calls, and on interface
+        -- 11509 every one of them dispatches a window update inside the call.
+        -- Each of those updates reaches OnWindowUpdate, which reaches Settle,
+        -- which reaches ClearNative — the sweep re-entering the sweep. 1.1.8's
+        -- latch was armed inside ApplyNative, so the skill-ups clear that opens
+        -- the sequence ran outside it and the cycle had its way in.
+        --
+        -- Here the whole probe runs against an echoing client, with the window
+        -- state live so the handlers are armed, and the conventions must still
+        -- come out MEASURED at the end — a latch that also swallowed the
+        -- measurement would look identical to a fix from the stack's point of
+        -- view and be useless from the player's.
+        for _, mode in ipairs({ "sync", "async" }) do
+            local sim = newConventionSim("triple", nil, mode)
+            sim:install()
+            reset()
+            local full = _G.GetNumTradeSkills()
+
+            -- The leftover the clear must lift, engaged BEFORE the window state
+            -- goes live so this setup call is not itself a window session event.
+            _G.TradeSkillOnlyShowSkillUps(true)
+            -- The window is OPEN: without this the update handler returns early
+            -- for a reason that has nothing to do with the latch.
+            local savedState = Filters._state
+            Filters._state = { [TRADESKILL] = Filters.NewState() }
+
+            local depth, deepest, calls = 0, 0, 0
+            local realClear = Filters.ClearNative
+            Filters.ClearNative = function(s, g)
+                calls = calls + 1
+                depth = depth + 1
+                if depth > deepest then deepest = depth end
+                local a, b = realClear(s, g)
+                depth = depth - 1
+                return a, b
+            end
+            local okLeg = pcall(function()
+                Filters.ClearNative(TRADESKILL)      -- the clear-on-open sequence
+                Filters.ApplyNative(TRADESKILL, freshState(function(st) st.subclass = 1 end))
+            end)
+            Filters.ClearNative = realClear
+
+            ck(okLeg, mode .. ": the probe errored against an echoing client")
+            ck(sim.echoes > 0, mode .. ": the fixture never echoed a setter call back "
+               .. "at the module, so it is kinder than the client and proves nothing")
+            ck(deepest == 1, mode .. ": ClearNative re-entered itself to depth "
+               .. tostring(deepest) .. " — that is the 1.1.8 cycle")
+            ck(calls == 1, mode .. ": the clear ran " .. tostring(calls)
+               .. " times for one clear-on-open")
+            ck((Filters._reentries and Filters._reentries[TRADESKILL] or 0) == 0,
+               mode .. ": the depth fuse had to refuse a sequence during an ordinary probe")
+            ck(_G.GetOnlyShowSkillUps() == false,
+               mode .. ": the skill-ups leftover survived the clear — the call that "
+               .. "opens the sequence must be covered by the latch, not skipped by it")
+
+            -- The measurement still happened, and it still narrows.
+            ck(_G.GetNumTradeSkills() == 3, mode .. ": the measured category filter left "
+               .. _G.GetNumTradeSkills() .. " rows, expected 3")
+            ck(Filters._conv[TRADESKILL].subPick ~= nil,
+               mode .. ": the category form was never measured under an echoing client")
+            Filters.ClearNative(TRADESKILL)
+            ck(_G.GetNumTradeSkills() == full,
+               mode .. ": the clear did not restore the full list ("
+               .. _G.GetNumTradeSkills() .. "/" .. full .. ")")
+
+            -- And in the SYNC posture the echoes really did arrive mid-sequence.
+            if mode == "sync" then
+                ck((Filters._echoes and Filters._echoes[TRADESKILL] or 0) > 0,
+                   "sync: not one echo reached a handler, so the latch was never "
+                   .. "the thing that refused them")
+            end
+
+            Filters._state = savedState
+            sim:restore()
+        end
+
+        -- ══ (10) THE DEPTH FUSE, EXERCISED DIRECTLY ══════════════════════════
+        -- Belt-and-braces to the latch above: legitimate nesting is exactly two
+        -- (ClearNative wraps ApplyNative), so a THIRD level is a composition
+        -- nobody foresaw and it is refused outright — one skipped filter push
+        -- instead of the overflow that took the owner's window down.
+        do
+            Filters._native, Filters._reentries = nil, nil
+            local ran = { false, false, false }
+            Filters.WithNative(TRADESKILL, "fuse-test", function()
+                ran[1] = true
+                Filters.WithNative(TRADESKILL, "fuse-test", function()
+                    ran[2] = true
+                    local ok3, why3 = Filters.WithNative(TRADESKILL, "fuse-test",
+                        function() ran[3] = true end)
+                    ck(ok3 == false and why3 == "reentry",
+                       "the depth fuse did not refuse the third nested sequence ("
+                       .. tostring(why3) .. ")")
+                end)
+            end)
+            ck(ran[1] and ran[2], "the fuse refused a legitimate two-deep sequence — "
+               .. "ClearNative wrapping ApplyNative is the normal shape")
+            ck(ran[3] == false, "the fuse let a third nested sequence reach the client")
+            ck((Filters._reentries and Filters._reentries[TRADESKILL] or 0) == 1,
+               "the fuse refusal was not counted for the diagnostics")
+            ck(Filters.NativeDepth(TRADESKILL) == 0,
+               "the latch did not unwind to zero after the sequences returned")
+
+            -- ...and an ERROR inside a sequence may not leave the latch stuck.
+            -- A wedged latch is a module that silently stops filtering, stops
+            -- clearing, and stops letting the capture layer read the window.
+            Filters._native, Filters._reentries = nil, nil
+            local okErr = Filters.WithNative(TRADESKILL, "fuse-test",
+                function() error("boom") end)
+            ck(okErr == false, "an erroring sequence reported success")
+            ck(Filters.NativeBusy(TRADESKILL) == false,
+               "an error inside a native sequence left the latch armed forever")
+            Filters._native, Filters._reentries = nil, nil
+        end
     end)
 
     reset()
     Filters._conv, Filters._unhonored, Filters._probing = savedConv[1], savedConv[2], savedConv[3]
     Filters._redrawFn, Filters._toldUnhonored = savedConv[4], savedConv[5]
+    Filters._native, Filters._reentries = savedConv[6], savedConv[7]
+    Filters._echoes = savedConv[8]
     if not ok then fails[#fails + 1] = "error in convention fixtures: " .. tostring(err) end
 end
 

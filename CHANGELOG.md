@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+- **Fixed: opening a profession window could freeze the game with a script error.** On some
+  clients the trade-skill window would not open at all — the game reported a stack overflow
+  and the error window filled with Nexus and other addons' frames. The cause was ours: when
+  Nexus clears the leftover filters a profession window opens with, this client announces
+  each of those changes *while the change is still being made*, so our own "the window
+  updated" handler ran in the middle of our own clear and started the clear again — and
+  again, until the game ran out of room. The clear now holds a lock from its very first
+  call to its last, so anything it hears back from the game while it works is recognised as
+  its own voice and ignored, with a hard stop underneath in case some future combination
+  finds another way in. The window opens, the filters clear, the scan runs, and the search
+  and category controls work exactly as before. This holds no matter what other profession
+  addons you have installed — they receive the same announcements and are free to do
+  whatever they like with them.
+
 ## 1.1.8 — 2026-08-10
 
 - Professions: the shopping-list verb moves to the detail pane's corner as Raid Prep's
