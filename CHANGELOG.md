@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Professions: the shopping-list verb moves to the detail pane's corner as Raid Prep's
+  gavel icon; delegate designations now speak through blue level/census inks and a name
+  asterisk instead of corner digits; and the cooldowns pane finally lists ready crafters
+  on quiet days — ownership proven from recipe knowledge, readiness from the absence of a
+  running stamp.
+
 - **Professions — records now survive dataset updates.** Until now, any update to the
   shipped recipe dataset — even one that touched no recipe, like the spec-tree addition —
   reset every character's known-recipe records to "not checked" and sent you on a re-scan
