@@ -1443,6 +1443,28 @@ local function defaultData()
             schema = 1,
             visits = {},    -- [1] = newest { at, build, class, want, pages, outcome }
         },
+        -- Rin'wosho visit flight recorder (1.1.10). Same doctrine as saygeTrace
+        -- above — bounded ring, newest first, build-stamped, additive — and it
+        -- exists for the same reason: the owner reported twice that the zanza
+        -- turn-in and the vendor repair never land on one physical visit, and
+        -- WHICH of the four client behaviours causes that is not provable
+        -- offline. `visits` is pure evidence and steers nothing.
+        --
+        -- `world` IS the exception, and it is the only steering diagnostic in
+        -- this file, so it is called out here rather than discovered later: it
+        -- counts what the CLIENT was observed to do at 14921 — whether gossip
+        -- re-shows after a quest reward (reshow*) and whether closing a
+        -- merchant window we opened returns to gossip (return*) — and
+        -- Auto.DecideRepairFirstLicense reads those counters to decide whether
+        -- the repair may be taken BEFORE the turn-in. Every counter is written
+        -- only from an observation that cost nothing (a turn-in that was going
+        -- to happen anyway, a repair on a visit with no token), so the learning
+        -- can never itself trade a flask for a repair.
+        rinwoshoTrace = {
+            schema = 1,
+            visits = {},    -- [1] = newest { at, build, sig, steps, outcome, … }
+            world  = {},    -- { reshowSeen, reshowMissed, returnSeen, returnMissed, build }
+        },
     }
 end
 
@@ -1472,6 +1494,79 @@ function Store.GetSaygeTrace()
     local data = Store.data
     local t = type(data) == "table" and data.saygeTrace or nil
     return type(t) == "table" and t.visits or nil
+end
+
+----------------------------------------------------------------------
+-- Rin'wosho visit ring + learned client world (1.1.10)
+----------------------------------------------------------------------
+
+-- Cap for the Rin'wosho visit ring (see rinwoshoTrace above).
+Store.RINWOSHO_TRACE_MAX = 10
+
+-- The counters Store.NoteRinwoshoWorld will accept. A WHITELIST, not a free
+-- table: this block steers a gold-spending flow, so a typo'd key must be a
+-- refusal rather than a new field nothing ever reads.
+Store.RINWOSHO_WORLD_KEYS = {
+    reshowSeen   = true,   -- gossip re-showed after a quest reward at 14921
+    reshowMissed = true,   -- …and the visits where it did not
+    returnSeen   = true,   -- gossip returned after we closed OUR merchant window
+    returnMissed = true,   -- …and the visits where it did not
+}
+
+-- The trace block, lazily rebuilt on a save file that predates 1.1.10 so the
+-- diagnostic can never crash on the very SV it exists to diagnose.
+local function rinwoshoBlock()
+    local data = Store.data
+    if type(data) ~= "table" then return nil end
+    local t = data.rinwoshoTrace
+    if type(t) ~= "table" then
+        t = { schema = 1, visits = {}, world = {} }
+        data.rinwoshoTrace = t
+    end
+    if type(t.visits) ~= "table" then t.visits = {} end
+    if type(t.world)  ~= "table" then t.world  = {} end
+    return t
+end
+
+-- Append one completed Rin'wosho visit record, newest first, and trim the ring.
+function Store.AppendRinwoshoVisit(rec)
+    if type(rec) ~= "table" then return false end
+    local t = rinwoshoBlock()
+    if not t then return false end
+    table.insert(t.visits, 1, rec)
+    for i = #t.visits, Store.RINWOSHO_TRACE_MAX + 1, -1 do
+        table.remove(t.visits, i)
+    end
+    return true
+end
+
+-- The ring, newest first (the `/dsn debug rinwosho` dump's source).
+function Store.GetRinwoshoTrace()
+    local data = Store.data
+    local t = type(data) == "table" and data.rinwoshoTrace or nil
+    return type(t) == "table" and t.visits or nil
+end
+
+-- The learned world counters. Returns nil when there is no data SV at all —
+-- which the license reads as "unproven", i.e. the conservative answer.
+function Store.GetRinwoshoWorld()
+    local data = Store.data
+    local t = type(data) == "table" and data.rinwoshoTrace or nil
+    return type(t) == "table" and t.world or nil
+end
+
+-- Count ONE observation. Returns (ok, newCount). An unknown key is refused.
+function Store.NoteRinwoshoWorld(key, build)
+    if not Store.RINWOSHO_WORLD_KEYS[key] then return false, nil end
+    local t = rinwoshoBlock()
+    if not t then return false, nil end
+    local n = (tonumber(t.world[key]) or 0) + 1
+    t.world[key] = n
+    -- Build-stamped like every other diagnostic here: a counter learned on an
+    -- older build is still readable, and the stamp is what tells the next
+    -- reader whether the observation predates a change to the flow.
+    t.world.build = build or t.world.build
+    return true, n
 end
 
 Store.ALERT_BUFF_KEYS    = ALERT_BUFF_KEYS
@@ -8478,6 +8573,57 @@ local function testSaygeTraceRing(fails)
     Store.data = savedData
 end
 
+-- Rin'wosho visit ring + learned world (1.1.10). The ring is the Sayge ring's
+-- twin and is asserted the same way; the WORLD counters get their own rows
+-- because they are the one diagnostic in this file that steers behaviour, so
+-- "an unknown key is refused" is a safety property and not a nicety.
+local function testRinwoshoTraceRing(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local savedData = Store.data
+
+    Store.data = { rinwoshoTrace = { schema = 1, visits = {}, world = {} } }
+    for i = 1, Store.RINWOSHO_TRACE_MAX + 2 do
+        ck(Store.AppendRinwoshoVisit({ n = i }) == true, "rin append " .. i .. " accepted")
+    end
+    local ring = Store.GetRinwoshoTrace()
+    ck(ring ~= nil and #ring == Store.RINWOSHO_TRACE_MAX,
+        "rin ring capped at RINWOSHO_TRACE_MAX (" .. tostring(ring and #ring) .. ")")
+    ck(ring[1].n == Store.RINWOSHO_TRACE_MAX + 2, "rin ring newest first")
+    ck(ring[#ring].n == 3, "rin ring oldest surviving record")
+
+    -- A pre-1.1.10 data SV has no block at all: both writers heal it.
+    Store.data = {}
+    ck(Store.AppendRinwoshoVisit({ n = 99 }) == true, "rin append heals a legacy data SV")
+    ck(#Store.GetRinwoshoTrace() == 1, "healed rin block holds the record")
+    Store.data = {}
+    local ok, n = Store.NoteRinwoshoWorld("reshowSeen", "1.1.10")
+    ck(ok == true and n == 1, "world note heals a legacy data SV and counts 1")
+    ok, n = Store.NoteRinwoshoWorld("reshowSeen", "1.1.10")
+    ck(ok == true and n == 2, "world note accumulates")
+    ck(Store.GetRinwoshoWorld().build == "1.1.10", "world block is build-stamped")
+
+    -- The whitelist: an unknown counter is refused and writes NOTHING.
+    ok = Store.NoteRinwoshoWorld("reshowSeenn", "1.1.10")
+    ck(ok == false, "an unknown world key is refused")
+    ck(Store.GetRinwoshoWorld().reshowSeenn == nil, "…and does not land as a new field")
+    ck(Store.NoteRinwoshoWorld(nil, "1.1.10") == false, "a nil world key is refused")
+
+    -- Garbage records refuse without touching the ring.
+    Store.data = { rinwoshoTrace = { schema = 1, visits = { { n = 1 } }, world = {} } }
+    ck(Store.AppendRinwoshoVisit(nil) == false, "nil rin record refused")
+    ck(Store.AppendRinwoshoVisit("visit") == false, "non-table rin record refused")
+    ck(#Store.GetRinwoshoTrace() == 1, "refused rin records did not land")
+
+    -- No data SV at all (called before Init): refuse, do not error.
+    Store.data = nil
+    ck(Store.AppendRinwoshoVisit({ n = 1 }) == false, "no data SV refuses the rin append")
+    ck(Store.GetRinwoshoTrace() == nil, "no data SV reads the rin ring as nil")
+    ck(Store.GetRinwoshoWorld() == nil, "no data SV reads the world as nil")
+    ck(Store.NoteRinwoshoWorld("reshowSeen") == false, "no data SV refuses the world note")
+
+    Store.data = savedData
+end
+
 ----------------------------------------------------------------------
 -- SELF-TEST: profession-delegate designations (accessors, heal, prune,
 -- rev/at discipline, the cross-owner LWW winner, adoption, record witness)
@@ -8623,6 +8769,7 @@ function Store.RunSelfTests(verbose)
     local suites = {
         { name = "defaults",        fn = testDefaults },
         { name = "sayge trace ring (1.1.7)", fn = testSaygeTraceRing },
+        { name = "rin'wosho trace ring + learned world (1.1.10)", fn = testRinwoshoTraceRing },
         { name = "storage migration (AT-RISK-3)", fn = testStorageMigration },
         { name = "bags import marker (NW-2)", fn = testBagsImportMarker },
         { name = "alert migration", fn = testAlertMigration },
