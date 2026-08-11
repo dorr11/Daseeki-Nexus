@@ -2140,23 +2140,25 @@ end
 -- missing list red-flagged a Goblin-only Dimensional Ripper).
 --
 -- The dataset speaks in spec ORDINALS (rec.spec -> D.specs[idx] = { id =
--- <spec spell id>, p = <profession idx>, name }), the payload in held spec
--- SPELL IDS (p.s). The standing of one recipe against one character:
+-- <spec spell id>, p = <profession idx>, name, parent = <spec ordinal|nil> }),
+-- the payload in held spec SPELL IDS (p.s). This function is the ORDINAL ->
+-- SPELL ID adapter; the rule itself lives in ONE place for every reader,
+-- professions.lua's Professions.SpecStandingFrom (read its header for the
+-- tree rule and the owner's 2026-08-11 case). The three answers:
 --
---   "ok"        no spec requirement, or the character HOLDS the required spec
---   "openable"  a spec is required and the character holds NO spec in that
---               profession's family — nothing is conflicted yet, they could
---               still choose it (the owner's rule 3: unchanged behavior)
---   "conflict"  the character holds a DIFFERENT spec of the same family —
---               "a different specialization than selected", the owner's exact
---               case. (With no spec-hierarchy data in the dataset, holding
---               ANY other family spec reads as "selected something else",
---               which is also the literal directive.)
+--   "ok"        no spec requirement; the character HOLDS the required spec;
+--               or holds a DESCENDANT of it, which implies it
+--   "openable"  required, not chosen against — including holding an ANCESTOR
+--               (a plain Weaponsmith can still take Master Axesmith)
+--   "conflict"  the character holds a spec in a DIFFERENT BRANCH: a sibling
+--               of the required spec, or a sibling of one of its ancestors
 --
 -- An unknown spec ordinal fails OPEN ("ok"): hiding a recipe on a guess would
--- be the silent-drop lie. The learnable computation (SearchRows) and the
--- recipe-list classification (RecipeRows) both read THIS function — the
--- self-test pins that they cannot drift into two spec rules.
+-- be the silent-drop lie. The learnable computation (SearchRows), the
+-- recipe-list classification (RecipeRows), the census denominator
+-- (ObtainableTotal), the shopping list (ShoplistRows) and the item tooltip's
+-- Learnable line (Tooltips.RecipeSpecOK) all read the SAME rule — the
+-- self-tests pin that they cannot drift into two spec rules.
 ----------------------------------------------------------------------
 
 function ProfUI.SpecStanding(D, rec, heldSpecs)
@@ -2164,17 +2166,10 @@ function ProfUI.SpecStanding(D, rec, heldSpecs)
     if not specIdx or specIdx == 0 then return "ok" end
     local sp = D and D.specs and D.specs[specIdx]
     if not sp then return "ok" end
-    if type(heldSpecs) == "table" then
-        for j = 1, #heldSpecs do
-            if heldSpecs[j] == sp.id then return "ok" end
-        end
-        for j = 1, #heldSpecs do
-            local hIdx = D.specById and D.specById[heldSpecs[j]]
-            local hs = hIdx and D.specs[hIdx]
-            if hs and hs.p == sp.p then return "conflict" end
-        end
-    end
-    return "openable"
+    local P = ns.Professions
+    if not (P and P.SpecTreeReaders and P.SpecStandingFrom) then return "ok" end
+    local parentOf, famOf = P.SpecTreeReaders(D)
+    return P.SpecStandingFrom(sp.id, heldSpecs, parentOf, famOf)
 end
 
 -- The census DENOMINATOR for one character's profession: the dataset recipes
@@ -6421,24 +6416,37 @@ local function testSpecRule(fails)
     local D = core()
     if not D then fails[#fails + 1] = "dataset unavailable for the spec tests" return end
 
-    -- Find a two-spec family and a recipe locked to one of its specs.
+    -- The deterministic "first recipe locked to this spec ordinal" reader —
+    -- the profession's own recipe list order, never pairs() order.
+    local function lockedSpellFor(ordinal)
+        local sp = D.specs[ordinal]
+        local key = sp and D.profs[sp.p] and D.profs[sp.p].key
+        local list = key and D.profRecipes[D.profIdx[key]] or nil
+        for i = 1, #(list or {}) do
+            local r = D.recipe[list[i]]
+            if r and r.spec == ordinal then return list[i] end
+        end
+        return nil
+    end
+
+    -- Find a SIBLING pair (same parent — which for a flat family means both
+    -- roots) and a recipe locked to one of them. Siblings are the pair the
+    -- rule actually excludes; a parent/child pair does NOT conflict.
     local specA, specB, lockedSpell
     for idx = 1, #(D.specs or {}) do
         local sB = D.specs[idx]
-        for spell, rec in pairs(D.recipe) do
-            if rec.spec == idx then
-                for j = 1, #D.specs do
-                    if j ~= idx and D.specs[j].p == sB.p then
-                        specA, specB, lockedSpell = D.specs[j], sB, spell
-                        break
-                    end
+        local spell = lockedSpellFor(idx)
+        if spell then
+            for j = 1, #D.specs do
+                if j ~= idx and D.specs[j].p == sB.p and D.specs[j].parent == sB.parent then
+                    specA, specB, lockedSpell = D.specs[j], sB, spell
+                    break
                 end
             end
-            if specA then break end
         end
         if specA then break end
     end
-    ck(specA ~= nil, "the dataset carries no two-spec family with a spec-locked recipe")
+    ck(specA ~= nil, "the dataset carries no sibling spec pair with a spec-locked recipe")
     if not specA then return end
     local profKey = D.profs[specB.p] and D.profs[specB.p].key
     ck(profKey ~= nil, "the spec family's profession key is unresolvable")
@@ -6575,6 +6583,198 @@ local function testSpecRule(fails)
         fakeResolver({ [lockedSpell] = lockedName }))
     ck(#sRows2 == 1 and #sRows2[1].learnable == 1,
        "who-can-craft denied the character who holds the required spec")
+
+    ------------------------------------------------------------------
+    -- 9) THE TREE (owner, 2026-08-11: "a plain Weaponsmith sees Master
+    --    Swordsmith / Axesmith / Hammersmith recipes as CONFLICTED", though a
+    --    Weaponsmith can still take a Master path). Exclusion is a matter of
+    --    SIBLINGS, not of family. The nested family is located STRUCTURALLY —
+    --    a spec with a parent, a sibling under that same parent, and a
+    --    sibling of the parent — so the matrix follows the dataset's edges,
+    --    never a shipped name.
+    ------------------------------------------------------------------
+    local kidI, parI, kidSibI, parSibI
+    for idx = 1, #(D.specs or {}) do
+        local s = D.specs[idx]
+        if s.parent then
+            for j = 1, #D.specs do
+                if j ~= idx and D.specs[j].parent == s.parent then kidSibI = j break end
+            end
+            if kidSibI then kidI, parI = idx, s.parent break end
+        end
+    end
+    if kidI then
+        local par = D.specs[parI]
+        for j = 1, #D.specs do
+            local t = D.specs[j]
+            if j ~= parI and t.p == par.p and t.parent == par.parent then parSibI = j break end
+        end
+    end
+    ck(kidI ~= nil and parSibI ~= nil,
+       "the dataset carries no nested spec family with a root sibling (FIX-4 edges gone?)")
+    if not (kidI and parSibI) then return end
+
+    local KID, PAR    = D.specs[kidI], D.specs[parI]
+    local KSIB, PSIB  = D.specs[kidSibI], D.specs[parSibI]
+    local treeProf    = D.profs[PAR.p].key
+    local function stand(ordinal, held)
+        return ProfUI.SpecStanding(D, { spec = ordinal }, held)
+    end
+    -- THE RED CONTROL: the flat rule (any other spec of the profession
+    -- conflicts) reproduced, so the bug has a shape before the fix answers.
+    local function flatStand(ordinal, held)
+        local sp = D.specs[ordinal]
+        for i = 1, #(held or {}) do if held[i] == sp.id then return "ok" end end
+        for i = 1, #(held or {}) do
+            local hIdx = D.specById[held[i]]
+            if hIdx and D.specs[hIdx].p == sp.p then return "conflict" end
+        end
+        return "openable"
+    end
+    ck(flatStand(kidI, { PAR.id }) == "conflict",
+       "the flat rule no longer reproduces the owner's bug (fixture broken)")
+    ck(stand(kidI, { PAR.id }) == "openable",
+       "THE FIX: holding only the PARENT spec still conflicts its child's recipes")
+    ck(stand(kidI, { KSIB.id }) == "conflict",
+       "two child specs under one parent stopped excluding each other")
+    ck(stand(parI, { KID.id }) == "ok" and stand(parI, { PAR.id, KID.id }) == "ok",
+       "a child-spec holder is not credited with the parent spec he already holds")
+    ck(stand(kidI, { KID.id }) == "ok" and stand(kidI, { PAR.id, KID.id }) == "ok",
+       "holding the required child spec did not read ok")
+    ck(stand(parI, { PSIB.id }) == "conflict" and stand(kidI, { PSIB.id }) == "conflict"
+       and stand(kidSibI, { PSIB.id }) == "conflict",
+       "the parent's sibling is not conflicted out of the WHOLE parent tree")
+    ck(stand(parSibI, { PAR.id }) == "conflict" and stand(parSibI, { KID.id }) == "conflict",
+       "the parent tree is not conflicted out of the parent-sibling's recipes")
+    ck(stand(kidI, {}) == "openable" and stand(parI, {}) == "openable"
+       and stand(parSibI, {}) == "openable" and stand(kidI, nil) == "openable",
+       "a no-spec character stopped reading openable everywhere")
+    -- A FLAT family (no parent edges anywhere in the profession) is untouched.
+    local flatA, flatB
+    for idx = 1, #D.specs do
+        local s = D.specs[idx]
+        if s.p ~= PAR.p and not s.parent then
+            local nested = false
+            for j = 1, #D.specs do
+                if D.specs[j].p == s.p and D.specs[j].parent then nested = true break end
+            end
+            if not nested then
+                for j = 1, #D.specs do
+                    if j ~= idx and D.specs[j].p == s.p then flatA, flatB = idx, j break end
+                end
+            end
+        end
+        if flatA then break end
+    end
+    ck(flatA ~= nil, "the dataset carries no flat two-spec family to pin unchanged")
+    if flatA then
+        ck(stand(flatA, { D.specs[flatB].id }) == "conflict"
+           and stand(flatB, { D.specs[flatA].id }) == "conflict",
+           "a FLAT spec family (the owner's Gnomish/Goblin case) changed behaviour")
+        ck(stand(flatA, { PAR.id }) == "openable",
+           "a spec of another profession conflicted")
+    end
+
+    -- 10) THE LIST, THE CENSUS, AND THE OTHER CONSUMERS under the fix.
+    local kidSpell = lockedSpellFor(kidI)
+    ck(kidSpell ~= nil, "the nested child spec locks no recipe (fixture broken)")
+    local function payloadFor(pkey, specList)
+        return { v = 1, ds = DS,
+                 p = { [pkey] = { l = 300, m = 300, k = P.EncodeKnown(pkey, {}),
+                                  n = 0, a = NOW, s = specList } }, c = {} }
+    end
+    if kidSpell then
+        local parHolder = payloadFor(treeProf, { PAR.id })
+        local kidHolder = payloadFor(treeProf, { PAR.id, KID.id })
+        local sibHolder = payloadFor(treeProf, { PSIB.id })
+        local function find(rows, spell)
+            for _, r in ipairs(rows) do if r.spell == spell then return r end end
+            return nil
+        end
+        -- The owner's row: MISSING and plainly so, no longer hidden behind an
+        -- unavailable(spec) reason he could act on by learning the spec.
+        local mr = find(ProfUI.RecipeRows(parHolder, treeProf,
+            { missingOnly = true, showUnavailable = true }, res), kidSpell)
+        ck(mr ~= nil and mr.state == "missing" and not mr.specConflict,
+           "a Master recipe is still withheld from a plain parent-spec holder")
+        ck(find(ProfUI.RecipeRows(parHolder, treeProf, {}, res), kidSpell) ~= nil,
+           "a Master recipe is still absent from the parent-spec holder's default list")
+        -- ...while the OTHER branch stays conflicted, reason and all.
+        local cr = find(ProfUI.RecipeRows(sibHolder, treeProf,
+            { showUnavailable = true }, res), kidSpell)
+        ck(cr ~= nil and cr.specConflict == true
+           and cr.unavailable ~= nil and cr.unavailable.key == "spec",
+           "the parent-sibling's row lost its spec conflict")
+
+        -- THE CENSUS DENOMINATOR, pinned to both rules: it is the catalogue
+        -- minus the TREE-conflicted recipes, and it is strictly LARGER than
+        -- the flat rule's answer by exactly the parent's descendant recipes.
+        local full = ProfUI.RecipeCount(treeProf)
+        local list = D.profRecipes[D.profIdx[treeProf]]
+        local nTree, nFlat, nDesc, nKid = 0, 0, 0, 0
+        for i = 1, #list do
+            local rec2 = D.recipe[list[i]]
+            local ord = rec2 and rec2.spec or 0
+            if ord and ord > 0 then
+                if stand(ord, { PAR.id }) == "conflict" then nTree = nTree + 1 end
+                if flatStand(ord, { PAR.id }) == "conflict" then nFlat = nFlat + 1 end
+                if stand(ord, { PAR.id, KID.id }) == "conflict" then nKid = nKid + 1 end
+                local sp2 = D.specs[ord]
+                if sp2 and sp2.parent == parI then nDesc = nDesc + 1 end
+            end
+        end
+        local obt = ProfUI.ObtainableTotal(parHolder, treeProf)
+        ck(obt == full - nTree, "the tree census denominator is not full-minus-conflicted ("
+           .. obt .. " vs " .. full .. "-" .. nTree .. ")")
+        ck(nDesc > 0 and obt == (full - nFlat) + nDesc,
+           "the census did not gain exactly the parent's descendant recipes ("
+           .. obt .. " vs " .. (full - nFlat) .. "+" .. nDesc .. ")")
+        ck(ProfUI.ObtainableTotal(kidHolder, treeProf) == full - nKid,
+           "the child-spec holder's denominator is not full-minus-conflicted")
+        ck(nKid > nTree,
+           "taking a child spec did not narrow the denominator below the parent's ("
+           .. nKid .. " vs " .. nTree .. ")")
+
+        -- WHO-CAN-CRAFT agrees with the predicate, not with a second rule:
+        -- "openable" is not learnable (he must take the spec first), the
+        -- child holder IS learnable for both his own and the parent's recipes.
+        local kidName = "R" .. tostring(kidSpell)
+        local entry1 = { { nameRealm = "Tree-Realm", rec = { classTag = "MAGE", level = 60 },
+                           online = true } }
+        local kres = fakeResolver({ [kidSpell] = kidName })
+        local wr = ProfUI.SearchRows(kidName, entry1, function() return parHolder end, kres)
+        ck(#wr == 1 and #wr[1].learnable == 0,
+           "who-can-craft called an openable (spec not yet taken) character learnable")
+        wr = ProfUI.SearchRows(kidName, entry1, function() return kidHolder end, kres)
+        ck(#wr == 1 and #wr[1].learnable == 1,
+           "who-can-craft denied the character who holds the child spec")
+        local parSpell = lockedSpellFor(parI)
+        if parSpell then
+            local pName = "R" .. tostring(parSpell)
+            local pres = fakeResolver({ [parSpell] = pName })
+            wr = ProfUI.SearchRows(pName, entry1,
+                function() return payloadFor(treeProf, { KID.id }) end, pres)
+            ck(#wr == 1 and #wr[1].learnable == 1,
+               "who-can-craft denied the parent-gated recipe to a child-spec holder")
+            wr = ProfUI.SearchRows(pName, entry1, function() return sibHolder end, pres)
+            ck(#wr == 1 and #wr[1].learnable == 0,
+               "who-can-craft called the parent-sibling learnable for a parent-gated recipe")
+        end
+
+        -- THE TOOLTIP'S OWN GATE reads the same rule (one predicate, both
+        -- surfaces — the duplicate exact-match check is gone).
+        local T = ns.Tooltips
+        if T and T.RecipeSpecOK then
+            ck(T.RecipeSpecOK({ specs = { KID.id } }, PAR.id) == true,
+               "the tooltip denies a child-spec holder the parent's recipes")
+            ck(T.RecipeSpecOK({ specs = { PAR.id } }, KID.id) == false,
+               "the tooltip calls a parent-spec holder learnable for a child recipe")
+            ck(T.RecipeSpecOK({ specs = { KSIB.id } }, KID.id) == false,
+               "the tooltip calls a sibling-spec holder learnable")
+            ck(T.RecipeSpecOK({ specs = { KID.id } }, nil) == true,
+               "the tooltip gated an ungated recipe")
+        end
+    end
 end
 
 ----------------------------------------------------------------------
@@ -6751,27 +6951,41 @@ local function testShoplist(fails)
     ProfUI.ShoplistRows(knowsNothing, "alchemy", res, allBoE)
     ProfUI.SpecStanding = realStanding
     ck(calls > 0, "the shopping list never consulted the shared spec predicate")
+    -- The fixture is a SIBLING pair (same parent — for a flat family, both
+    -- roots): siblings are what the rule excludes. A parent/child pair does
+    -- not conflict, and picking one would have tested nothing.
+    local function firstLocked(ordinal)
+        local sp = D.specs[ordinal]
+        local key = sp and D.profs[sp.p] and D.profs[sp.p].key
+        local list = key and D.profRecipes[D.profIdx[key]] or nil
+        for i = 1, #(list or {}) do
+            local r = D.recipe[list[i]]
+            if r and r.spec == ordinal then return list[i] end
+        end
+        return nil
+    end
     local specA, specB, lockedSpell
     for idx = 1, #(D.specs or {}) do
         local sB = D.specs[idx]
-        for spell, rec in pairs(D.recipe) do
-            if rec.spec == idx then
-                for j = 1, #D.specs do
-                    if j ~= idx and D.specs[j].p == sB.p then
-                        specA, specB, lockedSpell = D.specs[j], sB, spell
-                        break
-                    end
+        local spell = firstLocked(idx)
+        if spell then
+            for j = 1, #D.specs do
+                if j ~= idx and D.specs[j].p == sB.p and D.specs[j].parent == sB.parent then
+                    specA, specB, lockedSpell = D.specs[j], sB, spell
+                    break
                 end
             end
-            if specA then break end
         end
         if specA then break end
     end
     if specA then
         local sProf = D.profs[specB.p] and D.profs[specB.p].key
-        local conflicted = { v = 1, ds = DS,
-            p = { [sProf] = { l = 300, m = 300, k = P.EncodeKnown(sProf, {}), n = 0,
-                              a = NOW, s = { specA.id } } }, c = {} }
+        local function shopPayload(specList)
+            return { v = 1, ds = DS,
+                p = { [sProf] = { l = 300, m = 300, k = P.EncodeKnown(sProf, {}), n = 0,
+                                  a = NOW, s = specList } }, c = {} }
+        end
+        local conflicted = shopPayload({ specA.id })
         local sRows = ProfUI.ShoplistRows(conflicted, sProf, res, allBoE)
         for _, r in ipairs(sRows) do
             if r.spell == lockedSpell then
@@ -6779,6 +6993,22 @@ local function testShoplist(fails)
                 break
             end
         end
+        -- AGREEMENT, both directions: the list an unspecced character gets
+        -- MINUS exactly the recipes the shared predicate calls conflicted IS
+        -- the list a spec-holder gets. No second rule, no extra drops — so a
+        -- parent-spec holder keeps every child-branch recipe he can still take.
+        local openRows = ProfUI.ShoplistRows(shopPayload(nil), sProf, res, allBoE)
+        local want, got = {}, {}
+        for _, r in ipairs(openRows) do
+            if ProfUI.SpecStanding(D, D.recipe[r.spell], { specA.id }) ~= "conflict" then
+                want[#want + 1] = r.spell
+            end
+        end
+        for _, r in ipairs(sRows) do got[#got + 1] = r.spell end
+        local same = (#want == #got)
+        for i = 1, #want do if want[i] ~= got[i] then same = false break end end
+        ck(same, "the shopping list and the spec predicate disagree ("
+           .. #got .. " rows vs " .. #want .. " predicted)")
     end
 
     -- (d) COLD ITEMS: every candidate holds UNRESOLVED — none scored tradable,
@@ -7561,7 +7791,9 @@ if ns.RegisterSelfTest then
                   .. "source at multiple widths, one-row height cost)",
               fn = testRecipeHeader },
             { name = "spec rule (conflicted recipes never missing, unavailable-with-"
-                  .. "reason, census denominator, one shared predicate)",
+                  .. "reason, census denominator, one shared predicate, the spec "
+                  .. "TREE: siblings exclude, ancestors do not, with the flat-rule "
+                  .. "red control)",
               fn = testSpecRule },
             { name = "shopping list (AH-tradability matrix, defensive bind read, "
                   .. "cold-item unresolved, known/spec seams, ordering, empty "

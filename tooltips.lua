@@ -1011,11 +1011,29 @@ end
 -- id or nil. Neither the dataset nor any client API is touched here.
 ----------------------------------------------------------------------
 
--- PURE. Does this character hold the specialisation the recipe is gated on?
+-- Does this character hold the specialisation the recipe is gated on?
+--
+-- ONE SPEC RULE, not two: this routes through Professions.SpecStanding, the
+-- same tree-aware predicate the professions panel's list, census, shopping
+-- list and who-can-craft read (see its header in professions.lua). "Learnable"
+-- means HOLDING the gate — standing "ok" — which the tree widens by exactly
+-- one honest case: a Master Axesmith holds Weaponsmith by implication, so a
+-- Weaponsmith-gated recipe is learnable for him. A plain Weaponsmith is NOT
+-- learnable for a Master Axesmith recipe (standing "openable": he must take
+-- the spec first) — and that was already true of every unspecced character.
+--
+-- The fallback is exact membership, which is what the tree degenerates to for
+-- a spec it does not carry. It is what runs when this file is loaded ALONE —
+-- the cross-addon parity gate's micro-runtime publishes no ns.Professions —
+-- so the pure layer stays loadable on its own.
 function Tooltips.RecipeSpecOK(entry, specID)
     if specID == nil then return true end
     local list = entry and entry.specs
     if type(list) ~= "table" then return false end
+    local P = ns.Professions
+    if P and P.SpecStanding then
+        return P.SpecStanding(specID, list) == "ok"
+    end
     for i = 1, #list do
         if list[i] == specID then return true end
     end
@@ -1982,6 +2000,42 @@ local function selfTest(verbose)
             ck("recipe/spec-ok", Tooltips.RecipeSpecOK({ specs = { 1, 2, 3 } }, 2) == true
                 and Tooltips.RecipeSpecOK({ specs = { 1, 3 } }, 2) == false
                 and Tooltips.RecipeSpecOK({}, nil) == true)
+        end
+
+        -- ONE SPEC RULE, not two: the Learnable gate is the professions
+        -- module's tree-aware predicate, so a spec that IMPLIES the gate
+        -- (a child spec holds its parent) is learnable, and a spec that is
+        -- merely on the way to it is not. Structural — a spec with a parent
+        -- and a sibling under that parent, read off the shipped edges.
+        do
+            local D = ns.Professions and ns.Professions.Dataset
+            if D and D.LoadCore and D.LoadCore() then
+                local kid, par, sib
+                for i = 1, #D.specs do
+                    local s = D.specs[i]
+                    if s.parent then
+                        for j = 1, #D.specs do
+                            if j ~= i and D.specs[j].parent == s.parent then sib = D.specs[j] break end
+                        end
+                        if sib then kid, par = s, D.specs[s.parent] break end
+                    end
+                end
+                if kid then
+                    ck("recipe/spec-tree-implies",
+                       Tooltips.RecipeSpecOK({ specs = { kid.id } }, par.id) == true)
+                    ck("recipe/spec-tree-not-yet",
+                       Tooltips.RecipeSpecOK({ specs = { par.id } }, kid.id) == false)
+                    ck("recipe/spec-tree-sibling",
+                       Tooltips.RecipeSpecOK({ specs = { sib.id } }, kid.id) == false)
+                    local blk = Tooltips.BuildRecipeBlock({
+                        { name = "Master", state = "missing", skill = 300,
+                          specs = { par.id, kid.id } },
+                        { name = "Plain",  state = "missing", skill = 300, specs = { par.id } },
+                    }, 275, par.id)
+                    ck("recipe/spec-tree-learnable",
+                       #blk.learnable == 2 and blk.unscanned == 0)
+                end
+            end
         end
 
         -- A scanned alt whose SKILL never resolved cannot be judged, so it is a
