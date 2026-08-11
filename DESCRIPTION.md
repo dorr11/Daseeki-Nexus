@@ -2,12 +2,13 @@
 
 <!-- Canonical CurseForge project description. Update here first, then paste to
      https://www.curseforge.com/wow/addons/daseeki-nexus (project 1638357).
-     Last synced: 2026-08-11 (v1.1.10). -->
+     Last synced: 2026-08-11 (v1.1.11). -->
 
 Daseeki Nexus is a cross-account character dashboard for WoW Classic Era. Every character on every account you run appears as a card — world buffs held (including what's stored in a chronoboon), raid lockouts and attunements, rest and XP, gold, cooldowns, and notes — kept current live over a lightweight sync mesh between your accounts.
 
 ## Features
 - **NEW — Professions tracker**: every character's professions, levels, specializations, and known/missing recipes across all your accounts in one tab. Click a character for their full recipe census with search, source filters, and hover tooltips; recipe items everywhere show "Known: …" / "Learnable: …" lines (you included). Designate per-faction **primary collectors** per profession — down to specialization lanes (your Armorsmith and a future Axesmith can both stand for Blacksmithing) — and recipe tooltips call out loudly when your primary is missing one. A **shopping list** button collects the missing recipes actually buyable on the AH (and fills Auctionator's shopping tab at the auction house). Profession cooldowns (Mooncloth, transmutes, …) show who's ready to craft right now. In-window filter bar for the Blizzard tradeskill window included — MissingTradeSkillsList and ClassicProfessionFilter are fully absorbed and can be uninstalled.
+- **NEW — Inventory tab**: every item held anywhere across all your characters and accounts on one page — icon, quality-colored name, total quantity, hover for the item tooltip with the class-colored per-character breakdown. Live name search, category filter from the game's own item classes, click the QTY column for biggest-stacks-first. Built to stay smooth: the index builds in background slices and cold item names fill in as the client answers.
 - **Character cards** for your whole roster across accounts: world buffs with time remaining (boon-stored included), raid lockout status colored by available/locked/unattuned, hearth/chronoboon/Darkmoon cooldowns, rest %, gold, and a free-form notes box
 - **World buff timers** — Onyxia, Nefarian, Rend, Zandalar, Songflower and friends, fed by the same community timer mesh NovaWorldBuffs uses, so your timers agree with everyone else's
 - **Felwood map pins** for songflowers, tubers, and dragons with readable countdown chips, plus a timers dock on the dashboard

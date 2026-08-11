@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.1.11 — 2026-08-11
 
 - **Fixed: hovering a row in the Inventory tab now shows the item's own tooltip, and
   the character names under it are in their class colours again.** The hover was
