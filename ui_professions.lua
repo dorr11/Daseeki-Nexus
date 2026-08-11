@@ -412,11 +412,16 @@ end
 -- rule). Title + body, pinned by the self-test so the wording cannot drift
 -- silently. The BEHAVIOR the tooltip describes is untouched from the text
 -- button it replaces: RunShoplist, same arguments, same chat/Auctionator path.
-function ProfUI.ShoplistButtonTip()
+-- `includeEvent` (the pane's persisted toggle) appends ONE sentence, so the
+-- icon's explainer always describes the list the click will actually print.
+function ProfUI.ShoplistButtonTip(includeEvent)
     return "Shopping list",
         "This character's missing recipes that can be bought on the AH, as a"
         .. " chat list. With Auctionator loaded and the auction house open,"
         .. " the names also fill the Shopping tab."
+        .. (includeEvent
+            and " Event-vendor recipes are included (the filter row's toggle)."
+            or "")
 end
 
 ----------------------------------------------------------------------
@@ -2204,7 +2209,7 @@ end
 -- THE DRILL-IN RECIPE ROWS  (PURE apart from the injected resolver)
 --
 -- opts = { search = "", source = nil|<class key>, missingOnly = bool,
---          showUnavailable = bool }
+--          showUnavailable = bool, includeEvent = bool }
 --
 -- Row states are the contract's three, never two:
 --   "known"    proven in the bitmap
@@ -2278,7 +2283,17 @@ function ProfUI.RecipeRows(payload, profKey, opts, res)
         else
             unavailable = src and src.unavailable or nil
         end
-        if keep and unavailable and not showUnav then keep = false end
+        -- The EVENT TOGGLE's one exception (owner, 2026-08-11), and it is a
+        -- narrow one: with `includeEvent` a recipe whose ONLY unavailability is
+        -- the world-event gate stays in the set, so the shopping list can judge
+        -- its teaching item on the item's own routes. A spec conflict
+        -- ("requires Goblin Engineer") and a source-less recipe are untouched —
+        -- they are still unavailable, toggle or no toggle. The shopping list is
+        -- the only caller that passes this; the pane's recipe list never does,
+        -- so "Show unavailable" keeps its own meaning exactly.
+        if keep and unavailable and not showUnav then
+            if not (opts.includeEvent and unavailable.key == "event") then keep = false end
+        end
 
         if keep then
             local name = res.spell and res.spell(spell) or nil
@@ -2336,7 +2351,7 @@ end
 --   3. The teaching ITEM can reach the open world: its own acquisition facts
 --      carry a vendor / mob-drop / world-drop / world-object route. An item
 --      whose only route is a quest reward cannot be posted by anyone; an
---      event-gated or source-less item mirrors itemRoute's own blocked
+--      event-gated (see 5) or source-less item mirrors itemRoute's own blocked
 --      classification. All exclusions are sourced from the dataset's
 --      acquisition facts, never guessed.
 --   4. The item is BoE or unbound, read LIVE from the client. Item data is
@@ -2344,6 +2359,20 @@ end
 --      so the row renders in a distinct UNRESOLVED state — never silently
 --      included as tradable, never silently dropped — one warm load is
 --      requested, and re-running the list is the retry.
+--
+--   5. EVENT-VENDOR RECIPES, only with the toggle (owner, 2026-08-11: "people
+--      trawl the off-season AH for event recipes, so make them includable").
+--      "Not obtainable today" and "not obtainable at all" were being spelled
+--      the same way, and the AH does not care which month it is: a Winter Veil
+--      recipe bought in December is on the auction house in June. The pane's
+--      "Include event-vendor recipes" checkbox (persisted, DEFAULT OFF — with
+--      it off this list is what it always was, row for row) lets an event
+--      teaching item be judged on its OTHER routes: it still has to be
+--      item-taught, still has to have a real vendor/drop/object route (a quest
+--      reward is not one), still has to prove BoE-or-unbound LIVE, and its
+--      recipe still has to survive the spec rule. It then rides the list
+--      wearing "Event vendor — <the event's own name> · <its route>", and the
+--      chat header says the list includes event items.
 --
 -- Vendor-sold teaching items ARE included (someone can flip them onto the AH)
 -- but wear their vendor + zone tag, so the owner can see when the AH is the
@@ -2397,18 +2426,34 @@ end
 -- grammar itemRoute reads) into:
 --   { reachable = bool,           -- a vendor / drop / world-drop / object route exists
 --     vendor    = phrase|nil,     -- "Sold by X — Zone · cost" when vendor-sold
---     tag       = string|nil }    -- the row's source tag (vendor first, then
+--     tag       = string|nil,     -- the row's source tag (vendor first, then
 --                                 -- World drop, mob drop, world object)
--- Quest tokens are NOT routes (a quest reward cannot be posted); E/X tokens
--- (and the generator's e/x candidate flags) mirror itemRoute's blocked
--- classification, so an event-gated or source-less item is not reachable.
-function ProfUI.ItemTradeRoutes(D, itemID)
-    local out = { reachable = false, vendor = nil, tag = nil }
+--     event     = bool,           -- this route is world-event gated (toggle ON only)
+--     eventName = string|nil }    -- the [event] index's name, when it carries one
+-- Quest tokens are NOT routes (a quest reward cannot be posted); the X token
+-- (and the generator's x candidate flag) mirrors itemRoute's blocked
+-- classification, so a source-less item is never reachable.
+--
+-- THE EVENT TOGGLE (owner, 2026-08-11: "people trawl the off-season AH for
+-- event recipes, so make them includable"). E tokens and the generator's `e`
+-- candidate flag used to block exactly like X. They still do BY DEFAULT — an
+-- absent `includeEvent` is the old verdict, byte for byte. With the toggle ON
+-- the event gate stops blocking, and the item is judged on its OTHER routes
+-- alone: a Winter Veil VENDOR route is a route (someone bought it in December
+-- and can post it in June), a quest reward still is not, and a source-less
+-- item still is not. The row then wears the event fact in front of its route
+-- tag, because "buyable" and "buyable only because someone hoarded it" are not
+-- the same sentence. The event NAME comes from the dataset's [event] index and
+-- nowhere else; an id the index cannot name reads "seasonal".
+function ProfUI.ItemTradeRoutes(D, itemID, includeEvent)
+    local out = { reachable = false, vendor = nil, tag = nil,
+                  event = false, eventName = nil }
     local acq = D and D.itemAcq and D.itemAcq[itemID]
     local item = D and D.item and D.item[itemID]
     local flags = (item and item.flags) or "-"
     if type(acq) ~= "string" or acq == "" then return out end
-    local vendorTag, dropTag, worldTag, objectTag, blocked = nil, nil, nil, nil, false
+    local vendorTag, dropTag, worldTag, objectTag = nil, nil, nil, nil
+    local noSource, eventGated, eventName = false, false, nil
     for tok in (acq .. ";"):gmatch("(.-);") do
         if tok ~= "" then
             local head = tok:sub(1, 1)
@@ -2425,27 +2470,51 @@ function ProfUI.ItemTradeRoutes(D, itemID)
             elseif head == "O" then
                 local o = D.object and D.object[firstNumber(tok:sub(2))]
                 objectTag = "World object: " .. ((o and o.name) or "?")
-            elseif head == "E" or head == "X" then
-                blocked = true
+            elseif head == "E" then
+                eventGated = true
+                eventName = eventName or (D.event and D.event[firstNumber(tok:sub(2))]) or nil
+            elseif head == "X" then
+                noSource = true
             end
             -- Q is not a route to the AH; R/S are riders, not routes.
         end
     end
-    if blocked or flags:find("e", 1, true) or flags:find("x", 1, true) then return out end
+    -- The generator's own candidate flags, as a cross-check on the token walk
+    -- (itemRoute reads them the same way): `x` is always fatal, `e` is the gate
+    -- the toggle opens — and an `e` with no E token names no event, which is
+    -- exactly the "seasonal" case, never a guessed holiday.
+    if flags:find("x", 1, true) then noSource = true end
+    if flags:find("e", 1, true) then eventGated = true end
+    if noSource then return out end
+    if eventGated and not includeEvent then return out end
+
+    local routeTag = vendorTag or worldTag or dropTag or objectTag
+    if routeTag == nil then return out end
     out.vendor = vendorTag
-    out.tag = vendorTag or worldTag or dropTag or objectTag
-    out.reachable = (out.tag ~= nil)
+    out.reachable = true
+    if eventGated then
+        out.event = true
+        out.eventName = eventName
+        out.tag = "Event vendor " .. ProfUI.GLYPHS.dash .. " "
+            .. (eventName or "seasonal") .. " " .. ProfUI.GLYPHS.middot .. " " .. routeTag
+    else
+        out.tag = routeTag
+    end
     return out
 end
 
 -- PURE apart from the injected reader. One recipe's AH-tradability verdict:
---   { state = "tradable",   item, name, link, tag, vendor }  -- buy this
---   { state = "unresolved", item, tag, vendor }              -- bind unknown (cold)
+--   { state = "tradable",   item, name, link, tag, vendor, event, eventName }
+--   { state = "unresolved", item, tag, vendor, event, eventName }  -- bind unknown (cold)
 --   { state = "excluded",   reason = "no-item"|"unreachable"|"bound" }
 -- The FIRST teaching item that proves tradable wins; a cold/type-drifted read
 -- on a reachable item is held as an unresolved CANDIDATE (never a verdict)
 -- unless a later item settles it.
-function ProfUI.ShopTradability(D, spellID, iteminfo)
+-- `includeEvent` rides straight through to ItemTradeRoutes and changes NOTHING
+-- else: an event item that is BoP is still "bound", one whose only other route
+-- is a quest reward is still "unreachable", one the client has not answered for
+-- is still held unresolved. The toggle opens ONE gate, not the door.
+function ProfUI.ShopTradability(D, spellID, iteminfo, includeEvent)
     local sawItem, sawBound, unresolved = false, false, nil
     local acq = D and D.acq and D.acq[spellID]
     for tok in (tostring(acq or "") .. ";"):gmatch("(.-);") do
@@ -2454,7 +2523,7 @@ function ProfUI.ShopTradability(D, spellID, iteminfo)
             local itemID = tonumber(tok:sub(2))
             if itemID then
                 sawItem = true
-                local route = ProfUI.ItemTradeRoutes(D, itemID)
+                local route = ProfUI.ItemTradeRoutes(D, itemID, includeEvent)
                 if route.reachable then
                     local info = iteminfo and iteminfo(itemID) or nil
                     -- Class 5 (truthy-zero/false): `a and b or c` would collapse
@@ -2465,14 +2534,17 @@ function ProfUI.ShopTradability(D, spellID, iteminfo)
                     if info and ok == true then
                         return { state = "tradable", item = itemID, name = info.name,
                                  link = info.link, tag = route.tag,
-                                 vendor = route.vendor and true or false }
+                                 vendor = route.vendor and true or false,
+                                 event = route.event or false, eventName = route.eventName }
                     elseif info and ok == false then
                         sawBound = true
                     else
                         -- Cold item, or a bind slot that failed the type check:
                         -- UNKNOWN, held (class 4) — never included, never dropped.
                         unresolved = unresolved or { item = itemID, tag = route.tag,
-                                                     vendor = route.vendor and true or false }
+                                                     vendor = route.vendor and true or false,
+                                                     event = route.event or false,
+                                                     eventName = route.eventName }
                     end
                 end
             end
@@ -2480,11 +2552,34 @@ function ProfUI.ShopTradability(D, spellID, iteminfo)
     end
     if unresolved then
         return { state = "unresolved", item = unresolved.item, tag = unresolved.tag,
-                 vendor = unresolved.vendor }
+                 vendor = unresolved.vendor, event = unresolved.event,
+                 eventName = unresolved.eventName }
     end
     local reason = "no-item"
     if sawBound then reason = "bound" elseif sawItem then reason = "unreachable" end
     return { state = "excluded", reason = reason }
+end
+
+-- THE EVENT TOGGLE'S PERSISTED FLAG (owner, 2026-08-11). It lives where every
+-- other professions-pane choice lives — the UI state block the pane's persist()
+-- already writes (st.prof, beside missingOnly / showUnavailable / gridFilter) —
+-- so the pane checkbox and the slash command read ONE value and a /reload lands
+-- where the owner left it.
+--
+-- HEALED on the way out, and healed CONSERVATIVELY: only a real boolean `true`
+-- is ON. A string, a number, a table, a nil — anything SavedVariables hands
+-- back that is not the value we wrote — reads OFF, which is the default and
+-- the safe direction (the list shrinks back to what it always was rather than
+-- quietly widening because a corrupt key was truthy). Same instinct as
+-- ValidGridFilter healing an unknown chip key to "everyone".
+function ProfUI.EventFlagHeal(v)
+    return v == true
+end
+
+function ProfUI.IncludeEventRecipes()
+    local st = Dashboard and Dashboard.UIState and Dashboard.UIState() or nil
+    local p = (type(st) == "table" and type(st.prof) == "table") and st.prof or nil
+    return ProfUI.EventFlagHeal(p and p.includeEventRecipes)
 end
 
 -- The list itself. Base set = RecipeRows' missingOnly seam (spec rule +
@@ -2496,23 +2591,34 @@ end
 -- Rows are sorted by skill requirement ASCENDING (the owner reads it as a
 -- levelling path; Raid Prep's checklist order is user-authored so there was
 -- no deliberate ordering to inherit), spell id as the deterministic tiebreak.
-function ProfUI.ShoplistRows(payload, profKey, res, iteminfo)
+--
+-- `includeEvent` is the owner's toggle, and it is a PARAMETER first: nil means
+-- "ask the persisted flag" (what the button and the slash do), true/false is
+-- the explicit answer (what the self-tests pin, so a pinned row set never
+-- depends on a SavedVariables value). Event rows carry `event`/`eventName` and
+-- wear the event tag; every other exclusion is enforced exactly as before.
+function ProfUI.ShoplistRows(payload, profKey, res, iteminfo, includeEvent)
     res = res or ProfUI.LiveResolver()
     iteminfo = iteminfo or ProfUI.LiveItemInfo()
-    local base, _, state = ProfUI.RecipeRows(payload, profKey, { missingOnly = true }, res)
+    if includeEvent == nil then includeEvent = ProfUI.IncludeEventRecipes() end
+    includeEvent = includeEvent and true or false
+    local base, _, state = ProfUI.RecipeRows(payload, profKey,
+        { missingOnly = true, includeEvent = includeEvent }, res)
     local rows, pendingItems = {}, {}
     local D = sourcesDS()
     if not D then return rows, pendingItems, "nodata", #base end
     for i = 1, #base do
         local br = base[i]
-        local v = ProfUI.ShopTradability(D, br.spell, iteminfo)
+        local v = ProfUI.ShopTradability(D, br.spell, iteminfo, includeEvent)
         if v.state == "tradable" then
             rows[#rows + 1] = { spell = br.spell, name = br.name, skill = br.skill,
                 item = v.item, itemName = v.name, link = v.link,
-                tag = v.tag, vendor = v.vendor, unresolved = false }
+                tag = v.tag, vendor = v.vendor, unresolved = false,
+                event = v.event or false, eventName = v.eventName }
         elseif v.state == "unresolved" then
             rows[#rows + 1] = { spell = br.spell, name = br.name, skill = br.skill,
-                item = v.item, tag = v.tag, vendor = v.vendor, unresolved = true }
+                item = v.item, tag = v.tag, vendor = v.vendor, unresolved = true,
+                event = v.event or false, eventName = v.eventName }
             pendingItems[#pendingItems + 1] = v.item
         end
     end
@@ -2528,7 +2634,12 @@ end
 -- PURE. The chat render, as plain lines (ns:Print wears the brand tag). The
 -- unresolved rows wear their state IN the line — a cold bind is a fact worth
 -- printing, not a row to hide — and re-running the list is the retry.
-function ProfUI.ShoplistLines(ownerKey, profKey, rows, state, missingN)
+--
+-- `includeEvent` only ever adds a NOTE to the header: the list is chat-printed,
+-- so the toggle itself lives in the pane (the filter rows, beside "Missing
+-- only"), and the header is where a chat reader finds out which rule produced
+-- the list in front of them. A list printed with event items in it says so.
+function ProfUI.ShoplistLines(ownerKey, profKey, rows, state, missingN, includeEvent)
     local who = tostring(ownerKey or "?"):match("^([^%-]+)") or tostring(ownerKey or "?")
     local prof = ProfUI.ProfName(profKey)
     local out = {}
@@ -2553,7 +2664,8 @@ function ProfUI.ShoplistLines(ownerKey, profKey, rows, state, missingN)
         return out
     end
     out[1] = "Shopping list \226\128\148 " .. who .. "'s " .. prof .. " ("
-        .. #rows .. (#rows == 1 and " recipe" or " recipes") .. " buyable on the AH):"
+        .. #rows .. (#rows == 1 and " recipe" or " recipes") .. " buyable on the AH"
+        .. (includeEvent and ", including event items" or "") .. "):"
     for i = 1, #rows do
         local r = rows[i]
         local label
@@ -4046,7 +4158,8 @@ Dashboard.RegisterTab("professions", function(host)
         sel     = nil,                 -- { owner =, profKey =, spell = } — the selected
                                        -- row, its detail tab, and its picked recipe
         query   = "",
-        filters = { search = "", source = nil, missingOnly = false, showUnavailable = false },
+        filters = { search = "", source = nil, missingOnly = false, showUnavailable = false,
+                    includeEvent = false },   -- the shopping list's event toggle
         gridFilter = nil,              -- the chip bar's exclusive filter key, or
                                        -- nil = everyone (restored from st.prof below)
         obj     = {},
@@ -4067,6 +4180,10 @@ Dashboard.RegisterTab("professions", function(host)
     pane.filters.source          = st.prof.source
     pane.filters.missingOnly     = st.prof.missingOnly and true or false
     pane.filters.showUnavailable = st.prof.showUnavailable and true or false
+    -- The event toggle restores through its OWN healer (ProfUI.IncludeEventRecipes
+    -- reads this same key), so the checkbox and the slash command can never
+    -- disagree about what a stored value means.
+    pane.filters.includeEvent    = ProfUI.IncludeEventRecipes()
     pane.gridFilter              = ProfUI.ValidGridFilter(st.prof.gridFilter)
     if type(st.prof.selOwner) == "string" and st.prof.selOwner ~= "" then
         pane.sel = { owner = st.prof.selOwner, profKey = st.prof.selProf, spell = nil }
@@ -4075,6 +4192,9 @@ Dashboard.RegisterTab("professions", function(host)
         st.prof.source          = pane.filters.source
         st.prof.missingOnly     = pane.filters.missingOnly
         st.prof.showUnavailable = pane.filters.showUnavailable
+        -- Written as a REAL boolean, which is the only value the healer reads
+        -- as ON (see ProfUI.EventFlagHeal).
+        st.prof.includeEventRecipes = pane.filters.includeEvent and true or false
         st.prof.gridFilter      = pane.gridFilter or ""   -- "" = none (selOwner's idiom)
         st.prof.selOwner        = pane.sel and pane.sel.owner or ""
         st.prof.selProf         = pane.sel and pane.sel.profKey or nil
@@ -4289,7 +4409,7 @@ Dashboard.RegisterTab("professions", function(host)
     gavelBtn:SetScript("OnEnter", function(self)
         self._hot = true
         self._face:SetVertexColor(UI.Color("accent"))
-        local title, body = ProfUI.ShoplistButtonTip()
+        local title, body = ProfUI.ShoplistButtonTip(pane.filters.includeEvent)
         GameTooltip:SetOwner(self, "ANCHOR_BOTTOM")
         GameTooltip:SetText(title, UI.Color("text"))
         -- UI.Color returns r,g,b,a; the alpha lands on AddLine's wrapText slot
@@ -4415,13 +4535,41 @@ Dashboard.RegisterTab("professions", function(host)
     UI.Skin(recStatus, function(self) self:SetTextColor(UI.Color("muted")) end)
     pane._recStatus = recStatus
 
+    -- Filter row 3: THE SHOPPING LIST'S EVENT TOGGLE (owner, 2026-08-11:
+    -- "people trawl the off-season AH for event recipes, so make them
+    -- includable"). A row of its own, for two reasons and not one: filter row 2
+    -- is already the width it can carry (its own note says four controls will
+    -- not fit a detail-pane line), and this toggle does NOT filter the list
+    -- above it — it changes what the GAVEL prints. It lives in the pane because
+    -- the list itself is chat-printed and a chat list has nowhere to put a
+    -- control; the printed header says "including event items" when this is on,
+    -- so a reader of the chat can always see which rule produced it.
+    local filter3 = CreateFrame("Frame", nil, detailP)
+    filter3:SetPoint("TOPLEFT", filter2, "BOTTOMLEFT", 0, -2)
+    filter3:SetPoint("RIGHT", detailP, "RIGHT", -L.PANEL_PAD, 0)
+    filter3:SetHeight(22)
+    Dashboard.Tag(filter3, "prof.filters3")
+
+    local eventChk = checkBox(filter3, "Include event-vendor recipes",
+        function() return pane.filters.includeEvent end,
+        function(v)
+            pane.filters.includeEvent = v and true or false
+            persist()
+            -- No Refresh: the recipe list above is deliberately untouched by
+            -- this toggle. The tick (and the gavel's tooltip, which reads the
+            -- same flag) is the feedback; the list it changes is the next
+            -- shopping list printed.
+        end)
+    eventChk:SetPoint("LEFT", filter3, "LEFT", 0, 0)
+    pane._eventChk = eventChk
+
     -- THE COLUMN HEADER BAND (owner, 2026-08-10: "add column headers in the
     -- Detail list") — the grid header's idiom restated: an eyebrow row that
     -- CLIPS, its labels positioned per render from the SAME RecipeColumns the
     -- rows use, so the captions and the cells cannot drift apart. It costs the
     -- list exactly one LIST_ROW_H (RecipeListHeaderHeight, pinned).
     local recHead = CreateFrame("Frame", nil, detailP)
-    recHead:SetPoint("TOPLEFT", filter2, "BOTTOMLEFT", 0, -4)
+    recHead:SetPoint("TOPLEFT", filter3, "BOTTOMLEFT", 0, -4)
     recHead:SetPoint("RIGHT", detailP, "RIGHT", -L.PANEL_PAD, 0)
     recHead:SetHeight(L.HEAD_H)
     recHead:SetClipsChildren(true)
@@ -4753,6 +4901,7 @@ Dashboard.RegisterTab("professions", function(host)
         tabStrip:SetShown(on)
         filter1:SetShown(on)
         filter2:SetShown(on)
+        filter3:SetShown(on)
         recHead:SetShown(on)
         recScroll:SetShown(on)
         detail:SetShown(on)
@@ -5098,13 +5247,18 @@ function ProfUI.RunShoplist(ownerKey, profKey)
         return false
     end
     local payload = payloadLookup()(ownerKey)
+    -- The event toggle is read ONCE per run and handed to both halves, so the
+    -- rows and the header they print under can never describe two different
+    -- rules (a flag flipped mid-render is the drift this shape forbids).
+    local includeEvent = ProfUI.IncludeEventRecipes()
     local rows, pendingItems, state, missingN =
-        ProfUI.ShoplistRows(payload, profKey, ProfUI.LiveResolver(), ProfUI.LiveItemInfo())
+        ProfUI.ShoplistRows(payload, profKey, ProfUI.LiveResolver(), ProfUI.LiveItemInfo(),
+            includeEvent)
     -- Cold teaching items: ONE bounded warm-load request per id (class 4's fix
     -- shape — ask, never guess). No ladder here on purpose: the brief's rule
     -- is that re-running the list is the retry.
     if #pendingItems > 0 then ProfUI.AskFor("item", pendingItems) end
-    local lines = ProfUI.ShoplistLines(ownerKey, profKey, rows, state, missingN)
+    local lines = ProfUI.ShoplistLines(ownerKey, profKey, rows, state, missingN, includeEvent)
     for i = 1, #lines do ns:Print(lines[i]) end
     -- The Raid Prep hand-off, verbatim in spirit: with Auctionator loaded and
     -- the AH open, the resolved names fill the Shopping tab. Everything
@@ -6817,6 +6971,14 @@ local function testShoplist(fails)
             [108] = "Q777",             -- quest-taught, no item at all
             [109] = "I9007",            -- event-gated vendor item
             [110] = "T500@1;I9003",     -- trainer AND a BoE item: item route includes
+            -- The EVENT TOGGLE's matrix (owner, 2026-08-11). Every one of these
+            -- is excluded with the toggle OFF; with it ON, only the ones that
+            -- pass EVERY OTHER rule may ride.
+            [111] = "I9008",            -- event vendor item that is BoP
+            [112] = "I9009",            -- event vendor item, event id the index cannot name
+            [113] = "I9010",            -- event item whose only other route is a quest
+            [114] = "I9011",            -- event by generator FLAG only (no E token)
+            [115] = "I9012",            -- flagged source-less AND on a vendor route
         },
         itemAcq = {
             [9001] = "Q777",
@@ -6826,6 +6988,17 @@ local function testShoplist(fails)
             [9005] = "D88",
             [9006] = "V150@77",
             [9007] = "V100@77;E5",
+            [9008] = "V100@77;E5",
+            [9009] = "V100@77;E6",      -- E6 is deliberately NOT in the event index
+            [9010] = "Q777;E5",
+            [9011] = "V100@77",
+            [9012] = "V100@77",
+        },
+        -- The generator's candidate flags, as the shipped [item] block carries
+        -- them: `e` is the gate the toggle opens, `x` is fatal either way.
+        item = {
+            [9011] = { flags = "e" },
+            [9012] = { flags = "x" },
         },
         npc  = { [77] = { name = "Vendor Vic", zone = 3 }, [88] = { name = "Mob Mo", zone = 3 } },
         zone = { [3] = { name = "Testland" } },
@@ -6841,6 +7014,11 @@ local function testShoplist(fails)
         [9004] = { name = "Plans: World Thing",  link = "|Hitem:9004|h[w]|h", bind = 0 },
         [9005] = { name = "Plans: Drop Thing",   link = "|Hitem:9005|h[d]|h", bind = 2 },
         [9007] = { name = "Plans: Event Thing",  link = "|Hitem:9007|h[e]|h", bind = 2 },
+        [9008] = { name = "Plans: Bound Event",  link = "|Hitem:9008|h[be]|h", bind = 1 },
+        [9009] = { name = "Plans: Nameless Ev",  link = "|Hitem:9009|h[ne]|h", bind = 2 },
+        [9010] = { name = "Plans: Quest Event",  link = "|Hitem:9010|h[qe]|h", bind = 2 },
+        [9011] = { name = "Plans: Flagged Ev",   link = "|Hitem:9011|h[fe]|h", bind = 2 },
+        [9012] = { name = "Plans: Flagged Gone", link = "|Hitem:9012|h[fx]|h", bind = 2 },
     }
     local fakeInfo = function(id) return info[id] end
 
@@ -6881,6 +7059,51 @@ local function testShoplist(fails)
     v = ProfUI.ShopTradability(SD, 104, function() return { name = "N", bind = "2" } end)
     ck(v.state == "unresolved",
        "a type-drifted bind return was not held unresolved")
+
+    -- (b2) THE EVENT TOGGLE, same synthetic dataset, same reader — the ONLY
+    -- thing that changes is the flag. Every exclusion that is not the event
+    -- gate must survive it.
+    local ON = true
+    v = ProfUI.ShopTradability(SD, 109, fakeInfo, ON)
+    ck(v.state == "tradable" and v.event == true,
+       "the toggle did not admit a BoE event-vendor recipe (" .. tostring(v.state) .. ")")
+    ck(v.eventName == "Test Festival",
+       "the event row did not carry the dataset's event NAME (" .. tostring(v.eventName) .. ")")
+    ck(v.tag ~= nil and v.tag:find("Event vendor", 1, true) == 1
+       and v.tag:find("Test Festival", 1, true) ~= nil,
+       "the event row's tag does not LEAD with the event fact (" .. tostring(v.tag) .. ")")
+    ck(v.tag ~= nil and v.tag:find("Vendor Vic", 1, true) ~= nil,
+       "the event row's tag dropped the underlying route (" .. tostring(v.tag) .. ")")
+    -- ... and the same call with the flag OFF is still the old verdict.
+    v = ProfUI.ShopTradability(SD, 109, fakeInfo, false)
+    ck(v.state == "excluded",
+       "an explicit OFF still admitted the event-gated item")
+
+    v = ProfUI.ShopTradability(SD, 111, fakeInfo, ON)
+    ck(v.state == "excluded" and v.reason == "bound",
+       "a BoP event item rode the toggle (" .. tostring(v.reason) .. ")")
+    v = ProfUI.ShopTradability(SD, 112, fakeInfo, ON)
+    ck(v.state == "tradable" and v.eventName == nil
+       and v.tag ~= nil and v.tag:find("seasonal", 1, true) ~= nil,
+       "an event the index cannot name did not read 'seasonal' (" .. tostring(v.tag) .. ")")
+    v = ProfUI.ShopTradability(SD, 113, fakeInfo, ON)
+    ck(v.state == "excluded" and v.reason == "unreachable",
+       "a quest-only event item rode the toggle (a quest reward is not a route)")
+    v = ProfUI.ShopTradability(SD, 114, fakeInfo, ON)
+    ck(v.state == "tradable" and v.event == true
+       and v.tag ~= nil and v.tag:find("seasonal", 1, true) ~= nil,
+       "the generator's `e` FLAG alone was not treated as the event gate")
+    ck(ProfUI.ShopTradability(SD, 114, fakeInfo).state == "excluded",
+       "the `e` flag stopped blocking with the toggle OFF")
+    v = ProfUI.ShopTradability(SD, 115, fakeInfo, ON)
+    ck(v.state == "excluded",
+       "the source-less `x` flag stopped being fatal under the event toggle")
+    -- A NON-event row is bit-for-bit what it was: same state, same tag, no
+    -- event marking. The toggle may not touch anything it does not own.
+    local offV = ProfUI.ShopTradability(SD, 104, fakeInfo)
+    local onV  = ProfUI.ShopTradability(SD, 104, fakeInfo, ON)
+    ck(onV.state == offV.state and onV.tag == offV.tag and onV.event == false,
+       "the toggle changed a non-event row (" .. tostring(onV.tag) .. ")")
 
     -- (c) THE SEAMS, on the shipped dataset. A scanned character missing
     -- everything: rows exist, no known recipe rides, no unavailable rides,
@@ -6986,10 +7209,20 @@ local function testShoplist(fails)
                                   a = NOW, s = specList } }, c = {} }
         end
         local conflicted = shopPayload({ specA.id })
-        local sRows = ProfUI.ShoplistRows(conflicted, sProf, res, allBoE)
+        local sRows = ProfUI.ShoplistRows(conflicted, sProf, res, allBoE, false)
         for _, r in ipairs(sRows) do
             if r.spell == lockedSpell then
                 fails[#fails + 1] = "a spec-conflicted recipe rode the shopping list"
+                break
+            end
+        end
+        -- ... and the event toggle does not weaken the spec rule: a recipe the
+        -- character can never learn stays off the list whatever the flag says.
+        local sRowsOn = ProfUI.ShoplistRows(conflicted, sProf, res, allBoE, true)
+        for _, r in ipairs(sRowsOn) do
+            if r.spell == lockedSpell then
+                fails[#fails + 1] = "a spec-conflicted recipe rode the list with the "
+                    .. "event toggle ON"
                 break
             end
         end
@@ -7087,6 +7320,156 @@ local function testShoplist(fails)
     local o3, pk3, err3 = ProfUI.ShoplistTarget("aaa e", entries, lookup, {})
     ck(pk3 == nil and type(err3) == "string",
        "an ambiguous profession prefix resolved instead of erroring")
+
+    ------------------------------------------------------------------
+    -- (i) THE EVENT TOGGLE ON THE SHIPPED DATASET (owner, 2026-08-11).
+    -- COOKING is the profession the Era dataset actually gates behind a world
+    -- event (Winter Veil's vendor-sold recipes), so it is where the two lists
+    -- can be compared for real rather than by construction.
+    ------------------------------------------------------------------
+    local cookNothing = { v = 1, ds = DS,
+        p = { cooking = { l = 300, m = 300, k = P.EncodeKnown("cooking", {}), n = 0, a = NOW } },
+        c = {} }
+    local offRows = ProfUI.ShoplistRows(cookNothing, "cooking", res, allBoE, false)
+    local onRows  = ProfUI.ShoplistRows(cookNothing, "cooking", res, allBoE, true)
+
+    -- OFF is the list this addon has always printed: nothing event-marked, and
+    -- nothing the source model calls unavailable.
+    for _, r in ipairs(offRows) do
+        if r.event then
+            fails[#fails + 1] = "an event row rode the shopping list with the toggle OFF"
+            break
+        end
+    end
+    for _, r in ipairs(offRows) do
+        local src = ProfUI.SourceModel(r.spell)
+        if src and src.unavailable then
+            fails[#fails + 1] = "an unavailable recipe rode the OFF shopping list"
+            break
+        end
+    end
+
+    -- ON is OFF plus event rows, IN ORDER and otherwise untouched: strip the
+    -- event rows out of the ON list and what is left must be the OFF list, row
+    -- for row, field for field. That is the "nothing changes unless you flip
+    -- it" claim, pinned rather than asserted in prose.
+    local delta, stripped = {}, {}
+    for _, r in ipairs(onRows) do
+        if r.event then delta[#delta + 1] = r else stripped[#stripped + 1] = r end
+    end
+    local same = (#stripped == #offRows)
+    if same then
+        for i = 1, #stripped do
+            local a, b = stripped[i], offRows[i]
+            if a.spell ~= b.spell or a.tag ~= b.tag or a.skill ~= b.skill
+                or a.item ~= b.item or a.itemName ~= b.itemName
+                or a.unresolved ~= b.unresolved then
+                same = false
+                break
+            end
+        end
+    end
+    ck(same, "the ON list minus its event rows is not the OFF list ("
+       .. #stripped .. " vs " .. #offRows .. ")")
+    ck(#delta > 0, "the toggle admitted NOTHING on the shipped cooking dataset "
+       .. "\226\128\148 the event-vendor recipes it exists for are missing")
+    for _, r in ipairs(delta) do
+        if r.tag == nil or r.tag:find("Event vendor", 1, true) ~= 1 then
+            fails[#fails + 1] = "an admitted event row is not tagged as one ("
+                .. tostring(r.tag) .. ")"
+            break
+        end
+        local want = r.eventName or "seasonal"
+        if r.tag:find(want, 1, true) == nil then
+            fails[#fails + 1] = "an event row's tag does not name its event ("
+                .. tostring(r.tag) .. ")"
+            break
+        end
+    end
+    -- The dataset's own Winter Veil pair, named: if a regeneration ever drops
+    -- them the pin says so out loud instead of passing on an empty delta.
+    local inDelta = {}
+    for _, r in ipairs(delta) do inDelta[r.spell] = r end
+    for _, spell in ipairs({ 21143, 21144 }) do
+        if D.recipe and D.recipe[spell] then
+            local r = inDelta[spell]
+            ck(r ~= nil, "the Winter Veil cooking recipe " .. spell
+               .. " did not ride the toggle")
+            if r then
+                ck(r.eventName == "Feast of Winter Veil",
+                   "recipe " .. spell .. " did not name its event from the [event] "
+                   .. "index (" .. tostring(r.eventName) .. ")")
+            end
+        end
+    end
+
+    -- THE AUCTIONATOR HAND-OFF follows the toggle: the event items' names ride
+    -- ON and only ON.
+    local offTerms, onTerms = ProfUI.ShoplistSearchTerms(offRows),
+                              ProfUI.ShoplistSearchTerms(onRows)
+    ck(#onTerms == #offTerms + #delta,
+       "the Auctionator terms did not gain exactly the event rows ("
+       .. #onTerms .. " vs " .. #offTerms .. "+" .. #delta .. ")")
+    local offSeen = {}
+    for _, t in ipairs(offTerms) do offSeen[t] = true end
+    for _, r in ipairs(delta) do
+        if offSeen[r.itemName] then
+            fails[#fails + 1] = "an event item's name was already in the OFF terms"
+            break
+        end
+    end
+
+    -- (j) THE PERSISTED FLAG: healed conservatively, and the DEFAULT run reads
+    -- it. Only a real boolean true is ON — a corrupt SavedVariables value can
+    -- never widen the list behind the owner's back.
+    ck(ProfUI.EventFlagHeal(true) == true, "a stored true did not read ON")
+    ck(ProfUI.EventFlagHeal(false) == false, "a stored false did not read OFF")
+    ck(ProfUI.EventFlagHeal(nil) == false, "an absent flag did not default OFF")
+    ck(ProfUI.EventFlagHeal("true") == false, "a stored STRING healed to ON")
+    ck(ProfUI.EventFlagHeal(1) == false, "a stored number healed to ON")
+    ck(ProfUI.EventFlagHeal({}) == false, "a stored table healed to ON")
+
+    local st = Dashboard and Dashboard.UIState and Dashboard.UIState() or nil
+    -- The state block must be the SAME table twice, or there is no store to
+    -- test against (a settings-less harness hands back a fresh table each call).
+    if type(st) == "table" and Dashboard.UIState() == st then
+        st.prof = st.prof or {}
+        local saved = st.prof.includeEventRecipes
+        st.prof.includeEventRecipes = nil
+        ck(ProfUI.IncludeEventRecipes() == false,
+           "the never-set flag did not default OFF")
+        local defRows = ProfUI.ShoplistRows(cookNothing, "cooking", res, allBoE)
+        ck(#defRows == #offRows,
+           "the default run is not the OFF list (" .. #defRows .. " vs " .. #offRows .. ")")
+        st.prof.includeEventRecipes = "yes"
+        ck(ProfUI.IncludeEventRecipes() == false,
+           "a corrupt persisted flag did not heal to OFF")
+        ck(#ProfUI.ShoplistRows(cookNothing, "cooking", res, allBoE) == #offRows,
+           "a corrupt persisted flag still widened the list")
+        st.prof.includeEventRecipes = true
+        ck(ProfUI.IncludeEventRecipes() == true, "the persisted ON flag did not survive")
+        ck(#ProfUI.ShoplistRows(cookNothing, "cooking", res, allBoE) == #onRows,
+           "the default run ignored the persisted ON flag")
+        st.prof.includeEventRecipes = saved
+    end
+
+    -- (k) THE CHAT HEADER NOTE: the toggle lives in the pane, so the printed
+    -- list has to say which rule produced it. OFF prints the header it always
+    -- printed, character for character.
+    local hOff = ProfUI.ShoplistLines("Aaa-Realm", "alchemy", fRows, "scanned", 4, false)
+    ck(hOff[1] == fLines[1],
+       "the OFF header drifted from the header the list has always printed")
+    ck(hOff[1]:find("including event items", 1, true) == nil,
+       "the OFF header claims event items")
+    local hOn = ProfUI.ShoplistLines("Aaa-Realm", "alchemy", fRows, "scanned", 4, true)
+    ck(hOn[1]:find("including event items", 1, true) ~= nil,
+       "the ON header does not note the event items (" .. tostring(hOn[1]) .. ")")
+    ck(#hOn == #hOff, "the header note changed the line count")
+    -- The empty and unscanned states are untouched by the flag: there is no
+    -- list to describe, so there is nothing to note.
+    local eOn = ProfUI.ShoplistLines("Aaa-Realm", "alchemy", {}, "scanned", 5, true)
+    ck(eOn[1]:find("including event items", 1, true) == nil,
+       "an empty list still announced event items")
 end
 
 -- ── THE SHOPPING-LIST GAVEL (owner, 2026-08-10: corner placement + icon skin,
@@ -7145,6 +7528,13 @@ local function testShoplistGavel(fails)
        "the gavel tooltip body lost the missing-recipes-buyable-on-the-AH explainer")
     ck(body:find("Auctionator", 1, true) ~= nil,
        "the gavel tooltip body lost the Auctionator line")
+    -- The event toggle is a persisted flag the icon cannot show, so the
+    -- explainer says so when it is on — and says nothing when it is off.
+    ck(body:find("Event-vendor", 1, true) == nil,
+       "the default tooltip claims event recipes are included")
+    local _, onBody = ProfUI.ShoplistButtonTip(true)
+    ck(onBody:find("Event-vendor recipes are included", 1, true) ~= nil,
+       "the tooltip does not tell the owner the event toggle is on")
 
     -- (e) WIRING PINS (harness-only source scan, the retint-gate idiom): the
     -- gavel exists in the header region wearing the suite's gavel glyph, the
@@ -7174,6 +7564,20 @@ local function testShoplistGavel(fails)
             ck(text:find("tabStrip:SetPoint(\"RIGHT\", detailP, \"RIGHT\","
                .. " -ProfUI.DetailTabStripRightInset(), 0)", 1, true) ~= nil,
                "the tab strip's right edge is not reserved through the pure reader")
+            -- THE EVENT TOGGLE'S WIRING (owner, 2026-08-11). The checkbox is
+            -- real furniture in the pane's filter rows, and the VERB reads the
+            -- flag ONCE and hands the same value to the rows and to the header
+            -- that describes them — a second read is how the two could ever
+            -- disagree.
+            ck(text:find('checkBox(filter3, "Include event-' .. 'vendor recipes"',
+               1, true) ~= nil,
+               "the event toggle is not a checkbox in the detail pane's filter rows")
+            ck(text:find("local includeEvent = ProfUI.IncludeEvent" .. "Recipes()",
+               1, true) ~= nil,
+               "the shopping-list verb no longer reads the persisted event flag")
+            ck(text:find("ProfUI.ShoplistLines(ownerKey, profKey, rows, state,"
+               .. " missingN, includeEvent)", 1, true) ~= nil,
+               "the printed header no longer describes the same flag the rows used")
         end
         -- (f) THE ASSET: the copied-verbatim glyph ships beside the code — a
         -- 64x64 32bpp uncompressed TGA, byte-for-byte the Raid Prep original
