@@ -121,6 +121,60 @@
 -- filter change — so the suite exercises the recycle path directly.
 --
 ----------------------------------------------------------------------
+-- FIRST OPEN COSTS WHAT IT MEASURES  (owner, live 2026-08-11: "when i clicked
+-- the inventory tab for the first time there was a huge lag spike")
+--
+-- MEASURED, headless, against a 40-character / 1,617-distinct-item mesh — the
+-- shape of a well-played account, which is what the owner has:
+--
+--   BuildLedger (the transpose)      10.8 ms   + 3.1 MB allocated in one frame
+--   Decorate (1,617 GetItemInfo)      1.6 ms
+--   AskFor (1,617 warm-load asks)     3.0 ms   + 1,617 client item queries
+--   FilterRows                        0.2 ms
+--   SortRows                          2.9 ms cold / 6.3 ms once names land
+--   ---- first frame                 18.5 ms
+--
+-- 18 ms is a dropped frame, not a "huge spike". THE SPIKE WAS NEVER ONE FRAME:
+-- the ask flood buys ~1,617 GET_ITEM_INFO_RECEIVED events, and every one of
+-- them ran a FULL repaint — Decorate + Filter + Sort over every row, 8.0 ms
+-- each. 1,617 x 8.0 ms = ~13 SECONDS of aggregate work, arriving as a stutter
+-- over the seconds after the click. The cost was O(N^2) in the ledger size.
+--
+-- And it was not only the first click: Dashboard.RefreshActive calls this
+-- pane's Refresh on STORE_REFRESHED, STATE_CHANGED, TIMER_UPDATED, NODE_UPDATED
+-- and CD_WARNING whenever the window is open — so the 10.8 ms transpose re-ran
+-- on every world-buff tick and every peer payload, and each one also snapped the
+-- list back to the top mid-scroll.
+--
+-- FIVE FIXES, ONE PER MEASURED CAUSE:
+--
+--   1 COALESCE THE REPAINT. GET_ITEM_INFO_RECEIVED sets a dirty flag;
+--     REPAINT_DEBOUNCE later exactly one repaint runs. ~1,617 repaints become
+--     a handful. This is the ~13 seconds.
+--   2 BUDGET THE ASKS. Cold ids go into a QUEUE drained ASK_BUDGET at a time,
+--     ASK_PERIOD apart, VIEWPORT FIRST — the rows on screen are asked about
+--     before the rows nobody has scrolled to. The existing AskFor is the drain's
+--     one exit, so its per-id MAX_ASKS bound and its already-cached suppression
+--     are untouched. This also spreads the echoes the client sends back.
+--   3 SLICE THE TRANSPOSE. NewLedgerJob/StepLedger fold BUILD_CHUNK
+--     (owner,item) entries per frame through the timer seam. The FIRST slice
+--     paints, so the table is on screen while the rest is still being folded in,
+--     and the pane says "indexing 12 of 40 characters…" rather than showing
+--     partial sums as if they were totals (InvUI.ProgressText).
+--   4 PRECOMPUTE THE SORT KEY. SortRows' comparator called name:lower() per
+--     COMPARISON — measured, that is why a warm sort (6.3 ms) cost more than
+--     twice a cold one (2.9 ms). Decorate stores `sortKey` once per row.
+--   5 CACHE BY GENERATION. The ledger is rebuilt only when the store actually
+--     moved (InvUI.Generation, bumped by the same STORE_REFRESHED /
+--     ACCOUNT_ID_CHANGED signals Tooltips.Owners' own 1s cache listens to), and
+--     the filtered+sorted view is cached on top of it. A second visit to the tab
+--     is a repaint; a TIMER_UPDATED while the tab is open is a repaint; and
+--     neither loses the owner's scroll position any more.
+--
+-- InvUI.WORK is the call meter the suite budgets against, bumped once per PASS
+-- (never per item), so the pins cost nothing in the hot loop.
+--
+----------------------------------------------------------------------
 -- DETERMINISM (class 8)
 --
 -- Every ordering in this file is a TOTAL order, and every table walk that feeds one
@@ -463,6 +517,215 @@ function InvUI.BuildLedger(owners)
     return rows, stats
 end
 
+----------------------------------------------------------------------
+-- THE WORK METER
+--
+-- One counter per PASS, bumped once when the pass runs and never once per item,
+-- so the budget pins are call-counted evidence rather than a tax on the hot
+-- loop. `slices` is how many frames a build took; `repaintsAsked` vs
+-- `repaintsRun` is the coalescer's whole story in two numbers.
+----------------------------------------------------------------------
+
+InvUI.WORK = {
+    ledger = 0,        -- (owner,item) entries folded
+    slices = 0,        -- ledger slices run (== frames a build occupied)
+    builds = 0,        -- ledger builds STARTED (a cache hit starts none)
+    decorate = 0,      -- rows re-read from the client
+    filter = 0,        -- rows judged by the filter
+    sort = 0,          -- rows handed to a sort
+    ask = 0,           -- warm-load asks actually issued
+    paint = 0,         -- row frames painted
+    repaintsAsked = 0, -- repaints REQUESTED (one per client answer)
+    repaintsRun = 0,   -- repaints actually run (the coalescer's output)
+}
+
+function InvUI.ResetWork()
+    for k in pairs(InvUI.WORK) do InvUI.WORK[k] = 0 end
+end
+
+----------------------------------------------------------------------
+-- THE STORE GENERATION
+--
+-- The ledger is a pure function of the owners graph, so it only needs rebuilding
+-- when that graph moves. The signal is not invented here: it is the SAME pair
+-- ns.Tooltips already listens to in order to drop its own 1-second owners cache
+-- (tooltips.lua: STORE_REFRESHED, ACCOUNT_ID_CHANGED). Reusing it means the
+-- ledger cache can never outlive the data it was built from — the two caches
+-- are dropped by one signal, not by two rules that could drift.
+--
+-- `factGen` is the other axis: it moves when the CLIENT answers something (a
+-- coalesced GET_ITEM_INFO_RECEIVED burst), which is what makes a re-decorate
+-- worth doing. A refresh that moves neither is a repaint.
+----------------------------------------------------------------------
+
+InvUI._gen, InvUI._factGen = 1, 1
+function InvUI.Generation()        return InvUI._gen end
+function InvUI.FactGeneration()    return InvUI._factGen end
+function InvUI.BumpGeneration()     InvUI._gen     = InvUI._gen + 1     end
+function InvUI.BumpFactGeneration() InvUI._factGen = InvUI._factGen + 1 end
+
+if ns.On then
+    ns:On("STORE_REFRESHED",    function() InvUI.BumpGeneration() end)
+    ns:On("ACCOUNT_ID_CHANGED", function() InvUI.BumpGeneration() end)
+end
+
+----------------------------------------------------------------------
+-- THE SLICED LEDGER — the same transpose, spread over frames
+--
+-- BuildLedger above is kept EXACTLY as it was and is now the ORACLE: the suite
+-- pins the sliced job against it row for row, split for split, stat for stat, at
+-- several chunk sizes. Two independent implementations agreeing is a real pin;
+-- one implementation compared with itself is not. It is also the RED CONTROL —
+-- yesterday's shape, every entry in one frame — and the budget pins assert the
+-- sliced path never does that much in one step.
+--
+-- Resumption is at (owner, item) granularity. An owner's id collection and sort
+-- happens when that owner is first entered and is charged to the budget at #ids,
+-- so a character holding a very full bank cannot silently buy a long frame.
+----------------------------------------------------------------------
+
+-- (owner,item) entries folded per slice. Measured at ~0.8us per entry headless,
+-- so 2000 is a ~1.6ms slice — under a frame at 60fps with room for the client.
+InvUI.BUILD_CHUNK = 2000
+
+-- Repaint the partial table every Nth slice (and always on the first). A
+-- filter+sort per slice would make the slicing itself quadratic, which is the
+-- defect this whole section exists to remove.
+InvUI.PAINT_EVERY = 8
+
+function InvUI.NewLedgerJob(owners, chunk)
+    return {
+        owners = (type(owners) == "table") and owners or EMPTY,
+        chunk  = math.max(1, math.floor(tonumber(chunk) or InvUI.BUILD_CHUNK)),
+        keys = {}, ki = 0,          -- the sorted owner keys, and how far in we are
+        ids  = nil, ii = 0,         -- the current owner's sorted ids, and our place
+        byId = {},
+        rows = {},                  -- LIVE: the pane paints this array as it grows
+        stats = { distinct = 0, total = 0, chars = 0 },
+        phase = "keys", done = false,
+    }
+end
+
+-- How far along a job is, in CHARACTERS — the unit the progress line speaks in.
+function InvUI.LedgerProgress(job)
+    if type(job) ~= "table" then return 0, 0 end
+    local total = #(job.keys or EMPTY)
+    if job.done then return total, total end
+    local at = math.floor(tonumber(job.ki) or 0)
+    if at < 0 then at = 0 end
+    if at > total then at = total end
+    return at, total
+end
+
+-- Run ONE slice. Returns done, work. Calling it on a finished job is a no-op, so
+-- a stray pump cannot corrupt a completed ledger.
+function InvUI.StepLedger(job)
+    if type(job) ~= "table" or job.done then return true, 0 end
+    local budget, work = job.chunk, 0
+
+    if job.phase == "keys" then
+        -- class 8: the walk order is chosen, not inherited (BuildLedger's rule).
+        local keys = {}
+        for key, o in pairs(job.owners) do
+            if type(key) == "string" and key ~= "" and type(o) == "table" then
+                keys[#keys + 1] = key
+            end
+        end
+        table.sort(keys)
+        job.keys = keys
+        job.stats.chars = #keys
+        job.phase = "scan"
+        InvUI.WORK.ledger = InvUI.WORK.ledger + #keys
+        InvUI.WORK.slices = InvUI.WORK.slices + 1
+        return false, #keys
+    end
+
+    if job.phase == "scan" then
+        while work < budget do
+            if job.ids == nil then
+                job.ki = job.ki + 1
+                if job.ki > #job.keys then job.phase = "order" break end
+                local counts = job.owners[job.keys[job.ki]].itemCounts
+                local ids = {}
+                if type(counts) == "table" then
+                    for id, n in pairs(counts) do
+                        local ni, nn = tonumber(id), tonumber(n)
+                        if ni and nn and ni > 0 and nn > 0 then ids[#ids + 1] = ni end
+                    end
+                    table.sort(ids)
+                end
+                job.ids, job.ii = ids, 0
+                work = work + #ids          -- the collect + sort is real work
+            end
+            local key    = job.keys[job.ki]
+            local counts = job.owners[key].itemCounts
+            local ids    = job.ids
+            while job.ii < #ids and work < budget do
+                job.ii = job.ii + 1
+                local id  = ids[job.ii]
+                local n   = tonumber(counts[id])
+                local row = job.byId[id]
+                if not row then
+                    row = { id = id, total = 0, holders = 0, split = {} }
+                    job.byId[id] = row
+                    job.rows[#job.rows + 1] = row
+                end
+                row.total   = row.total + n
+                row.holders = row.holders + 1
+                row.split[#row.split + 1] = { key = key, count = n }
+                job.stats.total = job.stats.total + n
+                work = work + 1
+            end
+            if job.ii >= #ids then job.ids = nil end
+        end
+        -- The partial truth, so a mid-build reader sees what has landed rather
+        -- than a zero. The pane still refuses to PRINT these as totals — see
+        -- InvUI.ProgressText.
+        job.stats.distinct = #job.rows
+        InvUI.WORK.ledger = InvUI.WORK.ledger + work
+        InvUI.WORK.slices = InvUI.WORK.slices + 1
+        -- ALWAYS hand the frame back here, even when the scan just finished: the
+        -- closing sort is its own unit of work (D rows, not entries) and gets its
+        -- own slice, so no single frame pays for both.
+        return false, work
+    end
+
+    -- The canonical base order, item id ascending — BuildLedger's own final sort,
+    -- run once at the end for exactly the same result.
+    table.sort(job.rows, function(a, b) return a.id < b.id end)
+    job.stats.distinct = #job.rows
+    job.phase, job.done = "done", true
+    InvUI.WORK.ledger = InvUI.WORK.ledger + #job.rows
+    InvUI.WORK.slices = InvUI.WORK.slices + 1
+    return true, #job.rows
+end
+
+-- Drive a job to completion here and now. The no-timer fallback, and the suite's
+-- handle on the sliced path.
+function InvUI.RunLedger(owners, chunk)
+    local job = InvUI.NewLedgerJob(owners, chunk)
+    local steps = 0
+    while not InvUI.StepLedger(job) do
+        steps = steps + 1
+        if steps > 1e6 then break end     -- a fuse, never reached by real data
+    end
+    return job.rows, job.stats, steps + 1
+end
+
+-- PURE. What the pane says WHILE the transpose is running. The COUNTS are
+-- deliberately absent: a partial transpose understates every total, and a number
+-- that is still going to change is not a total. The rows paint as they arrive;
+-- this line is what stops them being read as the whole answer.
+function InvUI.ProgressText(charsDone, charsTotal)
+    local t = math.floor(tonumber(charsTotal) or 0)
+    if t <= 0 then return nil end
+    local d = math.floor(tonumber(charsDone) or 0)
+    if d < 0 then d = 0 end
+    if d > t then d = t end
+    return "indexing " .. InvUI.Commas(d) .. " of " .. InvUI.Commas(t)
+        .. (t == 1 and " character" or " characters") .. InvUI.GLYPHS.dots
+end
+
 -- PURE. Roster coverage, for the footer. `chars` is every owner record we hold;
 -- `oldest` is the age in seconds of the STALEST stamped record, or nil when no
 -- record carries a usable stamp (in which case the footer omits the age clause
@@ -538,6 +801,7 @@ local _askCount = {}       -- ["item:<id>"] = asks spent
 
 function InvUI.ClearCaches()
     _facts, _askCount = {}, {}
+    InvUI.ClearAskQueue()          -- defined with the ask ladder below
 end
 
 -- The live resolver. `item(id)` answers a facts table, or nil meaning "the client
@@ -594,6 +858,13 @@ end
 -- NOT resolved has its fact fields CLEARED rather than left standing, so a stale
 -- name from an earlier decoration can never survive a cache wipe and be presented
 -- as current.
+--
+-- `sortKey` is the row's lowercased name, computed ONCE here. SortRows compares
+-- names O(n log n) times and used to call name:lower() inside the comparator,
+-- allocating a transient string per COMPARISON — measured, that is why a warm
+-- sort (6.3 ms over 1,617 rows) cost more than twice a cold one (2.9 ms). It is
+-- cleared with the rest of the facts when a row goes cold, so it can never
+-- outlive the name it was derived from.
 function InvUI.Decorate(rows, res)
     local pending = {}
     if type(rows) ~= "table" then return pending end
@@ -603,14 +874,17 @@ function InvUI.Decorate(rows, res)
         local f = get and get(r.id) or nil
         if f then
             r.name, r.quality, r.icon, r.category = f.name, f.quality, f.icon, f.category
+            r.sortKey  = (type(f.name) == "string") and f.name:lower() or nil
             r.resolved = true
         else
             r.name, r.quality, r.icon, r.category = nil, nil, nil, nil
+            r.sortKey  = nil
             r.resolved = false
             pending[#pending + 1] = r.id
         end
     end
     table.sort(pending)        -- class 8: this list drives a bounded retry loop
+    InvUI.WORK.decorate = InvUI.WORK.decorate + #rows
     return pending
 end
 
@@ -640,6 +914,90 @@ function InvUI.AskFor(ids, res)
         end
     end
     return asked
+end
+
+----------------------------------------------------------------------
+-- THE ASK QUEUE — bounded rate, viewport first
+--
+-- MEASURED (see FIRST OPEN COSTS WHAT IT MEASURES): a fresh session's first open
+-- fired ~1,617 warm-load asks in ONE frame, and the client answered every one
+-- with its own GET_ITEM_INFO_RECEIVED — an echo per ask, each of which used to
+-- buy a full repaint. Asking for everything at once is what made the answers
+-- arrive as a storm.
+--
+-- So the asks go through a QUEUE instead. It is drained ASK_BUDGET at a time,
+-- ASK_PERIOD apart, and the rows ACTUALLY ON SCREEN are moved to the head
+-- (PromoteAsks, called by the renderer): the owner gets names for what they are
+-- looking at first, and the rest trickle in — or arrive sooner, as they scroll
+-- into view and get promoted.
+--
+-- AskFor is the queue's ONE exit. Its per-id MAX_ASKS bound, its EXHAUSTED
+-- marking and its already-cached suppression are untouched and still the only
+-- rules about whether an id may be asked at all; the queue only decides WHEN.
+----------------------------------------------------------------------
+
+InvUI.ASK_BUDGET = 40      -- asks per drain
+InvUI.ASK_PERIOD = 1       -- seconds between drains
+
+local askQueue, askQueued = {}, {}
+
+function InvUI.AskQueueDepth() return #askQueue end
+function InvUI.ClearAskQueue() askQueue, askQueued = {}, {} end
+
+-- Enqueue ids we still need names for. Duplicates are dropped, order of first
+-- arrival is kept (class 8: the drain order is chosen, never inherited).
+function InvUI.QueueAsks(ids)
+    if type(ids) ~= "table" then return 0 end
+    local added = 0
+    for i = 1, #ids do
+        local id = tonumber(ids[i])
+        if id and not askQueued[id] then
+            askQueued[id] = true
+            askQueue[#askQueue + 1] = id
+            added = added + 1
+        end
+    end
+    return added
+end
+
+-- Move the ids on screen to the head of the queue, KEEPING relative order inside
+-- both halves — a stable partition, so two renders of one viewport produce one
+-- queue order. Returns how many were promoted.
+function InvUI.PromoteAsks(ids)
+    if type(ids) ~= "table" or #ids == 0 or #askQueue == 0 then return 0 end
+    local want = {}
+    for i = 1, #ids do
+        local id = tonumber(ids[i])
+        if id and askQueued[id] then want[id] = true end
+    end
+    local head, tail = {}, {}
+    for i = 1, #askQueue do
+        local id = askQueue[i]
+        if want[id] then head[#head + 1] = id else tail[#tail + 1] = id end
+    end
+    if #head == 0 or #tail == 0 then return #head end
+    for i = 1, #head do askQueue[i] = head[i] end
+    for i = 1, #tail do askQueue[#head + i] = tail[i] end
+    return #head
+end
+
+-- Drain at most `budget` ids through AskFor. Returns asked, remaining.
+function InvUI.DrainAsks(res, budget)
+    budget = math.floor(tonumber(budget) or InvUI.ASK_BUDGET)
+    if budget < 0 then budget = 0 end
+    if budget == 0 or #askQueue == 0 then return 0, #askQueue end
+    local n = math.min(budget, #askQueue)
+    local slice = {}
+    for i = 1, n do
+        slice[i] = askQueue[i]
+        askQueued[askQueue[i]] = nil
+    end
+    local rest = {}
+    for i = n + 1, #askQueue do rest[#rest + 1] = askQueue[i] end
+    askQueue = rest
+    local asked = InvUI.AskFor(slice, res)
+    InvUI.WORK.ask = InvUI.WORK.ask + asked
+    return asked, #askQueue
 end
 
 -- PURE. The bounded re-ask ladder (ProfUI's idiom): rungs, then STOP claiming to
@@ -769,6 +1127,7 @@ function InvUI.FilterRows(rows, query, category)
         end
     end
     state.matched = #out
+    InvUI.WORK.filter = InvUI.WORK.filter + #rows
     return out, state
 end
 
@@ -796,10 +1155,15 @@ function InvUI.SortRows(rows, mode)
     local out = {}
     if type(rows) ~= "table" then return out end
     for i = 1, #rows do out[i] = rows[i] end
+    InvUI.WORK.sort = InvUI.WORK.sort + #out
 
+    -- PRECOMPUTED by Decorate (see its note): this runs once per COMPARISON, so
+    -- a :lower() here allocated O(n log n) transient strings. A hand-built row
+    -- that never met Decorate still answers correctly — it just pays for it.
+    -- Nothing is written back: SortRows stays pure.
     local function nameKey(r)
         if r.resolved and type(r.name) == "string" and r.name ~= "" then
-            return r.name:lower()
+            return r.sortKey or r.name:lower()
         end
         return nil
     end
@@ -819,7 +1183,12 @@ end
 
 -- PURE. The two things this table may say about its own certainty, and the words
 -- it says them in. (ProfUI.StatusText, specialised to items.)
---   state = { matched, pendingHidden, hasQuery, exhausted, ledgerEmpty, moduleOff }
+--   state = { matched, pendingHidden, hasQuery, exhausted, ledgerEmpty, moduleOff,
+--             indexing }
+-- `indexing` is the transpose still running (a string = the progress line to
+-- print). It outranks ledgerEmpty because an empty PARTIAL ledger is not an
+-- empty one, and "No item counts yet" would be a claim we cannot make while we
+-- are still counting.
 -- Returns emptyText (nil when rows are on screen) and statusText (nil when there
 -- is nothing to add). matched == 0 with pendingHidden > 0 is NOT "no matches" — it
 -- is "we have not been told yet", and it must read as that.
@@ -835,6 +1204,10 @@ function InvUI.StatusText(state)
     if matched == 0 then
         if state.moduleOff then
             return InvUI.EmptyText({ moduleOff = true }), nil
+        end
+        if state.indexing then
+            return (type(state.indexing) == "string" and state.indexing ~= "")
+                and state.indexing or ("indexing" .. dots), nil
         end
         if state.ledgerEmpty then
             return InvUI.EmptyText({ ledgerEmpty = true }), nil
@@ -1064,6 +1437,84 @@ local exhausted  = {}      -- "<id>" -> true, ids a completed ladder never got
 
 local repaintPane          -- forward declaration; defined with the pane below
 
+----------------------------------------------------------------------
+-- THE COALESCER — the ~13 seconds, in one flag
+--
+-- Every warm-load ask the client answers fires GET_ITEM_INFO_RECEIVED, and a
+-- fresh session's first open used to buy ~1,617 of them. Running the repaint
+-- inline meant ~1,617 full Decorate+Filter+Sort passes, 8.0 ms each, arriving as
+-- a stutter over the seconds after the click. It was never the click that was
+-- slow; it was the answers.
+--
+-- So an answer no longer repaints. It marks the pane DIRTY and, if nothing is
+-- armed already, arms ONE repaint REPAINT_DEBOUNCE later. A burst of a thousand
+-- answers inside one window costs one repaint. WORK.repaintsAsked vs
+-- WORK.repaintsRun is the whole story, and the suite budgets on the ratio.
+--
+-- With no timer seam (the harness, a client that never loaded C_Timer) the
+-- repaint runs inline: refusing to repaint at all would be a worse answer than
+-- repainting eagerly, and the harness drives this path deliberately.
+----------------------------------------------------------------------
+
+InvUI.REPAINT_DEBOUNCE = 0.2
+
+local repaintDirty, repaintArmed = false, false
+
+-- Run the pending repaint, if there is one. Returns whether it did anything.
+function InvUI.RunRepaint()
+    if not repaintDirty then return false end
+    repaintDirty = false
+    InvUI.WORK.repaintsRun = InvUI.WORK.repaintsRun + 1
+    -- The client answered SOMETHING, so a re-decorate is now worth doing; the
+    -- pane's warm path reads this to decide exactly that.
+    InvUI.BumpFactGeneration()
+    if repaintPane then repaintPane() end
+    return true
+end
+
+function InvUI.RequestRepaint()
+    InvUI.WORK.repaintsAsked = InvUI.WORK.repaintsAsked + 1
+    repaintDirty = true
+    if repaintArmed then return false end
+    if not (_G.C_Timer and _G.C_Timer.After) then
+        InvUI.RunRepaint()
+        return true
+    end
+    repaintArmed = true
+    _G.C_Timer.After(InvUI.REPAINT_DEBOUNCE, function()
+        repaintArmed = false
+        ns:SafeCall(InvUI.RunRepaint)
+    end)
+    return true
+end
+
+function InvUI._resetRepaint() repaintDirty, repaintArmed = false, false end
+
+----------------------------------------------------------------------
+-- THE ASK DRAIN — one ticker, alive only while the queue is
+----------------------------------------------------------------------
+
+local askTicking = false
+
+local function startAskDrain()
+    if askTicking then return end
+    if not (_G.C_Timer and _G.C_Timer.After) then
+        -- No timer seam: drain what we can now rather than queueing forever.
+        InvUI.DrainAsks(InvUI.LiveResolver(), InvUI.ASK_BUDGET)
+        return
+    end
+    askTicking = true
+    local function tick()
+        if InvUI.AskQueueDepth() == 0 then askTicking = false return end
+        InvUI.DrainAsks(InvUI.LiveResolver(), InvUI.ASK_BUDGET)
+        if InvUI.AskQueueDepth() == 0 then askTicking = false return end
+        _G.C_Timer.After(InvUI.ASK_PERIOD, function() ns:SafeCall(tick) end)
+    end
+    tick()          -- the first budget goes out immediately (viewport first)
+end
+InvUI._startAskDrain = startAskDrain
+function InvUI._resetAskDrain() askTicking = false end
+
 local function stopWatch()
     watchRound = 0
     for key in pairs(watching) do exhausted[key] = true end
@@ -1092,9 +1543,9 @@ local function startWatch()
     if watcher then return end
     if not _G.CreateFrame then return end
     local wf = _G.CreateFrame("Frame")
-    wf:SetScript("OnEvent", function()
-        if repaintPane then ns:SafeCall(repaintPane) end
-    end)
+    -- COALESCED (see THE COALESCER): the event marks the pane dirty; it does not
+    -- repaint. A thousand answers inside one debounce window cost one repaint.
+    wf:SetScript("OnEvent", function() InvUI.RequestRepaint() end)
     pcall(function() wf:RegisterEvent("GET_ITEM_INFO_RECEIVED") end)
     watcher = wf
     if _G.C_Timer and _G.C_Timer.After then
@@ -1104,11 +1555,11 @@ local function startWatch()
             local d = InvUI.LadderDelay(watchRound)
             if not d then
                 stopWatch()
-                if repaintPane then ns:SafeCall(repaintPane) end
+                InvUI.RequestRepaint()
                 return
             end
             _G.C_Timer.After(d, function()
-                if repaintPane then ns:SafeCall(repaintPane) end
+                InvUI.RequestRepaint()
                 rung()
             end)
         end
@@ -1118,6 +1569,10 @@ end
 
 -- Called by every render that produced pending ids. Ids a completed ladder has
 -- already given up on are dropped here, so they can neither re-ask nor re-arm.
+--
+-- BUDGETED (see THE ASK QUEUE): the fresh ids are QUEUED, not asked. The drain
+-- sends ASK_BUDGET of them per ASK_PERIOD, viewport first. On a fresh session
+-- this is the difference between 1,617 client queries in one frame and 40.
 local function notePending(ids, res)
     if type(ids) ~= "table" or #ids == 0 then return false end
     local fresh = {}
@@ -1129,16 +1584,21 @@ local function notePending(ids, res)
         end
     end
     if #fresh == 0 then return false end
-    InvUI.AskFor(fresh, res)
+    InvUI.QueueAsks(fresh)
+    startAskDrain()
     startWatch()
     return true
 end
 InvUI._notePending = notePending
 
--- One reset for both halves, so a fresh look is genuinely fresh.
+-- One reset for the whole cold-name machine, so a fresh look is genuinely fresh:
+-- the ladder, the exhausted verdicts, the ask queue and the pending repaint.
 function InvUI._resetWatchState()
     stopWatch()
     watching, exhausted = {}, {}
+    InvUI.ClearAskQueue()
+    InvUI._resetAskDrain()
+    InvUI._resetRepaint()
 end
 
 -- ════════════════════════════════════════════════════════════════════════════
@@ -1379,6 +1839,11 @@ Dashboard.RegisterTab("inventory", function(host)
         _view    = {},          -- filtered + sorted, what the window indexes into
         _pending = {},
         _state   = {},
+        _job     = nil,         -- the sliced ledger build in flight, or nil
+        _slice   = 0,
+        _ledgerGen = nil,       -- the store generation _ledger was built from
+        _factSeen  = nil,       -- the fact generation _ledger was decorated at
+        _viewKey   = nil,       -- everything _view depends on, as one string
     }
     thePane = pane
 
@@ -1530,18 +1995,29 @@ Dashboard.RegisterTab("inventory", function(host)
 
         local first, last, yTop = InvUI.VisibleWindow(scrolled, viewH, L.ROW_H, n)
 
-        local slot = 0
+        local slot, onScreen = 0, nil
         for i = first, last do
             slot = slot + 1
+            local row = pane._view[i]
             local ir = getRow(slot)
             ir:ClearAllPoints()
             ir:SetPoint("TOPLEFT", listKid, "TOPLEFT", 0, -(yTop + (i - first) * L.ROW_H))
             ir:SetWidth(math.max(1, availW))
             invFitRow(ir, cols)
-            invPaintRow(ir, pane._view[i])
+            invPaintRow(ir, row)
             ir:Show()
+            if not row.resolved then
+                onScreen = onScreen or {}
+                onScreen[#onScreen + 1] = row.id
+            end
         end
         for j = slot + 1, #pane._rows do pane._rows[j]:Hide() end
+        InvUI.WORK.paint = InvUI.WORK.paint + slot
+
+        -- VIEWPORT FIRST: the names the owner is looking at jump the ask queue.
+        -- Scrolling is therefore also what fetches — a row asked for as it comes
+        -- into view, rather than in a flood nobody was reading.
+        if onScreen then InvUI.PromoteAsks(onScreen) end
 
         emptyFS:SetShown(n == 0)
     end
@@ -1559,49 +2035,130 @@ Dashboard.RegisterTab("inventory", function(host)
     -- rebuild of the whole ledger (thousands of rows, once per data change).
     ------------------------------------------------------------------
 
-    -- filter -> sort -> draw.
-    function pane.obj.Apply()
+    -- Everything the rendered view is a function of, as one comparable string.
+    -- When none of it moved, an Apply is a repaint and nothing more — which is
+    -- what makes a second visit to the tab near-free, and what stops
+    -- Dashboard.RefreshActive (STORE_REFRESHED, STATE_CHANGED, TIMER_UPDATED,
+    -- NODE_UPDATED, CD_WARNING — several a second while the window is open) from
+    -- re-filtering and re-sorting the whole mesh for a world-buff tick.
+    local function viewKey()
+        return table.concat({
+            tostring(pane._ledgerGen), tostring(pane._factSeen),
+            tostring(pane.query), tostring(pane.category), tostring(pane.sort),
+            tostring(#pane._ledger),
+        }, "\1")
+    end
+
+    -- filter -> sort -> draw. `force` is the build path, which must repaint even
+    -- when the key has not moved (the ledger array grew in place).
+    function pane.obj.Apply(force)
+        local key = viewKey()
+        if not force and pane._viewKey == key then
+            -- Nothing the view depends on moved. Re-place the pooled rows (the
+            -- pane may have been resized or re-shown) and stop. The owner's
+            -- scroll position survives, which it did not before.
+            renderWindow()
+            return false
+        end
+        pane._viewKey = key
+
         local view, state = InvUI.FilterRows(pane._ledger, pane.query, pane.category)
         pane._view  = InvUI.SortRows(view, pane.sort)
         pane._state = state
         state.exhausted   = InvUI.Exhausted(pane._pending)
-        state.ledgerEmpty = (#pane._ledger == 0)
         state.moduleOff   = InvUI.ModuleOff()
+        -- A build in flight: the ledger is PARTIAL, so it is neither empty nor a
+        -- total. The progress line says which, and the footer says it instead of
+        -- counts that are still moving.
+        local job = pane._job
+        local doneC, totalC = InvUI.LedgerProgress(job)
+        local progress = job and InvUI.ProgressText(doneC, totalC) or nil
+        state.indexing    = progress or (job and true or nil)
+        state.ledgerEmpty = (not job) and (#pane._ledger == 0) or false
 
         local emptyText, statusText = InvUI.StatusText(state)
         emptyFS:SetText(emptyText or "")
         statusFS:SetText(statusText or "")
-        footerFS:SetText(InvUI.FooterText(pane._stats, pane._cov, Dashboard.FormatDuration))
+        footerFS:SetText(progress
+            or InvUI.FooterText(pane._stats, pane._cov, Dashboard.FormatDuration))
 
         listScroll:SetVerticalScroll(0)
         renderWindow()
+        return true
     end
 
-    -- Re-read the client's item facts and re-ask for what is still cold. Cheap
-    -- (the resolver caches every answer), so the watcher can drive it.
+    -- Re-read the client's item facts and queue what is still cold. Cheap (the
+    -- resolver caches every answer), so the coalesced repaint can drive it.
     function pane.obj.Decorate()
         local res = InvUI.LiveResolver()
         pane._pending = InvUI.Decorate(pane._ledger, res)
         notePending(pane._pending, res)
         pane.category = catChip:SetRing(InvUI.CategoryChoices(pane._ledger), pane.category)
         persist()
+        pane._factSeen = InvUI.FactGeneration()
     end
 
-    -- Rebuild the ledger from the owners graph.
-    function pane.obj.Refresh()
+    -- ONE SLICE, then hand the frame back. The first slice paints, so the table
+    -- is on screen while the rest of the mesh is still being folded in.
+    function pane.obj.PumpBuild()
+        local job = pane._job
+        if not job then return end
+        local finish = function()
+            pane._job, pane._slice = nil, 0
+            pane._ledgerGen = pane._buildGen
+            pane.obj.Decorate()
+            pane.obj.Apply(true)
+        end
+        if InvUI.StepLedger(job) then return finish() end
+        pane._slice = pane._slice + 1
+        if pane._slice == 1 or (pane._slice % InvUI.PAINT_EVERY) == 0 then
+            pane.obj.Apply(true)
+        end
+        if _G.C_Timer and _G.C_Timer.After then
+            _G.C_Timer.After(0, function() ns:SafeCall(pane.obj.PumpBuild) end)
+        else
+            -- No timer seam: finishing here beats leaving a half-built ledger
+            -- standing and calling it the mesh's contents.
+            while not InvUI.StepLedger(job) do end
+            finish()
+        end
+    end
+
+    -- Start a sliced rebuild for store generation `gen`.
+    function pane.obj.StartBuild(gen)
         local owners = InvUI.Owners()
-        local rows, stats = InvUI.BuildLedger(owners)
-        pane._ledger, pane._stats = rows, stats
-        pane._cov = InvUI.Coverage(owners, (GetServerTime and GetServerTime()) or (time and time()) or 0)
-        pane.obj.Decorate()
-        pane.obj.Apply()
+        pane._cov = InvUI.Coverage(owners,
+            (GetServerTime and GetServerTime()) or (time and time()) or 0)
+        local job = InvUI.NewLedgerJob(owners, InvUI.BUILD_CHUNK)
+        pane._job, pane._buildGen, pane._slice = job, gen, 0
+        -- The pane paints job.rows AS IT GROWS — the array is the live one, not
+        -- a copy handed over at the end.
+        pane._ledger, pane._stats = job.rows, job.stats
+        pane._viewKey = nil
+        InvUI.WORK.builds = InvUI.WORK.builds + 1
+        pane.obj.PumpBuild()
     end
 
-    -- The watcher's repaint: names only, never a ledger rebuild.
+    -- The shell's entry point, called on every tab selection AND on five store
+    -- events. It rebuilds ONLY when the store actually moved.
+    function pane.obj.Refresh()
+        if pane._job then return end                  -- a build is already running
+        local gen = InvUI.Generation()
+        if pane._ledgerGen == gen then
+            -- WARM. Re-read the client only if it has answered since we looked.
+            if pane._factSeen ~= InvUI.FactGeneration() then pane.obj.Decorate() end
+            pane.obj.Apply()
+            return
+        end
+        pane.obj.StartBuild(gen)
+    end
+
+    -- The coalescer's repaint: names only, never a ledger rebuild.
     repaintPane = function()
         if not thePane then return end
+        if thePane._job then return end               -- the build will decorate
         thePane.obj.Decorate()
-        thePane.obj.Apply()
+        thePane.obj.Apply(true)
     end
 
     pane.obj.Refresh()
@@ -2323,6 +2880,374 @@ local function testTabRegistrationAndInertness(fails)
 end
 
 ----------------------------------------------------------------------
+-- THE FIRST-OPEN BUDGET  (owner, live 2026-08-11: "a huge lag spike")
+--
+-- Every pin here is CALL-COUNTED off InvUI.WORK — no wall-clock, so the suite
+-- says the same thing on any machine. The RED CONTROL throughout is yesterday's
+-- shape: the whole mesh folded, decorated, sorted and asked for in ONE frame.
+----------------------------------------------------------------------
+
+-- A mesh big enough that "all in one frame" and "a slice at a time" are
+-- different sentences: 24 characters, ~600 distinct items, ~7,200 (char,item)
+-- entries. Deterministic — no math.random anywhere near a pin.
+local function bigOwners(nChars, universe, perChar)
+    nChars, universe, perChar = nChars or 24, universe or 601, perChar or 300
+    local owners = {}
+    for c = 1, nChars do
+        local counts, n, at = {}, 0, (c * 37) % universe
+        for i = 1, 60 do counts[1000 + i] = 10 + i; n = n + 1 end   -- the common core
+        while n < perChar do
+            at = (at + c) % universe          -- universe is PRIME: every stride walks it all
+            local id = 2000 + at
+            if not counts[id] then counts[id] = 1 + (at % 40); n = n + 1 end
+        end
+        owners[string.format("Big%03d-Realm", c)] =
+            { nameRealm = "Big" .. c, ts = 1000 + c, itemCounts = counts }
+    end
+    return owners
+end
+
+local function testFirstOpenBudget(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+
+    local owners = bigOwners()
+    local entries = 0
+    for _, o in pairs(owners) do
+        for _ in pairs(o.itemCounts) do entries = entries + 1 end
+    end
+    ck(entries > 5000, "the budget fixture is too small to distinguish the shapes ("
+       .. entries .. " entries)")
+
+    ------------------------------------------------------------------
+    -- 1. CORRECTNESS FIRST. The sliced job and the one-shot oracle must agree
+    --    completely — row for row, split for split, stat for stat — at several
+    --    chunk sizes INCLUDING ones that land mid-character. A faster wrong
+    --    answer is not a fix.
+    ------------------------------------------------------------------
+    local oneRows, oneStats = InvUI.BuildLedger(owners)
+    for _, chunk in ipairs({ 1, 7, 250, 2000, 1e9 }) do
+        local rows, stats = InvUI.RunLedger(owners, chunk)
+        local at = " (chunk " .. chunk .. ")"
+        ck(#rows == #oneRows, "the sliced ledger has " .. #rows .. " rows, the one-shot "
+           .. #oneRows .. at)
+        ck(stats.distinct == oneStats.distinct, "distinct disagrees" .. at)
+        ck(stats.total == oneStats.total, "the grand total disagrees: " .. stats.total
+           .. " vs " .. oneStats.total .. at)
+        ck(stats.chars == oneStats.chars, "the character count disagrees" .. at)
+        local bad = nil
+        for i = 1, math.min(#rows, #oneRows) do
+            local a, b = rows[i], oneRows[i]
+            if a.id ~= b.id or a.total ~= b.total or a.holders ~= b.holders
+               or #a.split ~= #b.split then bad = bad or i end
+            if not bad then
+                for j = 1, #a.split do
+                    if a.split[j].key ~= b.split[j].key
+                       or a.split[j].count ~= b.split[j].count then bad = bad or i end
+                end
+            end
+        end
+        ck(bad == nil, "the sliced ledger disagrees with the one-shot at row "
+           .. tostring(bad) .. at)
+    end
+
+    -- ...and it is still a TOTAL order (class 8), still item id ascending.
+    local rows = InvUI.RunLedger(owners, 97)
+    for i = 2, #rows do
+        ck(rows[i - 1].id < rows[i].id, "the sliced base order is not id ascending")
+    end
+    -- two sliced builds of one graph are identical (chunking may not leak in)
+    local r2 = InvUI.RunLedger(owners, 13)
+    local same = (#rows == #r2)
+    for i = 1, math.min(#rows, #r2) do
+        if rows[i].id ~= r2[i].id or rows[i].total ~= r2[i].total then same = false end
+    end
+    ck(same, "two sliced builds at different chunk sizes disagreed")
+
+    ------------------------------------------------------------------
+    -- 2. THE BUDGET. No single slice may fold more than the chunk (plus the one
+    --    owner's id list it had to open to get there). The RED CONTROL is the
+    --    one-shot: it folds EVERYTHING in one step, and the pin is that the
+    --    sliced path does not.
+    ------------------------------------------------------------------
+    local job = InvUI.NewLedgerJob(owners, InvUI.BUILD_CHUNK)
+    local worst, steps, biggestOwner = 0, 0, 0
+    for _, o in pairs(owners) do
+        local n = 0
+        for _ in pairs(o.itemCounts) do n = n + 1 end
+        if n > biggestOwner then biggestOwner = n end
+    end
+    -- A slice may overshoot its chunk by at most the ONE owner id list it had to
+    -- open to get there — which is why opening an owner is charged at #ids
+    -- rather than being free.
+    local ceiling, finalWork = InvUI.BUILD_CHUNK + biggestOwner, nil
+    while true do
+        local done, work = InvUI.StepLedger(job)
+        steps = steps + 1
+        if done then finalWork = work break end
+        if work > worst then worst = work end
+        ck(steps < 10000, "the sliced build did not terminate")
+        if steps >= 10000 then break end
+    end
+    ck(worst <= ceiling, "a single slice folded " .. worst .. " entries, over the "
+       .. ceiling .. " ceiling — the frame budget is not bounded")
+    ck(steps > 3, "the build finished in " .. steps
+       .. " steps — it is not actually being sliced")
+    -- The CLOSING slice is the canonical id sort and gets a frame of its own, so
+    -- no single frame pays for the fold AND the sort. Its unit is distinct rows,
+    -- which is far below the entry count.
+    ck(finalWork == #oneRows, "the closing sort slice did " .. tostring(finalWork)
+       .. " units of work, expected the " .. #oneRows .. " rows it sorts")
+    ck(finalWork * 4 < entries,
+       "the closing sort is not meaningfully smaller than the fold it follows")
+
+    -- RED CONTROL: yesterday's shape, stated and asserted to be the thing we no
+    -- longer do. If someone "simplifies" the job back into one step, this turns.
+    local redJob = InvUI.NewLedgerJob(owners, 1e9)
+    InvUI.StepLedger(redJob)                       -- phase "keys"
+    local _, redWork = InvUI.StepLedger(redJob)    -- phase "scan": ALL of it
+    ck(redWork >= entries,
+       "the red-control fixture is not exercising one-frame-does-everything")
+    ck(worst < redWork,
+       "RED CONTROL: the sliced build does as much in one step as the one-shot did "
+       .. "— the lag spike is back")
+
+    ------------------------------------------------------------------
+    -- 3. THE ASK BURST IS BOUNDED, AND VIEWPORT-FIRST.
+    ------------------------------------------------------------------
+    InvUI.ClearCaches()
+    InvUI._resetWatchState()
+    local ids = {}
+    for i = 1, #rows do ids[i] = rows[i].id end
+    ck(InvUI.QueueAsks(ids) == #ids, "the queue did not accept every cold id")
+    ck(InvUI.QueueAsks(ids) == 0, "the queue accepted the same ids twice")
+    ck(InvUI.AskQueueDepth() == #ids, "the queue depth is wrong")
+
+    -- the rows ON SCREEN jump the queue, keeping relative order inside both
+    -- halves (a stable partition, so one viewport implies one queue order)
+    local onScreen = { ids[#ids], ids[#ids - 1], ids[#ids - 2] }
+    ck(InvUI.PromoteAsks(onScreen) == 3, "the viewport rows were not promoted")
+    local drained = {}
+    local askRes = { cached = function() return false end }
+    InvUI.ResetWork()
+    local asked, left = InvUI.DrainAsks(askRes, InvUI.ASK_BUDGET)
+    ck(asked == InvUI.ASK_BUDGET, "the first drain issued " .. asked .. " asks, not "
+       .. InvUI.ASK_BUDGET)
+    ck(left == #ids - InvUI.ASK_BUDGET, "the drain did not consume exactly its budget")
+    ck(InvUI.WORK.ask == InvUI.ASK_BUDGET,
+       "the work meter disagrees with the drain (" .. InvUI.WORK.ask .. ")")
+    -- RED CONTROL: the old shape asked for EVERY cold id at once.
+    ck(asked < #ids,
+       "RED CONTROL: the first frame still asks for every cold id at once ("
+       .. asked .. " of " .. #ids .. ")")
+    ck(asked * 8 < #ids, "the ask budget is not meaningfully smaller than the flood")
+
+    -- the promoted ids were in that first budget — that is the whole point
+    InvUI.ClearCaches()
+    InvUI._resetWatchState()
+    InvUI.QueueAsks(ids)
+    InvUI.PromoteAsks({ ids[#ids] })
+    local seen = {}
+    local spyRes = { cached = function(id) seen[id] = true return true end }
+    InvUI.DrainAsks(spyRes, InvUI.ASK_BUDGET)
+    ck(seen[ids[#ids]] == true,
+       "a row the owner is LOOKING AT was not in the first ask budget")
+
+    -- draining empties the queue and then costs nothing
+    local guard = 0
+    while InvUI.AskQueueDepth() > 0 and guard < 1000 do
+        InvUI.DrainAsks(spyRes, InvUI.ASK_BUDGET); guard = guard + 1
+    end
+    ck(InvUI.AskQueueDepth() == 0, "the queue never drained")
+    ck(select(1, InvUI.DrainAsks(spyRes, InvUI.ASK_BUDGET)) == 0,
+       "draining an empty queue still issued asks")
+    ck(guard >= 2, "the whole queue went out in one drain")
+    -- a zero budget is a refusal, not an unbounded pass
+    InvUI.QueueAsks({ 1, 2, 3 })
+    ck(select(1, InvUI.DrainAsks(spyRes, 0)) == 0, "a zero budget still asked")
+    ck(InvUI.AskQueueDepth() == 3, "a zero-budget drain consumed the queue anyway")
+    InvUI.ClearAskQueue()
+    ck(InvUI.AskQueueDepth() == 0, "the queue did not clear")
+    ck(InvUI.PromoteAsks({ 1 }) == 0, "promoting into an empty queue reported work")
+
+    ------------------------------------------------------------------
+    -- 4. THE COALESCER — the ~13 seconds, as a ratio.
+    ------------------------------------------------------------------
+    -- 100 client answers inside one debounce window. THE RED CONTROL is the old
+    -- shape — one full repaint per answer, which is where the ~13 seconds lived.
+    InvUI._resetRepaint()
+    InvUI.ResetWork()
+    for _ = 1, 100 do InvUI.RequestRepaint() end
+    ck(InvUI.WORK.repaintsAsked == 100, "the repaint requests were not counted")
+    ck(InvUI.WORK.repaintsRun == 0,
+       "a repaint ran the moment it was asked for — the debounce is not arming")
+    ck(InvUI.RunRepaint() == true, "the coalesced repaint never ran at all")
+    ck(InvUI.WORK.repaintsRun == 1,
+       "RED CONTROL: 100 client answers cost " .. InvUI.WORK.repaintsRun
+       .. " repaints instead of 1 — the echo storm is back")
+    ck(InvUI.RunRepaint() == false,
+       "a clean pane repainted anyway — the dirty flag is not the gate")
+    -- and the fact generation moves ONLY when a repaint actually runs, which is
+    -- what the warm path uses to decide a re-decorate is worth doing
+    local g0 = InvUI.FactGeneration()
+    InvUI.RunRepaint()                       -- clean: nothing to do
+    ck(InvUI.FactGeneration() == g0, "a no-op repaint moved the fact generation")
+    InvUI.RequestRepaint(); InvUI.RunRepaint()
+    ck(InvUI.FactGeneration() > g0, "a real repaint did not move the fact generation")
+
+    ------------------------------------------------------------------
+    -- 5. THE LEDGER CACHE'S SIGNAL. The generation moves on the SAME store
+    --    signal Tooltips.Owners' own cache listens to, and on nothing else.
+    ------------------------------------------------------------------
+    local g = InvUI.Generation()
+    if ns.Fire then
+        ns:Fire("STORE_REFRESHED")
+        ck(InvUI.Generation() > g,
+           "STORE_REFRESHED did not invalidate the ledger cache — a stale mesh "
+           .. "would be shown as current")
+        local g2 = InvUI.Generation()
+        ns:Fire("ACCOUNT_ID_CHANGED")
+        ck(InvUI.Generation() > g2, "ACCOUNT_ID_CHANGED did not invalidate the ledger")
+        local g3 = InvUI.Generation()
+        ns:Fire("TIMER_UPDATED")
+        ck(InvUI.Generation() == g3,
+           "an unrelated event invalidated the ledger — the cache would never hold")
+    else
+        fails[#fails + 1] = "the event bus is absent; the cache-invalidation pin could not run"
+    end
+
+    ------------------------------------------------------------------
+    -- 6. THE WARM REOPEN CEILING. A second look at an unchanged store must not
+    --    re-fold the mesh. The pin is on the work METER, so it measures the
+    --    passes, not the clock.
+    ------------------------------------------------------------------
+    InvUI.ResetWork()
+    InvUI.RunLedger(owners, InvUI.BUILD_CHUNK)
+    local coldLedger = InvUI.WORK.ledger
+    ck(coldLedger >= entries, "the cold build did not fold the whole mesh")
+    InvUI.ResetWork()
+    -- A warm reopen is a filter+sort at most (and, with the view cache holding,
+    -- not even that) — never a ledger pass.
+    InvUI.FilterRows(rows, "", "")
+    InvUI.SortRows(rows, "name")
+    ck(InvUI.WORK.ledger == 0, "a warm reopen folded the ledger again")
+    ck(InvUI.WORK.filter + InvUI.WORK.sort <= 2 * #rows,
+       "a warm reopen cost more than one filter and one sort")
+    ck(InvUI.WORK.filter + InvUI.WORK.sort < coldLedger,
+       "the warm ceiling is not below the cold build's cost")
+end
+
+----------------------------------------------------------------------
+
+-- The sort key Decorate precomputes, and the progress sentence the pane says
+-- while the transpose is still running.
+local function testSliceHonesty(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+
+    -- THE SORT KEY. Set on resolve, CLEARED when a row goes cold, and never
+    -- allowed to change the ORDER — the optimisation may not move a row.
+    local rows = builtLedger()
+    for i = 1, #rows do
+        ck(rows[i].sortKey == rows[i].name:lower(),
+           "a resolved row's sortKey is not its lowercased name")
+    end
+    local keyed = InvUI.SortRows(rows, "name")
+    for i = 1, #rows do rows[i].sortKey = nil end        -- force the slow path
+    local unkeyed = InvUI.SortRows(rows, "name")
+    local a, b = {}, {}
+    for i = 1, #keyed do a[i] = keyed[i].id; b[i] = unkeyed[i].id end
+    ck(table.concat(a, ",") == table.concat(b, ","),
+       "the precomputed sort key changed the order the comparator produces")
+    -- a row that goes cold loses it, so a stale key can never outlive its name
+    InvUI.Decorate(rows, coldResolver())
+    for i = 1, #rows do
+        if not rows[i].resolved then
+            ck(rows[i].sortKey == nil,
+               "a cold row kept a sort key derived from a name it can no longer prove")
+        end
+    end
+    -- SortRows is still PURE: it may not write the key back onto the rows
+    InvUI.Decorate(rows, warmResolver())
+    for i = 1, #rows do rows[i].sortKey = nil end
+    InvUI.SortRows(rows, "name")
+    local wrote = false
+    for i = 1, #rows do if rows[i].sortKey ~= nil then wrote = true end end
+    ck(not wrote, "SortRows memoised onto its input — it is documented pure")
+
+    -- THE PROGRESS LINE. It counts CHARACTERS and prints NO totals: a partial
+    -- transpose understates every sum, and a number still moving is not a total.
+    local p = InvUI.ProgressText(12, 40)
+    ck(p == "indexing 12 of 40 characters" .. InvUI.GLYPHS.dots,
+       "the progress line is wrong: " .. tostring(p))
+    ck(InvUI.ProgressText(1, 1) == "indexing 1 of 1 character" .. InvUI.GLYPHS.dots,
+       "the progress line did not singularise one character")
+    ck(InvUI.ProgressText(2000, 4000):find("2,000 of 4,000", 1, true),
+       "the progress line does not group its thousands")
+    ck(InvUI.ProgressText(0, 0) == nil, "a job with no characters printed a progress line")
+    ck(InvUI.ProgressText(99, 40):find("40 of 40", 1, true),
+       "the progress line ran past its own total")
+    for _, txt in ipairs({ InvUI.ProgressText(1, 4) }) do
+        ck(txt:find("item", 1, true) == nil and txt:find("total", 1, true) == nil,
+           "the progress line quotes counts it cannot yet stand behind: " .. txt)
+    end
+
+    -- LedgerProgress tracks it, and lands exactly on the total when done.
+    local owners = bigOwners(6, 101, 60)
+    local job = InvUI.NewLedgerJob(owners, 40)
+    local d0, t0 = InvUI.LedgerProgress(job)
+    ck(d0 == 0 and t0 == 0, "a job reported progress before it had a roster")
+    InvUI.StepLedger(job)                                -- the "keys" phase
+    local _, t1 = InvUI.LedgerProgress(job)
+    ck(t1 == 6, "the job did not learn its character count: " .. t1)
+    local guard = 0
+    while not InvUI.StepLedger(job) and guard < 1000 do
+        local d, t = InvUI.LedgerProgress(job)
+        ck(d >= 0 and d <= t, "progress left its own bounds (" .. d .. " of " .. t .. ")")
+        guard = guard + 1
+    end
+    local dEnd, tEnd = InvUI.LedgerProgress(job)
+    ck(dEnd == tEnd and tEnd == 6, "a finished job did not report itself finished")
+    ck(job.done == true, "the job did not mark itself done")
+    ck(select(2, InvUI.StepLedger(job)) == 0, "stepping a finished job did more work")
+
+    -- "INDEXING" OUTRANKS "EMPTY". A partial ledger with nothing in it yet is
+    -- not an empty one, and must not read as "No item counts yet".
+    local indexingText = InvUI.StatusText({ matched = 0, ledgerEmpty = true,
+                                            indexing = "indexing 3 of 40 characters" })
+    ck(indexingText == "indexing 3 of 40 characters",
+       "an indexing pane claimed to be empty: " .. tostring(indexingText))
+    ck(select(1, InvUI.StatusText({ matched = 0, indexing = true })):find("indexing", 1, true),
+       "an indexing pane with no progress string said nothing about it")
+    -- ...but the module being OFF still outranks indexing (there is nothing to index)
+    ck(select(1, InvUI.StatusText({ matched = 0, indexing = "x", moduleOff = true }))
+       == InvUI.EmptyText({ moduleOff = true }),
+       "a switched-off module claimed to be indexing")
+    -- and with the build finished, the honest empty page comes back
+    ck(select(1, InvUI.StatusText({ matched = 0, ledgerEmpty = true }))
+       == InvUI.EmptyText({ ledgerEmpty = true }),
+       "the empty-ledger page was lost to the indexing branch")
+
+    -- A JOB OVER A JUNK GRAPH admits exactly what BuildLedger admits.
+    local junk = {
+        ["A-R"] = { itemCounts = { [0] = 5, [-3] = 2, [10] = 0, [11] = -1,
+                                   ["x"] = 9, [12] = 7 } },
+        ["B-R"] = { itemCounts = "not a table" },
+        ["C-R"] = "not a table",
+        [7]     = { itemCounts = { [12] = 1 } },
+    }
+    local jr, js = InvUI.RunLedger(junk, 2)
+    ck(#jr == 1 and jr[1].id == 12 and jr[1].total == 7,
+       "the sliced ledger admitted junk the one-shot rejects (" .. #jr .. " rows)")
+    -- "C-R" holds a non-table and the numeric key 7 is not a string: both are
+    -- refused, exactly as BuildLedger refuses them.
+    ck(js.chars == 2, "the sliced ledger's character count admitted junk keys ("
+       .. js.chars .. ")")
+    ck(js.chars == select(2, InvUI.BuildLedger(junk)).chars,
+       "the sliced and one-shot ledgers disagree about who counts as a character")
+    ck(#InvUI.RunLedger(nil) == 0, "a nil graph did not answer an empty sliced ledger")
+    ck(select(1, InvUI.StepLedger(nil)) == true, "a nil job was not a no-op")
+end
+
+----------------------------------------------------------------------
 
 -- The glyph registry: only sequences PROVEN to render, and no drift from the
 -- professions copy of the same table when that file is present.
@@ -2384,6 +3309,13 @@ if ns.RegisterSelfTest then
               fn = testTabRegistrationAndInertness },
             { name = "glyph registry + ask ladder bounds",
               fn = testGlyphs },
+            { name = "first-open budget (sliced ledger == one-shot, per-slice "
+                  .. "ceiling, bounded viewport-first asks, coalesced repaints, "
+                  .. "cache invalidation, warm ceiling, RED CONTROLS)",
+              fn = testFirstOpenBudget },
+            { name = "slice honesty (precomputed sort key cannot move a row, "
+                  .. "progress line quotes no totals, indexing outranks empty)",
+              fn = testSliceHonesty },
         }
         local allPass = true
         for _, suite in ipairs(suites) do

@@ -188,7 +188,18 @@ local L = {
     DGAVEL       = 22,  -- the gavel button's edge (Raid Prep's ICONBTN)
     DGAVEL_INSET = 2,   -- glyph inset inside the button => 18x18 drawn
 
-    CD_LABEL_W  = 170,  -- the cooldown kind's name column
+    -- The cooldown KIND row: [icon] name · the characters ready to craft it.
+    -- The icon column is the owner's 2026-08-11 directive ("item icons next to
+    -- the name of the CD"); these are read ONLY through ProfUI.CdRowColumns, so
+    -- the icon, the name and the ready list share one x/width source and cannot
+    -- drift or overrun the pane at any width (the grid's overflow lesson).
+    CD_ICON_X   = 2,    -- the icon's left inset
+    CD_ICON_W   = 16,   -- the icon's edge (inside a 20px row)
+    CD_LABEL_GAP = 5,   -- icon -> name
+    CD_LABEL_W  = 170,  -- the cooldown kind's name column (natural width)
+    CD_WHO_GAP  = 6,    -- name -> the ready list
+    CD_WHO_PAD  = 2,    -- the ready list -> the row's right edge
+    CD_WHO_MIN  = 40,   -- the ready list never shrinks past legibility
 
     LIST_ROW_H  = 20,   -- recipe / cooldown / search rows
     FILTER_H    = 24,   -- one filter row in the detail pane (there are two)
@@ -316,6 +327,47 @@ end
 -- skill requirement, and the source kind wearing the remainder. ONE reader for
 -- the rows AND the header band — they cannot disagree.
 -- Returns { mark = {x,w}, title = {x,w}, skill = {x,w}, src = {x,w} }.
+-- PURE. The cooldown KIND row's column band, from the width ACTUALLY available
+-- at render time: [icon][name][the characters ready].
+--
+-- This is InvUI.RowColumns' proven arithmetic, restated for three columns: at or
+-- below the natural sum every column AND gap shrinks by the same factor and
+-- FLOORS, so the accumulated right edge can only fall short of availW, never
+-- pass it — at ANY width, including zero and negative. Above the natural sum the
+-- whole surplus goes to the READY LIST, which is the column that actually grows
+-- (more characters, longer list); the icon and the name have one right size.
+--
+-- Returns { icon={x,w}, label={x,w}, who={x,w}, width=<right edge>, scale }.
+function ProfUI.CdRowColumns(availW)
+    availW = tonumber(availW) or 0
+    if availW < 0 then availW = 0 end
+    local gaps    = L.CD_ICON_X + L.CD_LABEL_GAP + L.CD_WHO_GAP + L.CD_WHO_PAD
+    local natural = L.CD_ICON_W + L.CD_LABEL_W + L.CD_WHO_MIN
+    local full    = natural + gaps
+
+    local scale, grow = 1, 0
+    if availW < full then
+        scale = (availW > 0) and (availW / full) or 0
+    else
+        grow = availW - full
+    end
+    local function dim(n)
+        local v = math.floor(n * scale)
+        if v < 0 then v = 0 end
+        return v
+    end
+
+    local x = dim(L.CD_ICON_X)
+    local icon = { x = x, w = dim(L.CD_ICON_W) }
+    x = x + icon.w + dim(L.CD_LABEL_GAP)
+    local label = { x = x, w = dim(L.CD_LABEL_W) }
+    x = x + label.w + dim(L.CD_WHO_GAP)
+    local who = { x = x, w = dim(L.CD_WHO_MIN) + grow }
+    x = x + who.w
+
+    return { icon = icon, label = label, who = who, width = x, scale = scale }
+end
+
 function ProfUI.RecipeColumns(availW)
     availW = tonumber(availW) or 0
     local titleW = math.floor(availW * L.REC_TITLE_FRAC)
@@ -742,6 +794,11 @@ function ProfUI.LiveResolver()
             if type(n) == "string" and n ~= "" then _itemName[id] = n; return n end
             return nil
         end,
+        -- ICONS. Both are SYNCHRONOUS client reads (see ProfUI.ItemIcon), so
+        -- unlike the name seams above they normally answer on the first paint;
+        -- they still route through the resolver so the pane is drivable headless.
+        itemIcon  = function(id) return ProfUI.ItemIcon(id)  end,
+        spellIcon = function(id) return ProfUI.SpellIcon(id) end,
     }
 end
 
@@ -931,17 +988,141 @@ function ProfUI.CdKeyMeta(cdKey)
     return nil, spell, nil
 end
 
+----------------------------------------------------------------------
+-- COOLDOWNS ARE TRACKED BY ITEM  (owner, verbatim, 2026-08-11)
+--
+--   "For profession cooldowns, I want the cooldowns to be tracked by item. so
+--    for alchemy just call it 'Transmute'. I also want item icons next to the
+--    name of the CD. For transmute put the arcanite bar icon."
+--
+-- Before this, a MULTI-MEMBER group could not name itself after any one member
+-- (twelve transmutes, one timer — naming it "Transmute: Arcanite" would be
+-- eleven wrong answers), so it fell back to "Alchemy · shared cooldown". The
+-- owner's answer is better than the compromise: the FAMILY has a short name, and
+-- "Transmute" is it. That is a naming judgement about a real-world recipe
+-- family, not something the dataset can derive — so it is an EXPLICIT,
+-- OWNER-DIRECTED MAPPING, and it lives in exactly one table.
+--
+-- KIND_DISPLAY is keyed by cdKey and may carry:
+--   name = the short, item-style label this kind wears
+--   item = an ITEM id whose icon represents the kind
+-- Anything absent falls through to the data-driven rules below, so a future
+-- cooldown group needs an entry here ONLY if the owner wants to name it; it gets
+-- an icon and a name for free either way.
+--
+-- THE ICON RULES, in order:
+--   1 a KIND_DISPLAY `item` -> that item's icon, read synchronously (see
+--     ProfUI.ItemIcon: C_Item.GetItemIconByID is catalog-present on 11509 and
+--     answers from the client's static item record, so it does NOT depend on the
+--     async GetItemInfo cache being warm);
+--   2 otherwise the kind's TEACHING SPELL texture (GetSpellTexture, also
+--     catalog-present) — data-driven, so every solo kind the next fact pass
+--     marks gets an icon with no edit here. A multi-member group with no
+--     directive uses its FIRST member by sorted id, which is a total order;
+--   3 nothing answered -> nil, and the pane draws the neutral question mark and
+--     heals on GET_ITEM_INFO_RECEIVED, exactly as a cold recipe row does.
+----------------------------------------------------------------------
+
+-- The Arcanite Bar. The owner named this icon for the transmute family; the id
+-- lives here rather than inline so the directive and the number are one thing.
+ProfUI.ARCANITE_BAR = 12360
+
+ProfUI.KIND_DISPLAY = {
+    -- g1 = alchemy's transmute family (twelve recipes, one timer).
+    ["g1"] = { name = "Transmute", item = ProfUI.ARCANITE_BAR },
+    -- g2 (Mooncloth) is deliberately ABSENT: a group of one already wears its
+    -- own recipe name, which is the item-style short name the owner asked for,
+    -- and its icon derives from its teaching spell. Adding an entry would be
+    -- restating what the data already says.
+}
+
+-- The kind's display record, or nil. One reader so the label and the icon can
+-- never disagree about which kind they are describing.
+function ProfUI.KindDisplay(cdKey)
+    local d = ProfUI.KIND_DISPLAY[tostring(cdKey or "")]
+    return d
+end
+
+-- The item icon for an item id, SYNCHRONOUSLY. C_Item.GetItemIconByID is
+-- catalog-present for interface 11509 and reads the client's static item record,
+-- so unlike GetItemInfo it is not gated on a warm item cache — a fresh login
+-- still gets the Arcanite Bar's icon on the first paint.
+-- GetItemInfoInstant (5th return) is the same class of answer and is the
+-- fallback; the bare GetItemIcon global is a DIFFERENT function (an inventory
+-- slot's icon) and is deliberately not consulted.
+-- Returns a texture, or nil for "the client did not answer" — never a guess.
+function ProfUI.ItemIcon(itemID)
+    local id = tonumber(itemID)
+    if not id then return nil end
+    if C_Item and C_Item.GetItemIconByID then
+        local ok, tex = pcall(C_Item.GetItemIconByID, id)
+        if ok and tex and tex ~= "" then return tex end
+    end
+    local instant = (C_Item and C_Item.GetItemInfoInstant) or GetItemInfoInstant
+    if instant then
+        local ok, _iid, _ty, _sub, _eq, tex = pcall(instant, id)
+        if ok and tex and tex ~= "" then return tex end
+    end
+    return nil
+end
+
+-- The teaching spell's texture. Also catalog-present both ways on 11509.
+function ProfUI.SpellIcon(spellID)
+    local id = tonumber(spellID)
+    if not id then return nil end
+    if C_Spell and C_Spell.GetSpellTexture then
+        local ok, tex = pcall(C_Spell.GetSpellTexture, id)
+        if ok and tex and tex ~= "" then return tex end
+    end
+    if GetSpellTexture then
+        local ok, tex = pcall(GetSpellTexture, id)
+        if ok and tex and tex ~= "" then return tex end
+    end
+    return nil
+end
+
+-- Returns texture, pending. Everything goes through `res` so the whole chain is
+-- drivable headless (the file's standing idiom); res.itemIcon / res.spellIcon are
+-- ProfUI.ItemIcon / ProfUI.SpellIcon on the live resolver.
+--
+-- pending=true means "the client has not answered YET" — the pane shows the
+-- neutral icon and heals in place, and never invents a texture.
+function ProfUI.CooldownIcon(cdKey, res)
+    local key = tostring(cdKey or "")
+    local d = ProfUI.KindDisplay(key)
+    if d and d.item then
+        local f = res and res.itemIcon
+        local tex = f and f(d.item) or nil
+        if tex then return tex, false end
+        return nil, true
+    end
+    -- Data-driven: the kind's own teaching spell. A group's first member by
+    -- sorted id (KindMembers is sorted — class 8), so the choice is total.
+    local members = ProfUI.KindMembers(key)
+    local spell = members[1]
+    if not spell then return nil, false end        -- a garbage key is not pending
+    local f = res and res.spellIcon
+    local tex = f and f(spell) or nil
+    if tex then return tex, false end
+    return nil, true
+end
+
 -- Returns label, pending. pending=true means a teaching-spell name has not been
 -- answered yet — held, never replaced with a guess.
 --
--- A SOLO group (FIX-5: one member, e.g. Mooncloth's "g2") wears the member's
--- own recipe name, resolved live from its teaching spell exactly as a bare
--- spell key is. The "shared cooldown" wording exists because naming a
--- twelve-member row after one member is eleven lies; with one member there is
--- nothing to lie about, and "Tailoring · shared cooldown" would itself be the
--- wrong answer. The route is the MEMBER COUNT, never a hardcoded ordinal, so
--- the next fact pass needs no edit here.
+-- THE ROUTE, in order:
+--   * an OWNER-DIRECTED short name (KIND_DISPLAY.name) wins and is never cold —
+--     it is our own string, not something the client has to answer for;
+--   * a SOLO group (FIX-5: one member, e.g. Mooncloth's "g2") wears the
+--     member's own recipe name, resolved live from its teaching spell exactly
+--     as a bare spell key is. With one member there is nothing to lie about;
+--   * a multi-member group with NO directive keeps the honest fallback,
+--     "<Profession> · shared cooldown": naming a twelve-member row after one
+--     member is eleven lies, and we will not pick one. The route is the MEMBER
+--     COUNT, never a hardcoded ordinal, so the next fact pass needs no edit.
 function ProfUI.CooldownLabel(cdKey, res)
+    local d = ProfUI.KindDisplay(cdKey)
+    if d and d.name then return d.name, false end
     local profKey, spell, group = ProfUI.CdKeyMeta(cdKey)
     if group then
         local members = ProfUI.KindMembers(cdKey)
@@ -1722,8 +1903,13 @@ function ProfUI.CooldownKindRows(entries, lookup, nowE, res)
         if not k then
             local profKey = ProfUI.CdKeyMeta(key)
             local label, pending = ProfUI.CooldownLabel(key, res)
+            -- The icon rides on the row beside the name (owner: "item icons next
+            -- to the name of the CD"). `iconPending` is its own certainty — a
+            -- kind can have its name and still be waiting for its texture.
+            local icon, iconPending = ProfUI.CooldownIcon(key, res)
             k = { cdKey = key, profKey = profKey, label = label,
                   pending = pending and true or false,
+                  icon = icon, iconPending = iconPending and true or false,
                   owners = 0, ready = {} }
             kinds[key] = k
             order[#order + 1] = k
@@ -3983,18 +4169,37 @@ local function paintRecipeRow(rr, row, selected)
     if selected then rr._title:SetTextColor(UI.Color("accent")) end
 end
 
--- ── the cooldown KIND row (name · the characters ready to craft it) ─────────
+-- ── the cooldown KIND row ([icon] name · the characters ready to craft it) ──
+-- NOTHING here bakes an x-position: every render calls cdFitRow with
+-- ProfUI.CdRowColumns, so a cell can never outrun the pane that produced it.
+local CD_NEUTRAL_ICON = "Interface/Icons/INV_Misc_QuestionMark"
+
 local function makeCdRow(cdParent)
     local kr = CreateFrame("Frame", nil, cdParent)
     kr:SetSize(1, L.LIST_ROW_H)
+    local krIcon = kr:CreateTexture(nil, "ARTWORK")
+    krIcon:SetPoint("LEFT", kr, "LEFT", L.CD_ICON_X, 0)
+    krIcon:SetSize(L.CD_ICON_W, L.CD_ICON_W)
+    krIcon:SetTexCoord(0.07, 0.93, 0.07, 0.93)   -- trim the stock icon border
     local krWhat = fstr(kr, "body", "LEFT")
     krWhat:SetPoint("LEFT", kr, "LEFT", 2, 0)
     krWhat:SetWidth(L.CD_LABEL_W)
     local krWho = fstr(kr, "small", "LEFT")
-    krWho:SetPoint("LEFT", krWhat, "RIGHT", 6, 0)
-    krWho:SetPoint("RIGHT", kr, "RIGHT", -2, 0)
-    kr._what, kr._who = krWhat, krWho
+    krWho:SetPoint("LEFT", kr, "LEFT", 2, 0)
+    krWho:SetWidth(1)
+    kr._icon, kr._what, kr._who = krIcon, krWhat, krWho
     return kr
+end
+
+-- Re-fit one pooled cooldown row to THIS render's column geometry.
+local function cdFitRow(kr, cols)
+    kr._icon:SetPoint("LEFT", kr, "LEFT", cols.icon.x, 0)
+    kr._icon:SetSize(math.max(1, cols.icon.w), math.max(1, cols.icon.w))
+    kr._icon:SetShown(cols.icon.w > 0)
+    kr._what:SetPoint("LEFT", kr, "LEFT", cols.label.x, 0)
+    kr._what:SetWidth(math.max(1, cols.label.w))
+    kr._who:SetPoint("LEFT", kr, "LEFT", cols.who.x, 0)
+    kr._who:SetWidth(math.max(1, cols.who.w))
 end
 
 -- ── the search result block ──────────────────────────────────────────────────
@@ -4860,16 +5065,35 @@ Dashboard.RegisterTab("professions", function(host)
         for i = 1, #rows do ready = ready + #rows[i].ready end
         cdCount:SetText(ready > 0 and (ready .. " ready") or "")
         cdCount:SetTextColor(UI.Color(ready > 0 and "ok" or "muted"))
-        cdChild:SetWidth(math.max(1, cdScroll:GetWidth() or 1))
+        local cdW = math.max(1, cdScroll:GetWidth() or 1)
+        cdChild:SetWidth(cdW)
+        local cdCols = ProfUI.CdRowColumns(cdW)
         for _, r in ipairs(pane._cdRows) do r:Hide() end
-        local pendingIDs, y = {}, 0
+        local pendingIDs, iconItems, y = {}, {}, 0
         for i = 1, #rows do
             local row = rows[i]
             if row.pending then pendingIDs[#pendingIDs + 1] = tonumber(row.cdKey) end
+            -- A cold ICON is its own pending fact: the name can be here while the
+            -- texture is not. An item-backed kind asks for the item's data; a
+            -- spell-backed one asks about its teaching spell.
+            if row.iconPending then
+                local d = ProfUI.KindDisplay(row.cdKey)
+                if d and d.item then
+                    iconItems[#iconItems + 1] = d.item
+                else
+                    local m = ProfUI.KindMembers(row.cdKey)
+                    if m[1] then pendingIDs[#pendingIDs + 1] = m[1] end
+                end
+            end
             local kr = getCdRow(i)
             kr:ClearAllPoints()
             kr:SetPoint("TOPLEFT", cdChild, "TOPLEFT", 0, -y)
             kr:SetPoint("RIGHT", cdChild, "RIGHT", 0, 0)
+            cdFitRow(kr, cdCols)
+            -- The owner's icon, or the honest neutral one desaturated while the
+            -- client has not answered — the inventory tab's cold-row idiom.
+            kr._icon:SetTexture(row.icon or CD_NEUTRAL_ICON)
+            kr._icon:SetDesaturated(row.icon == nil)
             kr._what:SetText(row.label or "\226\128\166")
             kr._what:SetTextColor(UI.Color("text"))
             if #row.ready > 0 then
@@ -4893,6 +5117,7 @@ Dashboard.RegisterTab("professions", function(host)
         cdChild:SetHeight(math.max(y, 1))
         pane._cdEmpty:SetShown(#rows == 0)
         notePending("spell", pendingIDs)
+        notePending("item", iconItems)
     end
 
     -- Show/hide the detail pane's working furniture in one motion (the empty
@@ -5573,10 +5798,18 @@ local function testRollup(fails)
        "the rollup did not order the running cooldowns soonest-first")
     ck(ProfUI.ReadyCount(rows) == 1, "the ready count is wrong")
 
-    -- A group key never wears a member's name.
-    local label = ProfUI.CooldownLabel("g1")
-    ck(type(label) == "string" and label:find("shared", 1, true) ~= nil,
-       "a shared-cooldown group did not label itself as shared")
+    -- A group key never wears a MEMBER's name — but it does wear the owner's
+    -- short family name (2026-08-11: "for alchemy just call it 'Transmute'").
+    -- The name is OURS, so it can never be cold.
+    local label, labelPending = ProfUI.CooldownLabel("g1")
+    ck(label == "Transmute" and labelPending == false,
+       "the transmute group did not wear the owner's short name (got "
+       .. tostring(label) .. ")")
+    local members = ProfUI.KindMembers("g1")
+    for i = 1, #members do
+        local mn = (core() and core().recipe[members[i]]) and members[i] or nil
+        ck(label ~= tostring(mn), "the group wore a single member's identity")
+    end
     -- A spell the resolver has not answered for is PENDING, not "unknown recipe".
     local _, pending = ProfUI.CooldownLabel("12345", fakeResolver({}))
     ck(pending == true, "a cold recipe name was not reported pending")
@@ -7879,6 +8112,207 @@ local function testKindOwnership(fails)
     end
 end
 
+-- ── COOLDOWNS TRACKED BY ITEM: short names + icons (owner, 2026-08-11) ──────
+--
+--   "For profession cooldowns, I want the cooldowns to be tracked by item. so
+--    for alchemy just call it 'Transmute'. I also want item icons next to the
+--    name of the CD. For transmute put the arcanite bar icon."
+--
+-- Three things have to hold at once: the DIRECTED pair (g1 -> "Transmute" +
+-- the Arcanite Bar icon), the DATA-DRIVEN fallback (a solo kind keeps its own
+-- recipe name and derives its icon from its teaching spell, so a future fact
+-- pass gets both for free), and the HONEST fallback for a kind nothing can
+-- answer for.
+local function testCooldownDisplay(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local D = core()
+    if not D then fails[#fails + 1] = "dataset unavailable for the cooldown-display tests" return end
+    local NOW = 1700000000
+    local MOONCLOTH = 18560
+
+    -- A resolver that answers icons for a named set and stays cold for the rest,
+    -- so every cold leg is exercised without touching the client.
+    local function iconRes(items, spells, names)
+        return {
+            spell     = function(id) return (names or {})[id] end,
+            item      = function() return nil end,
+            itemIcon  = function(id) return (items or {})[id] end,
+            spellIcon = function(id) return (spells or {})[id] end,
+        }
+    end
+
+    -- (a) THE DIRECTIVE, in one table. The mapping is explicit and the id is the
+    -- Arcanite Bar's, not a lookalike.
+    ck(ProfUI.ARCANITE_BAR == 12360,
+       "the Arcanite Bar item id drifted (" .. tostring(ProfUI.ARCANITE_BAR) .. ")")
+    local d = ProfUI.KindDisplay("g1")
+    ck(d ~= nil and d.name == "Transmute" and d.item == 12360,
+       "the g1 display directive is not Transmute + the Arcanite Bar")
+    ck(ProfUI.KindDisplay("g2") == nil,
+       "g2 acquired a directive — a group of one already names itself")
+    ck(ProfUI.KindDisplay("nonsense") == nil, "an unknown kind found a directive")
+
+    -- (b) THE NAME. g1 is the owner's short name and is NEVER pending: it is our
+    -- own string, so no client answer can withhold it — not even on a cold
+    -- resolver, which is the exact moment the pane used to show an ellipsis.
+    local n1, p1 = ProfUI.CooldownLabel("g1", iconRes())
+    ck(n1 == "Transmute" and p1 == false, "g1 is not 'Transmute': " .. tostring(n1))
+    ck(select(1, ProfUI.CooldownLabel("g1", nil)) == "Transmute",
+       "g1's name needed a resolver at all")
+    ck(select(1, ProfUI.CooldownLabel("g1")):find("shared", 1, true) == nil,
+       "the retired 'shared cooldown' wording is still reachable for g1")
+
+    -- g2 keeps the data-driven route: its own recipe name, cold when cold.
+    local n2, p2 = ProfUI.CooldownLabel("g2", iconRes(nil, nil, { [MOONCLOTH] = "Mooncloth" }))
+    ck(n2 == "Mooncloth" and p2 == false, "g2 lost its own recipe name: " .. tostring(n2))
+    ck(select(2, ProfUI.CooldownLabel("g2", iconRes())) == true,
+       "a cold solo-kind name stopped being pending")
+
+    -- (c) THE ICON, directed. g1 reads the ITEM icon, and pending is honest.
+    local i1, ip1 = ProfUI.CooldownIcon("g1", iconRes({ [12360] = "tex/arcanite" }))
+    ck(i1 == "tex/arcanite" and ip1 == false,
+       "g1 did not take the Arcanite Bar icon: " .. tostring(i1))
+    local i1c, ip1c = ProfUI.CooldownIcon("g1", iconRes())
+    ck(i1c == nil and ip1c == true,
+       "a cold item icon was invented rather than held pending")
+    -- ...and it asks the ITEM seam, never the spell one: a spell texture must
+    -- not be able to stand in for the owner's chosen item icon.
+    local wrong = ProfUI.CooldownIcon("g1", iconRes(nil, { [17187] = "tex/spell" }))
+    ck(wrong == nil, "g1 fell through to a spell texture instead of its item icon")
+
+    -- (d) THE ICON, data-driven. A solo kind derives from its TEACHING SPELL, so
+    -- the next fact pass gets an icon with no edit to KIND_DISPLAY.
+    local i2, ip2 = ProfUI.CooldownIcon("g2", iconRes(nil, { [MOONCLOTH] = "tex/moon" }))
+    ck(i2 == "tex/moon" and ip2 == false,
+       "the solo kind did not derive its icon from its teaching spell: " .. tostring(i2))
+    ck(select(2, ProfUI.CooldownIcon("g2", iconRes())) == true,
+       "a cold spell texture was not held pending")
+    -- a bare spell key routes the same way (one rule, both spellings)
+    ck(ProfUI.CooldownIcon("777", iconRes(nil, { [777] = "tex/solo" })) == "tex/solo",
+       "a bare-spell kind did not derive its icon from itself")
+    -- a multi-member group with NO directive uses its first member by sorted id
+    local m1 = ProfUI.KindMembers("g1")[1]
+    ProfUI.KIND_DISPLAY["g1"] = nil                      -- temporarily undirected
+    local iu = ProfUI.CooldownIcon("g1", iconRes(nil, { [m1] = "tex/first" }))
+    ProfUI.KIND_DISPLAY["g1"] = { name = "Transmute", item = ProfUI.ARCANITE_BAR }
+    ck(iu == "tex/first",
+       "an undirected group did not fall back to its first member's spell texture")
+    ck(ProfUI.KindDisplay("g1").name == "Transmute", "the directive was not restored")
+
+    -- (e) HONEST FALLBACK. A kind with no members at all is not pending — there
+    -- is nothing to wait FOR, and claiming otherwise would leave a spinner up
+    -- forever (the ladder lesson).
+    local ig, ipg = ProfUI.CooldownIcon("garbage", iconRes())
+    ck(ig == nil and ipg == false,
+       "a memberless kind claimed to be waiting for an icon that cannot exist")
+    ck(ProfUI.CooldownLabel("garbage") == "profession cooldown",
+       "a memberless kind lost its honest fallback label")
+
+    -- (f) THE PANE'S ROW MODEL carries both, per kind.
+    local P = ns.Professions
+    local DSV = (D.Version and D.Version()) or ns.ProfessionsDataMeta.version
+    local trans = ProfUI.KindMembers("g1")[1]
+    local pay = {
+        ["Aaa-Realm"] = { v = 1, ds = DSV,
+            p = { alchemy = { l = 300, m = 300, t = 4,
+                              k = P.EncodeKnown("alchemy", { trans }), n = 1, a = NOW - 50 } },
+            c = {} },
+        ["Bbb-Realm"] = { v = 1, ds = DSV,
+            p = { tailoring = { l = 300, m = 300, t = 4,
+                                k = P.EncodeKnown("tailoring", { MOONCLOTH }), n = 1, a = NOW - 50 } },
+            c = {} },
+    }
+    local res = iconRes({ [12360] = "tex/arcanite" }, { [MOONCLOTH] = "tex/moon" },
+                        { [MOONCLOTH] = "Mooncloth" })
+    local rows = ProfUI.CooldownKindRows(fixtureEntries(), function(k) return pay[k] end,
+                                         NOW, res)
+    local g1row, g2row
+    for _, r in ipairs(rows) do
+        if r.cdKey == "g1" then g1row = r elseif r.cdKey == "g2" then g2row = r end
+    end
+    ck(g1row and g1row.label == "Transmute" and g1row.icon == "tex/arcanite",
+       "the transmute row does not carry the owner's name+icon pair")
+    ck(g1row and g1row.pending == false and g1row.iconPending == false,
+       "the transmute row claims to be waiting for something")
+    ck(g2row and g2row.label == "Mooncloth" and g2row.icon == "tex/moon",
+       "the Mooncloth row lost its name or its derived icon")
+    -- ORDER: the pane reads alphabetically by LABEL, so the short names re-sort
+    -- the pane and that is deliberate, not an accident of the key.
+    ck(rows[1].label <= rows[2].label, "the kind rows are not in label order")
+    -- COLD: both icons absent, and the row says so rather than picking one.
+    local coldRows = ProfUI.CooldownKindRows(fixtureEntries(), function(k) return pay[k] end,
+                                             NOW, iconRes())
+    for _, r in ipairs(coldRows) do
+        ck(r.icon == nil, "a cold row invented an icon")
+        ck(r.iconPending == true, "a cold icon was not reported pending")
+    end
+
+    -- (g) THE ROLLUP SPEAKS THE SAME VOCABULARY. RollupRows shares CooldownLabel,
+    -- so the short name reaches it for free — the badge and the pane can never
+    -- call one timer two things.
+    local stamped = { ["Aaa-Realm"] = { p = {}, c = { ["g1"] = NOW - 5 } } }
+    local roll = ProfUI.RollupRows(fixtureEntries(), function(k) return stamped[k] end,
+                                   NOW, res)
+    ck(#roll == 1 and roll[1].label == "Transmute",
+       "the rollup did not adopt the short name: " .. tostring(roll[1] and roll[1].label))
+    -- The BADGE counts instances and renders no names at all, so it is unaffected
+    -- by the rename — asserted, not assumed.
+    ck(ProfUI.ReadyCount(roll) == 1, "the badge count moved with the rename")
+    -- The LOGIN LINE deliberately keeps naming the PROFESSION, not the kind: a
+    -- character can have several kinds ready and the line prints ONE clause per
+    -- character, so a kind name there would be a claim it has not computed.
+    -- (Its own doc block gives the other reason — a profession name is never
+    -- cold.) Pinned so a future pass makes that choice on purpose.
+    local line = ProfUI.LoginLine(roll)
+    ck(type(line) == "string" and line:find("Alchemy", 1, true) ~= nil,
+       "the login line stopped naming the profession: " .. tostring(line))
+    ck(line:find("Transmute", 1, true) == nil,
+       "the login line adopted the kind name — see the note above before changing this")
+end
+
+-- ── THE COOLDOWN ROW BAND fits its pane at every width ──────────────────────
+local function testCdRowGeometry(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    -- MULTI-WIDTH FIT: seven widths rather than one pinned number, so the band
+    -- is proven never to overrun rather than proven at one size.
+    for _, w in ipairs({ 60, 120, 200, 320, 480, 700, 1200 }) do
+        local c = ProfUI.CdRowColumns(w)
+        local at = "@" .. w .. "px"
+        ck(c.width <= w, "the cooldown band overruns the pane " .. at
+           .. " (" .. c.width .. " > " .. w .. ")")
+        ck(c.icon.x + c.icon.w <= c.label.x, "the icon overlaps the name " .. at)
+        ck(c.label.x + c.label.w <= c.who.x, "the name overlaps the ready list " .. at)
+        ck(c.icon.w >= 0 and c.label.w >= 0 and c.who.w >= 0,
+           "a negative cooldown column width " .. at)
+        ck(c.who.x + c.who.w == c.width,
+           "the band width is not the ready list's right edge " .. at)
+    end
+    -- Above the natural sum the READY LIST takes the whole surplus; the icon and
+    -- the name have one right size and keep it.
+    local natural = ProfUI.CdRowColumns(1e9).width
+    local wide, tight = ProfUI.CdRowColumns(1200), ProfUI.CdRowColumns(120)
+    ck(wide.scale == 1, "a pane wider than natural still shrank the columns")
+    ck(wide.label.w == L.CD_LABEL_W, "a wide pane resized the name column")
+    ck(wide.icon.w == L.CD_ICON_W, "a wide pane resized the icon column")
+    ck(wide.who.w > L.CD_WHO_MIN, "the ready list did not take the surplus width")
+    ck(wide.width == 1200 - L.CD_WHO_PAD,
+       "surplus width was not absorbed: " .. wide.width .. " of 1200")
+    -- Below it everything shrinks together and the band still fits.
+    ck(tight.scale < 1, "a pane narrower than natural did not shrink")
+    ck(tight.label.w < L.CD_LABEL_W, "the name column did not yield in a narrow pane")
+    ck(tight.width <= 120, "the shrunk cooldown band still overruns")
+    ck(natural > 0 and ProfUI.CdRowColumns(natural).scale == 1,
+       "the natural width is not the point the columns stop shrinking")
+    -- The icon fits inside the row that holds it.
+    ck(wide.icon.w <= L.LIST_ROW_H, "the icon is taller than the row that holds it")
+    -- Degenerate widths answer something drawable rather than throwing.
+    for _, w in ipairs({ 0, -40, 10 }) do
+        local c = ProfUI.CdRowColumns(w)
+        ck(c.width <= math.max(0, w),
+           "a degenerate width produced a " .. c.width .. "px cooldown band")
+    end
+end
+
 -- ── DELEGATE DESIGNATIONS (profession-delegates phase 1) ─────────────────────
 local function testDelegates(fails)
     local function ck(cond, msg) if not cond then fails[#fails + 1] = msg end end
@@ -8211,6 +8645,13 @@ if ns.RegisterSelfTest then
                   .. "absence, mid-cooldown silence, unscanned silence, solo/"
                   .. "group key mapping, determinism)",
               fn = testKindOwnership },
+            { name = "cooldown display (g1 -> Transmute + Arcanite Bar icon, solo "
+                  .. "kinds keep their recipe name + derive a spell texture, cold "
+                  .. "icons pending, rollup/badge/login-line consistency)",
+              fn = testCooldownDisplay },
+            { name = "cooldown row band (icon/name/ready geometry, multi-width fit, "
+                  .. "name yields first, ready-list floor)",
+              fn = testCdRowGeometry },
             { name = "delegate designations (ASCII marks retired to inks, level/"
                   .. "census designation blues, name asterisk, contextual menu "
                   .. "+ plan submenu, bank, faction isolation, action -> store "
