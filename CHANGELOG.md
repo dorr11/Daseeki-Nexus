@@ -1,5 +1,37 @@
 # Changelog
 
+## Unreleased
+
+- **Fixed: handing in a Zandalar Honor Token no longer costs you the repair at Rin'wosho.**
+  The turn-in used to take the one conversation window and the repair had to wait for a
+  second trip out to him. It now takes both on a single visit wherever the game allows
+  it: the moment the flask is handed over and the game puts his conversation back on
+  screen, that window is spent on the vendor — repaired, and closed again behind us. The
+  turn-in still goes first and always will; a flask is never traded for a repair. The
+  five-second guard that stops the repair being re-tried in a loop no longer counts the
+  second half of one visit as a retry, which is what had been quietly eating it on any
+  trip where you had repaired moments earlier.
+
+  On a game build that does *not* put the conversation back after a turn-in, there is
+  only ever one action to be had — so the turn-in takes it and the repair takes your next
+  visit, exactly as before. Nexus does watch for the one thing that would let it have
+  both anyway: whether closing a vendor window it opened returns you to the conversation.
+  Only once it has actually *seen* that happen — on an ordinary repair visit, with no
+  token in your bags and nothing at stake — will it start repairing first and handing in
+  second, the way ShadowNetwork does. It will never do that on a guess.
+
+  Also hardened underneath: if a client opens the vendor window instantly rather than
+  after a round-trip, that window is still recognised as ours and still closed. Everything
+  else is untouched — holding Shift still skips the whole lot, his other two quests are
+  still never auto-progressed, and the reward priority, bag-space and gold rules are
+  exactly as they were.
+
+- **New: `/dsn debug rinwosho`.** The ten most recent visits to Rin'wosho, each step with
+  what was decided and why, and a one-line signature per visit saying whether the game
+  handed the conversation back after the turn-in and after the vendor window. If a repair
+  ever goes missing again, that paste says which behaviour your client has — from the save
+  file, rather than from memory.
+
 ## 1.1.9 — 2026-08-10
 
 - **Fixed: opening a profession window could freeze the game with a script error.** On some

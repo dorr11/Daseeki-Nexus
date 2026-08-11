@@ -1710,6 +1710,220 @@ function Auto.HandleSayge(options, ordered, dmf)
     return true
 end
 
+----------------------------------------------------------------------
+-- RIN'WOSHO: THE ONE-VISIT PROBLEM (1.1.10)
+--
+-- THE REPORT (owner, twice). At Rin'wosho with a Zandalar Honor Token in the
+-- bags, the zanza turn-in fires and the vendor repair never does. ShadowNetwork
+-- lands BOTH on one physical visit ("it repairs and then grabs the zanzas").
+--
+-- WHAT WE HAD. Spec §14 scopes auto-repair to "when the zanza flow is idle",
+-- and Auto.OnGossipShow encodes that as an ORDER: the turn-in consumes the one
+-- gossip interaction and returns, so repair only ever takes a visit the zanza
+-- flow does not want. Faithful to the spec, and it produces exactly the
+-- owner's symptom on a client where the interaction ends with the reward.
+--
+-- WHAT WE DO NOT KNOW, AND CANNOT LEARN OFFLINE. Two client behaviours decide
+-- whether one visit can carry both actions, and NEITHER is provable headless:
+--
+--   R — does the client re-show gossip after a quest reward is taken?
+--   M — does closing a merchant window WE opened return to gossip?
+--
+-- Four worlds, and the strategy is written to win in every one of them:
+--
+--   world 1  R=Y M=Y : turn-in, the client re-shows, repair on the re-show.
+--   world 2  R=Y M=N : identical — the re-show is the whole mechanism.
+--   world 3  R=N M=Y : turn-in-first STRANDS the repair. Repair-FIRST wins it
+--                      (repair, close, gossip returns, turn-in) — but only on a
+--                      client where M has actually been OBSERVED, never on a
+--                      guess. See Auto.DecideRepairFirstLicense.
+--   world 4  R=N M=N : one interaction, one action. Turn-in, always; the
+--                      repair takes the next visit. Today's behaviour, kept.
+--
+-- THE PRIORITY IS ABSOLUTE: the flasks are the point and the repair is the
+-- bonus, so no path here may ever spend an interaction on the vendor in a way
+-- that costs a turn-in. That is why world 3's repair-first is licensed by
+-- evidence rather than by hope: the licence is only issued once the client has
+-- been SEEN returning to gossip after a merchant close (learned on visits with
+-- no token, where nothing was at stake) AND seen NOT re-showing after a reward.
+--
+-- THE FLIGHT RECORDER decides which world this client is, live: every event at
+-- 14921 with what the handler did and why, in a bounded build-stamped ring in
+-- the data SV (Store.AppendRinwoshoVisit — the 1.1.7 saygeTrace shape), read by
+-- `/dsn debug rinwosho`.
+----------------------------------------------------------------------
+
+-- s of silence that ends a physical visit. A client re-show is a server
+-- round-trip measured in milliseconds; an owner who walked away and came back
+-- is measured in seconds. Everything inside the window is ONE visit.
+Auto.RIN_VISIT_GRACE = 5
+
+-- Per-visit step cap. A visit is a handful of events; anything past this is a
+-- loop, and the ring must not carry it into the SV file.
+Auto.RIN_TRACE_STEPS = 24
+
+-- CLIENT_ASYNC_LESSONS Class 9 fuse. The client MAY dispatch MERCHANT_SHOW from
+-- inside our own SelectOption, and (world M=Y) GOSSIP_SHOW from inside our own
+-- CloseMerchant — so this handler can re-enter itself without a single timer
+-- involved. Legitimate nesting is gossip -> merchant -> gossip; past that we
+-- refuse with a recorded reason instead of recursing.
+Auto.RIN_DEPTH_MAX = 3
+
+-- How many reward-without-re-show visits prove R=N. One could be a stray (the
+-- owner closing the window on the same frame); two is a client behaviour.
+Auto.RIN_RESHOW_PROOF = 2
+
+Auto._rinVisit = nil        -- the in-flight physical visit record, or nil
+Auto._rinDepth = 0          -- Class 9 re-entry depth on the Rin'wosho flow
+
+-- Commit the in-flight visit when it has gone quiet. Called lazily at the top
+-- of every visit (so a client with no timer API still rolls the ring over) and
+-- from the deferred GOSSIP_CLOSED check.
+function Auto.RinCommitIfStale(now, grace)
+    local v = Auto._rinVisit
+    if not v then return false end
+    now = now or nowSecs()
+    if (now - (v.lastAt or v.startAt or 0)) <= (grace or Auto.RIN_VISIT_GRACE) then
+        return false
+    end
+    Auto.RinCommitVisit("ended")
+    return true
+end
+
+-- Record one step on the live visit and keep the visit alive. Returns nil when
+-- there is no visit — a stray merchant or quest event outside a Rin'wosho visit
+-- records nothing at all, which is the honest answer.
+function Auto.RinStep(ev, act, why, now)
+    local v = Auto._rinVisit
+    if not v then return nil end
+    now = now or nowSecs()
+    v.lastAt = now
+    local steps = v.steps
+    if #steps >= Auto.RIN_TRACE_STEPS then
+        -- Bounded, and TRUTHFULLY bounded: the last slot says the tail was cut.
+        steps[#steps] = { ev = "...", act = "truncated", why = "step cap" }
+        return nil
+    end
+    local step = { ev = ev, act = act, why = why,
+                   t = math.floor(((now - (v.startAt or now)) * 100) + 0.5) / 100 }
+    steps[#steps + 1] = step
+    return step
+end
+
+-- PURE-ish. The visit's one-line world signature — the line the owner pastes
+-- back, and the line that says which of the four worlds this client is.
+--   R=? / M=?  the behaviour was not exercised on this visit
+--   R=Y / R=N  gossip did / did not re-show after the reward
+--   M=Y / M=N  gossip did / did not return after we closed our merchant window
+function Auto.RinWorldSignature(v)
+    local function tri(exercised, yes)
+        if not exercised then return "?" end
+        return yes and "Y" or "N"
+    end
+    return ("R=%s M=%s turn-in=%s repair=%s"):format(
+        tri(v.rewardAt ~= nil, v.reshowAt ~= nil),
+        tri(v.merchantClosedAt ~= nil, v.merchantReturnAt ~= nil),
+        v.rewardAt and "yes" or "no",
+        v.repairedAt and "yes" or (v.repairRefused and ("no:" .. v.repairRefused) or "no"))
+end
+
+-- Fold this visit's observations into the learned world counters. ONLY the two
+-- questions above are counted, and only when the visit actually exercised them.
+function Auto.RinNoteWorld(v)
+    if not (Store and Store.NoteRinwoshoWorld) then return end
+    if v.rewardAt then
+        Store.NoteRinwoshoWorld(v.reshowAt and "reshowSeen" or "reshowMissed", ns.VERSION)
+    end
+    if v.merchantClosedAt then
+        Store.NoteRinwoshoWorld(v.merchantReturnAt and "returnSeen" or "returnMissed", ns.VERSION)
+    end
+end
+
+-- Close the in-flight visit and hand it to the ring. Idempotent.
+function Auto.RinCommitVisit(outcome)
+    local v = Auto._rinVisit
+    Auto._rinVisit = nil
+    if not v then return nil end
+    v.outcome = outcome
+    v.both    = (v.rewardAt ~= nil and v.repairedAt ~= nil) or false
+    v.sig     = Auto.RinWorldSignature(v)
+    Auto.RinNoteWorld(v)
+    if Store and Store.AppendRinwoshoVisit then Store.AppendRinwoshoVisit(v) end
+    gdbg("rin'wosho: visit committed -- %s [%s] (%d step(s))",
+         tostring(outcome), tostring(v.sig), #v.steps)
+    return v
+end
+
+-- GOSSIP_SHOW at 14921: continue the live visit or open a new one, and CLASSIFY
+-- the window — because "is this the client's own re-show?" is the single fact
+-- the whole strategy turns on, and it is answerable only from our own record of
+-- what we just did.
+function Auto.RinOnGossipShow(now)
+    now = now or nowSecs()
+    Auto.RinCommitIfStale(now)
+    local v, note = Auto._rinVisit, "opened"
+    if v then
+        if v.rewardAt and not v.reshowAt then
+            v.reshowAt = now
+            note = "re-show after turn-in"
+        elseif v.merchantClosedAt and not v.merchantReturnAt then
+            v.merchantReturnAt = now
+            note = "re-show after merchant close"
+        else
+            note = "re-opened"
+        end
+    else
+        v = { at      = (Store and Store.Now and Store.Now()) or 0,
+              build   = ns.VERSION,
+              startAt = now,
+              lastAt  = now,
+              steps   = {} }
+        Auto._rinVisit = v
+    end
+    Auto.RinStep("GOSSIP_SHOW", note, nil, now)
+    return v
+end
+
+-- PURE. May the repair be taken BEFORE the turn-in on this client?
+--
+-- This is the only diagnostic in the addon that steers, so every row is a
+-- refusal by default and the whole thing reads as "prove it":
+--   * a client that HAS re-shown gossip after a reward needs no reordering —
+--     turn-in-first already lands both, and reordering could only lose;
+--   * a client that has not been seen failing to re-show, twice, is unproven;
+--   * a client that has never been seen returning to gossip after a merchant
+--     close cannot be trusted to give the turn-in back, and the turn-in is
+--     the thing we may never gamble;
+--   * a client that has contradicted itself more often than it has confirmed
+--     loses the licence again.
+function Auto.DecideRepairFirstLicense(w)
+    if type(w) ~= "table" then return false, "no-world" end
+    if (tonumber(w.reshowSeen) or 0) > 0 then return false, "reshow-world" end
+    if (tonumber(w.reshowMissed) or 0) < Auto.RIN_RESHOW_PROOF then return false, "reshow-unproven" end
+    if (tonumber(w.returnSeen) or 0) < 1 then return false, "return-unproven" end
+    if (tonumber(w.returnMissed) or 0) > (tonumber(w.returnSeen) or 0) then
+        return false, "return-contradicted"
+    end
+    return true, "licensed"
+end
+
+-- CLASS 9 GUARD. Runs `fn` with the re-entry fuse up. The depth is restored
+-- through a pcall so an error inside a nested dispatch cannot wedge the fuse
+-- shut for the rest of the session, and the error is re-raised so the addon's
+-- own SafeCall reporter still sees it.
+function Auto.RinGuarded(fn, ...)
+    if (Auto._rinDepth or 0) >= Auto.RIN_DEPTH_MAX then
+        Auto.RinStep("GOSSIP_SHOW", "refused", "depth-fuse")
+        gdbg("rin'wosho: depth fuse at %d -- refusing to re-enter", Auto._rinDepth)
+        return false
+    end
+    Auto._rinDepth = (Auto._rinDepth or 0) + 1
+    local ok, res = pcall(fn, ...)
+    Auto._rinDepth = Auto._rinDepth - 1
+    if not ok then error(res, 0) end
+    return res
+end
+
 -- AUTO-REPAIR AT RIN'WOSHO — the gossip half (spec §14, §19.21).
 --
 -- Lives here, above Auto.OnGossipShow, because it needs the file-local
@@ -1718,33 +1932,92 @@ end
 -- reads is a pure function in the auto-repair block (Auto.DecideRinwoshoRepair,
 -- Auto.ZanzaIdleNow, Auto.AnyEquipmentDamaged, Auto.PickVendorOption).
 --
+-- `mode` is "idle" (spec order: the zanza flow does not want this interaction)
+-- or "repair-first" (world 3, licensed by evidence — the caller has already
+-- established that a turn-in IS pending and that this client gives the gossip
+-- window back, so the idle rule is answered by the SEQUENCE rather than by the
+-- state of this instant).
+--
 -- Returns true when it consumed the interaction. NOTHING IS ARMED UNLESS THE
 -- SELECT ACTUALLY GOES OUT — an unaffordable gate, a window with no vendor
 -- option, or a matched option carrying no gossipOptionID all leave the flag
 -- cold and the 5 s attempt cooldown unspent.
-function Auto.TryRinwoshoRepair(options)
+--
+-- CLASS 9 (1.1.10): the flag is now armed BEFORE the select, not after. If the
+-- client dispatches MERCHANT_SHOW from inside SelectOption — the posture Class 9
+-- proved the professions filters live in — then arming afterwards arms it one
+-- call too late: our own merchant window reads as the player's, is repaired on
+-- the waived any-vendor path and is never closed. Everything that could refuse
+-- the select is therefore checked first, so "armed" and "sent" stay one step.
+function Auto.TryRinwoshoRepair(options, mode)
+    mode = mode or "idle"
+    local v = Auto._rinVisit
     local ok, why = Auto.DecideRinwoshoRepair({
-        enabled   = aqBlock().autoRepair == true,
-        shift     = IsShiftKeyDown and IsShiftKeyDown() or false,
-        npcID     = Auto.NpcID(),
-        zanzaIdle = (Auto.ZanzaIdleNow()),
-        damaged   = (Auto.AnyEquipmentDamaged()),
-        now       = nowSecs(),
+        enabled         = aqBlock().autoRepair == true,
+        shift           = IsShiftKeyDown and IsShiftKeyDown() or false,
+        npcID           = Auto.NpcID(),
+        zanzaIdle       = (mode == "repair-first") or (Auto.ZanzaIdleNow()),
+        damaged         = (Auto.AnyEquipmentDamaged()),
+        now             = nowSecs(),
+        -- The second half of ONE visit is not a retry storm — see the cooldown
+        -- row in Auto.DecideRinwoshoRepair.
+        sameVisit       = (v ~= nil and v.rewardAt ~= nil) or false,
+        visitRepairDone = (v ~= nil and v.repairTriedAt ~= nil) or false,
     })
     if not ok then
         gdbg("rin'wosho repair: refused -- %s", tostring(why))
+        if v then v.repairRefused = why end
+        Auto.RinStep("REPAIR", "refused", why)
         return false
     end
     local selector, where = Auto.PickVendorOption(options)
     if selector == nil then
         gdbg("rin'wosho repair: %s (%d option(s))", tostring(where), #(options or {}))
+        if v then v.repairRefused = where end
+        Auto.RinStep("REPAIR", "refused", where)
         return false
     end
-    if not selectGossipOption(selector) then return false end
+    -- Everything selectGossipOption could refuse on, answered before we arm.
+    if not (C_GossipInfo and C_GossipInfo.SelectOption) then
+        if v then v.repairRefused = "no-select-api" end
+        Auto.RinStep("REPAIR", "refused", "no-select-api")
+        return false
+    end
+    if v then
+        v.repairTriedAt = nowSecs()
+        v.repairMode    = mode
+        v.repairRefused = nil
+    end
+    Auto.RinStep("REPAIR", "vendor option selected", mode .. ":" .. tostring(selector))
     Auto.ArmRepair()
-    gdbg("rin'wosho repair: vendor option %s selected via %s icon",
-         tostring(selector), tostring(where))
+    selectGossipOption(selector)
+    gdbg("rin'wosho repair: vendor option %s selected via %s icon (%s)",
+         tostring(selector), tostring(where), mode)
     return true
+end
+
+-- WORLD 3's opening move. Refuses on every client that has not proven itself,
+-- and refuses whenever the ordinary spec order can do the job.
+function Auto.TryRinwoshoRepairFirst()
+    if not (C_GossipInfo and C_GossipInfo.GetOptions) then return false end
+    local v = Auto._rinVisit
+    if v and v.repairTriedAt then return false end
+    local licensed, why = Auto.DecideRepairFirstLicense(
+        Store and Store.GetRinwoshoWorld and Store.GetRinwoshoWorld() or nil)
+    if not licensed then
+        gdbg("rin'wosho repair-first: not licensed -- %s", tostring(why))
+        return false
+    end
+    -- Only ever reorders around a turn-in that is ACTUALLY pending. "idle" goes
+    -- down the ordinary path below; "cannot-judge" (the quest lists are
+    -- unreadable) is not a licence to spend the interaction on gold.
+    local idle, reason = Auto.ZanzaIdleNow()
+    if idle or reason ~= "turn-in-pending" then return false end
+    local raw = C_GossipInfo.GetOptions()
+    if type(raw) ~= "table" or #raw == 0 then return false end
+    local options = (Auto.SortGossipOptions(raw))
+    Auto.RinStep("REPAIR-FIRST", "licensed", "turn-in pending, world 3")
+    return Auto.TryRinwoshoRepair(options, "repair-first")
 end
 
 -- GOSSIP_SHOW entry point.
@@ -1761,14 +2034,39 @@ end
 -- one modifier, one rule, no exceptions to remember.
 function Auto.OnGossipShow()
     if IsShiftKeyDown and IsShiftKeyDown() then return end
-    if Auto.HandleGossipQuests() then return end
+
+    -- THE RIN'WOSHO VISIT (1.1.10). Opened/continued before any handler runs so
+    -- that whatever this window turns out to be — the first gossip, the client's
+    -- re-show after a reward, or the window it hands back after we close a
+    -- merchant — the record says which, and the repair gate can read it.
+    local npcID = Auto.NpcID()
+    if npcID == Auto.ZANZA_NPC then
+        Auto.RinOnGossipShow()
+        -- World 3 only, and only on a client that has proven it (the licence
+        -- refuses on every other client, so this is inert everywhere else).
+        if Auto.RinGuarded(Auto.TryRinwoshoRepairFirst) then return end
+    elseif Auto._rinVisit then
+        -- Gossip at somebody else means the owner walked away from Rin'wosho.
+        Auto.RinCommitVisit("npc-changed")
+    end
+
+    local took, tookQuest = Auto.HandleGossipQuests()
+    if took then
+        if npcID == Auto.ZANZA_NPC then
+            local v = Auto._rinVisit
+            if v and tookQuest == Auto.ZANZA_QUEST then v.turnInAt = nowSecs() end
+            Auto.RinStep("GOSSIP_SHOW", "turn-in selected", tostring(tookQuest))
+        end
+        return
+    end
 
     if not (C_GossipInfo and C_GossipInfo.GetOptions) then return end
     local ago = agoBlock()
     local raw = C_GossipInfo.GetOptions()
-    if not raw or #raw == 0 then return end
-
-    local npcID = Auto.NpcID()
+    if not raw or #raw == 0 then
+        Auto.RinStep("GOSSIP_SHOW", "no action", "no-options")
+        return
+    end
 
     -- DISPLAY ORDER FIRST (1.1.7). Every positional handler below reads the
     -- SORTED view; the raw array is kept only for the Sayge trace. `ordered`
@@ -1793,12 +2091,25 @@ function Auto.OnGossipShow()
     -- Spec §14 auto-repair, the gossip half. It sits AFTER HandleGossipQuests
     -- (above) by construction, which is the spec's priority rule as code: a
     -- pickable turn-in has already consumed the interaction and returned, so
-    -- repair can only ever take a visit on which the zanza flow is idle. The
+    -- repair can only ever take a window on which the zanza flow is idle. The
     -- NPC test is repeated inside Auto.DecideRinwoshoRepair — this one is a
     -- cheap short-circuit, that one is the guard. (The vendor pick matches by
     -- ICON, not position, so display order cannot change what it matches; it
     -- reads the sorted view for uniformity.)
-    if npcID == Auto.ZANZA_NPC and Auto.TryRinwoshoRepair(options) then return end
+    --
+    -- 1.1.10 — "A WINDOW", NOT "A VISIT", AND THAT IS THE WHOLE FIX. The rule
+    -- was always about the interaction the zanza flow does not want; it was the
+    -- ONE-window-per-visit assumption that turned it into "the repair loses the
+    -- visit". On a client that re-shows gossip after the reward (worlds 1 and 2)
+    -- this same line now fires on that re-show: the token is spent, 8243 is off
+    -- the list, the flow is idle by the spec's own first arm, and both actions
+    -- land on one physical visit. Nothing about the idle rule was relaxed to get
+    -- there — the only guard that had to move is the 5 s attempt cooldown, which
+    -- was written against retry storms and must not eat the second half of one
+    -- visit (Auto.DecideRinwoshoRepair's `sameVisit` row).
+    if npcID == Auto.ZANZA_NPC and Auto.RinGuarded(Auto.TryRinwoshoRepair, options) then
+        return
+    end
 
     local idx, why = Auto.DecideDmtOption({
         enabled = ago.dmt, npcID = npcID, optionCount = n,
@@ -1843,6 +2154,21 @@ end
 -- next Sayge GOSSIP_SHOW instead — either path, a cold re-open never inherits
 -- the dead visit's page position.
 function Auto.OnGossipClosed()
+    -- The Rin'wosho visit gets the SAME treatment and for the same Class 2
+    -- reason, one flow over: a close that is really a transition (the reward
+    -- frame opening, the merchant window we just asked for) is followed by the
+    -- next window within milliseconds, and a close that is really the owner
+    -- walking away is followed by nothing. So the close is RECORDED here and
+    -- the commit is deferred; with no timer API the lazy commit at the next
+    -- visit does it instead.
+    if Auto._rinVisit then
+        Auto.RinStep("GOSSIP_CLOSED", "closed", nil)
+        if C_Timer and C_Timer.After then
+            C_Timer.After(Auto.RIN_VISIT_GRACE + 0.1, function()
+                ns:SafeCall(function() Auto.RinCommitIfStale() end)
+            end)
+        end
+    end
     if not Auto._saygeVisit then return end
     if C_Timer and C_Timer.After then
         C_Timer.After(Auto.SAYGE_PAGE_GRACE + 0.1, function()
@@ -2661,7 +2987,9 @@ function Auto.RoidsGateNow()
     return true, "ok"
 end
 
--- The gossip-window driver. Returns true when it consumed the interaction.
+-- The gossip-window driver. Returns (true, questID) when it consumed the
+-- interaction — the ID is what lets the Rin'wosho recorder tell "the turn-in
+-- took this window" from "some other category did".
 function Auto.HandleGossipQuests()
     if not (C_GossipInfo and C_GossipInfo.GetAvailableQuests
             and C_GossipInfo.GetActiveQuests) then
@@ -2688,12 +3016,12 @@ function Auto.HandleGossipQuests()
     if plan.kind == "active" then
         if C_GossipInfo.SelectActiveQuest then
             C_GossipInfo.SelectActiveQuest(plan.selector)
-            return true
+            return true, plan.questID
         end
     else
         if C_GossipInfo.SelectAvailableQuest then
             C_GossipInfo.SelectAvailableQuest(plan.selector)
-            return true
+            return true, plan.questID
         end
     end
     return false
@@ -2885,9 +3213,17 @@ end
 -- QUEST_PROGRESS: turn-in requirements screen. Complete when the game says the
 -- quest is completable and it belongs to an enabled category.
 function Auto.OnQuestProgress()
-    if not Auto.QuestFrameInScope() then return end
+    local inScope, qid = Auto.QuestFrameInScope()
+    local zanza = (qid == Auto.ZANZA_QUEST)
+    if not inScope then
+        if zanza then Auto.RinStep("QUEST_PROGRESS", "out of scope", nil) end
+        return
+    end
     if IsQuestCompletable and IsQuestCompletable() and CompleteQuest then
+        if zanza then Auto.RinStep("QUEST_PROGRESS", "completing", nil) end
         CompleteQuest()
+    elseif zanza then
+        Auto.RinStep("QUEST_PROGRESS", "not completable", nil)
     end
 end
 
@@ -3107,6 +3443,13 @@ end
 
 -- The reward dialog closed for real: nothing left to pick from.
 function Auto.OnQuestFinished()
+    -- Recorded, never acted on. QUEST_FINISHED is the last event before the
+    -- client decides whether to hand the gossip window back — so in the trace
+    -- it is the marker the owner's paste is read against: a GOSSIP_SHOW on the
+    -- next line is world R=Y, a GOSSIP_CLOSED is world R=N.
+    if Auto._rinVisit and Auto._rinVisit.rewardAt then
+        Auto.RinStep("QUEST_FINISHED", "reward frame closed", nil)
+    end
     Auto._zanzaChoices = nil
     Auto._zanzaWatch   = false
 end
@@ -3186,9 +3529,29 @@ function Auto.OnQuestComplete()
             tokenNeed  = Auto.ZANZA_TOKEN_NEED,
             freeSlots  = Auto.FreeBagSlots(),
         })
-        if not ok then return end
+        if not ok then
+            Auto.RinStep("QUEST_COMPLETE", "reward refused", "gate")
+            return
+        end
         Auto._zanzaChoices = Auto.ReadRewardChoices()
-        Auto.ZanzaPickAndRequest()
+
+        -- CLASS 9: GetQuestReward is a client call, and on a world where the
+        -- client re-shows gossip it may dispatch that GOSSIP_SHOW from INSIDE
+        -- the call. The visit is therefore stamped as "the reward has gone out"
+        -- BEFORE the request, not after — otherwise the re-show that the
+        -- request itself causes arrives at a visit that has never heard of it,
+        -- reads as a plain re-open, and the repair path loses the one fact it
+        -- needs. If nothing was actually requested the stamp is withdrawn, and
+        -- no dispatch can have happened in between.
+        local v = Auto._rinVisit
+        local at = nowSecs()
+        if v then v.rewardAt = at end
+        Auto.RinStep("QUEST_COMPLETE", "requesting reward", nil, at)
+        local requested, keyOrWhy = Auto.ZanzaPickAndRequest()
+        if v and not requested then v.rewardAt = nil end
+        Auto.RinStep("QUEST_COMPLETE",
+                     requested and "reward requested" or "no reward requested",
+                     tostring(keyOrWhy))
         return
     end
 
@@ -3396,9 +3759,30 @@ function Auto.DecideRinwoshoRepair(ctx)
     if ctx.npcID ~= Auto.ZANZA_NPC then return false, "wrong-npc" end
     if not ctx.zanzaIdle then return false, "zanza-busy" end
     if not ctx.damaged then return false, "nothing-damaged" end
+    -- THE 5 s ATTEMPT COOLDOWN, AND THE ONE CASE IT WAS NEVER MEANT TO COVER.
+    --
+    -- Spec §14 gives the gossip-driven repair a 5 s attempt cooldown, and it
+    -- was designed against a retry storm: a gossip window that yields no
+    -- merchant being re-selected on every re-open. The client's own re-show
+    -- after a quest reward is not that — it is the SECOND HALF OF ONE VISIT,
+    -- arriving milliseconds after the first half — and letting the storm guard
+    -- eat it is exactly how "the repair never fires when you hand in a token"
+    -- survives a release.
+    --
+    -- SO THE BYPASS IS EXACTLY ONE STEP WIDE, and both of its conditions are
+    -- needed to keep it from becoming the loop the cooldown exists to stop:
+    --   * `sameVisit` — the reward has already gone out on THIS visit, so this
+    --     window is the client handing the interaction back, not the owner
+    --     re-clicking; and
+    --   * `visitRepairDone` false — the visit has not already spent its one
+    --     attempt, so the bypass can be taken at most once per visit and the
+    --     stamp we just wrote closes it behind us.
+    -- Outside the bypass the cooldown is untouched: a plain re-open inside 5 s
+    -- is still refused, and at 5 s it is still allowed again.
     if Auto.IsCooling(ctx.cooldowns or Auto._repairCooldown, "repair",
                       ctx.now or 0, ctx.cooldown or Auto.REPAIR_COOLDOWN) then
-        return false, "cooling"
+        if not ctx.sameVisit then return false, "cooling" end
+        if ctx.visitRepairDone then return false, "visit-repair-done" end
     end
     return true, "ok"
 end
@@ -3488,8 +3872,19 @@ end
 -- screen because the repair was unaffordable would be the addon walking away
 -- from its own mess; the printed line already says why nothing was repaired.
 function Auto.OnMerchantShow()
-    local ours = Auto.ConsumeRepairArm()
-    Auto.RepairNow()
+    local ours, armWhy = Auto.ConsumeRepairArm()
+    local repaired, why = Auto.RepairNow()
+    local v = Auto._rinVisit
+    if v then
+        Auto.RinStep("MERCHANT_SHOW", ours and "ours" or ("not ours: " .. tostring(armWhy)),
+                     repaired and "repaired" or tostring(why))
+        if repaired then v.repairedAt = nowSecs() end
+        -- CLASS 9 AGAIN, and this is the one that decides world 3: on a client
+        -- where closing the merchant returns to gossip, that GOSSIP_SHOW can be
+        -- dispatched from INSIDE CloseMerchant. The stamp the re-show is
+        -- recognised by therefore goes down BEFORE the close, never after.
+        if ours then v.merchantClosedAt = nowSecs() end
+    end
     if ours and CloseMerchant then CloseMerchant() end
 end
 
@@ -3505,6 +3900,10 @@ function Auto.OnZoneChanged()
     -- clearing it on zone change is the very approximation the 1.1.4 wave
     -- removed.
     Auto.SaygeResetVisit("zone-changed")
+    -- Same for the Rin'wosho visit: zoning away ends the physical visit, so the
+    -- record is committed (and its world observations counted) rather than left
+    -- in flight to be inherited by the next one.
+    if Auto._rinVisit then Auto.RinCommitVisit("zone-changed") end
     -- Walking away ends any dialog we were holding open. The rejection stamps
     -- are NOT cleared: they are a 30 s time-based guard, not a location one.
     Auto._zanzaChoices = nil
@@ -5179,6 +5578,19 @@ local function testRinwoshoRepairGate()
         { "zanza turn-in due",   { zanzaIdle = false },               false, "zanza-busy" },
         { "nothing damaged",     { damaged = false },                 false, "nothing-damaged" },
         { "inside the cooldown", { cooldowns = { repair = 996 } },    false, "cooling" },
+        -- 1.1.10: the same-visit re-show is the second half of one visit, not a
+        -- retry storm, so the 5 s attempt cooldown steps aside for it exactly
+        -- once — and the second condition is what makes that safe.
+        { "same-visit re-show inside the cooldown",
+          { cooldowns = { repair = 996 }, sameVisit = true },         true,  "ok" },
+        { "same-visit re-show after this visit already repaired",
+          { cooldowns = { repair = 996 }, sameVisit = true, visitRepairDone = true },
+                                                                      false, "visit-repair-done" },
+        -- …and outside the cooldown the once-per-visit flag is not a gate of
+        -- its own: the cooldown stamp is what a real attempt always leaves
+        -- behind, so a cold stamp with the flag set is a state that cannot
+        -- occur, and inventing a refusal for it would be inventing a rule.
+        { "flag set with a cold cooldown", { visitRepairDone = true },  true, "ok" },
     }
     for _, row in ipairs(ROWS) do
         local ok, why = Auto.DecideRinwoshoRepair(ctx(row[2]))
@@ -5239,10 +5651,12 @@ local function testRinwoshoRepairLive()
     if type(fs) ~= "table" or type(fs.autoQuest) ~= "table" then
         return false, "the live autoQuest block is reachable"
     end
-    local savedAQ   = fs.autoQuest
-    local savedArm  = Auto._repairArmedAt
-    local savedCD   = Auto._repairCooldown
-    local savedBank = Auto._bankSnapshot
+    local savedAQ    = fs.autoQuest
+    local savedArm   = Auto._repairArmedAt
+    local savedCD    = Auto._repairCooldown
+    local savedBank  = Auto._bankSnapshot
+    local savedVisit = Auto._rinVisit
+    local savedRinSV = (type(Store.data) == "table") and Store.data.rinwoshoTrace or nil
 
     local RIN     = "Creature-0-3299-0-14-14921-0000027FA6"
     -- An NPC no handler in this file claims, so scene 10 measures the repair
@@ -5308,6 +5722,13 @@ local function testRinwoshoRepairLive()
         Auto._repairArmedAt  = nil
         Auto._repairCooldown = {}
         Auto._bankSnapshot   = nil
+        -- 1.1.10: each scene is its own physical visit, and none of them may
+        -- inherit the previous scene's visit record or learned world.
+        Auto._rinVisit = nil
+        Auto._rinDepth = 0
+        if type(Store.data) == "table" then
+            Store.data.rinwoshoTrace = { schema = 1, visits = {}, world = {} }
+        end
         W = { clock = 1000, shift = false, guid = RIN, options = rinOptions(),
               available = {}, bags = {}, free = 5,
               dur = { [5] = { 40, 100 } },                 -- damaged by default
@@ -5524,6 +5945,567 @@ local function testRinwoshoRepairLive()
     Auto._repairArmedAt   = savedArm
     Auto._repairCooldown  = savedCD
     Auto._bankSnapshot    = savedBank
+    Auto._rinVisit        = savedVisit
+    Auto._rinDepth        = 0
+    if type(Store.data) == "table" then Store.data.rinwoshoTrace = savedRinSV end
+    for _, k in ipairs(NAMES) do _G[k] = SAVE[k] end
+    if fail then return false, fail end
+    return true
+end
+
+-- PURE: the repair-first licence. Every row is a refusal until the client has
+-- earned it, because the thing being licensed is "spend the interaction on gold
+-- while a flask is waiting" and the flask always wins a coin toss.
+local function testRepairFirstLicense()
+    local ROWS = {
+        { "no world block at all",   nil,                                          false, "no-world" },
+        { "empty world block",       {},                                           false, "reshow-unproven" },
+        { "one missed re-show",      { reshowMissed = 1, returnSeen = 3 },          false, "reshow-unproven" },
+        { "proven R=N, M unproven",  { reshowMissed = 2 },                         false, "return-unproven" },
+        { "proven R=N, M proven",    { reshowMissed = 2, returnSeen = 1 },         true,  "licensed" },
+        -- A client that re-shows gossip after the reward needs no reordering:
+        -- turn-in-first already lands both, and reordering could only lose one.
+        { "the client DOES re-show", { reshowSeen = 1, reshowMissed = 9, returnSeen = 9 },
+                                                                                   false, "reshow-world" },
+        -- Learned once, contradicted since: the licence lapses.
+        { "M contradicted",          { reshowMissed = 4, returnSeen = 1, returnMissed = 2 },
+                                                                                   false, "return-contradicted" },
+        { "M contradicted but tied", { reshowMissed = 4, returnSeen = 2, returnMissed = 2 },
+                                                                                   true,  "licensed" },
+    }
+    for _, row in ipairs(ROWS) do
+        local ok, why = Auto.DecideRepairFirstLicense(row[2])
+        if ok ~= row[3] or why ~= row[4] then
+            return false, ("%s -> ok=%s (%s), want ok=%s (%s)")
+                :format(row[1], tostring(ok), tostring(why), tostring(row[3]), row[4])
+        end
+    end
+    if Auto.RIN_RESHOW_PROOF < 2 then
+        return false, "one stray non-re-show must not prove a client behaviour"
+    end
+    return true
+end
+
+-- THE CLASS 9 FUSE, on its own. Legitimate nesting at Rin'wosho is
+-- gossip -> merchant -> gossip; past that the flow refuses instead of recursing,
+-- and the depth unwinds even when the nested call errors.
+local function testRinDepthFuse()
+    local savedDepth, savedVisit = Auto._rinDepth, Auto._rinVisit
+    Auto._rinDepth, Auto._rinVisit = 0, nil
+    local seen, refusedAt = 0, nil
+    local function recurse()
+        seen = seen + 1
+        if seen > 20 then return "runaway" end
+        local r = Auto.RinGuarded(recurse)
+        if r == false and refusedAt == nil then refusedAt = Auto._rinDepth end
+        return true
+    end
+    Auto.RinGuarded(recurse)
+    local depthOk = (Auto._rinDepth == 0)
+    local fuseOk  = (seen == Auto.RIN_DEPTH_MAX)
+    -- An error inside the guarded call is RE-RAISED (so SafeCall still reports
+    -- it) and the depth is still restored.
+    local ok = pcall(Auto.RinGuarded, function() error("boom", 0) end)
+    local unwound = (Auto._rinDepth == 0)
+    Auto._rinDepth, Auto._rinVisit = savedDepth, savedVisit
+    if not fuseOk then
+        return false, ("the fuse must stop at RIN_DEPTH_MAX (%d), ran %d")
+            :format(Auto.RIN_DEPTH_MAX, seen)
+    end
+    if not depthOk then return false, "the depth must unwind to 0" end
+    if ok then return false, "an error inside a guarded call must be re-raised" end
+    if not unwound then return false, "the depth must unwind through an error" end
+    return true
+end
+
+----------------------------------------------------------------------
+-- THE FOUR CLIENT WORLDS (1.1.10) — one physical visit, both actions.
+--
+-- The owner's report is that the zanza turn-in fires at Rin'wosho and the
+-- vendor repair never does, on a visit where both were possible. Whether both
+-- CAN happen on one visit is a property of the client, not of this addon, and
+-- it is not provable offline — so this sim models all four worlds and the
+-- strategy is asserted in each:
+--
+--   R  the client re-shows gossip after a quest reward is taken
+--   M  the client returns to gossip when a merchant window we opened is closed
+--
+--   world 1 (R=Y M=Y) both, via the re-show          world 3 (R=N M=Y) both, via repair-first
+--   world 2 (R=Y M=N) both, via the re-show          world 4 (R=N M=N) turn-in only, by design
+--
+-- DISPATCH POSTURE (CLIENT_ASYNC_LESSONS Class 9): the default is SYNCHRONOUS
+-- IN-CALL — the client runs our handler from inside the very API call that
+-- caused the event (SelectAvailableQuest, GetQuestReward, SelectOption,
+-- CloseMerchant), so every latch has to be down before the call, not after it.
+-- The async posture is run as a named variant, never as the default.
+--
+-- BAG POSTURE (Class 1): the turn-in's bag counts do NOT move when the reward
+-- is taken. The token still reads as held on the re-show, so any "is the zanza
+-- flow idle?" answer that leans on the bag count reads the PRE-turn-in world —
+-- which is exactly the trap this flow has to walk through.
+----------------------------------------------------------------------
+local function testRinwoshoOneVisit()
+    local SAVE = {}
+    local NAMES = { "C_GossipInfo", "C_Item", "C_Container", "GetItemCount",
+                    "IsShiftKeyDown", "UnitGUID", "GetTime", "C_Timer",
+                    "GetInventoryItemDurability", "CanMerchantRepair",
+                    "GetRepairAllCost", "GetMoney", "RepairAllItems",
+                    "CloseMerchant", "GetCoinTextureString", "print",
+                    "GetQuestID", "GetTitleText", "IsQuestCompletable",
+                    "CompleteQuest", "AcceptQuest", "CloseQuest",
+                    "GetNumQuestChoices", "GetQuestItemInfo", "GetQuestItemLink",
+                    "GetQuestReward" }
+    for _, k in ipairs(NAMES) do SAVE[k] = _G[k] end
+
+    local fs = Auto.FactionSettings and Auto.FactionSettings() or nil
+    if type(fs) ~= "table" or type(fs.autoQuest) ~= "table" then
+        return false, "the live autoQuest block is reachable"
+    end
+    local savedAQ    = fs.autoQuest
+    local savedArm   = Auto._repairArmedAt
+    local savedCD    = Auto._repairCooldown
+    local savedBank  = Auto._bankSnapshot
+    local savedVisit = Auto._rinVisit
+    local savedData  = Store.data
+    local savedZ     = { Auto._zanzaCooldown, Auto._zanzaPending,
+                         Auto._zanzaChoices, Auto._zanzaWatch }
+    -- The ring lives in the data SV; give the test one of its own so the
+    -- assertions are unconditional and the real file is never touched.
+    if type(Store.data) ~= "table" then Store.data = {} end
+
+    local RIN     = "Creature-0-3299-0-14-14921-0000027FA6"
+    local TOKEN   = Auto.ZANZA_TOKEN
+    local SWIFT   = 20081
+    local VENDOR  = 771            -- the vendor option's gossipOptionID
+    local ZQ      = Auto.ZANZA_QUEST
+
+    local W, CALLS, said, queue
+
+    local function resetCalls()
+        CALLS = { option = {}, quest = {}, reward = {}, events = {},
+                  repaired = 0, closedMerchant = 0, closedGossip = 0 }
+        said  = {}
+        queue = {}
+    end
+    resetCalls()
+
+    -- THE CLIENT'S EVENT PUMP. Synchronous by default: the handler runs from
+    -- inside the API call that caused it, before that call returns.
+    local HANDLER = {
+        GOSSIP_SHOW        = function() Auto.OnGossipShow() end,
+        GOSSIP_CLOSED      = function() Auto.OnGossipClosed() end,
+        QUEST_PROGRESS     = function() Auto.OnQuestProgress() end,
+        QUEST_COMPLETE     = function() Auto.OnQuestComplete() end,
+        QUEST_FINISHED     = function() Auto.OnQuestFinished() end,
+        MERCHANT_SHOW      = function() Auto.OnMerchantShow() end,
+        BAG_UPDATE_DELAYED = function() Auto.OnBagUpdate() end,
+    }
+    local function fire(ev)
+        CALLS.events[#CALLS.events + 1] = ev
+        local fn = HANDLER[ev]
+        if not fn then return end
+        if W.sync then fn() else queue[#queue + 1] = fn end
+    end
+    local function drain()
+        local n = 0
+        while queue[1] and n < 60 do
+            local fn = table.remove(queue, 1)
+            fn()
+            n = n + 1
+        end
+    end
+
+    _G.GetTime        = function() return W.clock end
+    _G.IsShiftKeyDown = function() return W.shift end
+    _G.UnitGUID       = function(u) if u == "npc" then return W.guid end return "Player-4395-01C7B4D5" end
+    -- Timers are CAPTURED, never run: a repair that only exists behind a timer
+    -- is a repair this test must not be able to see.
+    _G.C_Timer        = { After = function() end }
+    _G.GetCoinTextureString = nil
+    _G.print = function(...)
+        local p = {}
+        for i = 1, select("#", ...) do p[i] = tostring((select(i, ...))) end
+        said[#said + 1] = table.concat(p, "\t")
+    end
+
+    local function availableList()
+        local out = {}
+        for i, q in ipairs(W.available) do out[i] = { questID = q, title = "q" .. q } end
+        return out
+    end
+
+    _G.C_GossipInfo = {
+        GetAvailableQuests = availableList,
+        GetActiveQuests    = function() return {} end,
+        SelectAvailableQuest = function(id)
+            CALLS.quest[#CALLS.quest + 1] = id
+            if id ~= ZQ then return end
+            W.questID = id
+            -- The gossip frame gives way to the quest frame. On this client
+            -- that IS a GOSSIP_CLOSED, and the visit must survive it.
+            if W.closeOnQuest then fire("GOSSIP_CLOSED") end
+            fire("QUEST_PROGRESS")
+        end,
+        SelectActiveQuest = function(id) CALLS.quest[#CALLS.quest + 1] = id end,
+        GetOptions   = function() return W.options end,
+        SelectOption = function(id)
+            CALLS.option[#CALLS.option + 1] = id
+            if id == VENDOR then fire("MERCHANT_SHOW") end
+        end,
+        CloseGossip  = function() CALLS.closedGossip = CALLS.closedGossip + 1 end,
+    }
+
+    _G.C_Item       = { GetItemCount = function(id) return W.bags[id] or 0 end }
+    _G.GetItemCount = function(id) return W.bags[id] or 0 end
+    _G.C_Container  = { CalculateTotalNumberOfFreeBagSlots = function() return W.free end }
+    _G.GetInventoryItemDurability = function(slot)
+        local d = W.dur[slot]
+        if not d then return nil end
+        return d[1], d[2]
+    end
+    _G.CanMerchantRepair = function() return W.canRepair end
+    _G.GetRepairAllCost  = function() return W.cost end
+    _G.GetMoney          = function() return W.money end
+    -- The gear stays damaged on purpose: what stops a second repair attempt on
+    -- the same visit must be the once-per-visit rule, not the world healing
+    -- underneath the assertion.
+    _G.RepairAllItems    = function() CALLS.repaired = CALLS.repaired + 1 end
+    _G.CloseMerchant     = function()
+        CALLS.closedMerchant = CALLS.closedMerchant + 1
+        if W.merchantReturn then fire("GOSSIP_SHOW") else fire("GOSSIP_CLOSED") end
+    end
+
+    _G.GetQuestID         = function() return W.questID or 0 end
+    _G.GetTitleText       = function() return "" end
+    _G.AcceptQuest        = function() end
+    _G.CloseQuest         = function() end
+    _G.IsQuestCompletable = function() return true end
+    _G.CompleteQuest      = function() fire("QUEST_COMPLETE") end
+    _G.GetNumQuestChoices = function() return #W.choices end
+    _G.GetQuestItemInfo   = function(_, i) local c = W.choices[i]; return c and c.name or nil end
+    _G.GetQuestItemLink   = function(_, i)
+        local c = W.choices[i]
+        return (c and c.itemID) and ("|Hitem:" .. c.itemID .. "::::|h[x]|h") or nil
+    end
+    _G.GetQuestReward = function(i)
+        CALLS.reward[#CALLS.reward + 1] = i
+        -- The server has taken the token and granted the flask. 8243 leaves the
+        -- offer list at once (that list is the server's answer) — the BAG
+        -- COUNTS do not move until the settled bag update (Class 1).
+        local left = {}
+        for _, q in ipairs(W.available) do if q ~= ZQ then left[#left + 1] = q end end
+        W.available, W.questID = left, nil
+        if W.settleBags then W.bags[TOKEN] = 0 end
+        fire("QUEST_FINISHED")
+        if W.reshow then fire("GOSSIP_SHOW") else fire("GOSSIP_CLOSED") end
+    end
+
+    local fail = nil
+    local function ck(cond, why) if not fail and not cond then fail = why end end
+
+    local function rinOptions()
+        return {
+            { name = "Tell me about the Zandalar tribe", gossipOptionID = 770, icon = 132048 },
+            { name = "I want to browse your goods",      gossipOptionID = VENDOR, icon = 132060 },
+        }
+    end
+
+    fs.autoQuest = { eko = false, zgCoins = false, roids = false, autoRepair = true,
+                     zanza = { enabled = true, priority = { "swiftness" },
+                               defaultsApplied = true } }
+
+    local function scene(t)
+        resetCalls()
+        Auto._repairArmedAt, Auto._repairCooldown = nil, {}
+        Auto._bankSnapshot = nil
+        Auto._rinVisit, Auto._rinDepth = nil, 0
+        Auto._zanzaCooldown, Auto._zanzaPending = {}, nil
+        Auto._zanzaChoices, Auto._zanzaWatch = nil, false
+        Store.data.rinwoshoTrace = { schema = 1, visits = {}, world = {} }
+        W = { clock = 1000, shift = false, guid = RIN, options = rinOptions(),
+              available = { 8196, 8246, ZQ }, bags = { [TOKEN] = 1 }, free = 5,
+              dur = { [5] = { 40, 100 } }, canRepair = true, cost = 12345, money = 999999,
+              choices = { { itemID = SWIFT, name = "Swiftness of Zanza" } },
+              questID = nil,
+              -- world 4 + the unkind postures are the defaults.
+              reshow = false, merchantReturn = false,
+              sync = true, settleBags = false, closeOnQuest = true }
+        for k, v in pairs(t or {}) do W[k] = v end
+    end
+
+    -- One physical visit: the owner clicks the NPC, the client shows gossip.
+    local function visit(t)
+        for k, v in pairs(t or {}) do W[k] = v end
+        fire("GOSSIP_SHOW")
+        drain()
+    end
+    -- The owner walks away; the client goes quiet and the visit rolls into the
+    -- ring (the same lazy commit a client with no timer API performs).
+    local function walkAway()
+        W.clock = W.clock + Auto.RIN_VISIT_GRACE + 1
+        Auto.RinCommitIfStale(W.clock)
+    end
+    -- The next physical visit, KEEPING everything the addon has learned.
+    local function again(t)
+        walkAway()
+        resetCalls()
+        Auto._repairArmedAt = nil
+        visit(t)
+    end
+    -- The settled bag update the client owes us after a turn-in: the token is
+    -- gone, the flask arrives (which is what CONFIRMS the delivery and clears
+    -- the 30 s rejection stamp), and the owner drinks it — otherwise every
+    -- later visit in this test would honestly refuse with "all-owned".
+    local function settle()
+        W.bags[TOKEN] = 0
+        W.bags[SWIFT] = (W.bags[SWIFT] or 0) + 1
+        fire("BAG_UPDATE_DELAYED")
+        drain()
+        W.bags[SWIFT] = 0
+        fire("BAG_UPDATE_DELAYED")
+        drain()
+    end
+    local function ring() return (Store.GetRinwoshoTrace and Store.GetRinwoshoTrace()) or {} end
+    local function last() return ring()[1] end
+    local function hasStep(v, ev, act)
+        for _, s in ipairs(v and v.steps or {}) do
+            if s.ev == ev and (act == nil or s.act == act) then return true end
+        end
+        return false
+    end
+    local function world() return Store.GetRinwoshoWorld() or {} end
+
+    ------------------------------------------------------------------
+    -- 1. WORLD 4 (R=N, M=N) — the client permits exactly one action, and the
+    --    turn-in takes it. This IS 1.1.9's behaviour and it is the right
+    --    behaviour here: the flasks are the point, the repair is the bonus.
+    ------------------------------------------------------------------
+    scene({})
+    visit({})
+    ck(#CALLS.quest == 1 and CALLS.quest[1] == ZQ,
+       "world 4: the turn-in is selected, got " .. tostring(CALLS.quest[1]))
+    ck(#CALLS.reward == 1, "world 4: the reward is taken")
+    ck(#CALLS.option == 0, "world 4: no vendor option (the client never came back)")
+    ck(CALLS.repaired == 0, "world 4: nothing repaired on this visit")
+    walkAway()
+    ck(last() ~= nil and last().sig == "R=N M=? turn-in=yes repair=no",
+       "world 4 signature, got " .. tostring(last() and last().sig))
+    ck(world().reshowMissed == 1, "world 4: the missing re-show is counted")
+    --    …and the repair takes the NEXT visit, which is the degradation the
+    --    strategy promises rather than a loss.
+    settle()
+    again({ available = { 8196, 8246 } })
+    ck(CALLS.option[1] == VENDOR, "world 4: the repair takes the next visit")
+    ck(CALLS.repaired == 1, "world 4: …and it repairs")
+    ck(CALLS.closedMerchant == 1, "world 4: …and closes the window it opened")
+    ck(Auto._rinDepth == 0, "world 4: the Class 9 depth unwound")
+
+    ------------------------------------------------------------------
+    -- 2. WORLD 1 (R=Y, M=Y) — THE FIX. One physical visit, both actions, in
+    --    the spec's order, with the bag counts still reading the PRE-turn-in
+    --    world on the re-show (Class 1).
+    ------------------------------------------------------------------
+    scene({ reshow = true, merchantReturn = true })
+    visit({})
+    ck(#CALLS.quest == 1 and CALLS.quest[1] == ZQ, "world 1: the turn-in still goes first")
+    ck(#CALLS.reward == 1, "world 1: the reward is taken")
+    ck(W.bags[TOKEN] == 1, "world 1 FIXTURE: the bag count is still stale (Class 1)")
+    ck(CALLS.option[1] == VENDOR,
+       "world 1: the repair takes the re-shown window, got " .. tostring(CALLS.option[1]))
+    ck(CALLS.repaired == 1, "world 1: BOTH actions land on one visit")
+    ck(CALLS.closedMerchant == 1, "world 1: our merchant window is closed")
+    ck(#CALLS.option == 1, "world 1: the vendor option is selected ONCE per visit")
+    walkAway()
+    local v = last()
+    ck(v ~= nil and v.both == true, "world 1: the visit records both=true")
+    ck(v ~= nil and v.sig == "R=Y M=Y turn-in=yes repair=yes",
+       "world 1 signature, got " .. tostring(v and v.sig))
+    ck(hasStep(v, "GOSSIP_SHOW", "re-show after turn-in"),
+       "world 1: the re-show is recorded as such")
+    ck(hasStep(v, "REPAIR", "vendor option selected"), "world 1: the repair step is recorded")
+    ck(hasStep(v, "MERCHANT_SHOW", "ours"), "world 1: the merchant window is recorded as ours")
+    ck(world().reshowSeen == 1 and world().returnSeen == 1,
+       "world 1: both client behaviours are learned")
+
+    ------------------------------------------------------------------
+    -- 3. WORLD 2 (R=Y, M=N) — the re-show is the whole mechanism, so the
+    --    merchant close not returning to gossip changes nothing.
+    ------------------------------------------------------------------
+    scene({ reshow = true, merchantReturn = false })
+    visit({})
+    ck(#CALLS.reward == 1 and CALLS.repaired == 1, "world 2: both actions land on one visit")
+    ck(#CALLS.option == 1, "world 2: one vendor selection")
+    walkAway()
+    ck(last().sig == "R=Y M=N turn-in=yes repair=yes",
+       "world 2 signature, got " .. tostring(last().sig))
+
+    ------------------------------------------------------------------
+    -- 4. WORLD 3 (R=N, M=Y) — the world turn-in-first cannot win, and the one
+    --    the repair-first ordering exists for. It is NOT taken on trust: the
+    --    first visits behave exactly like world 4 while the client is unproven,
+    --    and the licence is issued only from observations that cost nothing.
+    ------------------------------------------------------------------
+    scene({ reshow = false, merchantReturn = true })
+    visit({})
+    ck(#CALLS.reward == 1, "world 3 (unproven): the turn-in still wins")
+    ck(#CALLS.option == 0, "world 3 (unproven): repair-first must NOT fire on a guess")
+    walkAway()
+    ck(world().reshowMissed == 1, "world 3: one non-re-show learned")
+    --    A second token visit: still unproven (M has never been observed).
+    settle()
+    W.bags[TOKEN] = 1
+    W.available = { 8196, 8246, ZQ }
+    again({})
+    ck(#CALLS.reward == 1 and #CALLS.option == 0,
+       "world 3: two non-re-shows still do not license a reorder without M")
+    walkAway()
+    ck(world().reshowMissed == 2, "world 3: R=N is now proven")
+    ck(Auto.DecideRepairFirstLicense(world()) == false, "world 3: still unlicensed without M")
+    --    An ORDINARY repair visit — no token, nothing at stake — is where M is
+    --    learned. This is the whole safety argument: the licence is bought with
+    --    an observation that could never have cost a flask.
+    settle()
+    again({ available = { 8196, 8246 } })
+    ck(CALLS.repaired == 1, "world 3: the no-token visit repairs as usual")
+    ck(CALLS.closedMerchant == 1, "world 3: …and closes our window")
+    walkAway()
+    ck(world().returnSeen == 1, "world 3: the gossip hand-back is observed")
+    ck(Auto.DecideRepairFirstLicense(world()) == true, "world 3: NOW the reorder is licensed")
+    --    …and the next token visit lands BOTH, repair first — the owner's
+    --    stated ShadowNetwork order ("it repairs and then grabs the zanzas").
+    W.bags[TOKEN] = 1
+    again({ available = { 8196, 8246, ZQ } })
+    ck(CALLS.option[1] == VENDOR, "world 3: the repair goes FIRST")
+    ck(CALLS.repaired == 1, "world 3: …and it repairs")
+    ck(#CALLS.quest == 1 and CALLS.quest[1] == ZQ,
+       "world 3: …and the returned gossip still takes the turn-in")
+    ck(#CALLS.reward == 1, "world 3: BOTH actions land on one visit")
+    ck(#CALLS.option == 1, "world 3: one vendor selection")
+    walkAway()
+    ck(last().both == true, "world 3: the visit records both=true")
+    ck(hasStep(last(), "REPAIR-FIRST", "licensed"), "world 3: the reorder is recorded")
+    ck(Auto._rinDepth == 0, "world 3: the Class 9 depth unwound through the nesting")
+
+    ------------------------------------------------------------------
+    -- 5. THE COOLDOWN SWALLOW — the owner's report, reproduced and pinned.
+    --
+    --    RED CONTROL: the shipped 1.1.9 rule (no `sameVisit` concept) refuses
+    --    the re-show with "cooling" whenever the owner repaired at Rin'wosho
+    --    within the last five seconds — which, on a client that re-shows, is
+    --    every second visit. The 5 s guard was written against retry storms and
+    --    was eating the second half of one visit.
+    ------------------------------------------------------------------
+    local shipped = Auto.DecideRinwoshoRepair({
+        enabled = true, shift = false, npcID = Auto.ZANZA_NPC, zanzaIdle = true,
+        damaged = true, now = 1002, cooldowns = { repair = 1000 },
+    })
+    ck(shipped == false, "RED CONTROL: the 1.1.9 rule refuses the re-show inside the cooldown")
+
+    scene({ reshow = true, merchantReturn = false })
+    visit({ bags = {}, available = { 8196, 8246 } })          -- an ordinary repair visit
+    ck(CALLS.repaired == 1, "cooldown: the first visit repairs and stamps the attempt")
+    walkAway()
+    --    Two seconds later, with a token: the turn-in fires and the re-show
+    --    must NOT be swallowed by the storm guard.
+    W.clock = 1002
+    resetCalls()
+    Auto._repairArmedAt = nil
+    visit({ bags = { [TOKEN] = 1 }, available = { 8196, 8246, ZQ } })
+    ck(#CALLS.reward == 1, "cooldown: the turn-in fires")
+    ck(CALLS.repaired == 1,
+       "cooldown: the same-visit re-show is NOT swallowed by the 5 s attempt guard")
+    --    …and the guard itself is intact: a plain re-open 2 s after an attempt,
+    --    with no turn-in involved, is still refused.
+    walkAway()
+    W.clock = 1003
+    resetCalls()
+    Auto._repairArmedAt = nil
+    visit({ bags = {}, available = { 8196, 8246 } })
+    ck(#CALLS.option == 0, "cooldown: a plain re-open inside 5 s is still refused")
+
+    ------------------------------------------------------------------
+    -- 6. THE GUARDS, UNCHANGED. Shift, the 8196/8246 blacklist, the
+    --    nothing-damaged case, and the disabled toggle.
+    ------------------------------------------------------------------
+    scene({ reshow = true, merchantReturn = true })
+    visit({ shift = true })
+    ck(#CALLS.quest == 0 and #CALLS.option == 0, "shift: nothing at all happens")
+    ck(CALLS.repaired == 0, "shift: nothing is repaired")
+    ck(#ring() == 0 and Auto._rinVisit == nil, "shift: not even a visit is opened")
+
+    scene({ reshow = true, merchantReturn = true })
+    visit({ dur = { [5] = { 100, 100 } } })
+    ck(#CALLS.reward == 1, "undamaged: the turn-in still fires")
+    ck(#CALLS.option == 0, "undamaged: no vendor option is selected")
+    walkAway()
+    ck(last().sig == "R=Y M=? turn-in=yes repair=no:nothing-damaged",
+       "undamaged signature, got " .. tostring(last().sig))
+
+    scene({ reshow = true, merchantReturn = true })
+    fs.autoQuest.autoRepair = false
+    visit({})
+    ck(#CALLS.reward == 1, "repair off: the turn-in still fires")
+    ck(#CALLS.option == 0, "repair off: no vendor option is selected")
+    fs.autoQuest.autoRepair = true
+
+    --    Zanza switched off with a token in the bags: the flow is idle by the
+    --    spec's third arm and the repair takes the visit outright.
+    scene({ reshow = true, merchantReturn = true })
+    fs.autoQuest.zanza = { enabled = false, priority = { "swiftness" }, defaultsApplied = true }
+    visit({})
+    ck(#CALLS.quest == 0, "zanza off: the turn-in is not taken")
+    ck(CALLS.option[1] == VENDOR, "zanza off: the repair takes the visit")
+    fs.autoQuest.zanza = { enabled = true, priority = { "swiftness" }, defaultsApplied = true }
+
+    --    8196 / 8246 are on offer in every scene above and must never be
+    --    selected — restated here as its own assertion.
+    scene({ reshow = true, merchantReturn = true })
+    visit({})
+    for _, q in ipairs(CALLS.quest) do
+        ck(q ~= 8196 and q ~= 8246, "8196/8246 must never be auto-progressed, got " .. tostring(q))
+    end
+
+    ------------------------------------------------------------------
+    -- 7. THE ASYNC POSTURE, as a named variant (Class 9). Same worlds, same
+    --    verdicts, with every event delivered after its API call returned.
+    ------------------------------------------------------------------
+    for _, w in ipairs({ { 1, true, true }, { 2, true, false }, { 4, false, false } }) do
+        scene({ reshow = w[2], merchantReturn = w[3], sync = false })
+        visit({})
+        ck(#CALLS.reward == 1, ("async world %d: the turn-in fires"):format(w[1]))
+        ck(CALLS.repaired == (w[2] and 1 or 0),
+           ("async world %d: repair=%s"):format(w[1], tostring(CALLS.repaired)))
+    end
+
+    ------------------------------------------------------------------
+    -- 8. THE KIND BAG POSTURE. With the counts settling instantly the answer
+    --    must be identical — the flow may not be RELYING on a stale read.
+    ------------------------------------------------------------------
+    scene({ reshow = true, merchantReturn = true, settleBags = true })
+    visit({})
+    ck(#CALLS.reward == 1 and CALLS.repaired == 1,
+       "settled bags: both actions still land on one visit")
+
+    ------------------------------------------------------------------
+    -- 9. THE VISIT BOUNDARY. A mid-visit GOSSIP_CLOSED (the quest frame
+    --    replacing the gossip frame) must not end the visit; a walk-away must.
+    ------------------------------------------------------------------
+    scene({ reshow = true, merchantReturn = true })
+    visit({})
+    ck(#ring() == 0, "the mid-visit closes did not commit the visit early")
+    ck(Auto._rinVisit ~= nil, "…and the visit is still in flight")
+    walkAway()
+    ck(#ring() == 1, "the walk-away commits exactly one visit record")
+
+    fs.autoQuest         = savedAQ
+    Auto._repairArmedAt  = savedArm
+    Auto._repairCooldown = savedCD
+    Auto._bankSnapshot   = savedBank
+    Auto._rinVisit       = savedVisit
+    Auto._rinDepth       = 0
+    Auto._zanzaCooldown, Auto._zanzaPending  = savedZ[1], savedZ[2]
+    Auto._zanzaChoices,  Auto._zanzaWatch    = savedZ[3], savedZ[4]
+    Store.data = savedData
     for _, k in ipairs(NAMES) do _G[k] = SAVE[k] end
     if fail then return false, fail end
     return true
@@ -6507,6 +7489,11 @@ function Auto.RunSelfTests(verbose)
                                         fn = testRinwoshoRepairGate },
         { name = "rin'wosho: gossip->vendor->repair->close, live path",
                                         fn = testRinwoshoRepairLive },
+        { name = "rin'wosho: repair-first licence (rule per row)",
+                                        fn = testRepairFirstLicense },
+        { name = "rin'wosho: class-9 re-entry fuse", fn = testRinDepthFuse },
+        { name = "rin'wosho: one visit, both actions, all four client worlds",
+                                        fn = testRinwoshoOneVisit },
         { name = "quest title + reward", fn = testTitleAndReward },
         { name = "keyword pools disjoint", fn = testKeywordPools },
         { name = "forbidden quests",    fn = testForbiddenQuests },
@@ -6601,6 +7588,40 @@ if ns.RegisterDebugCommand then
                     ns:Print(("      disp %d: raw=%s ord=%s id=%s %s")
                         :format(oi, tostring(o.pos), tostring(o.ord), tostring(o.id), tostring(o.name)))
                 end
+            end
+        end
+    end)
+
+    -- /dsn debug rinwosho -> the 1.1.10 visit ring plus the learned world.
+    --
+    -- This is the command that answers the question the owner's report could
+    -- not: on a visit with a token in the bags and damaged gear, does the
+    -- client hand the gossip window back after the reward (R), and does it hand
+    -- it back after we close the merchant window (M)? Each visit prints its own
+    -- signature; the world block prints what the counters have learned and
+    -- whether the repair-first ordering is licensed yet.
+    ns:RegisterDebugCommand("rinwosho", function()
+        local w = Store.GetRinwoshoWorld and Store.GetRinwoshoWorld() or nil
+        local licensed, why = Auto.DecideRepairFirstLicense(w)
+        ns:Print(("rin'wosho world: re-show after reward seen=%s missed=%s ; gossip back after "
+              .. "merchant close seen=%s missed=%s (learned on build %s)")
+            :format(tostring(w and w.reshowSeen or 0), tostring(w and w.reshowMissed or 0),
+                    tostring(w and w.returnSeen or 0), tostring(w and w.returnMissed or 0),
+                    tostring(w and w.build or "-")))
+        ns:Print("  repair-before-turn-in: " .. (licensed and "LICENSED" or ("no (" .. tostring(why) .. ")")))
+        local ring = Store.GetRinwoshoTrace and Store.GetRinwoshoTrace() or nil
+        if not ring or #ring == 0 then
+            ns:Print("rin'wosho trace: no recorded visits yet -- talk to Rin'wosho (14921) and re-check.")
+            return
+        end
+        ns:Print(("rin'wosho trace: %d recorded visit(s), newest first:"):format(#ring))
+        for vi, v in ipairs(ring) do
+            ns:Print(("  #%d %s build=%s [%s] both=%s -> %s")
+                :format(vi, date and date("%Y-%m-%d %H:%M", v.at or 0) or tostring(v.at),
+                        tostring(v.build), tostring(v.sig), tostring(v.both), tostring(v.outcome)))
+            for _, s in ipairs(v.steps or {}) do
+                ns:Print(("    +%-5s %s: %s%s"):format(tostring(s.t), tostring(s.ev),
+                    tostring(s.act), s.why and (" (" .. tostring(s.why) .. ")") or ""))
             end
         end
     end)
