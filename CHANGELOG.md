@@ -1,5 +1,29 @@
 # Changelog
 
+## Unreleased
+
+- **Fixed: the search box on the profession window filters the recipe list again.**
+  Typing into it did nothing at all — the whole Blacksmithing list sat there,
+  Orcish War Leggings and Steel Breastplate and everything else, with the search
+  text still in the box. The filter *was* being sent to the game; it just was not
+  there any more by the time the list was drawn. The two controls that carry a way
+  to check what the game actually kept — the search box and *Have Materials* — were
+  the only two that never checked, so the panel could report success over a list it
+  had not touched, and the recipe scan then refused to run all session because it
+  believed a filter was engaged that was not.
+
+  Now those two are applied **last**, after everything else that rebuilds the list,
+  and then **read back**: if the game did not keep what it was given, it is sent
+  once more, and only then believed. A filter this client genuinely will not accept
+  is said out loud once, dropped from the search box rather than left sitting there
+  filtering nothing, and — the part that matters most — no longer blocks the
+  profession scan behind a filter that does not exist.
+
+- `/nexus debug proffilters` now answers a filter complaint in one paste: what is
+  in the box, what the module thinks it is filtering on, what the game says it is
+  actually holding, how the last apply ended, and the row count — alongside the
+  existing echo/fuse counters.
+
 ## 1.1.11 — 2026-08-11
 
 - **Fixed: hovering a row in the Inventory tab now shows the item's own tooltip, and
