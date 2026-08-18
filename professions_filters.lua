@@ -80,6 +80,12 @@
 --
 -- ══ AND A FOURTH, WHICH IS NOT ABOUT CAPTURE AT ALL ══════════════════════════
 --
+--   3b. AND THE VIEW GUARD MUST NOT LIE EITHER (fix/prof-filter). Interlock 1
+--      answers out of OUR state, so a filter that never reached the client still
+--      reports the window as narrowed and the capture refuses every scan for a
+--      narrowing that does not exist. A dimension the client will not keep is
+--      therefore rolled OUT of our state — see "THE WITNESSED DIMENSIONS".
+--
 --   4. NON-REENTRANCY (fix/filter-reentry, CLIENT_ASYNC_LESSONS class 9). The
 --      client dispatches the update these setters cause SYNCHRONOUSLY, inside
 --      the setter call, so every handler in the session — ours included — runs
@@ -137,8 +143,11 @@ Filters._probing   = nil     -- surface -> true while we are moving the client's
 Filters._unhonored = nil     -- surface -> { dimension -> true } this client ignores
 Filters._redrawFn  = nil     -- surface -> the client's own list-update function name
 Filters._native    = nil     -- surface -> depth of the native-call sequence in flight
+Filters._nativeAt  = nil     -- surface -> GetTime() the OUTERMOST sequence armed at
 Filters._reentries = nil     -- surface -> how many sequences the depth fuse refused
 Filters._echoes    = nil     -- surface -> how many of our own echoes we swallowed
+Filters._healed    = nil     -- surface -> how many stuck latches were cleared
+Filters._applied   = nil     -- surface -> the LAST apply's verdict (diagnostics)
 
 ----------------------------------------------------------------------
 -- Stand-down
@@ -307,6 +316,10 @@ function Filters.Api(surface, G)
             isProfession= G.CraftIsEnchanting,
             line        = G.GetCraftDisplaySkillLine,
             setMakeable = G.CraftOnlyShowMakeable,
+            -- The have-materials witness is ONE global on this client family and
+            -- it answers for both surfaces (professions.lua's view guard has
+            -- always read it unconditionally). See "THE WITNESSED DIMENSIONS".
+            getMakeable = G.GetOnlyShowMakeable,
             setSlot     = G.SetCraftFilter,
             getSlot     = G.GetCraftFilter,
             slots       = G.GetCraftSlots,
@@ -322,6 +335,7 @@ function Filters.Api(surface, G)
         setText     = G.SetTradeSkillItemNameFilter,
         getText     = G.GetTradeSkillItemNameFilter,
         setMakeable = G.TradeSkillOnlyShowMakeable,
+        getMakeable = G.GetOnlyShowMakeable,
         -- Not a control we offer; a leftover we clear. See ClearNative.
         setSkillUps = G.TradeSkillOnlyShowSkillUps,
         setSub      = G.SetTradeSkillSubClassFilter,
@@ -618,11 +632,55 @@ function Filters.NativeDepth(surface)
     return (Filters._native and Filters._native[surface]) or 0
 end
 
+-- ══ A LATCH OLDER THAN ITS OWN CALL STACK IS A BUG, NOT A STATE ═════════════
+--
+-- WithNative saves and restores under pcall, so no path in this file can leave
+-- the latch armed, and leg (10) proves an erroring sequence still unwinds it.
+-- The live 1.1.11 filter report was NOT a stuck latch either — the depth read
+-- zero and the fuse had refused nothing. But "the audit found no way" is exactly
+-- the argument v1.1.8 shipped on, and a wedged latch is the one failure this
+-- module cannot recover from on its own: every apply, every clear and every
+-- capture would be refused in silence for the rest of the session.
+--
+-- So the invariant is ASSERTED rather than trusted, and the assertion is exact
+-- rather than a heuristic. GetTime() is the frame's start time and is CONSTANT
+-- for the whole of that frame, and a C call stack cannot span frames. A latch
+-- stamped in an EARLIER frame than the one now asking therefore cannot still
+-- have its arming call underneath it: it is orphaned, by proof. It is cleared,
+-- counted, and written into the forensics ring — never silently, because a
+-- self-heal nobody can see is how a fault turns into folklore.
+function Filters.HealStuckLatch(surface)
+    local depth = (Filters._native and Filters._native[surface]) or 0
+    if depth <= 0 then return false end
+    local at  = Filters._nativeAt and Filters._nativeAt[surface]
+    local now = _G.GetTime and _G.GetTime()
+    if type(at) ~= "number" or type(now) ~= "number" or now <= at then return false end
+    Filters._native[surface] = 0
+    if Filters._probing  then Filters._probing[surface]  = nil end
+    if Filters._nativeAt then Filters._nativeAt[surface] = nil end
+    Filters._healed = Filters._healed or {}
+    Filters._healed[surface] = (Filters._healed[surface] or 0) + 1
+    noteProbe(surface, "latch-healed", "depth " .. tostring(depth) .. " armed at "
+        .. tostring(at) .. ", now " .. tostring(now)
+        .. " build " .. tostring(Filters.ClientBuild()))
+    return true
+end
+
 -- Are WE inside a native sequence on this surface? (nil surface: any surface.)
+-- Every reader passes through the orphan check above, so a wedged latch cannot
+-- outlive the frame that armed it however it got there.
 function Filters.NativeBusy(surface)
-    if surface then return Filters.NativeDepth(surface) > 0 end
+    if surface then
+        Filters.HealStuckLatch(surface)
+        return Filters.NativeDepth(surface) > 0
+    end
     if not Filters._native then return false end
-    for _, d in pairs(Filters._native) do if (d or 0) > 0 then return true end end
+    for s, d in pairs(Filters._native) do
+        if (d or 0) > 0 then
+            Filters.HealStuckLatch(s)
+            if Filters.NativeDepth(s) > 0 then return true end
+        end
+    end
     return false
 end
 
@@ -654,6 +712,13 @@ function Filters.WithNative(surface, what, fn)
         return false, "reentry"
     end
     Filters._native[surface] = depth + 1
+    -- The OUTERMOST arming is stamped with the frame it happened in; that stamp
+    -- is what makes an orphaned latch provable rather than suspected. See
+    -- Filters.HealStuckLatch.
+    if depth == 0 then
+        Filters._nativeAt = Filters._nativeAt or {}
+        Filters._nativeAt[surface] = (_G.GetTime and _G.GetTime()) or 0
+    end
     -- The view guard's witness rides the same latch, so the capture layer sees
     -- "probing" for exactly as long as the client's filters are ours to move.
     Filters._probing = Filters._probing or {}
@@ -662,6 +727,7 @@ function Filters.WithNative(surface, what, fn)
     local ok, err = pcall(fn)
     Filters._probing[surface] = wasProbing
     Filters._native[surface] = depth
+    if depth == 0 and Filters._nativeAt then Filters._nativeAt[surface] = nil end
     return ok, err
 end
 
@@ -864,6 +930,144 @@ function Filters.ApplyPickers(surface, api, state, G)
     return true, final
 end
 
+----------------------------------------------------------------------
+-- ══ THE WITNESSED DIMENSIONS: SET IS NOT LANDED ═════════════════════════════
+--    (fix/prof-filter — the 1.1.11 live defect)
+--
+-- THE DEFECT THIS CLOSES. The owner typed into the search box on a live 11509
+-- Blacksmithing window and the recipe list did not narrow by one row: Orcish War
+-- Leggings, Mithril Scale Bracers and Steel Breastplate sat there alongside the
+-- Green Iron items with "green" in the box. Not a wedged latch (the depth
+-- unwound to zero and the fuse never refused a thing), not a dead script (the
+-- keystroke reached the debounce and the debounce reached the client). The
+-- setter was CALLED, and the filter was not THERE afterwards.
+--
+-- WHY IT WAS INVISIBLE. This file's whole doctrine is that a call whose effect
+-- it cannot verify must not be trusted — "every filter call is a HYPOTHESIS and
+-- the client's own row count is the experiment". Two dimensions were exempted
+-- from it, in writing: "the two dimensions whose meaning is NOT in doubt: one
+-- string, one boolean, BOTH WITH GETTERS THAT READ BACK WHAT WAS SET." The
+-- getters existed. Nothing ever called them. So the one pair of dimensions with
+-- a cheap, exact, already-available witness was the only pair applied blind —
+-- and when the client did not keep what it was given, ApplyNative returned true,
+-- the panel kept its text, and no counter anywhere moved.
+--
+-- IT IS WORSE THAN A DEAD CONTROL. Filters.ViewGuard answers out of OUR state,
+-- so a filter that never landed still reports the window as narrowed: the
+-- capture layer refuses every scan ("view-filtered") for a narrowing that does
+-- not exist. The player gets an unfiltered list AND a profession that stops
+-- updating. A control that lies costs more than a control that is absent.
+--
+-- THE MECHANISM, REPRODUCED. Two client shapes produce exactly that screenshot,
+-- and the suite drives both (testPanelEndToEnd, postures "picker" and "redraw"):
+--
+--   * "picker" — the client re-syncs its filter RECORD from its own widgets
+--     whenever the list is rebuilt, and the picker setters rebuild it. This file
+--     already established that the two picker setters share one record; a record
+--     that also carries the name filter means the show-all sweep — dozens of
+--     setter calls — runs AFTER the text was set and wipes it. Order alone.
+--   * "redraw" — the client's own list-update function does the re-syncing, so
+--     the repaint we ask for is what erases us.
+--
+-- THE FIX, IN THREE PARTS, none of which interprets a client value:
+--
+--   1. ORDER. The witnessed dimensions go LAST, after every picker call and
+--      after the repaint that follows them. The pickers already reason this way
+--      among themselves ("everything that should show ALL goes first, and the
+--      narrowing calls go last"); text and have-materials were simply left at
+--      the front of the sequence, which is the "picker" shape's whole opening.
+--   2. PROOF. After the push, the getter is READ. Landed / not landed / no
+--      witness at all are three different answers and the third is never read as
+--      the first (class 4: absence of proof is not absence).
+--   3. ONE BOUNDED RE-ASSERT, THEN THE TRUTH. A dimension that did not land is
+--      pushed once more — a client that re-syncs on a rebuild is beaten by
+--      having the last word — and if the second round does not land either, the
+--      dimension is NOT HONORED: recorded, said once, and ROLLED OUT of our own
+--      state so the view guard stops claiming a narrowing the client refused.
+--      Bounded at one extra round: a loop against a client that keeps taking the
+--      filter back is the overflow this module already paid for once.
+--
+-- All of it inside the native latch, so every echo the extra calls provoke is
+-- still recognisably ours (class 9).
+----------------------------------------------------------------------
+
+-- How many times a witnessed dimension may be re-pushed within one sequence.
+Filters.MAX_REASSERTS = 1
+
+-- PURE(ish). true = the client kept it, false = it did not, nil = THIS CLIENT
+-- OFFERS NO WITNESS and we may not assert either way.
+function Filters.TextLanded(api, want)
+    if not (type(api) == "table" and api.getText) then return nil end
+    local ok, got = pcall(api.getText)
+    if not ok or type(got) ~= "string" then return nil end
+    return Filters.Trim(got) == Filters.Trim(want)
+end
+
+function Filters.MakeableLanded(api, want)
+    if not (type(api) == "table" and api.getMakeable) then return nil end
+    local ok, got = pcall(api.getMakeable)
+    if not ok or type(got) ~= "boolean" then return nil end
+    return got == (want and true or false)
+end
+
+-- The two unambiguous pushes, together, so "set them again" is one call.
+function Filters.PushWitnessed(surface, api, state)
+    if api.setText then pcall(api.setText, Filters.Trim(state.text)) end
+    if api.setMakeable then pcall(api.setMakeable, state.makeable and true or false) end
+    return true
+end
+
+-- PUSH AND PAINT AS ONE UNIT, then prove the unit. Returns outcome, rounds:
+--   "landed"       the client kept what it was given, first time.
+--   "re-asserted"  it took a second round, and the second round held.
+--   "not-honored"  it will not keep it. The caller rolls the dimension out.
+--   "unwitnessed"  neither dimension has a getter on this client: no verdict.
+--
+-- THE PAIRING IS THE POINT. Verifying the push BEFORE the repaint would pass on
+-- a client whose repaint is the thief — the record would be right and the rows
+-- on screen would be the rows from before, which is the same screenshot the
+-- owner sent. So the repaint is inside the loop and the witness is read AFTER
+-- it: what is proven is "the client is holding this filter AND has drawn it".
+--
+-- And the loop is BOUNDED at MAX_REASSERTS extra rounds. A client that keeps
+-- taking the filter back is a client this panel cannot drive, and grinding
+-- against it is how a module that already paid for one stack overflow pays
+-- again. The bound turns it into an honest stand-down instead.
+function Filters.LandWitnessed(surface, api, state, G)
+    Filters._unhonored = Filters._unhonored or {}
+    Filters._unhonored[surface] = Filters._unhonored[surface] or {}
+    local bad = Filters._unhonored[surface]
+    local rounds = 0
+    while true do
+        Filters.PushWitnessed(surface, api, state)
+        Filters.Redraw(surface, G)
+        local t = Filters.TextLanded(api, state.text)
+        local m = Filters.MakeableLanded(api, state.makeable)
+        if t == nil and m == nil then return "unwitnessed", rounds end
+        if t ~= false and m ~= false then
+            -- Whatever a previous apply could not make stick, this one did —
+            -- but ONLY a non-trivial assertion may un-condemn a dimension. An
+            -- EMPTY search filter "lands" on every client alive, and the apply
+            -- that follows a roll-back is exactly that: clearing the condemned
+            -- dimension on the strength of the call that cleared it would erase
+            -- the refusal from the diagnostics and re-arm the same futile round
+            -- on the very next keystroke. A vacuous witness is not a witness.
+            if t == true and Filters.Trim(state.text) ~= "" then bad.text = nil end
+            if m == true and state.makeable then bad.makeable = nil end
+            return (rounds > 0) and "re-asserted" or "landed", rounds
+        end
+        if rounds >= Filters.MAX_REASSERTS then
+            if t == false then bad.text = true end
+            if m == false then bad.makeable = true end
+            noteProbe(surface, "not-honored",
+                (t == false and "text " or "") .. (m == false and "makeable" or "")
+                .. " after " .. tostring(rounds + 1) .. " round(s)")
+            return "not-honored", rounds
+        end
+        rounds = rounds + 1
+    end
+end
+
 -- Every call is guarded and pcall'd. A client that has moved on and dropped one
 -- of these functions loses that dimension, not the window.
 --
@@ -873,33 +1077,44 @@ end
 function Filters.ApplyNative(surface, state, G)
     state = state or Filters.NewState()
     local pushErr = nil
+    local outcome, rounds = nil, 0
     local ok, err = Filters.WithNative(surface, "apply", function()
         local api = Filters.Api(surface, G)
         local pushed, perr = pcall(function()
-            -- The two dimensions whose meaning is NOT in doubt: one string, one
-            -- boolean, both with getters that read back what was set.
-            if api.setText then pcall(api.setText, Filters.Trim(state.text)) end
-            if api.setMakeable then pcall(api.setMakeable, state.makeable and true or false) end
-            -- ...and the two whose argument convention the catalog does not carry.
+            -- THE PICKERS FIRST — the dimensions whose argument convention the
+            -- catalog does not carry, and whose show-all sweep is dozens of
+            -- setter calls into a record they share. Anything set BEFORE that
+            -- sweep is set into a record the sweep then rewrites.
             Filters.ApplyPickers(surface, api, state, G)
+            -- ...then the repaint that closes the picker work out, so whatever
+            -- housekeeping the client does on a rebuild is behind us.
+            --
+            -- INSIDE the latch (class 9): the client's own list-update function
+            -- runs the game's refresh, and anything that refresh announces comes
+            -- back at our handlers synchronously. v1.1.8 released the latch first.
+            Filters.Redraw(surface, G)
+            -- ...and the two dimensions that have a WITNESS go LAST — pushed,
+            -- painted and PROVEN. Set is not landed, and that is the whole of
+            -- fix/prof-filter.
+            outcome, rounds = Filters.LandWitnessed(surface, api, state, G)
         end)
         if not pushed then pushErr = perr end
-        -- The client filtered; now make it repaint. Without this the list on
-        -- screen is the list from before the filter, which is indistinguishable
-        -- to a player from a filter that does not work.
-        --
-        -- INSIDE the latch (class 9): the client's own list-update function runs
-        -- the game's refresh, and anything that refresh announces comes back at
-        -- our handlers synchronously. v1.1.8 released the latch first.
-        Filters.Redraw(surface, G)
     end)
     if err == "reentry" then return false end
     if not ok then pushErr = pushErr or err end
+    -- The last apply's verdict, for `/nexus debug proffilters`. Recorded even on
+    -- the error path: "we do not know" is an answer the owner can act on.
+    Filters._applied = Filters._applied or {}
+    Filters._applied[surface] = {
+        outcome = pushErr and "error" or (outcome or "unwitnessed"),
+        rounds = rounds, want = Filters.Trim(state.text),
+        makeable = state.makeable and true or false,
+    }
     if pushErr then
         noteProbe(surface, "apply-error", tostring(pushErr))
         return false
     end
-    return true
+    return outcome ~= "not-honored"
 end
 
 -- Everything back to "show me all of it". This is what runs on window show and
@@ -951,19 +1166,38 @@ end
 -- A dimension this client would not honor is reported ONCE and then rolled back
 -- out of our own state, so the control cannot sit there looking engaged while
 -- the list behind it is unfiltered. Honest absence beats a lying control.
+--
+-- The witnessed dimensions (text, have-materials) roll back the same way and for
+-- the same reason, which is the half fix/prof-filter had to add: a search box
+-- whose text the client keeps taking back left `narrowed` true forever, so the
+-- capture refused every scan for a filter that was not there. Rolling the state
+-- out is what makes the guard honest again — the box is emptied with it, so the
+-- player is never left looking at text that filters nothing.
+local UNHONORED_LABEL = {
+    subclass = "category", slot = "slot", text = "search", makeable = "have-materials",
+}
+
 function Filters.NoteUnhonored(surface, st)
     local bad = Filters._unhonored and Filters._unhonored[surface]
     if not bad then return false end
     local rolled = false
     Filters._toldUnhonored = Filters._toldUnhonored or {}
-    for _, key in ipairs({ "subclass", "slot" }) do
+    for _, key in ipairs({ "subclass", "slot", "text", "makeable" }) do
         if bad[key] then
-            if st and (tonumber(st[key]) or 0) > 0 then st[key] = 0 rolled = true end
+            if st then
+                if key == "text" then
+                    if Filters.Trim(st.text) ~= "" then st.text = "" rolled = true end
+                elseif key == "makeable" then
+                    if st.makeable then st.makeable = false rolled = true end
+                elseif (tonumber(st[key]) or 0) > 0 then
+                    st[key] = 0 rolled = true
+                end
+            end
             local tag = surface .. ":" .. key
             if not Filters._toldUnhonored[tag] and ns.Print then
                 Filters._toldUnhonored[tag] = true
                 ns:Print("this client does not honor the " ..
-                    (key == "slot" and "slot" or "category") ..
+                    (UNHONORED_LABEL[key] or key) ..
                     " filter on the " .. surface .. " window — the control is standing down.")
             end
         end
@@ -1487,8 +1721,11 @@ function Filters.Teardown()
     Filters._textTimer = nil
     Filters._probing   = nil
     Filters._native    = nil
+    Filters._nativeAt  = nil
     Filters._reentries = nil
     Filters._echoes    = nil
+    Filters._healed    = nil
+    Filters._applied   = nil
     -- The measured conventions go too. They describe a client we are no longer
     -- talking to, and a form remembered across a teardown is the sticky
     -- calibration class 5 warns about wearing a different hat.
@@ -1502,31 +1739,80 @@ end
 -- Diagnostics
 ----------------------------------------------------------------------
 
-ns:RegisterDebugCommand("proffilters", function()
+-- Held on the module as well as handed to the registry, so the self-tests can
+-- prove it RUNS. A diagnostic surface that throws in the state you needed it for
+-- is worse than no diagnostic surface at all, and the states this one has to
+-- survive are the awkward ones: no window, no panel, no client API, a dimension
+-- the client refused.
+-- `emit` is an optional line sink; the registry calls this with the command's
+-- argument string, so anything that is not a function falls back to printing.
+function Filters.DebugDump(emit)
+    local say = (type(emit) == "function") and emit or function(m) ns:Print(m) end
     local active, why = Filters.Status()
-    ns:Print("profession filters: " .. (active and "ACTIVE" or "standing down")
+    say("profession filters: " .. (active and "ACTIVE" or "standing down")
         .. " — " .. tostring(why))
     for _, surface in ipairs(Filters.SURFACES) do
         local api = Filters.Api(surface)
         local keys = Filters.DimensionKeys(api)
         local st = Filters._state and Filters._state[surface]
-        ns:Print(string.format("  %s: frame=%s | dimensions=%s | open=%s | narrowed=%s",
+        say(string.format("  %s: frame=%s | dimensions=%s | open=%s | narrowed=%s",
             surface, tostring(api.frame ~= nil),
             (#keys > 0) and table.concat(keys, ",") or "none",
             tostring(st ~= nil), tostring(Filters.ViewGuard(surface))))
     end
-    ns:Print(string.format("  activated=%s | cpf=%s | panels=%s",
+    say(string.format("  activated=%s | cpf=%s | panels=%s",
         tostring(Filters._activated), tostring(Filters.ProbeCPF().cpfLoaded),
         tostring(Filters._panels ~= nil)))
     -- THE CLASS-9 READOUT. `echoes` is how many of our own update events this
     -- client dispatched back at us mid-sequence — on a synchronous-dispatch
     -- client it is never zero — and `fused` must stay zero: it counts sequences
     -- the depth fuse had to refuse, which is a composition nobody foresaw.
+    -- `healed` must stay zero too: it counts latches found orphaned by the
+    -- frame-stamp proof, i.e. wedged, which is a bug however it heals.
     for _, surface in ipairs(Filters.SURFACES) do
-        ns:Print(string.format("  %s echo discipline: depth=%d | echoes swallowed=%d"
-            .. " | fuse refusals=%d", surface, Filters.NativeDepth(surface),
+        say(string.format("  %s echo discipline: depth=%d | echoes swallowed=%d"
+            .. " | fuse refusals=%d | latches healed=%d", surface,
+            Filters.NativeDepth(surface),
             (Filters._echoes and Filters._echoes[surface]) or 0,
-            (Filters._reentries and Filters._reentries[surface]) or 0))
+            (Filters._reentries and Filters._reentries[surface]) or 0,
+            (Filters._healed and Filters._healed[surface]) or 0))
+    end
+    -- ══ THE FILTER READOUT (fix/prof-filter) ═══════════════════════════════
+    -- "The filter does nothing" must be answerable from ONE paste, so every
+    -- link in the chain is printed side by side: what the player TYPED (the
+    -- box), what this module BELIEVES (the state), what the CLIENT says it is
+    -- holding (the getters — the witness that was never read), how the last
+    -- apply ended, and how many rows the client is enumerating right now. A
+    -- box and a state that disagree is a reset racing the typing; a state and
+    -- a client that disagree is the client taking the filter back.
+    for _, surface in ipairs(Filters.SURFACES) do
+        local api = Filters.Api(surface)
+        local st  = Filters._state and Filters._state[surface]
+        local panel = Filters._panels and Filters._panels[surface]
+        local c = (panel and panel._controls) or EMPTY
+        local box = nil
+        if c.text and c.text.editBox and c.text.editBox.GetText then
+            local okB, t = pcall(c.text.editBox.GetText, c.text.editBox)
+            box = okB and t or nil
+        end
+        local gotText, gotMake = "no getter", "no getter"
+        if api.getText then
+            local okT, t = pcall(api.getText)
+            gotText = okT and string.format("%q", tostring(t)) or "ERROR"
+        end
+        if api.getMakeable then
+            local okM, m = pcall(api.getMakeable)
+            gotMake = okM and tostring(m) or "ERROR"
+        end
+        local last = Filters._applied and Filters._applied[surface]
+        say(string.format("  %s filter: box=%s | state=%s/makeable=%s | client=%s/%s",
+            surface, box and string.format("%q", box) or "(no box)",
+            st and string.format("%q", Filters.Trim(st.text)) or "(closed)",
+            tostring(st and st.makeable or false), gotText, gotMake))
+        say(string.format("    last apply: %s (re-asserts=%s, wanted %s) | rows=%s",
+            last and last.outcome or "none yet", last and tostring(last.rounds) or "-",
+            last and string.format("%q", last.want) or "-",
+            tostring(Filters.RowCount(surface) or "?")))
     end
     -- WHAT THIS CLIENT ACTUALLY HONORS, as measured rather than as assumed.
     -- This is the readout that answers the question P3 could only flag.
@@ -1536,7 +1822,7 @@ ns:RegisterDebugCommand("proffilters", function()
         local badList = {}
         for key in pairs(bad or EMPTY) do badList[#badList + 1] = key end
         table.sort(badList)
-        ns:Print(string.format("  %s conventions: subAll=%s subPick=%s slotAll=%s slotPick=%s"
+        say(string.format("  %s conventions: subAll=%s subPick=%s slotAll=%s slotPick=%s"
             .. " | interfere=%s | redraw=%s | rows=%s%s", surface,
             Filters.FormName(conv and conv.subAll), Filters.FormName(conv and conv.subPick),
             Filters.FormName(conv and conv.slotAll), Filters.FormName(conv and conv.slotPick),
@@ -1545,7 +1831,10 @@ ns:RegisterDebugCommand("proffilters", function()
             tostring(Filters.RowCount(surface) or "?"),
             (#badList > 0) and (" | NOT HONORED: " .. table.concat(badList, ",")) or ""))
     end
-end)
+    return true
+end
+
+ns:RegisterDebugCommand("proffilters", Filters.DebugDump)
 
 ----------------------------------------------------------------------
 -- Self-tests (suite "proffilters")
@@ -1994,12 +2283,29 @@ end
 -- "sync" is therefore the default; "async" (a queued echo, or none if the
 -- fixture has no timer) is the kinder variant, kept so the fix is proven under
 -- both and never only under the one that unwinds the stack first.
-local function newConventionSim(convention, rows, dispatch)
+local function newConventionSim(convention, rows, dispatch, clobber)
     local G = _G
     local sim = { rows = rows or convFixture(), saved = {}, redraws = 0,
-                  convention = convention, dispatch = dispatch or "sync", echoes = 0 }
+                  convention = convention, dispatch = dispatch or "sync", echoes = 0,
+                  clobber = clobber, ownBox = "" }
     sim.f = { text = "", makeable = false, sub = 0, slot = 0, skillUps = false,
               allSub = true, allSlot = true }
+
+    -- THE CLIENT OWNS ITS OWN FILTER WIDGETS. On a client whose trade-skill
+    -- window carries its own search box and have-materials tick, the filter
+    -- RECORD is re-synced from those widgets whenever the list is rebuilt — so
+    -- a filter WE set is wiped by the client's own housekeeping, and the wipe
+    -- rides the very repaint we asked for. `sim.ownBox` is what the client's own
+    -- box holds (empty: the player typed in OUR box, not Blizzard's).
+    --   "picker" — the picker setters re-sync the record (they already share it).
+    --   "redraw" — the list-update function re-syncs it.
+    local function resync()
+        if sim.clobber then
+            sim.f.text = sim.ownBox or ""
+            sim.f.makeable = false
+        end
+    end
+    sim.resync = resync
 
     -- The echo goes to THIS module's handler only: the capture layer's own
     -- composition with these events is the composed chain's territory
@@ -2054,6 +2360,7 @@ local function newConventionSim(convention, rows, dispatch)
             f.allSub  = (a == 1)
             f.allSlot = (b == 1)
         end
+        if sim.clobber == "picker" then resync() end
     end
 
     function sim:install()
@@ -2098,6 +2405,7 @@ local function newConventionSim(convention, rows, dispatch)
         sim.displayed = sim.visible()
         G.TradeSkillFrame_Update = function()
             sim.redraws = sim.redraws + 1
+            if sim.clobber == "redraw" then resync() end
             sim.displayed = sim.visible()
         end
     end
@@ -2568,6 +2876,69 @@ local function testNativeConventions(fails)
                "an error inside a native sequence left the latch armed forever")
             Filters._native, Filters._reentries = nil, nil
         end
+
+        -- ══ (11) THE ORPHANED LATCH HEALS, AND SAYS SO ═══════════════════════
+        -- Suspect one for the 1.1.11 report was a wedged latch: every apply and
+        -- every clear refused in silence for the rest of the session, which is
+        -- the exact symptom the owner described. It was NOT the cause — the
+        -- depth read zero and the fuse had refused nothing — and no path in this
+        -- file can leave it armed. But "the audit found no way" is what v1.1.8
+        -- shipped on, so the invariant is asserted: a latch stamped in an
+        -- earlier FRAME than the one asking cannot still have its arming call
+        -- underneath it (GetTime is constant within a frame; a C stack cannot
+        -- span frames). Cleared, counted, traced — never silently.
+        do
+            local savedGetTime = _G.GetTime
+            local okHeal, errHeal = pcall(function()
+                Filters._native, Filters._nativeAt, Filters._healed = nil, nil, nil
+                local now = 1000
+                _G.GetTime = function() return now end
+
+                -- A latch armed and abandoned (only reachable through a bug —
+                -- forced here, which is the only way to test the recovery).
+                Filters._native   = { [TRADESKILL] = 1 }
+                Filters._nativeAt = { [TRADESKILL] = now }
+                Filters._probing  = { [TRADESKILL] = true }
+                ck(Filters.NativeBusy(TRADESKILL) == true,
+                   "the latch did not read as busy inside its own frame")
+                ck((Filters._healed and Filters._healed[TRADESKILL] or 0) == 0,
+                   "a latch was healed inside the very frame that armed it — the "
+                   .. "arming call may still be underneath it")
+
+                -- The frame ends. Anything still armed is orphaned, by proof.
+                now = 1001
+                ck(Filters.NativeBusy(TRADESKILL) == false,
+                   "an orphaned latch survived the frame that armed it — every "
+                   .. "apply, clear and capture would refuse in silence forever")
+                ck(Filters.NativeDepth(TRADESKILL) == 0,
+                   "the healed latch did not unwind to zero")
+                ck((Filters._probing and Filters._probing[TRADESKILL]) ~= true,
+                   "the healed latch left the capture layer's probing witness up, "
+                   .. "which wedges the scan instead of the filter")
+                ck((Filters._healed and Filters._healed[TRADESKILL] or 0) == 1,
+                   "the heal was not counted for the diagnostics — a self-heal "
+                   .. "nobody can see is how a fault becomes folklore")
+
+                -- A LEGITIMATE sequence is never healed out from under itself,
+                -- however long the frame runs.
+                Filters._native, Filters._nativeAt, Filters._healed = nil, nil, nil
+                local sawBusy = nil
+                Filters.WithNative(TRADESKILL, "heal-test", function()
+                    sawBusy = Filters.NativeBusy(TRADESKILL)
+                end)
+                ck(sawBusy == true, "a live sequence healed its own latch away")
+                ck((Filters._healed and Filters._healed[TRADESKILL] or 0) == 0,
+                   "a live sequence was counted as an orphan")
+                ck(Filters.NativeDepth(TRADESKILL) == 0,
+                   "the latch did not unwind after the live sequence returned")
+            end)
+            _G.GetTime = savedGetTime
+            Filters._native, Filters._nativeAt, Filters._healed = nil, nil, nil
+            Filters._probing = nil
+            if not okHeal then
+                fails[#fails + 1] = "error in latch-heal fixtures: " .. tostring(errHeal)
+            end
+        end
     end)
 
     reset()
@@ -2615,6 +2986,392 @@ local function testInertness(fails)
     if not ok then fails[#fails + 1] = "error in inertness fixtures: " .. tostring(err) end
 end
 
+----------------------------------------------------------------------
+-- ══ THE PANEL, END TO END: A KEYSTROKE MUST REACH THE ROWS ══════════════════
+--    (fix/prof-filter — the 1.1.11 live defect)
+--
+-- THE BLIND SPOT THIS CLOSES, NAMED. Every leg above drives Filters.ApplyNative
+-- and its neighbours DIRECTLY. Not one of them ever built the panel, because the
+-- headless kit had no MakeEditBox / MakeCheckbox / MakeDropdown to build it with
+-- — so EnsurePanel, the search box's OnTextChanged, the debounce, SetState and
+-- RefreshPanel were, all together, structurally invisible to the suite. The
+-- owner's report is "typing in the search box does nothing", which is precisely
+-- the span of code no test could see. A kit that lacks the widgets the code
+-- under test uses is a KINDER CLIENT in exactly the sense class 9 named about
+-- absent setters, and the fix is the same one: stub every widget the panel
+-- actually builds, and drive the player's own path — keystroke, debounce, apply,
+-- repaint — rather than the API underneath it.
+--
+-- THE CLIENT POSTURES. The list is filtered by the client, so "did it work?" is
+-- a question about the client, and the shipped code must come out right under
+-- every shape it might be:
+--   "none"    the client keeps what it is given. The happy path.
+--   "picker"  the client re-syncs its filter record from ITS OWN widgets when
+--             the list is rebuilt, and the picker setters rebuild it. The
+--             pre-fix order set the text FIRST and then ran the show-all sweep
+--             over it: the text was gone before the repaint. THE OWNER'S
+--             SCREENSHOT, and the leg carries the pre-fix sequence as its red
+--             control.
+--   "redraw"  the client's own list-update does the re-syncing, so the repaint
+--             this module asks for is what erases it. Unwinnable by
+--             construction: the assertion here is that the module SAYS SO —
+--             rolls the dimension out of its own state, empties the box, and
+--             leaves the capture layer unblocked — rather than sitting there
+--             with text in a box that filters nothing.
+--
+-- Both dispatch postures, always (class 9): the echo that lands inside the
+-- setter call and the one that lands a frame later are different hazards.
+----------------------------------------------------------------------
+
+local function fakeWidget()
+    local w = { _scripts = {}, _shown = false, _text = "" }
+    setmetatable(w, { __index = function(t, k)
+        if type(k) == "string" and k:sub(1, 1) == "_" then return nil end
+        return function(self) return self end
+    end })
+    w.SetScript = function(self, s, fn) self._scripts[s] = fn return self end
+    w.GetScript = function(self, s) return self._scripts[s] end
+    w.HookScript = function(self, s, fn)
+        local prev = self._scripts[s]
+        self._scripts[s] = function(...) if prev then prev(...) end return fn(...) end
+        return self
+    end
+    w.Fire = function(self, s, ...) local fn = self._scripts[s]
+        if fn then return fn(self, ...) end end
+    w.Show = function(self) self._shown = true
+        local fn = self._scripts.OnShow if fn then fn(self) end return self end
+    w.Hide = function(self) self._shown = false
+        local fn = self._scripts.OnHide if fn then fn(self) end return self end
+    w.IsShown = function(self) return self._shown end
+    w.SetText = function(self, t) self._text = tostring(t or "")
+        local fn = self._scripts.OnTextChanged if fn then fn(self, false) end return self end
+    w.GetText = function(self) return self._text end
+    w.CreateFontString = function() return fakeWidget() end
+    w.GetFrameLevel = function() return 1 end
+    return w
+end
+
+local function fakeKit()
+    local UI = { fonts = { muted = "GameFontDisableSmall" } }
+    UI.FlatFrame  = function() return fakeWidget() end
+    UI.MakeButton = function(_, opts) local b = fakeWidget() b.Click =
+        function() if opts.onClick then opts.onClick() end end return b end
+    UI.MakeEditBox = function(_, opts)
+        local frame, box = fakeWidget(), fakeWidget()
+        frame.editBox = box
+        frame.Refresh = function() box:SetText(opts.get and (opts.get() or "") or "") end
+        box:SetScript("OnEnterPressed", function(self)
+            if opts.set then opts.set(self:GetText()) end end)
+        frame:SetScript("OnShow", function() frame.Refresh() end)
+        frame.Refresh()
+        return frame
+    end
+    UI.MakeCheckbox = function(_, opts)
+        local cb = fakeWidget() cb.uiWidth = 120
+        cb.Refresh = function() end
+        cb.Click = function() if opts.set then opts.set(not (opts.get and opts.get())) end end
+        return cb
+    end
+    UI.MakeDropdown = function(_, opts)
+        local dd = fakeWidget()
+        dd.SetValue = function(self, v) self._value = v return self end
+        dd.Pick = function(self, v) self._value = v if opts.set then opts.set(v) end end
+        return dd
+    end
+    return UI
+end
+
+-- THE RED CONTROL: v1.1.11's ApplyNative, in the order it shipped. The two
+-- witnessed dimensions go FIRST, the picker sweep runs over the top of them, the
+-- repaint closes, and NOTHING is ever read back — the getters this file's own
+-- comment cited as the reason those two dimensions were safe were never called.
+local function prefixWitnessedOrder(surface, state, G)
+    return Filters.WithNative(surface, "apply-prefix", function()
+        local api = Filters.Api(surface, G)
+        if api.setText then pcall(api.setText, Filters.Trim(state.text)) end
+        if api.setMakeable then pcall(api.setMakeable, state.makeable and true or false) end
+        Filters.ApplyPickers(surface, api, state, G)
+        Filters.Redraw(surface, G)
+    end)
+end
+
+local function testPanelSession(fails, posture, dispatch)
+    local function ck(c, m)
+        if not c then fails[#fails + 1] = posture .. "/" .. dispatch .. ": " .. m end
+    end
+    local P = ns.Professions
+
+    local savedUI, savedTimer = _G.DaseekiUI, _G.C_Timer
+    local savedPanels, savedState, savedProf = Filters._panels, Filters._state, Filters._prof
+    local savedConv = { Filters._conv, Filters._unhonored, Filters._probing,
+                        Filters._redrawFn, Filters._toldUnhonored,
+                        Filters._native, Filters._reentries, Filters._echoes,
+                        Filters._applied, Filters._nativeAt, Filters._healed }
+    local db = ns.Store and ns.Store.GetSettings and ns.Store.GetSettings()
+    local savedSetting = db and db.professionsEnabled
+
+    local Q = {}
+    local function flush()
+        local n = 0
+        while #Q > 0 and n < 200 do
+            local job = table.remove(Q, 1)
+            pcall(job)
+            n = n + 1
+        end
+    end
+
+    local savedWorld = P and { P._leavingWorld, P._loggingOut, P._enteredWorldAt, P._live,
+                               P._scanAt, P._windowOpen, P._retry, P._settled, P._stale,
+                               P._harvested, P._harvestJob, P._viewGuards }
+    local savedTime = _G.GetTime
+    local savedArea = ns.Store and ns.Store.data and ns.Store.data.professions
+
+    local ok, err = pcall(function()
+        if P and P.SetEnabled then P.SetEnabled(true) end
+        _G.GetTime = function() return 20000 end
+        P._leavingWorld, P._loggingOut = false, false
+        P._enteredWorldAt = 0
+        P._live, P._scanAt = nil, nil
+        P._settled, P._stale = nil, nil
+        P._harvested, P._harvestJob = nil, nil
+        P._windowOpen, P._retry = nil, nil
+        P.ClearViewGuards()
+        P.RegisterViewGuard(Filters.ViewGuard)
+
+        local sim = newConventionSim("triple", nil, dispatch,
+                                     (posture ~= "none") and posture or nil)
+        sim:install()
+        -- THE PEER HANDLER RIDES THE SAME DISPATCH. The client raises ONE
+        -- TRADE_SKILL_UPDATE and EVERY addon's handler runs before the setter
+        -- returns; newConventionSim only wakes this file's. Live, the capture
+        -- layer's handler runs in the same breath.
+        for _, name in ipairs({ "SetTradeSkillItemNameFilter", "TradeSkillOnlyShowMakeable",
+                                "TradeSkillOnlyShowSkillUps", "SetTradeSkillSubClassFilter",
+                                "SetTradeSkillInvSlotFilter" }) do
+            local real = _G[name]
+            if real then
+                _G[name] = function(a, b, c)
+                    real(a, b, c)
+                    if P and P._onEvent then P._onEvent(nil, "TRADE_SKILL_UPDATE") end
+                end
+            end
+        end
+        local function reset()
+            Filters.ForgetConventions(nil)
+            Filters._conv, Filters._unhonored, Filters._probing = nil, nil, nil
+            Filters._redrawFn, Filters._toldUnhonored = nil, nil
+            Filters._native, Filters._nativeAt = nil, nil
+            Filters._reentries, Filters._echoes, Filters._healed = nil, nil, nil
+            Filters._applied = nil
+        end
+        reset()
+        Filters._panels, Filters._state, Filters._prof = nil, nil, nil
+
+        _G.DaseekiUI = fakeKit()
+        _G.C_Timer = { After = function(_, fn) Q[#Q + 1] = fn end }
+
+        local full = _G.GetNumTradeSkills()
+        ck(full == 7, "the fixture did not start unfiltered (" .. tostring(full) .. " rows)")
+
+        -- ══ THE RED CONTROL, on the shape that produced the report ═══════════
+        -- Only on "picker": that is the client whose rebuild re-syncs the record
+        -- the show-all sweep keeps rebuilding, so the pre-fix ORDER is what
+        -- loses the text. Replay it and the owner's screenshot comes back — a
+        -- state that says "arcanite" over a list that shows everything.
+        if posture == "picker" then
+            Filters._state = { [TRADESKILL] = Filters.NewState() }
+            local st = Filters._state[TRADESKILL]
+            st.text = "arcanite"
+            prefixWitnessedOrder(TRADESKILL, st, _G)
+            ck(_G.GetNumTradeSkills() == full,
+               "RED CONTROL DID NOT REPRODUCE: the pre-fix order narrowed after "
+               .. "all (" .. _G.GetNumTradeSkills() .. "/" .. full .. ") — the "
+               .. "fixture no longer models the defect")
+            ck(Filters.Trim(st.text) == "arcanite" and Filters.Narrowed(st) == true,
+               "RED CONTROL: the module stopped believing it was filtering, so it "
+               .. "is no longer reproducing the lie the owner was shown")
+            ck(Filters.ViewGuard(TRADESKILL) == true,
+               "RED CONTROL: the view guard did not report the phantom narrowing "
+               .. "that wedges the capture layer behind a filter that is not there")
+            Filters._state = nil
+            reset()
+        end
+
+        -- ══ THE WINDOW OPENS, through the events, both modules listening ═════
+        if P and P._onEvent then P._onEvent(nil, "TRADE_SKILL_SHOW") end
+        Filters._onEvent(nil, "TRADE_SKILL_SHOW")
+        flush()
+        -- ...and the server's own rebuild lands afterwards, as it does live.
+        if P and P._onEvent then P._onEvent(nil, "TRADE_SKILL_UPDATE") end
+        Filters._onEvent(nil, "TRADE_SKILL_UPDATE")
+        flush()
+
+        local panel = Filters._panels and Filters._panels[TRADESKILL]
+        ck(panel ~= nil, "no panel was built even with a widget kit present")
+        if not panel then return end
+        ck(_G.GetNumTradeSkills() == full,
+           "the window did not open UNFILTERED (" .. _G.GetNumTradeSkills()
+           .. "/" .. full .. ") — interlock 2")
+
+        local c = panel._controls or {}
+        ck(c.text ~= nil and c.makeable ~= nil and c.subclass ~= nil and c.slot ~= nil,
+           "the panel did not build all four dimensions this client offers")
+        local eb = c.text and c.text.editBox
+        ck(eb ~= nil, "the search box exposed no edit box, so nothing could wire live typing")
+        if not eb then return end
+        ck(eb:GetScript("OnTextChanged") ~= nil,
+           "OnTextChanged was never wired — typing could not reach the debounce")
+
+        -- ══ THE KEYSTROKES ═══════════════════════════════════════════════════
+        -- The client writes the character, then raises the script with
+        -- userInput true. Eight of them, as a player types them.
+        for i = 1, #("arcanite") do
+            eb._text = ("arcanite"):sub(1, i)
+            eb:Fire("OnTextChanged", true)
+        end
+        ck(_G.GetNumTradeSkills() == full,
+           "the debounce did not debounce: the client moved before the timer ran")
+        ck(#Q > 0, "not one keystroke reached the debounce timer")
+        flush()
+        -- The server's rebuild echo, after our sequence has already returned.
+        if P and P._onEvent then P._onEvent(nil, "TRADE_SKILL_UPDATE") end
+        Filters._onEvent(nil, "TRADE_SKILL_UPDATE")
+        flush()
+
+        local st = Filters._state and Filters._state[TRADESKILL]
+        local rows = _G.GetNumTradeSkills()
+        local disp = {}
+        for i = 1, #sim.displayed do disp[i] = sim.displayed[i].name end
+        local painted = table.concat(disp, ",")
+        local last = Filters._applied and Filters._applied[TRADESKILL]
+
+        -- ══ THE ONE PASTE ════════════════════════════════════════════════════
+        -- `/nexus debug proffilters` is what the owner is asked for when a
+        -- filter misbehaves, so it has to RUN — with a window up, a panel built,
+        -- and (on the refusing client) a condemned dimension in the table — and
+        -- it has to carry the whole chain, because a second round trip for a
+        -- filter bug is the thing this readout exists to prevent.
+        local dump = {}
+        ck(pcall(Filters.DebugDump, function(m) dump[#dump + 1] = tostring(m) end) == true,
+           "the diagnostics threw with the window open — the one paste the owner "
+           .. "is asked for is the one that would not run")
+        local paste = table.concat(dump, "\n")
+        for _, needed in ipairs({ "box=", "state=", "client=", "last apply:",
+                                  "echo discipline", "latches healed", "rows=" }) do
+            ck(paste:find(needed, 1, true) ~= nil,
+               "the diagnostics do not report " .. string.format("%q", needed)
+               .. ", so this defect would still cost a second round trip")
+        end
+
+        -- Whatever the client does, these hold: the latch unwinds, the fuse is
+        -- never reached, and no latch is ever found orphaned on a healthy path.
+        ck(Filters.NativeDepth(TRADESKILL) == 0, "the latch did not unwind to zero")
+        ck((Filters._reentries and Filters._reentries[TRADESKILL] or 0) == 0,
+           "the depth fuse had to refuse a sequence during ordinary typing")
+        ck((Filters._healed and Filters._healed[TRADESKILL] or 0) == 0,
+           "a latch was found orphaned during ordinary typing")
+        ck(last ~= nil, "the apply recorded no verdict for the diagnostics")
+
+        -- ...and THE BOX AND THE STATE NEVER DIVERGE. A box holding text that
+        -- the module is not filtering on is the owner's screenshot, whichever
+        -- way round it happened.
+        ck(Filters.Trim(eb:GetText()) == Filters.Trim(st and st.text or ""),
+           "the box says " .. string.format("%q", eb:GetText()) .. " and the state says "
+           .. string.format("%q", tostring(st and st.text)) .. " — a control that "
+           .. "displays a filter it is not applying is the whole defect")
+
+        if posture == "redraw" then
+            -- UNWINNABLE BY CONSTRUCTION: this client's repaint is the thief, so
+            -- there is no order that keeps the filter AND draws it. The contract
+            -- is that the module says so instead of pretending. The refusal is
+            -- STICKY (the roll-back apply that follows it trivially succeeds, and
+            -- that must not un-condemn the dimension) and it is what
+            -- `/nexus debug proffilters` prints as NOT HONORED.
+            ck((Filters._unhonored and Filters._unhonored[TRADESKILL]
+                and Filters._unhonored[TRADESKILL].text) == true,
+               "the refused search dimension was not recorded as unhonored, so the "
+               .. "diagnostics would show a filter chain that looks healthy")
+            ck(Filters.Trim(st and st.text or "") == "",
+               "the refused search text was left in the module's own state")
+            ck(Filters.Trim(eb:GetText()) == "",
+               "the refused search text was left on screen, filtering nothing")
+            ck(Filters.ViewGuard(TRADESKILL) == false,
+               "a filter the client refused still blocked the capture — the "
+               .. "profession would stop updating for a narrowing that is not there")
+            ck(rows == full, "the stood-down window is not showing the full list ("
+               .. rows .. "/" .. full .. ")")
+            ck(painted == "Weapons,Arcanite Reaper,Iron Sword,Armor,Iron Shield,"
+               .. "Arcanite Plate,Copper Chain",
+               "the stood-down window painted '" .. painted .. "'")
+        else
+            ck(last.outcome == "landed" or last.outcome == "re-asserted",
+               "the apply reported '" .. tostring(last.outcome) .. "'")
+            ck(rows == 4, "TYPING DID NOT FILTER: " .. rows .. " rows, expected 4")
+            ck(painted == "Weapons,Arcanite Reaper,Armor,Arcanite Plate",
+               "the painted list was '" .. painted .. "'")
+            ck(Filters.Trim(st and st.text or "") == "arcanite",
+               "the state lost the text the player typed")
+            ck(Filters.TextLanded(Filters.Api(TRADESKILL), "arcanite") == true,
+               "the client is not holding the filter the module believes it applied")
+            ck(Filters.ViewGuard(TRADESKILL) == true,
+               "a genuinely narrowed window did not guard the capture")
+
+            -- CLEARING GOES ALL THE WAY BACK, through the panel's own button.
+            if c.clear and c.clear.Click then c.clear.Click() end
+            flush()
+            ck(_G.GetNumTradeSkills() == full,
+               "Clear did not restore the full list (" .. _G.GetNumTradeSkills()
+               .. "/" .. full .. ")")
+            ck(Filters.Trim(eb:GetText()) == "", "Clear left text in the box")
+            ck(Filters.ViewGuard(TRADESKILL) == false, "Clear did not clear the guard")
+        end
+
+        -- The window closes: nothing of ours survives it.
+        Filters._onEvent(nil, "TRADE_SKILL_CLOSE")
+        if P and P._onEvent then P._onEvent(nil, "TRADE_SKILL_CLOSE") end
+        flush()
+        ck(Filters.ViewGuard(TRADESKILL) == false,
+           "a closed window still reported itself as narrowing")
+        ck(_G.GetNumTradeSkills() == full,
+           "the close left the client narrowed for whatever opens next")
+        ck(pcall(Filters.DebugDump, function() end) == true,
+           "the diagnostics threw with the window CLOSED, which is the state the "
+           .. "owner is most likely to run them in")
+
+        Filters._state = nil
+        sim:restore()
+    end)
+
+    _G.DaseekiUI, _G.C_Timer, _G.GetTime = savedUI, savedTimer, savedTime
+    if P and savedWorld then
+        P._leavingWorld, P._loggingOut, P._enteredWorldAt = savedWorld[1], savedWorld[2], savedWorld[3]
+        P._live, P._scanAt, P._windowOpen = savedWorld[4], savedWorld[5], savedWorld[6]
+        P._retry, P._settled, P._stale = savedWorld[7], savedWorld[8], savedWorld[9]
+        P._harvested, P._harvestJob = savedWorld[10], savedWorld[11]
+        P.ClearViewGuards()
+        P._viewGuards = savedWorld[12]
+    end
+    if ns.Store and ns.Store.data then ns.Store.data.professions = savedArea end
+    Filters._panels, Filters._state, Filters._prof = savedPanels, savedState, savedProf
+    Filters._conv, Filters._unhonored, Filters._probing = savedConv[1], savedConv[2], savedConv[3]
+    Filters._redrawFn, Filters._toldUnhonored = savedConv[4], savedConv[5]
+    Filters._native, Filters._reentries, Filters._echoes = savedConv[6], savedConv[7], savedConv[8]
+    Filters._applied, Filters._nativeAt, Filters._healed = savedConv[9], savedConv[10], savedConv[11]
+    if db then db.professionsEnabled = savedSetting end
+    if not ok then
+        fails[#fails + 1] = posture .. "/" .. dispatch
+            .. ": error in panel fixtures: " .. tostring(err)
+    end
+end
+
+local function testPanelEndToEnd(fails)
+    for _, dispatch in ipairs({ "sync", "async" }) do
+        for _, posture in ipairs({ "none", "picker", "redraw" }) do
+            testPanelSession(fails, posture, dispatch)
+        end
+    end
+end
+
 function Filters.RunSelfTests(verbose)
     local suites = {
         { name = "pure model (state, narrowing, plain matching, stand-down)", fn = testPureModel },
@@ -2623,6 +3380,9 @@ function Filters.RunSelfTests(verbose)
           fn = testNativeConventions },
         { name = "capture interlock (a filtered VIEW never becomes a filtered CAPTURE)",
           fn = testCaptureInterlock },
+        { name = "the panel end to end (a keystroke reaches the rows, three client "
+                 .. "postures x both dispatches, with the red control)",
+          fn = testPanelEndToEnd },
         { name = "inertness (off = no frame, no panel, no guard)", fn = testInertness },
     }
     local allPass = true
