@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+- **New: the minimap button's tooltip now shows where you stand against the
+  instance limit.** Below the world buff timers there is an **Instances** section:
+  how many of your five instances this hour are gone, then one line for each one
+  still counting — the instance, the character who went in, and when that slot
+  frees. A **Today** line joins them once the 30-per-day count climbs far enough
+  to be worth watching. Nothing this hour reads *none this hour* and stays out of
+  your way.
+
+  The 5-per-hour and 30-per-day limits are counted by the server **per account**,
+  not per character, so the section counts every character on the account together
+  — and any *other* account on your mesh that has been in an instance this hour
+  gets its own line, because that account's limit is the one that will stop it.
+  A re-entry into an instance that was still alive — a corpse run, a hearth and a
+  summon back, a relog inside — does not appear and is not counted, because the
+  server did not charge you for it either.
+
+  Hide the whole section with **Show instance count in button tooltip** in
+  Settings → General. Turning it off only hides it; the instance log keeps
+  recording, so switching it back on shows you the real hour rather than a gap.
+
+- **Fixed: the world buff countdowns in that tooltip are back in their state
+  colours.** Rend and both Onyxia timers had been rendering in plain white
+  whatever they were doing — the colour that says *this one is nearly up* was
+  being worked out on every hover and then thrown away before it reached the
+  screen. Amber for a kill, red under twenty minutes, green for Open.
+
 - **Fixed: the search box on the profession window filters the recipe list again.**
   Typing into it did nothing at all — the whole Blacksmithing list sat there,
   Orcish War Leggings and Steel Breastplate and everything else, with the search

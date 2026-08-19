@@ -711,6 +711,16 @@ local function buildGeneral(flow)
         get = function() local db = DB(); return db and db.minimap.lock end,
         set = function(v) local db = DB(); if db then db.minimap.lock = v and true or false end end,
     }).Refresh)
+    -- Same parent/child indent: this is a property of the minimap button's tooltip,
+    -- so it lives under the button that owns it rather than in a section of its own.
+    -- Default ON; turning it off hides the section only — the ledger keeps recording.
+    local rInst = sec:AddRow({ vAlign = "center" })
+    rInst._indent = rInst._indent + 20
+    register("general", rInst:Checkbox({
+        label = "Show instance count in button tooltip",
+        get = function() local db = DB(); return db and db.minimap.showInstances ~= false end,
+        set = function(v) local db = DB(); if db then db.minimap.showInstances = v and true or false end end,
+    }).Refresh)
 
     local r2 = sec:AddRow({ vAlign = "center" })
     register("general", r2:Checkbox({
@@ -2863,6 +2873,7 @@ local function buildHelp(flow)
     mm:Hint("Alt + Left-click \226\128\148 disabled on purpose. A logout macro would make the button a protected frame, so this build refuses the click and prints a note in chat instead.")
     mm:Hint("Other mouse buttons \226\128\148 nothing is bound to them.")
     mm:Hint("Hover \226\128\148 the tooltip shows the live Rend, Ony (A) and Ony (H) states and keeps them counting while the cursor stays on the button.")
+    mm:Hint("Hover \226\128\148 below the world buffs, an Instances section shows this account against the server's 5-per-hour limit, one line per instance still inside the hour (its name, the character that entered, and when that slot frees), and a Today line once the 30-per-day count climbs. The 5/hr and 30/day limits are per ACCOUNT, so any other account on your mesh with instances in the last hour gets its own line. Hide the section with \"Show instance count in button tooltip\" in Settings \226\134\146 General \226\128\148 the ledger keeps recording either way.")
     mm:Hint("Drag \226\128\148 slide the button around the minimap ring to reposition it, unless it is locked. Lock or unlock it with \"Lock minimap button\" in Settings \226\134\146 General or in the Shift + Right-click menu; hide it entirely with \"Show minimap button\" in Settings \226\134\146 General.")
 
     local tr = flow:AddSection("Troubleshooting")

@@ -1299,6 +1299,14 @@ local function defaultSettings()
             lock = false,
             -- free-floating button (NOT minimap-anchored, per §9)
             point = "CENTER", x = 0, y = 200,
+            -- The minimap tooltip's "Instances" section (the rolling 5/hr picture,
+            -- rendered BELOW the world-buff timers). ADDITIVE — one boolean, no
+            -- settingsVersion bump. applyDefaults refills absent leaf keys, so a
+            -- SavedVariables file written before this key existed comes up with the
+            -- section ON, exactly like a fresh install. Turning it off only stops the
+            -- section RENDERING: the instance ledger keeps recording either way, so
+            -- re-enabling shows the true window rather than a gap.
+            showInstances = true,
         },
         mesh = {
             token       = "",
