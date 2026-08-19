@@ -388,6 +388,190 @@ end
 -- Same model, same lines, both backends.
 ----------------------------------------------------------------------
 
+----------------------------------------------------------------------
+-- The "Instances" section — the rolling 5/hr picture, rendered BELOW the world
+-- buff timers as its own block.
+--
+-- This is a PURE READ over data instances.lua already owns. Nothing here detects,
+-- records, prunes or merges an instance entry: entry detection (PLAYER_ENTERING_WORLD
+-- -> IsInInstance/GetInstanceInfo), the server-time stamp, the rolling-window prune
+-- and the same-live-instance merge all live in instances.lua and are driven by its
+-- own sim. The section is a VIEW, so it adds no client-mutating call and therefore
+-- no Class 9 in-call dispatch surface of its own.
+--
+-- Cross-account for free: the 5/hr and 30/day limits are enforced PER ACCOUNT, and
+-- the mesh ALREADY replicates every peer's instance ledger (instances.lua
+-- MergeInbound, carried on the existing sync namespace). Instances.AllAccounts
+-- therefore hands us peers' counts with no new namespace and no new wire traffic —
+-- the peer lines are a read of data that was already on this disk.
+----------------------------------------------------------------------
+
+local HOUR_SECS   = 3600
+-- The "Today" line stays HIDDEN below this. The 30/day limit only becomes
+-- actionable near its cap, and the tooltip's job here is to stay quiet: an
+-- ever-present "4/30" is noise the owner would learn to stop reading.
+local DAY_SHOW_AT = 20
+-- Defensive bound on the row list. The hourly cap is 5, so a healthy ledger can
+-- never exceed it; a drifted or hand-imported one must not be able to grow the
+-- tooltip without limit.
+local MAX_ROWS    = 6
+
+-- Class ink for a character name. Same doctrine as the item-count tooltip and the
+-- Instances panel's roster grid: an UNKNOWN class renders NEUTRAL, never a guessed
+-- grey — a confidently wrong class colour is worse than no colour at all.
+local function classInk(tag)
+    local c = tag and ((_G.CUSTOM_CLASS_COLORS or _G.RAID_CLASS_COLORS or {})[tag])
+    if c and type(c.r) == "number" then return c.r, c.g, c.b end
+    return nil
+end
+
+local function inkHex(r, g, b)
+    if type(r) ~= "number" then return "" end
+    return string.format("|cff%02x%02x%02x", math.floor(r * 255 + 0.5),
+        math.floor(g * 255 + 0.5), math.floor(b * 255 + 0.5))
+end
+
+-- Minutes until an entry ages out of the rolling hour. Minute precision, never
+-- below 1: an entry with 20 seconds left has NOT freed yet, and "frees in 0m"
+-- would read as a slot the owner does not actually have.
+local function freesInMinutes(entryT, nowE)
+    local rem = (entryT or 0) + HOUR_SECS - (nowE or 0)
+    if rem < 0 then rem = 0 end
+    return math.max(1, math.ceil(rem / 60))
+end
+
+local function meterToken(count, cap, warn)
+    local IUI = ns.InstancesUI
+    if not (IUI and IUI.MeterState and IUI.StateToken) then return "muted" end
+    return IUI.StateToken(IUI.MeterState(count, cap, warn))
+end
+
+-- Build the section as model entries, or nil when it must not render at all.
+-- cfg.showInstances == false is the ONLY off switch; an ABSENT key renders (the
+-- stored default is true, and a caller handing us a partial cfg table — the
+-- self-test's { lock = ... } — must not silently lose the section).
+local function instanceSection(cfg, nowE)
+    if cfg and cfg.showInstances == false then return nil end
+
+    local E, IUI, Store = ns.Instances, ns.InstancesUI, ns.Store
+    if not (E and IUI and Store) then return nil end
+    if not (E.AllAccounts and IUI.GatherEntries and IUI.FilterEntries and IUI.ClassLookup) then
+        return nil
+    end
+
+    -- Server time, via the same helper the world-buff rows above use (Store.Now,
+    -- GetServerTime fallback). Entries are stamped with server time by
+    -- instances.lua, so the window arithmetic must be done in the same clock.
+    nowE = nowE or nowEpoch()
+    local selfAID = (ns.GetAccountID and ns:GetAccountID()) or ""
+    local view    = E.AllAccounts(nowE) or {}
+    local accounts = view.accounts or {}
+    local mine     = accounts[selfAID] or { hour = 0, day = 0 }
+
+    local hCap,  hWarn = E.HOURLY_CAP or 5, E.WARN_HOURLY or 4
+    local dCap,  dWarn = E.DAILY_CAP or 30, E.WARN_DAILY  or 27
+
+    local out = {}
+    out[#out + 1] = { k = "blank" }
+    out[#out + 1] = { k = "line", text = "Instances", color = "accent" }
+    out[#out + 1] = { k = "double", left = "This hour", color = "muted",
+                      right = string.format("%d/%d", mine.hour or 0, hCap),
+                      token = meterToken(mine.hour, hCap, hWarn) }
+    if (mine.day or 0) >= DAY_SHOW_AT then
+        out[#out + 1] = { k = "double", left = "Today", color = "muted",
+                          right = string.format("%d/%d", mine.day, dCap),
+                          token = meterToken(mine.day, dCap, dWarn) }
+    end
+
+    -- The rows: this account's OWN entries still inside the rolling hour. `merged`
+    -- entries are skipped for the same reason the cap math skips them — the serial
+    -- watcher proved they were a re-entry into the SAME live instance, which the
+    -- server never billed a second time.
+    local data  = Store.data
+    local list  = IUI.FilterEntries(IUI.GatherEntries(data and data.instances), { aid = selfAID })
+    local classBy = IUI.ClassLookup(data)
+
+    local rows = {}
+    for i = 1, #list do
+        local item = list[i]
+        local e = item and item.entry
+        local age = e and (nowE - (e.t or 0))
+        if e and not e.merged and age and age >= 0 and age < HOUR_SECS then
+            rows[#rows + 1] = item
+        end
+    end
+
+    if #rows == 0 then
+        -- Empty state matches the world-buff block above, which always states
+        -- itself ("no data") rather than vanishing.
+        out[#out + 1] = { k = "line", text = "none this hour", color = "faint" }
+    else
+        -- OLDEST FIRST, so "frees in" ascends and the top row is the next slot to
+        -- re-open. GatherEntries hands us newest-first, so this walks backwards.
+        local faintHex = inkHex(UI.Color("faint"))
+        local drawn = 0
+        for i = #rows, 1, -1 do
+            if drawn >= MAX_ROWS then break end
+            local item = rows[i]
+            local e    = item.entry
+            local short = tostring(item.nameRealm or "?"):match("^([^%-]+)") or item.nameRealm
+            local cr, cg, cb = classInk(classBy[item.nameRealm])
+            -- The right column carries its own colour escapes so the character and
+            -- the countdown are inked separately; the numeric args are the class
+            -- colour as the fallback for a client that strips escapes. The ink is
+            -- NOT in a string alone — a recorder that drops the numeric args must
+            -- still be able to see the class colour.
+            local right = (cr and (inkHex(cr, cg, cb) .. short .. "|r") or short)
+                          .. faintHex .. "  frees in " .. freesInMinutes(e.t, nowE) .. "m|r"
+            local row = { k = "double", color = "text",
+                          left = tostring(e.name or "?"), right = right }
+            if cr then row.rgb2 = { cr, cg, cb } else row.token = "text" end
+            out[#out + 1] = row
+            drawn = drawn + 1
+        end
+        -- Truncation is SAID, never silent. The hourly cap is 5, so reaching this
+        -- means a drifted or hand-imported ledger — and a tooltip that quietly drops
+        -- rows would under-report exactly when the picture matters most.
+        if #rows > drawn then
+            out[#out + 1] = { k = "line", color = "faint",
+                              text = string.format("+%d more this hour", #rows - drawn) }
+        end
+    end
+
+    -- Peer accounts, one line each — their own 5/hr meters. Skipped entirely when
+    -- a peer has nothing in the window, so a single-account owner never sees them.
+    local others = {}
+    for aid in pairs(accounts) do
+        if aid ~= selfAID and (accounts[aid].hour or 0) > 0 then others[#others + 1] = aid end
+    end
+    if #others > 0 then
+        -- Sorted: pairs() order is not stable across table lifetimes, and an
+        -- account list that reshuffles between two hovers is the tooltip reading
+        -- as though something changed when nothing did (Class 8, applied to a view).
+        local sorted = (ns.SortedAIDs and ns.SortedAIDs(accounts)) or nil
+        if sorted then
+            local keep = {}
+            for _, aid in ipairs(sorted) do
+                for _, want in ipairs(others) do
+                    if aid == want then keep[#keep + 1] = aid end
+                end
+            end
+            others = keep
+        else
+            table.sort(others, function(a, b) return tostring(a) < tostring(b) end)
+        end
+        for _, aid in ipairs(others) do
+            local c = accounts[aid]
+            out[#out + 1] = { k = "double", color = "faint",
+                              left = "Account " .. (tonumber(aid) or aid),
+                              right = string.format("%d/%d", c.hour or 0, hCap),
+                              token = meterToken(c.hour, hCap, hWarn) }
+        end
+    end
+
+    return out
+end
+
 local function buildTooltipModel(cfg)
     cfg = cfg or minimapCfg()
     local rendT, rendC = cdStatus("rend")
@@ -399,16 +583,46 @@ local function buildTooltipModel(cfg)
         { k = "double", left = "Rend",    right = rendT, color = "muted", token = rendC },
         { k = "double", left = "Ony (A)", right = onyAT, color = "muted", token = onyAC },
         { k = "double", left = "Ony (H)", right = onyHT, color = "muted", token = onyHC },
+    }
+    -- The Instances block sits BELOW the world buff timers and ABOVE the click
+    -- hints, in its own blank-separated section.
+    local inst = instanceSection(cfg)
+    if inst then
+        for i = 1, #inst do model[#model + 1] = inst[i] end
+    end
+    local tail = {
         { k = "blank" },
         { k = "line",   text = "Left: invite online",            color = "faint" },
         { k = "line",   text = "Shift-Left: invite, no convert", color = "faint" },
         { k = "line",   text = "Right: toggle dashboard",        color = "faint" },
         { k = "line",   text = "Shift-Right: menu",              color = "faint" },
     }
+    for i = 1, #tail do model[#model + 1] = tail[i] end
     if not cfg.lock then
         model[#model + 1] = { k = "line", text = "Drag to move", color = "faint" }
     end
     return model
+end
+
+-- The ink for a double line, as NUMBERS. AddDoubleLine takes two colour triples;
+-- the model has always carried a right-hand `token` (the world-buff state colour)
+-- and the renderer passed only three arguments, so that token was computed on every
+-- build and dropped on every render — the countdowns rendered default-white whatever
+-- state they were in. Both triples are passed now.
+--
+-- `rgb2` is the raw-numbers escape hatch for a colour that is not a UI token: the
+-- instance rows' CLASS ink. Deliberately numeric rather than a "|cff" string — a
+-- colour that lives only inside a string is invisible to the recording tooltip the
+-- self-test drives, so a regression that dropped it would render green.
+local function doubleInk(e)
+    local lr, lg, lb = UI.Color(e.color or "muted")
+    local rr, rg, rb
+    if type(e.rgb2) == "table" then
+        rr, rg, rb = e.rgb2[1], e.rgb2[2], e.rgb2[3]
+    elseif e.token then
+        rr, rg, rb = UI.Color(e.token)
+    end
+    return lr, lg, lb, rr, rg, rb
 end
 
 local function renderTooltip(tt, model)
@@ -416,7 +630,12 @@ local function renderTooltip(tt, model)
     model = model or buildTooltipModel()
     for _, e in ipairs(model) do
         if e.k == "double" then
-            tt:AddDoubleLine(e.left, e.right, UI.Color(e.color))
+            local lr, lg, lb, rr, rg, rb = doubleInk(e)
+            if type(rr) == "number" then
+                tt:AddDoubleLine(e.left, e.right, lr, lg, lb, rr, rg, rb)
+            else
+                tt:AddDoubleLine(e.left, e.right, lr, lg, lb)
+            end
         elseif e.k == "blank" then
             tt:AddLine(" ")
         else
@@ -854,13 +1073,33 @@ ns:RegisterSelfTest("minimap", function(verbose)
     -- recording tooltip (proves the lib backend emits our lines into the frame
     -- the library hands us, not GameTooltip).
     ------------------------------------------------------------------
+    -- The recorder captures the COLOUR ARGUMENTS, not only the text. The class ink
+    -- on an instance row is passed to AddDoubleLine as three numbers, so a recorder
+    -- that only kept the strings would watch the ink disappear and still go green —
+    -- the exact failure the Inventory tab's hand-written copy of the count block
+    -- shipped (see tooltips.lua RenderCountRows). The ink is not in a string.
     local function recorder()
         local r = { lines = {} }
-        function r:AddLine(text) self.lines[#self.lines + 1] = { k = "line", text = text } end
-        function r:AddDoubleLine(l, rt) self.lines[#self.lines + 1] = { k = "double", left = l, right = rt } end
+        function r:AddLine(text, cr, cg, cb)
+            self.lines[#self.lines + 1] = { k = "line", text = text, r = cr, g = cg, b = cb }
+        end
+        function r:AddDoubleLine(l, rt, lr, lg, lb, rr, rg, rb)
+            self.lines[#self.lines + 1] = { k = "double", left = l, right = rt,
+                                            r = lr, g = lg, b = lb,
+                                            r2 = rr, g2 = rg, b2 = rb }
+        end
         function r:ClearLines() self.lines = {} end
         function r:Show() self.shown = true end
         return r
+    end
+
+    -- Find a line by its left/text content; returns index + line.
+    local function findLine(lines, want)
+        for i = 1, #lines do
+            local e = lines[i]
+            if e.text == want or e.left == want then return i, e end
+        end
+        return nil
     end
 
     local rec = recorder()
@@ -870,11 +1109,12 @@ ns:RegisterSelfTest("minimap", function(verbose)
     check(L1[2] and L1[2].k == "double" and L1[2].left == "Rend",    "tooltip Rend doubleline")
     check(L1[3] and L1[3].k == "double" and L1[3].left == "Ony (A)", "tooltip Ony (A) doubleline")
     check(L1[4] and L1[4].k == "double" and L1[4].left == "Ony (H)", "tooltip Ony (H) doubleline")
-    check(L1[5] and L1[5].k == "line" and L1[5].text == " ",         "tooltip blank separator")
-    check(L1[6] and L1[6].text == "Left: invite online",             "tooltip hint 1")
-    check(L1[7] and L1[7].text == "Shift-Left: invite, no convert",  "tooltip hint 2")
-    check(L1[8] and L1[8].text == "Right: toggle dashboard",         "tooltip hint 3")
-    check(L1[9] and L1[9].text == "Shift-Right: menu",               "tooltip hint 4")
+    local hintStart = findLine(L1, "Left: invite online")
+    check(hintStart ~= nil, "tooltip hint 1")
+    check(L1[hintStart - 1] and L1[hintStart - 1].text == " ", "tooltip blank separator before hints")
+    check(L1[hintStart + 1] and L1[hintStart + 1].text == "Shift-Left: invite, no convert", "tooltip hint 2")
+    check(L1[hintStart + 2] and L1[hintStart + 2].text == "Right: toggle dashboard",        "tooltip hint 3")
+    check(L1[hintStart + 3] and L1[hintStart + 3].text == "Shift-Right: menu",              "tooltip hint 4")
 
     -- Drag hint is conditional on the lock setting, on BOTH backends.
     local unlocked = buildTooltipModel({ lock = false })
@@ -882,6 +1122,175 @@ ns:RegisterSelfTest("minimap", function(verbose)
     local locked = buildTooltipModel({ lock = true })
     check(locked[#locked].text == "Shift-Right: menu", "locked -> no drag hint")
     check(#unlocked == #locked + 1, "the drag hint is the only lock-dependent line")
+
+    ------------------------------------------------------------------
+    -- THE INSTANCES SECTION.
+    --
+    -- Driven against a hand-built store so the window boundaries are exact rather
+    -- than whatever the harness happens to hold. The section is a pure READ over
+    -- instances.lua's ledger — detection, the server-time stamp and the same-live-
+    -- instance merge are that module's suite, and are not re-litigated here.
+    ------------------------------------------------------------------
+    local Store = ns.Store
+    local savedData, savedNow, savedGet = Store.data, Store.Now, ns.GetAccountID
+    local savedClasses = _G.RAID_CLASS_COLORS
+    local T0 = 1000000
+
+    _G.RAID_CLASS_COLORS = { ROGUE = { r = 1, g = 0.96, b = 0.41 },
+                             MAGE  = { r = 0.41, g = 0.8, b = 0.94 } }
+    ns.GetAccountID = function() return "1" end
+    Store.Now = function() return T0 end
+    Store.data = {
+        accounts = { ["1"] = { characters = {
+            ["Shalk-Sim"]   = { classTag = "ROGUE" },
+            ["Bramble-Sim"] = { classTag = "MAGE"  },
+            ["Nomad-Sim"]   = {},                     -- class UNKNOWN on purpose
+        } } },
+        instances = { ["1"] = {
+            -- 12 minutes in  -> frees in 48m
+            ["Shalk-Sim"]   = { entries = { { t = T0 - 12 * 60, name = "Scholomance" } } },
+            -- 59m30s in -> still INSIDE the window, and rounds UP to 1m, never 0m
+            ["Bramble-Sim"] = { entries = { { t = T0 - 3570, name = "Stratholme" } } },
+            ["Nomad-Sim"]   = { entries = {
+                { t = T0 - 30 * 60, name = "Maraudon" },
+                -- EXACTLY 60m old: aged OUT (age < HOUR is strict), must not count
+                { t = T0 - 3600,    name = "Uldaman" },
+                -- inside the window but MERGED: same live instance, server never
+                -- billed it twice, so it is neither counted nor listed
+                { t = T0 - 20 * 60, name = "Maraudon", merged = true },
+            } },
+        } },
+    }
+
+    local sec = instanceSection({}, T0)
+    check(sec ~= nil, "instances: section builds")
+    check(sec[1].k == "blank" and sec[2].text == "Instances" and sec[2].color == "accent",
+          "instances: own section, blank-separated, accent header like the tooltip's other header")
+    check(sec[3].left == "This hour" and sec[3].right == "3/5",
+          "instances: 3 counted (60m-old aged out, merged re-entry not double-counted)")
+
+    -- The section sits BELOW the world buff timers and ABOVE the click hints.
+    local recI = recorder()
+    renderTooltip(recI, buildTooltipModel({ lock = true }))
+    local iHdr = findLine(recI.lines, "Instances")
+    local iHint = findLine(recI.lines, "Left: invite online")
+    check(iHdr and recI.lines[iHdr - 1].text == " ", "instances: blank line opens the section")
+    check(iHdr and recI.lines[iHdr - 2].left == "Ony (H)",
+          "instances: section renders immediately BELOW the world buff timers")
+    check(iHdr and iHint and iHdr < iHint, "instances: section renders ABOVE the click hints")
+
+    -- Rows: oldest first, so "frees in" ascends and the top row is the next slot.
+    local r1 = recI.lines[iHdr + 2]
+    local r2 = recI.lines[iHdr + 3]
+    local r3 = recI.lines[iHdr + 4]
+    check(r1 and r1.left == "Stratholme" and r1.right:find("frees in 1m", 1, true),
+          "instances: oldest row first; 59m30s rounds UP to 1m, never a phantom free slot")
+    check(r2 and r2.left == "Maraudon" and r2.right:find("frees in 30m", 1, true),
+          "instances: 30m-old entry frees in 30m")
+    check(r3 and r3.left == "Scholomance" and r3.right:find("frees in 48m", 1, true),
+          "instances: 12m-old entry frees in 48m")
+    check(not findLine(recI.lines, "Uldaman"), "instances: the exactly-60m entry is not listed")
+    -- The merged re-entry must not appear as a SECOND Maraudon row. The count above
+    -- already excludes it (the engine's own rule); this pins the LIST as well, so a
+    -- row filter that forgot `merged` cannot show the owner an instance they never
+    -- paid a slot for.
+    local maraudonRows = 0
+    for _, e in ipairs(recI.lines) do if e.left == "Maraudon" then maraudonRows = maraudonRows + 1 end end
+    check(maraudonRows == 1, "instances: a merged re-entry is not listed as a second row")
+
+    -- THE INK IS NOT IN A STRING: the class colour reaches AddDoubleLine as numbers.
+    check(r1.r2 == 0.41 and r1.g2 == 0.8 and r1.b2 == 0.94,
+          "instances: MAGE class ink passed to AddDoubleLine as NUMERIC args")
+    check(r3.r2 == 1 and r3.g2 == 0.96 and r3.b2 == 0.41,
+          "instances: ROGUE class ink passed to AddDoubleLine as NUMERIC args")
+    check(r1.right:find("Bramble", 1, true) and r3.right:find("Shalk", 1, true),
+          "instances: the character that entered is named on its row")
+    -- An unknown class renders NEUTRAL, never a guessed grey.
+    check(r2.r2 ~= nil and r2.r2 == select(1, UI.Color("text")),
+          "instances: unknown class falls back to the neutral text token, not a guess")
+
+    -- The world-buff rows' own state token now reaches the tooltip too (it was
+    -- computed into the model and dropped by the 3-argument AddDoubleLine call).
+    local wb = recI.lines[2]
+    check(wb.left == "Rend" and type(wb.r2) == "number",
+          "world buff row carries its state token as numeric right-hand ink")
+
+    ------------------------------------------------------------------
+    -- Rolling-window boundary, walked one second at a time across 60m.
+    ------------------------------------------------------------------
+    Store.data.instances["1"] = { ["Shalk-Sim"] = { entries = { { t = T0, name = "Dire Maul" } } } }
+    local function hourAt(tt) return instanceSection({}, tt)[3].right end
+    check(hourAt(T0) == "1/5",              "window: an entry counts the instant it happens")
+    check(hourAt(T0 + 3599) == "1/5",       "window: still counted at 59m59s")
+    check(hourAt(T0 + 3600) == "0/5",       "window: aged out at EXACTLY 60m (age < HOUR is strict)")
+    check(hourAt(T0 + 3601) == "0/5",       "window: stays out past 60m")
+
+    ------------------------------------------------------------------
+    -- The "Today" line: quiet until the daily count is actually actionable.
+    ------------------------------------------------------------------
+    local dayEntries = {}
+    for i = 1, 19 do dayEntries[i] = { t = T0 - 7200 - i, name = "Old" .. i } end
+    Store.data.instances["1"] = { ["Shalk-Sim"] = { entries = dayEntries } }
+    check(findLine(instanceSection({}, T0), "Today") == nil,
+          "today line: hidden at 19/30 — the tooltip stays quiet")
+    dayEntries[20] = { t = T0 - 7200 - 20, name = "Old20" }
+    local _, todayLine = findLine(instanceSection({}, T0), "Today")
+    check(todayLine and todayLine.right == "20/30", "today line: appears at 20/30")
+
+    ------------------------------------------------------------------
+    -- A drifted ledger truncates the LIST but says so, and the meter above it
+    -- still reports the true count.
+    ------------------------------------------------------------------
+    local manyEntries = {}
+    for i = 1, 9 do manyEntries[i] = { t = T0 - i * 60, name = "Run" .. i } end
+    Store.data.instances["1"] = { ["Shalk-Sim"] = { entries = manyEntries } }
+    local many = instanceSection({}, T0)
+    check(many[3].right == "9/5", "truncation: the meter still reports the true count")
+    local _, moreLine = findLine(many, "+3 more this hour")
+    check(moreLine and moreLine.color == "faint", "truncation: the dropped rows are SAID, not silently omitted")
+
+    ------------------------------------------------------------------
+    -- Empty state + the config toggle.
+    ------------------------------------------------------------------
+    Store.data.instances["1"] = {}
+    local empty = instanceSection({}, T0)
+    check(empty[3].right == "0/5", "empty: meter reads 0/5")
+    check(empty[4] and empty[4].text == "none this hour" and empty[4].color == "faint",
+          "empty: a single muted line, matching the world buff block's \"no data\" posture")
+
+    check(instanceSection({ showInstances = false }, T0) == nil,
+          "toggle off -> no section at all")
+    check(instanceSection({ showInstances = true }, T0) ~= nil, "toggle on -> section present")
+    check(instanceSection({}, T0) ~= nil,
+          "ABSENT key renders: the stored default is ON, so a pre-existing SavedVariables shows it")
+
+    local recOff = recorder()
+    renderTooltip(recOff, buildTooltipModel({ lock = true, showInstances = false }))
+    check(not findLine(recOff.lines, "Instances"), "toggle off -> \"Instances\" header absent from the tooltip")
+    check(findLine(recOff.lines, "Rend") and findLine(recOff.lines, "Left: invite online"),
+          "toggle off -> world buffs and hints are untouched")
+
+    ------------------------------------------------------------------
+    -- PEER ACCOUNTS. The limits are per ACCOUNT, and the mesh already replicates
+    -- every peer's ledger, so the peer lines cost no new wire traffic.
+    ------------------------------------------------------------------
+    Store.data.instances = {
+        ["1"]  = { ["Shalk-Sim"] = { entries = { { t = T0 - 60, name = "Scholomance" } } } },
+        ["3"]  = { ["Gorak-Sim"] = { entries = { { t = T0 - 60, name = "Stratholme" },
+                                                 { t = T0 - 70, name = "Stratholme" } } } },
+        ["2"]  = { ["Tuska-Sim"] = { entries = { { t = T0 - 60, name = "Maraudon" } } } },
+        ["4"]  = { ["Idle-Sim"]  = { entries = { { t = T0 - 90000, name = "LastWeek" } } } },
+    }
+    local peers = instanceSection({}, T0)
+    local i2 = findLine(peers, "Account 2")
+    local i3 = findLine(peers, "Account 3")
+    check(i2 and i3 and i2 < i3, "peers: one line each, ACCOUNT-SORTED (pairs order is not stable)")
+    check(peers[i3].right == "2/5", "peers: a peer's own 5/hr meter, not a sum")
+    check(not findLine(peers, "Account 4"), "peers: an account with nothing in the hour gets no line")
+    check(not findLine(peers, "Account 1"), "peers: our OWN account is the meter above, not a peer line")
+
+    Store.data, Store.Now, ns.GetAccountID = savedData, savedNow, savedGet
+    _G.RAID_CLASS_COLORS = savedClasses
 
     -- The fallback path renders the SAME model through the SAME renderer, so a
     -- recorder fed that model must match the lib path line-for-line.
