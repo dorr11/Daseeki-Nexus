@@ -399,11 +399,12 @@ end
 -- own sim. The section is a VIEW, so it adds no client-mutating call and therefore
 -- no Class 9 in-call dispatch surface of its own.
 --
--- Cross-account for free: the 5/hr and 30/day limits are enforced PER ACCOUNT, and
--- the mesh ALREADY replicates every peer's instance ledger (instances.lua
--- MergeInbound, carried on the existing sync namespace). Instances.AllAccounts
--- therefore hands us peers' counts with no new namespace and no new wire traffic —
--- the peer lines are a read of data that was already on this disk.
+-- THIS ACCOUNT ONLY (owner, verbatim: "i dont need it to show information for
+-- other accounts on the hover, just the current account"). The peer-account lines
+-- this section used to carry are gone from the HOVER; the underlying replication
+-- is untouched — instances.lua still merges every peer's ledger and the Instances
+-- PANEL still reads it, because a cross-account view is exactly what a panel is
+-- for and exactly what a one-second glance at a minimap button is not.
 ----------------------------------------------------------------------
 
 local HOUR_SECS   = 3600
@@ -446,6 +447,106 @@ local function meterToken(count, cap, warn)
     return IUI.StateToken(IUI.MeterState(count, cap, warn))
 end
 
+----------------------------------------------------------------------
+-- THE CURRENT-RUN BLOCK — what this run has taken so far, while inside.
+--
+-- Rendered ONLY while a run is open, and "open" is not a guess: it is
+-- `Instances.CurrentRun()`, which hands back the very entry table the capture
+-- path is writing into. So the block cannot show for a run that has ended, and
+-- the numbers in it cannot be a stale copy of anything. The instant the exit
+-- routine fires, CurrentRun answers nil and the whole block is gone — the
+-- attribution rule and the display rule are the same rule.
+--
+-- OUR GRAMMAR, NOT THE REFERENCE'S. The reference fences this block with grey
+-- hairline textures and paints it cyan-label / white-value. We have a blank line
+-- and colour tokens: the label side takes `muted`, the figure side takes `text`,
+-- the run's identity takes the same treatment a section's lead row takes
+-- elsewhere in this tooltip, and a sub-section header takes `faint`. Every figure
+-- reaches AddDoubleLine as a real colour triple, not as an escape sequence buried
+-- in a string — THE INK IS NOT IN A STRING, the same rule the instance rows
+-- below already keep, so a recorder that drops the numeric arguments watches the
+-- colour disappear instead of going quietly green.
+--
+-- SUPPRESSION follows the spec: a field with nothing to say is omitted rather
+-- than printed as a zero, and GOLD is the single exception that always prints —
+-- "0c" is a real answer to "what did this run pay", and its absence would read as
+-- a missing row rather than an empty purse.
+--
+-- Experience and XP/hour disappear at max level without this code knowing what
+-- max level is: the engine refuses to store a zero level requirement, so
+-- XPPercentOfLevel has no denominator and returns nil. The XP total itself still
+-- shows if any XP landed, and the mob count — which the kill-derived counter
+-- keeps alive on a run of greys — is what carries a max-level run.
+local MAX_REP_ROWS = 4      -- a dungeon awards one or two factions; the cap is a bound, not a rule
+
+local function currentRunLines(nowE)
+    local E, IUI = ns.Instances, ns.InstancesUI
+    if not (E and IUI and E.CurrentRun and IUI.FormatCount) then return nil end
+    local e = E.CurrentRun()
+    if type(e) ~= "table" then return nil end
+
+    local out = {}
+    local dur = (E.EntryDuration and E.EntryDuration(e, nowE, true)) or 0
+    local D = ns.Dashboard
+    local durText = (D and D.FormatDuration and D.FormatDuration(dur))
+                    or (math.floor(dur) .. "s")
+    -- The run's identity and its live clock, one row: the instance you are in and
+    -- how long you have been in it are one fact, and the tooltip has a two-column
+    -- line for exactly that shape.
+    out[#out + 1] = { k = "double", color = "text", token = "accent",
+                      left = tostring(e.name or "?"), right = durText }
+
+    local mobs = (IUI.MobCount and IUI.MobCount(e)) or 0
+    if mobs > 0 then
+        out[#out + 1] = { k = "double", color = "muted", token = "text",
+                          left = "Mob count", right = IUI.FormatCount(mobs) }
+    end
+    local honor = tonumber(e.honor) or 0
+    if honor > 0 then
+        out[#out + 1] = { k = "double", color = "muted", token = "text",
+                          left = "Honor", right = IUI.FormatCount(honor) }
+    end
+    local xp = math.max(0, tonumber(e.xp) or 0)
+    if xp > 0 then
+        local right = IUI.FormatCount(xp, true)
+        local pct = IUI.XPPercentOfLevel and IUI.XPPercentOfLevel(xp, e.xpMax)
+        if pct then right = right .. string.format("  (%.1f%% of level)", pct) end
+        out[#out + 1] = { k = "double", color = "muted", token = "text",
+                          left = "Experience", right = right }
+        local rate = IUI.XPPerHour and IUI.XPPerHour(xp, dur)
+        if rate then
+            out[#out + 1] = { k = "double", color = "muted", token = "text",
+                              left = "XP/hour", right = IUI.FormatCount(rate) }
+        end
+    end
+    -- Gold ALWAYS prints, and by the spec's precedence: the looted-coin
+    -- accumulator, with the wallet delta consulted only when the accumulator is
+    -- zero AND the wallet rose.
+    local gold = (IUI.RunGold and IUI.RunGold(e)) or 0
+    out[#out + 1] = { k = "double", color = "muted", token = "text",
+                      left = "Gold", right = IUI.FormatMoneyFull(gold) }
+
+    -- Every faction that fired, alphabetical, losses signed. No primary faction,
+    -- no filtering of small amounts — a dungeon awarding two factions simply
+    -- produces two rows.
+    local reps = (IUI.RepRows and IUI.RepRows(e.repBy)) or {}
+    if #reps > 0 then
+        out[#out + 1] = { k = "line", text = "Reputation", color = "faint" }
+        for i = 1, math.min(#reps, MAX_REP_ROWS) do
+            out[#out + 1] = { k = "double", color = "muted", token = "text",
+                              left = "  " .. reps[i].faction, right = reps[i].text }
+        end
+        if #reps > MAX_REP_ROWS then
+            out[#out + 1] = { k = "line", color = "faint",
+                              text = string.format("  +%d more faction(s)", #reps - MAX_REP_ROWS) }
+        end
+    end
+
+    -- The blank line that closes the block — our hairline.
+    out[#out + 1] = { k = "blank" }
+    return out
+end
+
 -- Build the section as model entries, or nil when it must not render at all.
 -- cfg.showInstances == false is the ONLY off switch; an ABSENT key renders (the
 -- stored default is true, and a caller handing us a partial cfg table — the
@@ -474,6 +575,13 @@ local function instanceSection(cfg, nowE)
     local out = {}
     out[#out + 1] = { k = "blank" }
     out[#out + 1] = { k = "line", text = "Instances", color = "accent" }
+    -- CURRENT RUN first, when there is one: while you are inside, what this run
+    -- has taken is the news and the hour meter is the context. Outside, the block
+    -- is absent entirely and the section opens on the meter exactly as before.
+    local run = currentRunLines(nowE)
+    if run then
+        for i = 1, #run do out[#out + 1] = run[i] end
+    end
     out[#out + 1] = { k = "double", left = "This hour", color = "muted",
                       right = string.format("%d/%d", mine.hour or 0, hCap),
                       token = meterToken(mine.hour, hCap, hWarn) }
@@ -538,37 +646,13 @@ local function instanceSection(cfg, nowE)
         end
     end
 
-    -- Peer accounts, one line each — their own 5/hr meters. Skipped entirely when
-    -- a peer has nothing in the window, so a single-account owner never sees them.
-    local others = {}
-    for aid in pairs(accounts) do
-        if aid ~= selfAID and (accounts[aid].hour or 0) > 0 then others[#others + 1] = aid end
-    end
-    if #others > 0 then
-        -- Sorted: pairs() order is not stable across table lifetimes, and an
-        -- account list that reshuffles between two hovers is the tooltip reading
-        -- as though something changed when nothing did (Class 8, applied to a view).
-        local sorted = (ns.SortedAIDs and ns.SortedAIDs(accounts)) or nil
-        if sorted then
-            local keep = {}
-            for _, aid in ipairs(sorted) do
-                for _, want in ipairs(others) do
-                    if aid == want then keep[#keep + 1] = aid end
-                end
-            end
-            others = keep
-        else
-            table.sort(others, function(a, b) return tostring(a) < tostring(b) end)
-        end
-        for _, aid in ipairs(others) do
-            local c = accounts[aid]
-            out[#out + 1] = { k = "double", color = "faint",
-                              left = "Account " .. (tonumber(aid) or aid),
-                              right = string.format("%d/%d", c.hour or 0, hCap),
-                              token = meterToken(c.hour, hCap, hWarn) }
-        end
-    end
-
+    -- NO PEER-ACCOUNT LINES. This section used to close with one "Account 2  1/5"
+    -- row per other account on the mesh. The owner does not want them here: the
+    -- hover is a glance at YOUR five, and a second account's meter is a question
+    -- you go to the Instances panel to ask. The replication that fed those rows is
+    -- deliberately left in place (instances.lua MergeInbound, the panel's
+    -- cross-account view) — this is a trim of the hover, not a retreat from the
+    -- data. `accounts` above is still read for our OWN row and nothing else.
     return out
 end
 
@@ -1271,8 +1355,14 @@ ns:RegisterSelfTest("minimap", function(verbose)
           "toggle off -> world buffs and hints are untouched")
 
     ------------------------------------------------------------------
-    -- PEER ACCOUNTS. The limits are per ACCOUNT, and the mesh already replicates
-    -- every peer's ledger, so the peer lines cost no new wire traffic.
+    -- NO PEER ACCOUNTS ON THE HOVER (owner: "just the current account").
+    --
+    -- The pin is an ABSENCE, so it is built on a store that would have produced
+    -- three peer rows on the previous build — two accounts inside the hour and
+    -- one outside it — and it asserts BOTH halves: not one peer row anywhere in
+    -- the section, and our own meter still reading only our own account. A test
+    -- that merely said "no Account 2 line" over an empty store would go green
+    -- forever without proving anything.
     ------------------------------------------------------------------
     Store.data.instances = {
         ["1"]  = { ["Shalk-Sim"] = { entries = { { t = T0 - 60, name = "Scholomance" } } } },
@@ -1282,13 +1372,151 @@ ns:RegisterSelfTest("minimap", function(verbose)
         ["4"]  = { ["Idle-Sim"]  = { entries = { { t = T0 - 90000, name = "LastWeek" } } } },
     }
     local peers = instanceSection({}, T0)
-    local i2 = findLine(peers, "Account 2")
-    local i3 = findLine(peers, "Account 3")
-    check(i2 and i3 and i2 < i3, "peers: one line each, ACCOUNT-SORTED (pairs order is not stable)")
-    check(peers[i3].right == "2/5", "peers: a peer's own 5/hr meter, not a sum")
-    check(not findLine(peers, "Account 4"), "peers: an account with nothing in the hour gets no line")
-    check(not findLine(peers, "Account 1"), "peers: our OWN account is the meter above, not a peer line")
+    -- RED CONTROL for the fixture itself: the peer accounts really are in the
+    -- window, so "no peer rows" is a statement about the SECTION, not about an
+    -- empty store. Instances.AllAccounts is the source those rows were built from.
+    local av = ns.Instances.AllAccounts(T0)
+    check(av.accounts["2"] and av.accounts["2"].hour == 1
+          and av.accounts["3"] and av.accounts["3"].hour == 2,
+          "peer-absence fixture is vacuous: the peer accounts are not in the window at all")
+    check(not findLine(peers, "Account 2"), "no peer lines: account 2 is absent from the hover")
+    check(not findLine(peers, "Account 3"), "no peer lines: account 3 is absent from the hover")
+    check(not findLine(peers, "Account 4"), "no peer lines: account 4 is absent from the hover")
+    for _, e in ipairs(peers) do
+        check(not (e.left and tostring(e.left):match("^Account ")),
+              "no peer lines: a row still reads \"" .. tostring(e.left) .. "\"")
+    end
+    check(peers[3].left == "This hour" and peers[3].right == "1/5",
+          "our OWN meter counts our OWN account only, peers excluded (got "
+          .. tostring(peers[3].right) .. ")")
+    -- The same absence, through the real renderer into the real tooltip frame.
+    local recPeers = recorder()
+    renderTooltip(recPeers, buildTooltipModel({ lock = true }))
+    for _, e in ipairs(recPeers.lines) do
+        check(not (e.left and tostring(e.left):match("^Account ")),
+              "no peer lines: the rendered tooltip still carries \"" .. tostring(e.left) .. "\"")
+    end
 
+    ------------------------------------------------------------------
+    -- THE CURRENT-RUN BLOCK.
+    --
+    -- Driven through Instances.CurrentRun — the same accessor the live path
+    -- reads — by opening a run on a hand-built entry, so the block's presence,
+    -- its ordering, its suppression rules and its ATTRIBUTION BOUNDARY are all
+    -- asserted against the real builder.
+    ------------------------------------------------------------------
+    local savedOpenKey, savedOpenSample = ns.Instances._openKey, ns.Instances._openSample
+    Store.data.instances = { ["1"] = { ["Shalk-Sim"] = { entries = {} } } }
+    local liveEntry = {
+        t = T0 - 1800, name = "Stratholme", mapID = 329,
+        xp = 12500, xpMax = 20000, mobXP = 47, mobKill = 51,
+        goldLoot = 48210, gold = -12000, honor = 0,
+        repBy = { ["Timbermaw Hold"] = -75, ["Argent Dawn"] = 250 },
+    }
+    Store.data.instances["1"]["Shalk-Sim"].entries[1] = liveEntry
+    local function openRun(entry)
+        ns.Instances._openKey = { aid = "1", nameRealm = "Shalk-Sim" }
+        ns.Instances._openSample = { entry = entry,
+            entries = Store.data.instances["1"]["Shalk-Sim"].entries }
+    end
+    local function closeRun()
+        ns.Instances._openKey, ns.Instances._openSample = nil, nil
+    end
+
+    -- OUTSIDE first: no block at all. This is the red control for everything
+    -- below — the same store, the same entry, only the open run differs.
+    closeRun()
+    local outside = instanceSection({}, T0)
+    check(outside[3].left == "This hour",
+          "outside: the section opens straight onto the meter, no current-run block")
+    check(not findLine(outside, "Experience"), "outside: no Experience row")
+    check(not findLine(outside, "Gold"), "outside: no Gold row")
+
+    openRun(liveEntry)
+    local live = instanceSection({}, T0)
+    check(live[2].text == "Instances", "current run: still inside the Instances section")
+    check(live[3].left == "Stratholme" and live[3].right == "30m",
+          "current run: instance name + LIVE elapsed lead the block (got "
+          .. tostring(live[3].left) .. " / " .. tostring(live[3].right) .. ")")
+    local _, mobLine = findLine(live, "Mob count")
+    check(mobLine and mobLine.right == "47",
+          "current run: mob count PREFERS the XP-derived tally (got "
+          .. tostring(mobLine and mobLine.right) .. ")")
+    local _, xpLine = findLine(live, "Experience")
+    check(xpLine and xpLine.right == "+12,500  (62.5% of level)",
+          "current run: XP comma-grouped with its percent of level (got "
+          .. tostring(xpLine and xpLine.right) .. ")")
+    local _, rateLine = findLine(live, "XP/hour")
+    check(rateLine and rateLine.right == "25,000",
+          "current run: XP/hour over the live elapsed (got "
+          .. tostring(rateLine and rateLine.right) .. ")")
+    local _, goldLine = findLine(live, "Gold")
+    check(goldLine and goldLine.right == "4g 82s 10c",
+          "current run: gold is the LOOT accumulator, not the negative wallet delta (got "
+          .. tostring(goldLine and goldLine.right) .. ")")
+    check(not findLine(live, "Honor"), "current run: a zero honor tally prints no row")
+    -- Reputation: every faction, ALPHABETICAL, losses signed.
+    local repHdr = findLine(live, "Reputation")
+    check(repHdr and live[repHdr + 1].left == "  Argent Dawn" and live[repHdr + 1].right == "+250",
+          "current run: rep rows are alphabetical, gains signed")
+    check(repHdr and live[repHdr + 2].left == "  Timbermaw Hold" and live[repHdr + 2].right == "-75",
+          "current run: a LOSS keeps its minus sign")
+    -- The block is fenced from the meter by a blank line, and the meter follows.
+    local hourIdx = findLine(live, "This hour")
+    check(hourIdx and live[hourIdx - 1].k == "blank",
+          "current run: a blank line closes the block before the hour meter")
+
+    -- THE INK IS NOT IN A STRING: every figure reaches AddDoubleLine as numbers.
+    local recRun = recorder()
+    renderTooltip(recRun, buildTooltipModel({ lock = true }))
+    local _, rXP = findLine(recRun.lines, "Experience")
+    check(rXP and type(rXP.r2) == "number" and rXP.r2 == select(1, UI.Color("text")),
+          "current run: the XP figure's ink reaches AddDoubleLine as NUMERIC args")
+    local _, rName = findLine(recRun.lines, "Stratholme")
+    check(rName and type(rName.r2) == "number" and rName.r2 == select(1, UI.Color("accent")),
+          "current run: the run's live clock carries the accent triple as numbers")
+    local _, rRep = findLine(recRun.lines, "  Argent Dawn")
+    check(rRep and type(rRep.r) == "number" and type(rRep.r2) == "number",
+          "current run: a rep row carries BOTH colour triples as numbers")
+
+    -- SUPPRESSION: a run that has taken nothing shows its name, its clock and
+    -- gold — and nothing else. Gold is the one field that always prints.
+    local bare = { t = T0 - 90, name = "Deadmines", mapID = 36 }
+    Store.data.instances["1"]["Shalk-Sim"].entries = { bare }
+    openRun(bare)
+    local quiet = instanceSection({}, T0)
+    check(quiet[3].left == "Deadmines", "quiet run: the name still leads")
+    check(not findLine(quiet, "Mob count"), "quiet run: no mob row")
+    check(not findLine(quiet, "Experience"), "quiet run: no XP row")
+    check(not findLine(quiet, "Reputation"), "quiet run: no reputation header")
+    local _, qGold = findLine(quiet, "Gold")
+    check(qGold and qGold.right == "0c", "quiet run: gold ALWAYS prints, as 0c")
+
+    -- MAX LEVEL: XP landed but the engine stored no level requirement, so the
+    -- percentage is absent while the total and the rate remain.
+    local maxed = { t = T0 - 600, name = "Naxxramas", mapID = 533, xp = 900, mobXP = 3 }
+    Store.data.instances["1"]["Shalk-Sim"].entries = { maxed }
+    openRun(maxed)
+    local mx = instanceSection({}, T0)
+    local _, mxXP = findLine(mx, "Experience")
+    check(mxXP and mxXP.right == "+900",
+          "max level: the XP total shows with NO percent-of-level (got "
+          .. tostring(mxXP and mxXP.right) .. ")")
+
+    -- THE BOUNDARY, on the display side: closing the run removes the block in the
+    -- same pass, with the entry still sitting in the ledger.
+    closeRun()
+    local after = instanceSection({}, T0)
+    check(after[3].left == "This hour", "closed run: the section opens on the meter again")
+    check(not findLine(after, "Experience") and not findLine(after, "Mob count"),
+          "closed run: the current-run block is gone at once")
+    -- The entry itself is untouched and simply becomes an ordinary hourly row —
+    -- the block went away, the record did not.
+    local _, naxRow = findLine(after, "Naxxramas")
+    check(naxRow and naxRow.right and naxRow.right:find("frees in", 1, true),
+          "closed run: the run survives as an ordinary hourly row")
+
+    ns.Instances._openKey, ns.Instances._openSample = savedOpenKey, savedOpenSample
     Store.data, Store.Now, ns.GetAccountID = savedData, savedNow, savedGet
     _G.RAID_CLASS_COLORS = savedClasses
 

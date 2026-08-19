@@ -231,7 +231,15 @@ end
 -- (drops the oldest). Every entry is born NON-merged and counted; the serial
 -- watcher may retroactively merge it (Instances.ApplySerial).
 -- `extra` (optional) seeds the ADDITIVE detail fields captured at entry time
--- (enteredLevel, group, groupAvg) without widening the positional signature.
+-- (enteredLevel, xpMax, entryMoney, group, groupAvg) without widening the
+-- positional signature.
+--
+-- FIELDS THAT ARE NOT SEEDED HERE. `honor` and `repBy` accumulate lazily —
+-- absent means "nothing of this kind happened on this run", which is the shape
+-- every historical record already has and the shape the display treats as
+-- "omit the row". Seeding them to zero would write a dead field onto sixty ring
+-- entries per character for a statistic Era practically never produces inside a
+-- party/raid instance.
 -- Returns (entry, count).
 function Instances.RecordInto(entries, name, mapID, t, extra)
     entries = entries or {}
@@ -482,6 +490,14 @@ function Instances.ApplySerial(entries, serial, guid, source)
             prev.repBy = prev.repBy or {}
             for who, amt in pairs(newest.repBy) do prev.repBy[who] = (prev.repBy[who] or 0) + amt end
         end
+        -- Honor folds like every other taking.
+        if newest.honor then prev.honor = (prev.honor or 0) + newest.honor end
+        -- The LEVEL REQUIREMENT is not a taking and is not summed. The survivor
+        -- keeps its own; it is only filled from the re-entry when the survivor
+        -- never learned one (a run whose first XP message landed after the corpse
+        -- run started). Filling is upgrade-only for the same reason the roster's
+        -- is: a value we know beats one we do not, and never the other way.
+        if prev.xpMax == nil and newest.xpMax ~= nil then prev.xpMax = newest.xpMax end
         -- Entry level / entry XP / entry money on the survivor are deliberately
         -- NOT overwritten (spec §2.4 — overwriting them was a bug there too).
         -- The GROUP is unioned rather than kept, though: someone who joined during
@@ -688,7 +704,9 @@ function Instances.MergeEntryList(existing, incoming)
     -- ROUND-26: `rep` / `repBy` join the additive optional fields — filled from an inbound
     -- copy when we lack them, never overwriting what we already hold.
     local FILL = { "serial", "prevSerial", "exitT", "goldLoot", "mobXP", "mobKill", "mapID",
-                   "enteredLevel", "group", "groupAvg", "trades", "src", "rep", "repBy" }
+                   "enteredLevel", "group", "groupAvg", "trades", "src", "rep", "repBy",
+                   -- per-visit statistics: same additive contract, same fill-only rule
+                   "honor", "xpMax", "entryMoney" }
     for i = 1, #incoming do
         local e = incoming[i]
         if e and e.t ~= nil then
@@ -762,6 +780,60 @@ function Instances.AllAccounts(nowE)
         end
     end
     return { accounts = accounts, total = { hour = totH, day = totD } }
+end
+
+-- THE OPEN RUN, or nil. Returns (entry, nameRealm, aid).
+--
+-- The one supported way for a VIEW to ask "am I inside, and which record is
+-- accruing?". Both answers are the same object the capture path writes to, so a
+-- display reading it is reading the live totals with no copy to go stale — and
+-- the ATTRIBUTION RULE falls out for free: when the run is closed this returns
+-- nil, so a hover built from it cannot show a current-run block for a run that
+-- has ended (spec §A6: the block exists only while the inside flag is up).
+function Instances.CurrentRun()
+    local sample = Instances._openSample
+    local e = sample and sample.entry
+    if type(e) ~= "table" then return nil end
+    local key = Instances._openKey or {}
+    return e, key.nameRealm, key.aid
+end
+
+-- PURE. May the head of this ledger be RE-OPENED as the run we are standing in?
+--
+-- THE GAP THIS CLOSES. A /reload (and, on this build, a full relog) inside an
+-- instance produces no transition at all: `OnLogin` deliberately seeds `_inside`
+-- true so the first PLAYER_ENTERING_WORLD classifies as "none" and no phantom
+-- entry is created. Correct — but nothing re-opened `_openSample` either, so the
+-- head record sat there with the player standing in it and every accumulator
+-- (XP, mobs, coin, rep) silently credited nothing for the rest of the run. The
+-- spec's rule for a reload is CONTINUATION: no new record, the head keeps
+-- counting. This is what makes that true.
+--
+-- The guards are the whole safety of it:
+--   * the head must not be MERGED — that record is not the live run, its
+--     survivor is;
+--   * its identity must match what the client says we are standing in: mapID
+--     when both sides carry one, else the localized name. A mismatch means the
+--     head belongs to some earlier instance and must not absorb this one's
+--     takings;
+--   * it must be recent enough to still be the same visit — DUR_FALLBACK_MAX,
+--     the same 6h bound `EntryDuration` refuses past, so a log-out-inside
+--     yesterday cannot be resumed tomorrow.
+-- Returns the entry, or nil.
+function Instances.ResumableEntry(entries, name, mapID, nowE)
+    if type(entries) ~= "table" then return nil end
+    local e = entries[#entries]
+    if type(e) ~= "table" or e.merged then return nil end
+    if mapID ~= nil and e.mapID ~= nil then
+        if e.mapID ~= mapID then return nil end
+    elseif name ~= nil and e.name ~= nil then
+        if e.name ~= name then return nil end
+    else
+        return nil                       -- nothing identifiable to match on
+    end
+    local age = (nowE or 0) - (e.t or 0)
+    if age < 0 or age >= DUR_FALLBACK_MAX then return nil end
+    return e
 end
 
 -- Merge an inbound account's instance ledger (arrives over the mesh). Self-immune
@@ -895,6 +967,27 @@ local function sampleLevel()
     return nil
 end
 
+-- THE LEVEL REQUIREMENT — what "(N.N% of level)" is a percentage OF.
+--
+-- A read of ZERO is refused, and the refusal is doing two jobs at once (async
+-- lesson Class 4 / Class 5). At MAX LEVEL the client genuinely answers 0 because
+-- there is no next level; on the far side of a loading screen it also answers 0
+-- because the unit has not warmed. Both cases mean the same thing to a display —
+-- "there is no level requirement to be a percentage of" — and both resolve the
+-- same way: store nothing, show no percentage. That is exactly the reference's
+-- own rule (the XP rows are gated off entirely at max level), reached without
+-- ever needing to ask which of the two it was.
+--
+-- Re-sampled on every XP message rather than only at entry, so a mid-run ding
+-- moves the denominator to the NEW level's requirement instead of leaving the
+-- run reporting a percentage of the level it has already left.
+local function sampleXPMax()
+    if not UnitXPMax then return nil end
+    local v = tonumber(UnitXPMax("player"))
+    if v and v > 0 then return v end
+    return nil
+end
+
 -- Read the live group roster as { name, level, isSelf }. The player is always
 -- member 1 (the average includes them, spec §3.4). Party tokens are party1..N-1
 -- (the player is not among them); raid tokens are raid1..N and DO include the
@@ -1006,12 +1099,18 @@ function Instances._recordEntry()
     local nameRealm = selfNameRealm()
     local t = now()
     local entries = charEntries(aid, nameRealm, true)
-    -- ADDITIVE detail sampled at the moment of entry: the level the character
-    -- walked in at (never overwritten later, spec §2.4 / §8.2).
-    local entry = Instances.RecordInto(entries, name, instanceID, t,
-        { enteredLevel = sampleLevel() })
     -- Open a run so exit can stamp duration + the wallet delta.
     local entryGold, entryGoldProven = sampleGold()
+    -- ADDITIVE detail sampled at the moment of entry: the level the character
+    -- walked in at (never overwritten later, spec §2.4 / §8.2), the level
+    -- requirement the run's XP will be a percentage of, and the wallet baseline.
+    -- `entryMoney` is persisted ONLY when it was proven — an unproven baseline
+    -- stored as fact is how a resumed run would later compute a delta from a
+    -- loading-screen zero (NX-5), so absence is the honest record.
+    local entry = Instances.RecordInto(entries, name, instanceID, t,
+        { enteredLevel = sampleLevel(),
+          xpMax        = sampleXPMax(),
+          entryMoney   = (entryGoldProven and entryGold) or nil })
     Instances._openKey     = { aid = aid, nameRealm = nameRealm }
     Instances._openSample  = { gold = entryGold, goldProven = entryGoldProven,
                                entry = entry, entries = entries }
@@ -1027,6 +1126,46 @@ function Instances._recordEntry()
     -- un-count it (spec §2.7).
     Instances._maybeWarn(aid, t)
     if ns.Fire then ns:Fire("INSTANCES_CHANGED") end
+end
+
+-- RESUME: re-open the head record as the live run after a reload / relog inside.
+-- Idempotent (a run already open is left alone) and inert everywhere the guards
+-- in ResumableEntry do not agree, so the worst case is the behaviour we had.
+function Instances._resumeOpenRun()
+    if Instances._openSample then return nil end          -- already open
+    local name, instanceID, itype = currentInstanceIdentity()
+    if not COUNTED_TYPES[itype or ""] then return nil end
+    local aid = (ns.GetAccountID and ns:GetAccountID()) or ""
+    local nameRealm = selfNameRealm()
+    local entries = charEntries(aid, nameRealm, false)    -- never CREATE on a resume
+    if not entries then return nil end
+    local nowE = now()
+    local entry = Instances.ResumableEntry(entries, name, instanceID, nowE)
+    if not entry then return nil end
+
+    -- THE WALLET BASELINE IS THE RUN'S OWN, NOT A FRESH READ. A reload does not
+    -- reset what the run has taken, so re-sampling here would record only the
+    -- post-reload half of the delta as the whole run's. `entryMoney` was only
+    -- persisted when it was proven, so an absent one leaves the sample with no
+    -- baseline at all and `_stampExit` refuses to invent a delta (NX-5) —
+    -- goldLoot, the accumulator, carries the answer either way.
+    Instances._openKey     = { aid = aid, nameRealm = nameRealm }
+    Instances._openSample  = { gold = entry.entryMoney,
+                               goldProven = (entry.entryMoney ~= nil),
+                               entry = entry, entries = entries }
+    -- The post-entry suppression window applies again: we are on the far side of
+    -- a loading screen, and a unit still targeted or moused over from before it
+    -- must not stamp a serial (spec §2.1).
+    Instances._entryAt     = nowE
+    -- Only arm the watcher if this record never got a serial. A record that has
+    -- one is already committed or merged; re-arming could only overwrite it, and
+    -- ApplySerial's one-shot rule would refuse anyway.
+    Instances._serialArmed = not ((entry.serial or 0) > 0)
+    Instances._lastGroupSnap = nil
+    Instances._snapshotGroup(true)
+    Instances._armGroupLadder()
+    if ns.Fire then ns:Fire("INSTANCES_CHANGED") end
+    return entry
 end
 
 -- Stamp the exit sample onto an open run's entry. Shared by the real exit path
@@ -1202,6 +1341,13 @@ function Instances._onXPGain(text)
     if not gained then return end
     e.xp = (e.xp or 0) + gained
     e.mobXP = (e.mobXP or 0) + 1
+    -- Keep the denominator current: this is the one event that fires on a ding,
+    -- so re-reading here is what moves "% of level" onto the NEW level's
+    -- requirement. A zero read is refused by sampleXPMax, so max level (and a
+    -- cold unit) simply leaves whatever was last proven — never a divide by a
+    -- number the client did not stand behind.
+    local xm = sampleXPMax()
+    if xm then e.xpMax = xm end
 end
 
 -- ROUND-26 Part A.2: REPUTATION for the run.
@@ -1216,15 +1362,52 @@ end
 -- later wants the breakdown. Both are additive and absent on historical rows.
 -- The message is localised, so the pattern is built from Blizzard's own global strings the
 -- same way the money patterns are, with a literal English fallback.
+-- ── THE FORMAT-STRING → PATTERN TRANSFORM (and the bug it replaces) ──────────
+--
+-- Blizzard's localized strings are printf FORMATS ("Your reputation with %s has
+-- increased by %d."). Turning one into a Lua pattern is two steps and the ORDER
+-- of them is the whole thing: every magic character must be escaped INCLUDING
+-- the per-cent sign, and only then may the (now doubled) placeholders be
+-- re-opened as captures.
+--
+-- The previous transform escaped `^$()%.[]*+-?` but NOT `%`, so `%s` and `%d`
+-- survived the escape pass untouched — and then looked for `%%s` / `%%d`, which
+-- by then existed nowhere in the string. Nothing was replaced. What came out was
+-- `Your reputation with %s has increased by %d%.`, which Lua reads as
+-- WHITESPACE-CLASS and DIGIT-CLASS, carries no captures at all, and so returned
+-- `who = <the whole match>, amt = nil` on every line. `ParseRepChange` requires
+-- both, so it returned nil for every reputation message ever seen: rep capture
+-- has never fired in a live session. Proven by the red control in
+-- testRepCapture, which runs the pre-fix transform on the real enUS format and
+-- asserts it still produces nothing.
+--
+-- `numberClass` lets a caller widen `%d` (Era's honorable-kill line reports
+-- "13.00", not "13").
+local function escMagic(s)
+    return (s:gsub("([%^%$%(%)%%%.%[%]%*%+%-%?])", "%%%1"))
+end
+
+function Instances.FormatToPattern(fmt, numberClass)
+    if type(fmt) ~= "string" or fmt == "" then return nil end
+    numberClass = numberClass or "(%d+)"
+    local p = escMagic(fmt)                       -- '%s' -> '%%s', '(' -> '%(' , '.' -> '%.'
+    -- gsub REPLACEMENTS treat '%' specially too, so the class is re-escaped on
+    -- the way in and lands as written.
+    p = p:gsub("%%%%d", (numberClass:gsub("%%", "%%%%")))
+    p = p:gsub("%%%%s", "(.-)")
+    return p
+end
+
+-- The increase / decrease pair is all Era needs. The achievement-bonus and
+-- double-bonus variants are the SAME sentence with a suffix, and `match` is
+-- unanchored, so the plain increase pattern already matches those lines and
+-- takes the base amount — which is the figure the reference records too.
 local _repPats
 function Instances.RepPatterns(reset)
     if _repPats and not reset then return _repPats end
     local function pat(s, fallback)
-        s = (type(s) == "string" and s ~= "") and s or fallback
-        -- escape magic chars, then turn the %s / %d placeholders into captures
-        s = s:gsub("([%^%$%(%)%.%[%]%*%+%-%?])", "%%%1")
-        s = s:gsub("%%%%s", "(.+)"):gsub("%%%%d", "(%%d+)")
-        return s
+        return Instances.FormatToPattern(
+            (type(s) == "string" and s ~= "") and s or fallback)
     end
     _repPats = {
         inc = pat(rawget(_G, "FACTION_STANDING_INCREASED"),
@@ -1240,10 +1423,14 @@ end
 function Instances.ParseRepChange(text, pats)
     if type(text) ~= "string" then return nil end
     pats = pats or Instances.RepPatterns()
-    local who, amt = text:match(pats.inc)
-    if who and amt then return who, tonumber(amt) or 0 end
-    who, amt = text:match(pats.dec)
-    if who and amt then return who, -(tonumber(amt) or 0) end
+    if pats.inc then
+        local who, amt = text:match(pats.inc)
+        if who and amt and who ~= "" then return who, tonumber(amt) or 0 end
+    end
+    if pats.dec then
+        local who, amt = text:match(pats.dec)
+        if who and amt and who ~= "" then return who, -(tonumber(amt) or 0) end
+    end
     return nil
 end
 
@@ -1256,6 +1443,66 @@ function Instances._onRepChange(text)
     e.rep = (e.rep or 0) + delta
     e.repBy = e.repBy or {}
     e.repBy[who] = (e.repBy[who] or 0) + delta
+end
+
+----------------------------------------------------------------------
+-- HONOR (spec §A4.1: "every honor-gain chat message", pre-Cata scheme).
+--
+-- A CHAT ACCUMULATOR, like XP, rep and coin — never a before/after currency
+-- pair. The reference's own Era saved data carries a single honor tally and no
+-- currency snapshot at all, which is the evidence that the chat path is the Era
+-- path.
+--
+-- HONEST SCOPE. This ledger only logs `party` / `raid` instances (COUNTED_TYPES
+-- — battlegrounds and arenas do not consume the 5/hr slot the module exists to
+-- meter), and Era does not let the opposing faction into your dungeon. So the
+-- tally is captured, folded and stored correctly, and on Era it will read zero
+-- essentially always — at which point every display omits the row. That is the
+-- spec's own suppression rule ("only when the run has an honor tally"), not a
+-- special case: we record what the client reports and show nothing when it
+-- reports nothing, rather than inventing a zero row.
+--
+-- Era reports the honorable-kill line with a DECIMAL amount ("13.00"), so the
+-- number class is widened for that one pattern.
+local _honorPats
+function Instances.HonorPatterns(reset)
+    if _honorPats and not reset then return _honorPats end
+    local F = Instances.FormatToPattern
+    _honorPats = {
+        -- "You have been awarded %d honor points."
+        award = F(rawget(_G, "COMBATLOG_HONORAWARD")
+                  or "You have been awarded %d honor points."),
+        -- "%s dies, honorable kill Rank: %s (%s Honor Points)" — three captures,
+        -- the THIRD is the amount.
+        kill  = F(rawget(_G, "COMBATLOG_HONORGAIN")
+                  or "%s dies, honorable kill Rank: %s (%s Honor Points)"),
+    }
+    return _honorPats
+end
+
+-- Parse an honor-gain line into a positive amount, or nil. Pure given patterns.
+function Instances.ParseHonorGain(text, pats)
+    if type(text) ~= "string" then return nil end
+    pats = pats or Instances.HonorPatterns()
+    if pats.award then
+        local n = tonumber(text:match(pats.award))
+        if n and n > 0 then return n end
+    end
+    if pats.kill then
+        local _, _, amt = text:match(pats.kill)
+        local n = tonumber(amt)
+        if n and n > 0 then return n end
+    end
+    return nil
+end
+
+function Instances._onHonorGain(text)
+    local sample = Instances._openSample
+    local e = sample and sample.entry
+    if not e then return end
+    local gained = Instances.ParseHonorGain(text)
+    if not gained then return end
+    e.honor = (e.honor or 0) + gained
 end
 
 -- CHAT_MSG_MONEY: the loot-only coin accumulator. Spend-proof, unlike the wallet
@@ -1450,9 +1697,14 @@ Instances._Handlers = {
     TRADE_CLOSED             = function() Instances._onTradeClosed() end,
     -- ROUND-26 Part A.2: reputation accrual for the open run.
     CHAT_MSG_COMBAT_FACTION_CHANGE = function(text) Instances._onRepChange(text) end,
+    -- Honor accrual (pre-Cata chat scheme). Catalog 11509:
+    -- Event.ChatInfo.ChatMsgCombatHonorGain(text, ...).
+    CHAT_MSG_COMBAT_HONOR_GAIN = function(text) Instances._onHonorGain(text) end,
 }
 
-function Instances.OnLogin()
+-- The LOGIN seed, split out from the event registration so the reload fixture can
+-- drive the exact code a fresh session runs without re-registering handlers.
+function Instances._seedInside()
     -- Seed inside-state so the very first PLAYER_ENTERING_WORLD (login or /reload
     -- inside an instance) classifies as "none" and creates no phantom entry.
     local isInside = (IsInInstance and IsInInstance()) and true or false
@@ -1460,7 +1712,15 @@ function Instances.OnLogin()
     if isInside then
         local name, instanceID = currentInstanceIdentity()
         Instances._curKey = instanceID or name
+        -- ...and RE-OPEN the head record, so "no phantom entry" does not also
+        -- mean "no statistics for the rest of the run". Seeding the flag without
+        -- this is what made a reload silently stop every accumulator.
+        return Instances._resumeOpenRun()
     end
+end
+
+function Instances.OnLogin()
+    Instances._seedInside()
     for event, fn in pairs(Instances._Handlers) do
         ns:RegisterEvent(event, function(_, ...) ns:SafeCall(fn, ...) end)
     end
@@ -1551,7 +1811,7 @@ local function newSimClient()
         GetMoney = G.GetMoney, UnitName = G.UnitName, GetRealmName = G.GetRealmName,
         CombatLogGetCurrentEventInfo = G.CombatLogGetCurrentEventInfo,
         UnitGUID = G.UnitGUID, C_Timer = G.C_Timer,
-        UnitLevel = G.UnitLevel, UnitIsUnit = G.UnitIsUnit,
+        UnitLevel = G.UnitLevel, UnitIsUnit = G.UnitIsUnit, UnitXPMax = G.UnitXPMax,
         GetNumGroupMembers = G.GetNumGroupMembers, IsInRaid = G.IsInRaid,
         GetPlayerTradeMoney = G.GetPlayerTradeMoney, GetTargetTradeMoney = G.GetTargetTradeMoney,
     }
@@ -1571,6 +1831,9 @@ local function newSimClient()
 
     -- Group roster the sim reports: { unitToken -> {name, level} } plus the player.
     sim.playerLevel = 58
+    -- The level requirement. 0 is the MAX-LEVEL answer (and, live, also the cold
+    -- one) — the sim can set it to drive both.
+    sim.playerXPMax = 20000
     sim.party = {}         -- array of { name = , level = }
     sim.inRaid = false
     sim.tradeMoney = { player = 0, target = 0 }
@@ -1588,6 +1851,10 @@ local function newSimClient()
         local i = tonumber(tostring(unit):match("(%d+)$"))
         local m = i and sim.party[i]
         return m and m.name or nil
+    end
+    G.UnitXPMax = function(unit)
+        if unit == "player" then return sim.playerXPMax end
+        return 0
     end
     G.UnitLevel = function(unit)
         if unit == "player" then return sim.playerLevel end
@@ -1640,6 +1907,24 @@ local function newSimClient()
     end
     function sim.enter(name, instanceID, itype) sim.zoneTo(true, name, instanceID, itype or "party") end
     function sim.leave() sim.zoneTo(false, nil, nil, "none") end
+    -- A /RELOAD (or relog) WHILE INSIDE, modelled honestly: the teardown stamp
+    -- fires, then the ADDON'S WHOLE SESSION STATE IS GONE — every `_open*`,
+    -- `_inside`, `_curKey`, `_serial*` field is a module local that does not
+    -- survive a reload — and the new session runs the LOGIN seed and then gets a
+    -- PLAYER_ENTERING_WORLD. Wiping the state by hand is the point of the
+    -- fixture: a reload sim that leaves `_openSample` in place would test nothing,
+    -- because the pre-fix build looked perfectly healthy right up until that field
+    -- vanished.
+    function sim.reload()
+        sim.fire("PLAYER_LEAVING_WORLD")
+        Instances._openKey, Instances._openSample = nil, nil
+        Instances._serialArmed, Instances._entryAt = false, nil
+        Instances._lastGroupSnap, Instances._trade = nil, nil
+        Instances._inside, Instances._curKey = false, nil
+        Instances._walletWarm, Instances._groupSettled = nil, false
+        Instances._seedInside()          -- the LOGIN path, minus event registration
+        sim.fire("PLAYER_ENTERING_WORLD")
+    end
     sim.unitGUID = {}
     local function creatureGUID(serial, npcID)
         return ("Creature-0-3151-%d-%d-%d-000082EA3F"):format(sim.instanceID or 0, serial, npcID or 11583)
@@ -2461,6 +2746,44 @@ local function testMergeFoldsDetail(fails)
     ck(#a.trades == 2, "trades from both visits land on the survivor (got " .. #a.trades .. ")")
     ck(a.trades[2].who == "Dorn", "…in order")
     ck(a.mobKill == 7, "kill-derived count folded")
+
+    -- The PER-VISIT STATISTICS fold the same way: a corpse run back into the same
+    -- live instance is ONE run, so its honor and its per-faction rep belong to the
+    -- survivor's totals — while the level REQUIREMENT, which is not a taking, is
+    -- never summed and never overwritten.
+    local entries2 = {}
+    local s = select(1, Instances.RecordInto(entries2, "Stratholme", 329, 2000,
+        { xpMax = 20000 }))
+    s.serial, s.honor, s.xp = 6001, 10, 500
+    s.repBy = { ["Argent Dawn"] = 250, ["Timbermaw Hold"] = -25 }
+    s.rep = 225
+    local r = select(1, Instances.RecordInto(entries2, "Stratholme", 329, 2400,
+        { xpMax = 22000 }))
+    r.honor, r.xp = 5, 300
+    r.repBy = { ["Argent Dawn"] = 125, ["Brood of Nozdormu"] = 10 }
+    r.rep = 135
+    local res2, surv2 = Instances.ApplySerial(entries2, 6001, "g", "mouseover")
+    ck(res2 == "merged" and surv2 == s, "the corpse run merges into the survivor")
+    ck(s.honor == 15, "honor folds into the survivor (got " .. tostring(s.honor) .. ")")
+    ck(s.xp == 800, "xp folds")
+    ck(s.repBy["Argent Dawn"] == 375,
+        "a faction seen in BOTH visits sums (got " .. tostring(s.repBy["Argent Dawn"]) .. ")")
+    ck(s.repBy["Brood of Nozdormu"] == 10, "a faction seen only in the re-entry is carried over")
+    ck(s.repBy["Timbermaw Hold"] == -25, "…and one seen only in the first visit survives, signed")
+    ck(s.rep == 360, "the net total folds too (got " .. tostring(s.rep) .. ")")
+    ck(s.xpMax == 20000,
+        "the level requirement is NOT summed and NOT overwritten (got " .. tostring(s.xpMax) .. ")")
+
+    -- …but a survivor that never learned a requirement takes the re-entry's.
+    local entries3 = {}
+    local s3 = select(1, Instances.RecordInto(entries3, "Stratholme", 329, 3000))
+    s3.serial = 6002
+    local r3 = select(1, Instances.RecordInto(entries3, "Stratholme", 329, 3400,
+        { xpMax = 22000 }))
+    r3.honor = 4
+    Instances.ApplySerial(entries3, 6002, "g", "cast")
+    ck(s3.xpMax == 22000, "an absent requirement is FILLED from the re-entry (upgrade-only)")
+    ck(s3.honor == 4, "honor lands on a survivor that had none")
 end
 
 -- The mesh instance-ledger hash must be BLIND to the new optional fields, or an
@@ -2966,6 +3289,418 @@ local function testDebugPrintOrder(fails)
     Store.data, ns.Print = savedData, savedPrint
 end
 
+----------------------------------------------------------------------
+-- PER-VISIT STATISTICS — REPUTATION (and the transform bug it uncovered)
+--
+-- The rep accumulator has been wired since round-26 and has never once fired.
+-- The format-string→pattern transform did not escape the per-cent sign before
+-- looking for the placeholders, so `%s` / `%d` survived into the finished pattern
+-- as Lua's WHITESPACE and DIGIT classes, the pattern carried no captures, and
+-- `ParseRepChange` — which requires both a faction and an amount — returned nil
+-- for every line. Every stored `repBy` in the wild is empty for that reason.
+--
+-- RED CONTROL: the pre-fix transform, verbatim, on the real enUS format. It must
+-- still fail to produce a faction and an amount, or the green rows below are
+-- asserting nothing about the fix.
+----------------------------------------------------------------------
+local function testRepCapture(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+
+    -- ---- 1) RED CONTROL: the pre-fix transform ---------------------------
+    local function preFixPattern(s)
+        s = s:gsub("([%^%$%(%)%.%[%]%*%+%-%?])", "%%%1")     -- '%' NOT escaped
+        s = s:gsub("%%%%s", "(.+)"):gsub("%%%%d", "(%%d+)")  -- looks for '%%s'
+        return s
+    end
+    local FMT_INC = "Your reputation with %s has increased by %d."
+    local who0, amt0 = ("Your reputation with Argent Dawn has increased by 250.")
+                       :match(preFixPattern(FMT_INC))
+    ck(not (who0 and amt0 and tonumber(amt0)),
+       "RED CONTROL FAILED: the pre-fix transform now captures a faction AND an "
+       .. "amount, so the rows below prove nothing (got "
+       .. tostring(who0) .. " / " .. tostring(amt0) .. ")")
+
+    -- ---- 2) the transform, pure ------------------------------------------
+    local p = Instances.FormatToPattern(FMT_INC)
+    ck(p and p:find("(.-)", 1, true) ~= nil and p:find("(%d+)", 1, true) ~= nil,
+       "the transform must open BOTH placeholders as captures (got " .. tostring(p) .. ")")
+    ck(Instances.FormatToPattern(nil) == nil, "a nil format yields no pattern")
+    ck(Instances.FormatToPattern("") == nil, "an empty format yields no pattern")
+    -- A wider number class, for the decimal amounts Era's honor line carries.
+    local pd = Instances.FormatToPattern("gain %d points", "([%d%.]+)")
+    ck(("gain 13.00 points"):match(pd) == "13.00",
+       "a widened number class captures a decimal (got " .. tostring(("gain 13.00 points"):match(pd)) .. ")")
+
+    -- ---- 3) parsing, pure -------------------------------------------------
+    local pats = Instances.RepPatterns(true)
+    local who, amt = Instances.ParseRepChange(
+        "Your reputation with Argent Dawn has increased by 250.", pats)
+    ck(who == "Argent Dawn" and amt == 250,
+       "an increase parses to (faction, +amount) (got " .. tostring(who) .. " / " .. tostring(amt) .. ")")
+    who, amt = Instances.ParseRepChange(
+        "Your reputation with Timbermaw Hold has decreased by 75.", pats)
+    ck(who == "Timbermaw Hold" and amt == -75,
+       "a DECREASE keeps its sign (got " .. tostring(amt) .. ")")
+    -- The bonus variants are the same sentence with a suffix; `match` is
+    -- unanchored, so the base pattern takes the base amount off them too.
+    who, amt = Instances.ParseRepChange(
+        "Your reputation with Argent Dawn has increased by 250.  (+12.5 Bonus)", pats)
+    ck(who == "Argent Dawn" and amt == 250, "a bonus-suffixed line still yields the base amount")
+    ck(Instances.ParseRepChange("You have slain a foe.", pats) == nil, "an unrelated line -> nil")
+    ck(Instances.ParseRepChange(nil, pats) == nil, "nil text -> nil")
+
+    -- ---- 4) THE LIVE PATH: several factions, signed, on one run -----------
+    local sim = newSimClient()
+    local ok, err = pcall(function()
+        sim.enter("Stratholme", 329)
+        sim.clock = sim.clock + 5
+        sim.cast(3210)
+        sim.fire("CHAT_MSG_COMBAT_FACTION_CHANGE",
+                 "Your reputation with Argent Dawn has increased by 250.")
+        sim.fire("CHAT_MSG_COMBAT_FACTION_CHANGE",
+                 "Your reputation with Argent Dawn has increased by 125.")
+        sim.fire("CHAT_MSG_COMBAT_FACTION_CHANGE",
+                 "Your reputation with Timbermaw Hold has decreased by 75.")
+        sim.fire("CHAT_MSG_COMBAT_FACTION_CHANGE",
+                 "Your reputation with Brood of Nozdormu has increased by 10.")
+        local e = sim.entries()[1]
+        ck(type(e.repBy) == "table", "the run recorded a per-faction table")
+        ck(e.repBy and e.repBy["Argent Dawn"] == 375,
+           "the same faction ACCUMULATES (got " .. tostring(e.repBy and e.repBy["Argent Dawn"]) .. ")")
+        ck(e.repBy and e.repBy["Timbermaw Hold"] == -75,
+           "a LOSS is kept as a negative (got " .. tostring(e.repBy and e.repBy["Timbermaw Hold"]) .. ")")
+        ck(e.repBy and e.repBy["Brood of Nozdormu"] == 10,
+           "EVERY faction that fired is kept — there is no primary-faction concept")
+        ck(e.rep == 310, "the net total is the signed sum (got " .. tostring(e.rep) .. ")")
+    end)
+    sim.restore()
+    if not ok then fails[#fails + 1] = "rep capture sim errored: " .. tostring(err) end
+end
+
+----------------------------------------------------------------------
+-- PER-VISIT STATISTICS — HONOR.
+-- The chat accumulator, both Era line shapes. Captured and folded correctly;
+-- on Era it will read zero for a party/raid run, and every display omits the row
+-- when it does (see the note on HonorPatterns).
+----------------------------------------------------------------------
+local function testHonorCapture(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local pats = Instances.HonorPatterns(true)
+    ck(Instances.ParseHonorGain("You have been awarded 42 honor points.", pats) == 42,
+       "the award line parses its integer")
+    ck(Instances.ParseHonorGain(
+        "Ganker dies, honorable kill Rank: Grunt (13.00 Honor Points)", pats) == 13,
+       "the honorable-kill line parses its DECIMAL amount (got "
+       .. tostring(Instances.ParseHonorGain(
+            "Ganker dies, honorable kill Rank: Grunt (13.00 Honor Points)", pats)) .. ")")
+    ck(Instances.ParseHonorGain("Ganker dies, you gain 500 experience.", pats) == nil,
+       "an XP line is not an honor line")
+    ck(Instances.ParseHonorGain(nil, pats) == nil, "nil text -> nil")
+
+    local sim = newSimClient()
+    local ok, err = pcall(function()
+        sim.enter("Alterac Valley", 30, "party")   -- typed party so the ledger logs it
+        sim.clock = sim.clock + 5
+        sim.cast(700)
+        local e = sim.entries()[1]
+        ck(e.honor == nil, "a run with no honor carries NO honor field, not a zero")
+        sim.fire("CHAT_MSG_COMBAT_HONOR_GAIN", "You have been awarded 42 honor points.")
+        sim.fire("CHAT_MSG_COMBAT_HONOR_GAIN",
+                 "Ganker dies, honorable kill Rank: Grunt (13.00 Honor Points)")
+        ck(e.honor == 55, "honor accumulates across both line shapes (got " .. tostring(e.honor) .. ")")
+        ck(Instances._Handlers.CHAT_MSG_COMBAT_HONOR_GAIN ~= nil,
+           "CHAT_MSG_COMBAT_HONOR_GAIN is not in the handler table (the producer is unwired)")
+        sim.leave()
+        sim.fire("CHAT_MSG_COMBAT_HONOR_GAIN", "You have been awarded 999 honor points.")
+        ck(e.honor == 55, "honor stops at the instance boundary like every other taking")
+    end)
+    sim.restore()
+    if not ok then fails[#fails + 1] = "honor sim errored: " .. tostring(err) end
+end
+
+----------------------------------------------------------------------
+-- PER-VISIT STATISTICS — THE LEVEL REQUIREMENT ("% of level").
+--
+-- The denominator, and the two zeros that are not denominators: max level, and
+-- a cold read on the far side of a loading screen. Both are refused, and the
+-- refusal is what keeps a ding from leaving the run reporting a percentage of a
+-- level the character has already left.
+----------------------------------------------------------------------
+local function testXPMaxCapture(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local sim = newSimClient()
+    local ok, err = pcall(function()
+        sim.playerLevel, sim.playerXPMax = 58, 20000
+        sim.enter("Scholomance", 289)
+        local e = sim.entries()[1]
+        ck(e.xpMax == 20000, "the level requirement is snapshotted at entry (got " .. tostring(e.xpMax) .. ")")
+
+        sim.clock = sim.clock + 10
+        sim.cast(4242)
+        sim.fire("CHAT_MSG_COMBAT_XP_GAIN", "Risen Guard dies, you gain 3000 experience.")
+        ck(e.xp == 3000 and e.xpMax == 20000, "an ordinary kill leaves the requirement alone")
+
+        -- THE DING. The character levels mid-run and the requirement grows.
+        sim.playerLevel, sim.playerXPMax = 59, 22000
+        sim.fire("CHAT_MSG_COMBAT_XP_GAIN", "You gain 4000 experience.")
+        ck(e.xpMax == 22000,
+           "a mid-run ding moves the denominator to the NEW level (got " .. tostring(e.xpMax) .. ")")
+        ck(e.xp == 7000, "…and the accumulator keeps summing across it (got " .. tostring(e.xp) .. ")")
+
+        -- MAX LEVEL: the client answers 0. That is not a requirement, so the last
+        -- proven figure is left alone rather than a zero being written in.
+        sim.playerXPMax = 0
+        sim.fire("CHAT_MSG_COMBAT_XP_GAIN", "Risen Guard dies, you gain 1 experience.")
+        ck(e.xpMax == 22000, "a ZERO requirement is refused, never stored (got " .. tostring(e.xpMax) .. ")")
+
+        -- A run that only ever saw zero carries no requirement at all, which is
+        -- what suppresses the percentage entirely.
+        sim.leave()
+        sim.clock = sim.clock + 60
+        sim.enter("Stratholme", 329)
+        local e2 = sim.entries()[2]
+        ck(e2.xpMax == nil, "a max-level run stores NO requirement (got " .. tostring(e2.xpMax) .. ")")
+    end)
+    sim.restore()
+    if not ok then fails[#fails + 1] = "xpMax sim errored: " .. tostring(err) end
+end
+
+----------------------------------------------------------------------
+-- THE ATTRIBUTION BOUNDARY (spec §A4: "nothing accrues to a run while the inside
+-- flag is down").
+--
+-- Every accumulator hangs off `_openSample`, and `_closeRun` clears it — so the
+-- boundary is structural rather than a check someone has to remember to write.
+-- This fixture proves it for ALL SIX producers at once, one second after the
+-- exit, with a RED CONTROL that fires the same six lines while the run is open
+-- so the "nothing moved" assertions cannot be vacuous.
+----------------------------------------------------------------------
+local function testAttributionBoundary(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local sim = newSimClient()
+    local ok, err = pcall(function()
+        local function volley()
+            sim.fire("CHAT_MSG_COMBAT_XP_GAIN", "Risen Guard dies, you gain 500 experience.")
+            sim.fire("CHAT_MSG_MONEY", "You loot 1 Gold, 0 Silver, 0 Copper")
+            sim.fire("CHAT_MSG_COMBAT_FACTION_CHANGE",
+                     "Your reputation with Argent Dawn has increased by 25.")
+            sim.fire("CHAT_MSG_COMBAT_HONOR_GAIN", "You have been awarded 7 honor points.")
+            sim.unitDied()
+            sim.trade("Bramble", 100, 0)
+        end
+        local function snapshot(e)
+            return table.concat({ e.xp or 0, e.goldLoot or 0, e.rep or 0, e.honor or 0,
+                                  e.mobXP or 0, e.mobKill or 0, #(e.trades or {}) }, "/")
+        end
+
+        sim.money = 100000
+        Instances._noteWallet(100000)
+        sim.enter("Scholomance", 289)
+        sim.clock = sim.clock + 5
+        sim.cast(9000)
+        local e = sim.entries()[1]
+
+        -- RED CONTROL: the same six lines INSIDE must all land, or "nothing
+        -- changed" after the exit would be true for the wrong reason.
+        local before = snapshot(e)
+        volley()
+        local inside = snapshot(e)
+        ck(inside ~= before,
+           "RED CONTROL FAILED: the volley changed nothing even INSIDE the run, "
+           .. "so the boundary assertions below prove nothing (" .. inside .. ")")
+        ck(inside == "500/10000/25/7/1/1/1",
+           "every producer credited the open run (got " .. inside .. ")")
+
+        -- THE BOUNDARY. One second after leaving, the same volley credits nothing.
+        sim.clock = sim.clock + 600
+        sim.leave()
+        local atExit = snapshot(e)
+        sim.clock = sim.clock + 1
+        volley()
+        ck(snapshot(e) == atExit,
+           "a volley 1s AFTER the exit credited the closed run (" .. snapshot(e)
+           .. " vs " .. atExit .. ")")
+        ck(Instances.CurrentRun() == nil, "CurrentRun reports no open run once the exit lands")
+
+        -- …and it does not silently open a NEW record either.
+        ck(#sim.entries() == 1, "the post-exit volley created no entry (got " .. #sim.entries() .. ")")
+    end)
+    sim.restore()
+    if not ok then fails[#fails + 1] = "attribution boundary sim errored: " .. tostring(err) end
+end
+
+----------------------------------------------------------------------
+-- RELOAD CONTINUATION (spec §A6: a reload while inside is a CONTINUATION — no
+-- new record, the head keeps counting).
+--
+-- THE GAP. `OnLogin` seeded `_inside = true` so the first PLAYER_ENTERING_WORLD
+-- classified as "none" and created no phantom entry — correct — but nothing
+-- re-opened `_openSample`, which is a module local and does not survive a
+-- reload. So from the moment of the reload every accumulator in the file
+-- credited nothing for the rest of the run, while the record sat in the ledger
+-- looking healthy. RED CONTROL: the pre-fix seed, on the same sim, must still
+-- lose everything.
+----------------------------------------------------------------------
+local function testReloadContinuation(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+
+    -- ---- 1) the resume guard, pure ---------------------------------------
+    local T = 500000
+    local entries = { { t = T - 600, name = "Stratholme", mapID = 329 } }
+    ck(Instances.ResumableEntry(entries, "Stratholme", 329, T) == entries[1],
+       "the head record resumes when the identity matches")
+    ck(Instances.ResumableEntry(entries, "Scholomance", 289, T) == nil,
+       "a DIFFERENT instance must not absorb this one's takings")
+    ck(Instances.ResumableEntry(entries, "Stratholme", 329, T + DUR_FALLBACK_MAX) == nil,
+       "a run older than the 6h bound is not the run we are standing in")
+    ck(Instances.ResumableEntry(entries, "Stratholme", 329, T - 10000) == nil,
+       "a head record from the FUTURE is refused")
+    ck(Instances.ResumableEntry({ { t = T - 60, name = "S", mapID = 329, merged = true } },
+                                "S", 329, T) == nil,
+       "a MERGED head is not the live run — its survivor is")
+    ck(Instances.ResumableEntry({}, "S", 329, T) == nil, "an empty ledger resumes nothing")
+    ck(Instances.ResumableEntry(nil, "S", 329, T) == nil, "no ledger at all -> nil")
+    -- Name is the fallback identity when either side lacks a mapID.
+    ck(Instances.ResumableEntry({ { t = T - 60, name = "Stratholme" } }, "Stratholme", nil, T) ~= nil,
+       "with no mapID on either side the localized name is the identity")
+    ck(Instances.ResumableEntry({ { t = T - 60, name = "Stratholme" } }, "Scholomance", nil, T) == nil,
+       "…and a name mismatch still refuses")
+
+    -- ---- 2) THE LIVE PATH -------------------------------------------------
+    local sim = newSimClient()
+    local ok, err = pcall(function()
+        sim.money = 100000
+        Instances._noteWallet(100000)
+        sim.playerXPMax = 20000
+        sim.enter("Stratholme", 329)
+        sim.clock = sim.clock + 10
+        sim.cast(9100)
+        sim.fire("CHAT_MSG_COMBAT_XP_GAIN", "Risen Guard dies, you gain 900 experience.")
+        sim.fire("CHAT_MSG_MONEY", "You loot 2 Gold, 0 Silver, 0 Copper")
+        local e = sim.entries()[1]
+        ck(e.xp == 900 and e.goldLoot == 20000, "the run is accruing before the reload")
+
+        -- /RELOAD. Session state is gone; the seed runs; PEW arrives.
+        sim.clock = sim.clock + 60
+        sim.reload()
+        ck(#sim.entries() == 1, "a reload creates NO second record (got " .. #sim.entries() .. ")")
+        ck(Instances.CurrentRun() == e, "the head record is re-opened as the live run")
+        ck(Instances._inside == true, "the inside flag is seeded true")
+
+        -- …and it keeps counting.
+        sim.clock = sim.clock + 30
+        sim.fire("CHAT_MSG_COMBAT_XP_GAIN", "Risen Guard dies, you gain 1100 experience.")
+        sim.fire("CHAT_MSG_MONEY", "You loot 3 Gold, 0 Silver, 0 Copper")
+        sim.fire("CHAT_MSG_COMBAT_FACTION_CHANGE",
+                 "Your reputation with Argent Dawn has increased by 250.")
+        sim.unitDied()
+        ck(e.xp == 2000, "XP keeps accumulating after the reload (got " .. tostring(e.xp) .. ")")
+        ck(e.goldLoot == 50000, "coin keeps accumulating after the reload (got " .. tostring(e.goldLoot) .. ")")
+        ck(e.repBy and e.repBy["Argent Dawn"] == 250, "rep keeps accumulating after the reload")
+        ck(e.mobKill == 1, "the kill counter keeps counting after the reload")
+
+        -- The serial is already committed, so the watcher does not re-arm and
+        -- cannot overwrite it.
+        ck(Instances._serialArmed == false, "a record that already holds a serial does not re-arm the watcher")
+        ck(e.serial == 9100, "…and its serial is untouched")
+
+        -- The exit closes the WHOLE run, spanning the reload.
+        sim.clock = sim.clock + 100
+        sim.leave()
+        ck(e.exitT == sim.clock, "the exit stamps the real end of the whole run")
+        ck(Instances.EntryDuration(e, sim.clock) == 200,
+           "duration spans the reload (got " .. Instances.EntryDuration(e, sim.clock) .. ")")
+        ck(sim.counts().hour == 1, "still exactly one slot for one physical instance")
+        -- The wallet baseline came from the RUN's own entry snapshot, not a fresh
+        -- read after the reload, so the delta is the whole run's.
+        sim.money = 150000
+        Instances._noteWallet(150000)
+        Instances._stampExit({ gold = e.entryMoney, goldProven = true, entry = e }, sim.clock)
+        ck(e.entryMoney == 100000, "the entry wallet baseline was persisted for the resume")
+        ck(e.gold == 50000, "the wallet delta spans the reload (got " .. tostring(e.gold) .. ")")
+    end)
+    sim.restore()
+    if not ok then fails[#fails + 1] = "reload continuation sim errored: " .. tostring(err) end
+
+    -- ---- 3) THE OTHER DISPATCH POSTURE ------------------------------------
+    -- The fixture above runs the LOGIN order the addon actually gets: the
+    -- lifecycle seed, then PLAYER_ENTERING_WORLD. The client is not obliged to
+    -- hand us that order — a full relog can deliver PEW before our LOGIN hook has
+    -- run at all, and then the module is a fresh chunk with `_inside` false, so
+    -- the transition classifies as an ENTRY and a second record is born. That is
+    -- the spec's relog case, and the answer is the identity merge, not a special
+    -- path: this posture must end with ONE billed slot and ONE set of totals.
+    local sim3 = newSimClient()
+    local ok3, err3 = pcall(function()
+        sim3.enter("Stratholme", 329)
+        sim3.clock = sim3.clock + 10
+        sim3.cast(9200)
+        sim3.fire("CHAT_MSG_COMBAT_XP_GAIN", "Risen Guard dies, you gain 900 experience.")
+        sim3.fire("CHAT_MSG_COMBAT_HONOR_GAIN", "You have been awarded 10 honor points.")
+        sim3.fire("CHAT_MSG_COMBAT_FACTION_CHANGE",
+                  "Your reputation with Argent Dawn has increased by 250.")
+        ck(sim3.counts().hour == 1, "posture B: one slot before the relog")
+
+        -- RELOG, PEW FIRST. Session state gone, nothing seeded.
+        sim3.clock = sim3.clock + 60
+        sim3.fire("PLAYER_LEAVING_WORLD")
+        Instances._openKey, Instances._openSample = nil, nil
+        Instances._serialArmed, Instances._entryAt = false, nil
+        Instances._inside, Instances._curKey = false, nil
+        sim3.fire("PLAYER_ENTERING_WORLD")            -- classifies as ENTRY
+        ck(#sim3.entries() == 2, "posture B: PEW-before-seed opens a second record (the relog case)")
+        ck(sim3.counts().hour == 2, "posture B: …counted, until the serial proves otherwise")
+
+        -- The new record accrues, and then the merge folds it into the first.
+        sim3.fire("CHAT_MSG_COMBAT_XP_GAIN", "Risen Guard dies, you gain 1100 experience.")
+        sim3.fire("CHAT_MSG_COMBAT_HONOR_GAIN", "You have been awarded 5 honor points.")
+        sim3.fire("CHAT_MSG_COMBAT_FACTION_CHANGE",
+                  "Your reputation with Argent Dawn has increased by 125.")
+        sim3.clock = sim3.clock + 5
+        sim3.cast(9200)                                -- SAME live instance
+        local e1 = sim3.entries()[1]
+        ck(sim3.entries()[2].merged == true, "posture B: the relog record merges")
+        ck(sim3.counts().hour == 1, "posture B: one live instance, one slot (got "
+            .. sim3.counts().hour .. ")")
+        ck(e1.xp == 2000, "posture B: xp folded onto the survivor (got " .. tostring(e1.xp) .. ")")
+        ck(e1.honor == 15, "posture B: honor folded (got " .. tostring(e1.honor) .. ")")
+        ck(e1.repBy["Argent Dawn"] == 375,
+            "posture B: rep folded per faction (got " .. tostring(e1.repBy["Argent Dawn"]) .. ")")
+        ck(Instances.CurrentRun() == e1, "posture B: the open run continues on the SURVIVOR")
+
+        -- And what happens next lands on the survivor, not the merged husk.
+        sim3.fire("CHAT_MSG_COMBAT_XP_GAIN", "Risen Guard dies, you gain 100 experience.")
+        ck(e1.xp == 2100, "posture B: post-merge takings credit the survivor")
+        ck((sim3.entries()[2].xp or 0) == 1100, "posture B: the husk stops accruing")
+    end)
+    sim3.restore()
+    if not ok3 then fails[#fails + 1] = "reload posture-B sim errored: " .. tostring(err3) end
+
+    -- ---- 4) RED CONTROL: the pre-fix seed ---------------------------------
+    -- Identical scenario, except the reload does exactly what the old code did:
+    -- seed the flag and stop. Everything after it must be lost, or the green
+    -- rows above are asserting nothing.
+    local sim2 = newSimClient()
+    local ok2, err2 = pcall(function()
+        sim2.enter("Stratholme", 329)
+        sim2.clock = sim2.clock + 10
+        sim2.cast(9100)
+        sim2.fire("CHAT_MSG_COMBAT_XP_GAIN", "Risen Guard dies, you gain 900 experience.")
+        local e = sim2.entries()[1]
+        -- the PRE-FIX reload: teardown, state gone, flag seeded, NO resume
+        sim2.fire("PLAYER_LEAVING_WORLD")
+        Instances._openKey, Instances._openSample = nil, nil
+        Instances._inside, Instances._curKey = true, 329
+        sim2.fire("PLAYER_ENTERING_WORLD")
+        sim2.fire("CHAT_MSG_COMBAT_XP_GAIN", "Risen Guard dies, you gain 1100 experience.")
+        ck(e.xp == 900,
+           "RED CONTROL FAILED: the pre-fix seed kept accumulating on its own, so "
+           .. "the continuation rows above prove nothing (got " .. tostring(e.xp) .. ")")
+    end)
+    sim2.restore()
+    if not ok2 then fails[#fails + 1] = "reload red-control sim errored: " .. tostring(err2) end
+end
+
 function Instances.RunSelfTests(verbose)
     local suites = {
         { name = "transition classifier",         fn = testTransition },
@@ -2985,6 +3720,11 @@ function Instances.RunSelfTests(verbose)
         { name = "cold SELF row admission (NX-6, Class 6)",          fn = testColdSelfRow },
         { name = "cold wallet refusal (NX-5, Class 7/4)",            fn = testColdWallet },
         { name = "live detail capture",           fn = testLiveDetailCapture },
+        { name = "reputation capture (format-transform red control)", fn = testRepCapture },
+        { name = "honor capture",                 fn = testHonorCapture },
+        { name = "level requirement (% of level)", fn = testXPMaxCapture },
+        { name = "attribution boundary",          fn = testAttributionBoundary },
+        { name = "reload continuation",           fn = testReloadContinuation },
         { name = "double corpse run",             fn = testDoubleCorpseRun },
         { name = "merge folds detail fields",     fn = testMergeFoldsDetail },
         { name = "inbound merge dedup",           fn = testMergeInbound },

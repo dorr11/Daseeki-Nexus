@@ -25,6 +25,50 @@
   is enough to tell "it never left" from "it arrived and was rejected" — which
   previously took a hand comparison of the saved files.
 
+- **New: while you are inside an instance, the minimap tooltip tells you how the
+  run is going.** Hover the button and the **Instances** section opens with the
+  run you are standing in: the instance, how long you have been in there, how many
+  mobs have died, the experience it has paid you and what percentage of your level
+  that is, the rate per hour, the gold the mobs dropped, and one line for every
+  faction whose standing moved — gains and losses both, in alphabetical order, so
+  a dungeon that pays two factions shows you two numbers instead of one blurred
+  total. Step outside and the block disappears; the hour meter and your remaining
+  slots are there as before.
+
+  Anything the run has nothing to say about is left out rather than printed as a
+  zero — no mobs yet means no mob line. Gold is the one exception and always
+  shows, because *0c* is a real answer. At maximum level the percentage-of-level
+  figure drops away on its own, and the mob count keeps working on a boosted run
+  of grey mobs that pays no experience at all.
+
+  The gold figure is the coin you actually looted, not the change in your purse.
+  A run where you repaired would otherwise be reported as having *cost* you money,
+  which is the opposite of what the line claims to say.
+
+- **Fixed: reputation earned in a dungeon was never being recorded.** Every run
+  in your instance log has an empty reputation total, and the cause was one
+  character: the pattern the addon builds from the game's own "Your reputation
+  with X has increased by N" sentence was assembled in the wrong order, so it
+  matched nothing and quietly threw every reputation message away. It now records
+  each faction separately, keeps losses as losses, and shows them on the run — both
+  on the minimap hover and on the row hover in the Instances panel. Runs recorded
+  before this fix have nothing to recover; from here they will.
+
+- **Fixed: reloading your interface inside an instance stopped the run counting.**
+  A `/reload` in the middle of a dungeon left the run in your log looking healthy
+  while nothing further was added to it — no experience, no mobs, no coin, no
+  reputation, for the rest of the clear. The run is now picked back up where it
+  left off, still as one run and still one slot against your five, and the gold
+  and duration span the reload instead of restarting at it.
+
+- **New: the Instances panel's row hover carries the rest of the run.**
+  Experience per hour and what share of a level the run was worth join the grid,
+  honour appears when a run actually earned some, and a **Reputation** section
+  lists every faction the run moved. A run recorded before any of this existed
+  shows exactly the block it always did. The row for the run you are currently
+  inside also reports its clock live now, instead of freezing at whatever it read
+  the last time something stamped it.
+
 - **New: the minimap button's tooltip now shows where you stand against the
   instance limit.** Below the world buff timers there is an **Instances** section:
   how many of your five instances this hour are gone, then one line for each one
@@ -34,9 +78,8 @@
   your way.
 
   The 5-per-hour and 30-per-day limits are counted by the server **per account**,
-  not per character, so the section counts every character on the account together
-  — and any *other* account on your mesh that has been in an instance this hour
-  gets its own line, because that account's limit is the one that will stop it.
+  not per character, so the section counts every character on **this** account
+  together. Only this account: other accounts on your mesh are not on the hover.
   A re-entry into an instance that was still alive — a corpse run, a hearth and a
   summon back, a relog inside — does not appear and is not counted, because the
   server did not charge you for it either.
