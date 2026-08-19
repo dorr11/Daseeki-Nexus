@@ -94,6 +94,17 @@ Mesh.SEND_COOLDOWN_PRUNE = 4    -- prune send-cooldown entries older than N x th
 Mesh.ACK_WAIT_TTL = 300         -- drop an un-ACKed settings sync after 5 min
 Mesh.INSEQ_TTL    = 3600        -- drop a seq high-water for a non-peer after 1 h
 
+-- HOW FAR BELOW THE HIGH-WATER A FRAME MAY STILL BE ACCEPTED (see Mesh.FreshSeq).
+--
+-- Seqs are stamped at BUILD time from one monotonic counter, but frames leave in
+-- PRIORITY order (Mesh.DrainTick pops the priority queue), so within one prefix
+-- our own scheduler routinely emits seqs out of order. 512 is ~an order of
+-- magnitude past the largest inversion this transport can construct: the worst
+-- case is a full backfill answer (NS_ANSWER_SCAN_CAP owners, one frame each,
+-- priority 6) sitting behind a run of priority-4 pushes, and the SYNC bucket
+-- drains ~1 msg/sec so the window is also many minutes wide in wall-clock terms.
+Mesh.SEQ_LAG_WINDOW = 512
+
 -- B5 split-brain: two clients can both believe they are the guild broadcaster
 -- (election races a roster change), and both then relay the SAME snapshot. A
 -- small random defer plus same-payload cancellation makes the loser drop its
@@ -732,6 +743,24 @@ Mesh._nsOwnersSkipped   = 0  -- owner payloads the manifest filter suppressed
 Mesh._nsQueueDedup      = 0  -- enqueues suppressed because the same rev was pending
 Mesh._nsAskGated        = 0  -- NSREQs suppressed by the requester-side cooldown
 
+-- RELAY TRACE (2026-08-18). The chatcfg stall took a SavedVariables diff across
+-- three accounts to see, because nothing on either side of the wire recorded what
+-- it had last done per namespace. These three make the next one a one-paste
+-- verdict in /dsn debug mesh:
+--   _nsLastSend[ns]              what we last put on the wire for that namespace
+--   _nsLastRecv[ns.."\1"..owner] what last arrived for that (namespace, source)
+--   _nsRecvStale / _nsRecvSelf   receive-side REFUSALS, by reason
+Mesh._nsLastSend  = {}   -- [nsKey] = { at, target, owner, rev, op }
+Mesh._nsLastRecv  = {}   -- [nsKey.."\1"..ownerKey] = { at, from, rev, result }
+Mesh._nsRecvApplied = 0  -- inbound namespace payloads the store accepted
+Mesh._nsRecvStale   = 0  -- inbound refused by the rev gate (we already hold >= it)
+Mesh._nsRecvSelf    = 0  -- inbound refused by self-immunity (a peer echoing US)
+
+-- Session-sequence gate telemetry (see Mesh.FreshSeq).
+Mesh._seqReordered   = 0    -- accepted below the high-water (our own queue reordered it)
+Mesh._seqStaleDropped= 0    -- refused: further behind than SEQ_LAG_WINDOW
+Mesh._seqStaleLast   = nil  -- { key, seq, water, at } of the last refusal
+
 -- Suite-namespace transport tunables (wave N5; backfill rework 2026-08).
 Mesh.NS_PUSH_DEBOUNCE = 3    -- seconds to coalesce rapid MarkDirty pushes
 -- ANSWER-side: how long after answering a peer's pull we refuse to answer again.
@@ -1280,6 +1309,37 @@ Mesh._SessionOfMsgId = sessionOfMsgId   -- exposed for the seq self-tests
 --
 -- `t` is optional and used only for bookkeeping: every consultation restamps
 -- rec.t so Mesh.PruneInSeq can tell a live conversation from an abandoned one.
+--
+-- THE REORDER WINDOW (2026-08-18, the chatcfg/namespace relay stall).
+--
+-- This gate used to be a STRICT high-water: `seq <= rec.last -> refuse`. That is
+-- only correct if frames reach the wire in the order their seqs were stamped, and
+-- on this transport they do not. Mesh.Enqueue stamps the seq when the frame is
+-- BUILT (one global counter) and Mesh.DrainTick sends in PRIORITY order, so any
+-- frame in a LOWER-priority band than something built after it goes out with an
+-- older seq. On the SYNC prefix that is not an edge case, it is the design:
+--
+--   nspush   = 4  (a fresh delta for our own owner)
+--   nspayload= 6  (a pull answer -- the entire store-and-forward backfill)
+--   settings = 6
+--
+-- So a backfill answer queued at seq N, followed by ANY live push at seq N+1,
+-- drains as [N+1, N] -- and the receiver refused N. The refusal was silent, the
+-- rev hash therefore stayed diverged, the next heartbeat asked again, the answer
+-- was rebuilt with a fresh (still-lower-than-the-next-push) seq, and it was
+-- refused again. FOREVER. Live pushes kept landing (they are the high seq), which
+-- is why the field symptom was "the first exchange worked and nothing since":
+-- every namespace whose repair depended on the BACKFILL path froze at whatever
+-- rev happened to land while the queue was uncontended.
+--
+-- The fix is to accept a frame that is merely BEHIND the high-water, without
+-- advancing the water, as long as it is within SEQ_LAG_WINDOW. Replay protection
+-- does not live here and never did: Mesh.Dispatch consults Mesh.SeenBefore(msgId)
+-- FIRST, and every payload past this gate is independently idempotent (namespace
+-- payloads are rev-gated, timers dedup on their own key, state pushes are
+-- wholesale replacements). What this gate is actually for -- refusing a sender's
+-- pre-reload backlog -- is unchanged: the session token still resets the water,
+-- and anything further back than the window is still refused (and now counted).
 function Mesh.FreshSeq(sender, seq, sess, t)
     seq = tonumber(seq) or 0
     if seq == 0 then return true end   -- unsequenced ops (ping/ack) always pass
@@ -1294,9 +1354,22 @@ function Mesh.FreshSeq(sender, seq, sess, t)
         rec.last = 0
     end
     rec.t = t or now()
-    if seq <= rec.last then return false end
-    rec.last = seq
-    return true
+    if seq > rec.last then
+        rec.last = seq
+        return true
+    end
+    -- Behind the water but inside the window: our own priority queue reordered
+    -- it. Accept, and deliberately do NOT advance the water.
+    if seq > (rec.last - Mesh.SEQ_LAG_WINDOW) then
+        Mesh._seqReordered = (Mesh._seqReordered or 0) + 1
+        return true
+    end
+    -- Genuinely ancient: refuse, and leave a readable trace behind. A non-zero
+    -- count here with a namespace stall is the one line that says "the receiver
+    -- is dropping frames", so it is printed in /dsn debug mesh.
+    Mesh._seqStaleDropped = (Mesh._seqStaleDropped or 0) + 1
+    Mesh._seqStaleLast = { key = sender, seq = seq, water = rec.last, at = rec.t }
+    return false
 end
 
 ----------------------------------------------------------------------
@@ -1574,7 +1647,12 @@ function Mesh.DrainTick(t)
             s.queue:Push(PRIO[rejects[i].op] or 5, rejects[i])
         end
         if picked then
-            local ok = rawSend(prefix, picked.wire, picked.chatType, picked.target)
+            -- Through the Mesh table, not the file-local: Mesh._rawSend is the
+            -- transport's one send seam, and the relay self-test replaces it to
+            -- run a real sender->receiver exchange headless (build order in,
+            -- priority order out). rawSend's forbidden-prefix guard is not
+            -- weakened by this — Mesh.Enqueue refuses those frames entry.
+            local ok = Mesh._rawSend(prefix, picked.wire, picked.chatType, picked.target)
             if picked.target then
                 if ok then Mesh.NoteSuccess(picked.target)
                 else Mesh.NoteFailure(picked.target, t) end
@@ -2797,6 +2875,10 @@ local function sendNSPayloadTo(target, nsKey, ownerKey, opName)
         return false
     end
     rec.left = tonumber(nChunks) or 1
+    Mesh._nsLastSend[nsKey] = {
+        at = now(), target = target, owner = ownerKey, rev = rev,
+        op = opName or "nspayload",
+    }
     return true
 end
 Mesh._sendNSPayloadTo = sendNSPayloadTo   -- exposed for the scheduling self-test
@@ -3066,7 +3148,23 @@ function Mesh.HandleNSPayload(f, sender)
     if not blob or type(blob.ns) ~= "string" or type(blob.o) ~= "string" then return end
     local Sync = suiteSync()
     if not (Sync and Sync.ApplyInbound) then return end
-    Sync.ApplyInbound(blob.ns, blob.o, blob.r, blob.d, now())
+    local result = Sync.ApplyInbound(blob.ns, blob.o, blob.r, blob.d, now())
+    -- RELAY TRACE: what arrived, from whom, and whether the store took it. A
+    -- namespace that is stuck now says so on ONE line in /dsn debug mesh instead
+    -- of needing a SavedVariables diff across accounts to see.
+    Mesh._nsLastRecv[blob.ns .. "\1" .. blob.o] = {
+        at = now(), from = sender, rev = tonumber(blob.r) or 0,
+        result = tostring(result),
+    }
+    if result == "applied" then
+        Mesh._nsRecvApplied = (Mesh._nsRecvApplied or 0) + 1
+    elseif Sync.IsProviderNamespace and Sync.LocalOwnerKey
+        and Sync.IsProviderNamespace(blob.ns)
+        and blob.o == Sync.LocalOwnerKey(blob.ns) then
+        Mesh._nsRecvSelf = (Mesh._nsRecvSelf or 0) + 1
+    else
+        Mesh._nsRecvStale = (Mesh._nsRecvStale or 0) + 1
+    end
     -- No re-broadcast on receive: the next heartbeat advertises our updated rev
     -- hash and any still-stale peer pulls from us (store-and-forward), which
     -- avoids the fan-out storm a naive relay would cause.
@@ -4124,6 +4222,53 @@ local function debugMesh()
         Mesh._nsOwnersSent or 0, Mesh._nsOwnersSkipped or 0,
         Mesh._nsQueueDedup or 0, pendN, Mesh._nsAskGated or 0,
         Mesh.NS_REQ_ASK_COOLDOWN, Mesh.NS_REQ_DEDUP))
+
+    ------------------------------------------------------------------
+    -- THE RELAY VERDICT (2026-08-18). Three blocks, in the order the question
+    -- gets asked: did we SEND it, did it ARRIVE, and was anything REFUSED.
+    -- Pasting these lines from both accounts is enough to place a namespace
+    -- stall on one side of the wire without touching SavedVariables.
+    ------------------------------------------------------------------
+    local t = now()
+    local function ago(at) return at and string.format("%ds ago", t - at) or "never" end
+
+    -- Receive-side refusals FIRST: this is the line the stall wrote.
+    ns:Print(string.format(
+        "  ns-refusals: recv applied=%d stale=%d self=%d | seq reordered=%d staleDropped=%d (window %d)",
+        Mesh._nsRecvApplied or 0, Mesh._nsRecvStale or 0, Mesh._nsRecvSelf or 0,
+        Mesh._seqReordered or 0, Mesh._seqStaleDropped or 0, Mesh.SEQ_LAG_WINDOW))
+    local sl = Mesh._seqStaleLast
+    if sl then
+        ns:Print(string.format("    last seq refusal: %s seq=%s water=%s (%s)",
+            tostring(sl.key), tostring(sl.seq), tostring(sl.water), ago(sl.at)))
+    end
+
+    -- Last SEND per namespace.
+    local sendKeys = Mesh.SortedKeys(Mesh._nsLastSend)
+    if #sendKeys == 0 then
+        ns:Print("  ns-lastsend: nothing has been put on the wire this session")
+    end
+    for i = 1, #sendKeys do
+        local r = Mesh._nsLastSend[sendKeys[i]]
+        ns:Print(string.format("  ns-lastsend %-12s -> %s owner=%s rev=%s as %s (%s)",
+            sendKeys[i], tostring(r.target), tostring(r.owner), tostring(r.rev),
+            tostring(r.op), ago(r.at)))
+    end
+
+    -- Last RECEIVE per (namespace, source owner) — the cross-account row that
+    -- froze. `result` is the store's own verdict, so a namespace that is arriving
+    -- but being rev-refused reads differently from one that never arrives at all.
+    local recvKeys = Mesh.SortedKeys(Mesh._nsLastRecv)
+    if #recvKeys == 0 then
+        ns:Print("  ns-lastrecv: no namespace payload has arrived this session")
+    end
+    for i = 1, #recvKeys do
+        local r = Mesh._nsLastRecv[recvKeys[i]]
+        local nsKey, ownerKey = recvKeys[i]:match("^([^\1]*)\1(.*)$")
+        ns:Print(string.format("  ns-lastrecv %-12s from owner=%s rev=%s %s via %s (%s)",
+            tostring(nsKey), tostring(ownerKey), tostring(r.rev),
+            tostring(r.result), tostring(r.from), ago(r.at)))
+    end
 end
 
 ----------------------------------------------------------------------
@@ -4255,18 +4400,27 @@ local function testFrameRoundTrip()
 end
 
 local function testFreshSeq()
-    -- (a) Same-session ordering: duplicate + stale rejected, newer accepted,
-    -- unsequenced (seq 0) always passes. sess held constant = "A".
+    -- (a) Same-session ordering. THE CONTRACT CHANGED 2026-08-18 (see the note on
+    -- Mesh.FreshSeq): a seq at-or-behind the high-water but INSIDE
+    -- SEQ_LAG_WINDOW is our own priority queue's reordering, not a replay, so it
+    -- is ACCEPTED — and must not drag the water backwards. Replay defense never
+    -- lived here: Mesh.Dispatch consults Mesh.SeenBefore(msgId) first. Beyond the
+    -- window the refusal is intact. Unsequenced (seq 0) always passes.
     Mesh._inSeq = {}
     if not Mesh.FreshSeq("S", 5, "A") then return false, "first seq rejected" end
-    if Mesh.FreshSeq("S", 5, "A") then return false, "duplicate seq accepted" end
-    if Mesh.FreshSeq("S", 4, "A") then return false, "stale seq accepted" end
+    if not Mesh.FreshSeq("S", 5, "A") then return false, "an in-window repeat was refused" end
+    if not Mesh.FreshSeq("S", 4, "A") then return false, "an in-window reorder was refused" end
+    if Mesh._inSeq["S"].last ~= 5 then return false, "a reorder moved the high-water" end
     if not Mesh.FreshSeq("S", 6, "A") then return false, "newer seq rejected" end
     if not Mesh.FreshSeq("S", 0, "A") then return false, "unsequenced op rejected" end
-    -- (a) explicit: seq 5 then 3 within one session -> the 3 must drop.
+    if Mesh.FreshSeq("S", 6 - Mesh.SEQ_LAG_WINDOW, "A") then
+        return false, "a seq a full window behind was accepted"
+    end
+    -- (a) explicit: seq 5 then 3 within one session -> the 3 is a reorder now.
     Mesh._inSeq = {}
     if not Mesh.FreshSeq("S", 5, "A") then return false, "seq5 rejected" end
-    if Mesh.FreshSeq("S", 3, "A") then return false, "stale seq3 accepted after 5" end
+    if not Mesh.FreshSeq("S", 3, "A") then return false, "in-window seq3 refused after 5" end
+    if Mesh._inSeq["S"].last ~= 5 then return false, "in-window seq3 moved the water" end
 
     -- (b) Sender SESSION RESTART: a high seq on session A, then seq 1 on session B
     -- (a /reload reset the sender's counter) MUST be accepted, not stale-dropped.
@@ -4276,7 +4430,7 @@ local function testFreshSeq()
     if not Mesh.FreshSeq("S", 1, "B") then return false, "sessB seq1 stale-dropped (the bug)" end
     -- ...and ordering resumes within the new session.
     if not Mesh.FreshSeq("S", 2, "B") then return false, "sessB seq2 rejected" end
-    if Mesh.FreshSeq("S", 1, "B") then return false, "sessB seq1 replay accepted" end
+    if not Mesh.FreshSeq("S", 1, "B") then return false, "sessB in-window reorder refused" end
     -- A late straggler from the OLD session (higher seq, old sess) is treated as a
     -- session switch back and accepted once — acceptable: sessions don't interleave
     -- in practice, and the alternative (tracking every past session) is unbounded.
@@ -4287,8 +4441,15 @@ local function testFreshSeq()
     Mesh._inSeq = {}
     if not Mesh.FreshSeq("Sndr\1P1", 10, "A") then return false, "prefix1 seq rejected" end
     if not Mesh.FreshSeq("Sndr\1P2", 4, "A") then return false, "prefix2 low seq wrongly staled" end
-    if Mesh.FreshSeq("Sndr\1P1", 4, "A") then return false, "prefix1 stale accepted" end
     if not Mesh.FreshSeq("Sndr\1P2", 5, "A") then return false, "prefix2 newer rejected" end
+    -- The two waters are genuinely separate: P2 climbing to 5 must not decide
+    -- anything about P1, and P1's own beyond-window refusal is measured against
+    -- P1's water (10), not P2's.
+    if Mesh._inSeq["Sndr\1P1"].last ~= 10 then return false, "prefix2 traffic moved prefix1's water" end
+    if Mesh.FreshSeq("Sndr\1P1", 10 - Mesh.SEQ_LAG_WINDOW, "A") then
+        return false, "prefix1 beyond-window seq accepted"
+    end
+    if Mesh._inSeq["Sndr\1P2"].last ~= 5 then return false, "prefix1 refusal disturbed prefix2's water" end
     return true
 end
 
@@ -5228,6 +5389,279 @@ local function testNSTargetedBackfill()
     Mesh.IsEnabled, Mesh.Enqueue = savedEnabled, savedEnqueue
     Mesh._nsReqSeen, Mesh._nsReqAsked, Mesh._nsQueued = savedSeen, savedAsked, savedQueued
     if restoreSync then _G.Daseeki.Sync = nil end
+    _G.Daseeki = savedDaseeki
+    return ok, why
+end
+
+----------------------------------------------------------------------
+-- THE NAMESPACE RELAY, END TO END THROUGH THE REAL SCHEDULER
+-- (2026-08-18 — the chatcfg stall).
+--
+-- THE FIELD BUG. Cross-account `chatcfg` (Daseeki-Chat's whole config) stopped
+-- arriving between accounts. The stores said the local publish path was healthy
+-- (each account's OWN entry was current) and that cross-account entries were
+-- frozen at whatever rev happened to land during the FIRST exchange — the same
+-- shape on `delegates`, which is what proved it was not a Chat-side defect but
+-- the transport underneath both.
+--
+-- THE MECHANISM. Seqs are stamped at BUILD time (Mesh.Enqueue, one global
+-- counter); frames leave in PRIORITY order (Mesh.DrainTick). On the SYNC prefix
+-- a pull answer is `nspayload` (priority 6) and a live delta is `nspush`
+-- (priority 4) — the split that 1.1.x deliberately introduced so a gold change
+-- would not queue behind a login backfill. So a backfill answer built at seq N,
+-- followed by ANY live push at seq N+1, went out as [N+1, N]; the receiver's
+-- Mesh.FreshSeq high-water was strict, refused N in silence, and the rev hash
+-- stayed diverged — so the peer asked again, was answered again, and was refused
+-- again, for as long as the accounts stayed up. Every namespace whose repair
+-- depended on the BACKFILL path froze; every namespace lucky enough to land a
+-- live push while the queue was uncontended looked fine.
+--
+-- WHY EVERY EXISTING SUITE STAYED GREEN. `testFreshSeq` asserts the gate in
+-- isolation (monotonic in, monotonic out) and the whole ns-backfill suite stubs
+-- Mesh.Enqueue, so nothing ever ran the scheduler and the receive gate in the
+-- same test — the ONE composition where the defect exists. This suite closes
+-- that seam: it drives the REAL Enqueue/DrainTick on the sender, captures the
+-- wire in the order the priority queue actually chose, and feeds it through the
+-- REAL DeEnvelope/FeedChunk/Dispatch on a receiver with its own inSeq state.
+--
+-- ROW DISCIPLINE: the inversion itself is ASSERTED before the delivery rows, so
+-- a future re-rank of PRIO that removed the hazard would fail the fixture loudly
+-- rather than making the delivery assertions vacuously true.
+----------------------------------------------------------------------
+local function testNSRelayThroughScheduler()
+    local ok, why = true, nil
+    local function ck(c, m) if ok and not c then ok, why = false, m end end
+
+    local savedData    = Store.data
+    local savedEnabled = Mesh.IsEnabled
+    local savedRaw     = Mesh._rawSend
+    local savedSched   = Mesh._sched
+    local savedQueued  = Mesh._nsQueued
+    local savedSeen    = Mesh._nsReqSeen
+    local savedAsked   = Mesh._nsReqAsked
+    local savedInSeq   = Mesh._inSeq
+    local savedIds     = Mesh._seenIds
+    local savedReasm   = Mesh._reasm
+    local savedFail    = Mesh._fail
+    local savedDaseeki = _G.Daseeki
+
+    Mesh.IsEnabled = function() return true end
+
+    -- THE WIRE: every chunk the drain actually sent, in send order.
+    local wire = {}
+    Mesh._rawSend = function(prefix, w, chatType, target)
+        wire[#wire + 1] = { prefix = prefix, wire = w, target = target }
+        return true
+    end
+
+    -- THE RECEIVER's namespace store: the real rev gate, nothing else.
+    local inbox = { applied = {}, calls = 0 }
+    local receiver = {
+        IsProviderNamespace = function() return true end,
+        LocalOwnerKey = function() return "acct-B" end,
+        ApplyInbound = function(nsKey, owner, rev, _data, _t)
+            inbox.calls = inbox.calls + 1
+            local k = nsKey .. "/" .. owner
+            rev = tonumber(rev) or 0
+            if (inbox.applied[k] or -1) >= rev then return "stale" end
+            inbox.applied[k] = rev
+            return "applied"
+        end,
+    }
+
+    local base = now()
+    local function senderRole()
+        wire = {}
+        Mesh._sched, Mesh._nsQueued, Mesh._fail = {}, {}, {}
+    end
+    local function drainAll()
+        for i = 1, 600 do
+            local pending = false
+            for _, s in pairs(Mesh._sched) do
+                if not s.queue:IsEmpty() then pending = true break end
+            end
+            if not pending then break end
+            Mesh.DrainTick(base + i)
+        end
+    end
+    -- Hand the captured wire to a receiver whose seq/dedup/reassembly state is
+    -- its own (a different client), through the same three calls onChatMsgAddon
+    -- makes. Returns how many frames the receiver DISPATCHED.
+    local function receiverRole()
+        Mesh._inSeq, Mesh._seenIds, Mesh._reasm = {}, {}, {}
+        inbox = { applied = {}, calls = 0 }
+        _G.Daseeki = { Sync = receiver }
+        local dispatched = 0
+        for i = 1, #wire do
+            local env = Mesh.DeEnvelope(wire[i].wire)
+            if env then
+                local frame = Mesh.FeedChunk("Peer-A", wire[i].prefix, env, base + i)
+                if frame then
+                    dispatched = dispatched + 1
+                    Mesh.Dispatch(wire[i].prefix, frame, "Peer-A")
+                end
+            end
+        end
+        return dispatched
+    end
+    -- The (op, seq) of each frame on the wire, decoded off the real bytes.
+    local function wireSeqs()
+        local out = {}
+        for i = 1, #wire do
+            local env = Mesh.DeEnvelope(wire[i].wire)
+            -- single-chunk frames only in these fixtures; index 1 carries the header
+            if env and env.index == 1 then
+                local pf = Mesh.ParseFrame(env.data)
+                local blob = pf and Mesh.Unpack(pf.payload)
+                out[#out + 1] = { seq = tonumber(pf and pf.seq) or 0,
+                                  ns = blob and blob.ns, owner = blob and blob.o,
+                                  rev = blob and blob.r }
+            end
+        end
+        return out
+    end
+
+    local function store(t) return { syncNamespaces = t } end
+
+    ------------------------------------------------------------------
+    -- 1. THE INVERSION IS REAL. A backfill answer built FIRST leaves the queue
+    --    AFTER a live push built second, carrying the OLDER seq.
+    ------------------------------------------------------------------
+    Store.data = store({
+        chatcfg = { ["acct-A"] = { rev = 7, data = { at = 700, cfg = { j = 1 } } } },
+        bags    = { ["Char-X"] = { rev = 9, data = { g = 9 } } },
+    })
+    senderRole()
+    Mesh._nsReqSeen, Mesh._nsReqAsked = {}, {}
+    -- The pull answer: priority 6 (`nspayload`), built first.
+    Mesh.SendNamespace("Peer-B", "chatcfg", { ["acct-A"] = 2 })
+    -- A live delta a moment later: priority 4 (`nspush`), built second.
+    Mesh._sendNSPayloadTo("Peer-B", "bags", "Char-X", "nspush")
+    drainAll()
+
+    local seqs = wireSeqs()
+    ck(#seqs == 2, "the fixture put " .. tostring(#seqs) .. " frames on the wire (expected 2)")
+    ck(seqs[1] and seqs[1].ns == "bags",
+        "the priority split is gone: the live push did NOT overtake the backfill answer")
+    ck(seqs[2] and seqs[2].ns == "chatcfg",
+        "the backfill answer did not drain second")
+    ck(seqs[1] and seqs[2] and seqs[1].seq > seqs[2].seq,
+        "the fixture is VACUOUS: the wire is in ascending seq order, so no receiver gate is under test")
+
+    ------------------------------------------------------------------
+    -- 2. THE DEFECT ITSELF. Both frames must land. Before the reorder window,
+    --    the chatcfg payload was refused by Mesh.FreshSeq and dropped silently.
+    ------------------------------------------------------------------
+    local dispatched = receiverRole()
+    ck(dispatched == 2, "the receiver dispatched " .. tostring(dispatched) .. " of 2 frames")
+    ck(inbox.applied["bags/Char-X"] == 9, "the live push did not land")
+    ck(inbox.applied["chatcfg/acct-A"] == 7,
+        "THE STALL: the backfill answer was dropped by the seq gate (chatcfg never arrives)")
+
+    ------------------------------------------------------------------
+    -- 3. EXCHANGE ONCE, THEN BUMP — the live pattern, verbatim. A first push
+    --    lands; a rev bump behind a queued backfill must land too.
+    ------------------------------------------------------------------
+    Store.data = store({
+        chatcfg = { ["acct-A"] = { rev = 1, data = { at = 100, cfg = {} } } },
+    })
+    senderRole()
+    Mesh._sendNSPayloadTo("Peer-B", "chatcfg", "acct-A", "nspush")
+    drainAll()
+    receiverRole()
+    ck(inbox.applied["chatcfg/acct-A"] == 1, "the first exchange did not land")
+    local firstInSeq, firstIds = Mesh._inSeq, Mesh._seenIds   -- the receiver KEEPS its state
+
+    -- ...now a bulk answer is queued, and the config is edited behind it.
+    Store.data = store({
+        chatcfg = { ["acct-A"] = { rev = 2, data = { at = 200, cfg = { edited = true } } } },
+        bags    = { ["Char-X"] = { rev = 4, data = { g = 4 } },
+                    ["Char-Y"] = { rev = 5, data = { g = 5 } } },
+    })
+    senderRole()
+    Mesh._nsReqSeen, Mesh._nsReqAsked = {}, {}
+    Mesh.SendNamespace("Peer-B", "bags", nil)                       -- prio 6, older seqs
+    Mesh._sendNSPayloadTo("Peer-B", "chatcfg", "acct-A", "nspush")  -- prio 4, newest seq
+    drainAll()
+    -- Same receiver: restore the seq/dedup state the first exchange left behind.
+    Mesh._inSeq, Mesh._seenIds, Mesh._reasm = firstInSeq, firstIds, {}
+    _G.Daseeki = { Sync = receiver }
+    for i = 1, #wire do
+        local env = Mesh.DeEnvelope(wire[i].wire)
+        local frame = env and Mesh.FeedChunk("Peer-A", wire[i].prefix, env, base + 100 + i)
+        if frame then Mesh.Dispatch(wire[i].prefix, frame, "Peer-A") end
+    end
+    ck(inbox.applied["chatcfg/acct-A"] == 2, "the rev bump after a first exchange never arrived")
+    ck(inbox.applied["bags/Char-X"] == 4 and inbox.applied["bags/Char-Y"] == 5,
+        "the backfill queued ahead of the bump was dropped")
+
+    ------------------------------------------------------------------
+    -- 4. THE THREE-PEER LEG: a peer that was offline asks at login and must
+    --    receive EVERY owner, even with live pushes interleaving the answer.
+    ------------------------------------------------------------------
+    Store.data = store({
+        chatcfg = { ["acct-A"] = { rev = 3, data = { at = 300, cfg = {} } },
+                    ["acct-B"] = { rev = 6, data = { at = 600, cfg = {} } },
+                    ["acct-C"] = { rev = 2, data = { at = 200, cfg = {} } } },
+        attune  = { ["acct-A"] = { rev = 11, data = { x = 1 } } },
+    })
+    senderRole()
+    Mesh._nsReqSeen, Mesh._nsReqAsked = {}, {}
+    -- The returning peer's NSREQ, built and answered through the real path.
+    local reqFrame = Mesh.BuildFrame(OP.NSREQ, Mesh.Pack({ ns = "chatcfg", m = {} }), {})
+    Mesh.HandleNSReq(Mesh.ParseFrame(reqFrame), "Peer-C")
+    -- ...with a live attune delta racing it out of the queue.
+    Mesh._sendNSPayloadTo("Peer-C", "attune", "acct-A", "nspush")
+    drainAll()
+    receiverRole()
+    ck(inbox.applied["chatcfg/acct-A"] == 3
+        and inbox.applied["chatcfg/acct-B"] == 6
+        and inbox.applied["chatcfg/acct-C"] == 2,
+        "the login backfill delivered only part of the namespace to a cold peer")
+    ck(inbox.applied["attune/acct-A"] == 11, "the live delta racing the backfill was lost")
+
+    ------------------------------------------------------------------
+    -- 5. THE GATE STILL GATES. The window is a reorder allowance, not an
+    --    amnesty: a genuinely ancient seq is still refused, a re-used msgId is
+    --    still deduped, and a NEW session still resets the water.
+    ------------------------------------------------------------------
+    Mesh._inSeq = {}
+    ck(Mesh.FreshSeq("G\1S", 1000, "sess1", 1) == true, "a first frame was refused")
+    ck(Mesh.FreshSeq("G\1S", 1001, "sess1", 1) == true, "a forward seq was refused")
+    ck(Mesh.FreshSeq("G\1S", 999, "sess1", 1) == true,
+        "a one-behind reorder was refused (this is the stall)")
+    ck(Mesh._inSeq["G\1S"].last == 1001,
+        "accepting a reorder wrongly ADVANCED the high-water backwards")
+    ck(Mesh.FreshSeq("G\1S", 1001 - Mesh.SEQ_LAG_WINDOW, "sess1", 1) == false,
+        "a seq a full window behind was accepted (the stale defense is gone)")
+    ck(Mesh.FreshSeq("G\1S", 1, "sess1", 1) == false, "an ancient seq was accepted")
+    ck(Mesh._seqStaleLast and Mesh._seqStaleLast.water == 1001,
+        "a stale refusal left no trace for the debug surface")
+    ck(Mesh.FreshSeq("G\1S", 3, "sess2", 1) == true,
+        "a NEW sender session did not reset the high-water (the reload wedge is back)")
+    -- Replay is msgId's job, and it still does it.
+    Mesh._seenIds = {}
+    ck(Mesh.SeenBefore("relay-dup-1", 10) == false, "a first msgId was seen-before")
+    ck(Mesh.SeenBefore("relay-dup-1", 11) == true, "a repeated msgId was not deduped")
+
+    ------------------------------------------------------------------
+    -- 6. THE TRACE SURFACES. A stall must be readable from /dsn debug mesh in
+    --    one paste, so the send/receive rows have to actually be written.
+    ------------------------------------------------------------------
+    ck(type(Mesh._nsLastSend["chatcfg"]) == "table"
+        and Mesh._nsLastSend["chatcfg"].owner == "acct-C",
+        "no last-send row was recorded for chatcfg")
+    ck(type(Mesh._nsLastRecv["chatcfg\1acct-B"]) == "table"
+        and Mesh._nsLastRecv["chatcfg\1acct-B"].result == "applied",
+        "no last-receive row was recorded for a delivered chatcfg owner")
+    ck((Mesh._seqReordered or 0) > 0,
+        "the reorder counter never moved, so nothing in this suite exercised the window")
+
+    Store.data = savedData
+    Mesh.IsEnabled, Mesh._rawSend = savedEnabled, savedRaw
+    Mesh._sched, Mesh._nsQueued, Mesh._fail = savedSched, savedQueued, savedFail
+    Mesh._nsReqSeen, Mesh._nsReqAsked = savedSeen, savedAsked
+    Mesh._inSeq, Mesh._seenIds, Mesh._reasm = savedInSeq, savedIds, savedReasm
     _G.Daseeki = savedDaseeki
     return ok, why
 end
@@ -7345,10 +7779,18 @@ local function testInSeqPrune()
         if ok and Mesh._inSeq["Recent-R\1DSKN1"] == nil then ok, why = false, "recently used record pruned" end
         if ok and dropped ~= 1 then ok, why = false, "prune count wrong: " .. tostring(dropped) end
     end
-    -- The high-water still rejects a replay after the prune.
+    -- The high-water SURVIVES the prune. An in-window reorder is accepted without
+    -- disturbing it (the 2026-08-18 contract), and anything past the window is
+    -- still refused — which is the property the prune must not quietly re-open.
     if ok then
-        if Mesh.FreshSeq("Live-R\1DSKN1", 4, "aa", T + 1) then
-            ok, why = false, "replay accepted after prune"
+        if not Mesh.FreshSeq("Live-R\1DSKN1", 4, "aa", T + 1) then
+            ok, why = false, "an in-window reorder was refused after the prune"
+        end
+        if ok and Mesh._inSeq["Live-R\1DSKN1"].last ~= 5 then
+            ok, why = false, "the high-water did not survive the prune"
+        end
+        if ok and Mesh.FreshSeq("Live-R\1DSKN1", 5 - Mesh.SEQ_LAG_WINDOW, "aa", T + 2) then
+            ok, why = false, "a beyond-window seq was accepted after the prune"
         end
     end
     -- Records created before this build carry no stamp: adopt, don't drop.
@@ -7441,6 +7883,8 @@ function Mesh.RunSelfTests(verbose)
         { name = "hash diff",        fn = testHashDiff },
         { name = "namespace hash diff", fn = testNamespaceDiff },
         { name = "ns targeted backfill (rev manifest)", fn = testNSTargetedBackfill },
+        { name = "ns relay end-to-end through the scheduler (seq reorder)",
+          fn = testNSRelayThroughScheduler },
         { name = "wire-order determinism (Class 8, NXM-1..8)", fn = testWireOrderDeterminism },
         { name = "ns answer order on the wire (NXM-1)", fn = testNSAnswerOrderOnTheWire },
         { name = "ns queue duplicate suppression", fn = testNSQueueDedup },
