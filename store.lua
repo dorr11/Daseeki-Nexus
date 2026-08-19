@@ -4390,16 +4390,62 @@ function Store.SyncNSPut(nsKey, ownerKey, rev, data, now)
     return Store.SyncNSApply(nsp, ownerKey, rev, data, now)
 end
 
--- Remove one owner from a namespace (tombstone / eviction).
+----------------------------------------------------------------------
+-- OWN-ROW IMMUNITY  (the pinned invariant, 2026-08-19)
+--
+-- THE INVARIANT: a row this account OWNS is only ever REPLACED by a newer scan
+-- of our own. No retention sweep, no tombstone, no dedup and no inbound frame
+-- may DELETE it. Everything a peer knows about our characters came from us; if
+-- we drop our own row, the mesh's only remaining copy is whatever stale rev a
+-- peer happens to hold, and there is no authority left to correct it.
+--
+-- THE HOLE THIS CLOSES. SweepSyncNamespaces evicted ANY entry not refreshed
+-- within SYNCNS_STALE (30 days) — our own alts included. An alt parked for a
+-- month lost its `bags` row at the next login, and the row's ONLY route back is
+-- logging that character in again: nothing else can rebuild it, because nothing
+-- else has ever seen its bags. Meanwhile every SIBLING row (the alts played
+-- inside the window, and every peer-owned row the mesh keeps refreshing)
+-- survived — which is exactly the shape of "my own character has no row while
+-- everyone else's does".
+--
+-- Two ownership kinds, because the namespaces are keyed two ways:
+--   char-granular ("bags", "professions")  -> ownerKey is "Name-Realm"
+--   account-granular ("attune", "chatcfg") -> ownerKey is our account id
+-- Both are ours, and both are immune.
+----------------------------------------------------------------------
+
+-- Counters surfaced by the debug line: proof the guard is load-bearing rather
+-- than decorative.
+Store._ownRow = { keptStale = 0, dropRefused = 0, lastRefused = nil }
+
+-- PURE-ish (reads the account graph): does `ownerKey` name something THIS
+-- account owns — one of our characters, or our own account id?
+function Store.OwnsNamespaceOwner(ownerKey)
+    if type(ownerKey) ~= "string" or ownerKey == "" then return false end
+    local selfID = ns.GetAccountID and ns:GetAccountID() or ""
+    if selfID ~= "" and ownerKey == selfID then return true end
+    return Store.IsOwnCharacter(ownerKey)
+end
+
+-- Remove one owner from a namespace (tombstone / eviction). REFUSES an owner
+-- key of ours: see the invariant above. Returns true when the drop happened.
 function Store.SyncNSDrop(nsKey, ownerKey)
+    if Store.OwnsNamespaceOwner(ownerKey) then
+        local c = Store._ownRow
+        c.dropRefused = (c.dropRefused or 0) + 1
+        c.lastRefused = tostring(nsKey) .. "/" .. tostring(ownerKey)
+        return false
+    end
     local nsp = Store.SyncNSNamespace(nsKey, false)
     if nsp then nsp[ownerKey] = nil end
+    return true
 end
 
 -- Retention: drop stale entries (not refreshed within SYNCNS_STALE) and any
 -- entry whose ownerKey names a tombstoned account (account-granular
 -- namespaces). Char-granular namespaces like "bags" simply age out by
--- staleness. Emits a one-line size-sanity note if a namespace grows past
+-- staleness. OUR OWN owner keys are exempt from both rules (own-row immunity).
+-- Emits a one-line size-sanity note if a namespace grows past
 -- SYNCNS_SIZE_WARN owners. Returns the number of entries dropped.
 function Store.SweepSyncNamespaces(now)
     now = now or serverNow()
@@ -4408,9 +4454,16 @@ function Store.SweepSyncNamespaces(now)
     for nsKey, nsp in pairs(all) do
         local count = 0
         for ownerKey, entry in pairs(nsp) do
+            local mine = Store.OwnsNamespaceOwner(ownerKey)
             local stale = (now - (entry.updatedAt or 0)) > SYNCNS_STALE
             local tombstoned = Store.IsTombstoned and Store.IsTombstoned(ownerKey)
-            if stale or tombstoned then
+            if mine then
+                count = count + 1
+                if stale or tombstoned then
+                    local c = Store._ownRow
+                    c.keptStale = (c.keptStale or 0) + 1
+                end
+            elseif stale or tombstoned then
                 nsp[ownerKey] = nil
                 dropped = dropped + 1
             else
@@ -4646,9 +4699,19 @@ function Store.InventoryPut(ownerKey, rev, data, now)
     return Store.InventoryApply(a.owners, ownerKey, rev, data, now or serverNow())
 end
 
+-- Own-row immunity applies here too: the owners graph is the SYSTEM OF RECORD,
+-- so a drop of one of our own characters is strictly worse than a drop from the
+-- transport table. Returns true when the drop happened.
 function Store.InventoryDrop(ownerKey)
+    if Store.OwnsNamespaceOwner(ownerKey) then
+        local c = Store._ownRow
+        c.dropRefused = (c.dropRefused or 0) + 1
+        c.lastRefused = "inventory/" .. tostring(ownerKey)
+        return false
+    end
     local a = Store.InventoryArea()
     if a then a.owners[ownerKey] = nil end
+    return true
 end
 
 ----------------------------------------------------------------------
@@ -7705,6 +7768,120 @@ end
 -- their ORIGINAL capture epoch (the property that makes newest-wins honest for
 -- third-party observers).
 ----------------------------------------------------------------------
+----------------------------------------------------------------------
+-- OWN-ROW IMMUNITY (2026-08-19)
+--
+-- THE INVARIANT UNDER TEST: a row this account owns is only ever REPLACED by a
+-- newer scan of our own. No sweep, no tombstone, no drop call may delete it.
+--
+-- WHAT WAS WRONG. SweepSyncNamespaces ran at every login and evicted any entry
+-- whose updatedAt was older than SYNCNS_STALE (30 days) — our own alts
+-- included. An alt parked for a month lost its `bags` row, and NOTHING can
+-- rebuild that row except logging the character in again, because nothing else
+-- has ever seen its bags: peers only ever held copies of what we published.
+-- Every sibling row survived (the alts played inside the window, and every
+-- peer-owned row the mesh keeps refreshing), so the save came up looking
+-- healthy with exactly one character missing — which is indistinguishable, from
+-- the outside, from "that character never published".
+--
+-- The rows below pin BOTH directions: ours survives, theirs is still collected.
+-- A retention guard that kept everything would be a leak, not a fix.
+----------------------------------------------------------------------
+local function testOwnRowImmunity(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local T = 1700000000
+    local OLD = T - (40 * 86400)      -- 40 days: past SYNCNS_STALE either way
+
+    local savedData   = Store.data
+    local savedGetAID = ns.GetAccountID
+    local savedOwnRow = Store._ownRow
+
+    ns.GetAccountID = function() return "1" end
+    Store._ownRow = { keptStale = 0, dropRefused = 0 }
+    Store.data = {
+        deletedAIDs = {},
+        accounts = {
+            ["1"] = { isSelf = true, characters = {
+                        ["Poonyx-Whitemane"] = {}, ["Shalk-Whitemane"] = {} },
+                      homeless = {} },
+            ["3"] = { characters = { ["Puucons-Whitemane"] = {} }, homeless = {} },
+        },
+        syncNamespaces = {
+            bags = {
+                ["Poonyx-Whitemane"]  = { rev = 857, updatedAt = OLD, data = { g = 1 } },
+                ["Shalk-Whitemane"]   = { rev = 616, updatedAt = T,   data = { g = 2 } },
+                ["Puucons-Whitemane"] = { rev = 116, updatedAt = OLD, data = { g = 3 } },
+                ["Stranger-Whitemane"]= { rev = 1,   updatedAt = T,   data = { g = 4 } },
+            },
+            attune = {
+                ["1"] = { rev = 345, updatedAt = OLD, data = { a = 1 } },   -- our account id
+                ["3"] = { rev = 67,  updatedAt = OLD, data = { a = 3 } },
+            },
+        },
+        inventory = { owners = {
+            ["Poonyx-Whitemane"]  = { rev = 857, updatedAt = OLD, data = { g = 1 } },
+            ["Puucons-Whitemane"] = { rev = 116, updatedAt = OLD, data = { g = 3 } },
+        }, parts = {}, schema = 1, migrated = true },
+    }
+
+    -- (0) The predicate itself, both ownership kinds.
+    ck(Store.OwnsNamespaceOwner("Poonyx-Whitemane") == true,
+        "own-row: our own CHARACTER was not recognised as ours")
+    ck(Store.OwnsNamespaceOwner("1") == true,
+        "own-row: our own ACCOUNT ID was not recognised as ours (account-granular namespaces)")
+    ck(Store.OwnsNamespaceOwner("Puucons-Whitemane") == false,
+        "own-row: a PEER's character was claimed as ours -- that would make peer rows immortal")
+    ck(Store.OwnsNamespaceOwner("") == false, "own-row: the empty key was claimed as ours")
+
+    -- (1) THE DEFECT. A 40-day-old row of OURS must survive the retention sweep.
+    local dropped = Store.SweepSyncNamespaces(T)
+    local bags = Store.data.syncNamespaces.bags
+    ck(bags["Poonyx-Whitemane"] ~= nil,
+        "THE LOSS: the retention sweep deleted our OWN character's row -- nothing but"
+        .. " logging that character in can ever rebuild it")
+    ck(bags["Poonyx-Whitemane"].rev == 857, "our own row survived but was not left intact")
+    ck(Store.data.syncNamespaces.attune["1"] ~= nil,
+        "the sweep deleted our own ACCOUNT-granular row")
+    ck((Store._ownRow.keptStale or 0) >= 2,
+        "the sweep kept our rows without recording it, so the debug surface cannot say so")
+
+    -- (2) THE GUARD IS NOT A LEAK. Foreign rows past the window still go.
+    ck(bags["Puucons-Whitemane"] == nil,
+        "retention is gone: a 40-day-old PEER row survived the sweep")
+    ck(Store.data.syncNamespaces.attune["3"] == nil,
+        "retention is gone: a 40-day-old peer account row survived the sweep")
+    ck(bags["Shalk-Whitemane"] ~= nil and bags["Stranger-Whitemane"] ~= nil,
+        "the sweep collected a row that was inside the window")
+    ck(dropped == 2, ("the sweep reported %d drops (expected 2)"):format(dropped))
+
+    -- (3) THE EXPLICIT DROPS REFUSE TOO. A dedup/cleanup path must not be able
+    --     to do by hand what the sweep is no longer allowed to do.
+    ck(Store.SyncNSDrop("bags", "Poonyx-Whitemane") == false,
+        "SyncNSDrop deleted our own row on request")
+    ck(bags["Poonyx-Whitemane"] ~= nil, "SyncNSDrop refused and deleted the row anyway")
+    ck(Store.InventoryDrop("Poonyx-Whitemane") == false,
+        "InventoryDrop deleted our own row from the SYSTEM OF RECORD on request")
+    ck(Store.data.inventory.owners["Poonyx-Whitemane"] ~= nil,
+        "InventoryDrop refused and deleted the row anyway")
+    ck((Store._ownRow.dropRefused or 0) == 2,
+        "a refused drop left no counter behind for the debug surface")
+    -- ...and still drop what is not ours.
+    ck(Store.InventoryDrop("Puucons-Whitemane") == true,
+        "InventoryDrop refused a PEER row -- the graph can never be pruned")
+    ck(Store.data.inventory.owners["Puucons-Whitemane"] == nil,
+        "InventoryDrop said it dropped a peer row but did not")
+
+    -- (4) REPLACED, NEVER DELETED: a newer own scan still wins, which is the
+    --     only write the invariant permits against our own key.
+    ck(Store.SyncNSPut("bags", "Poonyx-Whitemane", 858, { g = 99 }, T) == "applied",
+        "own-row immunity blocked our OWN newer scan -- the row is now frozen, not protected")
+    ck(bags["Poonyx-Whitemane"].rev == 858, "our own newer scan did not land")
+
+    Store.data      = savedData
+    ns.GetAccountID = savedGetAID
+    Store._ownRow   = savedOwnRow
+end
+
 local function testOwnAccountAuthority(fails)
     local function ck(c, m) if not c then fails[#fails + 1] = m end end
     local T = 1700000000
@@ -9028,6 +9205,7 @@ function Store.RunSelfTests(verbose)
         { name = "stale-twin reconciliation (B5)", fn = testStaleTwins },
         { name = "self-bucket sanity (B5.1)", fn = testSelfBucketSanity },
         { name = "own-account authority", fn = testOwnAccountAuthority },
+        { name = "own-row immunity (sweep / drop / replace)", fn = testOwnRowImmunity },
         { name = "owner-relay admission (§9.7 rule 2 / D1)", fn = testOwnerRelayAdmission },
         { name = "timer log dedup (F10)", fn = testTimerLogDedup },
         { name = "coordinate overrides (A17.3)", fn = testCoordinateOverrides },

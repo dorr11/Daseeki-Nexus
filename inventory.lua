@@ -926,6 +926,83 @@ function Inventory.NeedsPublishHeal(area, mode, selfKey)
     return owners[selfKey] ~= nil
 end
 
+----------------------------------------------------------------------
+-- OWN-ROW SELF-HEAL AT LOGIN
+--
+-- The store-side guard (Store.OwnsNamespaceOwner) makes our own row
+-- UNDELETABLE from here on. This is the other half: a row that is ALREADY gone
+-- — swept by a pre-guard build, lost to a corrupt save, or simply never written
+-- because this character has not been played since the module landed — must be
+-- REBUILT from live bags at login, and nothing else in the addon can do it.
+-- Only the logged-in character can scan its own bags.
+--
+-- TWO FAILURES THIS FIXES, both of which leave a character with no row of its
+-- own while every sibling row sits there looking healthy:
+--
+--   1. THE DETECTOR SWALLOWED THE RESTORE. Inventory.Publish consults
+--      LastPublishedSignature, which falls back to the payload the namespace
+--      store already holds under our key. With the row ABSENT that fallback is
+--      nil and the publish goes out — correct. But the OWNERS-GRAPH row can
+--      survive while the NAMESPACE row is gone (they are swept independently),
+--      and then Inventory._lastSig from earlier in the same session answers the
+--      question instead and the restore is judged "unchanged". Absence of the
+--      row is not a content question, so it must not be asked of the detector:
+--      when our own row is missing anywhere, the login publish is FORCED.
+--
+--   2. ONE SHOT AT A COLD WORLD. The login publish was a single
+--      C_Timer.After(INITIAL_PUBLISH) with no re-arm. Publish() answers `false`
+--      — not "unchanged" — while CaptureAllowed() is still false (teardown, or
+--      inside ENTERING_WORLD_GRACE), which a slow loading screen reaches
+--      routinely. That one `false` dropped the character's first publish of the
+--      session on the floor and nothing asked again until a dirty signal
+--      happened to fire. Inventory.MarkDirty already owns the retry loop for
+--      exactly this case, so a hard `false` now hands off to it.
+----------------------------------------------------------------------
+
+-- PURE. Is our own row present in BOTH stores? `nsEntry` is the namespace entry
+-- under our key and `ownersEntry` the owners-graph entry; either being absent
+-- means the character has no complete row of its own.
+function Inventory.OwnRowPresent(nsEntry, ownersEntry)
+    local function real(e) return type(e) == "table" and type(e.data) == "table" end
+    return real(nsEntry) and real(ownersEntry)
+end
+
+-- PURE. The login publish decision, as a table a test can read:
+--   { publish = <bool>, force = <bool>, reason = <string> }
+-- `force` is the interesting one — see failure 1 above.
+function Inventory.LoginPublishPlan(enabled, mode, selfKey, nsEntry, ownersEntry)
+    if not enabled then return { publish = false, force = false, reason = "disabled" } end
+    if mode ~= "publish" then return { publish = false, force = false, reason = "consume-only" } end
+    if type(selfKey) ~= "string" or selfKey == "" then
+        return { publish = false, force = false, reason = "no self key" }
+    end
+    if not Inventory.OwnRowPresent(nsEntry, ownersEntry) then
+        return { publish = true, force = true, reason = "own row missing -- rebuilding from live bags" }
+    end
+    return { publish = true, force = false, reason = "own row present" }
+end
+
+-- The live wrapper: read both stores, decide, publish, and re-arm on a cold
+-- answer. Returns the plan plus Publish()'s own verdict (nil when we did not
+-- publish at all), so the diagnostic can state both.
+function Inventory.LoginPublish()
+    local S = ns.Store
+    local selfKey = Inventory.SelfKey()
+    local nsEntry = S and S.SyncNSGet and S.SyncNSGet(NS_KEY, selfKey) or nil
+    local owners  = S and S.InventoryGet and S.InventoryGet(selfKey) or nil
+    local plan = Inventory.LoginPublishPlan(
+        Inventory.IsEnabled(), Inventory._mode, selfKey, nsEntry, owners)
+    Inventory._loginPlan = plan
+    if not plan.publish then return plan, nil end
+    local res = Inventory.Publish(plan.force)
+    Inventory._loginPublish = res
+    -- ONLY a hard `false` re-arms; "unchanged" is an answered question. This is
+    -- the same rule MarkDirty's own timer uses, and handing off to MarkDirty
+    -- reuses its bounded retry rather than inventing a second one.
+    if res == false and not Inventory.IsTeardown() then Inventory.MarkDirty() end
+    return plan, res
+end
+
 -- Stamp the marker. Returns true when it actually changed.
 function Inventory.StampProbeGen(area)
     if type(area) ~= "table" then return false end
@@ -1321,7 +1398,7 @@ function Inventory.Activate()
     if mode == "publish" and C_Timer and C_Timer.After then
         C_Timer.After(INITIAL_PUBLISH, function()
             if Inventory.IsEnabled() and Inventory._mode == "publish" then
-                Inventory.Publish()
+                Inventory.LoginPublish()
             end
         end)
     end
@@ -1524,6 +1601,69 @@ ns:RegisterDebugCommand("inventory", function(args)
         tostring(liveSig ~= nil and liveSig ~= Inventory.LastPublishedSignature(selfKey)),
         #Inventory.PLAIN_DIRTY_EVENTS + #Inventory.REFRESH_DIRTY_EVENTS,
         PUBLISH_DEBOUNCE))
+
+    ------------------------------------------------------------------
+    -- OUR OWN ROWS, ONE PER LINE. "my own character has no row" and "my row is
+    -- fresh here but stale over there" are different faults with the same
+    -- symptom, and telling them apart used to need a SavedVariables diff across
+    -- accounts. Every character of THIS account is listed with the rev and the
+    -- capture stamp we hold for it, MISSING when we hold none — so the answer is
+    -- one paste from the account that owns the character, and the peer's own
+    -- paste of the same block is what makes a one-directional relay stall
+    -- visible (same character, two revs, two accounts).
+    ------------------------------------------------------------------
+    local nowE = (S and S.Now and S.Now()) or (time and time()) or 0
+    local ownerNames, seen = {}, {}
+    local accounts = S and S.data and S.data.accounts
+    local selfID = ns.GetAccountID and ns:GetAccountID() or ""
+    if type(accounts) == "table" then
+        for aid, bucket in pairs(accounts) do
+            if type(bucket) == "table"
+               and (bucket.isSelf == true or (aid ~= "" and aid == selfID)) then
+                for _, tbl in ipairs({ bucket.characters, bucket.homeless }) do
+                    if type(tbl) == "table" then
+                        for nr in pairs(tbl) do
+                            if not seen[nr] then seen[nr] = true; ownerNames[#ownerNames + 1] = nr end
+                        end
+                    end
+                end
+            end
+        end
+    end
+    if not seen[selfKey] and selfKey ~= "" then
+        seen[selfKey] = true
+        ownerNames[#ownerNames + 1] = selfKey
+    end
+    table.sort(ownerNames)
+    ns:Print(string.format("  own rows (account %s): %d character(s)",
+        selfID ~= "" and selfID or "?", #ownerNames))
+    local missing = 0
+    for i = 1, #ownerNames do
+        local nr = ownerNames[i]
+        local e  = S and S.SyncNSGet and S.SyncNSGet(NS_KEY, nr)
+        local o  = S and S.InventoryGet and S.InventoryGet(nr)
+        local d  = e and type(e.data) == "table" and e.data or nil
+        local n  = 0
+        if d and type(d.itemCounts) == "table" then
+            for _ in pairs(d.itemCounts) do n = n + 1 end
+        end
+        if not (d and o) then missing = missing + 1 end
+        ns:Print(string.format("    %-22s %s ns=%s owners=%s ts=%s (%s) items=%d",
+            nr, nr == selfKey and "*" or " ",
+            e and ("rev " .. tostring(e.rev)) or "MISSING",
+            o and ("rev " .. tostring(o.rev)) or "MISSING",
+            d and tostring(d.ts) or "-",
+            (d and tonumber(d.ts)) and string.format("%dm ago", math.floor((nowE - d.ts) / 60)) or "never",
+            n))
+    end
+    -- The login self-heal's own verdict: what it decided and what Publish said.
+    local plan = Inventory._loginPlan
+    ns:Print(string.format("  own-row heal: %s | last login publish -> %s | rows incomplete=%d"
+        .. " | store refused drops=%d kept stale=%d",
+        plan and (tostring(plan.reason) .. (plan.force and " (FORCED)" or "")) or "not run yet",
+        tostring(Inventory._loginPublish), missing,
+        (S and S._ownRow and S._ownRow.dropRefused) or 0,
+        (S and S._ownRow and S._ownRow.keptStale) or 0))
 end)
 
 ----------------------------------------------------------------------
@@ -2041,6 +2181,87 @@ local function selfTest(verbose)
     ck("consume-only refuses to mark dirty", Inventory.MarkDirty() == false)
     ck("consume-only still projects", type(Inventory.Refresh()) == "number")
     Inventory._mode = "publish"
+
+    ------------------------------------------------------------------
+    -- 3e2) THE OWN-ROW SELF-HEAL AT LOGIN
+    --
+    --     The store guard makes our row undeletable from here on; this is the
+    --     other half — a row already gone must be REBUILT, and only the
+    --     logged-in character can do it. Both halves of the plan matter:
+    --     an ABSENT row forces the publish past the delta detector (absence is
+    --     not a content question), and a PRESENT row must NOT force, or every
+    --     login would fan a redundant payload at every peer.
+    ------------------------------------------------------------------
+    do
+        local ROW = { rev = 5, data = { money = 1 } }
+        local p
+
+        p = Inventory.LoginPublishPlan(true, "publish", "Me-R", ROW, ROW)
+        ck("login heal: a complete own row publishes without forcing",
+            p.publish == true and p.force == false)
+
+        p = Inventory.LoginPublishPlan(true, "publish", "Me-R", nil, ROW)
+        ck("THE LOSS: an absent NAMESPACE row did not force the rebuild",
+            p.publish == true and p.force == true)
+
+        p = Inventory.LoginPublishPlan(true, "publish", "Me-R", ROW, nil)
+        ck("an absent OWNERS-GRAPH row did not force the rebuild",
+            p.publish == true and p.force == true)
+
+        p = Inventory.LoginPublishPlan(true, "publish", "Me-R",
+            { rev = 5, data = "not a table" }, ROW)
+        ck("a row whose payload is not a table read as present",
+            p.publish == true and p.force == true)
+
+        -- The three refusals, so a forced publish can never escape its gates.
+        ck("login heal: disabled does not publish",
+            Inventory.LoginPublishPlan(false, "publish", "Me-R", nil, nil).publish == false)
+        ck("login heal: consume-only does not publish",
+            Inventory.LoginPublishPlan(true, "consume", "Me-R", nil, nil).publish == false)
+        ck("login heal: no self key does not publish",
+            Inventory.LoginPublishPlan(true, "publish", "", nil, nil).publish == false)
+
+        -- THE DEBUG SURFACE MUST RUN. Its whole job is to be pasteable at the
+        -- moment something is broken, which is exactly when a nil-index in the
+        -- printer costs the diagnosis. Both blocks are driven here, over the
+        -- real store, so a formatting slip cannot ship green.
+        local dbg  = ns._debugCommands and ns._debugCommands["inventory"]
+        local dbgm = ns._debugCommands and ns._debugCommands["mesh"]
+        ck("the inventory + mesh debug commands are registered at all",
+            type(dbg) == "function" and type(dbgm) == "function")
+        if type(dbg) == "function" then
+            local okd, errd = pcall(dbg, "")
+            ck("debug inventory: the own-rows block runs :: " .. tostring(errd), okd)
+        end
+        if type(dbgm) == "function" then
+            local okm, errm = pcall(dbgm, "")
+            ck("debug mesh: the queue/starvation block runs :: " .. tostring(errm), okm)
+        end
+
+        ck("OwnRowPresent needs BOTH stores",
+            Inventory.OwnRowPresent(ROW, ROW) == true
+            and Inventory.OwnRowPresent(ROW, nil) == false
+            and Inventory.OwnRowPresent(nil, nil) == false)
+
+        -- ONE SHOT AT A COLD WORLD: a hard `false` (teardown / entering-world
+        -- grace) must hand off to MarkDirty's retry, not be dropped.
+        local savedPub, savedDirty = Inventory.Publish, Inventory.MarkDirty
+        local savedSig, savedMode = Inventory._lastSig, Inventory._mode
+        local rearmed, forced = 0, nil
+        Inventory._mode = "publish"
+        Inventory.Publish   = function(f) forced = f; return false end
+        Inventory.MarkDirty = function() rearmed = rearmed + 1; return true end
+        Inventory.LoginPublish()
+        ck("THE DROPPED FIRST PUBLISH: a cold-world `false` did not re-arm the retry",
+            rearmed == 1)
+        rearmed = 0
+        Inventory.Publish = function() return "unchanged" end
+        Inventory.LoginPublish()
+        ck("login heal: an ANSWERED question ('unchanged') wrongly re-armed the retry",
+            rearmed == 0)
+        Inventory.Publish, Inventory.MarkDirty = savedPub, savedDirty
+        Inventory._lastSig, Inventory._mode = savedSig, savedMode
+    end
 
     ------------------------------------------------------------------
     -- 3f) THE GEN-1 CONSUME-ONLY HEAL
