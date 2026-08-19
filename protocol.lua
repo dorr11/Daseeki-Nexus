@@ -172,6 +172,35 @@ function PriorityQueue:Size()
     return #self.items
 end
 
+-- ANTI-STARVATION: remove and return the item that has been WAITING longest,
+-- but only if it has been waiting since at or before `cutoff`. Age is read from
+-- the caller's own `item.at` stamp (the queue does not own a clock), and the
+-- item table is reused across requeues, so the stamp survives every rotation
+-- back through Push — which is exactly what makes "how long has this waited"
+-- answerable at all.
+--
+-- Returns nil when nothing is that old, which is the normal case: this is a
+-- FLOOR under the priority order, not a replacement for it. See Mesh.DrainTick
+-- for the rate limit that keeps a promotion from becoming a takeover.
+function PriorityQueue:PopStarved(cutoff)
+    if cutoff == nil then return nil end
+    local best, bestIdx
+    for i = 1, #self.items do
+        local e = self.items[i]
+        local at = e.item and e.item.at
+        if type(at) == "number" and at <= cutoff then
+            if not best
+               or at < best.item.at
+               or (at == best.item.at and e.seq < best.seq) then
+                best, bestIdx = e, i
+            end
+        end
+    end
+    if not best then return nil end
+    table.remove(self.items, bestIdx)
+    return best.item, best.priority
+end
+
 -- Remove and return the highest-priority item (lowest number, then oldest).
 function PriorityQueue:Pop()
     local best, bestIdx

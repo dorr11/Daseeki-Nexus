@@ -125,6 +125,39 @@ Mesh.OP_COST = {
 }
 Mesh.OP_MAX_BURST = { relay = 3, sync = 6, settings = 6, nspayload = 6, nspush = 4 }
 
+-- ANTI-STARVATION FLOOR ON THE SHARED PREFIX BUCKET (2026-08-19).
+--
+-- THE DEFECT. One token bucket serves a whole prefix, and the SYNC prefix's
+-- sustained rate is ~1 msg/sec. Everything bulk rides it: manifests, segments,
+-- settings, nsreq, live namespace pushes (tier 4) AND the entire store-and-
+-- forward backfill (tier 6). Mesh.DrainTick pops in strict priority order, so
+-- ANY tier-4 source that produces one frame per second — a manifest per target
+-- per MANIFEST_COOLDOWN, a hot nspush character, a segment repair loop that has
+-- not settled — consumes the bucket completely and tier 6 NEVER LEAVES THE
+-- QUEUE. Not "eventually": never, for as long as the source keeps up. The
+-- account looks healthy from the inside (its own rows are current, its STATE
+-- prefix has its own bucket and keeps flowing, it RECEIVES normally) while
+-- every peer's copy of everything it owns freezes at whatever rev landed before
+-- the saturation started. That is a one-directional convergence failure with no
+-- error, no counter and no symptom other than stale numbers on the other side.
+--
+-- THE FIX is a floor, not a re-rank: an item that has waited past STARVE_AGE
+-- gets one guaranteed send, and at most one per STARVE_INTERVAL per prefix. The
+-- priority order is untouched below that threshold — a live push is served in
+-- well under a second on any healthy queue and can never reach the floor — so
+-- the tiers still mean what they meant. Under genuine saturation the backfill
+-- gets a bounded minority share instead of zero, which is the difference
+-- between converging slowly and not converging.
+--
+-- STARVE_INTERVAL is deliberately short relative to Mesh.REASM_TIMEOUT_BIG
+-- (60s): promotions are per CHUNK, so a promoted multi-chunk frame must still
+-- deliver all of its chunks inside the receiver's reassembly window. At 2s a
+-- frame of up to ~30 chunks fits; the largest payload this transport carries is
+-- an inventory row at 4.
+Mesh.STARVE_AGE      = 30   -- seconds queued with no service = starving
+Mesh.STARVE_INTERVAL = 3    -- ...then one promoted send per prefix per this
+Mesh._starvePromoted = 0    -- telemetry: promotions granted (debug surface)
+
 -- Frame operation codes (single chars keep the header tiny).
 local OP = {
     STATE      = "s",   -- binary character push
@@ -1559,6 +1592,11 @@ function Mesh.Enqueue(prefix, frame, meta)
     local chunks = Protocol.Chunk.Split(frame, seq, Mesh.CHUNK_DATA_MAX)
     local s = scheduler(prefix)
     local prio = meta.priority or PRIO[meta.op] or 5
+    -- `at` is the ENQUEUE stamp and it rides the item table, so it survives
+    -- every requeue in DrainTick. It is the only thing that makes "this frame
+    -- has been waiting five minutes" a question the scheduler can answer — see
+    -- the anti-starvation floor.
+    local at = now()
     for i = 1, #chunks do
         s.queue:Push(prio, {
             wire     = Mesh.EnvelopeChunk(chunks[i]),
@@ -1567,6 +1605,7 @@ function Mesh.Enqueue(prefix, frame, meta)
             op       = meta.op,
             cost     = meta.cost or (meta.op and Mesh.OP_COST[meta.op]) or 1,
             big      = big,
+            at       = at,
             nsPendKey = meta.nsPendKey,
             nsPendGen = meta.nsPendGen,
         })
@@ -1624,7 +1663,27 @@ function Mesh.DrainTick(t)
         -- One send per prefix per tick keeps us well under the hardware cap;
         -- we scan the queue for the first eligible (non-skipped) target.
         local picked, rejects = nil, {}
-        while not s.queue:IsEmpty() do
+        -- THE FLOOR, consulted BEFORE the priority order (see Mesh.STARVE_AGE).
+        -- Rate-limited per prefix, so this can spend at most one send per
+        -- STARVE_INTERVAL on the oldest waiter and can never become the queue's
+        -- ordering rule. A promotion that cannot pay (skipped target, empty
+        -- bucket) is requeued exactly like any other reject and does NOT burn
+        -- the interval — the stamp only moves on a send that actually happened.
+        if (t - (s.starveAt or 0)) >= Mesh.STARVE_INTERVAL then
+            local starved = s.queue:PopStarved(t - Mesh.STARVE_AGE)
+            if starved then
+                if starved.target and Mesh.TargetSkipped(starved.target, t) then
+                    rejects[#rejects + 1] = starved
+                elseif not s.bucket:TryConsume(starved.cost, t) then
+                    rejects[#rejects + 1] = starved
+                else
+                    picked = starved
+                    s.starveAt = t
+                    Mesh._starvePromoted = (Mesh._starvePromoted or 0) + 1
+                end
+            end
+        end
+        while not picked and not s.queue:IsEmpty() do
             local item = s.queue:Pop()
             if not item then break end
             local op = item.op or "state"
@@ -4191,10 +4250,34 @@ local function debugMesh()
             "  owner-relay (§9.7 r2): claimed=%d epochBypassed=%d aidMismatched=%d",
             orl.claimed or 0, orl.bypassed or 0, orl.mismatched or 0))
     end
-    for prefix, s in pairs(Mesh._sched) do
-        ns:Print(string.format("  prefix %s: queue=%d bucket=%.1f/%d",
-            prefix, s.queue:Size(), s.bucket.tokens, s.bucket.cap))
+    -- Per-prefix queue depth, split BY TIER and with the oldest waiter's age.
+    -- A prefix whose low tiers are deep while the high tiers keep turning over
+    -- is the starvation signature: nothing errors, nothing is refused, the
+    -- backfill simply never reaches the wire. "oldest" past Mesh.STARVE_AGE with
+    -- promotions climbing says the floor is currently carrying that namespace.
+    local tnow = now()
+    for _, prefix in ipairs(Mesh.SchedulerPrefixes()) do
+        local s = Mesh._sched[prefix]
+        local byTier, oldest = {}, nil
+        for i = 1, #s.queue.items do
+            local e = s.queue.items[i]
+            byTier[e.priority] = (byTier[e.priority] or 0) + 1
+            local at = e.item and e.item.at
+            if type(at) == "number" and (not oldest or at < oldest) then oldest = at end
+        end
+        local tiers = {}
+        for p = 1, 9 do
+            if byTier[p] then tiers[#tiers + 1] = string.format("p%d=%d", p, byTier[p]) end
+        end
+        ns:Print(string.format("  prefix %s: queue=%d [%s] bucket=%.1f/%d oldest=%s",
+            prefix, s.queue:Size(),
+            #tiers > 0 and joinList(tiers, " ") or "empty",
+            s.bucket.tokens, s.bucket.cap,
+            oldest and string.format("%ds", math.floor(tnow - oldest)) or "-"))
     end
+    ns:Print(string.format(
+        "  starvation floor: promoted=%d (age %ds, one per %ds per prefix)",
+        Mesh._starvePromoted or 0, Mesh.STARVE_AGE, Mesh.STARVE_INTERVAL))
     local seen = 0
     for _ in pairs(Mesh._seenIds) do seen = seen + 1 end
     -- Bookkeeping-map sizes: these three used to grow without bound, so their
@@ -5663,6 +5746,187 @@ local function testNSRelayThroughScheduler()
     Mesh._nsReqSeen, Mesh._nsReqAsked = savedSeen, savedAsked
     Mesh._inSeq, Mesh._seenIds, Mesh._reasm = savedInSeq, savedIds, savedReasm
     _G.Daseeki = savedDaseeki
+    return ok, why
+end
+
+----------------------------------------------------------------------
+-- THE SYNC-PREFIX STARVATION FLOOR  (the own-row convergence stall)
+--
+-- THE FIELD BUG. Account 1's own inventory row was current and correct locally
+-- (Poonyx-Whitemane, rev 857, 177 items, chronoboons absent because it holds
+-- none) while BOTH peers read rev 559 from two days earlier and still showed 6
+-- chronoboons. It was never a lost row: the row was there, at the newest rev in
+-- the whole mesh. What had stopped was that account's OUTBOUND namespace
+-- traffic — every provider namespace at once (`bags` frozen at 559/613/7,
+-- `attune` at 345-vs-322) and to BOTH peers — while its INBOUND was perfectly
+-- current and its character-graph pushes kept landing on the same peers in the
+-- same minutes. One account, one prefix, one direction.
+--
+-- THE MECHANISM. STATE and SYNC are separate prefixes with separate token
+-- buckets, which is why the character graph stayed healthy while the namespaces
+-- froze. The SYNC bucket sustains ~1 msg/sec and carries everything bulk:
+-- manifests, segments, settings, nsreq and live pushes at tier 4, and the ENTIRE
+-- store-and-forward backfill at tier 6. Mesh.DrainTick popped in strict priority
+-- order, so any tier-4 source producing one frame per second consumed the whole
+-- bucket and tier 6 never left the queue. Not "eventually" — never, for as long
+-- as the source kept up. Everything a peer knows about an account's non-live
+-- alts arrives on the backfill path, so that account's peers freeze while the
+-- account itself sees nothing wrong.
+--
+-- ROW DISCIPLINE. Row 1 is a VACUITY GUARD: it re-runs the identical fixture
+-- with the floor pushed out of reach and requires the frame to be starved, so a
+-- future change that removed the hazard (a bigger bucket, a re-rank) fails here
+-- loudly instead of making row 2 vacuously true. Row 3 holds the line the floor
+-- must NOT cross: on a healthy queue the priority tiers still decide.
+----------------------------------------------------------------------
+local function testSyncStarvationFloor()
+    local ok, why = true, nil
+    local function ck(c, m) if ok and not c then ok, why = false, m end end
+
+    local savedData    = Store.data
+    local savedEnabled = Mesh.IsEnabled
+    local savedRaw     = Mesh._rawSend
+    local savedSched   = Mesh._sched
+    local savedQueued  = Mesh._nsQueued
+    local savedSeen    = Mesh._nsReqSeen
+    local savedAsked   = Mesh._nsReqAsked
+    local savedReasm   = Mesh._reasm
+    local savedFail    = Mesh._fail
+    local savedNow     = Store.Now
+    local savedAge     = Mesh.STARVE_AGE
+    local savedPromo   = Mesh._starvePromoted
+
+    Mesh.IsEnabled = function() return true end
+
+    -- The field payload's size: 177 itemCounts entries -> a 4-chunk frame, the
+    -- largest this transport carries and the only one in the owner's mesh that
+    -- needs more than three.
+    local function bigPayload()
+        local ic = {}
+        for i = 1, 177 do ic[6000 + i * 7] = (i * 13) % 200 + 1 end
+        return { key = "Poonyx-Whitemane", class = "WARRIOR", race = "Orc",
+                 level = 60, money = 123456, itemCounts = ic, ts = 1787161920 }
+    end
+
+    -- One run of the saturation fixture. Returns whether the tier-6 backfill
+    -- frame CROSSED (reassembled and unpacked at rev 857), plus the counters.
+    --
+    -- The clock is DRIVEN, not read: Mesh.Enqueue stamps each item's `at` from
+    -- Store.Now, so a fixture on a frozen harness clock would make every item
+    -- the same age and test the floor against a world that never advances.
+    local function run(minutes)
+        local clock = 1000000
+        Store.Now = function() return clock end
+        Mesh._sched, Mesh._nsQueued, Mesh._fail, Mesh._reasm = {}, {}, {}, {}
+        Mesh._nsReqSeen, Mesh._nsReqAsked = {}, {}
+        Mesh._starvePromoted = 0
+        local sent = {}
+        Mesh._rawSend = function(prefix, w) sent[#sent + 1] = { prefix = prefix, wire = w }; return true end
+        Store.data = { syncNamespaces = { bags = {
+            ["Poonyx-Whitemane"] = { rev = 857, data = bigPayload() },
+        } } }
+        -- PRIME the queue so the backfill arrives into a saturated scheduler
+        -- rather than an idle one. Without this the bucket's 8-token starting
+        -- burst carries the whole 4-chunk frame out in the first 200ms and the
+        -- fixture proves nothing: the stall in the field was a backfill queued
+        -- BEHIND traffic that was already there and never let up.
+        for i = 1, 60 do
+            Mesh.Enqueue(Protocol.PREFIX.SYNC, "1\ts\tprime" .. i .. "\t0\t\tpad",
+                { op = "sync", chatType = "WHISPER", target = "Peer-B", seq = 0 })
+        end
+        -- The backfill answer: tier 6, four chunks, into that backlog.
+        Mesh._sendNSPayloadTo("Peer-B", "bags", "Poonyx-Whitemane", "nspayload")
+        local ticks = math.floor(minutes * 60 / Mesh.DRAIN_INTERVAL)
+        for i = 1, ticks do
+            clock = 1000000 + i * Mesh.DRAIN_INTERVAL
+            -- The saturating source: two tier-4 frames per second, forever —
+            -- past the SYNC bucket's 1/sec refill, which is what a
+            -- manifest-per-target-per-cooldown plus segments plus a hot push
+            -- character look like from the queue's point of view. Anything AT
+            -- the refill rate leaves gaps the backfill can slip through; the
+            -- defect only bites once the tier above is never empty.
+            if i % 10 == 0 then
+                Mesh.Enqueue(Protocol.PREFIX.SYNC, "1\ts\tm" .. i .. "\t0\t\tpad",
+                    { op = "sync", chatType = "WHISPER", target = "Peer-B", seq = 0 })
+            end
+            Mesh.DrainTick(clock)
+        end
+        local crossed = false
+        Mesh._reasm = {}
+        for i = 1, #sent do
+            local env = Mesh.DeEnvelope(sent[i].wire)
+            local frame = env and Mesh.FeedChunk("Peer-A", sent[i].prefix, env, 1000000 + i)
+            if frame then
+                local pf = Mesh.ParseFrame(frame)
+                local blob = pf and Mesh.Unpack(pf.payload)
+                if blob and blob.o == "Poonyx-Whitemane" and tonumber(blob.r) == 857 then
+                    crossed = true
+                end
+            end
+        end
+        return crossed, #sent, Mesh._starvePromoted or 0
+    end
+
+    ------------------------------------------------------------------
+    -- 1. THE HAZARD IS REAL (vacuity guard). With the floor out of reach the
+    --    backfill frame is starved to zero for the whole run.
+    ------------------------------------------------------------------
+    Mesh.STARVE_AGE = 1e9
+    local crossedNoFloor, chunksNoFloor = run(10)
+    ck(crossedNoFloor == false, ("the fixture is VACUOUS: the backfill crossed"
+        .. " WITHOUT the floor (%d chunks sent), so nothing here is saturated")
+        :format(chunksNoFloor))
+
+    ------------------------------------------------------------------
+    -- 2. THE FIX. With the real constants the same saturated queue delivers it.
+    ------------------------------------------------------------------
+    Mesh.STARVE_AGE = savedAge
+    local crossed, chunks, promoted = run(10)
+    ck(crossed, ("THE STALL: after 10 saturated minutes the backfill never"
+        .. " crossed (chunks=%d promoted=%d)"):format(chunks, promoted))
+    ck(promoted > 0, "the frame crossed without a single promotion, so the floor is not what delivered it")
+    -- A floor, not a takeover: the promotions must stay a minority of the wire.
+    ck(promoted * 2 < chunks, ("the floor took %d of %d sends -- that is a re-rank, not a floor")
+        :format(promoted, chunks))
+
+    ------------------------------------------------------------------
+    -- 3. THE TIERS STILL DECIDE. On an uncontended queue nothing is starving,
+    --    so the priority split that keeps a gold change ahead of a login
+    --    backfill must be exactly as it was.
+    ------------------------------------------------------------------
+    local clock = 2000000
+    Store.Now = function() return clock end
+    Mesh._sched, Mesh._nsQueued, Mesh._fail = {}, {}, {}
+    Mesh._nsReqSeen, Mesh._nsReqAsked = {}, {}
+    local order = {}
+    Mesh._rawSend = function(_, w)
+        local env = Mesh.DeEnvelope(w)
+        if env and env.index == 1 then order[#order + 1] = env.seq end
+        return true
+    end
+    Store.data = { syncNamespaces = {
+        bags    = { ["Char-X"] = { rev = 9, data = { g = 9 } } },
+        chatcfg = { ["acct-A"] = { rev = 7, data = { c = 1 } } },
+    } }
+    Mesh.SendNamespace("Peer-B", "chatcfg", { ["acct-A"] = 2 })          -- tier 6, older seq
+    Mesh._sendNSPayloadTo("Peer-B", "bags", "Char-X", "nspush")          -- tier 4, newer seq
+    for i = 1, 400 do
+        clock = 2000000 + i * Mesh.DRAIN_INTERVAL
+        Mesh.DrainTick(clock)
+    end
+    ck(#order == 2, ("the tier fixture put %d frames on the wire (expected 2)"):format(#order))
+    ck(order[1] and order[2] and order[1] > order[2],
+        "the floor re-ranked a HEALTHY queue: the tier-4 push no longer overtakes the tier-6 answer")
+
+    Store.Now = savedNow
+    Mesh.STARVE_AGE = savedAge
+    Mesh._starvePromoted = savedPromo    -- the live counter is a DIAGNOSTIC; a
+                                         -- suite must not leave its own arithmetic in it
+    Store.data = savedData
+    Mesh.IsEnabled, Mesh._rawSend = savedEnabled, savedRaw
+    Mesh._sched, Mesh._nsQueued, Mesh._fail = savedSched, savedQueued, savedFail
+    Mesh._nsReqSeen, Mesh._nsReqAsked = savedSeen, savedAsked
+    Mesh._reasm = savedReasm
     return ok, why
 end
 
@@ -7885,6 +8149,8 @@ function Mesh.RunSelfTests(verbose)
         { name = "ns targeted backfill (rev manifest)", fn = testNSTargetedBackfill },
         { name = "ns relay end-to-end through the scheduler (seq reorder)",
           fn = testNSRelayThroughScheduler },
+        { name = "sync-prefix starvation floor (own-row convergence)",
+          fn = testSyncStarvationFloor },
         { name = "wire-order determinism (Class 8, NXM-1..8)", fn = testWireOrderDeterminism },
         { name = "ns answer order on the wire (NXM-1)", fn = testNSAnswerOrderOnTheWire },
         { name = "ns queue duplicate suppression", fn = testNSQueueDedup },

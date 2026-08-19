@@ -2,6 +2,42 @@
 
 ## Unreleased
 
+- **Fixed: one account could go quiet on the mesh without anything looking
+  wrong.** Everything an account shares — bags, gold, attunements, chat setup,
+  delegates — rides one lane, and that lane is deliberately slow so it never
+  crowds out the rest of the game. Urgent updates were served before routine
+  catch-up, which is correct, but nothing guaranteed the catch-up ever got a
+  turn. On a busy account it never did. The account looked perfectly healthy from
+  the inside: its own numbers were current, it kept receiving from everyone else,
+  and its character list stayed in sync — but the *other* accounts stopped
+  hearing anything about it and quietly froze at whatever they had last been
+  told. Days later a character with no chronoboons left still read as holding six
+  on every other login.
+
+  Catch-up now has a guaranteed minimum share: anything that has been waiting
+  more than half a minute gets a turn regardless of what else is queued. Urgent
+  updates keep their head start on a healthy connection — nothing changes there —
+  and a saturated one now catches up slowly instead of not at all.
+
+- **Fixed: a character you had not played in a month lost its bag record.** Old
+  entries are cleared out after thirty days, and that clear-out was not sparing
+  your own characters. It only ever showed up on an alt you had parked: every
+  other character still had its row, so the save looked fine with exactly one
+  gap. Nothing could fill that gap either, because the only thing that has ever
+  seen that character's bags is that character. Your own rows are now permanent —
+  they are replaced when you play the character and at no other time — and if one
+  is already missing, logging that character in rebuilds it immediately instead
+  of waiting for you to move an item.
+
+- **New: `/dsn debug inventory` lists your own characters and what is stored for
+  each.** One line per character with the revision, how long ago it was captured
+  and how many items it holds, or `MISSING` where there is no record at all.
+  Pasting that block from two accounts answers "my numbers are stale over there"
+  in one step: the same character with two different revisions means it never
+  travelled, and `MISSING` means it was never recorded. `/dsn debug mesh` now
+  also shows how deep each send queue is, how long its oldest item has waited,
+  and how often the catch-up guarantee has had to step in.
+
 - **Fixed: shared data that went missing between your accounts is arriving
   again.** Anything the suite passes from one account to another over the mesh —
   your chat setup, your delegates, your attunements, your bags and profession
