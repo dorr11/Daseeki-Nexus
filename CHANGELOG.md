@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+- **Fixed: shared data that went missing between your accounts is arriving
+  again.** Anything the suite passes from one account to another over the mesh —
+  your chat setup, your delegates, your attunements, your bags and profession
+  ledgers — travels two ways: a *live* push the moment something changes, and a
+  *catch-up* for whatever was missed while an account was elsewhere. The catch-up
+  half had stopped working entirely. Every catch-up answer was being thrown away
+  on arrival, without a word, so an account only ever saw what happened to reach
+  it live. That is why a value could land once, early, and then sit frozen for
+  days while the other account kept changing it: the live push that would have
+  refreshed it had been missed, and the repair that exists for exactly that case
+  was never allowed in the door.
+
+  Both halves work now. An account that was logged out catches up at its next
+  login, and a change made while the other account was busy stops being lost for
+  good.
+
+- **New: `/dsn debug mesh` can now say which side of the wire a sync problem is
+  on.** Three new blocks: what was last *sent* for each kind of shared data, what
+  last *arrived* for each account and whether it was accepted, and a count of
+  everything that was refused, with the reason. Pasting that from both accounts
+  is enough to tell "it never left" from "it arrived and was rejected" — which
+  previously took a hand comparison of the saved files.
+
 - **New: the minimap button's tooltip now shows where you stand against the
   instance limit.** Below the world buff timers there is an **Instances** section:
   how many of your five instances this hour are gone, then one line for each one
