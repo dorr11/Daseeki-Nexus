@@ -174,6 +174,88 @@ function InstancesUI.MobCount(entry)
     return 0, nil
 end
 
+-- ── PER-VISIT STATISTIC FORMATTERS (shared by the panel hover and the minimap
+--    button's current-run block) ───────────────────────────────────────────────
+-- All pure, all here rather than in minimap.lua, because two surfaces reading
+-- the same run must not be able to disagree about what it says.
+
+-- Comma-grouped integer, with an explicit sign when asked. "12500" -> "12,500".
+-- The grouping loop is the standard one; it terminates because each pass either
+-- inserts a separator or matches nothing. Pure.
+function InstancesUI.FormatCount(n, signed)
+    n = math.floor(tonumber(n) or 0)
+    local neg = n < 0
+    local s = tostring(neg and -n or n)
+    while true do
+        local rep
+        s, rep = s:gsub("^(%d+)(%d%d%d)", "%1,%2")
+        if rep == 0 then break end
+    end
+    if neg then return "-" .. s end
+    if signed then return "+" .. s end
+    return s
+end
+
+-- RAW GOLD FROM MOBS, by the spec's own precedence (§A2 row 7 / §A4.6):
+-- the looted-coin accumulator is AUTHORITATIVE; the wallet delta is consulted
+-- ONLY when the accumulator is zero *and* the wallet actually ROSE. It exists
+-- for users whose other addons rewrite the money chat strings, and nothing else.
+--
+-- The "and rose" half is the whole point of the rule. A wallet delta counts
+-- repairs, vendor sales, reagents and mail, so a run with no looted coin and a
+-- repair bill has a NEGATIVE delta — and reporting that as "gold from mobs"
+-- states the opposite of the truth. Zero is the honest answer there.
+-- Returns (copper, source) where source is "loot" | "wallet" | nil. Pure.
+function InstancesUI.RunGold(entry)
+    entry = entry or {}
+    local loot = math.floor(tonumber(entry.goldLoot) or 0)
+    if loot ~= 0 then return loot, "loot" end
+    local wallet = math.floor(tonumber(entry.gold) or 0)
+    if wallet > 0 then return wallet, "wallet" end
+    return 0, nil
+end
+
+-- The run's XP as a percentage of the level requirement, to one decimal, or nil.
+-- nil whenever there is no requirement to be a percentage of — which is how max
+-- level renders (the engine refuses to store a zero requirement) without this
+-- layer needing to know what max level is. Pure.
+function InstancesUI.XPPercentOfLevel(xp, xpMax)
+    xp = tonumber(xp) or 0
+    xpMax = tonumber(xpMax) or 0
+    if xp <= 0 or xpMax <= 0 then return nil end
+    return math.floor((xp / xpMax) * 1000 + 0.5) / 10
+end
+
+-- XP per hour, extrapolated from what the run has done so far. nil below a
+-- floor of elapsed time: a run three seconds old with one kill in it would
+-- otherwise report a rate in the millions, which is a number the owner would
+-- rightly stop trusting the row for. Pure.
+InstancesUI.XPRATE_MIN_ELAPSED = 30
+function InstancesUI.XPPerHour(xp, dur)
+    xp = tonumber(xp) or 0
+    dur = tonumber(dur) or 0
+    if xp <= 0 or dur < InstancesUI.XPRATE_MIN_ELAPSED then return nil end
+    return math.floor((xp / dur) * 3600 + 0.5)
+end
+
+-- The per-faction reputation rows for a run: ALPHABETICAL by faction name (not
+-- by amount — the reference orders them this way and it is the order that makes
+-- two runs' blocks comparable), losses keeping their sign, zero-net factions
+-- dropped. Returns an array of { faction = , amount = , text = }. Pure.
+function InstancesUI.RepRows(repBy)
+    local rows = {}
+    if type(repBy) ~= "table" then return rows end
+    for faction, amount in pairs(repBy) do
+        amount = math.floor(tonumber(amount) or 0)
+        if type(faction) == "string" and faction ~= "" and amount ~= 0 then
+            rows[#rows + 1] = { faction = faction, amount = amount,
+                                text = InstancesUI.FormatCount(amount, amount > 0) }
+        end
+    end
+    table.sort(rows, function(a, b) return a.faction < b.faction end)
+    return rows
+end
+
 -- "just now" under a minute, else "<duration> ago". Pure.
 function InstancesUI.AgoText(sec)
     sec = math.max(0, math.floor(sec or 0))
@@ -312,6 +394,12 @@ function InstancesUI.AggregateVisits(visits, nowE, isOpen)
         agg.xp       = math.max(0, primary.xp or 0)
         agg.mobXP    = primary.mobXP or 0
         agg.mobKill  = primary.mobKill or 0
+        -- The survivor already carries the folded honor / per-faction rep
+        -- (Instances.ApplySerial added them at merge time), and its own level
+        -- requirement.
+        agg.honor    = primary.honor
+        agg.repBy    = primary.repBy
+        agg.xpMax    = primary.xpMax
     else
         agg.dur, agg.goldLoot, agg.gold, agg.xp, agg.mobXP, agg.mobKill = 0, 0, 0, 0, 0, 0
         local n = #(visits or {})
@@ -323,6 +411,18 @@ function InstancesUI.AggregateVisits(visits, nowE, isOpen)
             agg.xp       = agg.xp       + math.max(0, e.xp or 0)
             agg.mobXP    = agg.mobXP    + (e.mobXP or 0)
             agg.mobKill  = agg.mobKill  + (e.mobKill or 0)
+            -- Honor sums; the per-faction table unions by faction. Both stay
+            -- ABSENT when no visit recorded one, so a legacy row keeps rendering
+            -- the block it always did rather than gaining a row of zeroes.
+            if e.honor then agg.honor = (agg.honor or 0) + e.honor end
+            if type(e.repBy) == "table" then
+                agg.repBy = agg.repBy or {}
+                for who, amt in pairs(e.repBy) do
+                    agg.repBy[who] = (agg.repBy[who] or 0) + (tonumber(amt) or 0)
+                end
+            end
+            -- The level requirement is not a taking: take the newest one seen.
+            if e.xpMax then agg.xpMax = e.xpMax end
         end
     end
     return agg
@@ -363,6 +463,16 @@ function InstancesUI.RowModel(entry, nameRealm, classTag, nowE, isOpen, visits)
                 or (E and E.EntryDuration and E.EntryDuration(entry, nowE, isOpen))
                 or (entry.dur or 0)
     local mobCount = InstancesUI.MobCount(agg or entry)
+
+    -- Per-visit statistics. Honor and the per-faction rep table come from the
+    -- aggregate when the row folds several visits; the two XP figures are DERIVED
+    -- here and never stored (spec §A4.5), so a record written before this build
+    -- gains them the moment it is displayed.
+    local honor = (agg and agg.honor) or entry.honor
+    local repBy = (agg and agg.repBy) or entry.repBy
+    local xpMax = (agg and agg.xpMax) or entry.xpMax
+    local xpPct  = InstancesUI.XPPercentOfLevel(xp, xpMax)
+    local xpRate = InstancesUI.XPPerHour(xp, dur)
 
     -- Per-entry detail (all optional; a run that never captured it renders none).
     -- On a LEGACY multi-visit group the roster and trades are unioned across the
@@ -423,6 +533,19 @@ function InstancesUI.RowModel(entry, nameRealm, classTag, nowE, isOpen, visits)
         rep       = entry.rep,
         repText   = (entry.rep and entry.rep ~= 0)
                     and ((entry.rep > 0 and "+" or "") .. entry.rep .. " rep") or nil,
+        -- The PER-FACTION breakdown behind that net total, alphabetical. Absent
+        -- (an empty array) on every entry recorded before the capture existed.
+        repRows   = InstancesUI.RepRows(repBy),
+        -- Honor, and the two XP figures derived at display time and never stored
+        -- (spec §A4.5). All nil when the run has nothing to say, so a pre-detail
+        -- entry renders exactly the block it always did.
+        honor     = honor,
+        honorText = (honor and honor > 0) and InstancesUI.FormatCount(honor) or nil,
+        xpMax     = xpMax,
+        xpPct     = xpPct,
+        xpPctText = xpPct and string.format("%.1f%% of level", xpPct) or nil,
+        xpPerHour = xpRate,
+        xpRateText = xpRate and (InstancesUI.FormatCount(xpRate) .. " xp/hr") or nil,
         merged    = (entry.merged or (visitList ~= nil)) and true or false,
         -- ── the hover block ──
         serial       = entry.serial,
@@ -794,6 +917,14 @@ function InstancesUI.RowTooltip(model, nowE, classBy)
          "Mobs killed", (model.mobCount or 0) > 0 and tostring(model.mobCount) or nil)
     pair("Entered level", model.enteredLevel and tostring(model.enteredLevel) or nil,
          "Avg group level", model.groupAvg and string.format("%.1f", model.groupAvg) or nil)
+    -- The two DERIVED XP figures (spec §A4.5), paired because they are the same
+    -- idea at two scales: what this run was worth, and what it was worth per hour.
+    -- Both omitted at max level and on a run with no XP, which is the same
+    -- suppression rule the reference applies.
+    pair("XP / hour", model.xpRateText and InstancesUI.FormatCount(model.xpPerHour) or nil,
+         "% of level", model.xpPct and string.format("%.1f%%", model.xpPct) or nil)
+    -- Honor only ever renders when the run actually recorded some.
+    pair("Honor", model.honorText, nil, nil)
     pair("When", model.agoText or "", nil, nil)
 
     local tip = {
@@ -834,6 +965,20 @@ function InstancesUI.RowTooltip(model, nowE, classBy)
         tip.groupHeader = "Group (" .. #(model.group or {}) .. ")"
         tip.groupRows = roster
         tip.groupPairs = roster   -- retained alias for any older consumer
+    end
+
+    -- REPUTATION, one line per faction, alphabetical, losses signed. The icon
+    -- strip above carries the NET total across factions; a dungeon that awards
+    -- two factions has always had two numbers behind that one, and this is where
+    -- they finally surface. Omitted entirely when the run recorded none, so every
+    -- record written before the capture worked renders exactly as before.
+    if model.repRows and #model.repRows > 0 then
+        tip.repHeader = "Reputation"
+        tip.repLines = {}
+        for i = 1, #model.repRows do
+            local r = model.repRows[i]
+            tip.repLines[i] = { r.faction, r.text }
+        end
     end
 
     if model.trades and #model.trades > 0 then
@@ -1686,6 +1831,16 @@ function InstancesPanel.Attach(host)
                     end
                 end
             end
+            -- Reputation: label left in the muted ink, the NUMBER right in the
+            -- value ink — the same double-line grammar the grid above uses, so a
+            -- faction row reads as a figure and not as prose.
+            if tip.repLines then
+                GameTooltip:AddLine(" ")
+                GameTooltip:AddLine(tip.repHeader, hr, hg, hb)
+                for _, ln in ipairs(tip.repLines) do
+                    GameTooltip:AddDoubleLine(ln[1], ln[2], tr, tg, tb, vr, vg, vb)
+                end
+            end
             if tip.tradeLines then
                 GameTooltip:AddLine(" ")
                 GameTooltip:AddLine(tip.tradeHeader, hr, hg, hb)
@@ -1923,6 +2078,14 @@ function InstancesPanel.Attach(host)
             -- of the run they belong to; a reset-and-rerun keeps its own row.
             local all = InstancesUI.GatherEntries((data and data.instances) or {})
             local groups = InstancesUI.GroupVisits(all)
+            -- THE LIVE RUN. The rows used to pass isOpen=false unconditionally, so
+            -- the run the owner was standing in reported the duration it had at its
+            -- last stamp — frozen — while every per-visit statistic on the same row
+            -- ticked up. One row cannot be live in its numbers and dead in its clock.
+            -- `Instances.CurrentRun` returns the very table the capture path writes
+            -- to, so identity is the whole test.
+            local openEntry = (ns.Instances and ns.Instances.CurrentRun
+                               and ns.Instances.CurrentRun()) or nil
             for i = 1, #groups do
                 local item = groups[i]
                 if shown >= MAX_REC then break end
@@ -1930,7 +2093,8 @@ function InstancesPanel.Attach(host)
                 local acctOK = (not P.selectedAcct) or (item.aid == P.selectedAcct)
                 if acctOK and ((not P.selectedChar) or (item.nameRealm == P.selectedChar)) then
                     local model = InstancesUI.RowModel(item.primary, item.nameRealm,
-                        classMap[item.nameRealm], nowE, false, item.visits)
+                        classMap[item.nameRealm], nowE,
+                        (openEntry ~= nil and item.primary == openEntry), item.visits)
                     shown = shown + 1
                     local r = getRec(shown)
                     r:ClearAllPoints(); r:SetPoint("TOPLEFT", child, "TOPLEFT", 0, -y); r:SetPoint("TOPRIGHT", child, "TOPRIGHT", 0, -y)
@@ -2884,6 +3048,156 @@ local function testInstancesUI(fails)
     ck(not (p1 == p2 and p2 == p3),
         "NX-15 RED CONTROL: the pre-fix first-pairs()-hit resolver agreed with itself "
         .. "across all three histories — this fixture would not have caught the bug")
+
+    -- ════════════════════════════════════════════════════════════════════════
+    --  PER-VISIT STATISTICS — the formatters, and the rules inside them.
+    -- ════════════════════════════════════════════════════════════════════════
+
+    -- ── comma grouping ──────────────────────────────────────────────────────
+    ck(IU.FormatCount(0) == "0", "count: zero")
+    ck(IU.FormatCount(999) == "999", "count: no separator below a thousand")
+    ck(IU.FormatCount(1000) == "1,000", "count: one separator")
+    ck(IU.FormatCount(12500) == "12,500", "count: 12,500")
+    ck(IU.FormatCount(1234567) == "1,234,567", "count: two separators (got " .. IU.FormatCount(1234567) .. ")")
+    ck(IU.FormatCount(12500, true) == "+12,500", "count: an explicit plus when asked")
+    ck(IU.FormatCount(-75, true) == "-75", "count: a negative keeps its own sign, never '+-'")
+    ck(IU.FormatCount(nil) == "0", "count: nil reads as zero, not an error")
+
+    -- ── RAW GOLD FROM MOBS: the accumulator, and the narrow wallet fallback ──
+    -- The rule is loot-first; the wallet delta only when loot is zero AND the
+    -- wallet ROSE. The negative case is the one that matters and the one a
+    -- plain `loot ~= 0 and loot or wallet` gets wrong.
+    local g, src = IU.RunGold({ goldLoot = 48000, gold = -12000 })
+    ck(g == 48000 and src == "loot",
+        "gold: the LOOT accumulator wins over a negative wallet delta (got " .. g .. ")")
+    g, src = IU.RunGold({ goldLoot = 0, gold = 7000 })
+    ck(g == 7000 and src == "wallet", "gold: with no looted coin, a wallet RISE is the fallback")
+    g, src = IU.RunGold({ goldLoot = 0, gold = -12000 })
+    ck(g == 0 and src == nil,
+        "gold: a wallet that FELL is a repair bill, not mob coin — the honest answer is 0 (got "
+        .. g .. ")")
+    -- RED CONTROL: the naive precedence, on that same run. If it ever stops
+    -- producing the repair bill, the row above is asserting nothing.
+    local naive = (0 ~= 0) and 0 or -12000
+    ck(naive == -12000,
+        "RED CONTROL: the naive loot-or-wallet precedence on a repair-bill run")
+    ck(IU.RunGold({ goldLoot = 0, gold = -12000 }) ~= naive,
+        "gold: the naive precedence would report the repair bill as gold from mobs")
+    g = IU.RunGold({})
+    ck(g == 0, "gold: an entry with neither figure reads 0")
+    ck(IU.RunGold(nil) == 0, "gold: a nil entry reads 0, not an error")
+
+    -- ── % of level, and the two zeros that are not denominators ─────────────
+    ck(IU.XPPercentOfLevel(12500, 20000) == 62.5, "pct: 12500/20000 = 62.5")
+    ck(IU.XPPercentOfLevel(1, 3) == 33.3, "pct: rounded to one decimal (got "
+        .. tostring(IU.XPPercentOfLevel(1, 3)) .. ")")
+    ck(IU.XPPercentOfLevel(900, 0) == nil, "pct: NO requirement (max level) -> no percentage")
+    ck(IU.XPPercentOfLevel(900, nil) == nil, "pct: an unrecorded requirement -> no percentage")
+    ck(IU.XPPercentOfLevel(0, 20000) == nil, "pct: no XP -> no percentage")
+
+    -- ── XP/hour, and the floor under it ─────────────────────────────────────
+    ck(IU.XPPerHour(12500, 1800) == 25000, "rate: 12500 in 30m = 25000/hr")
+    ck(IU.XPPerHour(500, 3600) == 500, "rate: an hour of it is itself")
+    ck(IU.XPPerHour(500, 1) == nil,
+        "rate: refused below the elapsed floor — a 1s run does not report millions per hour")
+    ck(IU.XPPerHour(0, 3600) == nil, "rate: no XP -> no rate")
+    ck(IU.XPPerHour(500, IU.XPRATE_MIN_ELAPSED) == 60000, "rate: lands exactly at the floor")
+
+    -- ── the two mob counters, and which one a display reaches for ───────────
+    local mc, msrc = IU.MobCount({ mobXP = 5, mobKill = 99 })
+    ck(mc == 5 and msrc == "xp",
+        "mobs: the XP-derived tally is preferred and says so (got " .. tostring(mc) .. "/" .. tostring(msrc) .. ")")
+    mc, msrc = IU.MobCount({ mobXP = 0, mobKill = 210 })
+    ck(mc == 210 and msrc == "kill",
+        "mobs: a boosted run of greys falls back to the KILL tally — the whole reason "
+        .. "the second counter exists (got " .. tostring(mc) .. "/" .. tostring(msrc) .. ")")
+    mc, msrc = IU.MobCount({})
+    ck(mc == 0 and msrc == nil, "mobs: nothing recorded -> 0 and no source")
+
+    -- ── reputation rows: every faction, alphabetical, signed ────────────────
+    local rr = IU.RepRows({ ["Timbermaw Hold"] = -75, ["Argent Dawn"] = 250,
+                            ["Brood of Nozdormu"] = 10, ["Zero Faction"] = 0 })
+    ck(#rr == 3, "rep rows: a zero-net faction is dropped (got " .. #rr .. ")")
+    ck(rr[1].faction == "Argent Dawn" and rr[2].faction == "Brood of Nozdormu"
+        and rr[3].faction == "Timbermaw Hold",
+        "rep rows: ALPHABETICAL by faction, not by amount")
+    ck(rr[1].text == "+250", "rep rows: a gain carries an explicit plus")
+    ck(rr[3].text == "-75", "rep rows: a loss carries its minus")
+    ck(#IU.RepRows(nil) == 0, "rep rows: no table -> an empty array, never nil")
+
+    -- ── the row model + hover carry all of it ───────────────────────────────
+    local T2 = 3000000
+    local statEntry = { t = T2 - 1800, exitT = T2, name = "Stratholme", mapID = 329,
+                        xp = 12500, xpMax = 20000, mobXP = 47, mobKill = 51,
+                        goldLoot = 48210, gold = -12000, honor = 55,
+                        repBy = { ["Timbermaw Hold"] = -75, ["Argent Dawn"] = 250 } }
+    local mStat = IU.RowModel(statEntry, "Shalk-Sim", "ROGUE", T2)
+    ck(mStat.xpPct == 62.5 and mStat.xpPctText == "62.5% of level",
+        "row model: percent of level (got " .. tostring(mStat.xpPctText) .. ")")
+    ck(mStat.xpPerHour == 25000 and mStat.xpRateText == "25,000 xp/hr",
+        "row model: xp/hour (got " .. tostring(mStat.xpRateText) .. ")")
+    ck(mStat.honorText == "55", "row model: honor")
+    ck(#mStat.repRows == 2 and mStat.repRows[1].faction == "Argent Dawn",
+        "row model: the per-faction rows ride the model")
+    ck(mStat.gold == 48210 and mStat.goldFromLoot == true,
+        "row model: gold still prefers the accumulator")
+
+    local tStat = IU.RowTooltip(mStat, T2)
+    ck(tStat.repHeader == "Reputation" and #tStat.repLines == 2,
+        "row hover: a Reputation section with one line per faction")
+    ck(tStat.repLines[1][1] == "Argent Dawn" and tStat.repLines[1][2] == "+250",
+        "row hover: faction left, signed amount right")
+    ck(tStat.repLines[2][2] == "-75", "row hover: the loss keeps its sign")
+    local sawRate, sawHonor = false, false
+    for _, ln in ipairs(tStat.lines) do
+        if ln[1] == "XP / hour" then sawRate = true end
+        if ln[1] == "Honor" then sawHonor = true end
+    end
+    ck(sawRate, "row hover: XP/hour joined the upper grid")
+    ck(sawHonor, "row hover: honor joined the upper grid")
+
+    -- OLD, STAT-LESS RECORDS RENDER GRACEFULLY. This is the SavedVariables
+    -- contract: every new field is additive, so a record written before any of
+    -- this existed must produce the block it always did — no nil, no zero rows.
+    local legacy = { t = T2 - 900, exitT = T2 - 300, name = "Uldaman", gold = 4200 }
+    local mLegacy = IU.RowModel(legacy, "Shalk-Sim", "ROGUE", T2)
+    ck(mLegacy.xpPct == nil and mLegacy.xpPctText == nil, "legacy row: no percent of level")
+    ck(mLegacy.xpRateText == nil, "legacy row: no xp/hour")
+    ck(mLegacy.honorText == nil, "legacy row: no honor")
+    ck(#mLegacy.repRows == 0, "legacy row: no faction rows")
+    ck(mLegacy.gold == 4200 and mLegacy.goldFromLoot == false,
+        "legacy row: a pre-accumulator run still reports its wallet rise")
+    local tLegacy = IU.RowTooltip(mLegacy, T2)
+    ck(tLegacy.repHeader == nil and tLegacy.repLines == nil,
+        "legacy hover: the Reputation section is absent, not empty")
+    for _, ln in ipairs(tLegacy.lines) do
+        ck(ln[1] ~= "Honor", "legacy hover: no honor row")
+        ck(ln[1] ~= "XP / hour" or ln[2] ~= nil, "legacy hover: no empty xp/hour row")
+    end
+    ck(#tLegacy.stats == 3, "legacy hover: the icon strip keeps its three cells")
+
+    -- A LEGACY (heuristic) group sums honor and UNIONS the faction tables; an
+    -- engine-folded group takes both from the survivor, which already holds them.
+    local vA = { entry = { t = T2 - 3000, name = "Zul'Gurub", honor = 10,
+                           repBy = { ["Zandalar Tribe"] = 100 }, xp = 500, dur = 600 } }
+    local vB = { entry = { t = T2 - 1200, name = "Zul'Gurub", honor = 5,
+                           repBy = { ["Zandalar Tribe"] = 50, ["Argent Dawn"] = 20 },
+                           xp = 300, dur = 600 } }
+    local aggL = IU.AggregateVisits({ vA, vB }, T2, false)
+    ck(aggL.honor == 15, "legacy group: honor sums (got " .. tostring(aggL.honor) .. ")")
+    ck(aggL.repBy["Zandalar Tribe"] == 150 and aggL.repBy["Argent Dawn"] == 20,
+        "legacy group: the faction tables union by faction")
+    local vS = { entry = { t = T2 - 3000, name = "Stratholme", honor = 99,
+                           repBy = { ["Argent Dawn"] = 375 }, merged = false } }
+    local vM = { entry = { t = T2 - 1200, name = "Stratholme", honor = 99,
+                           repBy = { ["Argent Dawn"] = 375 }, merged = true } }
+    local aggF = IU.AggregateVisits({ vS, vM }, T2, false)
+    ck(aggF.folded == true and aggF.honor == 99,
+        "engine-folded group: honor comes from the survivor ALONE, never doubled (got "
+        .. tostring(aggF.honor) .. ")")
+    ck(aggF.repBy["Argent Dawn"] == 375,
+        "engine-folded group: the faction table likewise (got "
+        .. tostring(aggF.repBy["Argent Dawn"]) .. ")")
 end
 
 if ns.RegisterSelfTest then
